@@ -320,10 +320,18 @@ class EditorialGroupingService:
             group = await uow.editorial_groups.get_for_update(group_id)
             if group is None or group.edition_id != edition_id:
                 raise EditorialGroupNotFoundError(str(group_id))
+            requested_ids = set(candidate_ids)
+            group_candidate_ids = {
+                reference.candidate_id for reference in group.candidate_references
+            }
+            if requested_ids - group_candidate_ids:
+                raise EditorialActionError(
+                    "Every requested split candidate must belong to the group"
+                )
             selected = {
                 reference
                 for reference in group.candidate_references
-                if reference.candidate_id in set(candidate_ids)
+                if reference.candidate_id in requested_ids
             }
             if not selected:
                 raise EditorialActionError("Split candidates do not belong to the group")

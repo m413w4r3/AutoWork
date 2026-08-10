@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import runpy
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +48,7 @@ def test_responses_facade_translates_web_search_and_rejects_binary_blocks() -> N
 async def test_responses_facade_completes_background_request_without_network() -> None:
     module = load_bridge()
 
-    async def fake_generation(*_: object, **__: object):
+    async def fake_generation(*_: object, **__: object) -> AsyncIterator[str]:
         yield "résultat simulé"
 
     module["_execute_background_response"].__globals__["run_generation"] = fake_generation

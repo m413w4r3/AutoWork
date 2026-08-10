@@ -6,7 +6,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
-from cti_app.application.editorial import AmbiguousGroupingResult, EditorialGroupingService
+import pytest
+
+from cti_app.application.editorial import (
+    AmbiguousGroupingResult,
+    EditorialActionError,
+    EditorialGroupingService,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
@@ -331,3 +337,45 @@ async def test_merge_split_and_selection_append_new_human_decisions() -> None:
     assert selected.editorial_type is EditorialType.BRIEF
     assert len(materializer.subjects) == 1
     assert uow.decisions[-1].payload["automatic"] is False
+
+
+async def test_split_rejects_entire_request_when_one_candidate_is_foreign() -> None:
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+    batch = _batch(
+        edition.id,
+        [
+            _candidate("Publication A", "https://a.example/report"),
+            _candidate("Publication B", "https://b.example/report"),
+        ],
+    )
+    uow.batches[batch.id] = batch
+    service = EditorialGroupingService(uow, None)
+    initial = await service.synchronize(edition.id)
+    merged = await service.merge(
+        edition.id,
+        (initial[0].id, initial[1].id),
+        actor_id="dev-analyst",
+        correlation_id="merge-before-invalid-split",
+    )
+    original_references = merged.candidate_references
+    group_count = len(uow.groups)
+    decision_count = len(uow.decisions)
+
+    with pytest.raises(
+        EditorialActionError,
+        match="Every requested split candidate must belong to the group",
+    ):
+        await service.split(
+            edition.id,
+            merged.id,
+            (original_references[0].candidate_id, uuid4()),
+            actor_id="dev-analyst",
+            correlation_id="invalid-split",
+        )
+
+    persisted = uow.groups[merged.id]
+    assert persisted.candidate_references == original_references
+    assert len(uow.groups) == group_count
+    assert len(uow.decisions) == decision_count
