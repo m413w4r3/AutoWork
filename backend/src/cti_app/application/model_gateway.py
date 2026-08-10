@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from types import TracebackType
 from typing import Any, Protocol, Self
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ValidationError
 
@@ -61,6 +61,40 @@ class AdapterResultStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class ConversationContext:
+    mode: str
+    id: UUID
+    external_locator: str | None = None
+    parent_turn_id: UUID | None = None
+    previous_head_hash: str | None = None
+    expected_profile: str | None = None
+    requested_model: str | None = None
+    external_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"fresh", "continue"}:
+            raise ValueError("Conversation mode must be fresh or continue")
+        if self.mode == "continue" and not self.external_locator:
+            raise ValueError("Continue mode requires an external locator")
+
+    def bridge_payload(self) -> dict[str, str | None]:
+        return {
+            "mode": self.mode,
+            "id": str(self.id),
+            "external_locator": self.external_locator,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationResult:
+    id: str
+    mode: str
+    external_locator: str | None
+    turn_id: str | None
+    verified: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ModelRequest:
     text: str
     prompt_template_id: str
@@ -72,6 +106,9 @@ class ModelRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
     parameters: dict[str, Any] = field(default_factory=dict)
     background: bool = False
+    provider: ModelProvider | None = None
+    conversation: ConversationContext | None = None
+    run_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if not self.text.strip():
@@ -97,6 +134,7 @@ class SafeModelRequest:
     background: bool
     authorized_input_hash: str
     request_id: str | None = None
+    conversation: ConversationContext | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +147,7 @@ class AdapterResult:
     response_id: str | None = None
     output_text: str | None = None
     structured_output: BaseModel | None = None
+    conversation: ConversationResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +155,7 @@ class ModelExecution:
     run: ModelRun
     output_text: str | None = None
     structured_output: BaseModel | None = None
+    conversation: ConversationResult | None = None
 
 
 class ModelAdapter(Protocol):
@@ -218,6 +258,8 @@ class ModelRouter:
         self._forced_provider = forced_provider
 
     def select(self, request: ModelRequest, role: ModelRole) -> ModelAdapter:
+        if request.provider is not None:
+            return self.by_provider(request.provider, role)
         if self._forced_provider is not None:
             return self.by_provider(self._forced_provider, role)
         if role is ModelRole.RESEARCH or request.routing_hint in {
@@ -269,6 +311,24 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
 
     async def critique(self, request: ModelRequest) -> ModelExecution:
         return await self._execute(request, ModelRole.CRITIC)
+
+    async def execute(self, request: ModelRequest, role: ModelRole) -> ModelExecution:
+        return await self._execute(request, role)
+
+    def build_run(self, request: ModelRequest, role: ModelRole) -> ModelRun:
+        adapter = self._router.select(request, role)
+        safe_request = sanitize_model_request(request)
+        return ModelRun(
+            provider=adapter.provider,
+            model_role=role,
+            requested_model=adapter.requested_model,
+            prompt_template_id=request.prompt_template_id,
+            prompt_template_version=request.prompt_template_version,
+            authorized_input_hash=safe_request.authorized_input_hash,
+            evidence_pack_hash=request.evidence_pack_hash,
+            parameters=safe_request.parameters,
+            id=request.run_id or uuid4(),
+        )
 
     async def resume(
         self, run_id: UUID, *, output_schema: type[BaseModel] | None = None
@@ -324,18 +384,19 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
     ) -> ModelExecution:
         adapter = self._router.select(request, role)
         safe_request = sanitize_model_request(request)
-        run = ModelRun(
-            provider=adapter.provider,
-            model_role=role,
-            requested_model=adapter.requested_model,
-            prompt_template_id=request.prompt_template_id,
-            prompt_template_version=request.prompt_template_version,
-            authorized_input_hash=safe_request.authorized_input_hash,
-            evidence_pack_hash=request.evidence_pack_hash,
-            parameters=safe_request.parameters,
-        )
+        run = self.build_run(request, role)
         async with self._uow_factory() as uow:
-            await uow.model_runs.add(run)
+            existing = await uow.model_runs.get_for_update(run.id) if request.run_id else None
+            if existing is None:
+                await uow.model_runs.add(run)
+            elif (
+                existing.authorized_input_hash != run.authorized_input_hash
+                or existing.provider is not run.provider
+                or existing.model_role is not run.model_role
+            ):
+                raise ModelGatewayError("Existing ModelRun does not match this request")
+            else:
+                run = existing
             if adapter.is_external and not request.external_llm_allowed:
                 run.fail(
                     "external_llm_blocked",
@@ -415,6 +476,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             run,
             output_text=result.output_text,
             structured_output=result.structured_output,
+            conversation=result.conversation,
         )
 
 
@@ -448,6 +510,18 @@ def sanitize_model_request(request: ModelRequest) -> SafeModelRequest:
         "prompt_template_id": request.prompt_template_id,
         "prompt_template_version": request.prompt_template_version,
         "evidence_pack_hash": request.evidence_pack_hash,
+        "conversation_id": str(request.conversation.id) if request.conversation else None,
+        "conversation_mode": request.conversation.mode if request.conversation else "fresh",
+        "external_locator": request.conversation.external_locator if request.conversation else None,
+        "parent_turn_id": (
+            str(request.conversation.parent_turn_id) if request.conversation else None
+        ),
+        "previous_head_hash": (
+            request.conversation.previous_head_hash if request.conversation else None
+        ),
+        "expected_profile": request.conversation.expected_profile if request.conversation else None,
+        "requested_model": request.conversation.requested_model if request.conversation else None,
+        "external_id": request.conversation.external_id if request.conversation else None,
     }
     digest = hashlib.sha256(
         json.dumps(authorized, sort_keys=True, separators=(",", ":")).encode()
@@ -463,6 +537,7 @@ def sanitize_model_request(request: ModelRequest) -> SafeModelRequest:
         parameters=parameters,
         background=request.background,
         authorized_input_hash=digest,
+        conversation=request.conversation,
     )
 
 

@@ -18,6 +18,8 @@ from cti_app.application.persistence import (
     IndicatorRepository,
     JobEventRepository,
     JobRepository,
+    ModelConversationRepository,
+    ModelConversationTurnRepository,
     ModelRunRepository,
     ProvenanceRepository,
     RejectedModelProposalRepository,
@@ -42,6 +44,8 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyIndicatorRepository,
     SqlAlchemyJobEventRepository,
     SqlAlchemyJobRepository,
+    SqlAlchemyModelConversationRepository,
+    SqlAlchemyModelConversationTurnRepository,
     SqlAlchemyModelRunRepository,
     SqlAlchemyProvenanceRepository,
     SqlAlchemyRejectedModelProposalRepository,
@@ -63,6 +67,8 @@ class SqlAlchemyUnitOfWork:
     editions: EditionRepository
     edition_audit: EditionAuditRepository
     model_runs: ModelRunRepository
+    model_conversations: ModelConversationRepository
+    model_conversation_turns: ModelConversationTurnRepository
     discovery_batches: DiscoveryBatchRepository
     editorial_groups: EditorialGroupRepository
     human_decisions: HumanDecisionRepository
@@ -93,6 +99,8 @@ class SqlAlchemyUnitOfWork:
         self.editions = SqlAlchemyEditionRepository(self._session)
         self.edition_audit = SqlAlchemyEditionAuditRepository(self._session)
         self.model_runs = SqlAlchemyModelRunRepository(self._session)
+        self.model_conversations = SqlAlchemyModelConversationRepository(self._session)
+        self.model_conversation_turns = SqlAlchemyModelConversationTurnRepository(self._session)
         self.discovery_batches = SqlAlchemyDiscoveryBatchRepository(self._session)
         self.editorial_groups = SqlAlchemyEditorialGroupRepository(self._session)
         self.human_decisions = SqlAlchemyHumanDecisionRepository(self._session)

@@ -22,14 +22,37 @@ const inflight = new Map();
 /** Deuxième barrière persistante : un id reçu n'est jamais retransmis deux fois au DOM. */
 const requestStates = new Map();
 const eventCounters = new Map();
+const conversationRegistry = new Map();
+const busyTabs = new Set();
+const requestConversationResults = new Map();
 
 const requestStatesReady = chrome.storage.local.get("bridgeRequestStates").then(({ bridgeRequestStates }) => {
   for (const [id, state] of Object.entries(bridgeRequestStates || {})) requestStates.set(id, state);
 });
+const conversationRegistryReady = chrome.storage.local
+  .get(["bridgeConversationRegistry", "bridgeRequestConversationResults"])
+  .then(({ bridgeConversationRegistry, bridgeRequestConversationResults }) => {
+    for (const [id, entry] of Object.entries(bridgeConversationRegistry || {})) {
+      conversationRegistry.set(id, { ...entry, tab_id: null, window_id: null });
+    }
+    for (const [id, value] of Object.entries(bridgeRequestConversationResults || {})) {
+      requestConversationResults.set(id, value);
+    }
+  });
 
 function persistRequestStates() {
   const entries = [...requestStates.entries()].slice(-1000);
   chrome.storage.local.set({ bridgeRequestStates: Object.fromEntries(entries) });
+}
+
+function persistConversationRegistry() {
+  const durable = Object.fromEntries(
+    [...conversationRegistry.entries()].map(([id, entry]) => [id, { ...entry, tab_id: null, window_id: null }]),
+  );
+  chrome.storage.local.set({
+    bridgeConversationRegistry: durable,
+    bridgeRequestConversationResults: Object.fromEntries([...requestConversationResults.entries()].slice(-1000)),
+  });
 }
 
 async function serverUrl() {
@@ -156,6 +179,85 @@ async function findChatTab() {
   return tabs.find((t) => t.active) || tabs[tabs.length - 1];
 }
 
+function validChatLocator(value) {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      ["chatgpt.com", "chat.openai.com"].includes(url.hostname) &&
+      !url.username &&
+      !url.password &&
+      !url.hash &&
+      url.pathname !== "/"
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function waitForTab(tabId) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status === "complete") return tab;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("chargement de la conversation expiré");
+}
+
+async function resolveConversationTab(conversation) {
+  if (!conversation?.id || !["fresh", "continue"].includes(conversation.mode)) {
+    throw new Error("cible de conversation invalide");
+  }
+  await conversationRegistryReady;
+  const known = conversationRegistry.get(conversation.id);
+  if (conversation.mode === "fresh") {
+    if (known?.tab_id) {
+      const cached = await chrome.tabs.get(known.tab_id).catch(() => null);
+      if (cached && !busyTabs.has(cached.id)) return cached;
+    }
+    const tab = await chrome.tabs.create({ url: "https://chatgpt.com/", active: false });
+    const loaded = await waitForTab(tab.id);
+    conversationRegistry.set(conversation.id, {
+      external_locator: null,
+      tab_id: loaded.id,
+      window_id: loaded.windowId,
+      last_verified_at: Date.now(),
+    });
+    persistConversationRegistry();
+    return loaded;
+  }
+  if (!validChatLocator(conversation.external_locator)) {
+    throw new Error("locator de conversation absent ou invalide");
+  }
+  if (known?.external_locator && known.external_locator !== conversation.external_locator) {
+    throw new Error("locator incohérent avec le registre applicatif");
+  }
+  const tabs = await chrome.tabs.query({
+    url: ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+  });
+  let tab = tabs.find((candidate) => candidate.url === conversation.external_locator);
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: conversation.external_locator, active: false });
+  }
+  if (busyTabs.has(tab.id)) throw new Error("onglet de conversation déjà occupé");
+  const loaded = await waitForTab(tab.id);
+  if (loaded.url !== conversation.external_locator) {
+    throw new Error("la navigation ne correspond pas au locator demandé");
+  }
+  conversationRegistry.set(conversation.id, {
+    external_locator: conversation.external_locator,
+    tab_id: loaded.id,
+    window_id: loaded.windowId,
+    last_verified_at: Date.now(),
+  });
+  persistConversationRegistry();
+  return loaded;
+}
+
+async function routeTab(msg) {
+  return msg.conversation ? resolveConversationTab(msg.conversation) : findChatTab();
+}
+
 /** Envoie au content script, en l'injectant si l'onglet a été chargé avant l'extension. */
 async function sendToTab(tabId, msg) {
   try {
@@ -171,14 +273,29 @@ async function handlePrompt(msg) {
   const known = requestStates.get(msg.id);
   if (known) {
     send({ type: "ack", id: msg.id, state: known, duplicate: true });
-    if (known === "completed") send({ type: "done", id: msg.id, replayed: true });
+    if (known === "completed") {
+      send({
+        type: "done",
+        id: msg.id,
+        replayed: true,
+        conversation: requestConversationResults.get(msg.id) || null,
+      });
+    }
     return;
   }
   // Réserver synchroniquement avant tout await ferme la course de deux paquets.
   requestStates.set(msg.id, "received");
   persistRequestStates();
   send({ type: "ack", id: msg.id, state: "received", duplicate: false });
-  const tab = await findChatTab();
+  let tab;
+  try {
+    tab = await routeTab(msg);
+  } catch (err) {
+    requestStates.set(msg.id, "failed");
+    persistRequestStates();
+    send({ type: "error", id: msg.id, code: "conversation_unavailable", message: err.message });
+    return;
+  }
   if (!tab) {
     requestStates.set(msg.id, "failed");
     persistRequestStates();
@@ -186,12 +303,14 @@ async function handlePrompt(msg) {
     return;
   }
   inflight.set(msg.id, tab.id);
+  busyTabs.add(tab.id);
   requestStates.set(msg.id, "running");
   persistRequestStates();
   try {
     await sendToTab(tab.id, msg);
   } catch (err) {
     inflight.delete(msg.id);
+    busyTabs.delete(tab.id);
     requestStates.set(msg.id, "failed");
     persistRequestStates();
     send({ type: "error", id: msg.id, message: `Onglet injoignable : ${err.message}` });
@@ -205,7 +324,13 @@ async function handlePrompt(msg) {
  * pouvoir dire au client *pourquoi* un contrôle n'a pas pris.
  */
 async function handleUiRequest(msg) {
-  const tab = await findChatTab();
+  let tab;
+  try {
+    tab = await routeTab(msg);
+  } catch (err) {
+    send({ type: msg.type, id: msg.id, ok: false, state: null, error: err.message });
+    return;
+  }
   if (!tab) {
     send({ type: msg.type, id: msg.id, ok: false, state: null, error: "Aucun onglet chatgpt.com ouvert" });
     return;
@@ -237,8 +362,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const sequence = (eventCounters.get(msg.id) || 0) + 1;
     eventCounters.set(msg.id, sequence);
     if (["done", "error"].includes(msg.type)) {
+      const tabId = inflight.get(msg.id);
       inflight.delete(msg.id);
+      if (tabId !== undefined) busyTabs.delete(tabId);
       requestStates.set(msg.id, msg.type === "done" ? "completed" : "failed");
+      if (msg.type === "done" && msg.conversation?.id) {
+        requestConversationResults.set(msg.id, msg.conversation);
+        conversationRegistry.set(msg.conversation.id, {
+          external_locator: msg.conversation.external_locator,
+          tab_id: sender.tab?.id || null,
+          window_id: sender.tab?.windowId || null,
+          last_verified_at: Date.now(),
+        });
+        persistConversationRegistry();
+      }
       persistRequestStates();
     }
     send({ ...msg, event_id: `${msg.id}:${sequence}` });

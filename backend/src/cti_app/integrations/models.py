@@ -19,6 +19,7 @@ from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
+    ConversationResult,
     ModelAdapter,
     ModelGatewayError,
     SafeModelRequest,
@@ -244,6 +245,10 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         "bridge_payload_conflict",
         "bridge_protocol_error",
         "bridge_server_error",
+        "conversation_busy",
+        "conversation_locator_invalid",
+        "conversation_unavailable",
+        "conversation_profile_mismatch",
     }:
         code = server_code
     elif status in {401, 403}:
@@ -259,7 +264,15 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
     else:
         code = "bridge_protocol_error"
     retryable = status in {408, 429, 502, 503, 504} or status >= 500
-    if code in {"bridge_auth_failed", "bridge_payload_conflict", "bridge_protocol_error"}:
+    if code in {
+        "bridge_auth_failed",
+        "bridge_payload_conflict",
+        "bridge_protocol_error",
+        "conversation_busy",
+        "conversation_locator_invalid",
+        "conversation_unavailable",
+        "conversation_profile_mismatch",
+    }:
         retryable = False
     messages = {
         "bridge_unreachable": "Le bridge ChatGPT est inaccessible.",
@@ -271,6 +284,10 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         "bridge_protocol_error": "Le protocole du bridge est invalide.",
         "bridge_timeout": "Le bridge ChatGPT n'a pas répondu à temps.",
         "bridge_server_error": "Le bridge ChatGPT a rencontré une erreur.",
+        "conversation_busy": "La conversation exécute déjà un tour.",
+        "conversation_locator_invalid": "Le locator de conversation est invalide.",
+        "conversation_unavailable": "La conversation ChatGPT est inaccessible.",
+        "conversation_profile_mismatch": "La conversation appartient à un autre profil.",
     }
     return BridgeTransportError(
         code,
@@ -302,6 +319,13 @@ class ChatGPTBridgeTransport(HttpResponsesTransport):
         }
         if idempotency_key:
             bridge_payload["request_id"] = idempotency_key
+        conversation = payload.get("conversation")
+        if isinstance(conversation, dict):
+            bridge_payload["conversation"] = conversation
+        if isinstance(payload.get("bridge_profile"), str):
+            bridge_payload["profile"] = payload["bridge_profile"]
+        if isinstance(payload.get("bridge_ui_model"), str):
+            bridge_payload["ui_model"] = payload["bridge_ui_model"]
         reasoning = payload.get("reasoning")
         if isinstance(reasoning, dict):
             bridge_payload["reasoning_effort"] = reasoning.get("effort")
@@ -372,6 +396,10 @@ class OpenAIResearchAdapter:
             "input": _responses_input(request),
             "background": request.background,
         }
+        if request.conversation is not None:
+            payload["conversation"] = request.conversation.bridge_payload()
+            payload["bridge_profile"] = request.conversation.expected_profile
+            payload["bridge_ui_model"] = request.conversation.requested_model
         if role is ModelRole.RESEARCH:
             payload["tools"] = [{"type": "web_search"}]
             payload["include"] = ["web_search_call.action.sources"]
@@ -427,6 +455,10 @@ class OpenAIStructuredAdapter:
                 }
             },
         }
+        if request.conversation is not None:
+            payload["conversation"] = request.conversation.bridge_payload()
+            payload["bridge_profile"] = request.conversation.expected_profile
+            payload["bridge_ui_model"] = request.conversation.requested_model
         payload.update(_allowed_parameters(request.parameters, _RESPONSES_PARAMETERS))
         return _responses_result(
             await _create_with_idempotency(self._transport, payload, request.request_id),
@@ -684,6 +716,25 @@ def _responses_result(
         usage=_usage(raw.get("usage")),
         output_text=None if structured is not None else output_text,
         structured_output=structured,
+        conversation=_conversation_result(raw),
+    )
+
+
+def _conversation_result(raw: dict[str, Any]) -> ConversationResult | None:
+    metadata = raw.get("metadata")
+    value = metadata.get("conversation") if isinstance(metadata, dict) else None
+    if not isinstance(value, dict):
+        return None
+    conversation_id = value.get("id")
+    mode = value.get("mode")
+    if not isinstance(conversation_id, str) or mode not in {"fresh", "continue"}:
+        raise ModelGatewayError("Bridge returned invalid conversation metadata")
+    return ConversationResult(
+        id=conversation_id,
+        mode=mode,
+        external_locator=_optional_string(value.get("external_locator")),
+        turn_id=_optional_string(value.get("turn_id")),
+        verified=value.get("verified") is True,
     )
 
 

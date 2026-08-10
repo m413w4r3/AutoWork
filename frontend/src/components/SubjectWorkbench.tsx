@@ -15,8 +15,10 @@ import {
 } from "../api/collection";
 import { JobStatusCard } from "./JobStatusCard";
 import { BriefEditor } from "./BriefEditor";
+import { AnalysisConversations } from "./AnalysisConversations";
 
-type Tab = "sources" | "evidence" | "ioc" | "extraction" | "brief";
+type Tab =
+  "sources" | "evidence" | "ioc" | "extraction" | "brief" | "conversations";
 
 export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
   const queryClient = useQueryClient();
@@ -71,6 +73,7 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
             ["ioc", "IOC"],
             ["extraction", "Extraction"],
             ["brief", "Brève"],
+            ["conversations", "Conversations"],
           ] as const
         ).map(([value, label]) => (
           <button
@@ -105,6 +108,9 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
       ) : null}
       {workbench.data && tab === "brief" ? (
         <BriefEditor subjectId={subjectId} />
+      ) : null}
+      {workbench.data && tab === "conversations" ? (
+        <AnalysisConversations subjectId={subjectId} />
       ) : null}
     </section>
   );

@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 from starlette.requests import Request
 
 
@@ -27,6 +28,12 @@ def test_extension_reserves_request_before_real_send_click() -> None:
     assert "await requestStatesReady" in background
     assert content.index("await claimPrompt(id)") < content.index("sendBtn.click()")
     assert "submittedRequestIds" in content
+    assert "bridgeConversationRegistry" in background
+    assert (
+        "msg.conversation ? resolveConversationTab(msg.conversation) : findChatTab()" in background
+    )
+    assert 'chrome.tabs.create({ url: "https://chatgpt.com/", active: false })' in background
+    assert "candidate.url === conversation.external_locator" in background
 
 
 class FakeExtension:
@@ -37,6 +44,7 @@ class FakeExtension:
         self.sent: list[dict[str, Any]] = []
         self.tasks: set[asyncio.Task[None]] = set()
         self.closed: tuple[int, str] | None = None
+        self.locators: dict[str, str] = {}
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         self.sent.append(payload)
@@ -78,7 +86,36 @@ class FakeExtension:
             self.module["bridge"].dispatch(
                 {"type": "chunk", "id": payload["id"], "text": "ok", "event_id": "1"}
             )
-            self.module["bridge"].dispatch({"type": "done", "id": payload["id"], "event_id": "2"})
+            target = payload.get("conversation")
+            conversation = None
+            if target:
+                if target["mode"] == "fresh":
+                    self.locators[target["id"]] = f"https://chatgpt.com/simulated/{target['id']}"
+                elif self.locators.get(target["id"]) != target.get("external_locator"):
+                    self.module["bridge"].dispatch(
+                        {
+                            "type": "error",
+                            "id": payload["id"],
+                            "event_id": "2",
+                            "message": "conversation simulée introuvable",
+                        }
+                    )
+                    return
+                conversation = {
+                    "id": target["id"],
+                    "external_locator": self.locators[target["id"]],
+                    "turn_id": f"turn-{self.prompt_count}",
+                    "mode": target["mode"],
+                    "verified": True,
+                }
+            self.module["bridge"].dispatch(
+                {
+                    "type": "done",
+                    "id": payload["id"],
+                    "event_id": "2",
+                    "conversation": conversation,
+                }
+            )
 
     async def close(self, code: int, reason: str) -> None:
         self.closed = (code, reason)
@@ -175,6 +212,75 @@ def test_native_bridge_contract_reports_honest_capabilities() -> None:
     assert translated.model == "premium-profile"
     assert translated.tools == [{"type": "web_search"}]
     assert translated.background is True
+
+
+def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation() -> None:
+    module = load_bridge()
+    conversation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    fresh = module["BridgeRunRequest"](
+        input="A1",
+        conversation={"mode": "fresh", "id": conversation_id, "external_locator": None},
+    )
+    continued = module["BridgeRunRequest"](
+        input="A2",
+        conversation={
+            "mode": "continue",
+            "id": conversation_id,
+            "external_locator": "https://chatgpt.com/opaque/conversation-a",
+        },
+    )
+
+    assert module["_response_chat_request"](module["_bridge_response_request"](fresh)).new_chat
+    assert not module["_response_chat_request"](
+        module["_bridge_response_request"](continued)
+    ).new_chat
+    with pytest.raises(ValidationError):
+        module["BridgeRunRequest"](
+            input="attaque SSRF",
+            conversation={
+                "mode": "continue",
+                "id": conversation_id,
+                "external_locator": "https://example.org/internal",
+            },
+        )
+    with pytest.raises(ValidationError):
+        module["BridgeRunRequest"](
+            input="continuation sans cible",
+            conversation={"mode": "continue", "id": conversation_id},
+        )
+
+
+async def test_fake_extension_routes_a_b_a_and_retry_clicks_once(tmp_path: Path) -> None:
+    module = load_bridge()
+    isolated_registry(module, tmp_path)
+    extension = FakeExtension(module)
+    module["bridge"].ws = extension
+    conversation_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    conversation_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+    async def send(key: str, conversation: dict[str, object]) -> dict[str, Any]:
+        return await module["create_bridge_run"](
+            module["BridgeRunRequest"](input=key, conversation=conversation),
+            request_with_key(key),
+        )
+
+    a1 = await send("a1", {"mode": "fresh", "id": conversation_a})
+    b1 = await send("b1", {"mode": "fresh", "id": conversation_b})
+    a2_target = {
+        "mode": "continue",
+        "id": conversation_a,
+        "external_locator": a1["metadata"]["conversation"]["external_locator"],
+    }
+    a2 = await send("a2", a2_target)
+    replay = await send("a2", a2_target)
+
+    assert a2["metadata"]["conversation"]["id"] == conversation_a
+    assert (
+        a2["metadata"]["conversation"]["external_locator"]
+        != b1["metadata"]["conversation"]["external_locator"]
+    )
+    assert replay == a2
+    assert extension.prompt_count == 3
 
 
 def test_requested_model_is_a_label_and_only_ui_model_drives_the_interface() -> None:
@@ -375,9 +481,7 @@ async def test_shutdown_during_run_fails_safe_without_second_prompt(tmp_path: Pa
     module["bridge"].ws = extension
     req = module["BridgeRunRequest"](input="expensive prompt")
 
-    active = asyncio.create_task(
-        module["create_bridge_run"](req, request_with_key("sigterm-run"))
-    )
+    active = asyncio.create_task(module["create_bridge_run"](req, request_with_key("sigterm-run")))
     for _ in range(100):
         if extension.prompt_count:
             break
@@ -533,9 +637,7 @@ def test_compose_and_makefile_bridge_lifecycle_contract() -> None:
         "\n    volumes:", 1
     )[0]
     backend = compose.split("\n  backend:", 1)[1].split("\n  migrate:", 1)[0]
-    backend_depends = backend.split("\n    depends_on:", 1)[1].split(
-        "\n    healthcheck:", 1
-    )[0]
+    backend_depends = backend.split("\n    depends_on:", 1)[1].split("\n    healthcheck:", 1)[0]
     worker = compose.split("\n  worker:", 1)[1].split("\n  job-recovery:", 1)[0]
     postgres = compose.split("\n  postgres:", 1)[1].split("\n  redis:", 1)[0]
     redis = compose.split("\n  redis:", 1)[1].split("\n  minio:", 1)[0]

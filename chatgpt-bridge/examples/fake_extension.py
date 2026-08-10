@@ -11,6 +11,7 @@ se fait déconnecter avec le code 4000 « replaced ».
 import asyncio
 import json
 import os
+import uuid
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websockets
@@ -26,7 +27,10 @@ def authenticated_url() -> str:
     query = dict(parse_qsl(parts.query))
     if WS_TOKEN:
         query["token"] = WS_TOKEN
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+    )
+
 
 # --------------------------------------------------------------------------- #
 # Interface simulée : mêmes messages typés que le content script (ui_state /
@@ -37,9 +41,13 @@ MODELES = [
     {"id": "gpt-5-thinking", "label": "GPT-5 Thinking"},
     {"id": "gpt-4o", "label": "GPT-4o"},
 ]
-PROFILS = [{"id": "personnel", "label": "Personnel"}, {"id": "equipe-cti", "label": "Équipe CTI"}]
+PROFILS = [
+    {"id": "personnel", "label": "Personnel"},
+    {"id": "equipe-cti", "label": "Équipe CTI"},
+]
 
 UI = {"model": "gpt-5", "profile": "personnel", "web_search": False}
+CONVERSATIONS: dict[str, str] = {}
 
 
 def _picker(courant: list, choix: str, probe: bool) -> dict:
@@ -125,7 +133,9 @@ async def main() -> None:
     try:
         ws = await websockets.connect(authenticated_url())
     except OSError as exc:
-        raise SystemExit(f"❌ Serveur injoignable sur {URL} ({exc}). Lance `python server.py`.")
+        raise SystemExit(
+            f"❌ Serveur injoignable sur {URL} ({exc}). Lance `python server.py`."
+        )
 
     async with ws:
         await ws.send(json.dumps({"type": "hello", "client": "simulateur"}))
@@ -137,14 +147,19 @@ async def main() -> None:
                     await ws.send(json.dumps({"type": "pong"}))
                     continue
                 if msg["type"] in ("ui_state", "ui_control"):
-                    applied = applique(msg.get("controls") or {}) if msg["type"] == "ui_control" else None
+                    applied = (
+                        applique(msg.get("controls") or {})
+                        if msg["type"] == "ui_control"
+                        else None
+                    )
                     print(f"{msg['type']} → {applied if applied is not None else UI}")
                     await ws.send(
                         json.dumps(
                             {
                                 "type": msg["type"],
                                 "id": msg["id"],
-                                "ok": applied is None or all(r["ok"] for r in applied.values()),
+                                "ok": applied is None
+                                or all(r["ok"] for r in applied.values()),
                                 "applied": applied,
                                 "state": etat(bool(msg.get("probe"))),
                                 "error": None,
@@ -155,16 +170,60 @@ async def main() -> None:
                 if msg["type"] != "prompt":
                     continue
 
+                target = msg.get("conversation")
+                conversation_result = None
+                if target:
+                    conversation_id = target["id"]
+                    if target["mode"] == "fresh":
+                        locator = f"https://chatgpt.com/simulated/{uuid.uuid4()}"
+                        CONVERSATIONS[conversation_id] = locator
+                    else:
+                        locator = target.get("external_locator")
+                        if CONVERSATIONS.get(conversation_id) != locator:
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "id": msg["id"],
+                                        "code": "conversation_unavailable",
+                                        "message": "conversation simulée introuvable",
+                                    }
+                                )
+                            )
+                            continue
+                    conversation_result = {
+                        "id": conversation_id,
+                        "external_locator": locator,
+                        "turn_id": f"simulated-turn-{uuid.uuid4()}",
+                        "mode": target["mode"],
+                        "verified": True,
+                    }
+
                 files = msg.get("files") or []
-                print(f"prompt reçu : {len(msg['prompt'])} caractère(s), {len(files)} pièce(s) jointe(s)")
+                print(
+                    f"prompt reçu : {len(msg['prompt'])} caractère(s), {len(files)} pièce(s) jointe(s)"
+                )
                 joints = "".join(
-                    f"\n- {f['name']} ({f['mime']}, {len(f['data']) * 3 // 4} octets)" for f in files
+                    f"\n- {f['name']} ({f['mime']}, {len(f['data']) * 3 // 4} octets)"
+                    for f in files
                 )
                 reponse = f"Écho ({len(msg['prompt'])} caractères){joints}\n\n```python\nprint('bloc de code')\n```"
                 for word in reponse.split(" "):
-                    await ws.send(json.dumps({"type": "chunk", "id": msg["id"], "text": word + " "}))
+                    await ws.send(
+                        json.dumps(
+                            {"type": "chunk", "id": msg["id"], "text": word + " "}
+                        )
+                    )
                     await asyncio.sleep(0.03)
-                await ws.send(json.dumps({"type": "done", "id": msg["id"]}))
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "done",
+                            "id": msg["id"],
+                            "conversation": conversation_result,
+                        }
+                    )
+                )
         except websockets.exceptions.ConnectionClosedError as exc:
             if exc.rcvd and exc.rcvd.code == 4000:
                 raise SystemExit(

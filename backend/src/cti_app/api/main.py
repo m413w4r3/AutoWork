@@ -11,6 +11,7 @@ from cti_app.api.editions import router as editions_router
 from cti_app.api.editorial import router as editorial_router
 from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
+from cti_app.api.model_conversations import router as model_conversations_router
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.discovery import DiscoveryService
@@ -29,6 +30,7 @@ from cti_app.application.http_collection import (
 )
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import JobService, create_job_registry
+from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
@@ -122,6 +124,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.edition_service = EditionService(uow_factory)
     app.state.identity_provider = LocalIdentityProvider()
     app.state.model_gateway = model_gateway
+    app.state.model_conversation_service = ModelConversationService(
+        uow_factory,
+        model_gateway,
+        blob_store,
+        retention_days=settings.model_conversation_retention_days,
+    )
     app.state.discovery_service = discovery_service
     app.state.editorial_service = editorial_service
     app.state.collection_service = collection_service
@@ -141,6 +149,7 @@ def create_app() -> FastAPI:
     application.include_router(jobs_router)
     application.include_router(collection_router)
     application.include_router(briefs_router)
+    application.include_router(model_conversations_router)
     return application
 
 

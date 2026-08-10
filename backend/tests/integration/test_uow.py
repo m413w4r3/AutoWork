@@ -15,6 +15,15 @@ from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.errors import BlobStillReferencedError
+from cti_app.domain.model_conversations import (
+    ConversationMode,
+    ConversationPurpose,
+    ConversationStatus,
+    ConversationTransport,
+    ConversationTurnStatus,
+    ModelConversation,
+    ModelConversationTurn,
+)
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelRunStatus
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.models import (
@@ -217,6 +226,111 @@ async def test_model_run_round_trip_never_persists_prompt_content(
         assert persisted.status is ModelRunStatus.WAITING_BACKGROUND
         assert persisted.response_id == "resp_integration"
         assert not hasattr(persisted, "prompt")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_model_conversation_and_turn_round_trip(migrated_postgres_url: str) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    subject = Subject(
+        external_id=f"SUBJ-CONVERSATION-{uuid4().hex}",
+        slug=f"conversation-{uuid4().hex}",
+        tlp=TLP.AMBER,
+    )
+    conversation = ModelConversation(
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.ANALYST_ASSISTANCE,
+        subject_id=subject.id,
+        title="Analyse persistante",
+    )
+    run = ModelRun(
+        provider=ModelProvider.OPENAI,
+        model_role=ModelRole.RESEARCH,
+        requested_model="chatgpt-web",
+        prompt_template_id="analyst-conversation",
+        prompt_template_version="1",
+        authorized_input_hash="a" * 64,
+        evidence_pack_hash="b" * 64,
+        parameters={},
+    )
+    try:
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            await uow.subjects.add(subject)
+            await uow.model_conversations.add(conversation)
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            persisted = await uow.model_conversations.get_for_update(conversation.id)
+            assert persisted is not None
+            persisted.start_turn(mode=ConversationMode.FRESH)
+            turn = ModelConversationTurn(
+                conversation_id=persisted.id,
+                sequence=persisted.turn_count,
+                model_run_id=run.id,
+                input_blob_reference=f"blob://{uuid4()}",
+                input_sha256="c" * 64,
+                idempotency_key=f"turn-{uuid4()}",
+                correlation_id="integration-conversation",
+            )
+            await uow.model_runs.add(run)
+            await uow.model_conversation_turns.add(turn)
+            await uow.model_conversations.save(persisted)
+            await uow.commit()
+
+        competing_run = ModelRun(
+            provider=ModelProvider.OPENAI,
+            model_role=ModelRole.RESEARCH,
+            requested_model="chatgpt-web",
+            prompt_template_id="analyst-conversation",
+            prompt_template_version="1",
+            authorized_input_hash="e" * 64,
+            evidence_pack_hash="b" * 64,
+            parameters={},
+        )
+        competing_turn = ModelConversationTurn(
+            conversation_id=conversation.id,
+            sequence=2,
+            model_run_id=competing_run.id,
+            input_blob_reference=f"blob://{uuid4()}",
+            input_sha256="f" * 64,
+            idempotency_key=f"turn-{uuid4()}",
+            correlation_id="integration-competing-turn",
+        )
+        with pytest.raises(DBAPIError):
+            async with SqlAlchemyUnitOfWork(session_factory) as uow:
+                await uow.model_runs.add(competing_run)
+                await uow.model_conversation_turns.add(competing_turn)
+                await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            persisted = await uow.model_conversations.get_for_update(conversation.id)
+            persisted_turn = await uow.model_conversation_turns.get(turn.id)
+            assert persisted is not None and persisted_turn is not None
+            persisted_turn.succeed(
+                output_blob_reference=f"blob://{uuid4()}",
+                output_sha256="d" * 64,
+                external_turn_id="opaque-turn",
+            )
+            persisted.finish_turn(
+                persisted_turn.id,
+                external_locator="https://chatgpt.com/opaque/conversation",
+            )
+            await uow.model_conversation_turns.save(persisted_turn)
+            await uow.model_conversations.save(persisted)
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            stored = await uow.model_conversations.get(conversation.id)
+            stored_turns = await uow.model_conversation_turns.list_for_conversation(conversation.id)
+        assert stored is not None
+        assert stored.status is ConversationStatus.READY
+        assert stored.turn_count == 1
+        assert stored.head_turn_id == turn.id
+        assert stored_turns[0].status is ConversationTurnStatus.SUCCEEDED
+        assert stored_turns[0].correlation_id == "integration-conversation"
     finally:
         await engine.dispose()
 

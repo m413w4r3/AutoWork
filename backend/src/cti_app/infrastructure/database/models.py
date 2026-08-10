@@ -13,6 +13,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -54,6 +55,14 @@ HUMAN_DECISION_VALUES_SQL = (
     "'brief_changes_requested', 'brief_approve', 'brief_promote'"
 )
 BRIEF_DRAFT_STATUS_VALUES_SQL = "'draft', 'changes_requested', 'approved', 'promoted'"
+CONVERSATION_TRANSPORT_VALUES_SQL = "'chatgpt_bridge', 'openai_responses', 'application_managed'"
+CONVERSATION_PURPOSE_VALUES_SQL = (
+    "'discovery', 'analyst_assistance', 'pivot_research', 'drafting', 'critic'"
+)
+CONVERSATION_STATUS_VALUES_SQL = (
+    "'pending', 'ready', 'busy', 'needs_review', 'unavailable', 'archived'"
+)
+CONVERSATION_TURN_STATUS_VALUES_SQL = "'running', 'succeeded', 'failed', 'needs_review', 'blocked'"
 
 
 class Base(DeclarativeBase):
@@ -335,6 +344,108 @@ class ModelRunRow(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ModelConversationRow(Base):
+    __tablename__ = "model_conversations"
+    __table_args__ = (
+        CheckConstraint(
+            f"provider IN ({MODEL_PROVIDER_VALUES_SQL})", name="ck_model_conversations_provider"
+        ),
+        CheckConstraint(
+            f"transport IN ({CONVERSATION_TRANSPORT_VALUES_SQL})",
+            name="ck_model_conversations_transport",
+        ),
+        CheckConstraint(
+            f"purpose IN ({CONVERSATION_PURPOSE_VALUES_SQL})", name="ck_model_conversations_purpose"
+        ),
+        CheckConstraint(
+            f"status IN ({CONVERSATION_STATUS_VALUES_SQL})", name="ck_model_conversations_status"
+        ),
+        CheckConstraint("turn_count >= 0 AND version >= 1", name="ck_model_conversations_counters"),
+        Index("ix_model_conversations_subject", "subject_id", "updated_at"),
+        Index("ix_model_conversations_edition", "edition_id", "updated_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    transport: Mapped[str] = mapped_column(String(32), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
+    edition_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT")
+    )
+    subject_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT")
+    )
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_id: Mapped[str | None] = mapped_column(String(255))
+    external_locator: Mapped[str | None] = mapped_column(Text)
+    expected_profile: Mapped[str | None] = mapped_column(String(255))
+    requested_model: Mapped[str | None] = mapped_column(String(255))
+    head_turn_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "model_conversation_turns.id",
+            name="fk_model_conversations_head_turn",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+    )
+    turn_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class ModelConversationTurnRow(Base):
+    __tablename__ = "model_conversation_turns"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "sequence", name="uq_model_conversation_turn_sequence"),
+        UniqueConstraint("model_run_id", name="uq_model_conversation_turn_model_run"),
+        UniqueConstraint("idempotency_key", name="uq_model_conversation_turn_idempotency"),
+        CheckConstraint(
+            f"status IN ({CONVERSATION_TURN_STATUS_VALUES_SQL})",
+            name="ck_model_conversation_turns_status",
+        ),
+        CheckConstraint("sequence >= 1", name="ck_model_conversation_turns_sequence"),
+        Index("ix_model_conversation_turns_conversation", "conversation_id", "sequence"),
+        Index(
+            "uq_model_conversation_turn_running",
+            "conversation_id",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("model_conversations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    parent_turn_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("model_conversation_turns.id", ondelete="RESTRICT")
+    )
+    model_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("model_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    input_blob_reference: Mapped[str] = mapped_column(Text, nullable=False)
+    input_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    output_blob_reference: Mapped[str | None] = mapped_column(Text)
+    output_sha256: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_turn_id: Mapped[str | None] = mapped_column(String(255))
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    error_details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DiscoveryBatchRow(Base):

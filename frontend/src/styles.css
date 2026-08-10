@@ -124,7 +124,8 @@ label {
 }
 
 input,
-select {
+select,
+textarea {
   min-height: 2.7rem;
   padding: 0.55rem 0.7rem;
   border: 1px solid #bdcbc2;
@@ -132,6 +133,70 @@ select {
   color: #17211d;
   background: #fff;
   font: inherit;
+}
+
+.conversation-panel,
+.conversation-detail {
+  display: grid;
+  gap: 1rem;
+}
+
+.conversation-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  padding: 1rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.75rem;
+  background: #fff;
+}
+
+.conversation-layout {
+  display: grid;
+  grid-template-columns: minmax(14rem, 1fr) minmax(0, 2fr);
+  gap: 1rem;
+}
+
+.conversation-list,
+.conversation-timeline {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.conversation-list__item {
+  display: grid;
+  gap: 0.3rem;
+  padding: 0.85rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.65rem;
+  text-align: left;
+  background: #fff;
+}
+
+.conversation-list__item[aria-pressed="true"] {
+  border-color: #1f6042;
+  box-shadow: 0 0 0 2px rgb(31 96 66 / 15%);
+}
+
+.conversation-timeline {
+  padding-left: 1.5rem;
+}
+
+.conversation-timeline li {
+  padding: 0.8rem;
+  border-left: 3px solid #8da99a;
+  background: #fff;
+}
+
+.conversation-compose textarea {
+  width: 100%;
+  min-height: 8rem;
+}
+
+.conversation-policy-check {
+  display: flex;
+  align-items: center;
+  grid-template-columns: auto 1fr;
 }
 
 input:focus,

@@ -20,7 +20,13 @@ from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import EditorialGroup, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics
-from cti_app.domain.model_runs import ModelRun
+from cti_app.domain.model_conversations import (
+    ConversationPurpose,
+    ConversationStatus,
+    ModelConversation,
+    ModelConversationTurn,
+)
+from cti_app.domain.model_runs import ModelProvider, ModelRun
 
 
 class BlobRepository(Protocol):
@@ -124,6 +130,40 @@ class ModelRunRepository(Protocol):
     async def get_for_update(self, run_id: UUID) -> ModelRun | None: ...
 
     async def save(self, run: ModelRun) -> None: ...
+
+
+class ModelConversationRepository(Protocol):
+    async def add(self, conversation: ModelConversation) -> None: ...
+
+    async def get(self, conversation_id: UUID) -> ModelConversation | None: ...
+
+    async def get_for_update(self, conversation_id: UUID) -> ModelConversation | None: ...
+
+    async def save(self, conversation: ModelConversation) -> None: ...
+
+    async def list(
+        self,
+        *,
+        edition_id: UUID | None,
+        subject_id: UUID | None,
+        purpose: ConversationPurpose | None,
+        status: ConversationStatus | None,
+        provider: ModelProvider | None,
+    ) -> Sequence[ModelConversation]: ...
+
+
+class ModelConversationTurnRepository(Protocol):
+    async def add(self, turn: ModelConversationTurn) -> None: ...
+
+    async def get(self, turn_id: UUID) -> ModelConversationTurn | None: ...
+
+    async def get_by_idempotency_key(self, key: str) -> ModelConversationTurn | None: ...
+
+    async def list_for_conversation(
+        self, conversation_id: UUID
+    ) -> Sequence[ModelConversationTurn]: ...
+
+    async def save(self, turn: ModelConversationTurn) -> None: ...
 
 
 class DiscoveryBatchRepository(Protocol):
@@ -251,6 +291,8 @@ class UnitOfWork(Protocol):
     editions: EditionRepository
     edition_audit: EditionAuditRepository
     model_runs: ModelRunRepository
+    model_conversations: ModelConversationRepository
+    model_conversation_turns: ModelConversationTurnRepository
     discovery_batches: DiscoveryBatchRepository
     editorial_groups: EditorialGroupRepository
     human_decisions: HumanDecisionRepository

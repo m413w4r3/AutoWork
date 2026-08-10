@@ -23,12 +23,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import RLock
 from typing import Any, AsyncIterator, Dict, List, Optional
-from urllib.parse import unquote_to_bytes
+from urllib.parse import unquote_to_bytes, urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 HOST = os.getenv("BRIDGE_HOST", "127.0.0.1")
 PORT = int(os.getenv("BRIDGE_PORT", "8001"))
@@ -76,6 +76,36 @@ class FileAttachment(BaseModel):
     data: str = Field(description="Contenu du fichier encodé en base64")
 
 
+class BridgeConversationTarget(BaseModel):
+    """Cible applicative explicite ; le locator reste opaque après validation d'origine."""
+
+    mode: str
+    id: uuid.UUID
+    external_locator: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_target(self):
+        if self.mode not in {"fresh", "continue"}:
+            raise ValueError("conversation.mode doit valoir fresh ou continue")
+        if self.mode == "fresh" and self.external_locator is not None:
+            raise ValueError("fresh interdit un locator préexistant")
+        if self.mode == "continue" and not self.external_locator:
+            raise ValueError("continue exige external_locator")
+        if self.external_locator:
+            parsed = urlsplit(self.external_locator)
+            if (
+                parsed.scheme != "https"
+                or parsed.hostname not in {"chatgpt.com", "chat.openai.com"}
+                or parsed.username
+                or parsed.password
+                or parsed.port not in {None, 443}
+                or parsed.fragment
+                or parsed.path in {"", "/"}
+            ):
+                raise ValueError("locator hors des origines ChatGPT autorisées")
+        return self
+
+
 class ChatRequest(BaseModel):
     model: str = "chatgpt-web"
     messages: List[ChatMessage]
@@ -103,6 +133,7 @@ class ResponseRequest(BaseModel):
     text: Optional[dict] = None
     background: bool = False
     stream: bool = False
+    conversation: Optional[BridgeConversationTarget] = None
 
     model_config = {"extra": "allow"}
 
@@ -133,6 +164,7 @@ class BridgeRunRequest(BaseModel):
     # Identité stable fournie par l'application. L'en-tête HTTP équivalent est
     # prioritaire, mais les deux doivent concorder lorsqu'ils sont présents.
     request_id: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    conversation: Optional[BridgeConversationTarget] = None
 
 
 class RunControls(BaseModel):
@@ -221,6 +253,7 @@ def _bridge_response_request(req: BridgeRunRequest) -> ResponseRequest:
         tools=[{"type": "web_search"}] if req.web_search else [],
         text={"format": req.response_format} if req.response_format else None,
         background=req.background,
+        conversation=req.conversation,
     )
 
 
@@ -786,10 +819,20 @@ def sse_chunk(cid: str, model: str, created: int, delta: dict, finish: Optional[
 
 
 class UpstreamError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str = "bridge_server_error", retryable: bool = True):
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
 
 
-async def run_generation(request_id: str, req: ChatRequest, http_req: Request) -> AsyncIterator[str]:
+async def run_generation(
+    request_id: str,
+    req: ChatRequest,
+    http_req: Request,
+    *,
+    conversation: Optional[BridgeConversationTarget] = None,
+    conversation_result: Optional[dict] = None,
+) -> AsyncIterator[str]:
     """Envoie le prompt à l'extension et cède les morceaux de texte au fil de l'eau."""
     prompt, medias = parse_messages(req.messages)
     # Médias extraits des blocs OpenAI + pièces jointes du champ maison `files`.
@@ -808,6 +851,7 @@ async def run_generation(request_id: str, req: ChatRequest, http_req: Request) -
                 "prompt": prompt,
                 "new_chat": req.new_chat,
                 "files": [f.model_dump() for f in attachments],
+                "conversation": conversation.model_dump(mode="json") if conversation else None,
             }
         )
         generation_announced = False
@@ -831,10 +875,48 @@ async def run_generation(request_id: str, req: ChatRequest, http_req: Request) -
                 if text:
                     yield text
             elif kind == "done":
+                reported = packet.get("conversation")
+                if conversation is not None:
+                    if (
+                        not isinstance(reported, dict)
+                        or reported.get("id") != str(conversation.id)
+                        or reported.get("mode") != conversation.mode
+                        or not isinstance(reported.get("turn_id"), str)
+                        or not reported["turn_id"]
+                    ):
+                        raise UpstreamError("métadonnées de conversation absentes ou incohérentes")
+                    if reported.get("verified") is not True:
+                        raise UpstreamError("conversation non vérifiée par l'extension")
+                    try:
+                        BridgeConversationTarget(
+                            mode="continue",
+                            id=conversation.id,
+                            external_locator=reported.get("external_locator"),
+                        )
+                    except ValueError as exc:
+                        raise UpstreamError("locator retourné par l'extension invalide") from exc
+                    if (
+                        conversation.mode == "continue"
+                        and reported.get("external_locator") != conversation.external_locator
+                    ):
+                        raise UpstreamError("l'extension a changé de conversation cible")
+                    if conversation_result is not None:
+                        conversation_result.update(reported)
                 logger.info("bridge_run_phase bridge_run_id=%s phase=response_retrieval", request_id)
                 return
             elif kind == "error":
-                raise UpstreamError(packet.get("message", "erreur côté extension"))
+                code = str(packet.get("code", "bridge_server_error"))
+                if code not in {
+                    "conversation_unavailable",
+                    "conversation_profile_mismatch",
+                    "conversation_locator_invalid",
+                }:
+                    code = "bridge_server_error"
+                raise UpstreamError(
+                    packet.get("message", "erreur côté extension"),
+                    code=code,
+                    retryable=code == "bridge_server_error",
+                )
     finally:
         bridge.close_channel(request_id)
         if bridge.online:
@@ -894,9 +976,19 @@ def _ui_state_of(packet: dict) -> Optional[UiState]:
     return UiState.model_validate(state) if isinstance(state, dict) else None
 
 
-async def fetch_ui_state(probe: bool = False) -> UiState:
+async def fetch_ui_state(
+    probe: bool = False, conversation: Optional[BridgeConversationTarget] = None
+) -> UiState:
     """Lit l'état de l'UI. `probe` ouvre les menus pour énumérer les choix."""
-    state = _ui_state_of(await _ui_roundtrip({"type": "ui_state", "probe": probe}))
+    state = _ui_state_of(
+        await _ui_roundtrip(
+            {
+                "type": "ui_state",
+                "probe": probe,
+                "conversation": conversation.model_dump(mode="json") if conversation else None,
+            }
+        )
+    )
     if state is None:
         raise UiUnavailable("l'extension n'a renvoyé aucun état")
     bridge.last_ui_state = state
@@ -920,11 +1012,19 @@ async def probed_ui_state(fresh: bool = False) -> UiState:
     return state
 
 
-async def apply_controls(controls: RunControls) -> tuple[Outcomes, Optional[UiState]]:
+async def apply_controls(
+    controls: RunControls, conversation: Optional[BridgeConversationTarget] = None
+) -> tuple[Outcomes, Optional[UiState]]:
     wanted = controls.wanted()
     if not wanted:
-        return {}, await fetch_ui_state()
-    packet = await _ui_roundtrip({"type": "ui_control", "controls": wanted})
+        return {}, await fetch_ui_state(conversation=conversation)
+    packet = await _ui_roundtrip(
+        {
+            "type": "ui_control",
+            "controls": wanted,
+            "conversation": conversation.model_dump(mode="json") if conversation else None,
+        }
+    )
     outcomes = {
         name: ControlOutcome.model_validate(value)
         for name, value in (packet.get("applied") or {}).items()
@@ -945,14 +1045,23 @@ def _web_search_mode(controls: RunControls, outcomes: Outcomes) -> str:
     return "untouched"
 
 
-async def prepare_run(controls: RunControls, *, allow_unverified_model: bool) -> RunReport:
+async def prepare_run(
+    controls: RunControls,
+    *,
+    allow_unverified_model: bool,
+    conversation: Optional[BridgeConversationTarget] = None,
+) -> RunReport:
     """Applique les contrôles avant la génération, à l'intérieur du slot.
 
     Un contrôle explicitement demandé et non vérifié fait échouer le run : dans
     une chaîne CTI, un run attribué au mauvais modèle est pire qu'un run manquant.
     """
     try:
-        outcomes, state = await apply_controls(controls)
+        outcomes, state = (
+            await apply_controls(controls, conversation)
+            if conversation is not None
+            else await apply_controls(controls)
+        )
     except UiUnavailable as exc:
         # Modèle et profil sont des exigences : sans pilotage de l'UI, le run
         # n'a pas lieu. La recherche web, elle, a un repli par le prompt, et
@@ -1018,7 +1127,12 @@ def _response_chat_request(req: ResponseRequest, *, web_search_native: bool = Fa
             + json.dumps(schema, ensure_ascii=False, sort_keys=True)
         )
     messages.insert(0, ChatMessage(role="system", content="\n".join(instructions)))
-    return ChatRequest(model=req.model, messages=messages, stream=False, new_chat=True)
+    return ChatRequest(
+        model=req.model,
+        messages=messages,
+        stream=False,
+        new_chat=req.conversation is None or req.conversation.mode == "fresh",
+    )
 
 
 def _response_messages(value: Any) -> List[ChatMessage]:
@@ -1062,6 +1176,7 @@ def _response_body(
     output_text: Optional[str] = None,
     error: Optional[str] = None,
     run: Optional[RunReport] = None,
+    conversation_result: Optional[dict] = None,
 ) -> dict:
     output = []
     if output_text is not None:
@@ -1104,6 +1219,7 @@ def _response_body(
             "model_source": report.model_source,
             "web_search_mode": report.web_search_mode,
             "controls": {name: o.model_dump() for name, o in report.controls.items()},
+            "conversation": conversation_result,
         },
     }
 
@@ -1116,18 +1232,32 @@ async def _execute_background_response(
     )
     try:
         async with bridge.slot:
-            report = await prepare_run(controls, allow_unverified_model=allow_unverified_model)
+            report = await prepare_run(
+                controls,
+                allow_unverified_model=allow_unverified_model,
+                conversation=req.conversation,
+            )
             chat_request = _response_chat_request(
                 req, web_search_native=report.web_search_mode == "ui_tool"
             )
+            conversation_result: dict = {}
             parts = [
                 text
                 async for text in run_generation(
-                    response_id, chat_request, _BackgroundRequest()
+                    response_id,
+                    chat_request,
+                    _BackgroundRequest(),
+                    conversation=req.conversation,
+                    conversation_result=conversation_result,
                 )
             ]
         background_responses[response_id] = _response_body(
-            response_id, req, status="completed", output_text="".join(parts), run=report
+            response_id,
+            req,
+            status="completed",
+            output_text="".join(parts),
+            run=report,
+            conversation_result=conversation_result or None,
         )
     except HTTPException as exc:
         # Un contrôle d'interface refusé est un diagnostic actionnable, pas une
@@ -1189,16 +1319,38 @@ async def _create_response(
             response_id,
             int((time.monotonic() - queued_at) * 1000),
         )
-        report = await prepare_run(controls, allow_unverified_model=allow_unverified_model)
+        report = await prepare_run(
+            controls,
+            allow_unverified_model=allow_unverified_model,
+            conversation=req.conversation,
+        )
         chat_request = _response_chat_request(
             req, web_search_native=report.web_search_mode == "ui_tool"
         )
         try:
-            parts = [text async for text in run_generation(response_id, chat_request, http_req)]
+            conversation_result: dict = {}
+            parts = [
+                text
+                async for text in run_generation(
+                    response_id,
+                    chat_request,
+                    http_req,
+                    conversation=req.conversation,
+                    conversation_result=conversation_result,
+                )
+            ]
         except UpstreamError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=502,
+                detail={"code": exc.code, "message": str(exc), "retryable": exc.retryable},
+            ) from exc
     return _response_body(
-        response_id, req, status="completed", output_text="".join(parts), run=report
+        response_id,
+        req,
+        status="completed",
+        output_text="".join(parts),
+        run=report,
+        conversation_result=conversation_result or None,
     )
 
 

@@ -71,4 +71,6 @@ L'état de production est canonique dans PostgreSQL, les fichiers versionnés et
 
 La stratégie et les invariants de l'incrément sont détaillés dans
 [docs/source_collection_and_evidence.md](docs/source_collection_and_evidence.md) et
-[docs/brief_workflow.md](docs/brief_workflow.md).
+[docs/brief_workflow.md](docs/brief_workflow.md). Les conversations persistantes,
+leur politique `fresh`/`continue` et leurs limites sont documentées dans
+[docs/model_conversations.md](docs/model_conversations.md).

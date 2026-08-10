@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "10";
+const VERSION = "11";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -928,7 +928,22 @@ async function streamAnswer(job, locator, before) {
   if (!job.aborted) emitDelta(job.id, sent, full);
 }
 
-async function handlePrompt({ id, prompt, new_chat: newChat, files }) {
+function verifiedLocator() {
+  const url = new URL(window.location.href);
+  if (
+    url.protocol !== "https:" ||
+    !["chatgpt.com", "chat.openai.com"].includes(url.hostname) ||
+    url.username ||
+    url.password ||
+    url.hash ||
+    url.pathname === "/"
+  ) {
+    return null;
+  }
+  return url.toString();
+}
+
+async function handlePrompt({ id, prompt, new_chat: newChat, files, conversation }) {
   if (!(await claimPrompt(id))) {
     reply({ type: "ack", id, state: "duplicate", duplicate: true });
     return;
@@ -938,6 +953,9 @@ async function handlePrompt({ id, prompt, new_chat: newChat, files }) {
   currentJob = job;
 
   try {
+    if (conversation?.mode === "continue" && window.location.href !== conversation.external_locator) {
+      throw new Error("la page ne correspond pas au locator demandé");
+    }
     if (newChat) {
       const link = $(SELECTORS.newChat);
       if (link) {
@@ -966,6 +984,10 @@ async function handlePrompt({ id, prompt, new_chat: newChat, files }) {
     );
     sendBtn.click();
 
+    const externalLocator = conversation
+      ? await waitFor(() => verifiedLocator(), 15000, "locator de conversation non attribué")
+      : null;
+
     // Attendre la bulle de réponse *nouvelle* (pas la précédente).
     const premier = await waitFor(
       () => {
@@ -977,7 +999,24 @@ async function handlePrompt({ id, prompt, new_chat: newChat, files }) {
     );
     await streamAnswer(job, turnLocator(premier), before);
 
-    if (!job.aborted) reply({ type: "done", id });
+    if (!job.aborted) {
+      const container = closestOf(premier, SELECTORS.turnContainer);
+      const externalTurnId =
+        container?.getAttribute("data-testid") || premier.getAttribute("data-message-id") || null;
+      reply({
+        type: "done",
+        id,
+        conversation: conversation
+          ? {
+              id: conversation.id,
+              external_locator: externalLocator,
+              turn_id: externalTurnId || `bridge-${id}`,
+              mode: conversation.mode,
+              verified: true,
+            }
+          : null,
+      });
+    }
   } catch (err) {
     if (!job.aborted) reply({ type: "error", id, message: err.message });
   } finally {
