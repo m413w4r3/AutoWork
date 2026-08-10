@@ -1,6 +1,45 @@
 name: cti-bulletin
 
 services:
+  chatgpt-bridge:
+    build:
+      context: .
+      dockerfile: infra/chatgpt-bridge.Dockerfile
+    environment:
+      BRIDGE_HOST: 0.0.0.0
+      BRIDGE_PORT: 8001
+      BRIDGE_API_KEY: ${OPENAI_BRIDGE_API_KEY:-}
+      BRIDGE_WS_TOKEN: ${BRIDGE_WS_TOKEN:-}
+      BRIDGE_RUN_DB: /data/bridge-runs.sqlite3
+      BRIDGE_TOTAL_TIMEOUT: ${MODEL_REQUEST_TIMEOUT_SECONDS:-900}
+      BRIDGE_UI_TIMEOUT: ${BRIDGE_UI_TIMEOUT_SECONDS:-30}
+    ports:
+      - "127.0.0.1:${BRIDGE_PORT:-8001}:8001"
+    volumes:
+      - bridge_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+    restart: unless-stopped
+
+  bridge-smoke:
+    profiles: ["bridge-test"]
+    build:
+      context: .
+      dockerfile: infra/chatgpt-bridge.Dockerfile
+    command: ["python", "examples/compose_smoke.py"]
+    environment:
+      BRIDGE_HTTP: http://chatgpt-bridge:8001/v1
+      BRIDGE_WS: ws://chatgpt-bridge:8001/ws
+      BRIDGE_API_KEY: ${OPENAI_BRIDGE_API_KEY:-}
+      BRIDGE_WS_TOKEN: ${BRIDGE_WS_TOKEN:-}
+    depends_on:
+      chatgpt-bridge:
+        condition: service_healthy
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -83,8 +122,11 @@ services:
       JOB_RETRY_MAX_SECONDS: ${JOB_RETRY_MAX_SECONDS:-300}
       JOB_HEARTBEAT_TIMEOUT_SECONDS: ${JOB_HEARTBEAT_TIMEOUT_SECONDS:-120}
       JOB_RECOVERY_INTERVAL_SECONDS: ${JOB_RECOVERY_INTERVAL_SECONDS:-30}
-      OPENAI_BRIDGE_BASE_URL: ${OPENAI_BRIDGE_BASE_URL:-http://host.docker.internal:8001/v1}
+      OPENAI_BRIDGE_BASE_URL: ${OPENAI_BRIDGE_BASE_URL:-http://chatgpt-bridge:8001/v1}
       OPENAI_BRIDGE_API_KEY: ${OPENAI_BRIDGE_API_KEY:-}
+      OPENAI_BRIDGE_CONNECT_TIMEOUT_SECONDS: ${OPENAI_BRIDGE_CONNECT_TIMEOUT_SECONDS:-3}
+      OPENAI_BRIDGE_CAPABILITIES_TIMEOUT_SECONDS: ${OPENAI_BRIDGE_CAPABILITIES_TIMEOUT_SECONDS:-2}
+      OPENAI_BRIDGE_MAX_ATTEMPTS: ${OPENAI_BRIDGE_MAX_ATTEMPTS:-3}
       OPENAI_RESEARCH_MODEL: ${OPENAI_RESEARCH_MODEL:-chatgpt-web}
       OPENAI_STRUCTURED_MODEL: ${OPENAI_STRUCTURED_MODEL:-chatgpt-web}
       OPENAI_DRAFTING_MODEL: ${OPENAI_DRAFTING_MODEL:-chatgpt-web}
@@ -235,4 +277,5 @@ volumes:
   postgres_data:
   redis_data:
   minio_data:
+  bridge_data:
   subject_workspaces:

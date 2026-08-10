@@ -6,7 +6,7 @@
  * il survit aux navigations SPA, et il n'est pas soumis à la CSP de la page.
  */
 
-const DEFAULT_URL = "ws://127.0.0.1:8000/ws";
+const DEFAULT_URL = "ws://127.0.0.1:8001/ws";
 const RECONNECT_MIN = 1000;
 const RECONNECT_MAX = 30000;
 
@@ -19,10 +19,29 @@ let suppressUntil = 0;
 let status = { connected: false, lastError: null, url: DEFAULT_URL };
 /** id de requête -> id de l'onglet qui la traite */
 const inflight = new Map();
+/** Deuxième barrière persistante : un id reçu n'est jamais retransmis deux fois au DOM. */
+const requestStates = new Map();
+const eventCounters = new Map();
+
+const requestStatesReady = chrome.storage.local.get("bridgeRequestStates").then(({ bridgeRequestStates }) => {
+  for (const [id, state] of Object.entries(bridgeRequestStates || {})) requestStates.set(id, state);
+});
+
+function persistRequestStates() {
+  const entries = [...requestStates.entries()].slice(-1000);
+  chrome.storage.local.set({ bridgeRequestStates: Object.fromEntries(entries) });
+}
 
 async function serverUrl() {
   const { serverUrl } = await chrome.storage.local.get("serverUrl");
   return serverUrl || DEFAULT_URL;
+}
+
+async function authenticatedServerUrl() {
+  const [url, stored] = await Promise.all([serverUrl(), chrome.storage.local.get("wsToken")]);
+  const parsed = new URL(url);
+  if (stored.wsToken) parsed.searchParams.set("token", stored.wsToken);
+  return parsed.toString();
 }
 
 function setStatus(patch) {
@@ -38,8 +57,9 @@ async function connect() {
   // en boucle (sinon les deux se volent la connexion indéfiniment).
   if (Date.now() < suppressUntil) return;
   clearTimeout(reconnectTimer);
-  const url = await serverUrl();
-  setStatus({ url });
+  const displayUrl = await serverUrl();
+  const url = await authenticatedServerUrl();
+  setStatus({ url: displayUrl });
 
   try {
     socket = new WebSocket(url);
@@ -53,7 +73,7 @@ async function connect() {
     setStatus({ connected: true, lastError: null });
     send({ type: "hello", client: "extension-chrome" });
     flush(); // rejoue ce qui a été produit pendant la coupure
-    console.log("🤖 Connecté au Mini-Bridge", url, enAttente.length ? "(file non vidée)" : "");
+    console.log("🤖 Connecté au Mini-Bridge", displayUrl, enAttente.length ? "(file non vidée)" : "");
   };
 
   socket.onmessage = (event) => {
@@ -147,16 +167,33 @@ async function sendToTab(tabId, msg) {
 }
 
 async function handlePrompt(msg) {
+  await requestStatesReady;
+  const known = requestStates.get(msg.id);
+  if (known) {
+    send({ type: "ack", id: msg.id, state: known, duplicate: true });
+    if (known === "completed") send({ type: "done", id: msg.id, replayed: true });
+    return;
+  }
+  // Réserver synchroniquement avant tout await ferme la course de deux paquets.
+  requestStates.set(msg.id, "received");
+  persistRequestStates();
+  send({ type: "ack", id: msg.id, state: "received", duplicate: false });
   const tab = await findChatTab();
   if (!tab) {
+    requestStates.set(msg.id, "failed");
+    persistRequestStates();
     send({ type: "error", id: msg.id, message: "Aucun onglet chatgpt.com ouvert" });
     return;
   }
   inflight.set(msg.id, tab.id);
+  requestStates.set(msg.id, "running");
+  persistRequestStates();
   try {
     await sendToTab(tab.id, msg);
   } catch (err) {
     inflight.delete(msg.id);
+    requestStates.set(msg.id, "failed");
+    persistRequestStates();
     send({ type: "error", id: msg.id, message: `Onglet injoignable : ${err.message}` });
   }
 }
@@ -196,9 +233,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
-  if (["chunk", "done", "error"].includes(msg?.type)) {
-    if (msg.type !== "chunk") inflight.delete(msg.id);
-    send(msg);
+  if (["ack", "chunk", "done", "error"].includes(msg?.type)) {
+    const sequence = (eventCounters.get(msg.id) || 0) + 1;
+    eventCounters.set(msg.id, sequence);
+    if (["done", "error"].includes(msg.type)) {
+      inflight.delete(msg.id);
+      requestStates.set(msg.id, msg.type === "done" ? "completed" : "failed");
+      persistRequestStates();
+    }
+    send({ ...msg, event_id: `${msg.id}:${sequence}` });
   }
   sendResponse({ ok: true });
   return true;

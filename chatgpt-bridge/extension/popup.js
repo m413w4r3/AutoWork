@@ -2,6 +2,7 @@ const dot = document.getElementById("dot");
 const state = document.getElementById("state");
 const detail = document.getElementById("detail");
 const url = document.getElementById("url");
+const token = document.getElementById("token");
 const ui = document.getElementById("ui");
 
 /**
@@ -46,13 +47,14 @@ async function refresh() {
 }
 
 document.getElementById("save").addEventListener("click", async () => {
-  await chrome.storage.local.set({ serverUrl: url.value.trim() });
+  await chrome.storage.local.set({ serverUrl: url.value.trim(), wsToken: token.value });
   await chrome.runtime.sendMessage({ type: "reconnect" });
   setTimeout(refresh, 600);
 });
 
-chrome.storage.local.get("serverUrl").then(({ serverUrl }) => {
-  url.value = serverUrl || "ws://127.0.0.1:8000/ws";
+chrome.storage.local.get(["serverUrl", "wsToken"]).then(({ serverUrl, wsToken }) => {
+  url.value = serverUrl || "ws://127.0.0.1:8001/ws";
+  token.value = wsToken || "";
 });
 refresh();
 setInterval(refresh, 1500);

@@ -100,6 +100,24 @@ const SETTLE_UNKNOWN_MS = 6000; // stabilité exigée quand aucun signal n'est r
 const NO_MARKDOWN_FALLBACK_MS = 25000; // au-delà, on lit le tour entier faute de mieux
 
 let currentJob = null;
+const claimedRequestIds = new Set();
+let persistedRequestIdsPromise = chrome.storage.local.get("submittedRequestIds").then(
+  ({ submittedRequestIds }) => new Set(submittedRequestIds || []),
+);
+
+async function claimPrompt(id) {
+  if (claimedRequestIds.has(id)) return false;
+  claimedRequestIds.add(id);
+  const persisted = await persistedRequestIdsPromise;
+  if (persisted.has(id)) return false;
+  // Persister avant toute manipulation du DOM : après un arrêt du content
+  // script, la sécurité at-most-once prime sur une resoumission implicite.
+  persisted.add(id);
+  const bounded = [...persisted].slice(-1000);
+  persistedRequestIdsPromise = Promise.resolve(new Set(bounded));
+  await chrome.storage.local.set({ submittedRequestIds: bounded });
+  return true;
+}
 
 // --------------------------------------------------------------------------- //
 // Utilitaires DOM
@@ -911,6 +929,10 @@ async function streamAnswer(job, locator, before) {
 }
 
 async function handlePrompt({ id, prompt, new_chat: newChat, files }) {
+  if (!(await claimPrompt(id))) {
+    reply({ type: "ack", id, state: "duplicate", duplicate: true });
+    return;
+  }
   if (currentJob) currentJob.aborted = true;
   const job = { id, aborted: false };
   currentJob = job;
@@ -921,7 +943,7 @@ async function handlePrompt({ id, prompt, new_chat: newChat, files }) {
       if (link) {
         link.click();
       } else {
-        location.href = "https://chatgpt.com/";
+        throw new Error("bouton nouveau chat introuvable");
       }
       await sleep(1200);
     }

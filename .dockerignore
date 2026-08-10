@@ -10,7 +10,6 @@
 **/dist
 **/coverage
 .playwright-mcp
-chatgpt-bridge
 data
 work
 output
@@ -22,4 +21,3 @@ malware
 evidence-packs
 evidence_packs
 docs/references
-

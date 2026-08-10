@@ -723,9 +723,9 @@ def register_brief_jobs(registry: JobRegistry, service: BriefService) -> None:
             raise JobHandlerError("brief_generation_invalid", str(exc), transient=False) from exc
         except ModelGatewayError as exc:
             raise JobHandlerError(
-                "brief_model_unavailable",
-                "Le modèle de rédaction est temporairement indisponible.",
-                transient=True,
+                str(getattr(exc, "code", "brief_model_unavailable")),
+                str(exc),
+                transient=bool(getattr(exc, "retryable", True)),
             ) from exc
         await context.report_progress(1, 1, "Brève générée")
         return f"brief-draft://{draft.id}"

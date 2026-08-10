@@ -122,6 +122,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             ),
             retry_base_seconds=settings.job_retry_base_seconds,
             retry_max_seconds=settings.job_retry_max_seconds,
+            heartbeat_interval_seconds=min(20.0, settings.job_heartbeat_timeout_seconds / 3),
         )
         job = await executor.execute(job_id)
         if job.status is JobStatus.QUEUED and job.next_retry_at is not None:

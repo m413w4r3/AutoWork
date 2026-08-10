@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import json
+import logging
+import random
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from io import BytesIO
 from typing import Any, Protocol
 
@@ -19,16 +25,31 @@ from cti_app.application.model_gateway import (
     validate_structured_output,
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelUsage
+from cti_app.logging import get_correlation_id
+
+logger = logging.getLogger(__name__)
 
 
 class ResponsesTransport(Protocol):
-    async def create(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+    async def create(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]: ...
 
     async def retrieve(self, response_id: str) -> dict[str, Any]: ...
 
 
 class ChatCompletionsTransport(Protocol):
     async def create(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+
+async def _create_with_idempotency(
+    transport: ResponsesTransport, payload: dict[str, Any], key: str | None
+) -> dict[str, Any]:
+    # Compatibilité avec les doubles historiques ; les transports réels du
+    # bridge exposent toujours le paramètre et portent la garantie réseau.
+    if "idempotency_key" in inspect.signature(transport.create).parameters:
+        return await transport.create(payload, idempotency_key=key)
+    return await transport.create(payload)
 
 
 class HttpResponsesTransport:
@@ -38,43 +59,234 @@ class HttpResponsesTransport:
         *,
         api_key: str | None = None,
         timeout_seconds: float = 900,
+        connect_timeout_seconds: float = 3,
+        capabilities_timeout_seconds: float = 2,
+        max_attempts: int = 3,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout_seconds
+        self._connect_timeout = connect_timeout_seconds
+        self._capabilities_timeout = min(capabilities_timeout_seconds, 2)
+        self._max_attempts = max_attempts
         self._client = client
 
-    async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", "/responses", json_body=payload)
+    async def create(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST", "/responses", json_body=payload, idempotency_key=idempotency_key
+        )
 
     async def retrieve(self, response_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/responses/{response_id}")
 
     async def _request(
-        self, method: str, path: str, *, json_body: dict[str, Any] | None = None
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        timeout_seconds: float | None = None,
+        retry: bool = False,
     ) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-        if self._client is not None:
-            response = await self._client.request(
-                method, f"{self._base_url}{path}", json=json_body, headers=headers
-            )
-        else:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.request(
-                    method, f"{self._base_url}{path}", json=json_body, headers=headers
+        if idempotency_key:
+            headers["X-Idempotency-Key"] = idempotency_key
+        correlation_id = get_correlation_id()
+        if correlation_id != "-":
+            headers["X-Correlation-ID"] = correlation_id
+        attempts = self._max_attempts if retry and idempotency_key else 1
+        last_error: BridgeTransportError | None = None
+        for attempt in range(1, attempts + 1):
+            cause: Exception | None = None
+            try:
+                timeout = httpx.Timeout(
+                    timeout_seconds or self._timeout, connect=self._connect_timeout
                 )
-        response.raise_for_status()
-        value = response.json()
-        if not isinstance(value, dict):
-            raise ModelGatewayError("Model provider returned a non-object response")
-        return value
+                if self._client is not None:
+                    response = await self._client.request(
+                        method,
+                        f"{self._base_url}{path}",
+                        json=json_body,
+                        headers=headers,
+                        timeout=timeout,
+                    )
+                else:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        response = await client.request(
+                            method, f"{self._base_url}{path}", json=json_body, headers=headers
+                        )
+                if response.is_error:
+                    error = _bridge_http_error(response, attempt)
+                    if attempt >= attempts or not error.retryable:
+                        raise error
+                    last_error = error
+                    delay = _retry_delay(response, attempt)
+                    logger.warning(
+                        "bridge_request_retry code=%s attempt=%s delay_seconds=%.3f",
+                        error.code,
+                        attempt,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                try:
+                    value = response.json()
+                except (ValueError, json.JSONDecodeError) as exc:
+                    raise BridgeTransportError(
+                        "bridge_protocol_error",
+                        "Le bridge a renvoyé une réponse JSON invalide.",
+                        retryable=False,
+                        attempts=attempt,
+                    ) from exc
+                if not isinstance(value, dict):
+                    raise BridgeTransportError(
+                        "bridge_protocol_error",
+                        "Le bridge a renvoyé un contrat invalide.",
+                        retryable=False,
+                        attempts=attempt,
+                    )
+                return value
+            except httpx.ConnectError as exc:
+                cause = exc
+                error = BridgeTransportError(
+                    "bridge_unreachable",
+                    "Le bridge ChatGPT est inaccessible.",
+                    retryable=True,
+                    attempts=attempt,
+                )
+            except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+                cause = exc
+                error = BridgeTransportError(
+                    "bridge_timeout",
+                    "Le bridge ChatGPT n'a pas répondu à temps.",
+                    retryable=True,
+                    attempts=attempt,
+                )
+            if attempt >= attempts or not error.retryable:
+                raise error from cause
+            last_error = error
+            delay = _bounded_backoff(attempt)
+            logger.warning(
+                "bridge_request_retry code=%s attempt=%s delay_seconds=%.3f",
+                error.code,
+                attempt,
+                delay,
+            )
+            await asyncio.sleep(delay)
+        assert last_error is not None
+        raise last_error
+
+
+class BridgeTransportError(ModelGatewayError):
+    provider = "openai_chatgpt_bridge"
+
+    def __init__(
+        self,
+        code: str,
+        safe_description: str,
+        *,
+        retryable: bool,
+        attempts: int = 1,
+        retry_after: float | None = None,
+        phase: str = "generation",
+    ) -> None:
+        super().__init__(safe_description)
+        self.code = code
+        self.retryable = retryable
+        self.attempts = attempts
+        self.retry_after = retry_after
+        self.phase = phase
+
+
+def _bounded_backoff(attempt: int) -> float:
+    ceiling = min(5.0, 0.25 * (2 ** (attempt - 1)))
+    return random.uniform(ceiling / 2, ceiling)
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(value)
+            return max(0.0, (parsed - datetime.now(UTC)).total_seconds())
+        except (TypeError, ValueError):
+            return None
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    return _retry_after_seconds(response.headers.get("Retry-After")) or _bounded_backoff(attempt)
+
+
+def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTransportError:
+    status = response.status_code
+    server_code: str | None = None
+    try:
+        body = response.json()
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict) and isinstance(error.get("code"), str):
+            server_code = error["code"]
+    except ValueError:
+        pass
+    if server_code in {
+        "bridge_auth_failed",
+        "bridge_rate_limited",
+        "bridge_extension_disconnected",
+        "bridge_ui_timeout",
+        "bridge_timeout",
+        "bridge_unreachable",
+        "bridge_payload_conflict",
+        "bridge_protocol_error",
+        "bridge_server_error",
+    }:
+        code = server_code
+    elif status in {401, 403}:
+        code = "bridge_auth_failed"
+    elif status == 409:
+        code = "bridge_payload_conflict"
+    elif status == 429:
+        code = "bridge_rate_limited"
+    elif status in {408, 504}:
+        code = "bridge_timeout"
+    elif status >= 500:
+        code = "bridge_server_error"
+    else:
+        code = "bridge_protocol_error"
+    retryable = status in {408, 429, 502, 503, 504} or status >= 500
+    if code in {"bridge_auth_failed", "bridge_payload_conflict", "bridge_protocol_error"}:
+        retryable = False
+    messages = {
+        "bridge_unreachable": "Le bridge ChatGPT est inaccessible.",
+        "bridge_auth_failed": "L'authentification auprès du bridge a échoué.",
+        "bridge_rate_limited": "Le bridge limite temporairement les requêtes.",
+        "bridge_extension_disconnected": "L'extension ChatGPT est déconnectée.",
+        "bridge_ui_timeout": "L'inspection de l'interface ChatGPT a expiré.",
+        "bridge_payload_conflict": "La clé d'idempotence est liée à une autre requête.",
+        "bridge_protocol_error": "Le protocole du bridge est invalide.",
+        "bridge_timeout": "Le bridge ChatGPT n'a pas répondu à temps.",
+        "bridge_server_error": "Le bridge ChatGPT a rencontré une erreur.",
+    }
+    return BridgeTransportError(
+        code,
+        messages[code],
+        retryable=retryable,
+        attempts=attempts,
+        retry_after=_retry_after_seconds(response.headers.get("Retry-After")),
+    )
 
 
 class ChatGPTBridgeTransport(HttpResponsesTransport):
     """Translate Responses-shaped adapter calls to the bridge's honest native contract."""
 
-    async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def create(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
         tools = payload.get("tools", [])
         web_search = isinstance(tools, list) and any(
             isinstance(tool, dict) and tool.get("type") == "web_search" for tool in tools
@@ -88,16 +300,26 @@ class ChatGPTBridgeTransport(HttpResponsesTransport):
             "response_format": response_format,
             "background": bool(payload.get("background", False)),
         }
+        if idempotency_key:
+            bridge_payload["request_id"] = idempotency_key
         reasoning = payload.get("reasoning")
         if isinstance(reasoning, dict):
             bridge_payload["reasoning_effort"] = reasoning.get("effort")
-        return await self._request("POST", "/bridge/runs", json_body=bridge_payload)
+        return await self._request(
+            "POST",
+            "/bridge/runs",
+            json_body=bridge_payload,
+            idempotency_key=idempotency_key,
+            retry=True,
+        )
 
     async def retrieve(self, response_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/bridge/runs/{response_id}")
 
     async def capabilities(self) -> dict[str, Any]:
-        return await self._request("GET", "/bridge/capabilities")
+        return await self._request(
+            "GET", "/bridge/capabilities", timeout_seconds=self._capabilities_timeout
+        )
 
 
 class HttpChatCompletionsTransport:
@@ -154,7 +376,10 @@ class OpenAIResearchAdapter:
             payload["tools"] = [{"type": "web_search"}]
             payload["include"] = ["web_search_call.action.sources"]
         payload.update(_allowed_parameters(request.parameters, _RESPONSES_PARAMETERS))
-        return _responses_result(await self._transport.create(payload), self.provider)
+        return _responses_result(
+            await _create_with_idempotency(self._transport, payload, request.request_id),
+            self.provider,
+        )
 
     async def resume(
         self,
@@ -204,7 +429,9 @@ class OpenAIStructuredAdapter:
         }
         payload.update(_allowed_parameters(request.parameters, _RESPONSES_PARAMETERS))
         return _responses_result(
-            await self._transport.create(payload), self.provider, output_schema=output_schema
+            await _create_with_idempotency(self._transport, payload, request.request_id),
+            self.provider,
+            output_schema=output_schema,
         )
 
     async def resume(

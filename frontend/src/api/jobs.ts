@@ -49,3 +49,13 @@ export async function cancelJob(jobId: string): Promise<JobView> {
   }
   return (await response.json()) as JobView;
 }
+
+export async function retryJob(jobId: string): Promise<JobView> {
+  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/retry`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(`Job retry returned ${response.status}`);
+  }
+  return (await response.json()) as JobView;
+}

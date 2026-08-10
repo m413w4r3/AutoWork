@@ -69,6 +69,7 @@ class ModelRun:
     output_references: tuple[str, ...] = ()
     error_code: str | None = None
     error_message: str | None = None
+    error_details: dict[str, Any] | None = None
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -124,6 +125,7 @@ class ModelRun:
         self.output_references = output_references
         self.error_code = None
         self.error_message = None
+        self.error_details = None
         self.finished_at = timestamp
         self.updated_at = timestamp
 
@@ -133,6 +135,7 @@ class ModelRun:
         public_message: str,
         *,
         blocked: bool = False,
+        details: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> None:
         self._require_active()
@@ -140,6 +143,7 @@ class ModelRun:
         self.status = ModelRunStatus.BLOCKED if blocked else ModelRunStatus.FAILED
         self.error_code = code[:64]
         self.error_message = " ".join(public_message.replace("\x00", "").split())[:500]
+        self.error_details = details
         self.finished_at = timestamp
         self.updated_at = timestamp
 

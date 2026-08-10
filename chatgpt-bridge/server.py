@@ -9,13 +9,19 @@ Lancement :  python server.py   (ou  uvicorn server:app --port 8000)
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
+import logging
 import mimetypes
 import os
 import re
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
+from threading import RLock
 from typing import Any, AsyncIterator, Dict, List, Optional
 from urllib.parse import unquote_to_bytes
 
@@ -40,6 +46,15 @@ UI_TIMEOUT = float(os.getenv("BRIDGE_UI_TIMEOUT", "30"))
 # Durée de validité d'une sonde des menus (elle les ouvre à l'écran : on évite
 # de la refaire à chaque appel de /v1/models).
 UI_PROBE_TTL = float(os.getenv("BRIDGE_UI_PROBE_TTL", "60"))
+UI_SNAPSHOT_STALE = float(os.getenv("BRIDGE_UI_SNAPSHOT_STALE", "120"))
+WS_TOKEN = os.getenv("BRIDGE_WS_TOKEN")
+RUN_DB_PATH = Path(
+    os.getenv("BRIDGE_RUN_DB", str(Path(__file__).with_name("data") / "bridge-runs.sqlite3"))
+)
+RUN_RETENTION_SECONDS = float(os.getenv("BRIDGE_RUN_RETENTION_SECONDS", str(7 * 86400)))
+RUN_CLEANUP_LIMIT = int(os.getenv("BRIDGE_RUN_CLEANUP_LIMIT", "100"))
+
+logger = logging.getLogger("chatgpt_bridge")
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +129,9 @@ class BridgeRunRequest(BaseModel):
     # Par défaut, un modèle demandé mais non vérifié fait échouer le run : mieux
     # vaut une erreur qu'un run attribué au mauvais modèle dans la traçabilité CTI.
     allow_unverified_model: bool = False
+    # Identité stable fournie par l'application. L'en-tête HTTP équivalent est
+    # prioritaire, mais les deux doivent concorder lorsqu'ils sont présents.
+    request_id: Optional[str] = Field(default=None, min_length=1, max_length=255)
 
 
 class RunControls(BaseModel):
@@ -205,6 +223,115 @@ def _bridge_response_request(req: BridgeRunRequest) -> ResponseRequest:
     )
 
 
+class RunRegistry:
+    """Petit journal SQLite atomique ; aucun prompt/résultat n'est journalisé.
+
+    SQLite est volontairement local au bridge : la contrainte UNIQUE porte la
+    garantie de déduplication même lorsque deux handlers HTTP entrent ensemble.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = RLock()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bridge_runs (
+                    idempotency_key TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    bridge_run_id TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL CHECK(state IN ('queued','running','completed','failed')),
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    response_json TEXT,
+                    error_json TEXT
+                )
+                """
+            )
+
+    def recover_interrupted(self) -> None:
+        # Après un arrêt, il est impossible de prouver si le clic UI a eu lieu.
+        # Ne jamais resoumettre est la seule reprise sûre. Cette transition se
+        # fait au démarrage réel, pas au simple import du module par les tests.
+        interrupted = json.dumps(
+            {
+                "status_code": 503,
+                "body": {
+                    "error": {
+                        "code": "bridge_server_error",
+                        "message": "Le bridge a redémarré pendant cette exécution.",
+                        "retryable": True,
+                    }
+                },
+            },
+            separators=(",", ":"),
+        )
+        with self._lock, self._connect() as db:
+            db.execute(
+                "UPDATE bridge_runs SET state='failed', error_json=?, updated_at=? "
+                "WHERE state IN ('queued','running')",
+                (interrupted, time.time()),
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        return db
+
+    def claim(self, key: str, request_hash: str) -> tuple[dict[str, Any], bool]:
+        now = time.time()
+        run_id = f"resp_{uuid.uuid4().hex[:24]}"
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM bridge_runs WHERE idempotency_key=?", (key,)
+            ).fetchone()
+            if row is None:
+                db.execute(
+                    "INSERT INTO bridge_runs VALUES (?,?,?,?,?,?,NULL,NULL)",
+                    (key, request_hash, run_id, "queued", now, now),
+                )
+                row = db.execute(
+                    "SELECT * FROM bridge_runs WHERE idempotency_key=?", (key,)
+                ).fetchone()
+                created = True
+            else:
+                created = False
+            db.execute("COMMIT")
+        assert row is not None
+        return dict(row), created
+
+    def set_state(self, key: str, state: str, value: dict[str, Any] | None = None) -> None:
+        column = "response_json" if state == "completed" else "error_json"
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")) if value else None
+        with self._lock, self._connect() as db:
+            db.execute(
+                f"UPDATE bridge_runs SET state=?, updated_at=?, {column}=? WHERE idempotency_key=?",
+                (state, time.time(), encoded, key),
+            )
+
+    def get_by_run_id(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM bridge_runs WHERE bridge_run_id=?", (run_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def cleanup(self) -> int:
+        cutoff = time.time() - RUN_RETENTION_SECONDS
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                "DELETE FROM bridge_runs WHERE idempotency_key IN ("
+                "SELECT idempotency_key FROM bridge_runs "
+                "WHERE state IN ('completed','failed') AND updated_at < ? "
+                "ORDER BY updated_at LIMIT ?)",
+                (cutoff, RUN_CLEANUP_LIMIT),
+            )
+        return cursor.rowcount
+
+
 # --------------------------------------------------------------------------- #
 # Pont WebSocket vers l'extension
 # --------------------------------------------------------------------------- #
@@ -224,12 +351,18 @@ class Bridge:
         self.connected_at: Optional[float] = None
         self.client_name: str = "inconnu"
         self._grace: Optional[asyncio.Task] = None
+        self.last_ui_state: Optional[UiState] = None
+        self.last_ui_at: Optional[float] = None
+        self.reconnections = 0
+        self._seen_events: Dict[str, set[str]] = {}
 
     @property
     def online(self) -> bool:
         return self.ws is not None
 
     async def attach(self, ws: WebSocket) -> None:
+        if self.connected_at is not None:
+            self.reconnections += 1
         if self.ws is not None:
             # Un nouveau client prend la place de l'ancien : c'est ce qui permet
             # à un rechargement d'onglet de reprendre le pont sans redémarrage.
@@ -289,14 +422,40 @@ class Bridge:
 
     def close_channel(self, request_id: str) -> None:
         self.queues.pop(request_id, None)
+        self._seen_events.pop(request_id, None)
 
     def dispatch(self, packet: dict) -> None:
+        state = packet.get("state")
+        if isinstance(state, dict):
+            try:
+                self.last_ui_state = UiState.model_validate(state)
+                self.last_ui_at = time.time()
+            except Exception:
+                pass
+        request_id = str(packet.get("id", ""))
+        event_id = packet.get("event_id")
+        if request_id and isinstance(event_id, str):
+            seen = self._seen_events.setdefault(request_id, set())
+            if event_id in seen:
+                return
+            if len(seen) < 10_000:
+                seen.add(event_id)
         queue = self.queues.get(packet.get("id", ""))
         if queue is not None:
             queue.put_nowait(packet)
 
 
 bridge = Bridge()
+run_registry = RunRegistry(RUN_DB_PATH)
+idempotent_tasks: Dict[str, asyncio.Task] = {}
+bridge_metrics: Dict[str, int] = {
+    "runs_started": 0,
+    "runs_completed": 0,
+    "runs_failed": 0,
+    "deduplication_hits": 0,
+    "payload_conflicts": 0,
+    "ui_timeouts": 0,
+}
 
 # Les réponses de fond sont un cache de transport local, pas un état canonique.
 # PostgreSQL côté application conserve l'identité et le statut du ModelRun.
@@ -318,11 +477,15 @@ async def keepalive_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(keepalive_loop())
-    print(f"🚀 Mini-Bridge sur http://{HOST}:{PORT}  (WebSocket : ws://{HOST}:{PORT}/ws)")
+    run_registry.recover_interrupted()
+    run_registry.cleanup()
+    logger.info("bridge_started host=%s port=%s websocket_auth=%s", HOST, PORT, bool(WS_TOKEN))
     if API_KEY:
-        print("🔒 Authentification Bearer activée (BRIDGE_API_KEY)")
-    yield
-    task.cancel()
+        logger.info("bridge_http_auth_enabled")
+    try:
+        yield
+    finally:
+        task.cancel()
 
 
 app = FastAPI(title="ChatGPT Mini-Bridge", version="1.0.0", lifespan=lifespan)
@@ -331,8 +494,24 @@ _bearer = HTTPBearer(auto_error=False)
 
 
 async def require_key(cred: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)) -> None:
+    if not API_KEY and HOST not in {"127.0.0.1", "localhost", "::1"}:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "bridge_auth_failed",
+                "message": "BRIDGE_API_KEY est obligatoire sur une écoute non locale.",
+                "retryable": False,
+            },
+        )
     if API_KEY and (cred is None or cred.credentials != API_KEY):
-        raise HTTPException(status_code=401, detail="Clé API invalide")
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "bridge_auth_failed",
+                "message": "Clé API invalide.",
+                "retryable": False,
+            },
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -340,9 +519,15 @@ async def require_key(cred: Optional[HTTPAuthorizationCredentials] = Depends(_be
 # --------------------------------------------------------------------------- #
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
+    supplied = ws.query_params.get("token")
+    if not WS_TOKEN or not supplied or not hmac.compare_digest(supplied, WS_TOKEN):
+        # Fermeture avant acceptation : l'extension ne peut envoyer aucun paquet.
+        await ws.close(code=4401, reason="authentication required")
+        logger.warning("websocket_auth_failed")
+        return
     await ws.accept()
     await bridge.attach(ws)
-    print("✅ Extension Chrome connectée")
+    logger.info("extension_connected reconnections=%s", bridge.reconnections)
     try:
         while True:
             raw = await ws.receive_text()
@@ -355,13 +540,13 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 continue
             if kind == "hello":
                 bridge.client_name = str(packet.get("client", "inconnu"))
-                print(f"👋 Client identifié : {bridge.client_name}")
+                logger.info("extension_identified client=%s", bridge.client_name[:64])
                 continue
             bridge.dispatch(packet)
     except WebSocketDisconnect:
         pass
-    except Exception as exc:  # noqa: BLE001 - on ne veut jamais tuer le serveur
-        print(f"⚠️  WebSocket : {exc}")
+    except Exception:  # noqa: BLE001 - on ne veut jamais tuer le serveur
+        logger.exception("websocket_failure")
     finally:
         bridge.detach(ws)
 
@@ -505,6 +690,7 @@ async def run_generation(request_id: str, req: ChatRequest, http_req: Request) -
     queue = bridge.open_channel(request_id)
     deadline = time.monotonic() + TOTAL_TIMEOUT
     try:
+        logger.info("bridge_run_phase bridge_run_id=%s phase=submission", request_id)
         await bridge.send(
             {
                 "type": "prompt",
@@ -514,6 +700,7 @@ async def run_generation(request_id: str, req: ChatRequest, http_req: Request) -
                 "files": [f.model_dump() for f in attachments],
             }
         )
+        generation_announced = False
         while True:
             if await http_req.is_disconnected():
                 raise UpstreamError("client parti")
@@ -527,10 +714,14 @@ async def run_generation(request_id: str, req: ChatRequest, http_req: Request) -
 
             kind = packet.get("type")
             if kind == "chunk":
+                if not generation_announced:
+                    logger.info("bridge_run_phase bridge_run_id=%s phase=generation", request_id)
+                    generation_announced = True
                 text = packet.get("text", "")
                 if text:
                     yield text
             elif kind == "done":
+                logger.info("bridge_run_phase bridge_run_id=%s phase=response_retrieval", request_id)
                 return
             elif kind == "error":
                 raise UpstreamError(packet.get("message", "erreur côté extension"))
@@ -598,6 +789,8 @@ async def fetch_ui_state(probe: bool = False) -> UiState:
     state = _ui_state_of(await _ui_roundtrip({"type": "ui_state", "probe": probe}))
     if state is None:
         raise UiUnavailable("l'extension n'a renvoyé aucun état")
+    bridge.last_ui_state = state
+    bridge.last_ui_at = time.time()
     return state
 
 
@@ -854,16 +1047,21 @@ async def _create_response(
     controls: Optional[RunControls] = None,
     *,
     allow_unverified_model: bool = False,
+    response_id: Optional[str] = None,
 ) -> dict:
     if req.stream:
         raise HTTPException(status_code=422, detail="Responses streaming non supporté")
     if not bridge.online:
         raise HTTPException(
             status_code=503,
-            detail="Extension Chrome non connectée : ouvre un onglet chatgpt.com.",
+            detail={
+                "code": "bridge_extension_disconnected",
+                "message": "Extension Chrome non connectée : ouvre un onglet chatgpt.com.",
+                "retryable": True,
+            },
         )
     controls = controls or RunControls()
-    response_id = f"resp_{uuid.uuid4().hex[:24]}"
+    response_id = response_id or f"resp_{uuid.uuid4().hex[:24]}"
     # Valide immédiatement outils, entrées et schéma, avant de mettre en file.
     _response_chat_request(req)
     if req.background:
@@ -874,7 +1072,13 @@ async def _create_response(
         return background_responses[response_id]
     # Les contrôles sont appliqués *dans* le slot : entre leur vérification et la
     # génération, aucune autre requête ne doit pouvoir rebasculer l'interface.
+    queued_at = time.monotonic()
     async with bridge.slot:
+        logger.info(
+            "bridge_run_phase bridge_run_id=%s phase=ui_controls queue_wait_ms=%s",
+            response_id,
+            int((time.monotonic() - queued_at) * 1000),
+        )
         report = await prepare_run(controls, allow_unverified_model=allow_unverified_model)
         chat_request = _response_chat_request(
             req, web_search_native=report.web_search_mode == "ui_tool"
@@ -912,17 +1116,132 @@ async def retrieve_response(response_id: str):
 
 @app.post("/v1/bridge/runs", dependencies=[Depends(require_key)])
 async def create_bridge_run(req: BridgeRunRequest, http_req: Request):
-    return await _create_response(
-        _bridge_response_request(req),
-        http_req,
-        _bridge_controls(req),
-        allow_unverified_model=req.allow_unverified_model,
-    )
+    header_key = http_req.headers.get("X-Idempotency-Key")
+    if header_key and req.request_id and header_key != req.request_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "bridge_payload_conflict",
+                "message": "L'en-tête et request_id ne concordent pas.",
+                "retryable": False,
+            },
+        )
+    key = header_key or req.request_id or f"non_retryable_{uuid.uuid4().hex}"
+    canonical = req.model_dump(mode="json", exclude={"request_id"})
+    request_hash = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+    record, created = run_registry.claim(key, request_hash)
+    fingerprint = hashlib.sha256(key.encode()).hexdigest()[:12]
+    correlation_id = http_req.headers.get("X-Correlation-ID", "-")[:128]
+    run_id = str(record["bridge_run_id"])
+    if record["request_hash"] != request_hash:
+        bridge_metrics["payload_conflicts"] += 1
+        logger.warning(
+            "bridge_payload_conflict bridge_run_id=%s idempotency_fingerprint=%s",
+            run_id,
+            fingerprint,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "bridge_payload_conflict",
+                "message": "Cette clé d'idempotence désigne un autre payload.",
+                "retryable": False,
+            },
+        )
+
+    if not created:
+        bridge_metrics["deduplication_hits"] += 1
+        logger.info(
+            "bridge_run_deduplicated bridge_run_id=%s idempotency_fingerprint=%s "
+            "state=%s deduplication_hit=true",
+            run_id,
+            fingerprint,
+            record["state"],
+        )
+        if record["state"] == "completed" and record["response_json"]:
+            return json.loads(record["response_json"])
+        if record["state"] == "failed" and record["error_json"]:
+            stored = json.loads(record["error_json"])
+            return JSONResponse(status_code=stored["status_code"], content=stored["body"])
+
+    async def execute_once() -> dict:
+        started = time.monotonic()
+        bridge_metrics["runs_started"] += 1
+        run_registry.set_state(key, "running")
+        logger.info(
+            "bridge_run_started bridge_run_id=%s correlation_id=%s idempotency_fingerprint=%s phase=waiting_extension",
+            run_id,
+            correlation_id,
+            fingerprint,
+        )
+        try:
+            response = await _create_response(
+                _bridge_response_request(req),
+                _BackgroundRequest(),
+                _bridge_controls(req),
+                allow_unverified_model=req.allow_unverified_model,
+                response_id=run_id,
+            )
+            run_registry.set_state(key, "completed", response)
+            bridge_metrics["runs_completed"] += 1
+            logger.info(
+                "bridge_run_completed bridge_run_id=%s correlation_id=%s idempotency_fingerprint=%s "
+                "duration_ms=%s phase=completed",
+                run_id,
+                correlation_id,
+                fingerprint,
+                int((time.monotonic() - started) * 1000),
+            )
+            return response
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {
+                "code": "bridge_server_error",
+                "message": str(exc.detail),
+                "retryable": exc.status_code in {408, 429, 502, 503, 504},
+            }
+            stored = {"status_code": exc.status_code, "body": {"error": detail}}
+            run_registry.set_state(key, "failed", stored)
+            bridge_metrics["runs_failed"] += 1
+            raise
+        except Exception as exc:
+            logger.exception("bridge_run_unexpected_failure bridge_run_id=%s", run_id)
+            stored = {
+                "status_code": 500,
+                "body": {
+                    "error": {
+                        "code": "bridge_server_error",
+                        "message": "La génération via le bridge a échoué.",
+                        "retryable": True,
+                    }
+                },
+            }
+            run_registry.set_state(key, "failed", stored)
+            bridge_metrics["runs_failed"] += 1
+            raise HTTPException(status_code=500, detail=stored["body"]["error"]) from exc
+        finally:
+            idempotent_tasks.pop(run_id, None)
+
+    task = idempotent_tasks.get(run_id)
+    if task is None:
+        # Une déconnexion HTTP ne doit ni annuler ni resoumettre un clic coûteux.
+        task = asyncio.create_task(execute_once())
+        idempotent_tasks[run_id] = task
+    return await asyncio.shield(task)
 
 
 @app.get("/v1/bridge/runs/{response_id}", dependencies=[Depends(require_key)])
 async def retrieve_bridge_run(response_id: str):
-    return await retrieve_response(response_id)
+    record = run_registry.get_by_run_id(response_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Run bridge inconnu ou expiré")
+    if record["state"] == "completed" and record["response_json"]:
+        return json.loads(record["response_json"])
+    if record["state"] == "failed" and record["error_json"]:
+        stored = json.loads(record["error_json"])
+        return JSONResponse(status_code=stored["status_code"], content=stored["body"])
+    return {"id": response_id, "object": "response", "status": record["state"]}
 
 
 @app.get("/v1/bridge/ui", dependencies=[Depends(require_key)])
@@ -965,12 +1284,24 @@ async def bridge_capabilities(probe: bool = False, fresh: bool = False):
     Sans `probe`, l'état est lu sans toucher à l'UI : le modèle sélectionné est
     connu, mais pas la liste des modèles disponibles.
     """
-    state: Optional[UiState] = None
-    indisponible: Optional[str] = None
-    try:
-        state = await (probed_ui_state(fresh) if probe else fetch_ui_state())
-    except UiUnavailable as exc:
-        indisponible = str(exc)
+    if probe:
+        try:
+            state = await probed_ui_state(fresh)
+        except UiUnavailable as exc:
+            code = "bridge_ui_timeout" if "après" in str(exc) else "bridge_extension_disconnected"
+            if code == "bridge_ui_timeout":
+                bridge_metrics["ui_timeouts"] += 1
+            raise HTTPException(
+                status_code=504 if code == "bridge_ui_timeout" else 503,
+                detail={"code": code, "message": str(exc), "retryable": True},
+            ) from exc
+    else:
+        # Chemin critique : strictement aucun aller-retour WebSocket/DOM.
+        state = bridge.last_ui_state
+
+    observed_at = bridge.last_ui_at or (state.observed_at if state else None)
+    age = max(0.0, time.time() - observed_at) if observed_at else None
+    stale = age is None or age > UI_SNAPSHOT_STALE
 
     model_ok = bool(state and state.model.supported and state.model.verified)
     search_ok = bool(state and state.web_search.supported and state.web_search.verified)
@@ -982,7 +1313,7 @@ async def bridge_capabilities(probe: bool = False, fresh: bool = False):
         "new_chat": True,
         "web_search": "ui_toggle" if search_ok else "prompt_instructed",
         "structured_output": "prompt_and_client_validation",
-        "background": "memory_only",
+        "background": "synchronous_durable_result",
         "streaming": "chat_completions_only",
         # Vrai seulement quand le libellé du sélecteur a pu être relu : c'est le
         # modèle *affiché* par l'UI, pas le snapshot exact servi par OpenAI.
@@ -1000,7 +1331,26 @@ async def bridge_capabilities(probe: bool = False, fresh: bool = False):
             "reasoning_effort": "unavailable",
             "verification": "dom_readback",
         },
-        "ui": state.model_dump() if state else {"available": False, "reason": indisponible},
+        "ui": {
+            "available": state is not None,
+            "state": state.model_dump() if state else None,
+            "observed_at": observed_at,
+            "age_seconds": age,
+            "stale": stale,
+            "reason": None if state else "snapshot indisponible",
+        },
+    }
+
+
+@app.get("/v1/bridge/metrics", dependencies=[Depends(require_key)])
+async def bridge_operational_metrics():
+    """Compteurs bornés, sans labels issus des prompts ou des secrets."""
+    return {
+        **bridge_metrics,
+        "websocket_reconnections": bridge.reconnections,
+        "active_runs": len(idempotent_tasks),
+        "extension_connected": bridge.online,
+        "busy": bridge.slot.locked(),
     }
 
 
@@ -1120,9 +1470,18 @@ async def health():
 @app.exception_handler(HTTPException)
 async def openai_error(_: Request, exc: HTTPException):
     """Erreurs au format OpenAI, pour que les SDK clients les comprennent."""
+    if isinstance(exc.detail, dict):
+        error = exc.detail
+    else:
+        error = {
+            "message": str(exc.detail),
+            "type": "bridge_error",
+            "code": "bridge_server_error",
+            "retryable": exc.status_code in {408, 429, 502, 503, 504},
+        }
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": {"message": exc.detail, "type": "bridge_error", "code": exc.status_code}},
+        content={"error": error},
     )
 
 

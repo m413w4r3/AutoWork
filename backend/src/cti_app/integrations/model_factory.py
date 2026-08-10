@@ -24,6 +24,9 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
         settings.openai_bridge_base_url,
         api_key=_secret_value(settings.openai_bridge_api_key),
         timeout_seconds=settings.model_request_timeout_seconds,
+        connect_timeout_seconds=settings.openai_bridge_connect_timeout_seconds,
+        capabilities_timeout_seconds=settings.openai_bridge_capabilities_timeout_seconds,
+        max_attempts=settings.openai_bridge_max_attempts,
     )
     qwen_transport = HttpChatCompletionsTransport(
         settings.qwen_base_url,
@@ -73,7 +76,10 @@ def create_bridge_capabilities_provider(settings: Settings) -> ChatGPTBridgeTran
     return ChatGPTBridgeTransport(
         settings.openai_bridge_base_url,
         api_key=_secret_value(settings.openai_bridge_api_key),
-        timeout_seconds=settings.model_request_timeout_seconds,
+        timeout_seconds=settings.openai_bridge_capabilities_timeout_seconds,
+        connect_timeout_seconds=settings.openai_bridge_connect_timeout_seconds,
+        capabilities_timeout_seconds=settings.openai_bridge_capabilities_timeout_seconds,
+        max_attempts=1,
     )
 
 

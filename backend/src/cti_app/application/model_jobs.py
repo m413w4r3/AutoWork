@@ -42,9 +42,9 @@ def register_model_jobs(registry: JobRegistry, gateway: ModelGateway) -> None:
             ) from exc
         except ModelGatewayError as exc:
             raise JobHandlerError(
-                "model_response_failed",
-                "La reprise de la réponse du modèle a échoué.",
-                transient=False,
+                str(getattr(exc, "code", "model_response_failed")),
+                str(exc),
+                transient=bool(getattr(exc, "retryable", False)),
             ) from exc
         return execution.run.output_references[0]
 

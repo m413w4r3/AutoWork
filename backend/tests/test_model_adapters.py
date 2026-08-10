@@ -17,6 +17,7 @@ from cti_app.application.model_gateway import (
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole
 from cti_app.integrations.models import (
+    BridgeTransportError,
     ChatGPTBridgeTransport,
     FakeModelAdapter,
     OpenAIResearchAdapter,
@@ -36,7 +37,10 @@ class FakeResponsesTransport:
         self.created_payloads: list[dict[str, Any]] = []
         self.retrieved: list[str] = []
 
-    async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def create(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        del idempotency_key
         self.created_payloads.append(payload)
         return self.response
 
@@ -249,3 +253,73 @@ async def test_chatgpt_bridge_transport_uses_native_capabilities() -> None:
     }
     assert response["status"] == "queued"
     assert capabilities == {"transport": "chatgpt_web_ui"}
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "attempts"),
+    [(401, "bridge_auth_failed", 1), (500, "bridge_server_error", 3)],
+)
+async def test_bridge_classifies_http_errors_and_never_retries_auth(
+    status: int, code: str, attempts: int
+) -> None:
+    calls = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status, json={"error": {"message": "unsafe upstream detail"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.create({"input": "secret"}, idempotency_key="stable")
+
+    assert caught.value.code == code
+    assert caught.value.retryable is (status >= 500)
+    assert calls == attempts
+    assert "unsafe" not in str(caught.value)
+
+
+async def test_bridge_connect_error_is_typed_and_post_without_key_is_not_retried() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("connection refused secret", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.create({"input": "secret"})
+
+    assert caught.value.code == "bridge_unreachable"
+    assert caught.value.retryable is True
+    assert calls == 1
+
+
+async def test_bridge_429_honours_retry_after_and_reuses_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+    delays: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(429, headers={"Retry-After": "2"}, json={"error": {}})
+        return httpx.Response(200, json={"id": "resp_1", "status": "completed"})
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("cti_app.integrations.models.asyncio.sleep", fake_sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
+        await transport.create({"input": "secret"}, idempotency_key="stable-429")
+
+    assert delays == [2]
+    assert [request.headers["X-Idempotency-Key"] for request in requests] == [
+        "stable-429",
+        "stable-429",
+    ]

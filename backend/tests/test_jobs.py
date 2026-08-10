@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -147,3 +148,37 @@ async def test_abandoned_running_job_is_requeued() -> None:
     assert [item.id for item in recovered] == [job.id]
     assert (await service.get(job.id)).status is JobStatus.QUEUED
     assert (await service.get(job.id)).error_code == "heartbeat_expired"
+
+
+async def test_long_handler_renews_job_lease() -> None:
+    factory = InMemoryJobUnitOfWorkFactory()
+    registry = JobRegistry()
+    observed_renewal = False
+    job_id = None
+
+    async def slow_handler(parameters: JobParameters, context: JobExecutionContext) -> str:
+        del parameters, context
+        nonlocal observed_renewal
+        assert job_id is not None
+        initial = factory.state[job_id].heartbeat_at
+        await asyncio.sleep(0.04)
+        observed_renewal = factory.state[job_id].heartbeat_at != initial
+        return "memory://slow-result"
+
+    registry.register("test.slow", DemoJobParameters, slow_handler)
+    service = JobService(factory, registry)
+    executor = JobExecutor(factory, registry, heartbeat_interval_seconds=0.01)
+    job = await service.submit(
+        kind="test.slow",
+        aggregate_type="subject",
+        aggregate_id=uuid4(),
+        idempotency_key="slow-heartbeat",
+        correlation_id="heartbeat-test",
+        input_parameters={"steps": 1},
+    )
+    job_id = job.id
+
+    completed = await executor.execute(job.id)
+
+    assert completed.status is JobStatus.SUCCEEDED
+    assert observed_renewal is True

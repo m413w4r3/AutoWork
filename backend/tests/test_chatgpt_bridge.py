@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import runpy
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -13,6 +15,85 @@ from starlette.requests import Request
 def load_bridge() -> dict[str, Any]:
     path = Path(__file__).parents[2] / "chatgpt-bridge" / "server.py"
     return runpy.run_path(str(path))
+
+
+def test_extension_reserves_request_before_real_send_click() -> None:
+    root = Path(__file__).parents[2] / "chatgpt-bridge" / "extension"
+    background = (root / "background.js").read_text()
+    content = (root / "content.js").read_text()
+
+    assert 'requestStates.set(msg.id, "received")' in background
+    assert "await requestStatesReady" in background
+    assert content.index("await claimPrompt(id)") < content.index("sendBtn.click()")
+    assert "submittedRequestIds" in content
+
+
+class FakeExtension:
+    def __init__(self, module: dict[str, Any], *, prompt_delay: float = 0) -> None:
+        self.module = module
+        self.prompt_delay = prompt_delay
+        self.prompt_count = 0
+        self.sent: list[dict[str, Any]] = []
+        self.tasks: set[asyncio.Task[None]] = set()
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        self.sent.append(payload)
+        task = asyncio.create_task(self._respond(payload))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def _respond(self, payload: dict[str, Any]) -> None:
+        if payload["type"] in {"ui_control", "ui_state"}:
+            await asyncio.sleep(0)
+            applied = {}
+            if payload["type"] == "ui_control":
+                applied = {
+                    key: {
+                        "requested": value,
+                        "applied": value,
+                        "verified": True,
+                        "ok": True,
+                        "changed": False,
+                    }
+                    for key, value in payload.get("controls", {}).items()
+                }
+            self.module["bridge"].dispatch(
+                {
+                    "type": payload["type"],
+                    "id": payload["id"],
+                    "applied": applied,
+                    "state": {
+                        "observed_at": 1,
+                        "model": {},
+                        "profile": {},
+                        "web_search": {},
+                    },
+                }
+            )
+        elif payload["type"] == "prompt":
+            self.prompt_count += 1
+            await asyncio.sleep(self.prompt_delay)
+            self.module["bridge"].dispatch(
+                {"type": "chunk", "id": payload["id"], "text": "ok", "event_id": "1"}
+            )
+            self.module["bridge"].dispatch({"type": "done", "id": payload["id"], "event_id": "2"})
+
+
+def request_with_key(key: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/bridge/runs",
+            "headers": [(b"x-idempotency-key", key.encode())],
+        }
+    )
+
+
+def isolated_registry(module: dict[str, Any], tmp_path: Path) -> None:
+    registry = module["RunRegistry"](tmp_path / "runs.sqlite3")
+    module["create_bridge_run"].__globals__["run_registry"] = registry
+    module["retrieve_bridge_run"].__globals__["run_registry"] = registry
 
 
 def test_responses_facade_translates_web_search_and_rejects_binary_blocks() -> None:
@@ -184,4 +265,166 @@ async def test_capabilities_degrade_visibly_without_a_connected_extension() -> N
     assert caps["web_search"] == "prompt_instructed"
     assert caps["actual_model_version"] is False
     assert caps["controls"]["model_selection"] == "unavailable"
-    assert caps["ui"] == {"available": False, "reason": "extension non connectée"}
+    assert caps["ui"]["available"] is False
+    assert caps["ui"]["stale"] is True
+    assert caps["ui"]["state"] is None
+
+
+async def test_concurrent_same_key_submits_one_prompt_and_replays_result(tmp_path: Path) -> None:
+    module = load_bridge()
+    isolated_registry(module, tmp_path)
+    extension = FakeExtension(module, prompt_delay=0.02)
+    module["bridge"].ws = extension
+    req = module["BridgeRunRequest"](input="secret prompt")
+
+    first, second = await asyncio.gather(
+        module["create_bridge_run"](req, request_with_key("business-1")),
+        module["create_bridge_run"](req, request_with_key("business-1")),
+    )
+    replay = await module["create_bridge_run"](req, request_with_key("business-1"))
+
+    assert first["id"] == second["id"] == replay["id"]
+    assert extension.prompt_count == 1
+
+
+async def test_cancelled_http_wait_then_retry_joins_original_run(tmp_path: Path) -> None:
+    module = load_bridge()
+    isolated_registry(module, tmp_path)
+    extension = FakeExtension(module, prompt_delay=0.05)
+    module["bridge"].ws = extension
+    req = module["BridgeRunRequest"](input="expensive prompt")
+
+    abandoned = asyncio.create_task(
+        module["create_bridge_run"](req, request_with_key("business-timeout"))
+    )
+    await asyncio.sleep(0.01)
+    abandoned.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned
+    replay = await module["create_bridge_run"](req, request_with_key("business-timeout"))
+
+    assert replay["status"] == "completed"
+    assert extension.prompt_count == 1
+
+
+async def test_same_key_different_payload_conflicts(tmp_path: Path) -> None:
+    module = load_bridge()
+    isolated_registry(module, tmp_path)
+    extension = FakeExtension(module)
+    module["bridge"].ws = extension
+    await module["create_bridge_run"](
+        module["BridgeRunRequest"](input="one"), request_with_key("conflict")
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await module["create_bridge_run"](
+            module["BridgeRunRequest"](input="two"), request_with_key("conflict")
+        )
+    assert caught.value.status_code == 409
+    assert isinstance(caught.value.detail, dict)
+    assert caught.value.detail["code"] == "bridge_payload_conflict"
+
+
+async def test_completed_run_survives_registry_restart_without_ui(tmp_path: Path) -> None:
+    module = load_bridge()
+    database = tmp_path / "runs.sqlite3"
+    isolated_registry(module, tmp_path)
+    extension = FakeExtension(module)
+    module["bridge"].ws = extension
+    req = module["BridgeRunRequest"](input="once")
+    first = await module["create_bridge_run"](req, request_with_key("restart"))
+
+    module["create_bridge_run"].__globals__["run_registry"] = module["RunRegistry"](database)
+    module["bridge"].ws = None
+    replay = await module["create_bridge_run"](req, request_with_key("restart"))
+
+    assert replay["id"] == first["id"]
+    assert extension.prompt_count == 1
+
+
+async def test_capabilities_never_waits_for_a_blocked_extension() -> None:
+    module = load_bridge()
+
+    class Blocked:
+        async def send_json(self, _: dict[str, Any]) -> None:
+            await asyncio.Event().wait()
+
+    module["bridge"].ws = Blocked()
+    started = asyncio.get_running_loop().time()
+    caps = await module["bridge_capabilities"]()
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.25
+    assert caps["extension_connected"] is True
+
+
+async def test_ui_probe_timeout_is_typed() -> None:
+    module = load_bridge()
+
+    class Silent:
+        async def send_json(self, _: dict[str, Any]) -> None:
+            return None
+
+    module["bridge"].ws = Silent()
+    module["bridge_capabilities"].__globals__["UI_TIMEOUT"] = 0.01
+    with pytest.raises(HTTPException) as caught:
+        await module["bridge_capabilities"](probe=True, fresh=True)
+
+    assert caught.value.status_code == 504
+    assert isinstance(caught.value.detail, dict)
+    assert caught.value.detail["code"] == "bridge_ui_timeout"
+
+
+async def test_websocket_without_pairing_token_is_rejected() -> None:
+    module = load_bridge()
+    module["websocket_endpoint"].__globals__["WS_TOKEN"] = "required-secret"
+
+    class UnauthenticatedSocket:
+        def __init__(self) -> None:
+            self.query_params: dict[str, str] = {}
+            self.accepted = False
+            self.closed: tuple[int, str] | None = None
+
+        async def accept(self) -> None:
+            self.accepted = True
+
+        async def close(self, code: int, reason: str) -> None:
+            self.closed = (code, reason)
+
+    socket = UnauthenticatedSocket()
+    await module["websocket_endpoint"](socket)
+
+    assert socket.accepted is False
+    assert socket.closed == (4401, "authentication required")
+
+
+async def test_duplicate_websocket_event_is_dispatched_once() -> None:
+    module = load_bridge()
+    bridge = module["Bridge"]()
+    queue = bridge.open_channel("run-1")
+    packet = {"id": "run-1", "type": "chunk", "text": "x", "event_id": "event-1"}
+
+    bridge.dispatch(packet)
+    bridge.dispatch(packet)
+
+    assert (await queue.get())["text"] == "x"
+    assert queue.empty()
+
+
+async def test_bridge_logs_neither_prompt_nor_idempotency_secret(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    module = load_bridge()
+    isolated_registry(module, tmp_path)
+    module["bridge"].ws = FakeExtension(module)
+    caplog.set_level(logging.INFO, logger="chatgpt_bridge")
+
+    await module["create_bridge_run"](
+        module["BridgeRunRequest"](input="TOP-SECRET-PROMPT"),
+        request_with_key("TOP-SECRET-IDEMPOTENCY-KEY"),
+    )
+
+    rendered = caplog.text
+    assert "TOP-SECRET-PROMPT" not in rendered
+    assert "TOP-SECRET-IDEMPOTENCY-KEY" not in rendered
+    assert "idempotency_fingerprint=" in rendered

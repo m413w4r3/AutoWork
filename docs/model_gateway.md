@@ -84,13 +84,18 @@ Il traduit ensuite la requête vers l'interface ChatGPT :
   absents de l'interface ;
 - le JSON Schema est injecté comme contrainte et validé par l'application, sans prétendre à
   une garantie native du bridge ;
-- son cache background est en mémoire. Un redémarrage du bridge peut rendre un `resp_*`
-  irrécupérable ; PostgreSQL conserve néanmoins le `ModelRun` et son échec traçable.
+- le contrat natif `/bridge/runs` possède un registre SQLite durable et déduplique sur l'UUID du
+  `ModelRun`. Une exécution terminée survit au redémarrage ; une exécution interrompue échoue
+  sans resoumission implicite. Seule la façade Responses historique garde un cache mémoire.
 
 L'intégration est donc remplaçable par le service Responses officiel sans modifier les ports
 métier.
 
 ## Table `model_runs`
+
+Les échecs de transport typés conservent dans `error_details` uniquement le fournisseur, la
+phase, le caractère retryable et le nombre de tentatives. La description publique reste dans
+`error_message`; aucun secret ou contenu de requête n'est stocké dans ces champs.
 
 | Groupe | Colonnes |
 | --- | --- |

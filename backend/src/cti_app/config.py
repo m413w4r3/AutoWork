@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     job_recovery_interval_seconds: float = Field(default=30.0, gt=1, le=3600)
     openai_bridge_base_url: str = "http://127.0.0.1:8001/v1"
     openai_bridge_api_key: SecretStr | None = None
+    openai_bridge_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    openai_bridge_capabilities_timeout_seconds: float = Field(default=2.0, gt=0, le=2)
+    openai_bridge_max_attempts: int = Field(default=3, ge=1, le=10)
     openai_research_model: str = "chatgpt-web"
     openai_structured_model: str = "chatgpt-web"
     openai_drafting_model: str = "chatgpt-web"

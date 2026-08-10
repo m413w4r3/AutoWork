@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.persistence import JobUnitOfWork, JobUnitOfWorkFactory
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics, JobStatus
+from cti_app.logging import reset_correlation_id, set_correlation_id
 
 INTERNAL_ERROR_CODE = "internal_error"
 INTERNAL_ERROR_MESSAGE = "Une erreur interne est survenue pendant le traitement."
+logger = logging.getLogger(__name__)
 
 
 class JobNotFoundError(LookupError):
@@ -268,11 +273,13 @@ class JobExecutor:
         *,
         retry_base_seconds: float = 1.0,
         retry_max_seconds: float = 300.0,
+        heartbeat_interval_seconds: float = 20.0,
     ) -> None:
         self._uow_factory = uow_factory
         self._registry = registry
         self._retry_base_seconds = retry_base_seconds
         self._retry_max_seconds = retry_max_seconds
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
 
     async def execute(self, job_id: UUID, *, allow_early_retry: bool = False) -> Job:
         job, claimed = await self._start(job_id, allow_early_retry=allow_early_retry)
@@ -280,16 +287,53 @@ class JobExecutor:
             return job
 
         context = JobExecutionContext(job_id, self._uow_factory)
+        correlation_token = set_correlation_id(job.correlation_id)
         try:
             parameters = self._registry.validate(job.kind, job.input_parameters)
-            output_reference = await self._registry.handler(job.kind)(parameters, context)
+            output_reference = await self._run_with_heartbeat(
+                self._registry.handler(job.kind)(parameters, context), context
+            )
             return await self._succeed(job_id, output_reference)
         except JobCancelledError:
             return await self._get(job_id)
         except JobHandlerError as exc:
             return await self._handle_controlled_failure(job_id, exc)
         except Exception:
+            logger.exception(
+                "unexpected_job_failure job_id=%s correlation_id=%s kind=%s",
+                job.id,
+                job.correlation_id,
+                job.kind,
+            )
             return await self._fail(job_id, INTERNAL_ERROR_CODE, INTERNAL_ERROR_MESSAGE)
+        finally:
+            reset_correlation_id(correlation_token)
+
+    async def _run_with_heartbeat(
+        self, operation: Awaitable[str | None], context: JobExecutionContext
+    ) -> str | None:
+        async def maintain_lease() -> None:
+            while True:
+                await asyncio.sleep(self._heartbeat_interval_seconds)
+                await context.heartbeat()
+
+        operation_task: asyncio.Future[str | None] = asyncio.ensure_future(operation)
+        heartbeat_task: asyncio.Task[None] = asyncio.create_task(maintain_lease())
+        done, _ = await asyncio.wait(
+            cast(set[asyncio.Future[Any]], {operation_task, heartbeat_task}),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if operation_task in done:
+            heartbeat_task.cancel()
+            result = await operation_task
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+            return result
+        operation_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await operation_task
+        await heartbeat_task
+        return None
 
     async def _start(self, job_id: UUID, *, allow_early_retry: bool) -> tuple[Job, bool]:
         async with self._uow_factory() as uow:

@@ -23,11 +23,13 @@ from cti_app.application.model_gateway import (
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
 from cti_app.integrations.models import (
+    BridgeTransportError,
     FakeModelAdapter,
     InMemoryModelOutputStore,
     OpenAIResearchAdapter,
     OpenAIStructuredAdapter,
     QwenAdapter,
+    ResponsesTransport,
 )
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
@@ -39,7 +41,10 @@ class SequencedResponsesTransport:
         self.create_calls = 0
         self.retrieve_calls = 0
 
-    async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def create(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        del idempotency_key
         del payload
         self.create_calls += 1
         return self._responses[0]
@@ -48,6 +53,24 @@ class SequencedResponsesTransport:
         assert response_id == "resp_background"
         self.retrieve_calls += 1
         return self._responses[min(self.retrieve_calls, len(self._responses) - 1)]
+
+
+class FailingResponsesTransport:
+    async def create(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        del payload, idempotency_key
+        raise BridgeTransportError(
+            "bridge_auth_failed",
+            "L'authentification auprès du bridge a échoué.",
+            retryable=False,
+            attempts=1,
+            phase="generation",
+        )
+
+    async def retrieve(self, response_id: str) -> dict[str, Any]:
+        del response_id
+        raise AssertionError("not used")
 
 
 class NoCallChatTransport:
@@ -90,7 +113,7 @@ def request(
 
 
 def gateway_with_transport(
-    transport: SequencedResponsesTransport,
+    transport: ResponsesTransport,
 ) -> tuple[ModelGateway, InMemoryModelRunUnitOfWorkFactory, InMemoryModelOutputStore]:
     openai_research = OpenAIResearchAdapter(transport, model="chatgpt-web")
     openai_structured = OpenAIStructuredAdapter(transport, model="chatgpt-web")
@@ -118,6 +141,22 @@ async def test_external_llm_policy_blocks_before_transport() -> None:
     run = next(iter(model_uow.state.values()))
     assert run.status is ModelRunStatus.BLOCKED
     assert run.error_code == "external_llm_blocked"
+
+
+async def test_typed_bridge_error_details_are_persisted_safely() -> None:
+    gateway, model_uow, _ = gateway_with_transport(FailingResponsesTransport())
+
+    with pytest.raises(BridgeTransportError):
+        await gateway.research(request(external_llm_allowed=True))
+
+    run = next(iter(model_uow.state.values()))
+    assert run.error_code == "bridge_auth_failed"
+    assert run.error_details == {
+        "provider": "openai_chatgpt_bridge",
+        "phase": "generation",
+        "retryable": False,
+        "attempts": 1,
+    }
 
 
 async def test_qwen_trusted_gateway_runs_when_external_llm_is_forbidden() -> None:

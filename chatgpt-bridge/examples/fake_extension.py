@@ -11,12 +11,22 @@ se fait déconnecter avec le code 4000 « replaced ».
 import asyncio
 import json
 import os
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websockets
 
 HOST = os.getenv("BRIDGE_HOST", "127.0.0.1")
-PORT = os.getenv("BRIDGE_PORT", "8000")
+PORT = os.getenv("BRIDGE_PORT", "8001")
 URL = os.getenv("BRIDGE_WS", f"ws://{HOST}:{PORT}/ws")
+WS_TOKEN = os.getenv("BRIDGE_WS_TOKEN", "")
+
+
+def authenticated_url() -> str:
+    parts = urlsplit(URL)
+    query = dict(parse_qsl(parts.query))
+    if WS_TOKEN:
+        query["token"] = WS_TOKEN
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 # --------------------------------------------------------------------------- #
 # Interface simulée : mêmes messages typés que le content script (ui_state /
@@ -113,7 +123,7 @@ def applique(controls: dict) -> dict:
 
 async def main() -> None:
     try:
-        ws = await websockets.connect(URL)
+        ws = await websockets.connect(authenticated_url())
     except OSError as exc:
         raise SystemExit(f"❌ Serveur injoignable sur {URL} ({exc}). Lance `python server.py`.")
 
@@ -146,7 +156,7 @@ async def main() -> None:
                     continue
 
                 files = msg.get("files") or []
-                print(f"prompt reçu : {msg['prompt'][:60]!r}  ({len(files)} pièce(s) jointe(s))")
+                print(f"prompt reçu : {len(msg['prompt'])} caractère(s), {len(files)} pièce(s) jointe(s)")
                 joints = "".join(
                     f"\n- {f['name']} ({f['mime']}, {len(f['data']) * 3 // 4} octets)" for f in files
                 )

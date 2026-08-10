@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import TracebackType
@@ -23,7 +23,11 @@ from cti_app.domain.model_runs import (
 
 
 class ModelGatewayError(RuntimeError):
-    pass
+    code = "model_gateway_error"
+    retryable = False
+    provider = "unknown"
+    phase = "model_call"
+    attempts = 1
 
 
 class ExternalModelBlockedError(ModelGatewayError):
@@ -92,6 +96,7 @@ class SafeModelRequest:
     parameters: dict[str, Any]
     background: bool
     authorized_input_hash: str
+    request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,7 +306,11 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             except BackgroundResponsePendingError:
                 raise
             except Exception as exc:
-                run.fail("model_resume_failed", _public_error(exc))
+                run.fail(
+                    str(getattr(exc, "code", "model_resume_failed")),
+                    _public_error(exc),
+                    details=_error_details(exc),
+                )
                 await uow.model_runs.save(run)
                 await uow.commit()
                 raise
@@ -338,6 +347,9 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 raise ExternalModelBlockedError(run.error_message)
             await uow.commit()
 
+        # L'identité du ModelRun est créée une seule fois et devient la clé
+        # stable de toutes les tentatives réseau de ce même appel.
+        safe_request = replace(safe_request, request_id=str(run.id))
         started = time.monotonic()
         try:
             result = await adapter.invoke(safe_request, role=role, output_schema=output_schema)
@@ -371,7 +383,11 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     ModelRunStatus.RUNNING,
                     ModelRunStatus.WAITING_BACKGROUND,
                 }:
-                    persisted.fail("model_call_failed", _public_error(exc))
+                    persisted.fail(
+                        str(getattr(exc, "code", "model_call_failed")),
+                        _public_error(exc),
+                        details=_error_details(exc),
+                    )
                     await uow.model_runs.save(persisted)
                     await uow.commit()
             raise
@@ -500,3 +516,12 @@ def _public_error(exc: Exception) -> str:
     if isinstance(exc, ModelGatewayError):
         return str(exc)[:500]
     return "L'appel au modèle a échoué."
+
+
+def _error_details(exc: Exception) -> dict[str, str | bool | int]:
+    return {
+        "provider": str(getattr(exc, "provider", "unknown"))[:64],
+        "phase": str(getattr(exc, "phase", "model_call"))[:64],
+        "retryable": bool(getattr(exc, "retryable", False)),
+        "attempts": max(1, int(getattr(exc, "attempts", 1))),
+    }

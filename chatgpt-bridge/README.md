@@ -1,9 +1,13 @@
 # ChatGPT Mini-Bridge
 
+> La topologie sécurisée, l’idempotence, la matrice de retry et les procédures
+> d’exploitation sont décrites dans
+> [`docs/chatgpt_bridge_operations.md`](../docs/chatgpt_bridge_operations.md).
+
 API locale compatible OpenAI, servie par ton onglet `chatgpt.com` via une extension Chrome.
 
 ```
-[ton script]  ──POST 127.0.0.1:8000/v1/chat/completions──>  [server.py (FastAPI)]
+[ton script]  ──POST 127.0.0.1:8001/v1/chat/completions──>  [server.py (FastAPI)]
                                                                    ▲
                                                           WebSocket │ /ws
                                                                    ▼
@@ -69,7 +73,7 @@ pour les images, bloc `file` pour le reste. N'importe quel client OpenAI peut do
 ## Utilisation via HTTP
 
 ```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
+curl http://127.0.0.1:8001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"chatgpt-web","messages":[{"role":"user","content":"Raconte une blague courte."}]}'
 ```
@@ -95,7 +99,8 @@ client.chat.completions.create(
 | `GET /v1/responses/{id}` | polling d'une réponse de fond locale |
 | `POST /v1/bridge/runs` | contrat natif et honnête utilisé par l'application CTI |
 | `GET /v1/bridge/runs/{id}` | polling natif d'un run bridge |
-| `GET /v1/bridge/capabilities` | capacités réelles de l'extension, état vérifié des contrôles |
+| `GET /v1/bridge/capabilities` | capacités statiques et dernier snapshot UI, sans accès DOM |
+| `GET /v1/bridge/metrics` | compteurs opérationnels sans contenu sensible |
 | `GET /v1/bridge/ui` | état pilotable de l'onglet (`?probe=true` énumère les choix) |
 | `POST /v1/bridge/ui/controls` | applique un réglage hors run (profil, modèle, recherche) |
 | `GET /v1/models` | modèles réellement offerts par l'UI si connus, liste factice sinon |
@@ -180,10 +185,10 @@ Les règles de dégradation sont volontairement asymétriques :
   `web_search_mode: "prompt_instructed"`. C'est le comportement historique du bridge, qui
   reste disponible mais n'est plus confondu avec l'activation réelle de l'outil.
 
-`GET /v1/bridge/capabilities` reflète cet état : `web_search` passe à `ui_toggle`,
-`actual_model_version` à `true`, et le bloc `ui` porte l'état complet relu dans l'onglet.
-`?probe=true` ouvre en plus les menus pour énumérer modèles et profils — c'est visible à
-l'écran, donc fait après la génération en cours et mis en cache 60 s.
+`GET /v1/bridge/capabilities` reflète le dernier snapshot connu sans contacter le DOM ; le
+bloc `ui` indique son âge et s'il est périmé. `?probe=true` déclenche explicitement la lecture
+active et ouvre les menus pour énumérer modèles et profils — c'est visible à l'écran, donc
+fait après la génération en cours et mis en cache 60 s.
 
 `/v1/chat/completions` ne pilote rien : son champ `model` reste ignoré, comme avant.
 
@@ -193,6 +198,8 @@ l'écran, donc fait après la génération en cours et mis en cache 60 s.
 |---|---|---|
 | `BRIDGE_HOST` / `BRIDGE_PORT` | `127.0.0.1` / `8001` | écoute du serveur |
 | `BRIDGE_API_KEY` | *(vide)* | si défini, exige `Authorization: Bearer <clé>` |
+| `BRIDGE_WS_TOKEN` | *(obligatoire)* | jeton d'appairage distinct de l'extension |
+| `BRIDGE_RUN_DB` | `data/bridge-runs.sqlite3` | registre durable d'idempotence |
 | `BRIDGE_IDLE_TIMEOUT` | `120` | secondes sans le moindre paquet avant abandon |
 | `BRIDGE_TOTAL_TIMEOUT` | `900` | durée max d'une génération |
 | `BRIDGE_UI_TIMEOUT` | `30` | durée max d'une lecture ou d'un pilotage de l'interface |
@@ -215,7 +222,8 @@ L'URL du WebSocket côté extension se change dans le popup (utile si tu changes
 > rechargement d'onglet de reprendre le pont sans redémarrer le serveur. `GET /health` indique
 > qui le détient (`"client"`), et le bouton du popup force la reprise par l'extension.
 
-Les deux scripts d'exemple suivent `BRIDGE_HOST` / `BRIDGE_PORT` / `BRIDGE_API_KEY` :
+Les scripts d'exemple suivent `BRIDGE_HOST` / `BRIDGE_PORT` / `BRIDGE_API_KEY` ; la fausse
+extension exige aussi `BRIDGE_WS_TOKEN` :
 
 ```bash
 BRIDGE_PORT=8001 .venv/bin/python examples/test_client.py "ta question"
@@ -278,14 +286,14 @@ ajoute le nouveau sélecteur en première position, rien d'autre à toucher.
   sont estimés et les objets sources structurés de `web_search` ne peuvent pas être
   reconstruits. Le modèle rapporté est le **libellé affiché** par le sélecteur, pas le snapshot
   exact servi par OpenAI ; quand il n'est pas lisible, le bridge dit `chatgpt-web`.
-- Les réponses de fond sont conservées en mémoire. Elles sont perdues au redémarrage du bridge ;
-  l'application appelante doit persister son propre run et traiter un `404` comme un échec
-  traçable.
+- La façade historique `/v1/responses` conserve ses réponses de fond en mémoire. Les runs natifs
+  `/v1/bridge/runs` terminés sont durables dans SQLite ; un run interrompu par un redémarrage
+  échoue sans resoumission implicite.
 - Structured Outputs est demandé dans le prompt, puis doit impérativement être revalidé par le
   client contre son schéma.
 - Le contrat `/v1/bridge/*` est celui à privilégier dans l'application : il expose explicitement
   comment `web_search` a été obtenue (`ui_tool` ou `prompt_instructed`), Structured Outputs
-  comme prompt revalidé côté client, et le background comme état en mémoire.
+  comme prompt revalidé côté client, et une idempotence durable pour les runs natifs.
 - `reasoning_effort` reste accepté puis ignoré : ce réglage n'a pas de contrôle vérifiable dans
   l'UI, et le bridge préfère ne rien promettre.
 

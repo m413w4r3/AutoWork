@@ -18,6 +18,14 @@ def get_correlation_id() -> str:
     return _correlation_id.get()
 
 
+def set_correlation_id(value: str) -> Token[str]:
+    return _correlation_id.set(value[:128])
+
+
+def reset_correlation_id(token: Token[str]) -> None:
+    _correlation_id.reset(token)
+
+
 class CorrelationIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.correlation_id = get_correlation_id()
@@ -73,14 +81,25 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
                     extra={"http_method": request.method, "http_path": request.url.path},
                 )
                 raise
-            _http_logger.info(
-                "http_request_completed",
-                extra={
-                    "http_method": request.method,
-                    "http_path": request.url.path,
-                    "http_status": response.status_code,
-                },
+            # Les probes Compose/Kubernetes sont très fréquents : conserver les
+            # échecs, mais ne pas noyer les événements métier avec les succès.
+            is_successful_probe = (
+                request.url.path
+                in {
+                    "/api/health/live",
+                    "/api/health/ready",
+                }
+                and response.status_code < 400
             )
+            if not is_successful_probe:
+                _http_logger.info(
+                    "http_request_completed",
+                    extra={
+                        "http_method": request.method,
+                        "http_path": request.url.path,
+                        "http_status": response.status_code,
+                    },
+                )
             response.headers[CORRELATION_HEADER] = correlation_id
             return response
         finally:

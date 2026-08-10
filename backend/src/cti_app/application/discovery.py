@@ -299,9 +299,9 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
             batch = await service.discover_edition(parameters, context)
         except ModelGatewayError as exc:
             raise JobHandlerError(
-                "discovery_model_failed",
-                "La recherche ou sa structuration a échoué.",
-                transient=False,
+                str(getattr(exc, "code", "discovery_model_failed")),
+                str(exc),
+                transient=bool(getattr(exc, "retryable", False)),
             ) from exc
         return f"discovery-batch://{batch.id}"
 

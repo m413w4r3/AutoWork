@@ -4,10 +4,53 @@ import { useEffect } from "react";
 import {
   cancelJob,
   fetchJob,
+  retryJob,
   type JobStatus,
   type JobView,
   terminalJobStatuses,
 } from "../api/jobs";
+
+const bridgeErrors: Record<
+  string,
+  { message: string; kind: "transient" | "configuration" | "terminal" }
+> = {
+  bridge_unreachable: {
+    message: "Le bridge ChatGPT est inaccessible.",
+    kind: "transient",
+  },
+  bridge_timeout: {
+    message: "La recherche ChatGPT a dépassé le délai autorisé.",
+    kind: "transient",
+  },
+  bridge_rate_limited: {
+    message: "Le bridge limite temporairement les requêtes.",
+    kind: "transient",
+  },
+  bridge_extension_disconnected: {
+    message: "L’extension Chrome est déconnectée.",
+    kind: "transient",
+  },
+  bridge_ui_timeout: {
+    message: "L’inspection de l’interface ChatGPT a expiré.",
+    kind: "transient",
+  },
+  bridge_server_error: {
+    message: "Le bridge ChatGPT a rencontré une erreur.",
+    kind: "transient",
+  },
+  bridge_auth_failed: {
+    message: "L’authentification du bridge est incorrecte.",
+    kind: "configuration",
+  },
+  bridge_payload_conflict: {
+    message: "La clé d’idempotence correspond à une autre requête.",
+    kind: "terminal",
+  },
+  bridge_protocol_error: {
+    message: "Le bridge a renvoyé une réponse incompatible.",
+    kind: "terminal",
+  },
+};
 
 const statusLabels: Record<JobStatus, string> = {
   queued: "En attente",
@@ -64,6 +107,10 @@ export function JobStatusCard({
     mutationFn: () => cancelJob(jobId),
     onSuccess: (updated) => queryClient.setQueryData(["job", jobId], updated),
   });
+  const retry = useMutation({
+    mutationFn: () => retryJob(jobId),
+    onSuccess: (updated) => queryClient.setQueryData(["job", jobId], updated),
+  });
   useEffect(() => {
     if (job.data && terminalJobStatuses.has(job.data.status)) {
       onTerminal?.(job.data.status);
@@ -85,6 +132,13 @@ export function JobStatusCard({
     job.data.progress_total > 0
       ? Math.round((job.data.progress_current / job.data.progress_total) * 100)
       : 0;
+  const bridgeError = job.data.error_code
+    ? bridgeErrors[job.data.error_code]
+    : undefined;
+  const canRetry =
+    job.data.status === "failed" &&
+    bridgeError?.kind === "transient" &&
+    job.data.attempt < job.data.max_attempts;
 
   return (
     <article className={`job-card job-card--${job.data.status}`}>
@@ -126,10 +180,30 @@ export function JobStatusCard({
       ) : null}
       {job.data.error_message ? (
         <p role="alert" className="error-message">
-          {job.data.error_message}
+          {bridgeError?.message || job.data.error_message}
           {job.data.error_code ? ` (${job.data.error_code})` : ""}
+          {bridgeError
+            ? ` — ${bridgeError.kind === "configuration" ? "configuration requise" : bridgeError.kind === "transient" ? "erreur transitoire" : "erreur terminale"}`
+            : ""}
         </p>
       ) : null}
+      {canRetry ? (
+        <button
+          className="button button--secondary"
+          disabled={retry.isPending}
+          onClick={() => retry.mutate()}
+        >
+          Réessayer
+        </button>
+      ) : null}
+      {retry.isError ? (
+        <p role="alert" className="error-message">
+          La relance a échoué.
+        </p>
+      ) : null}
+      <p className="muted">
+        Identifiant de diagnostic : {job.data.correlation_id}
+      </p>
     </article>
   );
 }
