@@ -6,6 +6,10 @@
 
 API locale compatible OpenAI, servie par ton onglet `chatgpt.com` via une extension Chrome.
 
+Les URLs `http://127.0.0.1:8001/v1` ci-dessous concernent uniquement les
+clients lancés directement sur l’hôte. Dans Compose, `backend` et `worker`
+utilisent obligatoirement `http://chatgpt-bridge:8001/v1`.
+
 ```
 [ton script]  ──POST 127.0.0.1:8001/v1/chat/completions──>  [server.py (FastAPI)]
                                                                    ▲
@@ -105,6 +109,7 @@ client.chat.completions.create(
 | `POST /v1/bridge/ui/controls` | applique un réglage hors run (profil, modèle, recherche) |
 | `GET /v1/models` | modèles réellement offerts par l'UI si connus, liste factice sinon |
 | `GET /health` | extension connectée ? qui la détient ? requête en cours ? |
+| `GET /ready` | configuration, SQLite et disponibilité fonctionnelle de l’extension |
 
 ### Fichiers : format OpenAI standard
 
@@ -204,6 +209,7 @@ fait après la génération en cours et mis en cache 60 s.
 | `BRIDGE_TOTAL_TIMEOUT` | `900` | durée max d'une génération |
 | `BRIDGE_UI_TIMEOUT` | `30` | durée max d'une lecture ou d'un pilotage de l'interface |
 | `BRIDGE_UI_PROBE_TTL` | `60` | validité d'une énumération des menus (elle les ouvre à l'écran) |
+| `BRIDGE_SHUTDOWN_GRACE_SECONDS` | `20` | délai de drainage avant annulation prudente des runs |
 
 L'URL du WebSocket côté extension se change dans le popup (utile si tu changes `BRIDGE_PORT`).
 

@@ -19,7 +19,7 @@ encore activée.
 
 ```bash
 cp .env.example .env  # facultatif : Compose possède des valeurs locales par défaut
-make dev
+make up
 ```
 
 Services exposés :
@@ -31,6 +31,7 @@ Services exposés :
 | Live | <http://localhost:8000/api/health/live> |
 | Ready | <http://localhost:8000/api/health/ready> |
 | MinIO | <http://localhost:9001> |
+| Bridge ChatGPT (hôte uniquement) | <http://127.0.0.1:8001/health> |
 
 Les ports hôtes peuvent être adaptés dans `.env` avec `BACKEND_PORT`, `FRONTEND_PORT`, `MINIO_API_PORT` et `MINIO_CONSOLE_PORT`. Les ports internes et le proxy entre services ne changent pas.
 
@@ -43,6 +44,11 @@ Arrêt sans suppression des volumes nommés :
 ```bash
 make stop
 ```
+
+`make stop` reste un alias de `make down`. Les commandes d’exploitation sont
+`make up`, `make down`, `make status`, `make logs`, `make bridge-status`,
+`make bridge-logs` et `make restart-bridge`. `make down` conserve toujours les
+volumes nommés, dont le registre SQLite `bridge_data`.
 
 ## Développement hors conteneur
 

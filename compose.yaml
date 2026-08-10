@@ -13,6 +13,7 @@ services:
       BRIDGE_RUN_DB: /data/bridge-runs.sqlite3
       BRIDGE_TOTAL_TIMEOUT: ${MODEL_REQUEST_TIMEOUT_SECONDS:-900}
       BRIDGE_UI_TIMEOUT: ${BRIDGE_UI_TIMEOUT_SECONDS:-30}
+      BRIDGE_SHUTDOWN_GRACE_SECONDS: ${BRIDGE_SHUTDOWN_GRACE_SECONDS:-20}
     ports:
       - "127.0.0.1:${BRIDGE_PORT:-8001}:8001"
     volumes:
@@ -23,6 +24,7 @@ services:
       timeout: 3s
       retries: 12
       start_period: 3s
+    stop_grace_period: 30s
     restart: unless-stopped
 
   bridge-smoke:
@@ -211,6 +213,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
+      chatgpt-bridge:
+        condition: service_healthy
       redis:
         condition: service_healthy
       migrate:

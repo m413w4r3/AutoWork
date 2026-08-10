@@ -1,14 +1,35 @@
-.PHONY: dev stop test test-integration lint format typecheck
+.PHONY: up down status logs bridge-status bridge-logs restart-bridge dev stop test test-integration lint format typecheck
 
 UV ?= uv
 PNPM ?= pnpm
 COMPOSE ?= docker compose
 
+up:
+	$(COMPOSE) up -d --build --wait
+
+down:
+	$(COMPOSE) down
+
+status:
+	$(COMPOSE) ps
+
+logs:
+	$(COMPOSE) logs --tail=200 -f backend worker job-recovery frontend chatgpt-bridge
+
+bridge-status:
+	$(COMPOSE) ps chatgpt-bridge
+	$(COMPOSE) exec -T chatgpt-bridge python tools/status.py
+
+bridge-logs:
+	$(COMPOSE) logs --tail=200 -f chatgpt-bridge worker
+
+restart-bridge:
+	$(COMPOSE) up -d --build --wait --force-recreate --no-deps chatgpt-bridge
+
 dev:
 	$(COMPOSE) up --build
 
-stop:
-	$(COMPOSE) down
+stop: down
 
 test:
 	cd backend && $(UV) run pytest

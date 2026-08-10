@@ -53,6 +53,7 @@ RUN_DB_PATH = Path(
 )
 RUN_RETENTION_SECONDS = float(os.getenv("BRIDGE_RUN_RETENTION_SECONDS", str(7 * 86400)))
 RUN_CLEANUP_LIMIT = int(os.getenv("BRIDGE_RUN_CLEANUP_LIMIT", "100"))
+SHUTDOWN_GRACE_SECONDS = max(0.0, float(os.getenv("BRIDGE_SHUTDOWN_GRACE_SECONDS", "20")))
 
 logger = logging.getLogger("chatgpt_bridge")
 
@@ -331,6 +332,21 @@ class RunRegistry:
             )
         return cursor.rowcount
 
+    def accessible(self) -> bool:
+        """Vérifie le registre sans exposer son chemin ni son contenu."""
+        try:
+            with self._lock, self._connect() as db:
+                db.execute("SELECT 1").fetchone()
+            return True
+        except sqlite3.Error:
+            logger.exception("bridge_registry_unavailable")
+            return False
+
+    def checkpoint_and_close(self) -> None:
+        """Force le checkpoint WAL ; les connexions sont déjà ouvertes à l'appel."""
+        with self._lock, self._connect() as db:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+
 
 # --------------------------------------------------------------------------- #
 # Pont WebSocket vers l'extension
@@ -355,6 +371,7 @@ class Bridge:
         self.last_ui_at: Optional[float] = None
         self.reconnections = 0
         self._seen_events: Dict[str, set[str]] = {}
+        self.closing = False
 
     @property
     def online(self) -> bool:
@@ -390,8 +407,24 @@ class Bridge:
         # Un service worker MV3 est arrêté et relancé à tout moment : sa
         # reconnexion ne doit pas faire échouer une génération en cours. On
         # laisse donc un délai de grâce avant d'abandonner les requêtes.
-        if self.queues:
+        if self.queues and not self.closing:
             self._grace = asyncio.create_task(self._fail_after_grace())
+
+    async def close(self) -> None:
+        """Ferme proprement la liaison extension sans déclencher de reconnexion."""
+        self.closing = True
+        if self._grace is not None:
+            self._grace.cancel()
+            self._grace = None
+        ws = self.ws
+        self.ws = None
+        self.connected_at = None
+        self.client_name = "inconnu"
+        if ws is not None:
+            try:
+                await ws.close(code=1001, reason="server shutdown")
+            except Exception:
+                logger.exception("websocket_shutdown_failure")
 
     async def _fail_after_grace(self) -> None:
         await asyncio.sleep(RECONNECT_GRACE)
@@ -461,6 +494,7 @@ bridge_metrics: Dict[str, int] = {
 # PostgreSQL côté application conserve l'identité et le statut du ModelRun.
 background_responses: Dict[str, dict] = {}
 background_tasks: Dict[str, asyncio.Task] = {}
+accepting_runs = True
 
 
 async def keepalive_loop() -> None:
@@ -474,18 +508,91 @@ async def keepalive_loop() -> None:
                 pass
 
 
+def _configuration_state() -> dict[str, Any]:
+    local_only = HOST in {"127.0.0.1", "localhost", "::1"}
+    http_configured = bool(API_KEY)
+    websocket_configured = bool(WS_TOKEN)
+    return {
+        "complete": websocket_configured and (http_configured or local_only),
+        "http_auth": "configured" if http_configured else "absent",
+        "http_auth_required": not local_only,
+        "websocket_token": "configured" if websocket_configured else "absent",
+    }
+
+
+def _shutdown_error() -> dict[str, Any]:
+    return {
+        "status_code": 503,
+        "body": {
+            "error": {
+                "code": "bridge_server_error",
+                "message": "Le bridge a interrompu cette exécution pendant son arrêt.",
+                "retryable": True,
+            }
+        },
+    }
+
+
+def _ensure_accepting_runs() -> None:
+    if not accepting_runs:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "bridge_server_error",
+                "message": "Le bridge est en cours d'arrêt et n'accepte plus de nouveaux runs.",
+                "retryable": True,
+            },
+        )
+
+
+async def shutdown_bridge(grace_seconds: float = SHUTDOWN_GRACE_SECONDS) -> None:
+    """Draine les runs natifs, puis annule prudemment ce qui reste."""
+    global accepting_runs
+    accepting_runs = False
+    tracked = set(idempotent_tasks.values()) | set(background_tasks.values())
+    logger.info(
+        "bridge_shutdown_started grace_seconds=%s active_runs=%s extension=%s",
+        grace_seconds,
+        len(tracked),
+        "connected" if bridge.online else "disconnected",
+    )
+    pending = tracked
+    if tracked and grace_seconds > 0:
+        _, pending = await asyncio.wait(tracked, timeout=grace_seconds)
+    await bridge.close()
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    run_registry.checkpoint_and_close()
+    logger.info("bridge_shutdown_completed cancelled_runs=%s", len(pending))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global accepting_runs
+    accepting_runs = True
+    bridge.closing = False
     task = asyncio.create_task(keepalive_loop())
     run_registry.recover_interrupted()
     run_registry.cleanup()
-    logger.info("bridge_started host=%s port=%s websocket_auth=%s", HOST, PORT, bool(WS_TOKEN))
-    if API_KEY:
-        logger.info("bridge_http_auth_enabled")
+    configuration = _configuration_state()
+    registry_state = "accessible" if run_registry.accessible() else "unavailable"
+    logger.info(
+        "bridge_started host=%s port=%s http_auth=%s websocket_token=%s "
+        "sqlite_registry=%s extension=disconnected",
+        HOST,
+        PORT,
+        configuration["http_auth"],
+        configuration["websocket_token"],
+        registry_state,
+    )
     try:
         yield
     finally:
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await shutdown_bridge()
 
 
 app = FastAPI(title="ChatGPT Mini-Bridge", version="1.0.0", lifespan=lifespan)
@@ -519,6 +626,9 @@ async def require_key(cred: Optional[HTTPAuthorizationCredentials] = Depends(_be
 # --------------------------------------------------------------------------- #
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
+    if not accepting_runs or bridge.closing:
+        await ws.close(code=1013, reason="server shutdown")
+        return
     supplied = ws.query_params.get("token")
     if not WS_TOKEN or not supplied or not hmac.compare_digest(supplied, WS_TOKEN):
         # Fermeture avant acceptation : l'extension ne peut envoyer aucun paquet.
@@ -1100,6 +1210,7 @@ async def create_response(req: ResponseRequest, http_req: Request):
     une entrée du sélecteur de l'UI : il ne pilote donc rien ici. Seul l'outil
     `web_search` est traduit en réglage d'interface.
     """
+    _ensure_accepting_runs()
     web_search = any(str(tool.get("type", "")) == "web_search" for tool in req.tools)
     return await _create_response(
         req, http_req, RunControls(web_search=True if web_search else None)
@@ -1116,6 +1227,7 @@ async def retrieve_response(response_id: str):
 
 @app.post("/v1/bridge/runs", dependencies=[Depends(require_key)])
 async def create_bridge_run(req: BridgeRunRequest, http_req: Request):
+    _ensure_accepting_runs()
     header_key = http_req.headers.get("X-Idempotency-Key")
     if header_key and req.request_id and header_key != req.request_id:
         raise HTTPException(
@@ -1195,6 +1307,18 @@ async def create_bridge_run(req: BridgeRunRequest, http_req: Request):
                 int((time.monotonic() - started) * 1000),
             )
             return response
+        except asyncio.CancelledError:
+            stored = _shutdown_error()
+            run_registry.set_state(key, "failed", stored)
+            bridge_metrics["runs_failed"] += 1
+            logger.warning(
+                "bridge_run_interrupted bridge_run_id=%s correlation_id=%s "
+                "idempotency_fingerprint=%s phase=shutdown",
+                run_id,
+                correlation_id,
+                fingerprint,
+            )
+            raise
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, dict) else {
                 "code": "bridge_server_error",
@@ -1356,6 +1480,7 @@ async def bridge_operational_metrics():
 
 @app.post("/v1/chat/completions", dependencies=[Depends(require_key)])
 async def chat_completions(req: ChatRequest, http_req: Request):
+    _ensure_accepting_runs()
     if not bridge.online:
         raise HTTPException(
             status_code=503,
@@ -1467,6 +1592,33 @@ async def health():
     }
 
 
+@app.get("/ready")
+async def ready():
+    """Disponibilité fonctionnelle, distincte de la liveness `/health`."""
+    configuration = _configuration_state()
+    registry_accessible = run_registry.accessible()
+    if not registry_accessible:
+        status = "server_unavailable"
+    elif not configuration["complete"]:
+        status = "configuration_incomplete"
+    elif not bridge.online:
+        status = "extension_absent"
+    else:
+        status = "extension_available"
+    body = {
+        "status": status,
+        "server_operational": registry_accessible and accepting_runs,
+        "accepting_runs": accepting_runs,
+        "configuration": configuration,
+        "sqlite_registry": "accessible" if registry_accessible else "unavailable",
+        "extension": "connected" if bridge.online else "disconnected",
+    }
+    return JSONResponse(
+        status_code=200 if status == "extension_available" else 503,
+        content=body,
+    )
+
+
 @app.exception_handler(HTTPException)
 async def openai_error(_: Request, exc: HTTPException):
     """Erreurs au format OpenAI, pour que les SDK clients les comprennent."""
@@ -1488,4 +1640,26 @@ async def openai_error(_: Request, exc: HTTPException):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    # Les logs protocolaires INFO d'Uvicorn incluent l'URL du handshake et donc
+    # le token WebSocket en query string. Les événements applicatifs sûrs
+    # conservent leur propre handler INFO ; Uvicorn reste visible à WARNING.
+    bridge_handler = logging.StreamHandler()
+    bridge_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    logger.addHandler(bridge_handler)
+    logger.setLevel(
+        getattr(logging, os.getenv("BRIDGE_LOG_LEVEL", "INFO").upper(), logging.INFO)
+    )
+    logger.propagate = False
+    # Uvicorn libère rapidement les handlers HTTP ; les tâches idempotentes,
+    # protégées par shield, sont drainées par `shutdown_bridge` pendant le délai
+    # applicatif ci-dessus.
+    # Le token WebSocket est transporté dans la query string par l'extension :
+    # désactiver l'access log évite que Uvicorn ne l'imprime lors du handshake.
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=PORT,
+        log_level="warning",
+        access_log=False,
+        timeout_graceful_shutdown=1,
+    )

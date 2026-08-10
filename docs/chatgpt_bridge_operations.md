@@ -7,6 +7,12 @@
 est publié sur `127.0.0.1:8001`; l’extension Chrome se connecte à
 `ws://127.0.0.1:8001/ws` avec son jeton d’appairage.
 
+`http://127.0.0.1:8001/v1` est exclusivement l’URL des clients exécutés sur
+l’hôte. Elle ne doit jamais être placée dans l’environnement d’un conteneur.
+Un `docker compose up -d worker` démarre également le bridge et attend sa
+liveness ; l’absence de l’extension reste un état dégradé et n’empêche ni le
+backend ni Qwen de fonctionner.
+
 Deux secrets distincts sont obligatoires dès que le bridge écoute sur une
 adresse non locale :
 
@@ -35,6 +41,7 @@ extérieur au port 8001.
 | `BRIDGE_TOTAL_TIMEOUT` | recherche complète, 900 secondes par défaut |
 | `BRIDGE_UI_TIMEOUT` | probe ou contrôle actif de l’UI |
 | `BRIDGE_UI_SNAPSHOT_STALE` | âge après lequel le dernier snapshot est périmé |
+| `BRIDGE_SHUTDOWN_GRACE_SECONDS` | délai de drainage des runs, 20 secondes par défaut |
 | `OPENAI_BRIDGE_CONNECT_TIMEOUT_SECONDS` | connexion applicative, 3 secondes |
 | `OPENAI_BRIDGE_CAPABILITIES_TIMEOUT_SECONDS` | capabilities, au plus 2 secondes |
 | `OPENAI_BRIDGE_MAX_ATTEMPTS` | tentatives réseau bornées avec clé stable |
@@ -103,14 +110,29 @@ reconnexion. `GET /v1/bridge/metrics` expose des compteurs sans labels sensibles
 (runs, déduplication, conflits, timeouts UI, reconnexions et activité). Les probes de santé réussies ne sont pas journalisées par le
 backend. Aucun prompt, réponse, token, cookie ni clé brute ne doit être logué.
 
+`/health` est une liveness rapide et reste à HTTP 200 sans extension. `/ready`
+décrit séparément `server_operational`, la configuration HTTP/WebSocket,
+l’accès SQLite et l’état `extension_absent` ou `extension_available`. Une
+configuration incomplète et une extension absente répondent HTTP 503 sans
+faire échouer le healthcheck Compose.
+
 ```bash
-curl -s http://127.0.0.1:8001/health
-curl -s -H "Authorization: Bearer $OPENAI_BRIDGE_API_KEY" \
-  http://127.0.0.1:8001/v1/bridge/capabilities
-curl -s -H "Authorization: Bearer $OPENAI_BRIDGE_API_KEY" \
-  "http://127.0.0.1:8001/v1/bridge/capabilities?probe=true"
-docker compose logs chatgpt-bridge worker | rg 'bridge_run_id|correlation_id|error'
+make status
+make bridge-status
+make bridge-logs
 ```
+
+`make bridge-status` affiche health, ready et capabilities. Il construit
+l’en-tête Bearer dans le conteneur et n’affiche jamais le secret.
+
+## Cycle de vie et arrêt
+
+`make up` démarre et attend la stack ; `make down` l’arrête sans supprimer les
+volumes. `make restart-bridge` recrée uniquement le bridge. À la réception de
+SIGTERM, le bridge refuse les nouveaux runs, draine ceux déjà engagés pendant
+`BRIDGE_SHUTDOWN_GRACE_SECONDS`, ferme le WebSocket, annule le reliquat avec un
+échec sûr, puis effectue le checkpoint SQLite. Au redémarrage, les états
+`queued` ou `running` sont transformés en échec et ne sont jamais resoumis.
 
 ## Test manuel de non-duplication
 

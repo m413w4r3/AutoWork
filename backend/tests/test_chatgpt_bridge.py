@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import runpy
 from collections.abc import AsyncIterator
@@ -35,6 +36,7 @@ class FakeExtension:
         self.prompt_count = 0
         self.sent: list[dict[str, Any]] = []
         self.tasks: set[asyncio.Task[None]] = set()
+        self.closed: tuple[int, str] | None = None
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         self.sent.append(payload)
@@ -77,6 +79,13 @@ class FakeExtension:
                 {"type": "chunk", "id": payload["id"], "text": "ok", "event_id": "1"}
             )
             self.module["bridge"].dispatch({"type": "done", "id": payload["id"], "event_id": "2"})
+
+    async def close(self, code: int, reason: str) -> None:
+        self.closed = (code, reason)
+        for task in tuple(self.tasks):
+            task.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
 
 
 def request_with_key(key: str) -> Request:
@@ -270,6 +279,58 @@ async def test_capabilities_degrade_visibly_without_a_connected_extension() -> N
     assert caps["ui"]["state"] is None
 
 
+async def test_ready_distinguishes_incomplete_absent_and_available_states() -> None:
+    module = load_bridge()
+    globals_ = module["ready"].__globals__
+    globals_["HOST"] = "0.0.0.0"
+    globals_["API_KEY"] = None
+    globals_["WS_TOKEN"] = None
+    module["bridge"].ws = None
+
+    incomplete = await module["ready"]()
+    incomplete_body = json.loads(incomplete.body)
+    assert incomplete.status_code == 503
+    assert incomplete_body["status"] == "configuration_incomplete"
+    assert incomplete_body["server_operational"] is True
+    assert incomplete_body["configuration"]["http_auth"] == "absent"
+    assert incomplete_body["configuration"]["websocket_token"] == "absent"
+
+    globals_["API_KEY"] = "not-logged-http-secret"
+    globals_["WS_TOKEN"] = "not-logged-websocket-secret"
+    absent = await module["ready"]()
+    assert absent.status_code == 503
+    assert json.loads(absent.body)["status"] == "extension_absent"
+
+    module["bridge"].ws = FakeExtension(module)
+    available = await module["ready"]()
+    assert available.status_code == 200
+    assert json.loads(available.body)["status"] == "extension_available"
+
+
+async def test_startup_reports_safe_configuration_states(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    module = load_bridge()
+    isolated_registry(module, tmp_path)
+    globals_ = module["_configuration_state"].__globals__
+    globals_["HOST"] = "0.0.0.0"
+    globals_["API_KEY"] = "STARTUP-HTTP-SECRET"
+    globals_["WS_TOKEN"] = "STARTUP-WS-SECRET"
+    module["bridge"].ws = None
+    caplog.set_level(logging.INFO, logger="chatgpt_bridge")
+
+    async with module["lifespan"](None):
+        pass
+
+    rendered = caplog.text
+    assert "http_auth=configured" in rendered
+    assert "websocket_token=configured" in rendered
+    assert "sqlite_registry=accessible" in rendered
+    assert "extension=disconnected" in rendered
+    assert "STARTUP-HTTP-SECRET" not in rendered
+    assert "STARTUP-WS-SECRET" not in rendered
+
+
 async def test_concurrent_same_key_submits_one_prompt_and_replays_result(tmp_path: Path) -> None:
     module = load_bridge()
     isolated_registry(module, tmp_path)
@@ -305,6 +366,40 @@ async def test_cancelled_http_wait_then_retry_joins_original_run(tmp_path: Path)
 
     assert replay["status"] == "completed"
     assert extension.prompt_count == 1
+
+
+async def test_shutdown_during_run_fails_safe_without_second_prompt(tmp_path: Path) -> None:
+    module = load_bridge()
+    isolated_registry(module, tmp_path)
+    extension = FakeExtension(module, prompt_delay=60)
+    module["bridge"].ws = extension
+    req = module["BridgeRunRequest"](input="expensive prompt")
+
+    active = asyncio.create_task(
+        module["create_bridge_run"](req, request_with_key("sigterm-run"))
+    )
+    for _ in range(100):
+        if extension.prompt_count:
+            break
+        await asyncio.sleep(0.001)
+    assert extension.prompt_count == 1
+
+    await module["shutdown_bridge"](0.01)
+    with pytest.raises(asyncio.CancelledError):
+        await active
+    assert extension.closed == (1001, "server shutdown")
+
+    # Simule le redémarrage : la même clé rejoue l'échec SQLite et ne touche
+    # pas la nouvelle extension, même si elle est disponible.
+    module["shutdown_bridge"].__globals__["accepting_runs"] = True
+    module["bridge"].closing = False
+    replacement = FakeExtension(module)
+    module["bridge"].ws = replacement
+    replay = await module["create_bridge_run"](req, request_with_key("sigterm-run"))
+
+    assert replay.status_code == 503
+    assert json.loads(replay.body)["error"]["code"] == "bridge_server_error"
+    assert replacement.prompt_count == 0
 
 
 async def test_same_key_different_payload_conflicts(tmp_path: Path) -> None:
@@ -428,3 +523,42 @@ async def test_bridge_logs_neither_prompt_nor_idempotency_secret(
     assert "TOP-SECRET-PROMPT" not in rendered
     assert "TOP-SECRET-IDEMPOTENCY-KEY" not in rendered
     assert "idempotency_fingerprint=" in rendered
+
+
+def test_compose_and_makefile_bridge_lifecycle_contract() -> None:
+    root = Path(__file__).parents[2]
+    compose = (root / "compose.yaml").read_text()
+    makefile = (root / "Makefile").read_text()
+    environment = compose.split("environment: &backend-environment", 1)[1].split(
+        "\n    volumes:", 1
+    )[0]
+    backend = compose.split("\n  backend:", 1)[1].split("\n  migrate:", 1)[0]
+    backend_depends = backend.split("\n    depends_on:", 1)[1].split(
+        "\n    healthcheck:", 1
+    )[0]
+    worker = compose.split("\n  worker:", 1)[1].split("\n  job-recovery:", 1)[0]
+    postgres = compose.split("\n  postgres:", 1)[1].split("\n  redis:", 1)[0]
+    redis = compose.split("\n  redis:", 1)[1].split("\n  minio:", 1)[0]
+
+    assert (
+        "OPENAI_BRIDGE_BASE_URL: "
+        "${OPENAI_BRIDGE_BASE_URL:-http://chatgpt-bridge:8001/v1}" in environment
+    )
+    assert "127.0.0.1:8001/v1" not in environment
+    assert "chatgpt-bridge:\n        condition: service_healthy" in worker
+    assert "chatgpt-bridge:" not in backend_depends
+    assert "depends_on:" not in postgres
+    assert "depends_on:" not in redis
+    assert "bridge_data:/data" in compose
+    assert "stop_grace_period: 30s" in compose
+
+    assert "$(COMPOSE) up -d --build --wait" in makefile
+    assert "$(COMPOSE) down -v" not in makefile
+    assert "python tools/status.py" in makefile
+    status_script = (root / "chatgpt-bridge" / "tools" / "status.py").read_text()
+    assert 'os.getenv("BRIDGE_API_KEY")' in status_script
+    assert "print(key)" not in status_script
+    server = (root / "chatgpt-bridge" / "server.py").read_text()
+    assert "access_log=False" in server
+    assert 'log_level="warning"' in server
+    assert "logger.propagate = False" in server
