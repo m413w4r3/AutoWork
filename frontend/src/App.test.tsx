@@ -160,4 +160,147 @@ describe("App éditions", () => {
       "Service indisponible.",
     );
   });
+
+  it("lance la découverte et rend explicites sources et incertitudes non vérifiées", async () => {
+    const candidateResult = {
+      batches: [
+        {
+          id: "61cb719a-6432-4381-911e-d4447ecf6332",
+          complementary_axis: "initial",
+          queries: ["Iran APT July 2026 technical report"],
+          citations: [
+            {
+              label: "Rapport original",
+              url: "https://vendor.example/report",
+              excerpt: "Rapport technique cité par le modèle.",
+            },
+          ],
+          discovery_model_run_id: "f7fd2882-da41-4d3c-9bea-e592b6d2524a",
+          structuring_model_run_id: "4c84c931-989b-498b-84b0-60901671321d",
+          created_at: "2026-08-10T10:00:00Z",
+        },
+      ],
+      candidates: [
+        {
+          id: "c20fb3d8-d56e-4215-b746-05fcbd02d30e",
+          batch_id: "61cb719a-6432-4381-911e-d4447ecf6332",
+          title: "Nouvelle campagne MuddyWater",
+          summary: "Une publication technique propose des IOC.",
+          novelty: "Nouvelle chaîne d’infection",
+          technical_potential: 4,
+          event_date: "2026-07-02",
+          uncertainties: ["Attribution non vérifiée"],
+          relevance_reasons: ["Rapport technique original"],
+          actors: ["MuddyWater"],
+          campaigns: [],
+          malware: ["ExampleRAT"],
+          cves: [],
+          victims: [],
+          sectors: ["gouvernement"],
+          countries: ["Iran"],
+          likely_artifacts: ["ioc", "configurations"],
+          editorial_status: "proposed",
+          sources: [
+            {
+              id: "c6c38491-e0a3-4315-a64e-e27946a350a4",
+              url: "https://vendor.example/report",
+              canonical_url: "https://vendor.example/report",
+              title: "Rapport technique original",
+              publisher: "Vendor Research",
+              role: "primary",
+              published_at: "2026-07-10",
+              event_date: "2026-07-02",
+              citation: "Citation du modèle",
+              verification_status: "unverified",
+              verification_changed_at: null,
+              verification_changed_by: null,
+            },
+          ],
+        },
+      ],
+      total: 1,
+      warning: "Propositions non vérifiées",
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      if (url.includes("/discovery/candidates"))
+        return Response.json(candidateResult);
+      if (url.endsWith("/discovery") && init?.method === "POST") {
+        return Response.json(
+          {
+            job_id: "20658589-a6d5-4af5-b026-d5c6fcb3b7f0",
+            status: "queued",
+            reused: false,
+          },
+          { status: 202 },
+        );
+      }
+      if (url.includes("/api/jobs/")) {
+        return Response.json({
+          id: "20658589-a6d5-4af5-b026-d5c6fcb3b7f0",
+          kind: "discover_edition",
+          aggregate_type: "edition",
+          aggregate_id: iranEdition.id,
+          status: "succeeded",
+          progress_current: 4,
+          progress_total: 4,
+          user_message: "Candidats proposés — vérification humaine requise",
+          attempt: 1,
+          max_attempts: 1,
+          next_retry_at: null,
+          started_at: "2026-08-10T10:00:00Z",
+          finished_at: "2026-08-10T10:01:00Z",
+          heartbeat_at: "2026-08-10T10:01:00Z",
+          error_code: null,
+          error_message: null,
+          correlation_id: "test",
+          output_reference: "discovery-batch://batch",
+          cancellation_requested: false,
+          created_at: "2026-08-10T10:00:00Z",
+          updated_at: "2026-08-10T10:01:00Z",
+        });
+      }
+      if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+      return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
+    const user = userEvent.setup();
+    renderApp();
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Nouvelle campagne MuddyWater",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Aucun sujet n’est sélectionné automatiquement/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Attribution non vérifiée")).toBeInTheDocument();
+    expect(screen.getByText(/primary · unverified/)).toBeInTheDocument();
+    await user.click(screen.getByText(/Requêtes et citations/));
+    expect(
+      screen.getByText("Iran APT July 2026 technical report"),
+    ).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: "Rechercher les sujets" }),
+    );
+    expect(await screen.findByText("Terminée")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([input, init]) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        return url.endsWith("/discovery") && init?.method === "POST";
+      }),
+    ).toBe(true);
+  });
 });

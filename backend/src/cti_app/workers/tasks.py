@@ -4,6 +4,7 @@ from uuid import UUID
 
 import dramatiq
 
+from cti_app.application.discovery import DiscoveryService
 from cti_app.application.jobs import JobExecutor, JobService, create_job_registry
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.config import get_settings
@@ -44,9 +45,10 @@ async def _execute_job(job_id: UUID) -> int | None:
 
     try:
         model_gateway = create_model_gateway(settings, uow_factory)
+        discovery_service = DiscoveryService(uow_factory, model_gateway, model_gateway)
         executor = JobExecutor(
             uow_factory,
-            create_job_registry(model_gateway),
+            create_job_registry(model_gateway, discovery_service),
             retry_base_seconds=settings.job_retry_base_seconds,
             retry_max_seconds=settings.job_retry_max_seconds,
         )

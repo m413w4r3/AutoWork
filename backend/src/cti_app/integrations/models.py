@@ -299,8 +299,16 @@ class FakeModelAdapter:
     requested_model = "fake-deterministic-v1"
     is_external = False
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        research_text: str | None = None,
+        structured_outputs: dict[str, BaseModel | dict[str, Any]] | None = None,
+    ) -> None:
         self._background: dict[str, SafeModelRequest] = {}
+        self._research_text = research_text
+        self._structured_outputs = structured_outputs or {}
+        self.calls: list[SafeModelRequest] = []
 
     async def invoke(
         self,
@@ -309,6 +317,7 @@ class FakeModelAdapter:
         role: ModelRole,
         output_schema: type[BaseModel] | None = None,
     ) -> AdapterResult:
+        self.calls.append(request)
         if request.background:
             response_id = f"fake-{request.authorized_input_hash[:24]}"
             self._background[response_id] = request
@@ -357,10 +366,13 @@ class FakeModelAdapter:
         structured = None
         output_text = f"fake:{role.value}:{digest}"
         if output_schema is not None:
+            fixture = self._structured_outputs.get(output_schema.__name__)
             structured = output_schema.model_validate(
-                _fake_value(output_schema.model_json_schema())
+                fixture if fixture is not None else _fake_value(output_schema.model_json_schema())
             )
             output_text = ""
+        elif role is ModelRole.RESEARCH and self._research_text is not None:
+            output_text = self._research_text
         return AdapterResult(
             status=AdapterResultStatus.COMPLETED,
             provider=self.provider,

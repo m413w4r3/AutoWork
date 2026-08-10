@@ -2,9 +2,9 @@
 
 Application interne de production de bulletins CTI mensuels. Elle fournit l'environnement
 local, la persistance canonique, le stockage de blobs, les jobs asynchrones observables et le
-premier workflow métier de création et de suivi des éditions. Aucun connecteur CTI externe
-n'est encore activé. Une passerelle LLM typée est disponible, mais aucun workflow de découverte
-ne l'appelle encore.
+premier workflow métier de création et de suivi des éditions. La découverte ponctuelle crée
+des candidats sourcés et explicitement non vérifiés via la passerelle LLM typée ; aucun
+connecteur de collecte ou de chasse CTI n'est encore activé.
 
 ## Prérequis
 
@@ -57,4 +57,4 @@ Les commandes racine sont `make test`, `make test-integration`, `make lint`, `ma
 - `docs/adr/` : décisions d'architecture ;
 - `scripts/` : contrôles de développement non destructifs.
 
-L'état de production est canonique dans PostgreSQL, les fichiers versionnés et les evidence packs. Les workspaces matérialisés, conversations LLM, files Redis et réponses de services externes ne sont jamais des sources de vérité. La stratégie détaillée est décrite dans [docs/persistence_and_storage.md](docs/persistence_and_storage.md), [docs/async_jobs.md](docs/async_jobs.md), [docs/editions.md](docs/editions.md) et [docs/model_gateway.md](docs/model_gateway.md).
+L'état de production est canonique dans PostgreSQL, les fichiers versionnés et les evidence packs. Les workspaces matérialisés, conversations LLM, files Redis et réponses de services externes ne sont jamais des sources de vérité. La stratégie détaillée est décrite dans [docs/persistence_and_storage.md](docs/persistence_and_storage.md), [docs/async_jobs.md](docs/async_jobs.md), [docs/editions.md](docs/editions.md), [docs/model_gateway.md](docs/model_gateway.md) et [docs/discovery.md](docs/discovery.md).

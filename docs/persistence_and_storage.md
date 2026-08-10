@@ -19,6 +19,7 @@ PostgreSQL est la source canonique des identités, métadonnées, relations et �
 | `edition_audit_events` | Audit métier des éditions | avant/après, acteur et corrélation ; append-only |
 | `job_events` | Transitions techniques des jobs | statuts avant/après et acteur ; append-only |
 | `model_runs` | Exécutions de modèles | hash d'entrée, versions, usage, statut et références de sortie ; aucun prompt en clair |
+| `discovery_batches` | Propositions de découverte | paramètres hachés, runs, requêtes, citations et candidats/sources non vérifiés |
 
 `source_documents` et `samples` conservent séparément : nom d'origine, origine, date d'acquisition, licence ou restriction, TLP, `do_not_submit` et `external_llm_allowed`. Partager les mêmes octets ne leur donne donc jamais la même sémantique.
 
@@ -52,7 +53,7 @@ Le manifeste contient `"canonical": false`. Supprimer ou modifier un workspace n
 
 ## Migrations et tests
 
-Les révisions `0001` à `0004` sont additives. Leurs downgrades retirent triggers, index et
+Les révisions `0001` à `0005` sont additives. Leurs downgrades retirent triggers, index et
 tables dans l'ordre inverse. La CI démarre un PostgreSQL isolé, crée une base temporaire par
 fixture, teste `upgrade head`, `downgrade base`, les transactions, les triggers et les
 repositories, puis supprime la base.

@@ -66,3 +66,7 @@ Les métriques sont calculées depuis PostgreSQL et n'introduisent pas de second
 Le kind `demo.deterministic` accepte `steps` et `label`, publie une progression déterministe
 et retourne une référence `demo://`. Il ne contacte aucun service et n’exécute aucun fichier.
 Le composant React `JobStatusCard` consomme le SSE et conserve un polling HTTP comme fallback.
+
+Le kind métier `discover_edition` reçoit uniquement des paramètres validés et appelle le
+`DiscoveryService`. Sa clé d'idempotence dérive du hash des paramètres de recherche ; une
+relance identique retrouve donc le job canonique au lieu de créer un second batch.

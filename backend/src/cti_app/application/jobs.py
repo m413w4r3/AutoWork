@@ -409,7 +409,9 @@ async def demo_job_handler(parameters: JobParameters, context: JobExecutionConte
     return f"demo://completed/{context.job_id}/{parameters.steps}"
 
 
-def create_job_registry(model_gateway: object | None = None) -> JobRegistry:
+def create_job_registry(
+    model_gateway: object | None = None, discovery_service: object | None = None
+) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
     if model_gateway is not None:
@@ -419,6 +421,12 @@ def create_job_registry(model_gateway: object | None = None) -> JobRegistry:
         if not isinstance(model_gateway, ModelGateway):
             raise TypeError("model_gateway must be a ModelGateway")
         register_model_jobs(registry, model_gateway)
+    if discovery_service is not None:
+        from cti_app.application.discovery import DiscoveryService, register_discovery_jobs
+
+        if not isinstance(discovery_service, DiscoveryService):
+            raise TypeError("discovery_service must be a DiscoveryService")
+        register_discovery_jobs(registry, discovery_service)
     return registry
 
 

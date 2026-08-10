@@ -5,6 +5,7 @@ from typing import Protocol, Self
 from uuid import UUID
 
 from cti_app.domain.blobs import BlobRecord
+from cti_app.domain.discovery import DiscoveryBatch
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics
@@ -114,6 +115,20 @@ class ModelRunRepository(Protocol):
     async def save(self, run: ModelRun) -> None: ...
 
 
+class DiscoveryBatchRepository(Protocol):
+    async def add_if_absent(self, batch: DiscoveryBatch) -> bool: ...
+
+    async def get(self, batch_id: UUID) -> DiscoveryBatch | None: ...
+
+    async def get_by_request_hash(
+        self, edition_id: UUID, request_hash: str
+    ) -> DiscoveryBatch | None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoveryBatch]: ...
+
+    async def save(self, batch: DiscoveryBatch) -> None: ...
+
+
 class UnitOfWork(Protocol):
     blobs: BlobRepository
     subjects: SubjectRepository
@@ -125,6 +140,7 @@ class UnitOfWork(Protocol):
     editions: EditionRepository
     edition_audit: EditionAuditRepository
     model_runs: ModelRunRepository
+    discovery_batches: DiscoveryBatchRepository
 
     async def __aenter__(self) -> Self: ...
 
@@ -186,3 +202,24 @@ class EditionUnitOfWork(Protocol):
 
 class EditionUnitOfWorkFactory(Protocol):
     def __call__(self) -> EditionUnitOfWork: ...
+
+
+class DiscoveryUnitOfWork(Protocol):
+    discovery_batches: DiscoveryBatchRepository
+
+    async def __aenter__(self) -> Self: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+    async def commit(self) -> None: ...
+
+    async def rollback(self) -> None: ...
+
+
+class DiscoveryUnitOfWorkFactory(Protocol):
+    def __call__(self) -> DiscoveryUnitOfWork: ...

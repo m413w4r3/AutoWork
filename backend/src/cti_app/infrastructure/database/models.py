@@ -306,3 +306,37 @@ class ModelRunRow(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DiscoveryBatchRow(Base):
+    __tablename__ = "discovery_batches"
+    __table_args__ = (
+        UniqueConstraint("edition_id", "request_hash", name="uq_discovery_batches_request"),
+        CheckConstraint(f"tlp IN ({TLP_VALUES_SQL})", name="ck_discovery_batches_tlp"),
+        CheckConstraint(
+            "char_length(request_hash) = 64 AND request_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_discovery_batches_request_hash",
+        ),
+        CheckConstraint("status = 'completed'", name="ck_discovery_batches_status"),
+        Index("ix_discovery_batches_edition", "edition_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    edition_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
+    )
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    complementary_axis: Mapped[str] = mapped_column(String(500), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    discovery_model_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("model_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    structuring_model_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("model_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    tlp: Mapped[str] = mapped_column(String(16), nullable=False)
+    sensitivity: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_llm_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -3,9 +3,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from cti_app.api.discovery import router as discovery_router
 from cti_app.api.editions import router as editions_router
 from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
+from cti_app.application.discovery import DiscoveryService
 from cti_app.application.editions import EditionService
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import JobService, create_job_registry
@@ -32,13 +34,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         return SqlAlchemyUnitOfWork(session_factory)
 
     model_gateway = create_model_gateway(settings, uow_factory)
-    registry = create_job_registry(model_gateway)
+    discovery_service = DiscoveryService(uow_factory, model_gateway, model_gateway)
+    registry = create_job_registry(model_gateway, discovery_service)
     app.state.readiness = readiness
     app.state.job_service = JobService(uow_factory, registry)
     app.state.job_dispatcher = DramatiqJobDispatcher()
     app.state.edition_service = EditionService(uow_factory)
     app.state.identity_provider = LocalIdentityProvider()
     app.state.model_gateway = model_gateway
+    app.state.discovery_service = discovery_service
     yield
     await readiness.close()
     await job_engine.dispose()
@@ -49,6 +53,7 @@ def create_app() -> FastAPI:
     application.add_middleware(CorrelationIdMiddleware)
     application.include_router(health_router)
     application.include_router(editions_router)
+    application.include_router(discovery_router)
     application.include_router(jobs_router)
     return application
 

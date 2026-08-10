@@ -2,6 +2,12 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useEffect, useState } from "react";
 
 import {
+  fetchDiscovery,
+  launchDiscovery,
+  markDiscoverySource,
+  type SourceVerificationStatus,
+} from "./api/discovery";
+import {
   ApiError,
   createEdition,
   type Edition,
@@ -12,6 +18,7 @@ import {
   transitionEdition,
   type Tlp,
 } from "./api/editions";
+import { JobStatusCard } from "./components/JobStatusCard";
 
 const statusLabels: Record<EditionStatus, string> = {
   draft: "Brouillon",
@@ -369,6 +376,7 @@ function EditionDetailPage({ editionId }: { editionId: string }) {
           </dd>
         </div>
       </dl>
+      <DiscoveryPanel editionId={current.id} />
       <section className="actions-panel" aria-labelledby="edition-actions">
         <h2 id="edition-actions">Actions disponibles</h2>
         {transition.error ? (
@@ -396,6 +404,230 @@ function EditionDetailPage({ editionId }: { editionId: string }) {
           </div>
         )}
       </section>
+    </section>
+  );
+}
+
+function DiscoveryPanel({ editionId }: { editionId: string }) {
+  const queryClient = useQueryClient();
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [axis, setAxis] = useState("initial");
+  const [search, setSearch] = useState("");
+  const [minimum, setMinimum] = useState(0);
+  const [sourceStatus, setSourceStatus] = useState<
+    SourceVerificationStatus | ""
+  >("");
+  const [sort, setSort] = useState<
+    "newest" | "technical" | "novelty" | "title"
+  >("technical");
+  const discovery = useQuery({
+    queryKey: ["discovery", editionId, search, minimum, sourceStatus, sort],
+    queryFn: () =>
+      fetchDiscovery(editionId, {
+        search,
+        minTechnicalPotential: minimum,
+        sourceStatus,
+        sort,
+      }),
+    refetchInterval: jobId ? 2_000 : false,
+  });
+  const launch = useMutation({
+    mutationFn: () => launchDiscovery(editionId, axis.trim() || "initial"),
+    onSuccess: (result) => {
+      setJobId(result.job_id);
+      void queryClient.invalidateQueries({
+        queryKey: ["discovery", editionId],
+      });
+    },
+  });
+  const markSource = useMutation({
+    mutationFn: ({
+      sourceId,
+      status,
+    }: {
+      sourceId: string;
+      status: SourceVerificationStatus;
+    }) => markDiscoverySource(editionId, sourceId, status),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: ["discovery", editionId] }),
+  });
+  const candidates = discovery.data?.candidates ?? [];
+  const batches = discovery.data?.batches ?? [];
+
+  return (
+    <section className="discovery-panel" aria-labelledby="discovery-heading">
+      <div className="discovery-heading">
+        <div>
+          <p className="eyebrow">Découverte ponctuelle</p>
+          <h2 id="discovery-heading">Sujets candidats</h2>
+        </div>
+        <button
+          className="button"
+          disabled={launch.isPending}
+          onClick={() => launch.mutate()}
+        >
+          {launch.isPending ? "Lancement…" : "Rechercher les sujets"}
+        </button>
+      </div>
+      <label className="axis-field">
+        Axe de recherche
+        <input
+          value={axis}
+          onChange={(event) => setAxis(event.target.value)}
+          placeholder="initial ou axe complémentaire"
+        />
+      </label>
+      <p className="verification-warning" role="note">
+        Non vérifié : les résultats sont des propositions sourcées. Aucun sujet
+        n’est sélectionné automatiquement.
+      </p>
+      {launch.error ? (
+        <ErrorMessage error={launch.error} fallback="Recherche impossible." />
+      ) : null}
+      {jobId ? <JobStatusCard jobId={jobId} /> : null}
+      <div className="candidate-filters" aria-label="Filtres des candidats">
+        <label>
+          Recherche
+          <input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+        </label>
+        <label>
+          Potentiel technique minimal
+          <select
+            value={minimum}
+            onChange={(event) => setMinimum(Number(event.target.value))}
+          >
+            {[0, 1, 2, 3, 4].map((value) => (
+              <option key={value} value={value}>
+                {value}/4
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          État des sources
+          <select
+            value={sourceStatus}
+            onChange={(event) =>
+              setSourceStatus(
+                event.target.value as SourceVerificationStatus | "",
+              )
+            }
+          >
+            <option value="">Tous</option>
+            <option value="unverified">Non vérifiée</option>
+            <option value="verify_later">À vérifier</option>
+            <option value="invalid">Invalide</option>
+            <option value="unavailable">Indisponible</option>
+          </select>
+        </label>
+        <label>
+          Tri
+          <select
+            value={sort}
+            onChange={(event) => setSort(event.target.value as typeof sort)}
+          >
+            <option value="technical">Potentiel technique</option>
+            <option value="newest">Date de l’événement</option>
+            <option value="novelty">Nouveauté</option>
+            <option value="title">Titre</option>
+          </select>
+        </label>
+      </div>
+      {discovery.isPending ? (
+        <p role="status">Chargement des candidats…</p>
+      ) : null}
+      {discovery.isError ? (
+        <ErrorMessage
+          error={discovery.error}
+          fallback="Candidats inaccessibles."
+        />
+      ) : null}
+      <div className="candidate-list">
+        {candidates.map((candidate) => (
+          <article className="candidate-card" key={candidate.id}>
+            <div className="candidate-card__heading">
+              <h3>{candidate.title}</h3>
+              <span>Technique {candidate.technical_potential}/4</span>
+            </div>
+            <p>{candidate.summary}</p>
+            <p>
+              <strong>Nouveauté :</strong> {candidate.novelty}
+            </p>
+            <p>
+              <strong>Pertinence :</strong>{" "}
+              {candidate.relevance_reasons.join(", ")}
+            </p>
+            <p>
+              <strong>Matière probable :</strong>{" "}
+              {candidate.likely_artifacts.join(", ") || "non signalée"}
+            </p>
+            {candidate.uncertainties.length ? (
+              <div className="uncertainties">
+                <strong>Incertitudes</strong>
+                <ul>
+                  {candidate.uncertainties.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            <h4>Sources proposées</h4>
+            <ul className="source-list">
+              {candidate.sources.map((source) => (
+                <li key={source.id}>
+                  <a href={source.url} target="_blank" rel="noreferrer">
+                    {source.title}
+                  </a>
+                  <span>
+                    {source.role} · {source.verification_status}
+                  </span>
+                  <select
+                    aria-label={`État de ${source.title}`}
+                    value={source.verification_status}
+                    disabled={markSource.isPending}
+                    onChange={(event) =>
+                      markSource.mutate({
+                        sourceId: source.id,
+                        status: event.target.value as SourceVerificationStatus,
+                      })
+                    }
+                  >
+                    <option value="unverified">Non vérifiée</option>
+                    <option value="verify_later">À vérifier</option>
+                    <option value="invalid">Invalide</option>
+                    <option value="unavailable">Indisponible</option>
+                  </select>
+                </li>
+              ))}
+            </ul>
+          </article>
+        ))}
+      </div>
+      {batches.map((batch) => (
+        <details className="research-trace" key={batch.id}>
+          <summary>Requêtes et citations — {batch.complementary_axis}</summary>
+          <h3>Requêtes</h3>
+          <ul>
+            {batch.queries.map((query) => (
+              <li key={query}>{query}</li>
+            ))}
+          </ul>
+          <h3>Citations du modèle</h3>
+          <ul>
+            {batch.citations.map((citation) => (
+              <li key={`${citation.url}-${citation.label}`}>
+                <a href={citation.url} target="_blank" rel="noreferrer">
+                  {citation.label}
+                </a>
+                {citation.excerpt ? <p>{citation.excerpt}</p> : null}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ))}
     </section>
   );
 }

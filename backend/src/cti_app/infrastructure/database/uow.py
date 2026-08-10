@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.persistence import (
     BlobRepository,
+    DiscoveryBatchRepository,
     EditionAuditRepository,
     EditionRepository,
     JobEventRepository,
@@ -16,6 +17,7 @@ from cti_app.application.persistence import (
 )
 from cti_app.infrastructure.database.repositories import (
     SqlAlchemyBlobRepository,
+    SqlAlchemyDiscoveryBatchRepository,
     SqlAlchemyEditionAuditRepository,
     SqlAlchemyEditionRepository,
     SqlAlchemyJobEventRepository,
@@ -39,6 +41,7 @@ class SqlAlchemyUnitOfWork:
     editions: EditionRepository
     edition_audit: EditionAuditRepository
     model_runs: ModelRunRepository
+    discovery_batches: DiscoveryBatchRepository
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -57,6 +60,7 @@ class SqlAlchemyUnitOfWork:
         self.editions = SqlAlchemyEditionRepository(self._session)
         self.edition_audit = SqlAlchemyEditionAuditRepository(self._session)
         self.model_runs = SqlAlchemyModelRunRepository(self._session)
+        self.discovery_batches = SqlAlchemyDiscoveryBatchRepository(self._session)
         self._committed = False
         return self
 
