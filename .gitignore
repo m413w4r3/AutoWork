@@ -36,6 +36,7 @@ frontend/playwright-report/
 .DS_Store
 
 # Local application data and generated outputs
+docs/
 data/
 work/
 output/
