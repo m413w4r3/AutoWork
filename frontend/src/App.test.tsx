@@ -26,6 +26,15 @@ const iranEdition: Edition = {
   updated_at: "2026-08-08T00:00:00Z",
 };
 
+const emptyEditorialBoard = {
+  groups: [],
+  selected_briefs: 0,
+  selected_major: 0,
+  target_briefs: 6,
+  target_major: 2,
+  automatic_selection: false,
+};
+
 function renderApp() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
@@ -94,6 +103,8 @@ describe("App éditions", () => {
       if (url === "/api/editions" && init?.method === "POST") {
         return Response.json(iranEdition, { status: 201 });
       }
+      if (url.includes("/editorial-groups"))
+        return Response.json(emptyEditorialBoard);
       if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
       return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
     });
@@ -230,6 +241,8 @@ describe("App éditions", () => {
             : input.url;
       if (url.includes("/discovery/candidates"))
         return Response.json(candidateResult);
+      if (url.includes("/editorial-groups"))
+        return Response.json(emptyEditorialBoard);
       if (url.endsWith("/discovery") && init?.method === "POST") {
         return Response.json(
           {
@@ -279,7 +292,9 @@ describe("App éditions", () => {
       }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/Aucun sujet n’est sélectionné automatiquement/),
+      screen.getAllByText(
+        /Recherche effectuée depuis les citations visibles de ChatGPT/,
+      )[0],
     ).toBeInTheDocument();
     expect(screen.getByText("Attribution non vérifiée")).toBeInTheDocument();
     expect(screen.getByText(/primary · unverified/)).toBeInTheDocument();

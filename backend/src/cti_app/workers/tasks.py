@@ -5,13 +5,17 @@ from uuid import UUID
 import dramatiq
 
 from cti_app.application.discovery import DiscoveryService
+from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.jobs import JobExecutor, JobService, create_job_registry
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.config import get_settings
 from cti_app.domain.jobs import JobStatus
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
-from cti_app.integrations.model_factory import create_model_gateway
+from cti_app.integrations.model_factory import (
+    create_bridge_capabilities_provider,
+    create_model_gateway,
+)
 from cti_app.workers.broker import broker as broker
 
 
@@ -45,7 +49,14 @@ async def _execute_job(job_id: UUID) -> int | None:
 
     try:
         model_gateway = create_model_gateway(settings, uow_factory)
-        discovery_service = DiscoveryService(uow_factory, model_gateway, model_gateway)
+        editorial_service = EditorialGroupingService(uow_factory, model_gateway)
+        discovery_service = DiscoveryService(
+            uow_factory,
+            model_gateway,
+            model_gateway,
+            bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
+            after_discovery=editorial_service.synchronize,
+        )
         executor = JobExecutor(
             uow_factory,
             create_job_registry(model_gateway, discovery_service),

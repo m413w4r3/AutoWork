@@ -17,6 +17,7 @@ export interface SourceCandidate {
   event_date: string | null;
   citation: string | null;
   verification_status: SourceVerificationStatus;
+  relationship_status: "provisional" | "verified";
   verification_changed_at: string | null;
   verification_changed_by: string | null;
 }
@@ -39,6 +40,7 @@ export interface CandidateTopic {
   sectors: string[];
   countries: string[];
   likely_artifacts: string[];
+  iocs: string[];
   editorial_status: "proposed";
   sources: SourceCandidate[];
 }
@@ -51,6 +53,15 @@ export interface DiscoveryBatch {
   discovery_model_run_id: string;
   structuring_model_run_id: string;
   created_at: string;
+  source_mode:
+    | "native_complete"
+    | "visible_citations_only"
+    | "model_declared_urls"
+    | "manual_import";
+  bridge_capabilities: Record<string, unknown>;
+  citation_count: number;
+  source_coverage_complete: boolean;
+  source_coverage_incomplete_reason: string | null;
 }
 
 export interface DiscoveryResult {

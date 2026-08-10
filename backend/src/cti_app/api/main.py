@@ -2,22 +2,30 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from minio import Minio
 
 from cti_app.api.discovery import router as discovery_router
 from cti_app.api.editions import router as editions_router
+from cti_app.api.editorial import router as editorial_router
 from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.application.discovery import DiscoveryService
 from cti_app.application.editions import EditionService
+from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import JobService, create_job_registry
 from cti_app.application.persistence import UnitOfWork
+from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
+from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.health import InfrastructureReadinessChecker
 from cti_app.infrastructure.jobs import DramatiqJobDispatcher
-from cti_app.integrations.model_factory import create_model_gateway
+from cti_app.integrations.model_factory import (
+    create_bridge_capabilities_provider,
+    create_model_gateway,
+)
 from cti_app.logging import CorrelationIdMiddleware, configure_logging
 
 settings = get_settings()
@@ -34,7 +42,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         return SqlAlchemyUnitOfWork(session_factory)
 
     model_gateway = create_model_gateway(settings, uow_factory)
-    discovery_service = DiscoveryService(uow_factory, model_gateway, model_gateway)
+    blob_store = MinioBlobStore(
+        Minio(
+            settings.s3_endpoint,
+            access_key=settings.s3_access_key,
+            secret_key=settings.s3_secret_key,
+            secure=settings.s3_secure,
+        ),
+        physical_bucket=settings.s3_bucket,
+    )
+    editorial_service = EditorialGroupingService(
+        uow_factory,
+        model_gateway,
+        materializer=SubjectWorkspaceMaterializer(blob_store),
+        workspace_root=settings.subject_workspace_root,
+    )
+    discovery_service = DiscoveryService(
+        uow_factory,
+        model_gateway,
+        model_gateway,
+        bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
+        after_discovery=editorial_service.synchronize,
+    )
     registry = create_job_registry(model_gateway, discovery_service)
     app.state.readiness = readiness
     app.state.job_service = JobService(uow_factory, registry)
@@ -43,6 +72,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.identity_provider = LocalIdentityProvider()
     app.state.model_gateway = model_gateway
     app.state.discovery_service = discovery_service
+    app.state.editorial_service = editorial_service
     yield
     await readiness.close()
     await job_engine.dispose()
@@ -54,6 +84,7 @@ def create_app() -> FastAPI:
     application.include_router(health_router)
     application.include_router(editions_router)
     application.include_router(discovery_router)
+    application.include_router(editorial_router)
     application.include_router(jobs_router)
     return application
 

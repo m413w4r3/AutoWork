@@ -19,6 +19,7 @@ import {
   type Tlp,
 } from "./api/editions";
 import { JobStatusCard } from "./components/JobStatusCard";
+import { EditorialBoard } from "./components/EditorialBoard";
 
 const statusLabels: Record<EditionStatus, string> = {
   draft: "Brouillon",
@@ -377,6 +378,7 @@ function EditionDetailPage({ editionId }: { editionId: string }) {
         </div>
       </dl>
       <DiscoveryPanel editionId={current.id} />
+      <EditorialBoard editionId={current.id} />
       <section className="actions-panel" aria-labelledby="edition-actions">
         <h2 id="edition-actions">Actions disponibles</h2>
         {transition.error ? (
@@ -478,8 +480,8 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
         />
       </label>
       <p className="verification-warning" role="note">
-        Non vérifié : les résultats sont des propositions sourcées. Aucun sujet
-        n’est sélectionné automatiquement.
+        Recherche effectuée depuis les citations visibles de ChatGPT. La liste
+        des sources et leurs relations seront vérifiées lors de la collecte.
       </p>
       {launch.error ? (
         <ErrorMessage error={launch.error} fallback="Recherche impossible." />

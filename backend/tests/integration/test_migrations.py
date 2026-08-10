@@ -22,6 +22,8 @@ EXPECTED_TABLES = {
     "job_events",
     "model_runs",
     "discovery_batches",
+    "editorial_groups",
+    "human_decisions",
 }
 
 

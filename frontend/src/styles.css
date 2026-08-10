@@ -161,6 +161,81 @@ a:focus-visible {
   background: rgb(250 252 249 / 90%);
 }
 
+.editorial-board {
+  display: grid;
+  gap: 1rem;
+  margin-top: 2rem;
+  padding: 1.25rem;
+  border: 1px solid #c8d7cd;
+  border-radius: 1rem;
+  background: #fff;
+}
+
+.editorial-board__heading,
+.editorial-group-card__heading,
+.editorial-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.selection-counter {
+  padding: 0.75rem 1rem;
+  border-radius: 0.75rem;
+  background: #eaf1ec;
+}
+
+.editorial-group-list {
+  display: grid;
+  gap: 1rem;
+}
+
+.editorial-group-card {
+  padding: 1.1rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.85rem;
+  background: #fbfcfa;
+}
+
+.group-check,
+.group-candidates label {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.group-check input,
+.group-candidates input {
+  min-height: auto;
+}
+
+.historical-comparison {
+  padding: 0.8rem 1rem;
+  border-left: 4px solid #7c5aa6;
+  background: #f4eefb;
+}
+
+.score-details,
+.group-candidates {
+  margin: 1rem 0;
+  padding: 0.8rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.65rem;
+}
+
+.score-details dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.7rem;
+}
+
+.score-details dd {
+  margin: 0.2rem 0 0;
+  color: #5b6b62;
+}
+
 .discovery-heading,
 .candidate-card__heading {
   display: flex;

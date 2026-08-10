@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import date
-from typing import Literal
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -26,6 +27,7 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoverySourceMode,
     SourceCandidate,
     SourceRole,
     SourceVerificationStatus,
@@ -95,6 +97,7 @@ class ResearchTopic(BaseModel):
     victims: list[str] = Field(max_length=100)
     sectors: list[str] = Field(max_length=100)
     countries: list[str] = Field(max_length=100)
+    iocs: list[str] = Field(default_factory=list, max_length=500)
     artifact_availability: ArtifactAvailability
     uncertainties: list[str] = Field(max_length=100)
     reasons_for_relevance: list[str] = Field(max_length=100)
@@ -146,16 +149,37 @@ class SourceCandidateNotFoundError(LookupError):
     pass
 
 
+class BridgeCapabilitiesProvider(Protocol):
+    async def capabilities(self) -> dict[str, Any]: ...
+
+
 class DiscoveryService:
     def __init__(
         self,
         uow_factory: DiscoveryUnitOfWorkFactory,
         research_model: ResearchModel,
         structured_model: StructuredExtractionModel,
+        *,
+        bridge_capabilities: Mapping[str, object] | None = None,
+        bridge_capabilities_provider: BridgeCapabilitiesProvider | None = None,
+        after_discovery: Callable[[UUID], Awaitable[object]] | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._research_model = research_model
         self._structured_model = structured_model
+        self._bridge_capabilities_provider = bridge_capabilities_provider
+        self._after_discovery = after_discovery
+        self._bridge_capabilities = dict(
+            bridge_capabilities
+            or {
+                "transport": "chatgpt_web_ui",
+                "web_search": "prompt_instructed",
+                "structured_output": "prompt_and_client_validation",
+                "background": "memory_only",
+                "native_usage": False,
+                "native_sources": False,
+            }
+        )
 
     async def discover_edition(
         self, parameters: DiscoverEditionParameters, context: JobExecutionContext
@@ -169,6 +193,7 @@ class DiscoveryService:
                 return existing
 
         await context.report_progress(1, 4, "Préparation de la recherche sourcée")
+        bridge_capabilities = await self._capabilities_snapshot()
         research_request = ModelRequest(
             text=_research_prompt(parameters),
             prompt_template_id=PROMPT_TEMPLATE_ID,
@@ -208,6 +233,7 @@ class DiscoveryService:
             structured.structured_output,
             research.run.id,
             structured.run.id,
+            bridge_capabilities,
         )
         async with self._uow_factory() as uow:
             batches = list(await uow.discovery_batches.list_for_edition(parameters.edition_id))
@@ -223,8 +249,23 @@ class DiscoveryService:
                     raise RuntimeError("Discovery conflict without canonical batch")
                 batch = existing
             await uow.commit()
+        if self._after_discovery is not None:
+            await self._after_discovery(parameters.edition_id)
         await context.report_progress(4, 4, "Candidats proposés — vérification humaine requise")
         return batch
+
+    async def _capabilities_snapshot(self) -> dict[str, object]:
+        if self._bridge_capabilities_provider is None:
+            return dict(self._bridge_capabilities)
+        try:
+            capabilities = await self._bridge_capabilities_provider.capabilities()
+        except Exception as exc:
+            return {
+                **self._bridge_capabilities,
+                "snapshot_available": False,
+                "snapshot_error_type": type(exc).__name__,
+            }
+        return {**capabilities, "snapshot_available": True}
 
     async def list_batches(self, edition_id: UUID) -> list[DiscoveryBatch]:
         async with self._uow_factory() as uow:
@@ -294,8 +335,11 @@ en IOC, échantillons, configurations, PCAP, règles ou TTP. Pour chaque publica
 source originale, les sources réellement indépendantes, les simples reprises/agrégateurs,
 la date de l'événement et de publication, les acteurs, campagnes, malwares, CVE, victimes,
 secteurs et pays, la présence probable d'artefacts techniques, les incertitudes et les raisons
-de pertinence. Cite chaque source avec son URL HTTP(S). Ne formule aucune attribution nouvelle
-et ne sélectionne aucun sujet pour publication."""
+de pertinence. Cite explicitement chaque source effectivement utilisée et fournis son URL
+HTTP(S) dans la réponse lorsque cette URL est visible. N'invente jamais une URL absente.
+La liste peut être incomplète : ne présente aucun ensemble de sources comme exhaustif, ne
+déduis jamais qu'une source n'existe pas parce qu'elle n'est pas visible. Ne formule aucune
+attribution nouvelle et ne sélectionne aucun sujet pour publication."""
 
 
 def _structuring_prompt(raw: str) -> str:
@@ -313,6 +357,7 @@ def _to_domain_batch(
     result: ResearchBatch,
     research_run_id: UUID,
     structuring_run_id: UUID,
+    bridge_capabilities: Mapping[str, object],
 ) -> DiscoveryBatch:
     candidates = []
     for topic in result.topics:
@@ -357,6 +402,7 @@ def _to_domain_batch(
                 tlp=parameters.tlp,
                 sensitivity=parameters.sensitivity,
                 external_llm_allowed=parameters.external_llm_allowed,
+                iocs=tuple(topic.iocs),
             )
         )
     return DiscoveryBatch(
@@ -371,6 +417,14 @@ def _to_domain_batch(
         tlp=parameters.tlp,
         sensitivity=parameters.sensitivity,
         external_llm_allowed=parameters.external_llm_allowed,
+        source_mode=DiscoverySourceMode.VISIBLE_CITATIONS_ONLY,
+        bridge_capabilities=dict(bridge_capabilities),
+        citation_count=len(result.citations),
+        source_coverage_complete=False,
+        source_coverage_incomplete_reason=(
+            "Recherche effectuée depuis les citations visibles de ChatGPT ; "
+            "la liste native complète des sources consultées n'est pas disponible."
+        ),
     )
 
 

@@ -104,7 +104,14 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
     assert launched.status_code == 202
     assert job.json()["status"] == "succeeded"
     assert candidates.json()["total"] == 1
-    assert candidates.json()["warning"].startswith("Propositions de modèle non vérifiées")
+    assert candidates.json()["warning"] == (
+        "Recherche effectuée depuis les citations visibles de ChatGPT. La liste des sources "
+        "et leurs relations seront vérifiées lors de la collecte."
+    )
+    assert candidates.json()["batches"][0]["source_coverage_complete"] is False
+    assert candidates.json()["candidates"][0]["sources"][0]["relationship_status"] == (
+        "provisional"
+    )
     assert candidates.json()["candidates"][0]["editorial_status"] == "proposed"
     assert marked.json()["verification_status"] == "verify_later"
     assert duplicate.json()["reused"] is True

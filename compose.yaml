@@ -95,6 +95,9 @@ services:
       QWEN_IS_EXTERNAL: ${QWEN_IS_EXTERNAL:-false}
       MODEL_FORCE_ADAPTER: ${MODEL_FORCE_ADAPTER:-auto}
       MODEL_REQUEST_TIMEOUT_SECONDS: ${MODEL_REQUEST_TIMEOUT_SECONDS:-900}
+      SUBJECT_WORKSPACE_ROOT: /work/subjects
+    volumes:
+      - subject_workspaces:/work/subjects
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     extra_hosts:
@@ -217,3 +220,4 @@ volumes:
   postgres_data:
   redis_data:
   minio_data:
+  subject_workspaces:

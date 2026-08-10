@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -26,13 +26,27 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.model_gateway import ModelGateway, ModelRouter
 from cti_app.domain.classification import TLP
-from cti_app.domain.discovery import SourceRole, SourceVerificationStatus
+from cti_app.domain.discovery import (
+    DiscoverySourceMode,
+    SourceRelationshipStatus,
+    SourceRole,
+    SourceVerificationStatus,
+)
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import ModelProvider
 from cti_app.integrations.models import FakeModelAdapter, InMemoryModelOutputStore
 from tests.discovery_support import InMemoryDiscoveryUnitOfWorkFactory
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
+
+
+class FakeBridgeCapabilities:
+    async def capabilities(self) -> dict[str, object]:
+        return {
+            "web_search": True,
+            "native_sources": False,
+            "visible_citations": True,
+        }
 
 
 def research_fixture() -> ResearchBatch:
@@ -150,7 +164,18 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
         InMemoryModelOutputStore(),
     )
     discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
-    discovery = DiscoveryService(discovery_uow, gateway, gateway)
+    grouped_editions: list[UUID] = []
+
+    async def group_after_discovery(edition_id: UUID) -> None:
+        grouped_editions.append(edition_id)
+
+    discovery = DiscoveryService(
+        discovery_uow,
+        gateway,
+        gateway,
+        bridge_capabilities_provider=FakeBridgeCapabilities(),
+        after_discovery=group_after_discovery,
+    )
     job_uow = InMemoryJobUnitOfWorkFactory()
     registry = create_job_registry(gateway, discovery)
     jobs = JobService(job_uow, registry)
@@ -172,6 +197,15 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     batches = await discovery.list_batches(params.edition_id)
     assert len(batches) == 1
     assert len(batches[0].candidates) == 1
+    assert batches[0].source_mode is DiscoverySourceMode.VISIBLE_CITATIONS_ONLY
+    assert batches[0].source_coverage_complete is False
+    assert batches[0].citation_count == 1
+    assert batches[0].bridge_capabilities == {
+        "web_search": True,
+        "native_sources": False,
+        "visible_citations": True,
+        "snapshot_available": True,
+    }
     candidate = batches[0].candidates[0]
     assert candidate.editorial_status == "proposed"
     assert {source.role for source in candidate.sources} == {
@@ -183,7 +217,13 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
         source.verification_status is SourceVerificationStatus.UNVERIFIED
         for source in candidate.sources
     )
+    assert all(
+        source.relationship_status is SourceRelationshipStatus.PROVISIONAL
+        for source in candidate.sources
+    )
+    assert len({source.canonical_url for source in candidate.sources}) == len(candidate.sources)
     assert len(fake.calls) == 2
+    assert grouped_editions == [params.edition_id]
 
     with pytest.raises(DuplicateJobError):
         await jobs.submit(
@@ -210,6 +250,7 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     batches = await discovery.list_batches(params.edition_id)
     assert len(batches) == 2
     assert sum(len(batch.candidates) for batch in batches) == 1
+    assert grouped_editions == [params.edition_id, params.edition_id]
 
 
 def test_research_batch_rejects_non_http_urls() -> None:

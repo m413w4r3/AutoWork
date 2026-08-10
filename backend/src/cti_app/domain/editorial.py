@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any
+from uuid import UUID, uuid4
+
+from cti_app.domain.discovery import SourceRelationshipStatus
+
+
+class GroupingOutcome(StrEnum):
+    NEW_SUBJECT = "new_subject"
+    DUPLICATE_PUBLICATION = "duplicate_same_publication"
+    UPDATE_PREVIOUS = "update_previous_subject"
+    NON_INDEPENDENT_REPRINT = "non_independent_reprint"
+    AMBIGUOUS_REVIEW = "ambiguous_review"
+
+
+class EditorialType(StrEnum):
+    BRIEF = "brief"
+    MAJOR = "major"
+
+
+class EditorialGroupStatus(StrEnum):
+    PROPOSED = "proposed"
+    REJECTED = "rejected"
+    SELECTED = "selected"
+    SUPERSEDED = "superseded"
+
+
+class GroupingConfidence(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class HumanDecisionType(StrEnum):
+    MERGE = "merge"
+    SPLIT = "split"
+    REJECT = "reject"
+    SELECT = "select"
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateReference:
+    batch_id: UUID
+    candidate_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialScore:
+    impact: int
+    novelty: int
+    technical_depth: int
+    hunting_potential: int
+    actionability: int
+    source_quality: int
+    justifications: dict[str, str]
+
+    def __post_init__(self) -> None:
+        values = (
+            self.impact,
+            self.novelty,
+            self.technical_depth,
+            self.hunting_potential,
+            self.actionability,
+            self.source_quality,
+        )
+        if any(value < 0 or value > 4 for value in values):
+            raise ValueError("Editorial score dimensions must be between 0 and 4")
+
+    @property
+    def total(self) -> int:
+        return sum(
+            (
+                self.impact,
+                self.novelty,
+                self.technical_depth,
+                self.hunting_potential,
+                self.actionability,
+                self.source_quality,
+            )
+        )
+
+
+@dataclass(slots=True)
+class EditorialGroup:
+    edition_id: UUID
+    title: str
+    candidate_references: tuple[CandidateReference, ...]
+    outcome: GroupingOutcome
+    score: EditorialScore
+    source_relationship_status: SourceRelationshipStatus
+    needs_source_verification: bool
+    needs_source_expansion: bool
+    grouping_confidence: GroupingConfidence
+    grouping_justification: str
+    id: UUID = field(default_factory=uuid4)
+    potential_historical_group_id: UUID | None = None
+    status: EditorialGroupStatus = EditorialGroupStatus.PROPOSED
+    editorial_type: EditorialType | None = None
+    subject_id: UUID | None = None
+    version: int = 1
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        self.title = self.title.strip()
+        self.grouping_justification = self.grouping_justification.strip()
+        self.candidate_references = tuple(dict.fromkeys(self.candidate_references))
+        if not self.title or not self.candidate_references or not self.grouping_justification:
+            raise ValueError("Editorial group title, candidates and justification are required")
+        if self.source_relationship_status is SourceRelationshipStatus.PROVISIONAL:
+            self.needs_source_verification = True
+
+    def add_candidates(self, references: tuple[CandidateReference, ...]) -> None:
+        if self.status is not EditorialGroupStatus.PROPOSED:
+            raise ValueError("Only proposed groups can be enriched")
+        self.candidate_references = tuple(dict.fromkeys((*self.candidate_references, *references)))
+        self._bump()
+
+    def remove_candidates(self, references: set[CandidateReference]) -> None:
+        if self.status is not EditorialGroupStatus.PROPOSED:
+            raise ValueError("Only proposed groups can be split")
+        remaining = tuple(item for item in self.candidate_references if item not in references)
+        if not remaining:
+            raise ValueError("A split cannot empty its source group")
+        self.candidate_references = remaining
+        self._bump()
+
+    def supersede(self) -> None:
+        if self.status is not EditorialGroupStatus.PROPOSED:
+            raise ValueError("Only proposed groups can be merged")
+        self.status = EditorialGroupStatus.SUPERSEDED
+        self._bump()
+
+    def reject(self) -> None:
+        if self.status is not EditorialGroupStatus.PROPOSED:
+            raise ValueError("Only proposed groups can be rejected")
+        self.status = EditorialGroupStatus.REJECTED
+        self._bump()
+
+    def select(self, editorial_type: EditorialType, subject_id: UUID) -> None:
+        if self.status is not EditorialGroupStatus.PROPOSED:
+            raise ValueError("Only proposed groups can be selected")
+        self.status = EditorialGroupStatus.SELECTED
+        self.editorial_type = editorial_type
+        self.subject_id = subject_id
+        self._bump()
+
+    def _bump(self) -> None:
+        self.version += 1
+        self.updated_at = datetime.now(UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class HumanDecision:
+    edition_id: UUID
+    decision_type: HumanDecisionType
+    group_ids: tuple[UUID, ...]
+    actor_id: str
+    correlation_id: str
+    payload: dict[str, Any]
+    id: UUID = field(default_factory=uuid4)
+    occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        if not self.group_ids or not self.actor_id.strip() or not self.correlation_id.strip():
+            raise ValueError("Human decision requires groups, actor and correlation")

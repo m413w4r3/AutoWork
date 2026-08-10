@@ -7,6 +7,7 @@ from uuid import UUID
 from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.discovery import DiscoveryBatch
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
+from cti_app.domain.editorial import EditorialGroup, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics
 from cti_app.domain.model_runs import ModelRun
@@ -129,6 +130,26 @@ class DiscoveryBatchRepository(Protocol):
     async def save(self, batch: DiscoveryBatch) -> None: ...
 
 
+class EditorialGroupRepository(Protocol):
+    async def add(self, group: EditorialGroup) -> None: ...
+
+    async def get(self, group_id: UUID) -> EditorialGroup | None: ...
+
+    async def get_for_update(self, group_id: UUID) -> EditorialGroup | None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[EditorialGroup]: ...
+
+    async def list_historical(self, edition_id: UUID) -> Sequence[EditorialGroup]: ...
+
+    async def save(self, group: EditorialGroup) -> None: ...
+
+
+class HumanDecisionRepository(Protocol):
+    async def append(self, decision: HumanDecision) -> None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[HumanDecision]: ...
+
+
 class UnitOfWork(Protocol):
     blobs: BlobRepository
     subjects: SubjectRepository
@@ -141,6 +162,8 @@ class UnitOfWork(Protocol):
     edition_audit: EditionAuditRepository
     model_runs: ModelRunRepository
     discovery_batches: DiscoveryBatchRepository
+    editorial_groups: EditorialGroupRepository
+    human_decisions: HumanDecisionRepository
 
     async def __aenter__(self) -> Self: ...
 

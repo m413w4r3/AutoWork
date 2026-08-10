@@ -47,6 +47,20 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
         });
         return;
       }
+      if (new URL(request.url()).pathname.includes("/editorial-groups")) {
+        await route.fulfill({
+          contentType: "application/json",
+          body: JSON.stringify({
+            groups: [],
+            selected_briefs: 0,
+            selected_major: 0,
+            target_briefs: 6,
+            target_major: 2,
+            automatic_selection: false,
+          }),
+        });
+        return;
+      }
       await route.fulfill({
         contentType: "application/json",
         body: JSON.stringify({ items: [], total: 0, page: 1, page_size: 20 }),

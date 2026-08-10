@@ -20,7 +20,9 @@ from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobServic
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoverySourceMode,
     SourceCandidate,
+    SourceRelationshipStatus,
     SourceRole,
     SourceVerificationStatus,
 )
@@ -58,6 +60,7 @@ class SourceView(BaseModel):
     event_date: date | None
     citation: str | None
     verification_status: SourceVerificationStatus
+    relationship_status: SourceRelationshipStatus
     verification_changed_at: datetime | None
     verification_changed_by: str | None
 
@@ -80,6 +83,7 @@ class CandidateView(BaseModel):
     sectors: list[str]
     countries: list[str]
     likely_artifacts: list[str]
+    iocs: list[str]
     editorial_status: Literal["proposed"]
     sources: list[SourceView]
 
@@ -92,13 +96,21 @@ class BatchView(BaseModel):
     discovery_model_run_id: UUID
     structuring_model_run_id: UUID
     created_at: datetime
+    source_mode: DiscoverySourceMode
+    bridge_capabilities: dict[str, object]
+    citation_count: int
+    source_coverage_complete: bool
+    source_coverage_incomplete_reason: str | None
 
 
 class DiscoveryView(BaseModel):
     batches: list[BatchView]
     candidates: list[CandidateView]
     total: int
-    warning: str = "Propositions de modèle non vérifiées — aucune sélection automatique."
+    warning: str = (
+        "Recherche effectuée depuis les citations visibles de ChatGPT. La liste des sources "
+        "et leurs relations seront vérifiées lors de la collecte."
+    )
 
 
 class SourceStatusUpdate(BaseModel):
@@ -226,6 +238,11 @@ def _batch_view(batch: DiscoveryBatch) -> BatchView:
         discovery_model_run_id=batch.discovery_model_run_id,
         structuring_model_run_id=batch.structuring_model_run_id,
         created_at=batch.created_at,
+        source_mode=batch.source_mode,
+        bridge_capabilities=batch.bridge_capabilities,
+        citation_count=batch.citation_count,
+        source_coverage_complete=batch.source_coverage_complete,
+        source_coverage_incomplete_reason=batch.source_coverage_incomplete_reason,
     )
 
 
@@ -248,6 +265,7 @@ def _candidate_view(batch_id: UUID, candidate: CandidateTopic) -> CandidateView:
         sectors=list(candidate.sectors),
         countries=list(candidate.countries),
         likely_artifacts=list(candidate.likely_artifacts),
+        iocs=list(candidate.iocs),
         editorial_status="proposed",
         sources=[_source_view(source) for source in candidate.sources],
     )
@@ -265,6 +283,7 @@ def _source_view(source: SourceCandidate) -> SourceView:
         event_date=source.event_date,
         citation=source.citation,
         verification_status=source.verification_status,
+        relationship_status=source.relationship_status,
         verification_changed_at=source.verification_changed_at,
         verification_changed_by=source.verification_changed_by,
     )

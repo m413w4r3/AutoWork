@@ -28,6 +28,18 @@ class SourceVerificationStatus(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class SourceRelationshipStatus(StrEnum):
+    PROVISIONAL = "provisional"
+    VERIFIED = "verified"
+
+
+class DiscoverySourceMode(StrEnum):
+    NATIVE_COMPLETE = "native_complete"
+    VISIBLE_CITATIONS_ONLY = "visible_citations_only"
+    MODEL_DECLARED_URLS = "model_declared_urls"
+    MANUAL_IMPORT = "manual_import"
+
+
 class DiscoveryBatchStatus(StrEnum):
     COMPLETED = "completed"
 
@@ -46,6 +58,7 @@ class SourceCandidate:
     citation: str | None = None
     id: UUID = field(default_factory=uuid4)
     verification_status: SourceVerificationStatus = SourceVerificationStatus.UNVERIFIED
+    relationship_status: SourceRelationshipStatus = SourceRelationshipStatus.PROVISIONAL
     verification_changed_at: datetime | None = None
     verification_changed_by: str | None = None
     canonical_url: str = field(init=False)
@@ -89,6 +102,7 @@ class CandidateTopic:
     sensitivity: str
     external_llm_allowed: bool
     event_date: date | None = None
+    iocs: tuple[str, ...] = ()
     id: UUID = field(default_factory=uuid4)
     title_fingerprint: str = field(init=False)
     editorial_status: str = "proposed"
@@ -121,6 +135,13 @@ class DiscoveryBatch:
     tlp: TLP
     sensitivity: str
     external_llm_allowed: bool
+    source_mode: DiscoverySourceMode = DiscoverySourceMode.VISIBLE_CITATIONS_ONLY
+    bridge_capabilities: dict[str, object] = field(default_factory=dict)
+    citation_count: int = 0
+    source_coverage_complete: bool = False
+    source_coverage_incomplete_reason: str | None = (
+        "Le bridge expose uniquement les citations visibles de ChatGPT."
+    )
     id: UUID = field(default_factory=uuid4)
     status: DiscoveryBatchStatus = DiscoveryBatchStatus.COMPLETED
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -131,6 +152,18 @@ class DiscoveryBatch:
             raise ValueError("Discovery request hash must be a lowercase SHA-256")
         if not self.complementary_axis.strip() or not self.sensitivity.strip():
             raise ValueError("Discovery axis and sensitivity are required")
+        self.citation_count = len(self.citations)
+        if self.source_mode is DiscoverySourceMode.VISIBLE_CITATIONS_ONLY:
+            self.source_coverage_complete = False
+            self.source_coverage_incomplete_reason = (
+                self.source_coverage_incomplete_reason
+                or "Le bridge expose uniquement les citations visibles de ChatGPT."
+            )
+            for candidate in self.candidates:
+                for source in candidate.sources:
+                    source.relationship_status = SourceRelationshipStatus.PROVISIONAL
+        if not self.source_coverage_complete and not self.source_coverage_incomplete_reason:
+            raise ValueError("Incomplete source coverage requires a reason")
         self.candidates = deduplicate_topics(self.candidates)
 
     def source(self, source_id: UUID) -> SourceCandidate | None:

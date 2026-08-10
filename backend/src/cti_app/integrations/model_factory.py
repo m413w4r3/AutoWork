@@ -67,6 +67,14 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
     return ModelGateway(router, uow_factory, output_store)
 
 
+def create_bridge_capabilities_provider(settings: Settings) -> ChatGPTBridgeTransport:
+    return ChatGPTBridgeTransport(
+        settings.openai_bridge_base_url,
+        api_key=_secret_value(settings.openai_bridge_api_key),
+        timeout_seconds=settings.model_request_timeout_seconds,
+    )
+
+
 def _secret_value(secret: object | None) -> str | None:
     if secret is None:
         return None

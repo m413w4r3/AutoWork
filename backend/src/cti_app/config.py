@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr
@@ -23,6 +24,7 @@ class Settings(BaseSettings):
     s3_secret_key: str = "local-minio-password"
     s3_bucket: str = "cti-local"
     s3_secure: bool = False
+    subject_workspace_root: Path = Path("work/subjects")
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     job_retry_base_seconds: float = Field(default=1.0, gt=0, le=3600)
     job_retry_max_seconds: float = Field(default=300.0, gt=0, le=86400)

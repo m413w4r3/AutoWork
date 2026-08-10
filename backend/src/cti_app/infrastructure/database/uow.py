@@ -7,6 +7,8 @@ from cti_app.application.persistence import (
     DiscoveryBatchRepository,
     EditionAuditRepository,
     EditionRepository,
+    EditorialGroupRepository,
+    HumanDecisionRepository,
     JobEventRepository,
     JobRepository,
     ModelRunRepository,
@@ -20,6 +22,8 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyDiscoveryBatchRepository,
     SqlAlchemyEditionAuditRepository,
     SqlAlchemyEditionRepository,
+    SqlAlchemyEditorialGroupRepository,
+    SqlAlchemyHumanDecisionRepository,
     SqlAlchemyJobEventRepository,
     SqlAlchemyJobRepository,
     SqlAlchemyModelRunRepository,
@@ -42,6 +46,8 @@ class SqlAlchemyUnitOfWork:
     edition_audit: EditionAuditRepository
     model_runs: ModelRunRepository
     discovery_batches: DiscoveryBatchRepository
+    editorial_groups: EditorialGroupRepository
+    human_decisions: HumanDecisionRepository
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -61,6 +67,8 @@ class SqlAlchemyUnitOfWork:
         self.edition_audit = SqlAlchemyEditionAuditRepository(self._session)
         self.model_runs = SqlAlchemyModelRunRepository(self._session)
         self.discovery_batches = SqlAlchemyDiscoveryBatchRepository(self._session)
+        self.editorial_groups = SqlAlchemyEditorialGroupRepository(self._session)
+        self.human_decisions = SqlAlchemyHumanDecisionRepository(self._session)
         self._committed = False
         return self
 
