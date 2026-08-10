@@ -63,6 +63,7 @@ from cti_app.domain.model_conversations import (
     ModelConversationTurn,
 )
 from cti_app.domain.model_runs import (
+    ModelOutputRejection,
     ModelProvider,
     ModelRole,
     ModelRun,
@@ -87,6 +88,7 @@ from cti_app.infrastructure.database.models import (
     JobRow,
     ModelConversationRow,
     ModelConversationTurnRow,
+    ModelOutputRejectionRow,
     ModelRunRow,
     ProvenanceEventRow,
     RejectedModelProposalRow,
@@ -535,6 +537,45 @@ class SqlAlchemyModelRunRepository:
             raise LookupError(f"Model run {run.id} does not exist")
         for field_name, value in _model_run_values(run).items():
             setattr(row, field_name, value)
+
+
+class SqlAlchemyModelOutputRejectionRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def append(self, rejection: ModelOutputRejection) -> None:
+        self._session.add(
+            ModelOutputRejectionRow(
+                id=rejection.id,
+                model_run_id=rejection.model_run_id,
+                path=list(rejection.path),
+                error_type=rejection.error_type,
+                value_sha256=rejection.value_sha256,
+                raw_output_reference=rejection.raw_output_reference,
+                created_at=rejection.created_at,
+            )
+        )
+
+    async def list_for_run(self, run_id: UUID) -> list[ModelOutputRejection]:
+        rows = (
+            await self._session.scalars(
+                select(ModelOutputRejectionRow)
+                .where(ModelOutputRejectionRow.model_run_id == run_id)
+                .order_by(ModelOutputRejectionRow.created_at)
+            )
+        ).all()
+        return [
+            ModelOutputRejection(
+                id=row.id,
+                model_run_id=row.model_run_id,
+                path=tuple(row.path),
+                error_type=row.error_type,
+                value_sha256=row.value_sha256,
+                raw_output_reference=row.raw_output_reference,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
         await self._session.flush()
 
 
@@ -1120,6 +1161,7 @@ def _job_values(job: Job) -> dict[str, object]:
         "heartbeat_at": job.heartbeat_at,
         "error_code": job.error_code,
         "error_message": job.error_message,
+        "error_details": job.error_details,
         "correlation_id": job.correlation_id,
         "input_parameters": job.input_parameters,
         "output_reference": job.output_reference,
@@ -1148,6 +1190,7 @@ def _job_from_row(row: JobRow) -> Job:
         heartbeat_at=row.heartbeat_at,
         error_code=row.error_code,
         error_message=row.error_message,
+        error_details=row.error_details,
         correlation_id=row.correlation_id,
         input_parameters=row.input_parameters,
         output_reference=row.output_reference,
@@ -1340,6 +1383,21 @@ def _model_run_values(run: ModelRun) -> dict[str, object]:
         "error_code": run.error_code,
         "error_message": run.error_message,
         "error_details": run.error_details,
+        "raw_output_reference": run.raw_output_reference,
+        "raw_output_sha256": run.raw_output_sha256,
+        "raw_output_chars": run.raw_output_chars,
+        "normalized_output_reference": run.normalized_output_reference,
+        "normalized_output_sha256": run.normalized_output_sha256,
+        "parser_stage": run.parser_stage,
+        "serializer_version": run.serializer_version,
+        "normalization_version": run.normalization_version,
+        "json_error_line": run.json_error_line,
+        "json_error_column": run.json_error_column,
+        "validation_errors": list(run.validation_errors),
+        "transformations": list(run.transformations),
+        "citation_count": run.citation_count,
+        "extracted_url_count": run.extracted_url_count,
+        "visible_citations": list(run.visible_citations),
         "started_at": run.started_at,
         "finished_at": run.finished_at,
         "updated_at": run.updated_at,
@@ -1376,6 +1434,21 @@ def _model_run_from_row(row: ModelRunRow) -> ModelRun:
         error_code=row.error_code,
         error_message=row.error_message,
         error_details=row.error_details,
+        raw_output_reference=row.raw_output_reference,
+        raw_output_sha256=row.raw_output_sha256,
+        raw_output_chars=row.raw_output_chars,
+        normalized_output_reference=row.normalized_output_reference,
+        normalized_output_sha256=row.normalized_output_sha256,
+        parser_stage=row.parser_stage,
+        serializer_version=row.serializer_version,
+        normalization_version=row.normalization_version,
+        json_error_line=row.json_error_line,
+        json_error_column=row.json_error_column,
+        validation_errors=tuple(row.validation_errors),
+        transformations=tuple(row.transformations),
+        citation_count=row.citation_count,
+        extracted_url_count=row.extracted_url_count,
+        visible_citations=tuple(row.visible_citations),
         started_at=row.started_at,
         finished_at=row.finished_at,
         updated_at=row.updated_at,

@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "11";
+const VERSION = "12";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -213,65 +213,7 @@ async function attachFiles(files) {
  * On ne peut pas se contenter de `innerText` : il embarque le libellé des
  * boutons « Copier » des blocs de code et perd les délimiteurs.
  */
-const BLOCK_TAGS = new Set(["P", "DIV", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE", "TABLE", "TR", "HR"]);
-
-// Libellés de boutons présents dans l'en-tête d'un bloc de code : à ne pas
-// confondre avec le nom du langage.
-const MOTS_BOUTONS = new Set(["copier", "copy", "run", "exécuter", "executer", "edit", "éditer"]);
-
-/**
- * Langage d'un bloc de code, pour la balise ```lang.
- * ChatGPT ne met pas toujours de classe `language-*` sur `<code>` : il affiche
- * alors le langage dans l'en-tête du bloc (« Python  Run  Copier »).
- */
-function langueDu(pre, code) {
-  const classe = code && code.className.match(/language-([\w+-]+)/);
-  if (classe) return classe[1];
-
-  const entete = pre.querySelector("div");
-  if (!entete) return "";
-  // `textContent` colle le libellé des boutons au nom du langage : on les
-  // retire d'abord, sur une copie pour ne pas toucher à la page.
-  const copie = entete.cloneNode(true);
-  copie.querySelectorAll("button").forEach((b) => b.remove());
-  const mot = (copie.textContent.trim().split(/\s+/)[0] || "").toLowerCase();
-  if (MOTS_BOUTONS.has(mot) || !/^[a-z][\w+#-]*$/.test(mot)) return "";
-  return mot;
-}
-
-function serialize(node, ouvert) {
-  if (node.nodeType === Node.TEXT_NODE) return node.nodeValue;
-  if (node.nodeType !== Node.ELEMENT_NODE) return "";
-
-  const tag = node.tagName;
-  if (tag === "BUTTON" || tag === "SVG" || node.classList.contains("sr-only")) return "";
-  // Les régions `aria-live` portent des annonces d'état (« Analyzing image… »),
-  // jamais du contenu de réponse. Défensif : non vérifié sur ce cas précis.
-  if (node.hasAttribute("aria-live")) return "";
-  if (tag === "BR") return "\n";
-
-  if (tag === "PRE") {
-    const code = node.querySelector("code");
-    const raw = (code ? code.textContent : node.textContent).replace(/\n+$/, "");
-    const lang = langueDu(node, code);
-    // `ouvert` = bloc encore en cours d'écriture. Sa fermeture est omise, sinon
-    // le ``` final se déplacerait à chaque relevé et s'entrelacerait au code.
-    // Et tant que le langage est inconnu, on ne transmet rien du bloc : l'UI
-    // rend parfois l'en-tête (« Python ») après le début du code, et l'ouverture
-    // ```lang ne doit jamais être réécrite une fois transmise.
-    if (node === ouvert) return lang ? `\n\`\`\`${lang}\n${raw}` : "";
-    return `\n\`\`\`${lang}\n${raw}\n\`\`\`\n`;
-  }
-
-  let out = "";
-  for (const child of node.childNodes) out += serialize(child, ouvert);
-
-  if (tag === "CODE") return `\`${out}\``;
-  if (tag === "LI") return `\n- ${out.trim()}`;
-  if (tag === "TD" || tag === "TH") return `${out} | `;
-  if (BLOCK_TAGS.has(tag)) return `\n${out}\n`;
-  return out;
-}
+const DOM_SERIALIZER = globalThis.ChatGPTBridgeSerializer;
 
 /**
  * Conteneur portant la réponse finale.
@@ -335,10 +277,7 @@ function dernierPre(root) {
 function readAnswer(root, streaming) {
   // Tant que ChatGPT écrit, le dernier bloc de code est celui en cours.
   const ouvert = streaming ? dernierPre(root) : null;
-  return serialize(root, ouvert)
-    .replace(/[ \t]+$/gm, "") // fins de ligne + lignes d'indentation vides
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return DOM_SERIALIZER.serializeResponse(root, ouvert);
 }
 
 /**
@@ -899,7 +838,8 @@ async function streamAnswer(job, locator, before) {
       turn,
       finished === true || Date.now() - debut > NO_MARKDOWN_FALLBACK_MS,
     );
-    full = root ? readAnswer(root, finished !== true) : "";
+    const snapshot = root ? readAnswer(root, finished !== true) : null;
+    full = snapshot ? snapshot.text : "";
 
     if (DEBUG) {
       const pres = root ? root.querySelectorAll("pre") : [];
@@ -926,6 +866,11 @@ async function streamAnswer(job, locator, before) {
 
   // Le texte ne bouge plus : livrer ce qui restait retenu.
   if (!job.aborted) emitDelta(job.id, sent, full);
+  const finalTurn = findTurn(locator, before);
+  const finalRoot = finalTurn ? answerRoot(finalTurn, true) : null;
+  return finalRoot
+    ? readAnswer(finalRoot, false)
+    : { text: full, visible_citations: [], serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION };
 }
 
 function verifiedLocator() {
@@ -997,7 +942,7 @@ async function handlePrompt({ id, prompt, new_chat: newChat, files, conversation
       APPEAR_TIMEOUT_MS,
       "pas de réponse de ChatGPT",
     );
-    await streamAnswer(job, turnLocator(premier), before);
+    const serialized = await streamAnswer(job, turnLocator(premier), before);
 
     if (!job.aborted) {
       const container = closestOf(premier, SELECTORS.turnContainer);
@@ -1006,6 +951,10 @@ async function handlePrompt({ id, prompt, new_chat: newChat, files, conversation
       reply({
         type: "done",
         id,
+        metadata: {
+          visible_citations: serialized.visible_citations,
+          serializer_version: serialized.serializer_version,
+        },
         conversation: conversation
           ? {
               id: conversation.id,

@@ -8,8 +8,14 @@ from uuid import UUID, uuid4
 
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.model_gateway import ConversationContext, ModelGateway, ModelRequest
+from cti_app.application.model_gateway import (
+    ConversationContext,
+    ModelGateway,
+    ModelRequest,
+    ModelRoutingHint,
+)
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPurpose,
@@ -387,8 +393,12 @@ class ModelConversationService:
         ):
             raise ConversationNotFoundError("Conversation introuvable dans ce sujet")
 
-    async def _read_reference(self, reference: str, blobs: dict) -> str:
+    async def _read_reference(
+        self, reference: str, blobs: dict[UUID, BlobRecord | None]
+    ) -> str:
         blob_id = _blob_id(reference)
+        if blob_id is None:
+            raise ModelConversationError("Référence de blob conversationnel invalide")
         blob = blobs.get(blob_id)
         if blob is None:
             raise ModelConversationError("Blob conversationnel introuvable")
@@ -412,8 +422,7 @@ def _role(purpose: ConversationPurpose) -> ModelRole:
     return ModelRole.RESEARCH
 
 
-def _routing_hint(purpose: ConversationPurpose):
-    from cti_app.application.model_gateway import ModelRoutingHint
+def _routing_hint(purpose: ConversationPurpose) -> ModelRoutingHint:
 
     if purpose is ConversationPurpose.CRITIC:
         return ModelRoutingHint.CRITIQUE

@@ -26,7 +26,7 @@ from cti_app.domain.model_conversations import (
     ModelConversation,
     ModelConversationTurn,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelRun
+from cti_app.domain.model_runs import ModelOutputRejection, ModelProvider, ModelRun
 
 
 class BlobRepository(Protocol):
@@ -130,6 +130,12 @@ class ModelRunRepository(Protocol):
     async def get_for_update(self, run_id: UUID) -> ModelRun | None: ...
 
     async def save(self, run: ModelRun) -> None: ...
+
+
+class ModelOutputRejectionRepository(Protocol):
+    async def append(self, rejection: ModelOutputRejection) -> None: ...
+
+    async def list_for_run(self, run_id: UUID) -> Sequence[ModelOutputRejection]: ...
 
 
 class ModelConversationRepository(Protocol):
@@ -291,6 +297,7 @@ class UnitOfWork(Protocol):
     editions: EditionRepository
     edition_audit: EditionAuditRepository
     model_runs: ModelRunRepository
+    model_output_rejections: ModelOutputRejectionRepository
     model_conversations: ModelConversationRepository
     model_conversation_turns: ModelConversationTurnRepository
     discovery_batches: DiscoveryBatchRepository

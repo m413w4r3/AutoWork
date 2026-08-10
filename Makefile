@@ -1,4 +1,4 @@
-.PHONY: up down status logs bridge-status bridge-logs restart-bridge dev stop test test-integration lint format typecheck
+.PHONY: up down status logs bridge-status bridge-logs restart-bridge model-run-diagnostics dev stop test test-integration lint format typecheck
 
 UV ?= uv
 PNPM ?= pnpm
@@ -21,7 +21,11 @@ bridge-status:
 	$(COMPOSE) exec -T chatgpt-bridge python tools/status.py
 
 bridge-logs:
-	$(COMPOSE) logs --tail=200 -f chatgpt-bridge worker
+	$(COMPOSE) logs --tail=200 -f chatgpt-bridge worker backend
+
+model-run-diagnostics:
+	@test -n "$(RUN_ID)" || (echo "Usage: make model-run-diagnostics RUN_ID=<uuid>" >&2; exit 2)
+	$(COMPOSE) exec -T backend python -m cti_app.model_run_diagnostics "$(RUN_ID)"
 
 restart-bridge:
 	$(COMPOSE) up -d --build --wait --force-recreate --no-deps chatgpt-bridge

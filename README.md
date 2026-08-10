@@ -50,6 +50,9 @@ make stop
 `make bridge-logs` et `make restart-bridge`. `make down` conserve toujours les
 volumes nommés, dont le registre SQLite `bridge_data`.
 
+`make model-run-diagnostics RUN_ID=<uuid>` affiche uniquement les métadonnées sûres d'une
+sortie modèle et donne la commande d'export explicite de l'artefact brut.
+
 ## Développement hors conteneur
 
 ```bash

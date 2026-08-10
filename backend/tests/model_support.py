@@ -5,7 +5,7 @@ from types import TracebackType
 from uuid import UUID
 
 from cti_app.application.model_gateway import ModelRunRepository, ModelRunUnitOfWork
-from cti_app.domain.model_runs import ModelRun
+from cti_app.domain.model_runs import ModelOutputRejection, ModelRun
 
 
 class InMemoryModelRunRepository:
@@ -30,11 +30,23 @@ class InMemoryModelRunRepository:
         self._state[run.id] = deepcopy(run)
 
 
+class InMemoryModelOutputRejectionRepository:
+    def __init__(self) -> None:
+        self.items: list[ModelOutputRejection] = []
+
+    async def append(self, rejection: ModelOutputRejection) -> None:
+        self.items.append(deepcopy(rejection))
+
+    async def list_for_run(self, run_id: UUID) -> list[ModelOutputRejection]:
+        return [deepcopy(item) for item in self.items if item.model_run_id == run_id]
+
+
 class InMemoryModelRunUnitOfWork:
     model_runs: ModelRunRepository
 
     def __init__(self, state: dict[UUID, ModelRun]) -> None:
         self.model_runs = InMemoryModelRunRepository(state)
+        self.model_output_rejections = InMemoryModelOutputRejectionRepository()
 
     async def __aenter__(self) -> InMemoryModelRunUnitOfWork:
         return self

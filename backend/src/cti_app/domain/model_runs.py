@@ -70,6 +70,21 @@ class ModelRun:
     error_code: str | None = None
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
+    raw_output_reference: str | None = None
+    raw_output_sha256: str | None = None
+    raw_output_chars: int | None = None
+    normalized_output_reference: str | None = None
+    normalized_output_sha256: str | None = None
+    parser_stage: str | None = None
+    serializer_version: str | None = None
+    normalization_version: str | None = None
+    json_error_line: int | None = None
+    json_error_column: int | None = None
+    validation_errors: tuple[dict[str, Any], ...] = ()
+    transformations: tuple[str, ...] = ()
+    citation_count: int = 0
+    extracted_url_count: int = 0
+    visible_citations: tuple[dict[str, Any], ...] = ()
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -150,3 +165,14 @@ class ModelRun:
     def _require_active(self) -> None:
         if self.status not in {ModelRunStatus.RUNNING, ModelRunStatus.WAITING_BACKGROUND}:
             raise ValueError(f"Model run is already terminal: {self.status.value}")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelOutputRejection:
+    model_run_id: UUID
+    path: tuple[str, ...]
+    error_type: str
+    value_sha256: str
+    raw_output_reference: str
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))

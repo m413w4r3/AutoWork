@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from typing import Annotated, Literal, NoReturn
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.discovery import (
     DISCOVERY_JOB_KIND,
+    RETRY_STRUCTURING_JOB_KIND,
     DiscoverEditionParameters,
     DiscoveryService,
+    RetryStructuringParameters,
     SourceCandidateNotFoundError,
     discovery_idempotency_key,
 )
@@ -47,6 +49,10 @@ class DiscoveryLaunchView(BaseModel):
     job_id: UUID
     status: str
     reused: bool
+
+
+class StructuringRetryLaunch(DiscoveryLaunch):
+    research_model_run_id: UUID
 
 
 class SourceView(BaseModel):
@@ -210,6 +216,64 @@ async def read_candidates(
         candidates=[_candidate_view(batch_id, candidate) for batch_id, candidate in ordered],
         total=len(ordered),
     )
+
+
+@router.post(
+    "/structuring/retry",
+    response_model=DiscoveryLaunchView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_structuring(
+    edition_id: UUID, payload: StructuringRetryLaunch, request: Request
+) -> DiscoveryLaunchView:
+    editions: EditionService = request.app.state.edition_service
+    jobs: JobService = request.app.state.job_service
+    dispatcher: JobDispatcher = request.app.state.job_dispatcher
+    provider: IdentityProvider = request.app.state.identity_provider
+    try:
+        edition = await editions.get(edition_id)
+        aliases = list(
+            dict.fromkeys([edition.country, edition.country_code, *payload.country_aliases])
+        )
+        discovery = DiscoverEditionParameters(
+            edition_id=edition.id,
+            country=edition.country,
+            country_aliases=aliases,
+            period_start=edition.period_start,
+            period_end=edition.period_end,
+            languages=list(edition.languages),
+            source_profile=edition.source_profile,
+            keywords=payload.keywords,
+            exclusions=payload.exclusions,
+            complementary_axis=payload.complementary_axis,
+            tlp=edition.tlp,
+            sensitivity=payload.sensitivity,
+            external_llm_allowed=payload.external_llm_allowed,
+        )
+        nonce = uuid4()
+        parameters = RetryStructuringParameters(
+            discovery=discovery,
+            research_model_run_id=payload.research_model_run_id,
+            retry_nonce=nonce,
+        )
+        identity = await provider.current()
+        job = await jobs.submit(
+            kind=RETRY_STRUCTURING_JOB_KIND,
+            aggregate_type="edition",
+            aggregate_id=edition.id,
+            idempotency_key=(
+                f"retry-discovery-structuring:{edition.id}:"
+                f"{payload.research_model_run_id}:{nonce}"
+            ),
+            correlation_id=get_correlation_id(),
+            input_parameters=parameters.model_dump(mode="json"),
+            max_attempts=1,
+            actor_id=identity.actor_id,
+        )
+        await dispatcher.dispatch(job.id)
+        return DiscoveryLaunchView(job_id=job.id, status=job.status.value, reused=False)
+    except Exception as exc:
+        _raise_api_error(exc)
 
 
 @router.patch("/sources/{source_id}", response_model=SourceView)

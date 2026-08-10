@@ -216,6 +216,7 @@ class JobRow(Base):
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
+    error_details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     correlation_id: Mapped[str] = mapped_column(String(128), nullable=False)
     input_parameters: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     output_reference: Mapped[str | None] = mapped_column(Text)
@@ -341,9 +342,39 @@ class ModelRunRow(Base):
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
     error_details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    raw_output_reference: Mapped[str | None] = mapped_column(Text)
+    raw_output_sha256: Mapped[str | None] = mapped_column(String(64))
+    raw_output_chars: Mapped[int | None] = mapped_column(BigInteger)
+    normalized_output_reference: Mapped[str | None] = mapped_column(Text)
+    normalized_output_sha256: Mapped[str | None] = mapped_column(String(64))
+    parser_stage: Mapped[str | None] = mapped_column(String(64))
+    serializer_version: Mapped[str | None] = mapped_column(String(64))
+    normalization_version: Mapped[str | None] = mapped_column(String(64))
+    json_error_line: Mapped[int | None] = mapped_column(BigInteger)
+    json_error_column: Mapped[int | None] = mapped_column(BigInteger)
+    validation_errors: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    transformations: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    citation_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    extracted_url_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    visible_citations: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ModelOutputRejectionRow(Base):
+    __tablename__ = "model_output_rejections"
+    __table_args__ = (Index("ix_model_output_rejections_run", "model_run_id", "created_at"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    model_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("model_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    path: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    error_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    value_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_output_reference: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ModelConversationRow(Base):

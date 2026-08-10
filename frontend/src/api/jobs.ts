@@ -18,6 +18,17 @@ export interface JobView {
   heartbeat_at: string | null;
   error_code: string | null;
   error_message: string | null;
+  error_details: {
+    phase?: string;
+    validation_kind?: string;
+    valid_count?: number;
+    rejected_count?: number;
+    model_run_id?: string | null;
+    research_model_run_id?: string | null;
+    correlation_id?: string;
+    diagnostic_available?: boolean;
+    can_retry_structuring?: boolean;
+  } | null;
   correlation_id: string;
   output_reference: string | null;
   cancellation_requested: boolean;

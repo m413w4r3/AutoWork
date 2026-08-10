@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ValidationError
 
 from cti_app.domain.model_runs import (
+    ModelOutputRejection,
     ModelProvider,
     ModelRole,
     ModelRun,
@@ -40,6 +41,13 @@ class BinaryModelInputError(ModelGatewayError):
 
 class StructuredOutputError(ModelGatewayError):
     pass
+
+
+class StructuredModelUnavailableError(ModelGatewayError):
+    code = "structured_model_unavailable"
+    retryable = True
+    provider = "qwen"
+    phase = "structuring"
 
 
 class BackgroundResponsePendingError(ModelGatewayError):
@@ -148,6 +156,7 @@ class AdapterResult:
     output_text: str | None = None
     structured_output: BaseModel | None = None
     conversation: ConversationResult | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +165,7 @@ class ModelExecution:
     output_text: str | None = None
     structured_output: BaseModel | None = None
     conversation: ConversationResult | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class ModelAdapter(Protocol):
@@ -203,6 +213,8 @@ class CriticModel(Protocol):
 class ModelOutputStore(Protocol):
     async def store(self, content: bytes, *, mime_type: str) -> str: ...
 
+    async def read(self, reference: str, *, max_bytes: int) -> bytes: ...
+
 
 class ModelRunRepository(Protocol):
     async def add(self, run: ModelRun) -> None: ...
@@ -216,6 +228,7 @@ class ModelRunRepository(Protocol):
 
 class ModelRunUnitOfWork(Protocol):
     model_runs: ModelRunRepository
+    model_output_rejections: Any
 
     async def __aenter__(self) -> Self: ...
 
@@ -314,6 +327,55 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
 
     async def execute(self, request: ModelRequest, role: ModelRole) -> ModelExecution:
         return await self._execute(request, role)
+
+    async def get_run(self, run_id: UUID) -> ModelRun | None:
+        async with self._uow_factory() as uow:
+            return await uow.model_runs.get(run_id)
+
+    async def read_output(self, reference: str, *, max_bytes: int = 10_000_000) -> bytes:
+        return await self._output_store.read(reference, max_bytes=max_bytes)
+
+    async def archive_output(self, content: bytes, *, mime_type: str) -> str:
+        return await self._output_store.store(content, mime_type=mime_type)
+
+    async def record_output_diagnostics(
+        self,
+        run_id: UUID,
+        *,
+        normalized_reference: str | None,
+        normalized_sha256: str | None,
+        parser_stage: str,
+        normalization_version: str | None,
+        transformations: tuple[str, ...],
+        validation_errors: tuple[dict[str, Any], ...],
+        json_error_line: int | None = None,
+        json_error_column: int | None = None,
+    ) -> None:
+        async with self._uow_factory() as uow:
+            run = await uow.model_runs.get_for_update(run_id)
+            if run is None:
+                raise ModelGatewayError(f"Model run {run_id} does not exist")
+            run.normalized_output_reference = normalized_reference
+            run.normalized_output_sha256 = normalized_sha256
+            run.parser_stage = parser_stage[:64]
+            run.normalization_version = normalization_version
+            run.transformations = transformations
+            run.validation_errors = validation_errors
+            run.json_error_line = json_error_line
+            run.json_error_column = json_error_column
+            await uow.model_runs.save(run)
+            if run.raw_output_reference:
+                for item in validation_errors:
+                    await uow.model_output_rejections.append(
+                        ModelOutputRejection(
+                            model_run_id=run_id,
+                            path=tuple(str(part) for part in item.get("path", [])),
+                            error_type=str(item.get("code", "validation_error"))[:128],
+                            value_sha256=str(item.get("value_sha256", "0" * 64)),
+                            raw_output_reference=run.raw_output_reference,
+                        )
+                    )
+            await uow.commit()
 
     def build_run(self, request: ModelRequest, role: ModelRole) -> ModelRun:
         adapter = self._router.select(request, role)
@@ -465,6 +527,22 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         else:
             raise ModelGatewayError("Completed adapter response has no output")
         output_reference = await self._output_store.store(content, mime_type=mime_type)
+        run.raw_output_reference = output_reference
+        run.raw_output_sha256 = hashlib.sha256(content).hexdigest()
+        run.raw_output_chars = len(content.decode(errors="replace"))
+        run.serializer_version = _optional_metadata_text(result.metadata, "serializer_version")
+        citations = result.metadata.get("visible_citations")
+        run.visible_citations = tuple(
+            item for item in citations if isinstance(item, dict)
+        ) if isinstance(citations, list) else ()
+        run.citation_count = len(citations) if isinstance(citations, list) else 0
+        run.extracted_url_count = len(
+            {
+                item.get("canonical_url")
+                for item in citations
+                if isinstance(item, dict) and isinstance(item.get("canonical_url"), str)
+            }
+        ) if isinstance(citations, list) else 0
         run.succeed(
             actual_model_version=result.actual_model_version,
             duration_ms=duration_ms,
@@ -477,6 +555,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             output_text=result.output_text,
             structured_output=result.structured_output,
             conversation=result.conversation,
+            metadata=dict(result.metadata),
         )
 
 
@@ -600,3 +679,8 @@ def _error_details(exc: Exception) -> dict[str, str | bool | int]:
         "retryable": bool(getattr(exc, "retryable", False)),
         "attempts": max(1, int(getattr(exc, "attempts", 1))),
     }
+
+
+def _optional_metadata_text(metadata: dict[str, Any], key: str) -> str | None:
+    value = metadata.get(key)
+    return value[:64] if isinstance(value, str) and value else None

@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     model_force_adapter: Literal["auto", "openai", "qwen", "fake"] = "auto"
     model_request_timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
     model_conversation_retention_days: int = Field(default=90, ge=1, le=3650)
+    discovery_chatgpt_structuring_fallback: bool = False
     collection_max_redirects: int = Field(default=5, ge=0, le=10)
     collection_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     collection_max_download_bytes: int = Field(default=10 * 1024 * 1024, gt=0)

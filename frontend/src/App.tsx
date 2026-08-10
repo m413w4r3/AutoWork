@@ -5,6 +5,7 @@ import {
   fetchDiscovery,
   launchDiscovery,
   markDiscoverySource,
+  retryDiscoveryStructuring,
   type SourceVerificationStatus,
 } from "./api/discovery";
 import {
@@ -457,6 +458,15 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: ["discovery", editionId] }),
   });
+  const retryStructuring = useMutation({
+    mutationFn: (researchModelRunId: string) =>
+      retryDiscoveryStructuring(
+        editionId,
+        researchModelRunId,
+        axis.trim() || "initial",
+      ),
+    onSuccess: (result) => setJobId(result.job_id),
+  });
   const candidates = discovery.data?.candidates ?? [];
   const batches = discovery.data?.batches ?? [];
 
@@ -490,7 +500,14 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
       {launch.error ? (
         <ErrorMessage error={launch.error} fallback="Recherche impossible." />
       ) : null}
-      {jobId ? <JobStatusCard jobId={jobId} /> : null}
+      {jobId ? (
+        <JobStatusCard
+          jobId={jobId}
+          onRetryStructuring={(researchModelRunId) =>
+            retryStructuring.mutate(researchModelRunId)
+          }
+        />
+      ) : null}
       <div className="candidate-filters" aria-label="Filtres des candidats">
         <label>
           Recherche

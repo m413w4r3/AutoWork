@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import RLock
 from typing import Any, AsyncIterator, Dict, List, Optional
-from urllib.parse import unquote_to_bytes, urlsplit
+from urllib.parse import parse_qsl, unquote_to_bytes, urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -825,6 +825,53 @@ class UpstreamError(RuntimeError):
         self.retryable = retryable
 
 
+def _visible_citations(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in value[:500]:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("url")
+        canonical = item.get("canonical_url")
+        label = item.get("label")
+        position = item.get("position")
+        if not all(isinstance(part, str) for part in (raw, canonical, label)):
+            continue
+        raw_url = urlsplit(raw)
+        canonical_url = urlsplit(canonical)
+        if (
+            raw_url.scheme != "https"
+            or not raw_url.hostname
+            or canonical_url.scheme != "https"
+            or not canonical_url.hostname
+            or raw_url.hostname.casefold() != canonical_url.hostname.casefold()
+            or (raw_url.path or "/") != (canonical_url.path or "/")
+            or parse_qsl(canonical_url.query, keep_blank_values=True)
+            != sorted(
+                (key, value)
+                for key, value in parse_qsl(raw_url.query, keep_blank_values=True)
+                if not key.casefold().startswith("utm_")
+                and key.casefold() not in {"fbclid", "gclid"}
+            )
+            or canonical_url.fragment
+            or canonical in seen
+            or (position is not None and not isinstance(position, int))
+        ):
+            continue
+        seen.add(canonical)
+        result.append(
+            {
+                "label": label[:500],
+                "url": raw[:2048],
+                "canonical_url": canonical[:2048],
+                "position": position,
+            }
+        )
+    return result
+
+
 async def run_generation(
     request_id: str,
     req: ChatRequest,
@@ -832,6 +879,7 @@ async def run_generation(
     *,
     conversation: Optional[BridgeConversationTarget] = None,
     conversation_result: Optional[dict] = None,
+    extension_metadata: Optional[dict] = None,
 ) -> AsyncIterator[str]:
     """Envoie le prompt à l'extension et cède les morceaux de texte au fil de l'eau."""
     prompt, medias = parse_messages(req.messages)
@@ -875,6 +923,14 @@ async def run_generation(
                 if text:
                     yield text
             elif kind == "done":
+                reported_metadata = packet.get("metadata")
+                if extension_metadata is not None and isinstance(reported_metadata, dict):
+                    citations = reported_metadata.get("visible_citations")
+                    serializer_version = reported_metadata.get("serializer_version")
+                    if isinstance(citations, list):
+                        extension_metadata["visible_citations"] = _visible_citations(citations)
+                    if isinstance(serializer_version, str):
+                        extension_metadata["serializer_version"] = serializer_version[:64]
                 reported = packet.get("conversation")
                 if conversation is not None:
                     if (
@@ -1177,6 +1233,7 @@ def _response_body(
     error: Optional[str] = None,
     run: Optional[RunReport] = None,
     conversation_result: Optional[dict] = None,
+    extension_metadata: Optional[dict] = None,
 ) -> dict:
     output = []
     if output_text is not None:
@@ -1220,6 +1277,8 @@ def _response_body(
             "web_search_mode": report.web_search_mode,
             "controls": {name: o.model_dump() for name, o in report.controls.items()},
             "conversation": conversation_result,
+            "visible_citations": (extension_metadata or {}).get("visible_citations", []),
+            "serializer_version": (extension_metadata or {}).get("serializer_version"),
         },
     }
 
@@ -1241,6 +1300,7 @@ async def _execute_background_response(
                 req, web_search_native=report.web_search_mode == "ui_tool"
             )
             conversation_result: dict = {}
+            extension_metadata: dict = {}
             parts = [
                 text
                 async for text in run_generation(
@@ -1249,6 +1309,7 @@ async def _execute_background_response(
                     _BackgroundRequest(),
                     conversation=req.conversation,
                     conversation_result=conversation_result,
+                    extension_metadata=extension_metadata,
                 )
             ]
         background_responses[response_id] = _response_body(
@@ -1258,6 +1319,7 @@ async def _execute_background_response(
             output_text="".join(parts),
             run=report,
             conversation_result=conversation_result or None,
+            extension_metadata=extension_metadata or None,
         )
     except HTTPException as exc:
         # Un contrôle d'interface refusé est un diagnostic actionnable, pas une
@@ -1329,6 +1391,7 @@ async def _create_response(
         )
         try:
             conversation_result: dict = {}
+            extension_metadata: dict = {}
             parts = [
                 text
                 async for text in run_generation(
@@ -1337,6 +1400,7 @@ async def _create_response(
                     http_req,
                     conversation=req.conversation,
                     conversation_result=conversation_result,
+                    extension_metadata=extension_metadata,
                 )
             ]
         except UpstreamError as exc:
@@ -1351,6 +1415,7 @@ async def _create_response(
         output_text="".join(parts),
         run=report,
         conversation_result=conversation_result or None,
+        extension_metadata=extension_metadata or None,
     )
 
 
@@ -1505,6 +1570,23 @@ async def create_bridge_run(req: BridgeRunRequest, http_req: Request):
         task = asyncio.create_task(execute_once())
         idempotent_tasks[run_id] = task
     return await asyncio.shield(task)
+
+
+@app.delete("/v1/bridge/conversations/{conversation_id}", dependencies=[Depends(require_key)])
+async def archive_bridge_conversation(conversation_id: uuid.UUID):
+    if not bridge.online:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "bridge_extension_disconnected",
+                "message": "Extension Chrome non connectée.",
+                "retryable": True,
+            },
+        )
+    packet = await _ui_roundtrip(
+        {"type": "conversation_archive", "conversation_id": str(conversation_id)}
+    )
+    return {"archived": packet.get("ok") is True, "conversation_id": str(conversation_id)}
 
 
 @app.get("/v1/bridge/runs/{response_id}", dependencies=[Depends(require_key)])

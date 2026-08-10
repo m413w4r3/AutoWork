@@ -44,6 +44,7 @@ class Job:
     heartbeat_at: datetime | None = None
     error_code: str | None = None
     error_message: str | None = None
+    error_details: dict[str, Any] | None = None
     output_reference: str | None = None
     cancellation_requested_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -81,6 +82,7 @@ class Job:
         self.next_retry_at = None
         self.error_code = None
         self.error_message = None
+        self.error_details = None
         self.updated_at = timestamp
 
     def report_progress(
@@ -118,12 +120,20 @@ class Job:
         self.error_message = None
         self.updated_at = timestamp
 
-    def fail(self, code: str, message: str, now: datetime | None = None) -> None:
+    def fail(
+        self,
+        code: str,
+        message: str,
+        now: datetime | None = None,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         self._require_status(JobStatus.RUNNING)
         timestamp = now or datetime.now(UTC)
         self.status = JobStatus.FAILED
         self.error_code = code
         self.error_message = message
+        self.error_details = details
         self.finished_at = timestamp
         self.heartbeat_at = timestamp
         self.next_retry_at = None
@@ -143,6 +153,7 @@ class Job:
         self.status = JobStatus.QUEUED
         self.error_code = code
         self.error_message = message
+        self.error_details = None
         self.user_message = "Nouvelle tentative planifiée"
         self.next_retry_at = timestamp + delay
         self.heartbeat_at = timestamp
@@ -160,6 +171,7 @@ class Job:
         self.cancellation_requested_at = None
         self.error_code = None
         self.error_message = None
+        self.error_details = None
         self.user_message = "Relance demandée"
         self.updated_at = timestamp
 

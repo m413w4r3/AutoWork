@@ -25,20 +25,30 @@ const eventCounters = new Map();
 const conversationRegistry = new Map();
 const busyTabs = new Set();
 const requestConversationResults = new Map();
+const requestExtensionMetadata = new Map();
 
 const requestStatesReady = chrome.storage.local.get("bridgeRequestStates").then(({ bridgeRequestStates }) => {
   for (const [id, state] of Object.entries(bridgeRequestStates || {})) requestStates.set(id, state);
 });
 const conversationRegistryReady = chrome.storage.local
-  .get(["bridgeConversationRegistry", "bridgeRequestConversationResults"])
-  .then(({ bridgeConversationRegistry, bridgeRequestConversationResults }) => {
+  .get([
+    "bridgeConversationRegistry",
+    "bridgeRequestConversationResults",
+    "bridgeRequestExtensionMetadata",
+  ])
+  .then(
+    ({ bridgeConversationRegistry, bridgeRequestConversationResults, bridgeRequestExtensionMetadata }) => {
     for (const [id, entry] of Object.entries(bridgeConversationRegistry || {})) {
       conversationRegistry.set(id, { ...entry, tab_id: null, window_id: null });
     }
     for (const [id, value] of Object.entries(bridgeRequestConversationResults || {})) {
       requestConversationResults.set(id, value);
     }
-  });
+    for (const [id, value] of Object.entries(bridgeRequestExtensionMetadata || {})) {
+      requestExtensionMetadata.set(id, value);
+    }
+  },
+  );
 
 function persistRequestStates() {
   const entries = [...requestStates.entries()].slice(-1000);
@@ -52,6 +62,7 @@ function persistConversationRegistry() {
   chrome.storage.local.set({
     bridgeConversationRegistry: durable,
     bridgeRequestConversationResults: Object.fromEntries([...requestConversationResults.entries()].slice(-1000)),
+    bridgeRequestExtensionMetadata: Object.fromEntries([...requestExtensionMetadata.entries()].slice(-1000)),
   });
 }
 
@@ -114,6 +125,8 @@ async function connect() {
       handlePrompt(msg);
     } else if (msg.type === "ui_state" || msg.type === "ui_control") {
       handleUiRequest(msg);
+    } else if (msg.type === "conversation_archive") {
+      handleConversationArchive(msg);
     } else if (msg.type === "abort") {
       const tabId = inflight.get(msg.id);
       inflight.delete(msg.id);
@@ -134,6 +147,15 @@ async function connect() {
     scheduleReconnect(null);
   };
   socket.onerror = () => setStatus({ lastError: "serveur injoignable" });
+}
+
+async function handleConversationArchive(msg) {
+  await conversationRegistryReady;
+  const known = conversationRegistry.get(msg.conversation_id);
+  if (known?.tab_id) await chrome.tabs.remove(known.tab_id).catch(() => {});
+  conversationRegistry.delete(msg.conversation_id);
+  persistConversationRegistry();
+  send({ type: "conversation_archive", id: msg.id, ok: true });
 }
 
 function scheduleReconnect(error) {
@@ -279,6 +301,7 @@ async function handlePrompt(msg) {
         id: msg.id,
         replayed: true,
         conversation: requestConversationResults.get(msg.id) || null,
+        metadata: requestExtensionMetadata.get(msg.id) || null,
       });
     }
     return;
@@ -374,6 +397,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           window_id: sender.tab?.windowId || null,
           last_verified_at: Date.now(),
         });
+        persistConversationRegistry();
+      }
+      if (msg.type === "done" && msg.metadata) {
+        requestExtensionMetadata.set(msg.id, msg.metadata);
         persistConversationRegistry();
       }
       persistRequestStates();

@@ -86,6 +86,15 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
         candidates = await client.get(
             f"/api/editions/{edition.id}/discovery/candidates?sort=technical"
         )
+        research_run_id = candidates.json()["batches"][0]["discovery_model_run_id"]
+        retried = await client.post(
+            f"/api/editions/{edition.id}/discovery/structuring/retry",
+            json={
+                "research_model_run_id": research_run_id,
+                "complementary_axis": "initial",
+            },
+        )
+        retried_job = await client.get(f"/api/jobs/{retried.json()['job_id']}")
         source_id = candidates.json()["candidates"][0]["sources"][0]["id"]
         marked = await client.patch(
             f"/api/editions/{edition.id}/discovery/sources/{source_id}",
@@ -116,3 +125,6 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
     assert marked.json()["verification_status"] == "verify_later"
     assert duplicate.json()["reused"] is True
     assert duplicate.json()["job_id"] == launched.json()["job_id"]
+    assert retried.status_code == 202
+    assert retried_job.json()["status"] == "succeeded"
+    assert len(fake.calls) == 3  # recherche + structuration nominale + structuration seule

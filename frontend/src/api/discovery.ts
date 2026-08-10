@@ -88,6 +88,24 @@ export function launchDiscovery(
   });
 }
 
+export function retryDiscoveryStructuring(
+  editionId: string,
+  researchModelRunId: string,
+  complementaryAxis: string,
+): Promise<DiscoveryLaunchResult> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/structuring/retry`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        research_model_run_id: researchModelRunId,
+        complementary_axis: complementaryAxis,
+      }),
+    },
+  );
+}
+
 export function fetchDiscovery(
   editionId: string,
   filters: {

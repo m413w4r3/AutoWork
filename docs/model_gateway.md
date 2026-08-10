@@ -15,6 +15,7 @@ ou une décision humaine et ne devient jamais l'état canonique d'un sujet.
 | Usage | Adaptateur par défaut |
 | --- | --- |
 | Recherche web | OpenAI via `chatgpt-bridge` |
+| Structuration de la découverte | Qwen explicitement forcé |
 | Regroupement ambigu | OpenAI via `chatgpt-bridge` |
 | Synthèse premium et critique | OpenAI via `chatgpt-bridge` |
 | Extraction volumique | Qwen |
@@ -64,6 +65,9 @@ normalise le schéma Pydantic vers le sous-ensemble strict (`required` et
 Cette défense reste nécessaire pour le bridge et pour détecter toute incompatibilité
 fournisseur. Voir la
 [documentation Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs).
+Pour la découverte, Qwen reçoit plutôt un contrat compact versionné et
+`response_format={"type":"json_object"}` ; le schéma Pydantic complet n'est jamais injecté dans
+le prompt, mais reste la référence finale locale.
 Les extractions structurées de fond sont refusées pour l'instant : reprendre un tel run exige
 de persister l'identité du schéma, ce qui appartient à un incrément ultérieur.
 
@@ -104,7 +108,9 @@ phase, le caractère retryable et le nombre de tentatives. La description publiq
 | Preuves d'entrée | `authorized_input_hash`, `evidence_pack_hash` |
 | Observabilité | `parameters`, `duration_ms`, `usage`, `status`, dates |
 | Reprise | `response_id` unique |
-| Sorties | `output_references` vers le blob store |
+| Sorties | `output_references`, références/hashes/tailles brut et normalisé |
+| Parse | phase, versions sérialiseur/normalisation, transformations, ligne/colonne JSON |
+| Validation | chemins/codes Pydantic, compteurs de citations et URLs |
 | Erreur publique | `error_code`, `error_message` nettoyé |
 
 Le texte du prompt, les preuves, les clés API et les réponses ne sont pas enregistrés dans la
@@ -126,6 +132,7 @@ table ni dans les logs. Les sorties complètes vivent dans `model-outputs/` sur 
 | `QWEN_IS_EXTERNAL` | change explicitement la frontière de confiance Qwen |
 | `MODEL_FORCE_ADAPTER` | `auto`, ou forçage de développement |
 | `MODEL_REQUEST_TIMEOUT_SECONDS` | timeout HTTP borné |
+| `DISCOVERY_CHATGPT_STRUCTURING_FALLBACK` | fallback explicite, désactivé par défaut |
 
 Le `.env.example` pointe vers le gateway Qwen retenu. Placer la clé uniquement dans `.env` ou
 un secret manager ; elle n'est jamais nécessaire pour les tests. La décision de confiance

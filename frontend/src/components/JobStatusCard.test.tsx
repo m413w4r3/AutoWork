@@ -132,4 +132,73 @@ describe("JobStatusCard", () => {
       method: "POST",
     });
   });
+
+  it("affiche le diagnostic structuré et relance uniquement la structuration", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal("EventSource", undefined);
+    const retryStructuring = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            id: "4de4af61-811e-4c1c-ad4a-9b39a5c06c94",
+            kind: "discover_edition",
+            aggregate_type: "edition",
+            aggregate_id: "b131b279-d486-4af2-a1b8-c3579583b97e",
+            status: "failed",
+            progress_current: 3,
+            progress_total: 4,
+            user_message: null,
+            attempt: 1,
+            max_attempts: 1,
+            next_retry_at: null,
+            started_at: "2026-08-07T10:00:00Z",
+            finished_at: "2026-08-07T10:00:02Z",
+            heartbeat_at: "2026-08-07T10:00:02Z",
+            error_code: "discovery_structuring_invalid",
+            error_message: "JSON invalide",
+            error_details: {
+              phase: "json_parse",
+              validation_kind: "json_invalid",
+              valid_count: 1,
+              rejected_count: 2,
+              model_run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              research_model_run_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+              diagnostic_available: true,
+              can_retry_structuring: true,
+            },
+            correlation_id: "diag-structure-42",
+            output_reference: null,
+            cancellation_requested: false,
+            created_at: "2026-08-07T10:00:00Z",
+            updated_at: "2026-08-07T10:00:02Z",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <JobStatusCard
+          jobId="4de4af61-811e-4c1c-ad4a-9b39a5c06c94"
+          onRetryStructuring={retryStructuring}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("json_parse")).toBeInTheDocument();
+    expect(screen.getByText("1 valides · 2 rejetés")).toBeInTheDocument();
+    expect(screen.getByText("disponible")).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: "Retenter la structuration" }),
+    );
+    expect(retryStructuring).toHaveBeenCalledWith(
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    );
+  });
 });

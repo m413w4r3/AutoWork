@@ -24,7 +24,13 @@ from cti_app.domain.model_conversations import (
     ModelConversation,
     ModelConversationTurn,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelRunStatus
+from cti_app.domain.model_runs import (
+    ModelOutputRejection,
+    ModelProvider,
+    ModelRole,
+    ModelRun,
+    ModelRunStatus,
+)
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.models import (
     EditionAuditEventRow,
@@ -217,7 +223,24 @@ async def test_model_run_round_trip_never_persists_prompt_content(
                 actual_model_version="chatgpt-web",
                 usage=None,
             )
+            persisted.raw_output_reference = "blob://11111111-1111-4111-8111-111111111111"
+            persisted.raw_output_sha256 = "c" * 64
+            persisted.raw_output_chars = 42
+            persisted.parser_stage = "pydantic_validation"
+            persisted.normalization_version = "discovery-json-v1"
+            persisted.validation_errors = (
+                {"path": ["topics", "0", "sources", "1", "url"], "code": "value_error"},
+            )
             await uow.model_runs.save(persisted)
+            await uow.model_output_rejections.append(
+                ModelOutputRejection(
+                    model_run_id=run.id,
+                    path=("topics", "0", "sources", "1", "url"),
+                    error_type="value_error",
+                    value_sha256="d" * 64,
+                    raw_output_reference=persisted.raw_output_reference,
+                )
+            )
             await uow.commit()
 
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
@@ -225,6 +248,11 @@ async def test_model_run_round_trip_never_persists_prompt_content(
         assert persisted is not None
         assert persisted.status is ModelRunStatus.WAITING_BACKGROUND
         assert persisted.response_id == "resp_integration"
+        assert persisted.raw_output_sha256 == "c" * 64
+        assert persisted.validation_errors[0]["code"] == "value_error"
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            rejections = await uow.model_output_rejections.list_for_run(run.id)
+        assert rejections[0].path[-1] == "url"
         assert not hasattr(persisted, "prompt")
     finally:
         await engine.dispose()

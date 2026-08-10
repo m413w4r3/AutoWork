@@ -37,11 +37,19 @@ class UnknownJobKindError(ValueError):
 class JobHandlerError(Exception):
     """Controlled handler failure whose public fields are safe to expose."""
 
-    def __init__(self, code: str, public_message: str, *, transient: bool) -> None:
+    def __init__(
+        self,
+        code: str,
+        public_message: str,
+        *,
+        transient: bool,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.public_message = public_message
         self.transient = transient
+        self.details = details
 
 
 class JobCancelledError(Exception):
@@ -403,7 +411,11 @@ class JobExecutor:
                     timedelta(seconds=delay_seconds),
                 )
             else:
-                job.fail(error.code, _clean_public_message(error.public_message))
+                job.fail(
+                    error.code,
+                    _clean_public_message(error.public_message),
+                    details=error.details,
+                )
             await uow.jobs.save(job)
             event_type = (
                 "job.cancelled"

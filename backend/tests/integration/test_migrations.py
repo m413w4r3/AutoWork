@@ -21,6 +21,7 @@ EXPECTED_TABLES = {
     "edition_audit_events",
     "job_events",
     "model_runs",
+    "model_output_rejections",
     "model_conversations",
     "model_conversation_turns",
     "discovery_batches",

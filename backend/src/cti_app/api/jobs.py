@@ -51,6 +51,7 @@ class JobView(BaseModel):
     heartbeat_at: datetime | None
     error_code: str | None
     error_message: str | None
+    error_details: dict[str, Any] | None
     correlation_id: str
     input_parameters: dict[str, Any]
     output_reference: str | None
@@ -241,6 +242,7 @@ def _job_view(job: Job) -> JobView:
         heartbeat_at=job.heartbeat_at,
         error_code=job.error_code,
         error_message=job.error_message,
+        error_details=job.error_details,
         correlation_id=job.correlation_id,
         input_parameters=job.input_parameters,
         output_reference=job.output_reference,

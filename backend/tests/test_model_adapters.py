@@ -167,6 +167,7 @@ async def test_openai_research_uses_responses_web_search_and_background() -> Non
     assert payload["reasoning"] == {"effort": "high"}
     assert payload["background"] is True
     assert payload["include"] == ["web_search_call.action.sources"]
+    assert payload["input"] == [{"role": "user", "content": "Texte autorisé"}]
 
 
 async def test_openai_structured_rejects_invalid_output() -> None:
@@ -209,6 +210,68 @@ async def test_qwen_protocol_is_confined_to_its_adapter() -> None:
     assert result.provider is ModelProvider.QWEN
     assert transport.payloads[0]["model"] == "Qwen3-32B"
     assert transport.payloads[0]["messages"][1]["content"] == "Texte autorisé"
+
+
+async def test_qwen_uses_compact_contract_and_defers_discovery_validation() -> None:
+    transport = FakeChatTransport(
+        {
+            "id": "qwen_compact",
+            "model": "Qwen3-32B",
+            "choices": [{"message": {"content": '{"title":"Iran","score":2}'}}],
+        }
+    )
+    adapter = QwenAdapter(transport, model="Qwen3-32B", is_external=False)
+    request = replace(
+        safe_request(),
+        metadata={
+            "compact_contract": {
+                "version": "compact-v1",
+                "required": ["title", "score"],
+            },
+            "defer_validation": True,
+        },
+    )
+
+    result = await adapter.invoke(
+        request, role=ModelRole.STRUCTURED_EXTRACTION, output_schema=Extraction
+    )
+
+    system = transport.payloads[0]["messages"][0]["content"]
+    assert "compact-v1" in system
+    assert "$defs" not in system
+    assert '"title":' not in system
+    assert transport.payloads[0]["response_format"] == {"type": "json_object"}
+    assert result.output_text == '{"title":"Iran","score":2}'
+    assert result.structured_output is None
+
+
+async def test_bridge_visible_citations_are_exposed_as_adapter_metadata() -> None:
+    transport = FakeResponsesTransport(
+        {
+            "id": "resp_citations",
+            "status": "completed",
+            "model": "chatgpt-web",
+            "output_text": "Texte propre",
+            "metadata": {
+                "serializer_version": "chatgpt-dom-v2",
+                "visible_citations": [
+                    {
+                        "label": "Publisher",
+                        "url": "https://publisher.example/report?utm_source=chatgpt",
+                        "canonical_url": "https://publisher.example/report",
+                        "position": None,
+                    }
+                ],
+            },
+        }
+    )
+    adapter = OpenAIResearchAdapter(transport, model="chatgpt-web")
+
+    result = await adapter.invoke(safe_request(), role=ModelRole.RESEARCH)
+
+    assert result.output_text == "Texte propre"
+    assert result.metadata["serializer_version"] == "chatgpt-dom-v2"
+    assert result.metadata["visible_citations"][0]["label"] == "Publisher"
 
 
 async def test_chatgpt_bridge_transport_uses_native_capabilities() -> None:

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Annotated, Literal, NoReturn
+from typing import Annotated, Literal, NoReturn, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -219,7 +219,7 @@ async def reconcile_conversation(
 
 
 def _service(request: Request) -> ModelConversationService:
-    return request.app.state.model_conversation_service
+    return cast(ModelConversationService, request.app.state.model_conversation_service)
 
 
 def _conversation_view(value: ModelConversation) -> ConversationView:

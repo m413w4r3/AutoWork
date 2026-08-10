@@ -259,10 +259,12 @@ async def test_fake_extension_routes_a_b_a_and_retry_clicks_once(tmp_path: Path)
     conversation_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
     async def send(key: str, conversation: dict[str, object]) -> dict[str, Any]:
-        return await module["create_bridge_run"](
+        result = await module["create_bridge_run"](
             module["BridgeRunRequest"](input=key, conversation=conversation),
             request_with_key(key),
         )
+        assert isinstance(result, dict)
+        return result
 
     a1 = await send("a1", {"mode": "fresh", "id": conversation_a})
     b1 = await send("b1", {"mode": "fresh", "id": conversation_b})

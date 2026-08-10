@@ -97,9 +97,11 @@ function useJobTracking(jobId: string) {
 export function JobStatusCard({
   jobId,
   onTerminal,
+  onRetryStructuring,
 }: {
   jobId: string;
   onTerminal?: (status: JobStatus) => void;
+  onRetryStructuring?: (researchModelRunId: string) => void;
 }) {
   const job = useJobTracking(jobId);
   const queryClient = useQueryClient();
@@ -139,6 +141,12 @@ export function JobStatusCard({
     job.data.status === "failed" &&
     bridgeError?.kind === "transient" &&
     job.data.attempt < job.data.max_attempts;
+  const details = job.data.error_details;
+  const canRetryStructuring =
+    job.data.status === "failed" &&
+    details?.can_retry_structuring === true &&
+    typeof details.research_model_run_id === "string" &&
+    Boolean(onRetryStructuring);
 
   return (
     <article className={`job-card job-card--${job.data.status}`}>
@@ -186,6 +194,47 @@ export function JobStatusCard({
             ? ` — ${bridgeError.kind === "configuration" ? "configuration requise" : bridgeError.kind === "transient" ? "erreur transitoire" : "erreur terminale"}`
             : ""}
         </p>
+      ) : null}
+      {details ? (
+        <dl className="job-diagnostics">
+          <div>
+            <dt>Phase</dt>
+            <dd>{details.phase || "inconnue"}</dd>
+          </div>
+          <div>
+            <dt>Validation</dt>
+            <dd>{details.validation_kind || "non applicable"}</dd>
+          </div>
+          <div>
+            <dt>Éléments</dt>
+            <dd>
+              {details.valid_count ?? 0} valides · {details.rejected_count ?? 0}{" "}
+              rejetés
+            </dd>
+          </div>
+          {details.model_run_id ? (
+            <div>
+              <dt>ModelRun</dt>
+              <dd>{details.model_run_id}</dd>
+            </div>
+          ) : null}
+          <div>
+            <dt>Artefact diagnostic</dt>
+            <dd>
+              {details.diagnostic_available ? "disponible" : "indisponible"}
+            </dd>
+          </div>
+        </dl>
+      ) : null}
+      {canRetryStructuring ? (
+        <button
+          className="button button--secondary"
+          onClick={() =>
+            onRetryStructuring?.(details.research_model_run_id as string)
+          }
+        >
+          Retenter la structuration
+        </button>
       ) : null}
       {canRetry ? (
         <button

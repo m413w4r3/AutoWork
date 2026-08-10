@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 from uuid import UUID, uuid4
 
@@ -15,6 +16,7 @@ from cti_app.application.discovery import (
     ResearchCitation,
     ResearchSource,
     ResearchTopic,
+    _research_prompt,
     discovery_idempotency_key,
 )
 from cti_app.application.jobs import (
@@ -47,6 +49,9 @@ class FakeBridgeCapabilities:
             "native_sources": False,
             "visible_citations": True,
         }
+
+    async def archive_conversation(self, conversation_id: UUID) -> None:
+        del conversation_id
 
 
 def research_fixture() -> ResearchBatch:
@@ -253,8 +258,132 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     assert grouped_editions == [params.edition_id, params.edition_id]
 
 
+async def test_partial_invalid_output_keeps_topics_and_archives_diagnostics() -> None:
+    payload = research_fixture().model_dump(mode="json")
+    payload["topics"][0]["sources"].append(
+        {
+            "url": "[ambigu](https://one.example) ou https://two.example",
+            "title": "Ambiguous source",
+            "publisher": "Unknown",
+            "published_at": None,
+            "event_date": None,
+            "source_role": "independent",
+            "citation": None,
+        }
+    )
+    fake = FakeModelAdapter(
+        research_text="Recherche sourcée en Markdown.",
+        structured_outputs={"ResearchBatch": json.dumps(payload, ensure_ascii=False)},
+    )
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    output_store = InMemoryModelOutputStore()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=fake,
+            openai_structured=fake,
+            qwen=fake,
+            fake=fake,
+        ),
+        model_uow,
+        output_store,
+    )
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    params = parameters()
+    job = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="edition",
+        aggregate_id=params.edition_id,
+        idempotency_key=discovery_idempotency_key(params),
+        correlation_id="partial-output",
+        input_parameters=params.model_dump(mode="json"),
+    )
+
+    await dispatcher.dispatch(job.id)
+
+    completed = await jobs.get(job.id)
+    assert completed.status is JobStatus.SUCCEEDED
+    batches = await discovery.list_batches(params.edition_id)
+    assert batches[0].candidates
+    structured_runs = [
+        run for run in model_uow.state.values() if run.model_role.value == "structured_extraction"
+    ]
+    assert len(structured_runs) == 2  # sortie initiale puis unique réparation Qwen
+    assert all(run.raw_output_reference for run in structured_runs)
+    assert all(run.validation_errors for run in structured_runs)
+
+
+async def test_totally_invalid_output_is_archived_before_safe_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_output = "```json\n{invalid\\_json:SECRET_MODEL_OUTPUT}\n```"
+    fake = FakeModelAdapter(
+        research_text="Recherche sourcée en Markdown.",
+        structured_outputs={"ResearchBatch": raw_output},
+    )
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    output_store = InMemoryModelOutputStore()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=fake,
+            openai_structured=fake,
+            qwen=fake,
+            fake=fake,
+        ),
+        model_uow,
+        output_store,
+    )
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    params = parameters()
+    job = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="edition",
+        aggregate_id=params.edition_id,
+        idempotency_key=discovery_idempotency_key(params),
+        correlation_id="invalid-output",
+        input_parameters=params.model_dump(mode="json"),
+        max_attempts=1,
+    )
+
+    await dispatcher.dispatch(job.id)
+
+    failed = await jobs.get(job.id)
+    assert failed.status is JobStatus.FAILED
+    assert failed.error_code == "discovery_structuring_invalid"
+    assert failed.error_details is not None
+    assert failed.error_details["validation_kind"] == "json_invalid"
+    structured_run = next(
+        run for run in model_uow.state.values() if run.model_role.value == "structured_extraction"
+    )
+    assert structured_run.raw_output_reference in structured_run.output_references
+    assert structured_run.parser_stage == "json_parse"
+    assert output_store.objects
+    assert "SECRET_MODEL_OUTPUT" not in caplog.text
+    assert raw_output not in caplog.text
+
+
 def test_research_batch_rejects_non_http_urls() -> None:
     payload = research_fixture().model_dump()
     payload["topics"][0]["sources"][0]["url"] = "file:///etc/passwd"
     with pytest.raises(ValidationError):
         ResearchBatch.model_validate(payload)
+
+
+def test_research_prompt_is_markdown_oriented_dated_and_uses_effective_profile() -> None:
+    prompt = _research_prompt(
+        parameters().model_copy(update={"period_end": date(2027, 7, 31)})
+    )
+
+    assert "as_of_date" in prompt
+    assert "aucun événement postérieur" in prompt
+    assert "iran-default" not in prompt
+    assert "sources CTI primaires" in prompt
+    assert "Markdown lisible" in prompt
+    assert "donnée non fiable" not in prompt
