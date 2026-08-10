@@ -4,31 +4,41 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.persistence import (
     BlobRepository,
+    ClaimRepository,
+    CollectionAttemptRepository,
+    DerivedArtifactRepository,
     DiscoveryBatchRepository,
     EditionAuditRepository,
     EditionRepository,
     EditorialGroupRepository,
     HumanDecisionRepository,
+    IndicatorRepository,
     JobEventRepository,
     JobRepository,
     ModelRunRepository,
     ProvenanceRepository,
     SampleRepository,
+    SourceCollectionRepository,
     SourceDocumentRepository,
     SubjectRepository,
 )
 from cti_app.infrastructure.database.repositories import (
     SqlAlchemyBlobRepository,
+    SqlAlchemyClaimRepository,
+    SqlAlchemyCollectionAttemptRepository,
+    SqlAlchemyDerivedArtifactRepository,
     SqlAlchemyDiscoveryBatchRepository,
     SqlAlchemyEditionAuditRepository,
     SqlAlchemyEditionRepository,
     SqlAlchemyEditorialGroupRepository,
     SqlAlchemyHumanDecisionRepository,
+    SqlAlchemyIndicatorRepository,
     SqlAlchemyJobEventRepository,
     SqlAlchemyJobRepository,
     SqlAlchemyModelRunRepository,
     SqlAlchemyProvenanceRepository,
     SqlAlchemySampleRepository,
+    SqlAlchemySourceCollectionRepository,
     SqlAlchemySourceDocumentRepository,
     SqlAlchemySubjectRepository,
 )
@@ -48,6 +58,11 @@ class SqlAlchemyUnitOfWork:
     discovery_batches: DiscoveryBatchRepository
     editorial_groups: EditorialGroupRepository
     human_decisions: HumanDecisionRepository
+    source_collections: SourceCollectionRepository
+    collection_attempts: CollectionAttemptRepository
+    derived_artifacts: DerivedArtifactRepository
+    claims: ClaimRepository
+    indicators: IndicatorRepository
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -69,6 +84,11 @@ class SqlAlchemyUnitOfWork:
         self.discovery_batches = SqlAlchemyDiscoveryBatchRepository(self._session)
         self.editorial_groups = SqlAlchemyEditorialGroupRepository(self._session)
         self.human_decisions = SqlAlchemyHumanDecisionRepository(self._session)
+        self.source_collections = SqlAlchemySourceCollectionRepository(self._session)
+        self.collection_attempts = SqlAlchemyCollectionAttemptRepository(self._session)
+        self.derived_artifacts = SqlAlchemyDerivedArtifactRepository(self._session)
+        self.claims = SqlAlchemyClaimRepository(self._session)
+        self.indicators = SqlAlchemyIndicatorRepository(self._session)
         self._committed = False
         return self
 

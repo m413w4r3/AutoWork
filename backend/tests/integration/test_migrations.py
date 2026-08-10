@@ -24,6 +24,11 @@ EXPECTED_TABLES = {
     "discovery_batches",
     "editorial_groups",
     "human_decisions",
+    "source_collections",
+    "collection_attempts",
+    "derived_artifacts",
+    "claims",
+    "indicators",
 }
 
 

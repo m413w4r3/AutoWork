@@ -3,15 +3,26 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import dramatiq
+from minio import Minio
 
+from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.discovery import DiscoveryService
 from cti_app.application.editorial import EditorialGroupingService
+from cti_app.application.extraction import EvidenceExtractionService
+from cti_app.application.http_collection import (
+    CollectionPolicy,
+    SafeHttpCollector,
+    SystemDnsResolver,
+    parse_domain_policy,
+)
 from cti_app.application.jobs import JobExecutor, JobService, create_job_registry
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.config import get_settings
 from cti_app.domain.jobs import JobStatus
+from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
 from cti_app.integrations.model_factory import (
     create_bridge_capabilities_provider,
     create_model_gateway,
@@ -57,9 +68,36 @@ async def _execute_job(job_id: UUID) -> int | None:
             bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
             after_discovery=editorial_service.synchronize,
         )
+        blob_store = MinioBlobStore(
+            Minio(
+                settings.s3_endpoint,
+                access_key=settings.s3_access_key,
+                secret_key=settings.s3_secret_key,
+                secure=settings.s3_secure,
+            ),
+            physical_bucket=settings.s3_bucket,
+        )
+        collection_service = SubjectCollectionService(
+            uow_factory,
+            SafeHttpCollector(
+                AsyncioPinnedHttpTransport(),
+                SystemDnsResolver(),
+                CollectionPolicy(
+                    max_redirects=settings.collection_max_redirects,
+                    timeout_seconds=settings.collection_timeout_seconds,
+                    max_download_bytes=settings.collection_max_download_bytes,
+                    max_expanded_bytes=settings.collection_max_expanded_bytes,
+                    max_decompression_ratio=settings.collection_max_decompression_ratio,
+                    allowed_domains=parse_domain_policy(settings.collection_allowed_domains),
+                    blocked_domains=parse_domain_policy(settings.collection_blocked_domains),
+                ),
+            ),
+            blob_store,
+            EvidenceExtractionService(model_gateway),
+        )
         executor = JobExecutor(
             uow_factory,
-            create_job_registry(model_gateway, discovery_service),
+            create_job_registry(model_gateway, discovery_service, collection_service),
             retry_base_seconds=settings.job_retry_base_seconds,
             retry_max_seconds=settings.job_retry_max_seconds,
         )

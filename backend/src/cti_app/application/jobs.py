@@ -410,7 +410,9 @@ async def demo_job_handler(parameters: JobParameters, context: JobExecutionConte
 
 
 def create_job_registry(
-    model_gateway: object | None = None, discovery_service: object | None = None
+    model_gateway: object | None = None,
+    discovery_service: object | None = None,
+    collection_service: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
@@ -427,6 +429,15 @@ def create_job_registry(
         if not isinstance(discovery_service, DiscoveryService):
             raise TypeError("discovery_service must be a DiscoveryService")
         register_discovery_jobs(registry, discovery_service)
+    if collection_service is not None:
+        from cti_app.application.collection import (
+            SubjectCollectionService,
+            register_collection_jobs,
+        )
+
+        if not isinstance(collection_service, SubjectCollectionService):
+            raise TypeError("collection_service must be a SubjectCollectionService")
+        register_collection_jobs(registry, collection_service)
     return registry
 
 

@@ -50,6 +50,13 @@ class InMemoryEditorialGroupRepository:
             if group.edition_id in historical_ids and group.status.value == "selected"
         ]
 
+    async def get_by_subject(self, subject_id: UUID) -> EditorialGroup | None:
+        value = next(
+            (group for group in self._groups.values() if group.subject_id == subject_id),
+            None,
+        )
+        return deepcopy(value) if value else None
+
     async def save(self, group: EditorialGroup) -> None:
         if group.id not in self._groups:
             raise LookupError(group.id)

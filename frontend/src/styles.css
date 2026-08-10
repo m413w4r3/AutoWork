@@ -616,3 +616,36 @@ h1 {
     grid-template-columns: 1fr;
   }
 }
+.workbench-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin: 1.5rem 0;
+  flex-wrap: wrap;
+}
+
+.workbench-tabs button[aria-pressed="true"] {
+  background: var(--color-primary, #243b53);
+  color: white;
+}
+
+.workbench-list {
+  display: grid;
+  gap: 1rem;
+}
+
+.evidence-card {
+  border: 1px solid #bcccdc;
+  border-radius: 0.75rem;
+  padding: 1rem;
+  background: white;
+}
+
+.technical-value {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace;
+}
+
+.evidence-card mark {
+  background: #fff3bf;
+  padding: 0.15rem;
+}

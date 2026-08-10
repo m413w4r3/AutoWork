@@ -34,6 +34,13 @@ class FilesystemBlobStore:
     async def delete(self, descriptor: BlobDescriptor) -> None:
         self._path_for(descriptor).unlink(missing_ok=True)
 
+    async def read(self, descriptor: BlobDescriptor, *, max_bytes: int) -> bytes:
+        path = self._path_for(descriptor)
+        verify_file(path, descriptor)
+        if descriptor.size > max_bytes:
+            raise ValueError("Blob exceeds the read limit")
+        return path.read_bytes()
+
     def _put_sync(self, source: BinaryIO, *, logical_bucket: str, mime_type: str) -> BlobDescriptor:
         temporary, descriptor = spool_and_describe(
             source,

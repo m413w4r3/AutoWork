@@ -20,6 +20,7 @@ import {
 } from "./api/editions";
 import { JobStatusCard } from "./components/JobStatusCard";
 import { EditorialBoard } from "./components/EditorialBoard";
+import { SubjectWorkbench } from "./components/SubjectWorkbench";
 
 const statusLabels: Record<EditionStatus, string> = {
   draft: "Brouillon",
@@ -64,13 +65,16 @@ function Link({ to, children }: { to: string; children: React.ReactNode }) {
 export function App() {
   const pathname = usePathname();
   const detail = pathname.match(/^\/editions\/([^/]+)$/);
+  const subject = pathname.match(/^\/subjects\/([^/]+)$/);
   return (
     <main>
       <header className="app-header">
         <Link to="/editions">CTI Bulletin</Link>
         <span>Utilisateur local : dev-analyst</span>
       </header>
-      {pathname === "/editions/new" ? (
+      {subject ? (
+        <SubjectWorkbench subjectId={subject[1]!} />
+      ) : pathname === "/editions/new" ? (
         <EditionCreatePage />
       ) : detail ? (
         <EditionDetailPage editionId={detail[1]!} />

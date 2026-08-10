@@ -52,6 +52,11 @@ class MinioBlobStore:
             self._client.remove_object, self._physical_bucket, descriptor.object_key
         )
 
+    async def read(self, descriptor: BlobDescriptor, *, max_bytes: int) -> bytes:
+        if descriptor.size > max_bytes:
+            raise ValueError("Blob exceeds the read limit")
+        return await asyncio.to_thread(self._read_sync, descriptor)
+
     def _put_sync(self, source: BinaryIO, *, logical_bucket: str, mime_type: str) -> BlobDescriptor:
         temporary, descriptor = spool_and_describe(
             source,
@@ -108,3 +113,20 @@ class MinioBlobStore:
             return "copy"
         finally:
             temporary.unlink(missing_ok=True)
+
+    def _read_sync(self, descriptor: BlobDescriptor) -> bytes:
+        if not self._exists_sync(descriptor):
+            raise FileNotFoundError(descriptor.object_key)
+        response = self._client.get_object(self._physical_bucket, descriptor.object_key)
+        try:
+            content = response.read(descriptor.size + 1)
+        finally:
+            response.close()
+            response.release_conn()
+        if len(content) != descriptor.size:
+            raise BlobIntegrityError("Downloaded object size does not match its descriptor")
+        import hashlib
+
+        if hashlib.sha256(content).hexdigest() != descriptor.sha256:
+            raise BlobIntegrityError("Downloaded object digest does not match its descriptor")
+        return content

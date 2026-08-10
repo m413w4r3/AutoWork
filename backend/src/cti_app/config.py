@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     qwen_is_external: bool = False
     model_force_adapter: Literal["auto", "openai", "qwen", "fake"] = "auto"
     model_request_timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
+    collection_max_redirects: int = Field(default=5, ge=0, le=10)
+    collection_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    collection_max_download_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    collection_max_expanded_bytes: int = Field(default=25 * 1024 * 1024, gt=0)
+    collection_max_decompression_ratio: float = Field(default=20.0, gt=1, le=1000)
+    collection_allowed_domains: str = ""
+    collection_blocked_domains: str = ""
 
 
 @lru_cache

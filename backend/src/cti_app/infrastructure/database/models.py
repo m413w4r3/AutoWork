@@ -34,7 +34,22 @@ GROUPING_OUTCOME_VALUES_SQL = (
 EDITORIAL_TYPE_VALUES_SQL = "'brief', 'major'"
 RELATIONSHIP_STATUS_VALUES_SQL = "'provisional', 'verified'"
 GROUPING_CONFIDENCE_VALUES_SQL = "'low', 'medium', 'high'"
-HUMAN_DECISION_VALUES_SQL = "'merge', 'split', 'reject', 'select'"
+COLLECTION_STATE_VALUES_SQL = (
+    "'queued', 'fetching', 'archived', 'extracted', 'completed', 'unavailable', "
+    "'blocked', 'failed_retryable', 'failed_terminal'"
+)
+SOURCE_ROLE_VALUES_SQL = "'primary', 'independent', 'relay', 'aggregator', 'social', 'unknown'"
+ATTEMPT_OUTCOME_VALUES_SQL = "'succeeded', 'unavailable', 'blocked', 'too_large', 'error'"
+CLAIM_KIND_VALUES_SQL = (
+    "'name', 'date', 'ioc', 'cve', 'fact', 'assessment', 'uncertainty', "
+    "'infection_chain', 'ttp', 'victimology'"
+)
+INDICATOR_KIND_VALUES_SQL = "'hash', 'domain', 'ip', 'url', 'cve', 'attack_id', 'email'"
+HUMAN_DECISION_VALUES_SQL = (
+    "'merge', 'split', 'reject', 'select', 'claim_validate', 'claim_correct', "
+    "'claim_reject', 'indicator_validate', 'indicator_correct', 'indicator_reject', "
+    "'source_relationship_validate', 'source_relationship_correct'"
+)
 
 
 class Base(DeclarativeBase):
@@ -423,3 +438,184 @@ class HumanDecisionRow(Base):
     correlation_id: Mapped[str] = mapped_column(String(128), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SourceCollectionRow(Base):
+    __tablename__ = "source_collections"
+    __table_args__ = (
+        UniqueConstraint(
+            "subject_id", "source_candidate_id", name="uq_source_collections_subject_candidate"
+        ),
+        CheckConstraint(
+            f"state IN ({COLLECTION_STATE_VALUES_SQL})", name="ck_source_collections_state"
+        ),
+        CheckConstraint(
+            f"proposed_role IN ({SOURCE_ROLE_VALUES_SQL})",
+            name="ck_source_collections_role",
+        ),
+        CheckConstraint(
+            f"relationship_status IN ({RELATIONSHIP_STATUS_VALUES_SQL})",
+            name="ck_source_collections_relationship",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_source_collections_attempt_count"),
+        Index("ix_source_collections_subject_state", "subject_id", "state"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    subject_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
+    )
+    edition_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
+    )
+    group_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editorial_groups.id", ondelete="RESTRICT"), nullable=False
+    )
+    batch_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovery_batches.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_candidate_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    requested_url: Mapped[str] = mapped_column(Text, nullable=False)
+    proposed_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    relationship_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    relationship_evidence: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_document_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("source_documents.id", ondelete="RESTRICT")
+    )
+    latest_attempt_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("collection_attempts.id", ondelete="RESTRICT")
+    )
+    derived_artifact_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("derived_artifacts.id", ondelete="RESTRICT")
+    )
+    error_reason: Mapped[str | None] = mapped_column(Text)
+    attempt_count: Mapped[int] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class CollectionAttemptRow(Base):
+    __tablename__ = "collection_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            f"outcome IN ({ATTEMPT_OUTCOME_VALUES_SQL})", name="ck_collection_attempts_outcome"
+        ),
+        CheckConstraint("size IS NULL OR size >= 0", name="ck_collection_attempts_size"),
+        CheckConstraint(
+            "sha256 IS NULL OR (char_length(sha256) = 64 AND sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_collection_attempts_sha256",
+        ),
+        Index("ix_collection_attempts_collection", "collection_id", "attempted_at"),
+        Index("ix_collection_attempts_job", "job_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    collection_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("source_collections.id", ondelete="RESTRICT"), nullable=False
+    )
+    job_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("jobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    configuration_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_url: Mapped[str] = mapped_column(Text, nullable=False)
+    final_url: Mapped[str | None] = mapped_column(Text)
+    redirect_chain: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    http_status: Mapped[int | None] = mapped_column()
+    declared_content_type: Mapped[str | None] = mapped_column(String(255))
+    detected_content_type: Mapped[str | None] = mapped_column(String(255))
+    size: Mapped[int | None] = mapped_column(BigInteger)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    allowed_headers: Mapped[dict[str, str]] = mapped_column(JSONB, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    failure_reason: Mapped[str | None] = mapped_column(Text)
+
+
+class DerivedArtifactRow(Base):
+    __tablename__ = "derived_artifacts"
+    __table_args__ = (
+        CheckConstraint("text_length >= 0", name="ck_derived_artifacts_text_length"),
+        Index("ix_derived_artifacts_source", "source_document_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    source_document_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("source_documents.id", ondelete="RESTRICT"), nullable=False
+    )
+    text_blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    parser_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    parser_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    text_length: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    publication_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ClaimRow(Base):
+    __tablename__ = "claims"
+    __table_args__ = (
+        CheckConstraint(f"kind IN ({CLAIM_KIND_VALUES_SQL})", name="ck_claims_kind"),
+        CheckConstraint("span_start >= 0 AND span_end > span_start", name="ck_claims_span"),
+        Index("ix_claims_subject", "subject_id", "created_at"),
+        Index("ix_claims_source", "source_document_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    subject_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
+    )
+    edition_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
+    )
+    group_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editorial_groups.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_document_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("source_documents.id", ondelete="RESTRICT"), nullable=False
+    )
+    derived_artifact_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("derived_artifacts.id", ondelete="RESTRICT"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    span_start: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    span_end: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    extraction_method: Mapped[str] = mapped_column(String(128), nullable=False)
+    extraction_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class IndicatorRow(Base):
+    __tablename__ = "indicators"
+    __table_args__ = (
+        CheckConstraint(f"kind IN ({INDICATOR_KIND_VALUES_SQL})", name="ck_indicators_kind"),
+        CheckConstraint("span_start >= 0 AND span_end > span_start", name="ck_indicators_span"),
+        Index("ix_indicators_subject", "subject_id", "created_at"),
+        Index("ix_indicators_source", "source_document_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    subject_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
+    )
+    edition_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
+    )
+    group_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editorial_groups.id", ondelete="RESTRICT"), nullable=False
+    )
+    source_document_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("source_documents.id", ondelete="RESTRICT"), nullable=False
+    )
+    derived_artifact_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("derived_artifacts.id", ondelete="RESTRICT"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    original_value: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_value: Mapped[str] = mapped_column(Text, nullable=False)
+    span_start: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    span_end: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

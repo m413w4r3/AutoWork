@@ -40,6 +40,14 @@ class HumanDecisionType(StrEnum):
     SPLIT = "split"
     REJECT = "reject"
     SELECT = "select"
+    CLAIM_VALIDATE = "claim_validate"
+    CLAIM_CORRECT = "claim_correct"
+    CLAIM_REJECT = "claim_reject"
+    INDICATOR_VALIDATE = "indicator_validate"
+    INDICATOR_CORRECT = "indicator_correct"
+    INDICATOR_REJECT = "indicator_reject"
+    SOURCE_RELATIONSHIP_VALIDATE = "source_relationship_validate"
+    SOURCE_RELATIONSHIP_CORRECT = "source_relationship_correct"
 
 
 @dataclass(frozen=True, slots=True)

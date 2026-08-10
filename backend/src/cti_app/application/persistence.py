@@ -5,6 +5,13 @@ from typing import Protocol, Self
 from uuid import UUID
 
 from cti_app.domain.blobs import BlobRecord
+from cti_app.domain.collection import (
+    Claim,
+    CollectionAttempt,
+    DerivedArtifact,
+    Indicator,
+    SourceCollection,
+)
 from cti_app.domain.discovery import DiscoveryBatch
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import EditorialGroup, HumanDecision
@@ -141,6 +148,8 @@ class EditorialGroupRepository(Protocol):
 
     async def list_historical(self, edition_id: UUID) -> Sequence[EditorialGroup]: ...
 
+    async def get_by_subject(self, subject_id: UUID) -> EditorialGroup | None: ...
+
     async def save(self, group: EditorialGroup) -> None: ...
 
 
@@ -148,6 +157,50 @@ class HumanDecisionRepository(Protocol):
     async def append(self, decision: HumanDecision) -> None: ...
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[HumanDecision]: ...
+
+
+class SourceCollectionRepository(Protocol):
+    async def add_if_absent(self, collection: SourceCollection) -> bool: ...
+
+    async def get(self, collection_id: UUID) -> SourceCollection | None: ...
+
+    async def get_for_update(self, collection_id: UUID) -> SourceCollection | None: ...
+
+    async def get_by_candidate(
+        self, subject_id: UUID, source_candidate_id: UUID
+    ) -> SourceCollection | None: ...
+
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[SourceCollection]: ...
+
+    async def save(self, collection: SourceCollection) -> None: ...
+
+
+class CollectionAttemptRepository(Protocol):
+    async def append(self, attempt: CollectionAttempt) -> None: ...
+
+    async def list_for_collection(self, collection_id: UUID) -> Sequence[CollectionAttempt]: ...
+
+
+class DerivedArtifactRepository(Protocol):
+    async def append(self, artifact: DerivedArtifact) -> None: ...
+
+    async def get(self, artifact_id: UUID) -> DerivedArtifact | None: ...
+
+
+class ClaimRepository(Protocol):
+    async def append_many(self, claims: Sequence[Claim]) -> None: ...
+
+    async def get(self, claim_id: UUID) -> Claim | None: ...
+
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[Claim]: ...
+
+
+class IndicatorRepository(Protocol):
+    async def append_many(self, indicators: Sequence[Indicator]) -> None: ...
+
+    async def get(self, indicator_id: UUID) -> Indicator | None: ...
+
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[Indicator]: ...
 
 
 class UnitOfWork(Protocol):
@@ -164,6 +217,11 @@ class UnitOfWork(Protocol):
     discovery_batches: DiscoveryBatchRepository
     editorial_groups: EditorialGroupRepository
     human_decisions: HumanDecisionRepository
+    source_collections: SourceCollectionRepository
+    collection_attempts: CollectionAttemptRepository
+    derived_artifacts: DerivedArtifactRepository
+    claims: ClaimRepository
+    indicators: IndicatorRepository
 
     async def __aenter__(self) -> Self: ...
 

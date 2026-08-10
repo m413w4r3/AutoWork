@@ -160,6 +160,13 @@ function EditorialGroupCard({
         <span className="badge">{group.status}</span>
       </div>
       <h3>{group.title}</h3>
+      {group.status === "selected" && group.subject_id ? (
+        <p>
+          <a href={`/subjects/${group.subject_id}`}>
+            Ouvrir le Workbench Sujet
+          </a>
+        </p>
+      ) : null}
       <p>
         <strong>Résultat :</strong> {group.outcome} · relations de sources{" "}
         <strong>{group.source_relationship_status}</strong>
