@@ -1,0 +1,219 @@
+name: cti-bulletin
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cti_app}
+      POSTGRES_USER: ${POSTGRES_USER:-cti_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-postgres-only}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-local-minio-user}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-local-minio-password}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-local-minio-user}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-local-minio-password}
+      S3_BUCKET: ${S3_BUCKET:-cti-local}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "local/$${S3_BUCKET}"
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+      dockerfile: infra/backend.Dockerfile
+    environment: &backend-environment
+      APP_ENV: development
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      POSTGRES_DSN: postgresql+asyncpg://${POSTGRES_USER:-cti_app}:${POSTGRES_PASSWORD:-local-postgres-only}@postgres:5432/${POSTGRES_DB:-cti_app}
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-local-minio-user}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-local-minio-password}
+      S3_BUCKET: ${S3_BUCKET:-cti-local}
+      S3_SECURE: "false"
+      JOB_RETRY_BASE_SECONDS: ${JOB_RETRY_BASE_SECONDS:-1}
+      JOB_RETRY_MAX_SECONDS: ${JOB_RETRY_MAX_SECONDS:-300}
+      JOB_HEARTBEAT_TIMEOUT_SECONDS: ${JOB_HEARTBEAT_TIMEOUT_SECONDS:-120}
+      JOB_RECOVERY_INTERVAL_SECONDS: ${JOB_RECOVERY_INTERVAL_SECONDS:-30}
+      OPENAI_BRIDGE_BASE_URL: ${OPENAI_BRIDGE_BASE_URL:-http://host.docker.internal:8001/v1}
+      OPENAI_BRIDGE_API_KEY: ${OPENAI_BRIDGE_API_KEY:-}
+      OPENAI_RESEARCH_MODEL: ${OPENAI_RESEARCH_MODEL:-chatgpt-web}
+      OPENAI_STRUCTURED_MODEL: ${OPENAI_STRUCTURED_MODEL:-chatgpt-web}
+      OPENAI_DRAFTING_MODEL: ${OPENAI_DRAFTING_MODEL:-chatgpt-web}
+      OPENAI_CRITIC_MODEL: ${OPENAI_CRITIC_MODEL:-chatgpt-web}
+      QWEN_BASE_URL: ${QWEN_BASE_URL:-http://host.docker.internal:8080/v1}
+      QWEN_API_KEY: ${QWEN_API_KEY:-}
+      QWEN_MODEL: ${QWEN_MODEL:-Qwen3-32B}
+      QWEN_IS_EXTERNAL: ${QWEN_IS_EXTERNAL:-false}
+      MODEL_FORCE_ADAPTER: ${MODEL_FORCE_ADAPTER:-auto}
+      MODEL_REQUEST_TIMEOUT_SECONDS: ${MODEL_REQUEST_TIMEOUT_SECONDS:-900}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/ready', timeout=3)",
+        ]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      dockerfile: infra/backend.Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/backend.Dockerfile
+    command:
+      [
+        "dramatiq",
+        "cti_app.workers.tasks",
+        "--processes",
+        "1",
+        "--threads",
+        "2",
+        "--skip-logging",
+      ]
+    environment: *backend-environment
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import redis; redis.Redis(host='redis', port=6379).ping()",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    restart: unless-stopped
+
+  job-recovery:
+    build:
+      context: .
+      dockerfile: infra/backend.Dockerfile
+    command: ["python", "-m", "cti_app.workers.scheduler"]
+    environment: *backend-environment
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import redis; redis.Redis(host='redis', port=6379).ping()",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: infra/frontend.Dockerfile
+    environment:
+      VITE_API_PROXY_TARGET: http://backend:8000
+    ports:
+      - "${FRONTEND_PORT:-5173}:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:5173"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

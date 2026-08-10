@@ -1,0 +1,168 @@
+"""Fausse extension : simule Chrome pour tester le serveur sans navigateur.
+
+⚠️  Un seul client à la fois peut tenir le pont. Désactive l'extension Chrome
+(ou ferme l'onglet chatgpt.com) avant de lancer ce script, sinon l'un des deux
+se fait déconnecter avec le code 4000 « replaced ».
+
+    python examples/fake_extension.py
+    BRIDGE_PORT=8001 python examples/fake_extension.py
+"""
+
+import asyncio
+import json
+import os
+
+import websockets
+
+HOST = os.getenv("BRIDGE_HOST", "127.0.0.1")
+PORT = os.getenv("BRIDGE_PORT", "8000")
+URL = os.getenv("BRIDGE_WS", f"ws://{HOST}:{PORT}/ws")
+
+# --------------------------------------------------------------------------- #
+# Interface simulée : mêmes messages typés que le content script (ui_state /
+# ui_control), pour tester les contrôles du bridge sans navigateur.
+# --------------------------------------------------------------------------- #
+MODELES = [
+    {"id": "gpt-5", "label": "GPT-5"},
+    {"id": "gpt-5-thinking", "label": "GPT-5 Thinking"},
+    {"id": "gpt-4o", "label": "GPT-4o"},
+]
+PROFILS = [{"id": "personnel", "label": "Personnel"}, {"id": "equipe-cti", "label": "Équipe CTI"}]
+
+UI = {"model": "gpt-5", "profile": "personnel", "web_search": False}
+
+
+def _picker(courant: list, choix: str, probe: bool) -> dict:
+    item = next((m for m in courant if m["id"] == choix), None)
+    return {
+        "supported": True,
+        "selected": item["label"] if item else None,
+        "selected_id": choix,
+        "verified": item is not None,
+        "available": courant if probe else None,
+        "reason": None,
+    }
+
+
+def etat(probe: bool) -> dict:
+    return {
+        "observed_at": None,
+        "url": "https://chatgpt.com/simulateur",
+        "content_script_version": "simulateur",
+        "probed": probe,
+        "model": _picker(MODELES, UI["model"], probe),
+        "profile": _picker(PROFILS, UI["profile"], probe),
+        "web_search": {
+            "supported": True,
+            "enabled": UI["web_search"],
+            "verified": True,
+            "via": "composer_toggle",
+            "reason": None,
+        },
+    }
+
+
+def _select(cle: str, catalogue: list, voulu: str) -> dict:
+    item = next(
+        (m for m in catalogue if voulu.lower() in (m["id"], m["label"].lower())),
+        None,
+    )
+    if item is None:
+        return {
+            "requested": voulu,
+            "applied": None,
+            "verified": False,
+            "ok": False,
+            "changed": False,
+            "reason": f"« {voulu} » absent du sélecteur simulé",
+            "available": catalogue,
+        }
+    change = UI[cle] != item["id"]
+    UI[cle] = item["id"]
+    return {
+        "requested": voulu,
+        "applied": item["label"],
+        "verified": True,
+        "ok": True,
+        "changed": change,
+        "reason": None,
+    }
+
+
+def applique(controls: dict) -> dict:
+    resultats = {}
+    if controls.get("profile"):
+        resultats["profile"] = _select("profile", PROFILS, controls["profile"])
+    if controls.get("model"):
+        resultats["model"] = _select("model", MODELES, controls["model"])
+    if isinstance(controls.get("web_search"), bool):
+        voulu = controls["web_search"]
+        change = UI["web_search"] != voulu
+        UI["web_search"] = voulu
+        resultats["web_search"] = {
+            "requested": voulu,
+            "applied": voulu,
+            "verified": True,
+            "ok": True,
+            "changed": change,
+            "via": "composer_toggle",
+            "reason": None,
+        }
+    return resultats
+
+
+async def main() -> None:
+    try:
+        ws = await websockets.connect(URL)
+    except OSError as exc:
+        raise SystemExit(f"❌ Serveur injoignable sur {URL} ({exc}). Lance `python server.py`.")
+
+    async with ws:
+        await ws.send(json.dumps({"type": "hello", "client": "simulateur"}))
+        print(f"connecté au bridge sur {URL}")
+        try:
+            async for raw in ws:
+                msg = json.loads(raw)
+                if msg["type"] == "ping":
+                    await ws.send(json.dumps({"type": "pong"}))
+                    continue
+                if msg["type"] in ("ui_state", "ui_control"):
+                    applied = applique(msg.get("controls") or {}) if msg["type"] == "ui_control" else None
+                    print(f"{msg['type']} → {applied if applied is not None else UI}")
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": msg["type"],
+                                "id": msg["id"],
+                                "ok": applied is None or all(r["ok"] for r in applied.values()),
+                                "applied": applied,
+                                "state": etat(bool(msg.get("probe"))),
+                                "error": None,
+                            }
+                        )
+                    )
+                    continue
+                if msg["type"] != "prompt":
+                    continue
+
+                files = msg.get("files") or []
+                print(f"prompt reçu : {msg['prompt'][:60]!r}  ({len(files)} pièce(s) jointe(s))")
+                joints = "".join(
+                    f"\n- {f['name']} ({f['mime']}, {len(f['data']) * 3 // 4} octets)" for f in files
+                )
+                reponse = f"Écho ({len(msg['prompt'])} caractères){joints}\n\n```python\nprint('bloc de code')\n```"
+                for word in reponse.split(" "):
+                    await ws.send(json.dumps({"type": "chunk", "id": msg["id"], "text": word + " "}))
+                    await asyncio.sleep(0.03)
+                await ws.send(json.dumps({"type": "done", "id": msg["id"]}))
+        except websockets.exceptions.ConnectionClosedError as exc:
+            if exc.rcvd and exc.rcvd.code == 4000:
+                raise SystemExit(
+                    "❌ Un autre client (l'extension Chrome) a pris le pont.\n"
+                    "   Désactive l'extension dans chrome://extensions/ ou ferme l'onglet\n"
+                    "   chatgpt.com, puis relance ce script."
+                ) from None
+            raise
+
+
+asyncio.run(main())

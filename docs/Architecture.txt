@@ -1,0 +1,41 @@
+Couche
+
+Choix
+
+Backend
+
+Python 3.12+, FastAPI, Pydantic 2, SQLAlchemy 2, Alembic
+
+Frontend
+
+React, TypeScript, Vite, TanStack Query et Router
+
+Base
+
+PostgreSQL
+
+Jobs
+
+Dramatiq + Redis
+
+Fichiers
+
+interface de stockage objet, MinIO en développement
+
+UI
+
+Tailwind CSS et composants accessibles
+
+Tests backend
+
+pytest, pytest-asyncio, Ruff, mypy
+
+Tests frontend
+
+Vitest, Testing Library, Playwright
+
+Environnement
+
+Docker Compose, uv et pnpm
+
+Ce choix fournit une application interne robuste sans imposer immédiatement Kubernetes, Temporal ou OpenCTI. Les interfaces permettront de faire évoluer ces composants plus tard.

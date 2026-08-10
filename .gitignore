@@ -1,0 +1,66 @@
+# Environment and secrets
+.*
+!.gitignore
+!.dockerignore
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# JavaScript
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+coverage/
+frontend/test-results/
+frontend/playwright-report/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+
+# Local application data and generated outputs
+data/
+work/
+output/
+outputs/
+artifacts/
+tmp/
+*.log
+.playwright-mcp/
+
+# Sensitive or unsafe material must never be versioned
+samples/
+quarantine/
+malware/
+evidence-packs/
+evidence_packs/
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.iso
+*.dmg
+
+# Existing standalone utility runtime files
+chatgpt-bridge/.venv/
+chatgpt-bridge/__pycache__/
+chatgpt-bridge/out/

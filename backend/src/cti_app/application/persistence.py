@@ -1,0 +1,188 @@
+from collections.abc import Sequence
+from datetime import date, datetime
+from types import TracebackType
+from typing import Protocol, Self
+from uuid import UUID
+
+from cti_app.domain.blobs import BlobRecord
+from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
+from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
+from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics
+from cti_app.domain.model_runs import ModelRun
+
+
+class BlobRepository(Protocol):
+    async def add(self, blob: BlobRecord) -> None: ...
+
+    async def get(self, blob_id: UUID) -> BlobRecord | None: ...
+
+    async def get_by_address(self, logical_bucket: str, sha256: str) -> BlobRecord | None: ...
+
+    async def count_references(self, blob_id: UUID) -> int: ...
+
+    async def delete(self, blob_id: UUID) -> None: ...
+
+
+class SubjectRepository(Protocol):
+    async def add(self, subject: Subject) -> None: ...
+
+    async def get(self, subject_id: UUID) -> Subject | None: ...
+
+
+class SourceDocumentRepository(Protocol):
+    async def add(self, document: SourceDocument) -> None: ...
+
+    async def get(self, document_id: UUID) -> SourceDocument | None: ...
+
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[SourceDocument]: ...
+
+
+class SampleRepository(Protocol):
+    async def add(self, sample: Sample) -> None: ...
+
+    async def get(self, sample_id: UUID) -> Sample | None: ...
+
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[Sample]: ...
+
+
+class ProvenanceRepository(Protocol):
+    async def append(self, event: ProvenanceEvent) -> None: ...
+
+    async def list_for_aggregate(
+        self, aggregate_type: str, aggregate_id: UUID
+    ) -> Sequence[ProvenanceEvent]: ...
+
+
+class JobRepository(Protocol):
+    async def add_if_absent(self, job: Job) -> bool: ...
+
+    async def get(self, job_id: UUID) -> Job | None: ...
+
+    async def get_for_update(self, job_id: UUID) -> Job | None: ...
+
+    async def get_by_idempotency_key(self, idempotency_key: str) -> Job | None: ...
+
+    async def save(self, job: Job) -> None: ...
+
+    async def list_abandoned(self, heartbeat_before: datetime) -> Sequence[Job]: ...
+
+    async def operational_metrics(self) -> JobOperationalMetrics: ...
+
+
+class JobEventRepository(Protocol):
+    async def append(self, event: JobEvent) -> None: ...
+
+    async def list_for_job(self, job_id: UUID) -> Sequence[JobEvent]: ...
+
+
+class EditionRepository(Protocol):
+    async def add_if_absent(self, edition: Edition) -> bool: ...
+
+    async def get(self, edition_id: UUID) -> Edition | None: ...
+
+    async def get_by_logical_key(
+        self, country_code: str, period_start: date, period_end: date
+    ) -> Edition | None: ...
+
+    async def update(self, edition: Edition, expected_version: int) -> bool: ...
+
+    async def list(
+        self,
+        *,
+        offset: int,
+        limit: int,
+        country_code: str | None,
+        period_start: date | None,
+        period_end: date | None,
+        status: EditionStatus | None,
+    ) -> tuple[Sequence[Edition], int]: ...
+
+
+class EditionAuditRepository(Protocol):
+    async def append(self, event: EditionAuditEvent) -> None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[EditionAuditEvent]: ...
+
+
+class ModelRunRepository(Protocol):
+    async def add(self, run: ModelRun) -> None: ...
+
+    async def get(self, run_id: UUID) -> ModelRun | None: ...
+
+    async def get_for_update(self, run_id: UUID) -> ModelRun | None: ...
+
+    async def save(self, run: ModelRun) -> None: ...
+
+
+class UnitOfWork(Protocol):
+    blobs: BlobRepository
+    subjects: SubjectRepository
+    source_documents: SourceDocumentRepository
+    samples: SampleRepository
+    provenance: ProvenanceRepository
+    jobs: JobRepository
+    job_events: JobEventRepository
+    editions: EditionRepository
+    edition_audit: EditionAuditRepository
+    model_runs: ModelRunRepository
+
+    async def __aenter__(self) -> Self: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+    async def commit(self) -> None: ...
+
+    async def rollback(self) -> None: ...
+
+
+class UnitOfWorkFactory(Protocol):
+    def __call__(self) -> UnitOfWork: ...
+
+
+class JobUnitOfWork(Protocol):
+    jobs: JobRepository
+    job_events: JobEventRepository
+
+    async def __aenter__(self) -> Self: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+    async def commit(self) -> None: ...
+
+    async def rollback(self) -> None: ...
+
+
+class JobUnitOfWorkFactory(Protocol):
+    def __call__(self) -> JobUnitOfWork: ...
+
+
+class EditionUnitOfWork(Protocol):
+    editions: EditionRepository
+    edition_audit: EditionAuditRepository
+
+    async def __aenter__(self) -> Self: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+    async def commit(self) -> None: ...
+
+    async def rollback(self) -> None: ...
+
+
+class EditionUnitOfWorkFactory(Protocol):
+    def __call__(self) -> EditionUnitOfWork: ...
