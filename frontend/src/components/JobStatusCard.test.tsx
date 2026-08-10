@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { JobStatusCard } from "./JobStatusCard";
@@ -10,6 +11,7 @@ afterEach(() => {
 
 describe("JobStatusCard", () => {
   it("utilise le suivi HTTP périodique quand EventSource est indisponible", async () => {
+    const user = userEvent.setup();
     vi.stubGlobal("EventSource", undefined);
     vi.stubGlobal(
       "fetch",
@@ -55,6 +57,13 @@ describe("JobStatusCard", () => {
     expect(await screen.findByText("En cours")).toBeInTheDocument();
     expect(screen.getByText("50 % — 2/4")).toBeInTheDocument();
     expect(screen.getByText("Étape contrôlée")).toBeInTheDocument();
+    const cancel = screen.getByRole("button", { name: "Annuler la collecte" });
+    expect(cancel).toBeEnabled();
+    await user.click(cancel);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/jobs/4de4af61-811e-4c1c-ad4a-9b39a5c06c94/cancel",
+      { method: "POST" },
+    );
     expect(fetch).toHaveBeenCalledWith(
       "/api/jobs/4de4af61-811e-4c1c-ad4a-9b39a5c06c94",
     );

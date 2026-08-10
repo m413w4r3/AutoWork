@@ -1,7 +1,8 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 
 import {
+  cancelJob,
   fetchJob,
   type JobStatus,
   type JobView,
@@ -52,6 +53,11 @@ function useJobTracking(jobId: string) {
 
 export function JobStatusCard({ jobId }: { jobId: string }) {
   const job = useJobTracking(jobId);
+  const queryClient = useQueryClient();
+  const cancellation = useMutation({
+    mutationFn: () => cancelJob(jobId),
+    onSuccess: (updated) => queryClient.setQueryData(["job", jobId], updated),
+  });
 
   if (job.isPending) {
     return <p role="status">Chargement de la tâche…</p>;
@@ -91,6 +97,22 @@ export function JobStatusCard({ jobId }: { jobId: string }) {
           : "Progression en attente"}
       </p>
       {job.data.user_message ? <p>{job.data.user_message}</p> : null}
+      {job.data.status === "queued" || job.data.status === "running" ? (
+        <button
+          className="button button--secondary"
+          disabled={cancellation.isPending || job.data.cancellation_requested}
+          onClick={() => cancellation.mutate()}
+        >
+          {job.data.cancellation_requested
+            ? "Annulation demandée"
+            : "Annuler la collecte"}
+        </button>
+      ) : null}
+      {cancellation.isError ? (
+        <p role="alert" className="error-message">
+          L’annulation n’a pas pu être demandée.
+        </p>
+      ) : null}
       {job.data.error_message ? (
         <p role="alert" className="error-message">
           {job.data.error_message}

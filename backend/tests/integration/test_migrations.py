@@ -29,6 +29,8 @@ EXPECTED_TABLES = {
     "derived_artifacts",
     "claims",
     "indicators",
+    "collection_policy_snapshots",
+    "rejected_model_proposals",
 }
 
 
@@ -49,3 +51,6 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
 
     command.downgrade(config, "base")
     assert asyncio.run(_table_names(temporary_postgres_url)) <= {"alembic_version"}
+
+    command.upgrade(config, "head")
+    assert EXPECTED_TABLES <= asyncio.run(_table_names(temporary_postgres_url))

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import calendar
+import gzip
+import hashlib
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -17,7 +20,7 @@ from cti_app.application.http_collection import (
     RawHttpResponse,
     SafeHttpCollector,
 )
-from cti_app.application.jobs import JobExecutionContext, JobHandlerError
+from cti_app.application.jobs import JobCancelledError, JobExecutionContext, JobHandlerError
 from cti_app.application.model_gateway import StructuredExtractionModel
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
@@ -57,6 +60,19 @@ class Transport:
         return self.responses.pop(0)
 
 
+class BlockingTransport(Transport):
+    def __init__(self, item: RawHttpResponse) -> None:
+        super().__init__([item])
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def request(self, request: PinnedHttpRequest) -> RawHttpResponse:
+        self.requests.append(request)
+        self.started.set()
+        await self.release.wait()
+        return self.responses.pop(0)
+
+
 class NoopContext:
     def __init__(self, job_id: UUID) -> None:
         self.job_id = job_id
@@ -68,6 +84,20 @@ class NoopContext:
 
     async def heartbeat(self) -> None:
         return None
+
+    async def check_cancelled(self) -> None:
+        return None
+
+
+class CancelBeforeArchiveContext(NoopContext):
+    def __init__(self, job_id: UUID) -> None:
+        super().__init__(job_id)
+        self.checks = 0
+
+    async def check_cancelled(self) -> None:
+        self.checks += 1
+        if self.checks >= 5:
+            raise JobCancelledError
 
 
 class ClaimModel:
@@ -88,6 +118,18 @@ class ClaimModel:
                 }
             )
         )
+
+
+class FlakyClaimModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def extract(self, request: object, output_schema: object) -> object:
+        del request, output_schema
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("simulated extraction crash")
+        return SimpleNamespace(structured_output=QwenEvidenceOutput())
 
 
 def response(body: bytes = HTML, *, status: int = 200) -> RawHttpResponse:
@@ -302,3 +344,179 @@ async def test_selected_collect_extract_validate_scenario(tmp_path: Path) -> Non
     )
     assert decision.payload["original_value"] == "ExampleRAT"
     assert factory.claims[claims[0].id].value == "ExampleRAT"
+
+
+async def test_gzip_archives_encoded_and_decoded_representations(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    encoded = gzip.compress(HTML, mtime=1)
+    transport = Transport(
+        [RawHttpResponse(200, {"content-type": "text/html", "content-encoding": "gzip"}, encoded)]
+    )
+    blob_store = FilesystemBlobStore(tmp_path / "blobs")
+    app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(transport, Resolver()),
+        blob_store,
+        EvidenceExtractionService(None),
+    )
+    source = (await app.initialize(subject.id))[0]
+
+    assert await app.collect_one(source.id, uuid4()) is CollectionState.COMPLETED
+
+    raw = next(
+        item for item in factory.blobs.values() if item.descriptor.logical_bucket == "source-raw"
+    )
+    decoded = next(
+        item
+        for item in factory.blobs.values()
+        if item.descriptor.logical_bucket == "source-decoded"
+    )
+    assert await blob_store.read(raw.descriptor, max_bytes=len(encoded)) == encoded
+    assert await blob_store.read(decoded.descriptor, max_bytes=len(HTML)) == HTML
+    attempt = factory.attempts[0]
+    assert attempt.encoded_sha256 == hashlib.sha256(encoded).hexdigest()
+    assert attempt.decoded_sha256 == hashlib.sha256(HTML).hexdigest()
+    snapshot = factory.snapshots[attempt.policy_snapshot_id]
+    assert snapshot.user_agent == app.policy_snapshot.user_agent
+    assert snapshot.extraction_limits["parser_version"] == "2.0.0"
+    assert factory.artifacts
+
+
+async def test_distinct_gzip_streams_share_decoded_blob(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(
+        factory,
+        ("https://one.example/report", "https://two.example/report"),
+    )
+    headers = {"content-type": "text/html", "content-encoding": "gzip"}
+    transport = Transport(
+        [
+            RawHttpResponse(200, headers, gzip.compress(HTML, mtime=1)),
+            RawHttpResponse(200, headers, gzip.compress(HTML, mtime=2)),
+        ]
+    )
+    app = service(factory, transport, tmp_path / "blobs")
+
+    for source in await app.initialize(subject.id):
+        await app.collect_one(source.id, uuid4())
+
+    assert (
+        len(
+            [
+                item
+                for item in factory.blobs.values()
+                if item.descriptor.logical_bucket == "source-raw"
+            ]
+        )
+        == 2
+    )
+    assert (
+        len(
+            [
+                item
+                for item in factory.blobs.values()
+                if item.descriptor.logical_bucket == "source-decoded"
+            ]
+        )
+        == 1
+    )
+
+
+async def test_expired_fetch_lease_is_recovered_with_interruption_attempt(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    app = service(factory, Transport([response()]), tmp_path / "blobs")
+    source = (await app.initialize(subject.id))[0]
+    source.claim_fetch(
+        uuid4(),
+        lease_duration=timedelta(seconds=1),
+        policy_snapshot_id=app.configuration_id,
+        now=datetime.now(UTC) - timedelta(minutes=5),
+    )
+    factory.collections[source.id] = source
+
+    assert await app.collect_one(source.id, uuid4()) is CollectionState.COMPLETED
+
+    assert [item.outcome.value for item in factory.attempts] == ["interrupted", "succeeded"]
+
+
+async def test_crash_after_download_before_archive_is_immediately_resumable(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    transport = Transport([response(), response()])
+    app = service(factory, transport, tmp_path / "blobs")
+    source = (await app.initialize(subject.id))[0]
+
+    with pytest.raises(JobCancelledError):
+        await app.collect_one(
+            source.id,
+            uuid4(),
+            context=cast(JobExecutionContext, CancelBeforeArchiveContext(uuid4())),
+        )
+    assert factory.collections[source.id].state is CollectionState.FAILED_RETRYABLE
+
+    assert await app.collect_one(source.id, uuid4()) is CollectionState.COMPLETED
+    assert len(transport.requests) == 2
+
+
+async def test_archived_source_resumes_after_crash_without_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    transport = Transport([response()])
+    app = service(factory, transport, tmp_path / "blobs")
+    source = (await app.initialize(subject.id))[0]
+    original_extract = app._extract
+
+    async def crash(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("simulated crash after archival")
+
+    monkeypatch.setattr(app, "_extract", crash)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await app.collect_one(source.id, uuid4())
+    assert factory.collections[source.id].state is CollectionState.ARCHIVED
+
+    monkeypatch.setattr(app, "_extract", original_extract)
+    assert await app.collect_one(source.id, uuid4()) is CollectionState.COMPLETED
+    assert len(transport.requests) == 1
+
+
+async def test_two_workers_never_download_same_source_concurrently(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    transport = BlockingTransport(response())
+    app = service(factory, transport, tmp_path / "blobs")
+    source = (await app.initialize(subject.id))[0]
+
+    first = asyncio.create_task(app.collect_one(source.id, uuid4()))
+    await transport.started.wait()
+    second_state = await app.collect_one(source.id, uuid4())
+    transport.release.set()
+
+    assert second_state is CollectionState.FETCHING
+    assert await first is CollectionState.COMPLETED
+    assert len(transport.requests) == 1
+
+
+async def test_crash_during_extraction_resumes_without_download(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    transport = Transport([response()])
+    model = FlakyClaimModel()
+    app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(transport, Resolver()),
+        FilesystemBlobStore(tmp_path / "blobs"),
+        EvidenceExtractionService(cast(StructuredExtractionModel, model)),
+    )
+    source = (await app.initialize(subject.id))[0]
+
+    with pytest.raises(RuntimeError, match="extraction crash"):
+        await app.collect_one(source.id, uuid4())
+    assert factory.collections[source.id].state is CollectionState.ARCHIVED
+
+    assert await app.collect_one(source.id, uuid4()) is CollectionState.COMPLETED
+    assert len(transport.requests) == 1

@@ -10,8 +10,10 @@ from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.collection import (
     Claim,
     CollectionAttempt,
+    CollectionPolicySnapshot,
     DerivedArtifact,
     Indicator,
+    RejectedModelProposal,
     SourceCollection,
 )
 from cti_app.domain.discovery import DiscoveryBatch
@@ -126,6 +128,20 @@ class InMemoryAttemptRepository:
         return [item for item in self._attempts if item.collection_id == collection_id]
 
 
+class InMemoryPolicySnapshotRepository:
+    def __init__(self, snapshots: dict[str, CollectionPolicySnapshot]) -> None:
+        self._snapshots = snapshots
+
+    async def add_if_absent(self, snapshot: CollectionPolicySnapshot) -> bool:
+        if snapshot.id in self._snapshots:
+            return False
+        self._snapshots[snapshot.id] = deepcopy(snapshot)
+        return True
+
+    async def get(self, snapshot_id: str) -> CollectionPolicySnapshot | None:
+        return self._snapshots.get(snapshot_id)
+
+
 class InMemoryArtifactRepository:
     def __init__(self, artifacts: dict[UUID, DerivedArtifact]) -> None:
         self._artifacts = artifacts
@@ -165,6 +181,16 @@ class InMemoryIndicatorRepository:
         return [item for item in self._indicators.values() if item.subject_id == subject_id]
 
 
+class InMemoryRejectedProposalRepository:
+    def __init__(self, proposals: list[RejectedModelProposal]) -> None:
+        self._proposals = proposals
+
+    async def append_many(
+        self, proposals: list[RejectedModelProposal] | tuple[RejectedModelProposal, ...]
+    ) -> None:
+        self._proposals.extend(deepcopy(list(proposals)))
+
+
 class InMemoryProvenanceRepository:
     def __init__(self, events: list[ProvenanceEvent]) -> None:
         self._events = events
@@ -193,9 +219,13 @@ class InMemoryCollectionUnitOfWork:
         self.human_decisions = InMemoryHumanDecisionRepository(factory.decisions)
         self.source_collections = InMemorySourceCollectionRepository(factory.collections)
         self.collection_attempts = InMemoryAttemptRepository(factory.attempts)
+        self.collection_policy_snapshots = InMemoryPolicySnapshotRepository(factory.snapshots)
         self.derived_artifacts = InMemoryArtifactRepository(factory.artifacts)
         self.claims = InMemoryClaimRepository(factory.claims)
         self.indicators = InMemoryIndicatorRepository(factory.indicators)
+        self.rejected_model_proposals = InMemoryRejectedProposalRepository(
+            factory.rejected_proposals
+        )
 
     async def __aenter__(self) -> InMemoryCollectionUnitOfWork:
         return self
@@ -227,9 +257,11 @@ class InMemoryCollectionUnitOfWorkFactory:
         self.decisions: list[HumanDecision] = []
         self.collections: dict[UUID, SourceCollection] = {}
         self.attempts: list[CollectionAttempt] = []
+        self.snapshots: dict[str, CollectionPolicySnapshot] = {}
         self.artifacts: dict[UUID, DerivedArtifact] = {}
         self.claims: dict[UUID, Claim] = {}
         self.indicators: dict[UUID, Indicator] = {}
+        self.rejected_proposals: list[RejectedModelProposal] = []
 
     def __call__(self) -> UnitOfWork:
         return cast(UnitOfWork, InMemoryCollectionUnitOfWork(self))

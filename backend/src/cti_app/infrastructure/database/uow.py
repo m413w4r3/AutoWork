@@ -6,6 +6,7 @@ from cti_app.application.persistence import (
     BlobRepository,
     ClaimRepository,
     CollectionAttemptRepository,
+    CollectionPolicySnapshotRepository,
     DerivedArtifactRepository,
     DiscoveryBatchRepository,
     EditionAuditRepository,
@@ -17,6 +18,7 @@ from cti_app.application.persistence import (
     JobRepository,
     ModelRunRepository,
     ProvenanceRepository,
+    RejectedModelProposalRepository,
     SampleRepository,
     SourceCollectionRepository,
     SourceDocumentRepository,
@@ -26,6 +28,7 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyBlobRepository,
     SqlAlchemyClaimRepository,
     SqlAlchemyCollectionAttemptRepository,
+    SqlAlchemyCollectionPolicySnapshotRepository,
     SqlAlchemyDerivedArtifactRepository,
     SqlAlchemyDiscoveryBatchRepository,
     SqlAlchemyEditionAuditRepository,
@@ -37,6 +40,7 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyJobRepository,
     SqlAlchemyModelRunRepository,
     SqlAlchemyProvenanceRepository,
+    SqlAlchemyRejectedModelProposalRepository,
     SqlAlchemySampleRepository,
     SqlAlchemySourceCollectionRepository,
     SqlAlchemySourceDocumentRepository,
@@ -60,9 +64,11 @@ class SqlAlchemyUnitOfWork:
     human_decisions: HumanDecisionRepository
     source_collections: SourceCollectionRepository
     collection_attempts: CollectionAttemptRepository
+    collection_policy_snapshots: CollectionPolicySnapshotRepository
     derived_artifacts: DerivedArtifactRepository
     claims: ClaimRepository
     indicators: IndicatorRepository
+    rejected_model_proposals: RejectedModelProposalRepository
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -86,9 +92,13 @@ class SqlAlchemyUnitOfWork:
         self.human_decisions = SqlAlchemyHumanDecisionRepository(self._session)
         self.source_collections = SqlAlchemySourceCollectionRepository(self._session)
         self.collection_attempts = SqlAlchemyCollectionAttemptRepository(self._session)
+        self.collection_policy_snapshots = SqlAlchemyCollectionPolicySnapshotRepository(
+            self._session
+        )
         self.derived_artifacts = SqlAlchemyDerivedArtifactRepository(self._session)
         self.claims = SqlAlchemyClaimRepository(self._session)
         self.indicators = SqlAlchemyIndicatorRepository(self._session)
+        self.rejected_model_proposals = SqlAlchemyRejectedModelProposalRepository(self._session)
         self._committed = False
         return self
 

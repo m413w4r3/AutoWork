@@ -5,10 +5,12 @@ import ssl
 from urllib.parse import urlsplit
 
 from cti_app.application.http_collection import (
+    CollectionError,
     DownloadTooLargeError,
     DownloadTransientError,
     PinnedHttpRequest,
     RawHttpResponse,
+    UnsupportedContentError,
 )
 
 
@@ -48,33 +50,61 @@ class AsyncioPinnedHttpTransport:
                     ).encode("ascii")
                     writer.write(request_bytes)
                     await writer.drain()
-                    status_line = await reader.readline()
-                    parts = status_line.decode("iso-8859-1").strip().split(" ", 2)
-                    if len(parts) < 2 or not parts[1].isdigit():
+                    status_line = await _read_line(reader, 8 * 1024, "HTTP status line")
+                    parts = status_line.decode("iso-8859-1").rstrip("\r\n").split(" ", 2)
+                    if (
+                        len(parts) < 2
+                        or parts[0] not in {"HTTP/1.0", "HTTP/1.1"}
+                        or len(parts[1]) != 3
+                        or not parts[1].isdigit()
+                    ):
                         raise DownloadTransientError("Invalid HTTP status line")
                     headers = await _read_headers(reader)
                     content_length = headers.get("content-length")
-                    if content_length and int(content_length) > request.max_wire_bytes:
-                        raise DownloadTooLargeError("Content-Length exceeds the download limit")
-                    if headers.get("transfer-encoding", "").casefold() == "chunked":
+                    expected_length: int | None = None
+                    if content_length is not None:
+                        try:
+                            expected_length = int(content_length)
+                        except ValueError as exc:
+                            raise DownloadTransientError("Invalid Content-Length") from exc
+                        if expected_length < 0:
+                            raise DownloadTransientError("Negative Content-Length")
+                        if expected_length > request.max_wire_bytes:
+                            raise DownloadTooLargeError("Content-Length exceeds the download limit")
+                    transfer_encoding = headers.get("transfer-encoding", "").casefold().strip()
+                    if transfer_encoding == "chunked":
                         body = await _read_chunked(reader, request.max_wire_bytes)
+                    elif transfer_encoding:
+                        raise UnsupportedContentError(
+                            f"Unsupported Transfer-Encoding: {transfer_encoding}"
+                        )
+                    elif expected_length is not None:
+                        body = await _read_exact_body(reader, expected_length)
                     else:
                         body = await _read_bounded(reader, request.max_wire_bytes)
-                    return RawHttpResponse(status=int(parts[1]), headers=headers, body=body)
+                    return RawHttpResponse(status=int(parts[1]), headers=headers, encoded_body=body)
                 finally:
                     writer.close()
                     await writer.wait_closed()
         except TimeoutError as exc:
             raise DownloadTransientError("Collection timeout exceeded") from exc
+        except ssl.SSLError as exc:
+            raise DownloadTransientError("TLS handshake or validation failed") from exc
+        except asyncio.IncompleteReadError as exc:
+            raise DownloadTransientError("Remote response was truncated") from exc
+        except CollectionError:
+            raise
         except OSError as exc:
             raise DownloadTransientError("Remote connection failed") from exc
+        except (UnicodeError, ValueError) as exc:
+            raise DownloadTransientError("Invalid HTTP protocol response") from exc
 
 
 async def _read_headers(reader: asyncio.StreamReader) -> dict[str, str]:
     headers: dict[str, str] = {}
     total = 0
     while True:
-        line = await reader.readline()
+        line = await _read_line(reader, 16 * 1024, "HTTP header line")
         total += len(line)
         if total > 64 * 1024:
             raise DownloadTooLargeError("HTTP headers exceed the limit")
@@ -95,10 +125,19 @@ async def _read_bounded(reader: asyncio.StreamReader, limit: int) -> bytes:
     return bytes(result)
 
 
+async def _read_exact_body(reader: asyncio.StreamReader, length: int) -> bytes:
+    try:
+        return await reader.readexactly(length)
+    except asyncio.IncompleteReadError as exc:
+        raise DownloadTransientError("Response body is shorter than Content-Length") from exc
+
+
 async def _read_chunked(reader: asyncio.StreamReader, limit: int) -> bytes:
     result = bytearray()
     while True:
-        size_line = await reader.readline()
+        size_line = await _read_line(reader, 1024, "HTTP chunk size")
+        if not size_line:
+            raise DownloadTransientError("Chunked response ended before the final chunk")
         try:
             size = int(size_line.split(b";", 1)[0].strip(), 16)
         except ValueError as exc:
@@ -108,6 +147,20 @@ async def _read_chunked(reader: asyncio.StreamReader, limit: int) -> bytes:
             return bytes(result)
         if len(result) + size > limit:
             raise DownloadTooLargeError("Chunked response exceeds the download limit")
-        result.extend(await reader.readexactly(size))
-        if await reader.readexactly(2) != b"\r\n":
+        try:
+            result.extend(await reader.readexactly(size))
+            terminator = await reader.readexactly(2)
+        except asyncio.IncompleteReadError as exc:
+            raise DownloadTransientError("Chunked response was truncated") from exc
+        if terminator != b"\r\n":
             raise DownloadTransientError("Invalid chunk terminator")
+
+
+async def _read_line(reader: asyncio.StreamReader, limit: int, label: str) -> bytes:
+    try:
+        line = await reader.readline()
+    except (ValueError, asyncio.LimitOverrunError) as exc:
+        raise DownloadTooLargeError(f"{label} exceeds the limit") from exc
+    if len(line) > limit:
+        raise DownloadTooLargeError(f"{label} exceeds the limit")
+    return line

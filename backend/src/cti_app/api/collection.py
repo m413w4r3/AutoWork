@@ -43,8 +43,11 @@ class AttemptView(BaseModel):
     http_status: int | None
     declared_content_type: str | None
     detected_content_type: str | None
-    size: int | None
-    sha256: str | None
+    encoded_size: int | None
+    encoded_sha256: str | None
+    decoded_size: int | None
+    decoded_sha256: str | None
+    content_encoding: str | None
     outcome: str
     failure_reason: str | None
 
@@ -59,6 +62,7 @@ class SourceView(BaseModel):
     source_document_id: UUID | None
     attempt_count: int
     error_reason: str | None
+    fetch_lease_expires_at: str | None
     latest_attempt: AttemptView | None
 
 
@@ -117,7 +121,14 @@ async def launch_collection(subject_id: UUID, request: Request) -> CollectionLau
         sources = await collection.initialize(subject_id)
     except CollectionNotAllowedError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    round_number = max((item.attempt_count for item in sources), default=0) or 1
+    round_number = max(
+        (
+            item.attempt_count
+            + (0 if item.state.value in {"completed", "blocked", "failed_terminal"} else 1)
+            for item in sources
+        ),
+        default=1,
+    )
     key = collection_idempotency_key(subject_id, collection.configuration_id, round_number)
     duplicate = False
     try:
@@ -151,21 +162,30 @@ async def retry_source(
     source = next((item for item in sources if item.id == collection_id), None)
     if source is None:
         raise HTTPException(status_code=404, detail="Source collection not found")
+    try:
+        source = await collection.prepare_retry(collection_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     actor_id = await _actor_id(request)
     key = collection_idempotency_key(
         subject_id,
         collection.configuration_id,
         source.attempt_count + 1,
+        collection_id=source.id,
     )
     duplicate = False
     try:
         job = await jobs.submit(
             kind="source.collect",
-            aggregate_type="subject",
-            aggregate_id=subject_id,
+            aggregate_type="source_collection",
+            aggregate_id=source.id,
             idempotency_key=key,
             correlation_id=get_correlation_id(),
-            input_parameters={"subject_id": str(subject_id), "requested_by": actor_id},
+            input_parameters={
+                "subject_id": str(subject_id),
+                "collection_id": str(source.id),
+                "requested_by": actor_id,
+            },
             max_attempts=3,
             actor_id=actor_id,
         )
@@ -302,6 +322,9 @@ def _source_view(source: SourceCollection, attempt: CollectionAttempt | None) ->
         source_document_id=source.source_document_id,
         attempt_count=source.attempt_count,
         error_reason=source.error_reason,
+        fetch_lease_expires_at=(
+            source.fetch_lease_expires_at.isoformat() if source.fetch_lease_expires_at else None
+        ),
         latest_attempt=_attempt_view(attempt) if attempt else None,
     )
 
@@ -317,8 +340,11 @@ def _attempt_view(attempt: CollectionAttempt) -> AttemptView:
         http_status=attempt.http_status,
         declared_content_type=attempt.declared_content_type,
         detected_content_type=attempt.detected_content_type,
-        size=attempt.size,
-        sha256=attempt.sha256,
+        encoded_size=attempt.encoded_size,
+        encoded_sha256=attempt.encoded_sha256,
+        decoded_size=attempt.decoded_size,
+        decoded_sha256=attempt.decoded_sha256,
+        content_encoding=attempt.content_encoding,
         outcome=attempt.outcome.value,
         failure_reason=attempt.failure_reason,
     )

@@ -21,8 +21,11 @@ export interface CollectionAttempt {
   http_status: number | null;
   declared_content_type: string | null;
   detected_content_type: string | null;
-  size: number | null;
-  sha256: string | null;
+  encoded_size: number | null;
+  encoded_sha256: string | null;
+  decoded_size: number | null;
+  decoded_sha256: string | null;
+  content_encoding: string | null;
   outcome: string;
   failure_reason: string | null;
 }
@@ -37,6 +40,7 @@ export interface CollectedSource {
   source_document_id: string | null;
   attempt_count: number;
   error_reason: string | null;
+  fetch_lease_expires_at: string | null;
   latest_attempt: CollectionAttempt | null;
 }
 

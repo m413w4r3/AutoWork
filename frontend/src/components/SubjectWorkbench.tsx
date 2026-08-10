@@ -143,12 +143,28 @@ function SourcesTab({
                 <dd>{attempt?.final_url ?? "—"}</dd>
               </div>
               <div>
-                <dt>SHA-256</dt>
-                <dd className="technical-value">{attempt?.sha256 ?? "—"}</dd>
+                <dt>SHA-256 brut encodé</dt>
+                <dd className="technical-value">
+                  {attempt?.encoded_sha256 ?? "—"}
+                </dd>
               </div>
               <div>
-                <dt>Taille</dt>
-                <dd>{attempt?.size ?? "—"} octets</dd>
+                <dt>Taille brute encodée</dt>
+                <dd>{attempt?.encoded_size ?? "—"} octets</dd>
+              </div>
+              <div>
+                <dt>SHA-256 contenu décodé</dt>
+                <dd className="technical-value">
+                  {attempt?.decoded_sha256 ?? "—"}
+                </dd>
+              </div>
+              <div>
+                <dt>Taille contenu décodé</dt>
+                <dd>{attempt?.decoded_size ?? "—"} octets</dd>
+              </div>
+              <div>
+                <dt>Content-Encoding</dt>
+                <dd>{attempt?.content_encoding ?? "identity"}</dd>
               </div>
               <div>
                 <dt>Acquisition</dt>
@@ -169,14 +185,30 @@ function SourcesTab({
             <div className="editorial-actions">
               <button
                 className="button button--secondary"
-                disabled={action.isPending}
+                disabled={
+                  action.isPending ||
+                  [
+                    "completed",
+                    "blocked",
+                    "fetching",
+                    "failed_terminal",
+                  ].includes(source.state)
+                }
                 onClick={() =>
                   action.mutate(() =>
                     retryCollectedSource(subjectId, source.id),
                   )
                 }
               >
-                Relancer
+                {source.state === "completed"
+                  ? "Déjà terminée"
+                  : source.state === "blocked"
+                    ? "Bloquée par sécurité"
+                    : source.state === "failed_terminal"
+                      ? "Nouvelle politique requise"
+                      : source.state === "fetching"
+                        ? "Téléchargement en cours"
+                        : "Relancer cette source"}
               </button>
               <label>
                 Relation
@@ -375,10 +407,10 @@ function ReviewActions({
 function ExtractionTab({ claims }: { claims: EvidenceClaim[] }) {
   const structured = claims.filter((claim) =>
     [
-      "actor",
-      "campaign",
+      "actors",
+      "campaigns",
       "malware",
-      "tool",
+      "tools",
       "infection_chain",
       "ttp",
       "victimology",

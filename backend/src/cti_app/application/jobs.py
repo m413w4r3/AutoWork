@@ -120,6 +120,26 @@ class JobExecutionContext:
             await uow.jobs.save(job)
             await uow.commit()
 
+    async def check_cancelled(self) -> None:
+        async with self._uow_factory() as uow:
+            job = await uow.jobs.get_for_update(self.job_id)
+            if job is None:
+                raise JobNotFoundError(str(self.job_id))
+            if not job.cancellation_requested:
+                return
+            previous_status = job.status
+            job.mark_cancelled()
+            await uow.jobs.save(job)
+            await _append_job_event(
+                uow,
+                job,
+                previous_status,
+                "job.cancelled",
+                "system:worker",
+            )
+            await uow.commit()
+            raise JobCancelledError
+
     async def heartbeat(self) -> None:
         async with self._uow_factory() as uow:
             job = await uow.jobs.get_for_update(self.job_id)

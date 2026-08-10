@@ -38,3 +38,14 @@ export async function fetchJob(jobId: string): Promise<JobView> {
   }
   return (await response.json()) as JobView;
 }
+
+export async function cancelJob(jobId: string): Promise<JobView> {
+  const response = await fetch(
+    `/api/jobs/${encodeURIComponent(jobId)}/cancel`,
+    { method: "POST" },
+  );
+  if (!response.ok) {
+    throw new Error(`Job cancellation returned ${response.status}`);
+  }
+  return (await response.json()) as JobView;
+}

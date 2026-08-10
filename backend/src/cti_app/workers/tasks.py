@@ -8,7 +8,11 @@ from minio import Minio
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.discovery import DiscoveryService
 from cti_app.application.editorial import EditorialGroupingService
-from cti_app.application.extraction import EvidenceExtractionService
+from cti_app.application.extraction import (
+    ChunkingPolicy,
+    EvidenceExtractionService,
+    PdfParsingPolicy,
+)
 from cti_app.application.http_collection import (
     CollectionPolicy,
     SafeHttpCollector,
@@ -93,7 +97,21 @@ async def _execute_job(job_id: UUID) -> int | None:
                 ),
             ),
             blob_store,
-            EvidenceExtractionService(model_gateway),
+            EvidenceExtractionService(
+                model_gateway,
+                pdf_policy=PdfParsingPolicy(
+                    max_document_bytes=settings.pdf_max_document_bytes,
+                    max_pages=settings.pdf_max_pages,
+                    timeout_seconds=settings.pdf_parse_timeout_seconds,
+                    max_text_chars=settings.pdf_max_text_chars,
+                    max_metadata_length=settings.pdf_max_metadata_length,
+                ),
+                chunking_policy=ChunkingPolicy(
+                    max_chars=settings.qwen_chunk_max_chars,
+                    overlap_chars=settings.qwen_chunk_overlap_chars,
+                ),
+            ),
+            fetch_lease_seconds=settings.collection_fetch_lease_seconds,
         )
         executor = JobExecutor(
             uow_factory,

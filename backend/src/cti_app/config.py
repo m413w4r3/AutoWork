@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     collection_max_decompression_ratio: float = Field(default=20.0, gt=1, le=1000)
     collection_allowed_domains: str = ""
     collection_blocked_domains: str = ""
+    collection_fetch_lease_seconds: float = Field(default=120.0, gt=1, le=3600)
+    pdf_max_document_bytes: int = Field(default=25 * 1024 * 1024, gt=0)
+    pdf_max_pages: int = Field(default=200, gt=0, le=10_000)
+    pdf_parse_timeout_seconds: float = Field(default=15.0, gt=0, le=300)
+    pdf_max_text_chars: int = Field(default=2_000_000, gt=0)
+    pdf_max_metadata_length: int = Field(default=16_384, gt=0)
+    qwen_chunk_max_chars: int = Field(default=12_000, gt=100)
+    qwen_chunk_overlap_chars: int = Field(default=500, ge=0)
 
 
 @lru_cache

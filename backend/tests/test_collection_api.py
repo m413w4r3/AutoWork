@@ -33,8 +33,15 @@ class Resolver:
 
 
 class Transport:
+    def __init__(self, responses: list[RawHttpResponse] | None = None) -> None:
+        self.responses = responses or []
+        self.calls = 0
+
     async def request(self, request: PinnedHttpRequest) -> RawHttpResponse:
         del request
+        self.calls += 1
+        if self.responses:
+            return self.responses.pop(0)
         return RawHttpResponse(200, {"content-type": "text/html"}, HTML)
 
 
@@ -72,5 +79,52 @@ async def test_api_and_synchronous_worker_collect_selected_subject(tmp_path: Pat
     assert workbench.status_code == 200
     source = workbench.json()["sources"][0]
     assert source["state"] == "completed"
-    assert source["latest_attempt"]["sha256"]
+    assert source["latest_attempt"]["encoded_sha256"]
+    assert source["latest_attempt"]["decoded_sha256"]
     assert source["relationship_status"] == "provisional"
+
+
+async def test_retry_endpoint_processes_only_requested_source(tmp_path: Path) -> None:
+    collection_uow = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(
+        collection_uow,
+        ("https://one.example/report", "https://two.example/report"),
+    )
+    transport = Transport(
+        [
+            RawHttpResponse(200, {"content-type": "text/html"}, HTML),
+            RawHttpResponse(404, {"content-type": "text/html"}, b"missing"),
+            RawHttpResponse(200, {"content-type": "text/html"}, HTML),
+        ]
+    )
+    service = SubjectCollectionService(
+        collection_uow,
+        SafeHttpCollector(transport, Resolver()),
+        FilesystemBlobStore(tmp_path / "blobs"),
+        EvidenceExtractionService(None),
+    )
+    jobs_uow = InMemoryJobUnitOfWorkFactory()
+    registry = JobRegistry()
+    register_collection_jobs(registry, service)
+    job_service = JobService(jobs_uow, registry)
+    app = FastAPI()
+    app.include_router(router)
+    app.state.collection_service = service
+    app.state.job_service = job_service
+    app.state.job_dispatcher = SynchronousJobDispatcher(JobExecutor(jobs_uow, registry))
+    app.state.identity_provider = LocalIdentityProvider()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (await client.post(f"/api/subjects/{subject.id}/collection")).status_code == 202
+        sources = (await client.get(f"/api/subjects/{subject.id}/workbench")).json()["sources"]
+        completed = next(item for item in sources if item["state"] == "completed")
+        unavailable = next(item for item in sources if item["state"] == "unavailable")
+
+        retried = await client.post(f"/api/subjects/{subject.id}/sources/{unavailable['id']}/retry")
+
+    assert retried.status_code == 202
+    assert transport.calls == 3
+    assert collection_uow.collections[UUID(completed["id"])].attempt_count == 1
+    assert collection_uow.collections[UUID(unavailable["id"])].state.value == "completed"

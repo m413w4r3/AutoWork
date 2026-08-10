@@ -8,8 +8,10 @@ from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.collection import (
     Claim,
     CollectionAttempt,
+    CollectionPolicySnapshot,
     DerivedArtifact,
     Indicator,
+    RejectedModelProposal,
     SourceCollection,
 )
 from cti_app.domain.discovery import DiscoveryBatch
@@ -181,6 +183,12 @@ class CollectionAttemptRepository(Protocol):
     async def list_for_collection(self, collection_id: UUID) -> Sequence[CollectionAttempt]: ...
 
 
+class CollectionPolicySnapshotRepository(Protocol):
+    async def add_if_absent(self, snapshot: CollectionPolicySnapshot) -> bool: ...
+
+    async def get(self, snapshot_id: str) -> CollectionPolicySnapshot | None: ...
+
+
 class DerivedArtifactRepository(Protocol):
     async def append(self, artifact: DerivedArtifact) -> None: ...
 
@@ -203,6 +211,10 @@ class IndicatorRepository(Protocol):
     async def list_for_subject(self, subject_id: UUID) -> Sequence[Indicator]: ...
 
 
+class RejectedModelProposalRepository(Protocol):
+    async def append_many(self, proposals: Sequence[RejectedModelProposal]) -> None: ...
+
+
 class UnitOfWork(Protocol):
     blobs: BlobRepository
     subjects: SubjectRepository
@@ -219,9 +231,11 @@ class UnitOfWork(Protocol):
     human_decisions: HumanDecisionRepository
     source_collections: SourceCollectionRepository
     collection_attempts: CollectionAttemptRepository
+    collection_policy_snapshots: CollectionPolicySnapshotRepository
     derived_artifacts: DerivedArtifactRepository
     claims: ClaimRepository
     indicators: IndicatorRepository
+    rejected_model_proposals: RejectedModelProposalRepository
 
     async def __aenter__(self) -> Self: ...
 

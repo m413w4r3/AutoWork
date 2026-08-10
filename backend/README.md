@@ -37,21 +37,29 @@ La collecte ne concerne que les sources d'un `Subject` sélectionné et démarre
 `POST /api/subjects/{id}/collection`. Le job `source.collect` est idempotent et reprend les sources
 interrompues sans recréer les objets déjà terminés.
 
-- `source_collections` est la projection mutable par source sélectionnée : état courant, rôle proposé
-  et niveau de preuve. Le rôle ne devient `verified` qu'avec une preuve `deterministic:*` ou une
-  décision `human:*` journalisée.
+- `source_collections` est la projection mutable par source sélectionnée : état courant, bail de
+  téléchargement, références brute/décodée, rôle proposé et niveau de preuve. Le rôle ne devient
+  `verified` qu'avec une preuve `deterministic:*` ou une décision `human:*` journalisée ; PostgreSQL
+  applique aussi cet invariant.
 - `collection_attempts` est append-only : URL demandée/finale, redirections, UTC, statut, en-têtes
-  autorisés, MIME déclaré/détecté, taille, SHA-256, job, snapshot de configuration, résultat et motif.
-- `source_documents` conserve chaque observation d'URL et référence un blob immuable `source-raw`.
-  Deux URL aux octets identiques gardent deux observations mais réutilisent le même blob.
+  autorisés, MIME déclaré/détecté, tailles et SHA-256 encodés/décodés, job, snapshot de politique,
+  résultat et motif.
+- `collection_policy_snapshots` conserve la configuration canonique complète utilisée par chaque
+  tentative, et pas seulement son hash.
+- `source_documents` conserve chaque observation d'URL et référence les octets HTTP encodés
+  immuables `source-raw`; `source-decoded` porte séparément le contenu après `Content-Encoding`.
+  Deux gzip distincts peuvent donc partager le blob décodé sans partager le blob brut.
 - `derived_artifacts` référence séparément le texte `source-text`, sa version de parseur et les
   métadonnées de publication.
 - `claims` et `indicators` sont append-only et référencent le document source ainsi que les offsets
-  du passage. Les IOC gardent valeurs originale et normalisée.
+  du passage. Les claims Qwen gardent aussi segment, offsets locaux/globaux et ModelRun. Les IOC
+  gardent valeurs originale et normalisée.
+- `rejected_model_proposals` journalise séparément chaque proposition Qwen invalide sans supprimer
+  les propositions valides du même segment.
 - `human_decisions` porte les validations, corrections et rejets sans modifier l'extraction initiale.
 
-La migration additive et réversible `0007_source_collection_and_evidence` crée ces tables sans
-modifier les migrations antérieures.
+La migration additive et réversible `0008_harden_collection_recovery` complète `0007` sans modifier
+les migrations antérieures.
 
 Le collecteur accepte uniquement HTTP(S), refuse credentials, localhost, metadata cloud et plages
 privées, loopback, link-local, multicast ou réservées IPv4/IPv6. Il contrôle deux réponses DNS puis
@@ -66,6 +74,12 @@ Les limites se règlent avec `COLLECTION_MAX_REDIRECTS`, `COLLECTION_TIMEOUT_SEC
 `COLLECTION_BLOCKED_DOMAINS` acceptent des domaines séparés par des virgules ; la liste autorisée
 vide n'ajoute aucune restriction, tandis que la liste bloquée reste prioritaire. Les valeurs locales
 non secrètes sont dans `.env.example`.
+
+Le bail est réglé par `COLLECTION_FETCH_LEASE_SECONDS` et reste toujours supérieur à la durée HTTP
+totale. Le PDF est isolé dans un processus interruptible et borné par `PDF_MAX_DOCUMENT_BYTES`,
+`PDF_MAX_PAGES`, `PDF_PARSE_TIMEOUT_SECONDS`, `PDF_MAX_TEXT_CHARS` et
+`PDF_MAX_METADATA_LENGTH`. Qwen reçoit des segments déterministes configurés avec
+`QWEN_CHUNK_MAX_CHARS` et `QWEN_CHUNK_OVERLAP_CHARS`.
 
 ## Passerelle de modèles
 

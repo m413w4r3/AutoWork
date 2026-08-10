@@ -2,17 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import re
 import socket
 import time
 import zlib
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol
 from urllib.parse import SplitResult, urljoin, urlsplit
 
-from cti_app.domain.collection import AttemptOutcome, DetectedMimeType
+from cti_app.domain.collection import (
+    AttemptOutcome,
+    CollectionPolicySnapshot,
+    DetectedMimeType,
+)
+
+COLLECTOR_VERSION = "2.0.0"
+CancellationCheck = Callable[[], Awaitable[None]]
 
 
 class CollectionError(RuntimeError):
@@ -25,7 +33,7 @@ class CollectionError(RuntimeError):
         self.redirect_chain: tuple[str, ...] = ()
         self.http_status: int | None = None
         self.headers: dict[str, str] = {}
-        self.size: int | None = None
+        self.encoded_size: int | None = None
 
     def with_context(
         self,
@@ -34,13 +42,13 @@ class CollectionError(RuntimeError):
         redirect_chain: Sequence[str],
         http_status: int | None = None,
         headers: dict[str, str] | None = None,
-        size: int | None = None,
+        encoded_size: int | None = None,
     ) -> CollectionError:
         self.final_url = final_url
         self.redirect_chain = tuple(redirect_chain)
         self.http_status = http_status
         self.headers = _allowed_headers(headers or {})
-        self.size = size
+        self.encoded_size = encoded_size
         return self
 
 
@@ -75,20 +83,39 @@ class CollectionPolicy:
     allowed_domains: frozenset[str] = field(default_factory=frozenset)
     blocked_domains: frozenset[str] = field(default_factory=frozenset)
 
-    def snapshot_id(self) -> str:
-        value = "|".join(
-            (
-                str(self.max_redirects),
-                str(self.timeout_seconds),
-                str(self.max_download_bytes),
-                str(self.max_expanded_bytes),
-                str(self.max_decompression_ratio),
-                self.user_agent,
-                ",".join(sorted(self.allowed_domains)),
-                ",".join(sorted(self.blocked_domains)),
-            )
+    def snapshot(
+        self,
+        extraction_limits: dict[str, int | float | str] | None = None,
+    ) -> CollectionPolicySnapshot:
+        values = {
+            "max_redirects": self.max_redirects,
+            "timeout_seconds": self.timeout_seconds,
+            "max_download_bytes": self.max_download_bytes,
+            "max_expanded_bytes": self.max_expanded_bytes,
+            "max_decompression_ratio": self.max_decompression_ratio,
+            "user_agent": self.user_agent,
+            "allowed_domains": sorted(self.allowed_domains),
+            "blocked_domains": sorted(self.blocked_domains),
+            "collector_version": COLLECTOR_VERSION,
+            "extraction_limits": extraction_limits or {},
+        }
+        canonical = json.dumps(values, sort_keys=True, separators=(",", ":"))
+        return CollectionPolicySnapshot(
+            id=hashlib.sha256(canonical.encode()).hexdigest(),
+            max_redirects=self.max_redirects,
+            timeout_seconds=self.timeout_seconds,
+            max_download_bytes=self.max_download_bytes,
+            max_expanded_bytes=self.max_expanded_bytes,
+            max_decompression_ratio=self.max_decompression_ratio,
+            user_agent=self.user_agent,
+            allowed_domains=tuple(sorted(self.allowed_domains)),
+            blocked_domains=tuple(sorted(self.blocked_domains)),
+            collector_version=COLLECTOR_VERSION,
+            extraction_limits=dict(extraction_limits or {}),
         )
-        return hashlib.sha256(value.encode()).hexdigest()
+
+    def snapshot_id(self) -> str:
+        return self.snapshot().id
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +131,7 @@ class PinnedHttpRequest:
 class RawHttpResponse:
     status: int
     headers: dict[str, str]
-    body: bytes
+    encoded_body: bytes
 
 
 class HttpTransport(Protocol):
@@ -133,8 +160,13 @@ class CollectedResponse:
     headers: dict[str, str]
     declared_content_type: str | None
     detected_content_type: DetectedMimeType
-    body: bytes
-    sha256: str
+    encoded_body: bytes
+    decoded_body: bytes
+    encoded_size: int
+    encoded_sha256: str
+    decoded_size: int
+    decoded_sha256: str
+    content_encoding: str
     acquired_at: datetime
 
 
@@ -149,17 +181,26 @@ class SafeHttpCollector:
         self._resolver = resolver
         self.policy = policy or CollectionPolicy()
 
-    async def fetch(self, requested_url: str) -> CollectedResponse:
+    async def fetch(
+        self,
+        requested_url: str,
+        *,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> CollectedResponse:
         current = requested_url.strip()
         redirects: list[str] = []
         deadline = time.monotonic() + self.policy.timeout_seconds
         for redirect_count in range(self.policy.max_redirects + 1):
+            if cancellation_check is not None:
+                await cancellation_check()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise DownloadTransientError("Total collection timeout exceeded")
             try:
                 parsed = _validate_url(current, self.policy)
-                approved_ip = await self._resolve_and_pin(parsed.hostname or "", remaining)
+                approved_ip = await self._resolve_and_pin(
+                    parsed.hostname or "", remaining, cancellation_check
+                )
             except CollectionError as exc:
                 exc.with_context(final_url=current, redirect_chain=redirects)
                 raise
@@ -167,6 +208,8 @@ class SafeHttpCollector:
             if remaining <= 0:
                 raise DownloadTransientError("Total collection timeout exceeded")
             try:
+                if cancellation_check is not None:
+                    await cancellation_check()
                 response = await self._transport.request(
                     PinnedHttpRequest(
                         url=current,
@@ -189,7 +232,7 @@ class SafeHttpCollector:
                         redirect_chain=redirects,
                         http_status=response.status,
                         headers=response.headers,
-                        size=len(response.body),
+                        encoded_size=len(response.encoded_body),
                     )
                 if redirect_count >= self.policy.max_redirects:
                     raise DownloadUnavailableError("Maximum redirect count exceeded").with_context(
@@ -197,7 +240,7 @@ class SafeHttpCollector:
                         redirect_chain=redirects,
                         http_status=response.status,
                         headers=response.headers,
-                        size=len(response.body),
+                        encoded_size=len(response.encoded_body),
                     )
                 current = urljoin(current, location)
                 redirects.append(current)
@@ -210,7 +253,7 @@ class SafeHttpCollector:
                     redirect_chain=redirects,
                     http_status=response.status,
                     headers=response.headers,
-                    size=len(response.body),
+                    encoded_size=len(response.encoded_body),
                 )
             if response.status < 200 or response.status >= 300:
                 raise DownloadUnavailableError(
@@ -220,18 +263,20 @@ class SafeHttpCollector:
                     redirect_chain=redirects,
                     http_status=response.status,
                     headers=response.headers,
-                    size=len(response.body),
+                    encoded_size=len(response.encoded_body),
                 )
             try:
-                body = _decode_body(response.body, response.headers, self.policy)
-                detected = _detect_mime(body)
+                decoded_body, content_encoding = _decode_body(
+                    response.encoded_body, response.headers, self.policy
+                )
+                detected = _detect_mime(decoded_body)
             except CollectionError as exc:
                 exc.with_context(
                     final_url=current,
                     redirect_chain=redirects,
                     http_status=response.status,
                     headers=response.headers,
-                    size=len(response.body),
+                    encoded_size=len(response.encoded_body),
                 )
                 raise
             declared = _content_type(response.headers.get("content-type"))
@@ -244,21 +289,37 @@ class SafeHttpCollector:
                 headers=allowed_headers,
                 declared_content_type=declared,
                 detected_content_type=detected,
-                body=body,
-                sha256=hashlib.sha256(body).hexdigest(),
+                encoded_body=response.encoded_body,
+                decoded_body=decoded_body,
+                encoded_size=len(response.encoded_body),
+                encoded_sha256=hashlib.sha256(response.encoded_body).hexdigest(),
+                decoded_size=len(decoded_body),
+                decoded_sha256=hashlib.sha256(decoded_body).hexdigest(),
+                content_encoding=content_encoding,
                 acquired_at=datetime.now(UTC),
             )
         raise AssertionError("redirect loop terminates in the loop")
 
-    async def _resolve_and_pin(self, hostname: str, timeout_seconds: float) -> str:
+    async def _resolve_and_pin(
+        self,
+        hostname: str,
+        timeout_seconds: float,
+        cancellation_check: CancellationCheck | None,
+    ) -> str:
         import asyncio
 
         try:
             async with asyncio.timeout(timeout_seconds):
+                if cancellation_check is not None:
+                    await cancellation_check()
                 first = tuple(dict.fromkeys(await self._resolver.resolve(hostname)))
+                if cancellation_check is not None:
+                    await cancellation_check()
                 second = tuple(dict.fromkeys(await self._resolver.resolve(hostname)))
         except TimeoutError as exc:
             raise DownloadTransientError("DNS resolution exceeded the total timeout") from exc
+        except OSError as exc:
+            raise DownloadTransientError("DNS resolution failed") from exc
         if not first or not second:
             raise DownloadTransientError("DNS resolution returned no address")
         if set(first) != set(second):
@@ -317,7 +378,9 @@ def _validate_ip(value: str) -> None:
         raise UnsafeAddressError(f"Unsafe address is blocked: {address.compressed}")
 
 
-def _decode_body(body: bytes, headers: dict[str, str], policy: CollectionPolicy) -> bytes:
+def _decode_body(
+    body: bytes, headers: dict[str, str], policy: CollectionPolicy
+) -> tuple[bytes, str]:
     if len(body) > policy.max_download_bytes:
         raise DownloadTooLargeError("Compressed response exceeds the download limit")
     encoding = headers.get("content-encoding", "identity").casefold().strip()
@@ -336,7 +399,7 @@ def _decode_body(body: bytes, headers: dict[str, str], policy: CollectionPolicy)
         raise DownloadTooLargeError("Expanded response exceeds the size limit")
     if body and len(expanded) / len(body) > policy.max_decompression_ratio:
         raise DownloadTooLargeError("Response exceeds the decompression ratio limit")
-    return expanded
+    return expanded, encoding or "identity"
 
 
 def _bounded_decompress(body: bytes, limit: int, window_bits: int) -> bytes:

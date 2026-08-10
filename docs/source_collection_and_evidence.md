@@ -6,7 +6,14 @@ La collecte ne démarre jamais lors de la sélection éditoriale. L'analyste ouv
 `Subject` sélectionné puis appelle explicitement `POST /api/subjects/{subject_id}/collection`.
 Cette action crée le job canonique `source.collect`; Dramatiq ne transporte que son identifiant.
 Le handler reprend les sources `failed_retryable`, `archived` ou `extracted` et ignore celles déjà
-`completed`. Une annulation reste coopérative via le contexte de job entre deux sources.
+`completed`. Une annulation reste coopérative avant DNS, redirection, archivage, parsing et entre les
+segments Qwen.
+
+`fetching` est une prise de bail persistée sous `SELECT FOR UPDATE`. Un bail valide interdit un second
+téléchargement. Après expiration, un nouveau job ajoute une tentative `interrupted` append-only puis
+réclame la source. Les états `archived` et `extracted` repartent sans réseau. Une annulation avant
+archivage libère immédiatement la source en `failed_retryable`; après archivage, elle reste
+reconstructible depuis les blobs.
 
 Le collecteur est un adaptateur typé. Les tests remplacent DNS et transport HTTP par des doubles et
 n'ouvrent aucune connexion. Le collecteur de production :
@@ -29,16 +36,20 @@ Les domaines peuvent en plus être bornés par `COLLECTION_ALLOWED_DOMAINS` et
 | Table | Contenu | Mutabilité |
 | --- | --- | --- |
 | `source_collections` | Source candidate rattachée au Subject, état et relation proposée | projection mutable |
-| `collection_attempts` | URL, redirections, horodatages, statut, MIME, taille, hash, job et erreur | append-only |
+| `collection_attempts` | URL, redirections, statut, MIME, deux tailles/hashes, job, politique et erreur | append-only |
+| `collection_policy_snapshots` | Limites exactes, UA, domaines, versions collecteur/parseur/segments | append-only |
 | `source_documents` | Observation sémantique d'une URL acquise | métadonnées canoniques |
 | `derived_artifacts` | Texte dérivé, parseur/version et métadonnées de publication | append-only |
 | `claims` | Valeur extraite, méthode, source et offsets | append-only |
 | `indicators` | Valeurs originale/normalisée, type, source et offsets | append-only |
+| `rejected_model_proposals` | Proposition, segment, type demandé, motif, hash et ModelRun | append-only |
 | `human_decisions` | Validation, correction ou rejet par un acteur | append-only |
 
-Les octets bruts vont dans le bucket logique `source-raw`, le texte UTF-8 dans `source-text`. Ils
-sont adressés par SHA-256 et jamais stockés dans PostgreSQL. Deux URL retournant le même contenu
-partagent donc un blob mais gardent deux `SourceDocument` et deux historiques de tentatives.
+`source-raw` contient exactement les octets reçus après décodage du transfert HTTP, mais avant le
+décodage de `Content-Encoding`. Son hash est `encoded_sha256`. `source-decoded` contient les octets
+après gzip/deflate et porte `decoded_sha256`; c'est exclusivement cette représentation qui alimente
+HTML/PDF. Le texte UTF-8 dérivé va dans `source-text`. Tous ces blobs sont adressés par contenu et ne
+sont jamais stockés dans PostgreSQL.
 
 Les états sont :
 
@@ -50,21 +61,26 @@ queued -> fetching -> archived -> extracted -> completed
                    \-> failed_terminal
 ```
 
-Une reprise ne modifie ni ne supprime une tentative passée. La migration additive `0007` installe
-des triggers PostgreSQL refusant `UPDATE` et `DELETE` sur tentatives et artefacts de preuve.
+Une reprise ne modifie ni ne supprime une tentative passée. Les migrations additives `0007` et
+`0008` installent des triggers PostgreSQL refusant `UPDATE` et `DELETE` sur tentatives, snapshots,
+artefacts et propositions rejetées.
 
 ## Extraction et validation
 
 Le parseur HTML ignore les zones `script`, `style`, `noscript`, `template` et `svg`. Le parseur PDF
-extrait uniquement le texte et les métadonnées ; il n'exécute aucun contenu embarqué. Chaque texte
-est un artefact dérivé versionné.
+tourne dans un processus isolé interruptible. Il borne taille, pages, temps, texte et métadonnées,
+refuse les PDF chiffrés ou malformés et n'exécute ni action, lien ni pièce jointe. Chaque texte est un
+artefact dérivé versionné.
 
 L'extracteur déterministe reconnaît hash, domaine, IP, URL, CVE, identifiant ATT&CK et email,
 y compris les formes defangées. La valeur originale et la normalisation sont toutes deux gardées.
-Qwen reçoit uniquement le texte, explicitement marqué comme donnée distante non fiable, et propose
-une sortie structurée pour acteurs, campagnes, malwares, outils, chaîne d'infection, TTP,
-victimologie, faits, évaluations et incertitudes. Un nom, une date, un IOC ou une CVE est rejeté si
-sa valeur littérale n'est pas présente dans le passage exact fourni.
+Qwen reçoit des segments déterministes chevauchants, explicitement marqués comme données distantes
+non fiables. Chaque claim conserve son segment, son span local, son span global et son ModelRun. Les
+doublons de chevauchement fusionnent leur provenance. Les catégories imposent les types suivants :
+acteurs/campagnes/malwares/outils → `name`; chaîne d'infection → `infection_chain`; TTP → `ttp`;
+victimologie → `victimology`; évaluations → `assessment`; incertitudes → `uncertainty`; faits →
+`fact`, `date`, `ioc` ou `cve`. Une proposition invalide est journalisée individuellement et ne fait
+pas perdre les propositions valides.
 
 Une correction crée une `HumanDecision` avec valeur originale et valeur corrigée. Le `Claim` ou
 l'`Indicator` initial n'est jamais écrasé. De même, une relation de source proposée par un modèle

@@ -19,6 +19,7 @@ const workbench = {
       source_document_id: "f7fd2882-da41-4d3c-9bea-e592b6d2524a",
       attempt_count: 1,
       error_reason: null,
+      fetch_lease_expires_at: null,
       latest_attempt: {
         id: "4c84c931-989b-498b-84b0-60901671321d",
         requested_url: "https://research.example/report",
@@ -29,8 +30,11 @@ const workbench = {
         http_status: 200,
         declared_content_type: "text/plain",
         detected_content_type: "text/html",
-        size: 1234,
-        sha256: "a".repeat(64),
+        encoded_size: 800,
+        encoded_sha256: "a".repeat(64),
+        decoded_size: 1234,
+        decoded_sha256: "b".repeat(64),
+        content_encoding: "gzip",
         outcome: "succeeded",
         failure_reason: null,
       },
@@ -90,6 +94,9 @@ describe("SubjectWorkbench", () => {
       screen.getByText("https://research.example/final"),
     ).toBeInTheDocument();
     expect(screen.getByText("a".repeat(64))).toBeInTheDocument();
+    expect(screen.getByText("b".repeat(64))).toBeInTheDocument();
+    expect(screen.getByText("SHA-256 brut encodé")).toBeInTheDocument();
+    expect(screen.getByText("SHA-256 contenu décodé")).toBeInTheDocument();
     expect(
       screen.getByText("provisional", { selector: "strong" }),
     ).toBeInTheDocument();

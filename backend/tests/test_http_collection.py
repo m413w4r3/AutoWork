@@ -15,6 +15,7 @@ from cti_app.application.http_collection import (
     RawHttpResponse,
     SafeHttpCollector,
     UnsafeAddressError,
+    UnsupportedContentError,
     parse_domain_policy,
 )
 from cti_app.domain.collection import DetectedMimeType
@@ -60,7 +61,7 @@ def response(
     return RawHttpResponse(
         status=status,
         headers=headers or {"content-type": "text/html"},
-        body=body,
+        encoded_body=body,
     )
 
 
@@ -184,6 +185,16 @@ async def test_detected_mime_wins_over_misleading_content_type() -> None:
 
     assert result.declared_content_type == "text/html"
     assert result.detected_content_type is DetectedMimeType.PDF
+
+
+async def test_unsupported_content_encoding_is_typed() -> None:
+    collector = SafeHttpCollector(
+        QueueTransport([response(headers={"content-type": "text/html", "content-encoding": "br"})]),
+        StaticResolver(),
+    )
+
+    with pytest.raises(UnsupportedContentError, match="Content-Encoding"):
+        await collector.fetch("https://public.example/report")
 
 
 async def test_configured_domain_restrictions_are_enforced() -> None:
