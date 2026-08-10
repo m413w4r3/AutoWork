@@ -146,7 +146,9 @@ class StructuredExtractionModel(Protocol):
 
 
 class DraftingModel(Protocol):
-    async def draft(self, request: ModelRequest) -> ModelExecution: ...
+    async def draft(
+        self, request: ModelRequest, output_schema: type[BaseModel] | None = None
+    ) -> ModelExecution: ...
 
 
 class CriticModel(Protocol):
@@ -255,8 +257,10 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             request, ModelRole.STRUCTURED_EXTRACTION, output_schema=output_schema
         )
 
-    async def draft(self, request: ModelRequest) -> ModelExecution:
-        return await self._execute(request, ModelRole.DRAFTING)
+    async def draft(
+        self, request: ModelRequest, output_schema: type[BaseModel] | None = None
+    ) -> ModelExecution:
+        return await self._execute(request, ModelRole.DRAFTING, output_schema=output_schema)
 
     async def critique(self, request: ModelRequest) -> ModelExecution:
         return await self._execute(request, ModelRole.CRITIC)

@@ -57,7 +57,7 @@ describe("JobStatusCard", () => {
     expect(await screen.findByText("En cours")).toBeInTheDocument();
     expect(screen.getByText("50 % — 2/4")).toBeInTheDocument();
     expect(screen.getByText("Étape contrôlée")).toBeInTheDocument();
-    const cancel = screen.getByRole("button", { name: "Annuler la collecte" });
+    const cancel = screen.getByRole("button", { name: "Annuler la tâche" });
     expect(cancel).toBeEnabled();
     await user.click(cancel);
     expect(fetch).toHaveBeenCalledWith(

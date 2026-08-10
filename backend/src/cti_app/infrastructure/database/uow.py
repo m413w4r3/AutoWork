@@ -4,6 +4,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.persistence import (
     BlobRepository,
+    BriefDraftRepository,
+    BriefEvidencePackRepository,
     ClaimRepository,
     CollectionAttemptRepository,
     CollectionPolicySnapshotRepository,
@@ -26,6 +28,8 @@ from cti_app.application.persistence import (
 )
 from cti_app.infrastructure.database.repositories import (
     SqlAlchemyBlobRepository,
+    SqlAlchemyBriefDraftRepository,
+    SqlAlchemyBriefEvidencePackRepository,
     SqlAlchemyClaimRepository,
     SqlAlchemyCollectionAttemptRepository,
     SqlAlchemyCollectionPolicySnapshotRepository,
@@ -69,6 +73,8 @@ class SqlAlchemyUnitOfWork:
     claims: ClaimRepository
     indicators: IndicatorRepository
     rejected_model_proposals: RejectedModelProposalRepository
+    brief_evidence_packs: BriefEvidencePackRepository
+    brief_drafts: BriefDraftRepository
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -99,6 +105,8 @@ class SqlAlchemyUnitOfWork:
         self.claims = SqlAlchemyClaimRepository(self._session)
         self.indicators = SqlAlchemyIndicatorRepository(self._session)
         self.rejected_model_proposals = SqlAlchemyRejectedModelProposalRepository(self._session)
+        self.brief_evidence_packs = SqlAlchemyBriefEvidencePackRepository(self._session)
+        self.brief_drafts = SqlAlchemyBriefDraftRepository(self._session)
         self._committed = False
         return self
 

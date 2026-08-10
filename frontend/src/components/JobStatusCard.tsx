@@ -51,13 +51,24 @@ function useJobTracking(jobId: string) {
   return query;
 }
 
-export function JobStatusCard({ jobId }: { jobId: string }) {
+export function JobStatusCard({
+  jobId,
+  onTerminal,
+}: {
+  jobId: string;
+  onTerminal?: (status: JobStatus) => void;
+}) {
   const job = useJobTracking(jobId);
   const queryClient = useQueryClient();
   const cancellation = useMutation({
     mutationFn: () => cancelJob(jobId),
     onSuccess: (updated) => queryClient.setQueryData(["job", jobId], updated),
   });
+  useEffect(() => {
+    if (job.data && terminalJobStatuses.has(job.data.status)) {
+      onTerminal?.(job.data.status);
+    }
+  }, [job.data, onTerminal]);
 
   if (job.isPending) {
     return <p role="status">Chargement de la tâche…</p>;
@@ -105,7 +116,7 @@ export function JobStatusCard({ jobId }: { jobId: string }) {
         >
           {job.data.cancellation_requested
             ? "Annulation demandée"
-            : "Annuler la collecte"}
+            : "Annuler la tâche"}
         </button>
       ) : null}
       {cancellation.isError ? (

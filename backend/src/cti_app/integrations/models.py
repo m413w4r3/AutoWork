@@ -256,14 +256,14 @@ class QwenAdapter:
                 {"role": "user", "content": request.text},
             ],
         }
-        if role is ModelRole.STRUCTURED_EXTRACTION:
-            if output_schema is None:
-                raise ModelGatewayError("Structured extraction requires an output schema")
+        if output_schema is not None:
             schema_text = json.dumps(output_schema.model_json_schema(), sort_keys=True)
             payload["messages"][0]["content"] += (
                 " Réponds uniquement avec un objet JSON conforme à ce schéma : " + schema_text
             )
             payload["response_format"] = {"type": "json_object"}
+        elif role is ModelRole.STRUCTURED_EXTRACTION:
+            raise ModelGatewayError("Structured extraction requires an output schema")
         payload.update(_allowed_parameters(request.parameters, _CHAT_PARAMETERS))
         raw = await self._transport.create(payload)
         output_text = _chat_output_text(raw)

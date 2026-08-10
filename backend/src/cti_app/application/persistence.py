@@ -5,6 +5,7 @@ from typing import Protocol, Self
 from uuid import UUID
 
 from cti_app.domain.blobs import BlobRecord
+from cti_app.domain.briefs import BriefDraft, BriefEvidencePack
 from cti_app.domain.collection import (
     Claim,
     CollectionAttempt,
@@ -215,6 +216,30 @@ class RejectedModelProposalRepository(Protocol):
     async def append_many(self, proposals: Sequence[RejectedModelProposal]) -> None: ...
 
 
+class BriefEvidencePackRepository(Protocol):
+    async def append(self, pack: BriefEvidencePack) -> None: ...
+
+    async def get(self, pack_id: UUID) -> BriefEvidencePack | None: ...
+
+    async def get_current(self, subject_id: UUID) -> BriefEvidencePack | None: ...
+
+    async def get_by_hash(
+        self, subject_id: UUID, content_hash: str
+    ) -> BriefEvidencePack | None: ...
+
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[BriefEvidencePack]: ...
+
+
+class BriefDraftRepository(Protocol):
+    async def append(self, draft: BriefDraft) -> None: ...
+
+    async def get(self, draft_id: UUID) -> BriefDraft | None: ...
+
+    async def get_current(self, subject_id: UUID) -> BriefDraft | None: ...
+
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[BriefDraft]: ...
+
+
 class UnitOfWork(Protocol):
     blobs: BlobRepository
     subjects: SubjectRepository
@@ -236,6 +261,8 @@ class UnitOfWork(Protocol):
     claims: ClaimRepository
     indicators: IndicatorRepository
     rejected_model_proposals: RejectedModelProposalRepository
+    brief_evidence_packs: BriefEvidencePackRepository
+    brief_drafts: BriefDraftRepository
 
     async def __aenter__(self) -> Self: ...
 

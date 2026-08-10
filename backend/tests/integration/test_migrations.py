@@ -31,6 +31,8 @@ EXPECTED_TABLES = {
     "indicators",
     "collection_policy_snapshots",
     "rejected_model_proposals",
+    "brief_evidence_packs",
+    "brief_drafts",
 }
 
 

@@ -5,6 +5,7 @@ from uuid import UUID
 import dramatiq
 from minio import Minio
 
+from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.discovery import DiscoveryService
 from cti_app.application.editorial import EditorialGroupingService
@@ -113,9 +114,12 @@ async def _execute_job(job_id: UUID) -> int | None:
             ),
             fetch_lease_seconds=settings.collection_fetch_lease_seconds,
         )
+        brief_service = BriefService(uow_factory, blob_store, model_gateway)
         executor = JobExecutor(
             uow_factory,
-            create_job_registry(model_gateway, discovery_service, collection_service),
+            create_job_registry(
+                model_gateway, discovery_service, collection_service, brief_service
+            ),
             retry_base_seconds=settings.job_retry_base_seconds,
             retry_max_seconds=settings.job_retry_max_seconds,
         )

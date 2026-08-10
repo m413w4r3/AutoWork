@@ -5,8 +5,9 @@ local, la persistance canonique, le stockage de blobs, les jobs asynchrones obse
 premier workflow métier de création et de suivi des éditions. La découverte ponctuelle crée
 des candidats sourcés et explicitement non vérifiés via la passerelle LLM typée. Le board
 éditorial exige une décision humaine pour créer une brève ou un article principal. Un analyste
-peut ensuite lancer explicitement un job de collecte sûre HTML/PDF et examiner les preuves ;
-aucune chasse, attribution automatique, exécution d'échantillon ou génération de rapport n'est
+peut ensuite lancer explicitement un job de collecte sûre HTML/PDF, examiner les preuves et mener
+une brève jusqu’à son approbation et son export Markdown depuis un evidence pack gelé. Aucune
+chasse, attribution automatique, exécution d'échantillon ou génération d’article principal n'est
 encore activée.
 
 ## Prérequis
@@ -63,4 +64,5 @@ Les commandes racine sont `make test`, `make test-integration`, `make lint`, `ma
 L'état de production est canonique dans PostgreSQL, les fichiers versionnés et les evidence packs. Les workspaces matérialisés, conversations LLM, files Redis et réponses de services externes ne sont jamais des sources de vérité. Les représentations HTTP encodée et décodée sont archivées séparément par SHA-256 dans MinIO ; les observations d'URL, textes dérivés versionnés, claims, IOC et décisions humaines restent des objets canoniques distincts. La collecte utilise des baux récupérables, épingle une adresse DNS publique contrôlée à chaque connexion et redirection, borne durée, octets, décompression et parsing PDF, puis segmente l'extraction Qwen sans exécuter le contenu distant. Voir [backend/README.md](backend/README.md) pour les tables et limites configurables.
 
 La stratégie et les invariants de l'incrément sont détaillés dans
-[docs/source_collection_and_evidence.md](docs/source_collection_and_evidence.md).
+[docs/source_collection_and_evidence.md](docs/source_collection_and_evidence.md) et
+[docs/brief_workflow.md](docs/brief_workflow.md).

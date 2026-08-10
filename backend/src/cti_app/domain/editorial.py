@@ -48,6 +48,9 @@ class HumanDecisionType(StrEnum):
     INDICATOR_REJECT = "indicator_reject"
     SOURCE_RELATIONSHIP_VALIDATE = "source_relationship_validate"
     SOURCE_RELATIONSHIP_CORRECT = "source_relationship_correct"
+    BRIEF_CHANGES_REQUESTED = "brief_changes_requested"
+    BRIEF_APPROVE = "brief_approve"
+    BRIEF_PROMOTE = "brief_promote"
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +158,14 @@ class EditorialGroup:
         self.status = EditorialGroupStatus.SELECTED
         self.editorial_type = editorial_type
         self.subject_id = subject_id
+        self._bump()
+
+    def promote_to_major(self) -> None:
+        if self.status is not EditorialGroupStatus.SELECTED:
+            raise ValueError("Only a selected group can be promoted")
+        if self.editorial_type is not EditorialType.BRIEF:
+            raise ValueError("Only a brief can be promoted to a major article")
+        self.editorial_type = EditorialType.MAJOR
         self._bump()
 
     def _bump(self) -> None:

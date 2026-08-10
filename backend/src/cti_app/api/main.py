@@ -4,12 +4,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from minio import Minio
 
+from cti_app.api.briefs import router as briefs_router
 from cti_app.api.collection import router as collection_router
 from cti_app.api.discovery import router as discovery_router
 from cti_app.api.editions import router as editions_router
 from cti_app.api.editorial import router as editorial_router
 from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
+from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.discovery import DiscoveryService
 from cti_app.application.editions import EditionService
@@ -110,7 +112,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
         fetch_lease_seconds=settings.collection_fetch_lease_seconds,
     )
-    registry = create_job_registry(model_gateway, discovery_service, collection_service)
+    brief_service = BriefService(uow_factory, blob_store, model_gateway)
+    registry = create_job_registry(
+        model_gateway, discovery_service, collection_service, brief_service
+    )
     app.state.readiness = readiness
     app.state.job_service = JobService(uow_factory, registry)
     app.state.job_dispatcher = DramatiqJobDispatcher()
@@ -120,6 +125,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.discovery_service = discovery_service
     app.state.editorial_service = editorial_service
     app.state.collection_service = collection_service
+    app.state.brief_service = brief_service
     yield
     await readiness.close()
     await job_engine.dispose()
@@ -134,6 +140,7 @@ def create_app() -> FastAPI:
     application.include_router(editorial_router)
     application.include_router(jobs_router)
     application.include_router(collection_router)
+    application.include_router(briefs_router)
     return application
 
 

@@ -14,8 +14,9 @@ import {
   type SourceRole,
 } from "../api/collection";
 import { JobStatusCard } from "./JobStatusCard";
+import { BriefEditor } from "./BriefEditor";
 
-type Tab = "sources" | "evidence" | "ioc" | "extraction";
+type Tab = "sources" | "evidence" | "ioc" | "extraction" | "brief";
 
 export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
   const queryClient = useQueryClient();
@@ -69,6 +70,7 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
             ["evidence", "Preuves"],
             ["ioc", "IOC"],
             ["extraction", "Extraction"],
+            ["brief", "Brève"],
           ] as const
         ).map(([value, label]) => (
           <button
@@ -100,6 +102,9 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
       ) : null}
       {workbench.data && tab === "extraction" ? (
         <ExtractionTab claims={workbench.data.claims} />
+      ) : null}
+      {workbench.data && tab === "brief" ? (
+        <BriefEditor subjectId={subjectId} />
       ) : null}
     </section>
   );
