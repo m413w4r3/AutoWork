@@ -119,6 +119,21 @@ describe("App éditions", () => {
     await user.type(screen.getByLabelText("Période"), "2026-07");
     await user.clear(screen.getByLabelText("Langues"));
     await user.type(screen.getByLabelText("Langues"), "fr,en,fa");
+    expect(
+      screen.getByText(
+        "Ces objectifs ne limitent jamais la sélection éditoriale.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByLabelText(
+        "Objectif indicatif d’articles principaux — sans limite de sélection",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByLabelText(
+        "Objectif indicatif de brèves — sans limite de sélection",
+      ),
+    ).toBeInTheDocument();
     await user.clear(screen.getByLabelText("Profil de sources"));
     await user.type(screen.getByLabelText("Profil de sources"), "iran-default");
     await user.click(screen.getByRole("button", { name: "Créer l’édition" }));

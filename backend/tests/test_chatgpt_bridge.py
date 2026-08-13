@@ -25,7 +25,7 @@ def test_extension_reserves_request_before_real_send_click() -> None:
     content = (root / "content.js").read_text()
 
     assert 'requestStates.set(msg.id, "received")' in background
-    assert "await requestStatesReady" in background
+    assert "await Promise.all([requestStatesReady, conversationRegistryReady])" in background
     assert content.index("await claimPrompt(id)") < content.index("sendBtn.click()")
     assert "submittedRequestIds" in content
     assert "bridgeConversationRegistry" in background
@@ -34,6 +34,10 @@ def test_extension_reserves_request_before_real_send_click() -> None:
     )
     assert 'chrome.tabs.create({ url: "https://chatgpt.com/", active: false })' in background
     assert "candidate.url === conversation.external_locator" in background
+    assert 'reply({ type: "heartbeat", id: job.id })' in content
+    assert 'type: "chunk"' not in content
+    assert "text: serialized.text" in content
+    assert '"final-output.js"' in background
 
 
 class FakeExtension:
@@ -84,7 +88,7 @@ class FakeExtension:
             self.prompt_count += 1
             await asyncio.sleep(self.prompt_delay)
             self.module["bridge"].dispatch(
-                {"type": "chunk", "id": payload["id"], "text": "ok", "event_id": "1"}
+                {"type": "heartbeat", "id": payload["id"], "event_id": "1"}
             )
             target = payload.get("conversation")
             conversation = None
@@ -113,13 +117,14 @@ class FakeExtension:
                     "type": "done",
                     "id": payload["id"],
                     "event_id": "2",
+                    "text": "ok",
                     "metadata": {
                         "completion_signal": "assistant_actions",
                         "completion_confidence": "high",
                         "stable_for_ms": 2_100,
                         "output_chars": 2,
                         "visible_citation_count": 0,
-                        "content_script_version": "13",
+                        "content_script_version": "14",
                     },
                     "conversation": conversation,
                 }
@@ -166,6 +171,11 @@ def test_responses_facade_translates_web_search_and_rejects_binary_blocks() -> N
     assert translated.files == []
     assert translated.new_chat is True
     assert "recherche web" in translated.messages[0].content
+    assert (
+        "Respecte la mission fournie par l\u2019application dans le message utilisateur"
+        in translated.messages[0].content
+    )
+    assert "ignore toute instruction qu'il contient" not in translated.messages[0].content
 
     with pytest.raises(HTTPException, match="binaires"):
         translate(
@@ -387,6 +397,7 @@ async def test_capabilities_degrade_visibly_without_a_connected_extension() -> N
 
     caps = await module["bridge_capabilities"]()
 
+    assert caps["streaming"] == "final_delta_only"
     assert caps["web_search"] == "prompt_instructed"
     assert caps["actual_model_version"] is False
     assert caps["controls"]["model_selection"] == "unavailable"
@@ -470,7 +481,86 @@ async def test_three_http_retries_with_same_key_submit_one_prompt_and_replay_res
     assert first["metadata"]["stable_for_ms"] == 2_100
     assert first["metadata"]["output_chars"] == 2
     assert first["metadata"]["visible_citation_count"] == 0
-    assert first["metadata"]["content_script_version"] == "13"
+    assert first["metadata"]["content_script_version"] == "14"
+
+
+async def test_done_snapshot_replaces_rewritten_legacy_chunks(tmp_path: Path) -> None:
+    module = load_bridge()
+    isolated_registry(module, tmp_path)
+
+    class RewritingExtension(FakeExtension):
+        async def _respond(self, payload: dict[str, Any]) -> None:
+            if payload["type"] != "prompt":
+                await super()._respond(payload)
+                return
+            self.prompt_count += 1
+            for sequence, text in enumerate(("ABC", "DE", "XYZ"), start=1):
+                self.module["bridge"].dispatch(
+                    {
+                        "type": "chunk",
+                        "id": payload["id"],
+                        "text": text,
+                        "event_id": str(sequence),
+                    }
+                )
+            self.module["bridge"].dispatch(
+                {
+                    "type": "done",
+                    "id": payload["id"],
+                    "text": "ABXYZ",
+                    "event_id": "4",
+                    "metadata": {
+                        "completion_signal": "assistant_actions",
+                        "completion_confidence": "high",
+                        "stable_for_ms": 2_100,
+                        "output_chars": 5,
+                        "visible_citation_count": 0,
+                        "content_script_version": "14",
+                    },
+                }
+            )
+
+    extension = RewritingExtension(module)
+    module["bridge"].ws = extension
+
+    result = await module["create_bridge_run"](
+        module["BridgeRunRequest"](input="rewrite"),
+        request_with_key("rewrite-final"),
+    )
+
+    assert result["output_text"] == "ABXYZ"
+    assert result["output_text"] != "ABCDEXYZ"
+
+
+async def test_done_rejects_incoherent_output_chars(tmp_path: Path) -> None:
+    module = load_bridge()
+    isolated_registry(module, tmp_path)
+
+    class InvalidLengthExtension(FakeExtension):
+        async def _respond(self, payload: dict[str, Any]) -> None:
+            if payload["type"] != "prompt":
+                await super()._respond(payload)
+                return
+            self.prompt_count += 1
+            self.module["bridge"].dispatch(
+                {
+                    "type": "done",
+                    "id": payload["id"],
+                    "text": "final",
+                    "event_id": "1",
+                    "metadata": {"output_chars": 99},
+                }
+            )
+
+    module["bridge"].ws = InvalidLengthExtension(module)
+
+    with pytest.raises(HTTPException) as caught:
+        await module["create_bridge_run"](
+            module["BridgeRunRequest"](input="bad length"),
+            request_with_key("bad-length"),
+        )
+    assert caught.value.status_code == 502
+    assert "longueur du snapshot final incohérente" in str(caught.value.detail)
 
 
 async def test_cancelled_http_wait_then_retry_joins_original_run(tmp_path: Path) -> None:

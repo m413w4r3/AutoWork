@@ -613,6 +613,28 @@ a:focus-visible {
   grid-template-columns: 1fr 1fr;
 }
 
+.indicative-targets {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  padding: 1rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.75rem;
+}
+
+.indicative-targets legend {
+  padding: 0 0.4rem;
+  color: #405249;
+  font-weight: 700;
+}
+
+.indicative-targets p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #607269;
+}
+
 .edition-form small,
 .edition-form .form-actions {
   grid-column: 1 / -1;
@@ -850,6 +872,10 @@ h1 {
   .edition-form,
   .edition-facts,
   .progress-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .indicative-targets {
     grid-template-columns: 1fr;
   }
 }

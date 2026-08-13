@@ -74,9 +74,7 @@ async def test_editorial_api_applies_versioned_decisions_in_one_request() -> Non
     async with AsyncClient(
         transport=ASGITransport(app=application), base_url="http://test"
     ) as client:
-        board = (
-            await client.get(f"/api/editions/{edition.id}/editorial-groups")
-        ).json()
+        board = (await client.get(f"/api/editions/{edition.id}/editorial-groups")).json()
         response = await client.post(
             f"/api/editions/{edition.id}/editorial-groups/decisions",
             json={

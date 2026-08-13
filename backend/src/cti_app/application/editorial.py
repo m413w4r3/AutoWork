@@ -364,9 +364,7 @@ class EditorialGroupingService:
                 )
                 await uow.subjects.add(subject)
                 if self._materializer is not None:
-                    await self._materializer.materialize(
-                        subject, (), (), {}, self._workspace_root
-                    )
+                    await self._materializer.materialize(subject, (), (), {}, self._workspace_root)
                 group.select(editorial_type, subject.id)
                 await uow.editorial_groups.save(group)
                 await uow.human_decisions.append(

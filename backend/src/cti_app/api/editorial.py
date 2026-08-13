@@ -346,9 +346,9 @@ def _group_view(group: EditorialGroup, board: EditorialBoard) -> EditorialGroupV
     for candidate in candidates:
         for source in candidate.sources:
             previous = publications_by_url.get(source.canonical_url)
-            if previous is None or role_order.get(
-                source.role.value, 9
-            ) < role_order.get(previous.role.value, 9):
+            if previous is None or role_order.get(source.role.value, 9) < role_order.get(
+                previous.role.value, 9
+            ):
                 publications_by_url[source.canonical_url] = source
     publications = sorted(
         publications_by_url.values(),
@@ -378,13 +378,10 @@ def _group_view(group: EditorialGroup, board: EditorialBoard) -> EditorialGroupV
     actor_or_campaign = " · ".join(actor_values) if actor_values else None
     technical_reason = (
         representative.technical_potential_reason
-        if representative
-        and _is_meaningful(representative.technical_potential_reason)
+        if representative and _is_meaningful(representative.technical_potential_reason)
         else None
     )
-    metadata_incomplete = not all(
-        (presentation, actor_or_campaign, publications, technical_reason)
-    )
+    metadata_incomplete = not all((presentation, actor_or_campaign, publications, technical_reason))
 
     return EditorialGroupView(
         id=group.id,
@@ -419,9 +416,7 @@ def _group_view(group: EditorialGroup, board: EditorialBoard) -> EditorialGroupV
                 raw_value=item.raw_value,
                 normalized_value=item.normalized_value,
                 proposed_type=item.proposed_type.value,
-                declared_type=(
-                    item.declared_type if _is_meaningful(item.declared_type) else None
-                ),
+                declared_type=(item.declared_type if _is_meaningful(item.declared_type) else None),
                 warnings=list(item.warnings),
             )
             for item in provisional_iocs

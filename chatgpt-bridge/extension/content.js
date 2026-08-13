@@ -1,6 +1,6 @@
 /**
  * Content script injecté sur chatgpt.com : reçoit un prompt du service worker,
- * le tape dans le composer, puis observe le DOM pour renvoyer la réponse en flux.
+ * le tape dans le composer, puis observe le DOM avant de renvoyer un snapshot final.
  *
  * Tous les sélecteurs dépendants de l'UI OpenAI sont regroupés dans SELECTORS
  * ci-dessous : c'est le seul bloc à retoucher si l'interface change.
@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "13";
+const VERSION = "14";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -106,6 +106,7 @@ const UPLOAD_TIMEOUT_MS = 120000; // upload des pièces jointes
 const SETTLE_MS = 2000; // stabilité exigée quand un signal de fin est confirmé
 const SETTLE_UNKNOWN_MS = 8000; // stabilité exigée quand aucun signal n'est reconnu
 const NO_MARKDOWN_FALLBACK_MS = 25000; // au-delà, on lit le tour entier faute de mieux
+const HEARTBEAT_INTERVAL_MS = 20000; // réarme l'idle timeout sans transmettre le texte
 
 let currentJob = null;
 const claimedRequestIds = new Set();
@@ -904,41 +905,20 @@ function reply(payload) {
   chrome.runtime.sendMessage(payload).catch(() => {});
 }
 
-/** Longueur du plus long préfixe commun à deux chaînes. */
-function commonPrefix(a, b) {
-  const max = Math.min(a.length, b.length);
-  let i = 0;
-  while (i < max && a[i] === b[i]) i++;
-  return i;
-}
-
 /**
- * Émet vers le serveur ce que `next` ajoute à `sent`, et renvoie le nouvel état
- * transmis. Le rendu Markdown pouvant réécrire le texte déjà lu, on repart du
- * plus long préfixe commun plutôt que d'une simple longueur.
- */
-function emitDelta(id, sent, next) {
-  const i = commonPrefix(sent, next);
-  if (next.length <= i) return sent;
-  reply({ type: "chunk", id, text: next.slice(i) });
-  return next;
-}
-
-/**
- * Suit la réponse dans le DOM et la diffuse au fil de l'eau.
- *
- * Le texte transmis ne doit jamais avoir à être repris : tout ce qui est encore
- * susceptible de bouger — la fermeture du bloc de code en cours — est retenu
- * par `readAnswer(root, streaming)` et livré une fois la génération terminée.
+ * Suit la réponse dans le DOM sans transmettre les snapshots intermédiaires.
+ * Chaque observation remplace la précédente, car le rendu n'est pas append-only.
  */
 async function streamAnswer(job, locator, before) {
-  let sent = ""; // ce qui est déjà parti vers le serveur
+  const output = globalThis.ChatGPTBridgeFinalOutput.createAccumulator();
   let vu = ""; // relevé précédent, pour mesurer la stabilité
   let stableSince = null;
   let full = "";
   let debugSig = "";
   let completionSignature = "";
   const debut = Date.now();
+  let lastHeartbeatAt = debut;
+  let finalSerialized = null;
   let finalCompletion = {
     finished: null,
     signal: "unknown",
@@ -948,6 +928,10 @@ async function streamAnswer(job, locator, before) {
 
   while (!job.aborted) {
     await sleep(POLL_MS);
+    if (Date.now() - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+      reply({ type: "heartbeat", id: job.id });
+      lastHeartbeatAt = Date.now();
+    }
 
     // Re-recherche du tour à chaque itération, jamais de référence gardée :
     // React remplace le nœud du message entre la phase de réflexion et la
@@ -970,6 +954,7 @@ async function streamAnswer(job, locator, before) {
     );
     const snapshot = root ? readAnswer(root, finished !== true) : null;
     full = snapshot ? snapshot.text : "";
+    output.observe(full);
 
     if (DEBUG) {
       const pres = root ? root.querySelectorAll("pre") : [];
@@ -981,8 +966,6 @@ async function streamAnswer(job, locator, before) {
         );
       }
     }
-
-    sent = emitDelta(job.id, sent, full);
 
     if (full !== vu) {
       vu = full;
@@ -1004,7 +987,8 @@ async function streamAnswer(job, locator, before) {
         JSON.stringify(verification.visible_citations) ===
           JSON.stringify(snapshot.visible_citations);
       if (verification && verification.text === full && citationsIdentical) {
-        full = verification.text;
+        output.observe(verification.text);
+        finalSerialized = verification;
         finalCompletion = completion;
         break;
       }
@@ -1013,17 +997,11 @@ async function streamAnswer(job, locator, before) {
     }
   }
 
-  // Le texte ne bouge plus : livrer ce qui restait retenu.
-  if (!job.aborted) emitDelta(job.id, sent, full);
-  const finalTurn = findTurn(locator, before);
-  const finalRoot = finalTurn ? answerRoot(finalTurn, true) : null;
-  const serialized = finalRoot
-    ? readAnswer(finalRoot, false)
-    : {
-        text: full,
-        visible_citations: [],
-        serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
-      };
+  const serialized = finalSerialized || {
+    text: output.final(),
+    visible_citations: [],
+    serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
+  };
   return {
     ...serialized,
     completion_signal: finalCompletion.signal,
@@ -1131,13 +1109,15 @@ async function handlePrompt({
       reply({
         type: "done",
         id,
+        text: serialized.text,
         metadata: {
           visible_citations: serialized.visible_citations,
           serializer_version: serialized.serializer_version,
           completion_signal: serialized.completion_signal,
           completion_confidence: serialized.completion_confidence,
           stable_for_ms: serialized.stable_for_ms,
-          output_chars: serialized.text.length,
+          output_chars:
+            globalThis.ChatGPTBridgeFinalOutput.outputChars(serialized.text),
           visible_citation_count: serialized.visible_citations.length,
           content_script_version: VERSION,
         },

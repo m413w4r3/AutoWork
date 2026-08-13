@@ -246,28 +246,32 @@ function EditionCreatePage() {
         <small id="languages-help">
           Codes séparés par des virgules, par exemple fr,en,fa.
         </small>
-        <label>
-          Articles principaux ciblés
-          <input
-            name="target_major_articles"
-            type="number"
-            min={0}
-            max={20}
-            defaultValue={2}
-            required
-          />
-        </label>
-        <label>
-          Brèves ciblées
-          <input
-            name="target_briefs"
-            type="number"
-            min={0}
-            max={100}
-            defaultValue={6}
-            required
-          />
-        </label>
+        <fieldset className="indicative-targets">
+          <legend>Paramètres indicatifs</legend>
+          <p>Ces objectifs ne limitent jamais la sélection éditoriale.</p>
+          <label>
+            Objectif indicatif d’articles principaux — sans limite de sélection
+            <input
+              name="target_major_articles"
+              type="number"
+              min={0}
+              max={20}
+              defaultValue={2}
+              required
+            />
+          </label>
+          <label>
+            Objectif indicatif de brèves — sans limite de sélection
+            <input
+              name="target_briefs"
+              type="number"
+              min={0}
+              max={100}
+              defaultValue={6}
+              required
+            />
+          </label>
+        </fieldset>
         <label>
           Profil de sources
           <input
@@ -373,11 +377,11 @@ function EditionDetailPage({ editionId }: { editionId: string }) {
           <dd>{current.languages.join(", ")}</dd>
         </div>
         <div>
-          <dt>Articles principaux</dt>
+          <dt>Objectif indicatif d’articles principaux</dt>
           <dd>{current.target_major_articles}</dd>
         </div>
         <div>
-          <dt>Brèves</dt>
+          <dt>Objectif indicatif de brèves</dt>
           <dd>{current.target_briefs}</dd>
         </div>
         <div>

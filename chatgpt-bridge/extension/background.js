@@ -26,6 +26,7 @@ const conversationRegistry = new Map();
 const busyTabs = new Set();
 const requestConversationResults = new Map();
 const requestExtensionMetadata = new Map();
+const requestFinalOutputs = new Map();
 
 const requestStatesReady = chrome.storage.local.get("bridgeRequestStates").then(({ bridgeRequestStates }) => {
   for (const [id, state] of Object.entries(bridgeRequestStates || {})) requestStates.set(id, state);
@@ -35,9 +36,15 @@ const conversationRegistryReady = chrome.storage.local
     "bridgeConversationRegistry",
     "bridgeRequestConversationResults",
     "bridgeRequestExtensionMetadata",
+    "bridgeRequestFinalOutputs",
   ])
   .then(
-    ({ bridgeConversationRegistry, bridgeRequestConversationResults, bridgeRequestExtensionMetadata }) => {
+    ({
+      bridgeConversationRegistry,
+      bridgeRequestConversationResults,
+      bridgeRequestExtensionMetadata,
+      bridgeRequestFinalOutputs,
+    }) => {
     for (const [id, entry] of Object.entries(bridgeConversationRegistry || {})) {
       conversationRegistry.set(id, { ...entry, tab_id: null, window_id: null });
     }
@@ -46,6 +53,9 @@ const conversationRegistryReady = chrome.storage.local
     }
     for (const [id, value] of Object.entries(bridgeRequestExtensionMetadata || {})) {
       requestExtensionMetadata.set(id, value);
+    }
+    for (const [id, value] of Object.entries(bridgeRequestFinalOutputs || {})) {
+      if (typeof value === "string") requestFinalOutputs.set(id, value);
     }
   },
   );
@@ -63,6 +73,7 @@ function persistConversationRegistry() {
     bridgeConversationRegistry: durable,
     bridgeRequestConversationResults: Object.fromEntries([...requestConversationResults.entries()].slice(-1000)),
     bridgeRequestExtensionMetadata: Object.fromEntries([...requestExtensionMetadata.entries()].slice(-1000)),
+    bridgeRequestFinalOutputs: Object.fromEntries([...requestFinalOutputs.entries()].slice(-50)),
   });
 }
 
@@ -285,13 +296,16 @@ async function sendToTab(tabId, msg) {
   try {
     return await chrome.tabs.sendMessage(tabId, msg);
   } catch {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["serializer.js", "completion.js", "final-output.js", "content.js"],
+    });
     return await chrome.tabs.sendMessage(tabId, msg);
   }
 }
 
 async function handlePrompt(msg) {
-  await requestStatesReady;
+  await Promise.all([requestStatesReady, conversationRegistryReady]);
   const known = requestStates.get(msg.id);
   if (known) {
     send({ type: "ack", id: msg.id, state: known, duplicate: true });
@@ -300,6 +314,7 @@ async function handlePrompt(msg) {
         type: "done",
         id: msg.id,
         replayed: true,
+        text: requestFinalOutputs.get(msg.id) || "",
         conversation: requestConversationResults.get(msg.id) || null,
         metadata: requestExtensionMetadata.get(msg.id) || null,
       });
@@ -381,7 +396,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
-  if (["ack", "chunk", "done", "error"].includes(msg?.type)) {
+  if (["ack", "chunk", "heartbeat", "done", "error"].includes(msg?.type)) {
     const sequence = (eventCounters.get(msg.id) || 0) + 1;
     eventCounters.set(msg.id, sequence);
     if (["done", "error"].includes(msg.type)) {
@@ -401,8 +416,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       if (msg.type === "done" && msg.metadata) {
         requestExtensionMetadata.set(msg.id, msg.metadata);
-        persistConversationRegistry();
       }
+      if (msg.type === "done" && typeof msg.text === "string")
+        requestFinalOutputs.set(msg.id, msg.text);
+      if (msg.type === "done") persistConversationRegistry();
       persistRequestStates();
     }
     send({ ...msg, event_id: `${msg.id}:${sequence}` });

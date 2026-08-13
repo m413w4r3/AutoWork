@@ -17,7 +17,12 @@
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-      "js": ["serializer.js", "completion.js", "content.js"],
+      "js": [
+        "serializer.js",
+        "completion.js",
+        "final-output.js",
+        "content.js"
+      ],
       "run_at": "document_idle",
       "all_frames": false
     }

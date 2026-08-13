@@ -42,7 +42,6 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
   const board = useQuery({
     queryKey: ["editorial-board", editionId],
     queryFn: () => fetchEditorialBoard(editionId),
-    refetchInterval: 5_000,
   });
   const action = useMutation({
     mutationFn: (operation: () => Promise<EditorialBoardResult>) => operation(),

@@ -520,12 +520,8 @@ async def test_bulk_decisions_create_two_ready_subjects_without_collection() -> 
     await service.decide_many(
         edition.id,
         (
-            EditorialDecisionCommand(
-                groups[0].id, groups[0].version, EditorialDecisionValue.BRIEF
-            ),
-            EditorialDecisionCommand(
-                groups[1].id, groups[1].version, EditorialDecisionValue.MAJOR
-            ),
+            EditorialDecisionCommand(groups[0].id, groups[0].version, EditorialDecisionValue.BRIEF),
+            EditorialDecisionCommand(groups[1].id, groups[1].version, EditorialDecisionValue.MAJOR),
             EditorialDecisionCommand(
                 groups[2].id, groups[2].version, EditorialDecisionValue.IGNORE
             ),
@@ -542,12 +538,8 @@ async def test_bulk_decisions_create_two_ready_subjects_without_collection() -> 
     assert len(uow.subjects) == 2
     assert len(materializer.subjects) == 2
     assert materializer.source_document_inputs == [(), ()]
-    assert sum(
-        item.decision_type is HumanDecisionType.SELECT for item in uow.decisions
-    ) == 2
-    assert sum(
-        item.decision_type is HumanDecisionType.REJECT for item in uow.decisions
-    ) == 1
+    assert sum(item.decision_type is HumanDecisionType.SELECT for item in uow.decisions) == 2
+    assert sum(item.decision_type is HumanDecisionType.REJECT for item in uow.decisions) == 1
     # Selection only prepares empty workspaces; source collection has no entry point here.
     assert all(subject.id in uow.subjects for subject in materializer.subjects)
 
@@ -567,9 +559,7 @@ async def test_bulk_decisions_are_atomic_on_version_conflict() -> None:
     materializer = RecordingMaterializer()
     service = EditorialGroupingService(uow, None, materializer=materializer)
     groups = await service.synchronize(edition.id)
-    original = {
-        group.id: (group.status, group.version, group.subject_id) for group in groups
-    }
+    original = {group.id: (group.status, group.version, group.subject_id) for group in groups}
 
     with pytest.raises(EditorialActionError, match="has changed"):
         await service.decide_many(

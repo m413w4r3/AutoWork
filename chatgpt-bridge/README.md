@@ -82,7 +82,9 @@ curl http://127.0.0.1:8001/v1/chat/completions \
   -d '{"model":"chatgpt-web","messages":[{"role":"user","content":"Raconte une blague courte."}]}'
 ```
 
-Avec le SDK officiel — le serveur est compatible en streaming comme en non-streaming :
+Avec le SDK officiel — le serveur accepte le streaming comme le non-streaming. Le transport
+DOM est toutefois `final_delta_only` : une requête SSE reçoit un unique delta final après la
+stabilisation, et non les versions intermédiaires que ChatGPT peut réécrire :
 
 ```python
 from openai import OpenAI
@@ -276,10 +278,9 @@ ajoute le nouveau sélecteur en première position, rien d'autre à toucher.
 - **Les blocs de code ChatGPT sont des `<pre>` imbriqués.** Le sérialiseur ne visitant que le
   `<pre>` extérieur, c'est lui qui doit être repéré comme « en cours d'écriture » — viser le
   dernier `<pre>` en ordre document désignait l'intérieur et entrelaçait les délimiteurs.
-- **Un bloc de code n'est transmis qu'une fois son langage connu.** L'UI rend parfois l'en-tête
-  (« Python ») après le début du code : l'ouverture passerait alors de ` ``` ` à ` ```python `,
-  réécrivant du texte déjà transmis. Conséquence assumée : un bloc dont le langage n'est pas
-  encore rendu arrive d'un coup plutôt qu'en flux — quelques centaines de millisecondes.
+- **Le DOM n'est pas append-only.** L'UI peut réécrire un bloc, son langage ou une section
+  Markdown déjà rendue. L'extension observe ces snapshots localement, maintient la connexion
+  par heartbeat puis transmet une seule fois le texte final vérifié dans le paquet `done`.
 
 ## Limites
 
