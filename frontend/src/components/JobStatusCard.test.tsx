@@ -10,6 +10,57 @@ afterEach(() => {
 });
 
 describe("JobStatusCard", () => {
+  it("affiche l’état de recherche, le temps écoulé et masque la tentative unique", async () => {
+    vi.stubGlobal("EventSource", undefined);
+    const startedAt = new Date(Date.now() - 2_500).toISOString();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          id: "4de4af61-811e-4c1c-ad4a-9b39a5c06c94",
+          kind: "discover_edition",
+          aggregate_type: "edition",
+          aggregate_id: "b131b279-d486-4af2-a1b8-c3579583b97e",
+          status: "running",
+          progress_current: 1,
+          progress_total: 4,
+          user_message: null,
+          attempt: 1,
+          max_attempts: 1,
+          next_retry_at: null,
+          started_at: startedAt,
+          finished_at: null,
+          heartbeat_at: startedAt,
+          error_code: null,
+          error_message: null,
+          error_details: null,
+          correlation_id: "discovery-test",
+          output_reference: null,
+          cancellation_requested: false,
+          created_at: startedAt,
+          updated_at: startedAt,
+        }),
+      ),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <JobStatusCard jobId="4de4af61-811e-4c1c-ad4a-9b39a5c06c94" />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "ChatGPT recherche et analyse les sources",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Temps écoulé : [2-9] s/)).toBeInTheDocument();
+    expect(screen.queryByText(/Tentative 1\/1/)).not.toBeInTheDocument();
+  });
+
   it("utilise le suivi HTTP périodique quand EventSource est indisponible", async () => {
     const user = userEvent.setup();
     vi.stubGlobal("EventSource", undefined);

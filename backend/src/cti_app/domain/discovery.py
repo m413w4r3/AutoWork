@@ -57,6 +57,52 @@ class IocPresence(StrEnum):
     UNKNOWN = "unknown"
 
 
+class DiscoveryIocType(StrEnum):
+    IPV4 = "ipv4"
+    IPV6 = "ipv6"
+    DOMAIN = "domain"
+    URL = "url"
+    MD5 = "md5"
+    SHA1 = "sha1"
+    SHA256 = "sha256"
+    EMAIL = "email"
+    CVE = "cve"
+    OTHER = "other"
+    UNKNOWN = "unknown"
+
+
+class DiscoveryIocStatus(StrEnum):
+    PROVISIONAL_VISIBLE = "provisional_visible"
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionalIocPublicationRelation:
+    publication_id: UUID
+    publication_ref: str
+    raw_value: str
+    markdown_block: str
+
+
+@dataclass(slots=True)
+class ProvisionalDiscoveryIoc:
+    raw_value: str
+    normalized_value: str | None
+    declared_type: str
+    proposed_type: DiscoveryIocType
+    publication_relations: tuple[ProvisionalIocPublicationRelation, ...]
+    model_run_id: UUID | None
+    markdown_block: str
+    warnings: tuple[str, ...] = ()
+    status: DiscoveryIocStatus = DiscoveryIocStatus.PROVISIONAL_VISIBLE
+    id: UUID = field(default_factory=uuid4)
+
+    def __post_init__(self) -> None:
+        self.raw_value = self.raw_value.strip()
+        self.declared_type = self.declared_type.strip() or "unknown"
+        if not self.raw_value or not self.publication_relations:
+            raise ValueError("A provisional IOC requires a value and publication relation")
+
+
 @dataclass(slots=True)
 class SourceCandidate:
     url: str
@@ -153,6 +199,7 @@ class CandidateTopic:
     incomplete_sources: list[IncompleteSourceCandidate] = field(default_factory=list)
     event_date: date | None = None
     iocs: tuple[str, ...] = ()
+    provisional_iocs: list[ProvisionalDiscoveryIoc] = field(default_factory=list)
     local_ref: str | None = None
     actor_or_campaign: str = "unknown"
     technical_potential_reason: str = "Non précisé dans le rapport de découverte."
@@ -199,6 +246,10 @@ class DiscoveryBatch:
     parser_version: str = "legacy-model-structured"
     parsing_status: str = "completed"
     parsing_warnings: tuple[str, ...] = ()
+    unattached_visible_citations: tuple[dict[str, str | None], ...] = ()
+    parsing_revision: int = 1
+    supersedes_batch_id: UUID | None = None
+    replaced_by_batch_id: UUID | None = None
     source_mode: DiscoverySourceMode = DiscoverySourceMode.VISIBLE_CITATIONS_ONLY
     bridge_capabilities: dict[str, object] = field(default_factory=dict)
     citation_count: int = 0
@@ -229,6 +280,12 @@ class DiscoveryBatch:
         if not self.source_coverage_complete and not self.source_coverage_incomplete_reason:
             raise ValueError("Incomplete source coverage requires a reason")
         self.candidates = deduplicate_topics(self.candidates)
+        if self.parsing_revision < 1:
+            raise ValueError("Parsing revision must be positive")
+
+    @property
+    def is_active_revision(self) -> bool:
+        return self.replaced_by_batch_id is None
 
     def source(self, source_id: UUID) -> SourceCandidate | None:
         return next(

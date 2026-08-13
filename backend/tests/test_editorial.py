@@ -8,9 +8,12 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.discovery_report_parser import parse_discovery_report
 from cti_app.application.editorial import (
     AmbiguousGroupingResult,
     EditorialActionError,
+    EditorialDecisionCommand,
+    EditorialDecisionValue,
     EditorialGroupingService,
 )
 from cti_app.domain.classification import TLP
@@ -33,6 +36,8 @@ from cti_app.domain.editorial import (
 )
 from cti_app.domain.entities import Subject
 from tests.editorial_support import InMemoryEditorialUnitOfWorkFactory
+
+IRAN_REPORT = (Path(__file__).parent / "fixtures/chatgpt_iran_2026_08_escaped.md").read_text()
 
 
 def _edition(*, month: int = 7) -> Edition:
@@ -108,6 +113,7 @@ def _score() -> EditorialScore:
 class RecordingMaterializer:
     def __init__(self) -> None:
         self.subjects: list[Subject] = []
+        self.source_document_inputs: list[object] = []
 
     async def materialize(
         self,
@@ -118,6 +124,7 @@ class RecordingMaterializer:
         workspace_root: Path,
     ) -> object:
         self.subjects.append(subject)
+        self.source_document_inputs.append(source_documents)
         return workspace_root / subject.slug
 
 
@@ -136,7 +143,7 @@ class RecordingStructuredModel:
         )
 
 
-async def test_deterministic_grouping_merges_same_canonical_url_without_attribution() -> None:
+async def test_same_batch_candidates_never_merge_on_same_canonical_url() -> None:
     uow = InMemoryEditorialUnitOfWorkFactory()
     edition = _edition()
     uow.editions[edition.id] = edition
@@ -154,11 +161,123 @@ async def test_deterministic_grouping_merges_same_canonical_url_without_attribut
 
     groups = await EditorialGroupingService(uow, None).synchronize(edition.id)
 
+    assert len(groups) == 2
+    assert all(len(group.candidate_references) == 1 for group in groups)
+    assert all(
+        group.source_relationship_status is SourceRelationshipStatus.PROVISIONAL for group in groups
+    )
+    assert all(group.needs_source_verification for group in groups)
+
+
+async def test_real_iran_report_creates_five_groups_despite_shared_kaspersky_relay() -> None:
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition(month=8)
+    uow.editions[edition.id] = edition
+    parsed = parse_discovery_report(
+        IRAN_REPORT,
+        visible_citations=[],
+        period_start=edition.period_start,
+        period_end=edition.period_end,
+        tlp=edition.tlp,
+        sensitivity="internal",
+        external_llm_allowed=True,
+    )
+    batch = _batch(edition.id, parsed.candidates)
+    uow.batches[batch.id] = batch
+
+    groups = await EditorialGroupingService(uow, None).synchronize(edition.id)
+
+    assert len(groups) == 5
+    assert all(len(group.candidate_references) == 1 for group in groups)
+    assert (
+        sum(
+            "Kaspersky" in source.publisher
+            for candidate in parsed.candidates
+            for source in candidate.sources
+        )
+        == 5
+    )
+
+
+async def test_shared_relay_across_batches_is_not_identity_evidence() -> None:
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+    first = _candidate("Cyber Isnaad Front", "https://summary.example/quarterly")
+    first.sources[0].role = SourceRole.RELAY
+    second = _candidate("Nimbus Manticore", "https://summary.example/quarterly")
+    second.sources[0].role = SourceRole.RELAY
+    first_batch = _batch(edition.id, [first])
+    second_batch = _batch(edition.id, [second])
+    uow.batches.update({first_batch.id: first_batch, second_batch.id: second_batch})
+
+    groups = await EditorialGroupingService(uow, None).synchronize(edition.id)
+
+    assert len(groups) == 2
+
+
+async def test_shared_primary_url_requires_another_editorial_signal() -> None:
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+    first = _candidate("Cyber Isnaad Front", "https://vendor.example/report")
+    second = _candidate("Activité visant des PLC", "https://vendor.example/report")
+    for candidate in (first, second):
+        candidate.actors = ()
+        candidate.campaigns = ()
+        candidate.malware = ()
+    first_batch = _batch(edition.id, [first])
+    second_batch = _batch(edition.id, [second])
+    uow.batches.update({first_batch.id: first_batch, second_batch.id: second_batch})
+
+    groups = await EditorialGroupingService(uow, None).synchronize(edition.id)
+
+    assert len(groups) == 2
+
+
+async def test_shared_primary_url_and_explicit_actor_alias_can_merge_across_batches() -> None:
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+    first = _candidate("Opération de sideloading", "https://vendor.example/report")
+    second = _candidate("Analyse technique distincte", "https://vendor.example/report")
+    first.actors = ("Nimbus Manticore / UNC1549",)
+    second.actors = ("UNC1549",)
+    for candidate in (first, second):
+        candidate.campaigns = ()
+        candidate.malware = ()
+    first_batch = _batch(edition.id, [first])
+    second_batch = _batch(edition.id, [second])
+    uow.batches.update({first_batch.id: first_batch, second_batch.id: second_batch})
+
+    groups = await EditorialGroupingService(uow, None).synchronize(edition.id)
+
     assert len(groups) == 1
     assert len(groups[0].candidate_references) == 2
-    assert groups[0].source_relationship_status is SourceRelationshipStatus.PROVISIONAL
-    assert groups[0].needs_source_verification is True
-    assert not hasattr(groups[0], "attribution_level")
+
+
+async def test_reprocessing_replaces_group_reference_without_duplicate() -> None:
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+    candidate = _candidate("Campagne MuddyWater", "https://vendor.example/report")
+    previous = _batch(edition.id, [candidate])
+    uow.batches[previous.id] = previous
+    service = EditorialGroupingService(uow, None)
+    original_group = (await service.synchronize(edition.id))[0]
+
+    replacement = _batch(edition.id, [candidate])
+    replacement.discovery_model_run_id = previous.discovery_model_run_id
+    replacement.parsing_revision = 2
+    replacement.supersedes_batch_id = previous.id
+    previous.replaced_by_batch_id = replacement.id
+    uow.batches.update({previous.id: previous, replacement.id: replacement})
+
+    groups = await service.synchronize(edition.id)
+
+    assert len(groups) == 1
+    assert groups[0].id == original_group.id
+    assert groups[0].candidate_references == (CandidateReference(replacement.id, candidate.id),)
 
 
 async def test_previous_month_match_is_presented_as_update_not_filtered() -> None:
@@ -221,7 +340,7 @@ async def test_structured_model_is_used_only_for_ambiguous_grouping() -> None:
 
     groups = await EditorialGroupingService(uow, model).synchronize(edition.id)  # type: ignore[arg-type]
 
-    assert len(model.calls) == 1
+    assert len(model.calls) == 0
     assert len(groups) == 2
     assert groups[1].outcome is GroupingOutcome.NEW_SUBJECT
     assert "attribution" not in groups[1].grouping_justification.casefold()
@@ -379,3 +498,98 @@ async def test_split_rejects_entire_request_when_one_candidate_is_foreign() -> N
     assert persisted.candidate_references == original_references
     assert len(uow.groups) == group_count
     assert len(uow.decisions) == decision_count
+
+
+async def test_bulk_decisions_create_two_ready_subjects_without_collection() -> None:
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+    batch = _batch(
+        edition.id,
+        [
+            _candidate("Publication A", "https://a.example/report"),
+            _candidate("Publication B", "https://b.example/report"),
+            _candidate("Publication C", "https://c.example/report"),
+        ],
+    )
+    uow.batches[batch.id] = batch
+    materializer = RecordingMaterializer()
+    service = EditorialGroupingService(uow, None, materializer=materializer)
+    groups = await service.synchronize(edition.id)
+
+    await service.decide_many(
+        edition.id,
+        (
+            EditorialDecisionCommand(
+                groups[0].id, groups[0].version, EditorialDecisionValue.BRIEF
+            ),
+            EditorialDecisionCommand(
+                groups[1].id, groups[1].version, EditorialDecisionValue.MAJOR
+            ),
+            EditorialDecisionCommand(
+                groups[2].id, groups[2].version, EditorialDecisionValue.IGNORE
+            ),
+        ),
+        actor_id="dev-analyst",
+        correlation_id="bulk-selection",
+    )
+
+    board = await service.board(edition.id)
+    assert board.selected_briefs == 1
+    assert board.selected_major == 1
+    assert board.ignored == 1
+    assert board.undecided == 0
+    assert len(uow.subjects) == 2
+    assert len(materializer.subjects) == 2
+    assert materializer.source_document_inputs == [(), ()]
+    assert sum(
+        item.decision_type is HumanDecisionType.SELECT for item in uow.decisions
+    ) == 2
+    assert sum(
+        item.decision_type is HumanDecisionType.REJECT for item in uow.decisions
+    ) == 1
+    # Selection only prepares empty workspaces; source collection has no entry point here.
+    assert all(subject.id in uow.subjects for subject in materializer.subjects)
+
+
+async def test_bulk_decisions_are_atomic_on_version_conflict() -> None:
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+    batch = _batch(
+        edition.id,
+        [
+            _candidate("Publication A", "https://a.example/report"),
+            _candidate("Publication B", "https://b.example/report"),
+        ],
+    )
+    uow.batches[batch.id] = batch
+    materializer = RecordingMaterializer()
+    service = EditorialGroupingService(uow, None, materializer=materializer)
+    groups = await service.synchronize(edition.id)
+    original = {
+        group.id: (group.status, group.version, group.subject_id) for group in groups
+    }
+
+    with pytest.raises(EditorialActionError, match="has changed"):
+        await service.decide_many(
+            edition.id,
+            (
+                EditorialDecisionCommand(
+                    groups[0].id, groups[0].version, EditorialDecisionValue.BRIEF
+                ),
+                EditorialDecisionCommand(
+                    groups[1].id, groups[1].version + 1, EditorialDecisionValue.IGNORE
+                ),
+            ),
+            actor_id="dev-analyst",
+            correlation_id="conflict",
+        )
+
+    assert {
+        group_id: (group.status, group.version, group.subject_id)
+        for group_id, group in uow.groups.items()
+    } == original
+    assert uow.subjects == {}
+    assert uow.decisions == []
+    assert materializer.subjects == []

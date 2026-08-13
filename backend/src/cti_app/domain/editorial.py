@@ -140,6 +140,15 @@ class EditorialGroup:
         self.candidate_references = remaining
         self._bump()
 
+    def replace_candidate_references(
+        self, replacements: dict[CandidateReference, CandidateReference]
+    ) -> None:
+        updated = tuple(replacements.get(item, item) for item in self.candidate_references)
+        updated = tuple(dict.fromkeys(updated))
+        if updated != self.candidate_references:
+            self.candidate_references = updated
+            self._bump()
+
     def supersede(self) -> None:
         if self.status is not EditorialGroupStatus.PROPOSED:
             raise ValueError("Only proposed groups can be merged")

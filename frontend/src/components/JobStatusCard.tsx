@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import {
   cancelJob,
@@ -101,10 +101,12 @@ function useJobTracking(jobId: string) {
 export function JobStatusCard({
   jobId,
   onTerminal,
+  onUpdate,
   onReprocessReport,
 }: {
   jobId: string;
   onTerminal?: (status: JobStatus) => void;
+  onUpdate?: (job: JobView) => void;
   onReprocessReport?: (researchModelRunId: string) => void;
 }) {
   const job = useJobTracking(jobId);
@@ -118,10 +120,19 @@ export function JobStatusCard({
     onSuccess: (updated) => queryClient.setQueryData(["job", jobId], updated),
   });
   useEffect(() => {
+    if (job.data) onUpdate?.(job.data);
     if (job.data && terminalJobStatuses.has(job.data.status)) {
       onTerminal?.(job.data.status);
     }
-  }, [job.data, onTerminal]);
+  }, [job.data, onTerminal, onUpdate]);
+  const [now, setNow] = useState(() => Date.now());
+  const active =
+    job.data?.status === "queued" || job.data?.status === "running";
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [active]);
 
   if (job.isPending) {
     return <p role="status">Chargement de la tâche…</p>;
@@ -151,17 +162,29 @@ export function JobStatusCard({
     details?.can_retry_structuring === true &&
     typeof details.research_model_run_id === "string" &&
     Boolean(onReprocessReport);
+  const isDiscovery = job.data.kind === "discover_edition";
+  const elapsedFrom = job.data.started_at ?? job.data.created_at;
+  const elapsedSeconds = Math.max(
+    0,
+    Math.floor((now - new Date(elapsedFrom).getTime()) / 1_000),
+  );
 
   return (
     <article className={`job-card job-card--${job.data.status}`}>
       <div className="job-card__heading">
         <div>
           <p className="eyebrow">Tâche de fond</p>
-          <h2>{statusLabels[job.data.status]}</h2>
+          <h2>
+            {isDiscovery && active
+              ? "ChatGPT recherche et analyse les sources"
+              : statusLabels[job.data.status]}
+          </h2>
         </div>
-        <span>
-          Tentative {job.data.attempt}/{job.data.max_attempts}
-        </span>
+        {job.data.max_attempts > 1 ? (
+          <span>
+            Tentative {job.data.attempt}/{job.data.max_attempts}
+          </span>
+        ) : null}
       </div>
       <progress
         aria-label="Progression de la tâche"
@@ -173,6 +196,7 @@ export function JobStatusCard({
           ? `${progress} % — ${job.data.progress_current}/${job.data.progress_total}`
           : "Progression en attente"}
       </p>
+      {active ? <p>Temps écoulé : {elapsedSeconds} s</p> : null}
       {job.data.user_message ? <p>{job.data.user_message}</p> : null}
       {job.data.status === "queued" || job.data.status === "running" ? (
         <button

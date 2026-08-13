@@ -48,7 +48,6 @@ from cti_app.domain.discovery import (
     SourceRole,
     SourceVerificationStatus,
     canonicalize_http_url,
-    deduplicate_sources,
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRun
 from cti_app.logging import get_correlation_id
@@ -58,7 +57,7 @@ REPROCESS_DISCOVERY_REPORT_JOB_KIND = "reprocess_discovery_report"
 # Compatibility import for callers compiled against the previous name.
 RETRY_STRUCTURING_JOB_KIND = REPROCESS_DISCOVERY_REPORT_JOB_KIND
 PROMPT_TEMPLATE_ID = "monthly-cti-discovery"
-PROMPT_TEMPLATE_VERSION = "3.0"
+PROMPT_TEMPLATE_VERSION = "4.0"
 COMPACT_CONTRACT_VERSION = "research-batch-compact-v1"
 logger = logging.getLogger(__name__)
 
@@ -143,6 +142,7 @@ class DiscoverEditionParameters(JobParameters):
     country_aliases: list[str] = Field(min_length=1, max_length=30)
     period_start: date
     period_end: date
+    as_of_date: date = Field(default_factory=date.today)
     languages: list[str] = Field(min_length=1, max_length=10)
     source_profile: str = Field(min_length=1, max_length=128)
     keywords: list[str] = Field(default_factory=list, max_length=100)
@@ -158,7 +158,7 @@ class DiscoverEditionParameters(JobParameters):
     def parse_edition_id(cls, value: object) -> object:
         return UUID(value) if isinstance(value, str) and value else value
 
-    @field_validator("period_start", "period_end", mode="before")
+    @field_validator("period_start", "period_end", "as_of_date", mode="before")
     @classmethod
     def parse_date(cls, value: object) -> object:
         return date.fromisoformat(value) if isinstance(value, str) else value
@@ -346,6 +346,7 @@ class DiscoveryService:
                 tlp=parameters.tlp,
                 sensitivity=parameters.sensitivity,
                 external_llm_allowed=parameters.external_llm_allowed,
+                research_model_run_id=research.run.id,
             )
         except ReportParsingError as exc:
             exc.research_model_run_id = research.run.id
@@ -359,10 +360,6 @@ class DiscoveryService:
             bridge_capabilities,
         )
         async with self._uow_factory() as uow:
-            batches = list(await uow.discovery_batches.list_for_edition(parameters.edition_id))
-            _merge_existing_candidates(batch, batches)
-            for existing_batch in batches:
-                await uow.discovery_batches.save(existing_batch)
             inserted = await uow.discovery_batches.add_if_absent(batch)
             if not inserted:
                 existing = await uow.discovery_batches.get_by_request_hash(
@@ -582,6 +579,7 @@ class DiscoveryService:
             tlp=parameters.tlp,
             sensitivity=parameters.sensitivity,
             external_llm_allowed=parameters.external_llm_allowed,
+            research_model_run_id=research_run_id,
         )
         await self._record_parser_diagnostics(research_run_id, parsed)
         await context.report_progress(2, 2, "Analyse locale terminée sans appel au bridge")
@@ -596,7 +594,23 @@ class DiscoveryService:
             await self._capabilities_snapshot(),
         )
         async with self._uow_factory() as uow:
-            await uow.discovery_batches.add_if_absent(batch)
+            revisions = [
+                item
+                for item in await uow.discovery_batches.list_for_edition(parameters.edition_id)
+                if item.discovery_model_run_id == research_run_id
+            ]
+            active = next((item for item in reversed(revisions) if item.is_active_revision), None)
+            batch.parsing_revision = (
+                max((item.parsing_revision for item in revisions), default=0) + 1
+            )
+            if active is not None:
+                batch.supersedes_batch_id = active.id
+                active.replaced_by_batch_id = batch.id
+            inserted = await uow.discovery_batches.add_if_absent(batch)
+            if not inserted:
+                raise ModelGatewayError("A parsing revision already exists for this request")
+            if active is not None:
+                await uow.discovery_batches.save(active)
             await uow.commit()
         if self._after_discovery is not None:
             await self._after_discovery(parameters.edition_id)
@@ -605,7 +619,7 @@ class DiscoveryService:
     async def read_archived_report(self, edition_id: UUID, research_run_id: UUID) -> str:
         if self._output_archive is None:
             raise ReportParsingError("report_unavailable", "Archive de rapports indisponible.")
-        batches = await self.list_batches(edition_id)
+        batches = await self.list_batches(edition_id, include_replaced=True)
         if not any(batch.discovery_model_run_id == research_run_id for batch in batches):
             raise ReportParsingError("report_unavailable", "Rapport archivé introuvable.")
         run = await self._output_archive.get_run(research_run_id)
@@ -666,9 +680,16 @@ class DiscoveryService:
                 type(exc).__name__,
             )
 
-    async def list_batches(self, edition_id: UUID) -> list[DiscoveryBatch]:
+    async def list_batches(
+        self, edition_id: UUID, *, include_replaced: bool = False
+    ) -> list[DiscoveryBatch]:
         async with self._uow_factory() as uow:
-            return list(await uow.discovery_batches.list_for_edition(edition_id))
+            batches = list(await uow.discovery_batches.list_for_edition(edition_id))
+            return (
+                batches
+                if include_replaced
+                else [item for item in batches if item.is_active_revision]
+            )
 
     async def mark_source(
         self,
@@ -782,7 +803,12 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
 def discovery_request_hash(parameters: DiscoverEditionParameters) -> str:
     value = parameters.model_dump(mode="json")
     for key in ("country_aliases", "languages", "keywords", "exclusions"):
-        value[key] = sorted(dict.fromkeys(item.strip() for item in value[key] if item.strip()))
+        cleaned = [item.strip() for item in value[key] if item.strip()]
+        value[key] = (
+            sorted({item.casefold() for item in cleaned})
+            if key in {"country_aliases", "languages"}
+            else sorted(dict.fromkeys(cleaned))
+        )
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -792,33 +818,75 @@ def discovery_idempotency_key(parameters: DiscoverEditionParameters) -> str:
 
 
 def _research_prompt(parameters: DiscoverEditionParameters) -> str:
-    languages = ", ".join(parameters.languages)
-    period = f"{parameters.period_start.isoformat()} et {parameters.period_end.isoformat()}"
+    aliases: list[str] = []
+    seen_aliases = {parameters.country.strip().casefold()}
+    for value in parameters.country_aliases:
+        alias = value.strip()
+        fingerprint = alias.casefold()
+        if alias and fingerprint not in seen_aliases:
+            aliases.append(alias)
+            seen_aliases.add(fingerprint)
+    formatted_aliases = f" (alias : {', '.join(aliases)})" if aliases else ""
+    languages: list[str] = []
+    seen_languages: set[str] = set()
+    for value in parameters.languages:
+        language = value.strip()
+        fingerprint = language.casefold()
+        if language and fingerprint not in seen_languages:
+            languages.append(language)
+            seen_languages.add(fingerprint)
+    observable_end = min(parameters.period_end, parameters.as_of_date)
     return f"""Mission : rechercher les publications CTI significatives concernant
-{parameters.country} et ses alias {", ".join(parameters.country_aliases)}, publiées entre
-{period}, dans les langues {languages}.
+{parameters.country}{formatted_aliases}.
 
+Date de recherche : {parameters.as_of_date.isoformat()}
+Période demandée : {parameters.period_start.isoformat()} au {parameters.period_end.isoformat()}
+Période observable : {parameters.period_start.isoformat()} au {observable_end.isoformat()}
+Langues : {", ".join(languages)}
 Axe complémentaire : {parameters.complementary_axis}
+
+Ne recherche pas de publication postérieure à la date de recherche.
 
 Priorise les activités APT étatiques ou supposées étatiques et les publications
 techniques comportant des IOC, des échantillons, des configurations, une chaîne
-d’infection ou des règles de détection.
+d’infection, des outils, des TTP ou des règles de détection.
 
-Regroupe les publications qui décrivent manifestement la même campagne, le même
-incident ou la même recherche. Distingue le rapport original, les analyses
-réellement indépendantes et les simples reprises.
+Propose tous les sujets significatifs retrouvés. Il n’existe aucune limite ni
+quota de sujets, de brèves ou d’articles approfondis. La sélection finale sera
+effectuée par un analyste humain.
 
-N’invente jamais une URL, une date, un nombre d’IOC ou une attribution.
-Utilise `unknown` lorsqu’une information n’est pas disponible.
+Regroupe dans un même SUBJECT les publications décrivant manifestement la même
+campagne, le même incident ou la même recherche.
 
-Les publications hors période peuvent être rattachées comme contexte à un sujet
-dans la période. Elles ne doivent pas devenir seules un sujet candidat, sauf si
-l’axe complémentaire le demande explicitement.
+Une synthèse mensuelle ou trimestrielle peut être liée à plusieurs SUBJECT.
+Ne fusionne pas des campagnes différentes uniquement parce qu’elles sont
+mentionnées dans la même synthèse.
 
-Ne présente pas les résultats comme exhaustifs.
+Chaque SUBJECT doit normalement comporter au moins une publication dans la
+période observable. Les publications antérieures peuvent être ajoutées comme
+rapport original, analyse indépendante ou contexte technique.
 
-Retourne uniquement un rapport Markdown utilisant autant que possible le format
-suivant :
+Pour les IOC :
+
+- signale uniquement les IOC explicitement visibles dans les pages consultées ;
+- reproduis leurs valeurs exactes sans les corriger ni les compléter ;
+- indique leur type lorsqu’il est identifiable ;
+- distingue un total annoncé par l’éditeur des valeurs effectivement visibles ;
+- n’estime jamais un nombre d’IOC ;
+- utilise `unknown` si tu ne peux pas déterminer l’information ;
+- utilise `none` seulement si la publication indique clairement qu’aucun IOC
+  n’est fourni ou si son contenu visible permet de l’établir ;
+- une URL normale de publication ou de navigation n’est pas un IOC ;
+- un domaine d’éditeur ou de CDN n’est pas un IOC sauf s’il est explicitement
+  présenté comme tel dans la source.
+
+N’invente aucune URL, date, attribution, disponibilité d’artefact ou valeur
+d’IOC.
+
+Retourne uniquement du Markdown, sans bloc de code et sans texte avant le titre.
+N’échappe pas les tirets des noms de champs.
+N’insère pas de citation Markdown dans les champs de description.
+Toutes les URL de référence doivent apparaître dans un bloc PUBLICATION.
 
 # SUJETS CANDIDATS
 
@@ -826,23 +894,25 @@ suivant :
 
 title: <intitulé proposé>
 presentation: <deux phrases neutres maximum>
-actor_or_campaign: <valeur explicite ou unknown>
-technical_potential: <entier de 0 à 4>
-technical_potential_reason: <une phrase>
+actor-campaign: <acteur ou campagne explicitement rapporté, sinon unknown>
+technical-potential: <entier de 0 à 4>
+technical-reason: <raison en une phrase>
 artifacts: <liste parmi ioc, samples, configurations, pcap, yara, suricata, none, unknown>
-uncertainties: <une ou deux incertitudes courtes>
+uncertainty: <une ou deux incertitudes courtes>
 
 ### PUBLICATION P1
 
-title: <titre>
+title: <titre exact>
 url: <URL HTTP(S) exacte>
-publisher: <entité éditrice ou unknown>
-published_at: <YYYY-MM-DD ou unknown>
-period_relation: <in_period, outside_period ou unknown>
-source_role: <primary, independent, relay ou unknown>
-ioc_presence: <none, declared, visible ou unknown>
-ioc_declared_count: <entier ou unknown>
-ioc_visible_count: <entier ou unknown>
+publisher: <éditeur ou unknown>
+published-at: <YYYY-MM-DD ou unknown>
+period: <in-period, outside-period ou unknown>
+role: <primary, independent, relay, aggregator ou unknown>
+ioc-visibility: <none, declared, visible ou unknown>
+visible-ioc-types: <liste des types visibles ou none/unknown>
+visible-iocs: <valeurs exactes explicitement visibles ou none/unknown>
+publisher-ioc-count: <entier explicitement annoncé ou unknown>
+ioc-note: <une phrase courte ou none>
 
 ### PUBLICATION P2
 
@@ -854,7 +924,7 @@ ioc_visible_count: <entier ou unknown>
 
 # LIMITES
 
-<limites principales de la recherche>"""
+<limites principales de la recherche et de l’accès aux sources>"""
 
 
 def _source_profile_description(profile_id: str) -> str:
@@ -1175,6 +1245,7 @@ def _parsed_to_domain_batch(
         parser_version=PARSER_VERSION,
         parsing_status=("report_parsing_partial" if result.status == "partial" else "completed"),
         parsing_warnings=result.warnings,
+        unattached_visible_citations=result.unattached_visible_citations,
         source_mode=DiscoverySourceMode.MODEL_DECLARED_URLS,
         bridge_capabilities=dict(bridge_capabilities),
         citation_count=len(result.citations),
@@ -1184,39 +1255,3 @@ def _parsed_to_domain_batch(
             "exhaustive des sources consultées."
         ),
     )
-
-
-def _merge_existing_candidates(batch: DiscoveryBatch, existing: list[DiscoveryBatch]) -> None:
-    topic_by_title = {
-        topic.title_fingerprint: topic for item in existing for topic in item.candidates
-    }
-    topic_by_source = {
-        source.canonical_url: topic
-        for item in existing
-        for topic in item.candidates
-        for source in topic.sources
-    }
-    fresh: list[CandidateTopic] = []
-    for candidate in batch.candidates:
-        target = topic_by_title.get(candidate.title_fingerprint)
-        if target is None:
-            target = next(
-                (
-                    topic_by_source[source.canonical_url]
-                    for source in candidate.sources
-                    if source.canonical_url in topic_by_source
-                ),
-                None,
-            )
-        if target is None:
-            fresh.append(candidate)
-            continue
-        target.sources = deduplicate_sources([*target.sources, *candidate.sources])
-        target.technical_potential = max(target.technical_potential, candidate.technical_potential)
-        target.uncertainties = tuple(
-            dict.fromkeys((*target.uncertainties, *candidate.uncertainties))
-        )
-        target.relevance_reasons = tuple(
-            dict.fromkeys((*target.relevance_reasons, *candidate.relevance_reasons))
-        )
-    batch.candidates = fresh

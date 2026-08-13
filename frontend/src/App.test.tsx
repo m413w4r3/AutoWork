@@ -48,6 +48,7 @@ function renderApp() {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  window.localStorage.clear();
   window.history.replaceState({}, "", "/editions");
 });
 
@@ -172,6 +173,68 @@ describe("App éditions", () => {
     );
   });
 
+  it("reprend le suivi d’une recherche après rechargement", async () => {
+    const jobId = "20658589-a6d5-4af5-b026-d5c6fcb3b7f0";
+    window.localStorage.setItem(`cti-discovery-job:${iranEdition.id}`, jobId);
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      if (url.includes(`/api/jobs/${jobId}`))
+        return Response.json({
+          id: jobId,
+          kind: "discover_edition",
+          aggregate_type: "edition",
+          aggregate_id: iranEdition.id,
+          status: "succeeded",
+          progress_current: 4,
+          progress_total: 4,
+          user_message: "Lot persisté",
+          attempt: 1,
+          max_attempts: 1,
+          next_retry_at: null,
+          started_at: "2026-08-10T10:00:00Z",
+          finished_at: "2026-08-10T10:01:00Z",
+          heartbeat_at: "2026-08-10T10:01:00Z",
+          error_code: null,
+          error_message: null,
+          error_details: null,
+          correlation_id: "reload-test",
+          output_reference: "discovery-batch://batch",
+          cancellation_requested: false,
+          created_at: "2026-08-10T10:00:00Z",
+          updated_at: "2026-08-10T10:01:00Z",
+        });
+      if (url.includes("/discovery/candidates"))
+        return Response.json({
+          batches: [],
+          candidates: [],
+          total: 0,
+          warning: "",
+        });
+      if (url.includes("/editorial-groups"))
+        return Response.json(emptyEditorialBoard);
+      if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+      return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
+
+    renderApp();
+
+    expect(await screen.findByText("Terminée")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Sélection des sujets" }),
+    ).toBeInTheDocument();
+    expect(
+      window.localStorage.getItem(`cti-discovery-job:${iranEdition.id}`),
+    ).toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith(`/api/jobs/${jobId}`);
+  });
+
   it("lance la découverte et rend explicites sources et incertitudes non vérifiées", async () => {
     const candidateResult = {
       batches: [
@@ -189,6 +252,15 @@ describe("App éditions", () => {
           discovery_model_run_id: "f7fd2882-da41-4d3c-9bea-e592b6d2524a",
           structuring_model_run_id: "4c84c931-989b-498b-84b0-60901671321d",
           created_at: "2026-08-10T10:00:00Z",
+          parsing_warnings: [],
+          unattached_visible_citations: [
+            {
+              label: "Citation orpheline",
+              url: "https://orphan.example/report",
+              canonical_url: "https://orphan.example/report",
+              excerpt: null,
+            },
+          ],
         },
       ],
       candidates: [
@@ -210,6 +282,21 @@ describe("App éditions", () => {
           sectors: ["gouvernement"],
           countries: ["Iran"],
           likely_artifacts: ["ioc", "configurations"],
+          provisional_ioc_count: 1,
+          provisional_ioc_type_counts: { ipv4: 1 },
+          has_publisher_ioc_count: true,
+          provisional_iocs: [
+            {
+              id: "9e0fa012-1a63-4c70-888a-3cbc7f3190d6",
+              raw_value: "192.0.2.1",
+              normalized_value: "192.0.2.1",
+              declared_type: "ipv4",
+              proposed_type: "ipv4",
+              status: "provisional_visible",
+              publication_refs: ["P1"],
+              warnings: [],
+            },
+          ],
           editorial_status: "proposed",
           sources: [
             {
@@ -286,8 +373,19 @@ describe("App éditions", () => {
     const user = userEvent.setup();
     renderApp();
 
+    const technicalDetails = await screen.findByText(
+      "Détails techniques de la découverte",
+    );
     expect(
       await screen.findByRole("heading", {
+        name: "Nouvelle campagne MuddyWater",
+        hidden: true,
+      }),
+    ).not.toBeVisible();
+    expect(await screen.findByText("Citation orpheline")).not.toBeVisible();
+    await user.click(technicalDetails);
+    expect(
+      screen.getByRole("heading", {
         name: "Nouvelle campagne MuddyWater",
       }),
     ).toBeInTheDocument();
@@ -298,7 +396,19 @@ describe("App éditions", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Attribution non vérifiée")).toBeInTheDocument();
     expect(screen.getByText(/primary · unverified/)).toBeInTheDocument();
+    expect(
+      screen.getAllByText(
+        /IOC repérés pendant la recherche — non encore vérifiés depuis les sources/,
+      )[0],
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/ipv4: 1.*total éditeur annoncé/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Exemples : 192\.0\.2\.1/)).toBeInTheDocument();
+    await user.click(screen.getByText("Voir la liste complète (1)"));
+    expect(screen.getByText("192.0.2.1")).toBeInTheDocument();
     await user.click(screen.getByText(/Rapport et diagnostic/));
+    expect(screen.getByText("Citation orpheline")).toBeVisible();
     expect(
       screen.getByText("Iran APT July 2026 technical report"),
     ).toBeInTheDocument();

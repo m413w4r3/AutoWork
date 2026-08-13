@@ -62,6 +62,8 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test --run
+      - run: node ../chatgpt-bridge/tests/completion.test.js
+      - run: node --check ../chatgpt-bridge/extension/content.js
       - run: pnpm build
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:e2e

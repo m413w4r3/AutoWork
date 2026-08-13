@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "12";
+const VERSION = "13";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -17,7 +17,11 @@ const VERSION = "12";
 const DEBUG = false;
 
 const SELECTORS = {
-  composer: ["#prompt-textarea", "div[contenteditable='true'][id^='prompt']", "textarea[data-id]"],
+  composer: [
+    "#prompt-textarea",
+    "div[contenteditable='true'][id^='prompt']",
+    "textarea[data-id]",
+  ],
   send: [
     "button[data-testid='send-button']",
     "#composer-submit-button",
@@ -32,7 +36,10 @@ const SELECTORS = {
   fileInput: ["input[type='file']"],
   assistant: "[data-message-author-role='assistant']",
   markdown: ".markdown",
-  newChat: ["a[data-testid='create-new-chat-button']", "button[data-testid='create-new-chat-button']"],
+  newChat: [
+    "a[data-testid='create-new-chat-button']",
+    "button[data-testid='create-new-chat-button']",
+  ],
   // Conteneurs de la phase de réflexion : leur texte n'est pas la réponse.
   reasoning: [
     "[data-testid*='thinking']",
@@ -88,22 +95,23 @@ const SELECTORS = {
 };
 
 // Libellés reconnus comme « recherche web » dans un menu d'outils (FR/EN).
-const MOTS_RECHERCHE = /recherche web|rechercher sur le web|search the web|web search/;
+const MOTS_RECHERCHE =
+  /recherche web|rechercher sur le web|search the web|web search/;
 // Entrée d'un menu de modèles repliant les autres modèles dans un sous-menu.
 const MOTS_PLUS_MODELES = /plus de mod|autres mod|more models|legacy models/;
 
 const POLL_MS = 120;
 const APPEAR_TIMEOUT_MS = 30000; // délai d'apparition de la bulle de réponse
 const UPLOAD_TIMEOUT_MS = 120000; // upload des pièces jointes
-const SETTLE_MS = 700; // stabilité exigée quand un signal de fin est confirmé
-const SETTLE_UNKNOWN_MS = 6000; // stabilité exigée quand aucun signal n'est reconnu
+const SETTLE_MS = 2000; // stabilité exigée quand un signal de fin est confirmé
+const SETTLE_UNKNOWN_MS = 8000; // stabilité exigée quand aucun signal n'est reconnu
 const NO_MARKDOWN_FALLBACK_MS = 25000; // au-delà, on lit le tour entier faute de mieux
 
 let currentJob = null;
 const claimedRequestIds = new Set();
-let persistedRequestIdsPromise = chrome.storage.local.get("submittedRequestIds").then(
-  ({ submittedRequestIds }) => new Set(submittedRequestIds || []),
-);
+let persistedRequestIdsPromise = chrome.storage.local
+  .get("submittedRequestIds")
+  .then(({ submittedRequestIds }) => new Set(submittedRequestIds || []));
 
 async function claimPrompt(id) {
   if (claimedRequestIds.has(id)) return false;
@@ -162,7 +170,10 @@ async function waitFor(fn, timeout, label) {
 function typePrompt(el, text) {
   el.focus();
   if (el.tagName === "TEXTAREA") {
-    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set;
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    ).set;
     setter.call(el, text);
     el.dispatchEvent(new Event("input", { bubbles: true }));
     return;
@@ -177,7 +188,13 @@ function typePrompt(el, text) {
     // Repli : évènement paste synthétique (accepté par ProseMirror).
     const dt = new DataTransfer();
     dt.setData("text/plain", text);
-    el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+    el.dispatchEvent(
+      new ClipboardEvent("paste", {
+        clipboardData: dt,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
   }
   el.dispatchEvent(new Event("input", { bubbles: true }));
 }
@@ -196,7 +213,9 @@ async function attachFiles(files) {
     const bin = atob(f.data);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    dt.items.add(new File([bytes], f.name, { type: f.mime || "application/octet-stream" }));
+    dt.items.add(
+      new File([bytes], f.name, { type: f.mime || "application/octet-stream" }),
+    );
   }
 
   input.files = dt.files;
@@ -204,7 +223,13 @@ async function attachFiles(files) {
   // Repli : certaines versions de l'UI n'écoutent que le drop sur le composer.
   const composer = $(SELECTORS.composer);
   if (composer) {
-    composer.dispatchEvent(new DragEvent("drop", { dataTransfer: dt, bubbles: true, cancelable: true }));
+    composer.dispatchEvent(
+      new DragEvent("drop", {
+        dataTransfer: dt,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
   }
 }
 
@@ -229,7 +254,9 @@ function turnLocator(turn) {
 /** Retrouve le tour courant à partir de son identifiant, jamais d'un nœud gardé. */
 function findTurn(locator, before) {
   if (locator) {
-    const container = document.querySelector(`[data-testid="${CSS.escape(locator)}"]`);
+    const container = document.querySelector(
+      `[data-testid="${CSS.escape(locator)}"]`,
+    );
     const turn = container && container.querySelector(SELECTORS.assistant);
     if (turn) return turn;
   }
@@ -285,30 +312,46 @@ function readAnswer(root, streaming) {
  * n'est reconnaissable — ce dernier cas est capital : conclure « terminé » par
  * défaut tronquait la réponse pendant la phase de réflexion (« Thinking »).
  */
-function isFinished(turn) {
-  // Signal négatif : ChatGPT écrit encore.
-  if ($(SELECTORS.stop)) return false;
-  // `.streaming-animation` : mesuré présent pendant l'écriture, absent à la fin.
-  if (document.querySelector(".streaming-animation, .result-streaming, [data-is-streaming='true']")) {
-    return false;
-  }
-
-  // Signal positif : la barre d'actions de CE tour est rendue.
-  const scope = closestOf(turn, SELECTORS.turnContainer) || turn.parentElement || turn;
-  for (const sel of SELECTORS.turnActions) {
-    if (scope.querySelector(sel)) return true;
-  }
-
-  // Signal positif de repli : le composer a retrouvé son bouton d'envoi.
-  const submit = $(SELECTORS.send);
-  if (submit) {
-    const testid = submit.getAttribute("data-testid") || "";
-    const label = (submit.getAttribute("aria-label") || "").toLowerCase();
-    if (testid.includes("stop") || label.includes("stop") || label.includes("rrêt")) return false;
-    return true;
-  }
-
-  return null;
+function completionState(turn) {
+  const scope =
+    closestOf(turn, SELECTORS.turnContainer) || turn.parentElement || turn;
+  const visible = (element) => {
+    if (!element || element.getAttribute?.("aria-hidden") === "true")
+      return false;
+    const style = globalThis.getComputedStyle?.(element);
+    if (style?.display === "none" || style?.visibility === "hidden")
+      return false;
+    return (
+      typeof element.getClientRects !== "function" ||
+      element.getClientRects().length > 0
+    );
+  };
+  const activeReasoning = (element) => {
+    if (element?.tagName === "DETAILS" && !element.open) return false;
+    if (["closed", "collapsed"].includes(element?.getAttribute?.("data-state")))
+      return false;
+    return visible(element);
+  };
+  return globalThis.ChatGPTBridgeCompletion.completionState({
+    stopVisible: SELECTORS.stop.some((selector) =>
+      [...document.querySelectorAll(selector)].some(visible),
+    ),
+    streamingVisible: Boolean(
+      [
+        ...document.querySelectorAll(
+          ".streaming-animation, .result-streaming, [data-is-streaming='true']",
+        ),
+      ].some(visible),
+    ),
+    reasoningVisible: SELECTORS.reasoning.some((selector) =>
+      [...scope.querySelectorAll(selector)].some(activeReasoning),
+    ),
+    actionsVisible: SELECTORS.turnActions.some((selector) =>
+      [...scope.querySelectorAll(selector)].some(visible),
+    ),
+    // Conservé uniquement comme observation : le moteur pur l'ignore volontairement.
+    sendVisible: Boolean($(SELECTORS.send)),
+  });
 }
 
 // --------------------------------------------------------------------------- //
@@ -332,7 +375,10 @@ const norm = (s) =>
     .trim();
 
 /** Identifiant comparable : « GPT-5 Thinking » -> « gpt-5-thinking ». */
-const slug = (s) => norm(s).replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+const slug = (s) =>
+  norm(s)
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 
 /** Libellé d'un déclencheur (bouton portant l'état courant) : une seule ligne. */
 const triggerLabel = (el) => norm(el.innerText || el.textContent || "");
@@ -354,7 +400,9 @@ function itemLabel(el) {
 /** Identifiant d'une entrée : son `data-testid` si l'UI en pose un, sinon son libellé. */
 function itemId(el, label) {
   const testid = el.getAttribute("data-testid") || "";
-  const m = testid.match(/^(?:model-switcher|model|account|workspace|profile)-(.+)$/);
+  const m = testid.match(
+    /^(?:model-switcher|model|account|workspace|profile)-(.+)$/,
+  );
   return m ? slug(m[1]) : slug(label);
 }
 
@@ -381,7 +429,10 @@ function pressedState(el) {
 /** Formulaire du composer : périmètre des boutons d'outils de l'envoi. */
 function composerRoot() {
   const composer = $(SELECTORS.composer);
-  return (composer && (closestOf(composer, ["form"]) || composer.parentElement)) || document.body;
+  return (
+    (composer && (closestOf(composer, ["form"]) || composer.parentElement)) ||
+    document.body
+  );
 }
 
 /** Ouvre le menu d'un déclencheur et renvoie l'élément de menu, ou lève. */
@@ -425,7 +476,12 @@ function menuItems(menu) {
       vus.add(el);
       const label = itemLabel(el);
       if (!label) continue;
-      items.push({ el, label, id: itemId(el, label), checked: pressedState(el) });
+      items.push({
+        el,
+        label,
+        id: itemId(el, label),
+        checked: pressedState(el),
+      });
     }
   }
   return items;
@@ -489,9 +545,18 @@ function readPicker(selectors, quoi) {
   if (!trigger) return etatPicker({ reason: `${quoi} absent de la page` });
 
   const label = triggerLabel(trigger);
-  if (!label) return etatPicker({ supported: true, reason: `${quoi} sans libellé lisible` });
+  if (!label)
+    return etatPicker({
+      supported: true,
+      reason: `${quoi} sans libellé lisible`,
+    });
 
-  return etatPicker({ supported: true, selected: label, selected_id: slug(label), verified: true });
+  return etatPicker({
+    supported: true,
+    selected: label,
+    selected_id: slug(label),
+    verified: true,
+  });
 }
 
 /**
@@ -508,7 +573,10 @@ function readWebSearch() {
       enabled: pressed,
       verified: pressed !== null,
       via: "composer_toggle",
-      reason: pressed === null ? "bouton présent, mais son état on/off n'est pas exposé par l'UI" : null,
+      reason:
+        pressed === null
+          ? "bouton présent, mais son état on/off n'est pas exposé par l'UI"
+          : null,
     });
   }
   const tools = $in(composerRoot(), SELECTORS.toolsTrigger);
@@ -528,7 +596,11 @@ async function probeMenu(selectors, quoi) {
   let menu = null;
   try {
     menu = await openMenu(trigger, quoi);
-    return menuItems(menu).map((i) => ({ id: i.id, label: i.label, checked: i.checked }));
+    return menuItems(menu).map((i) => ({
+      id: i.id,
+      label: i.label,
+      checked: i.checked,
+    }));
   } catch {
     return null;
   } finally {
@@ -544,7 +616,9 @@ async function probeWebSearch() {
   let menu = null;
   try {
     menu = await openMenu(tools, "outils du composer");
-    const item = menuItems(menu).find((i) => MOTS_RECHERCHE.test(norm(i.label)));
+    const item = menuItems(menu).find((i) =>
+      MOTS_RECHERCHE.test(norm(i.label)),
+    );
     if (!item) {
       return etatRecherche({
         supported: false,
@@ -557,7 +631,10 @@ async function probeWebSearch() {
       enabled: item.checked,
       verified: item.checked !== null,
       via: "tools_menu",
-      reason: item.checked === null ? "entrée trouvée, mais son état n'est pas exposé par l'UI" : null,
+      reason:
+        item.checked === null
+          ? "entrée trouvée, mais son état n'est pas exposé par l'UI"
+          : null,
     });
   } catch (err) {
     return etatRecherche({ via: "tools_menu", reason: err.message });
@@ -584,7 +661,10 @@ async function uiState(probe) {
   };
   if (probe) {
     state.model.available = await probeMenu(SELECTORS.modelTrigger, "modèles");
-    state.profile.available = await probeMenu(SELECTORS.profileTrigger, "profils");
+    state.profile.available = await probeMenu(
+      SELECTORS.profileTrigger,
+      "profils",
+    );
     if (state.web_search.supported !== true || !state.web_search.verified) {
       const sonde = await probeWebSearch();
       if (sonde) state.web_search = sonde;
@@ -639,10 +719,14 @@ async function selectFromPicker(selectors, wanted, quoi) {
     if (!item) {
       // Les modèles secondaires sont repliés dans un sous-menu.
       const plus = items.find(
-        (i) => MOTS_PLUS_MODELES.test(norm(i.label)) || i.el.getAttribute("aria-haspopup") === "menu",
+        (i) =>
+          MOTS_PLUS_MODELES.test(norm(i.label)) ||
+          i.el.getAttribute("aria-haspopup") === "menu",
       );
       if (plus) {
-        plus.el.dispatchEvent(new PointerEvent("pointermove", { bubbles: true }));
+        plus.el.dispatchEvent(
+          new PointerEvent("pointermove", { bubbles: true }),
+        );
         plus.el.click();
         await sleep(250);
         for (const sel of SELECTORS.menu) {
@@ -686,7 +770,10 @@ async function selectFromPicker(selectors, wanted, quoi) {
   if (!applied) {
     const t = $(selectors);
     const vu = t ? triggerLabel(t) : "?";
-    return echec(wanted, `clic effectué mais ${quoi} affiche toujours « ${vu} »`);
+    return echec(
+      wanted,
+      `clic effectué mais ${quoi} affiche toujours « ${vu} »`,
+    );
   }
   return succes(wanted, applied, true);
 }
@@ -699,7 +786,8 @@ async function selectFromPicker(selectors, wanted, quoi) {
 async function setWebSearch(want) {
   const avant = readWebSearch();
 
-  if (avant.verified && avant.enabled === want) return succes(want, want, false, { via: avant.via });
+  if (avant.verified && avant.enabled === want)
+    return succes(want, want, false, { via: avant.via });
 
   const btn = $in(composerRoot(), SELECTORS.searchToggle);
   if (btn && avant.enabled !== null) {
@@ -713,22 +801,31 @@ async function setWebSearch(want) {
       "relecture du bouton de recherche",
     ).catch(() => null);
     if (apres) return succes(want, want, true, { via: apres.via });
-    return echec(want, "clic sans changement d'état observable", { via: "composer_toggle" });
+    return echec(want, "clic sans changement d'état observable", {
+      via: "composer_toggle",
+    });
   }
 
   // Repli : l'entrée du menu d'outils. Vérification indirecte — l'activation
   // fait apparaître le bouton dédié dans le composer, la désactivation le retire.
   const tools = $in(composerRoot(), SELECTORS.toolsTrigger);
   if (!tools) {
-    const raison = avant.reason || "aucun contrôle de recherche web dans le composer";
+    const raison =
+      avant.reason || "aucun contrôle de recherche web dans le composer";
     return echec(want, raison, { via: avant.via });
   }
   let menu = null;
   try {
     menu = await openMenu(tools, "outils du composer");
-    const item = menuItems(menu).find((i) => MOTS_RECHERCHE.test(norm(i.label)));
-    if (!item) return echec(want, "aucune entrée de recherche web dans ce menu", { via: "tools_menu" });
-    if (item.checked === want) return succes(want, want, false, { via: "tools_menu" });
+    const item = menuItems(menu).find((i) =>
+      MOTS_RECHERCHE.test(norm(i.label)),
+    );
+    if (!item)
+      return echec(want, "aucune entrée de recherche web dans ce menu", {
+        via: "tools_menu",
+      });
+    if (item.checked === want)
+      return succes(want, want, false, { via: "tools_menu" });
     item.el.click();
   } catch (err) {
     return echec(want, err.message, { via: "tools_menu" });
@@ -746,7 +843,9 @@ async function setWebSearch(want) {
   ).catch(() => null);
 
   if (!apres) {
-    return echec(want, "entrée cliquée mais le composer ne la reflète pas", { via: "tools_menu" });
+    return echec(want, "entrée cliquée mais le composer ne la reflète pas", {
+      via: "tools_menu",
+    });
   }
   return succes(want, want, true, { via: "tools_menu" });
 }
@@ -757,10 +856,18 @@ async function applyControls(controls) {
   // Le profil d'abord : changer d'espace de travail recharge la liste des modèles.
   if (typeof controls.profile === "string" && controls.profile) {
     const quoi = "sélecteur de profil";
-    resultats.profile = await selectFromPicker(SELECTORS.profileTrigger, controls.profile, quoi);
+    resultats.profile = await selectFromPicker(
+      SELECTORS.profileTrigger,
+      controls.profile,
+      quoi,
+    );
   }
   if (typeof controls.model === "string" && controls.model) {
-    resultats.model = await selectFromPicker(SELECTORS.modelTrigger, controls.model, "sélecteur de modèle");
+    resultats.model = await selectFromPicker(
+      SELECTORS.modelTrigger,
+      controls.model,
+      "sélecteur de modèle",
+    );
   }
   if (typeof controls.web_search === "boolean") {
     resultats.web_search = await setWebSearch(controls.web_search);
@@ -771,12 +878,22 @@ async function applyControls(controls) {
 /** Requête de contrôle/lecture venue du serveur : toujours une réponse typée. */
 async function handleUi(msg) {
   try {
-    const applied = msg.type === "ui_control" ? await applyControls(msg.controls || {}) : null;
+    const applied =
+      msg.type === "ui_control"
+        ? await applyControls(msg.controls || {})
+        : null;
     const state = await uiState(msg.probe);
     const ok = !applied || Object.values(applied).every((r) => r.ok);
     return { type: msg.type, id: msg.id, ok, applied, state, error: null };
   } catch (err) {
-    return { type: msg.type, id: msg.id, ok: false, applied: null, state: null, error: err.message };
+    return {
+      type: msg.type,
+      id: msg.id,
+      ok: false,
+      applied: null,
+      state: null,
+      error: err.message,
+    };
   }
 }
 
@@ -820,7 +937,14 @@ async function streamAnswer(job, locator, before) {
   let stableSince = null;
   let full = "";
   let debugSig = "";
+  let completionSignature = "";
   const debut = Date.now();
+  let finalCompletion = {
+    finished: null,
+    signal: "unknown",
+    confidence: "low",
+  };
+  let stableForMs = 0;
 
   while (!job.aborted) {
     await sleep(POLL_MS);
@@ -833,7 +957,13 @@ async function streamAnswer(job, locator, before) {
 
     // `finished === false` (ChatGPT écrit encore) interdit de sortir ; `null`
     // (aucun signal reconnu) exige une stabilité bien plus longue.
-    const finished = isFinished(turn);
+    const completion = completionState(turn);
+    const finished = completion.finished;
+    const nextCompletionSignature = `${finished}:${completion.signal}`;
+    if (nextCompletionSignature !== completionSignature) {
+      completionSignature = nextCompletionSignature;
+      stableSince = null;
+    }
     const root = answerRoot(
       turn,
       finished === true || Date.now() - debut > NO_MARKDOWN_FALLBACK_MS,
@@ -846,7 +976,9 @@ async function streamAnswer(job, locator, before) {
       const sig = `fini=${finished} root=${root ? root.tagName + "." + (root.className || "-").slice(0, 24) : "null"} pre=${pres.length}`;
       if (sig !== debugSig) {
         debugSig = sig;
-        console.log(`[bridge] ${sig} | queue=${JSON.stringify(full.slice(-40))}`);
+        console.log(
+          `[bridge] ${sig} | queue=${JSON.stringify(full.slice(-40))}`,
+        );
       }
     }
 
@@ -860,17 +992,44 @@ async function streamAnswer(job, locator, before) {
     }
 
     const need = finished === null ? SETTLE_UNKNOWN_MS : SETTLE_MS;
-    const stable = stableSince !== null && Date.now() - stableSince > need;
-    if (stable && finished !== false && full.length > 0) break;
+    stableForMs = stableSince === null ? 0 : Date.now() - stableSince;
+    const stable = stableForMs >= need;
+    if (stable && finished !== false && full.length > 0) {
+      const verificationRoot = answerRoot(turn, true);
+      const verification = verificationRoot
+        ? readAnswer(verificationRoot, false)
+        : null;
+      const citationsIdentical =
+        verification &&
+        JSON.stringify(verification.visible_citations) ===
+          JSON.stringify(snapshot.visible_citations);
+      if (verification && verification.text === full && citationsIdentical) {
+        full = verification.text;
+        finalCompletion = completion;
+        break;
+      }
+      vu = verification ? verification.text : "";
+      stableSince = null;
+    }
   }
 
   // Le texte ne bouge plus : livrer ce qui restait retenu.
   if (!job.aborted) emitDelta(job.id, sent, full);
   const finalTurn = findTurn(locator, before);
   const finalRoot = finalTurn ? answerRoot(finalTurn, true) : null;
-  return finalRoot
+  const serialized = finalRoot
     ? readAnswer(finalRoot, false)
-    : { text: full, visible_citations: [], serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION };
+    : {
+        text: full,
+        visible_citations: [],
+        serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
+      };
+  return {
+    ...serialized,
+    completion_signal: finalCompletion.signal,
+    completion_confidence: finalCompletion.confidence,
+    stable_for_ms: stableForMs,
+  };
 }
 
 function verifiedLocator() {
@@ -888,7 +1047,13 @@ function verifiedLocator() {
   return url.toString();
 }
 
-async function handlePrompt({ id, prompt, new_chat: newChat, files, conversation }) {
+async function handlePrompt({
+  id,
+  prompt,
+  new_chat: newChat,
+  files,
+  conversation,
+}) {
   if (!(await claimPrompt(id))) {
     reply({ type: "ack", id, state: "duplicate", duplicate: true });
     return;
@@ -898,7 +1063,10 @@ async function handlePrompt({ id, prompt, new_chat: newChat, files, conversation
   currentJob = job;
 
   try {
-    if (conversation?.mode === "continue" && window.location.href !== conversation.external_locator) {
+    if (
+      conversation?.mode === "continue" &&
+      window.location.href !== conversation.external_locator
+    ) {
       throw new Error("la page ne correspond pas au locator demandé");
     }
     if (newChat) {
@@ -911,7 +1079,11 @@ async function handlePrompt({ id, prompt, new_chat: newChat, files, conversation
       await sleep(1200);
     }
 
-    const composer = await waitFor(() => $(SELECTORS.composer), 15000, "composer introuvable");
+    const composer = await waitFor(
+      () => $(SELECTORS.composer),
+      15000,
+      "composer introuvable",
+    );
     const before = document.querySelectorAll(SELECTORS.assistant).length;
 
     if (files && files.length) await attachFiles(files);
@@ -925,12 +1097,18 @@ async function handlePrompt({ id, prompt, new_chat: newChat, files, conversation
         return b && !b.disabled ? b : null;
       },
       files && files.length ? UPLOAD_TIMEOUT_MS : 8000,
-      files && files.length ? "upload des pièces jointes non terminé" : "bouton d'envoi jamais actif",
+      files && files.length
+        ? "upload des pièces jointes non terminé"
+        : "bouton d'envoi jamais actif",
     );
     sendBtn.click();
 
     const externalLocator = conversation
-      ? await waitFor(() => verifiedLocator(), 15000, "locator de conversation non attribué")
+      ? await waitFor(
+          () => verifiedLocator(),
+          15000,
+          "locator de conversation non attribué",
+        )
       : null;
 
     // Attendre la bulle de réponse *nouvelle* (pas la précédente).
@@ -947,13 +1125,21 @@ async function handlePrompt({ id, prompt, new_chat: newChat, files, conversation
     if (!job.aborted) {
       const container = closestOf(premier, SELECTORS.turnContainer);
       const externalTurnId =
-        container?.getAttribute("data-testid") || premier.getAttribute("data-message-id") || null;
+        container?.getAttribute("data-testid") ||
+        premier.getAttribute("data-message-id") ||
+        null;
       reply({
         type: "done",
         id,
         metadata: {
           visible_citations: serialized.visible_citations,
           serializer_version: serialized.serializer_version,
+          completion_signal: serialized.completion_signal,
+          completion_confidence: serialized.completion_confidence,
+          stable_for_ms: serialized.stable_for_ms,
+          output_chars: serialized.text.length,
+          visible_citation_count: serialized.visible_citations.length,
+          content_script_version: VERSION,
         },
         conversation: conversation
           ? {
@@ -991,4 +1177,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true;
 });
 
-console.log(`🔌 ChatGPT Mini-Bridge : content script prêt — version ${VERSION}`);
+console.log(
+  `🔌 ChatGPT Mini-Bridge : content script prêt — version ${VERSION}`,
+);

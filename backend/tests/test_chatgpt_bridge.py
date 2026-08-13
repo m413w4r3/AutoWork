@@ -113,6 +113,14 @@ class FakeExtension:
                     "type": "done",
                     "id": payload["id"],
                     "event_id": "2",
+                    "metadata": {
+                        "completion_signal": "assistant_actions",
+                        "completion_confidence": "high",
+                        "stable_for_ms": 2_100,
+                        "output_chars": 2,
+                        "visible_citation_count": 0,
+                        "content_script_version": "13",
+                    },
                     "conversation": conversation,
                 }
             )
@@ -439,21 +447,30 @@ async def test_startup_reports_safe_configuration_states(
     assert "STARTUP-WS-SECRET" not in rendered
 
 
-async def test_concurrent_same_key_submits_one_prompt_and_replays_result(tmp_path: Path) -> None:
+async def test_three_http_retries_with_same_key_submit_one_prompt_and_replay_result(
+    tmp_path: Path,
+) -> None:
     module = load_bridge()
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module, prompt_delay=0.02)
     module["bridge"].ws = extension
     req = module["BridgeRunRequest"](input="secret prompt")
 
-    first, second = await asyncio.gather(
+    first, second, third = await asyncio.gather(
+        module["create_bridge_run"](req, request_with_key("business-1")),
         module["create_bridge_run"](req, request_with_key("business-1")),
         module["create_bridge_run"](req, request_with_key("business-1")),
     )
     replay = await module["create_bridge_run"](req, request_with_key("business-1"))
 
-    assert first["id"] == second["id"] == replay["id"]
+    assert first["id"] == second["id"] == third["id"] == replay["id"]
     assert extension.prompt_count == 1
+    assert first["metadata"]["completion_signal"] == "assistant_actions"
+    assert first["metadata"]["completion_confidence"] == "high"
+    assert first["metadata"]["stable_for_ms"] == 2_100
+    assert first["metadata"]["output_chars"] == 2
+    assert first["metadata"]["visible_citation_count"] == 0
+    assert first["metadata"]["content_script_version"] == "13"
 
 
 async def test_cancelled_http_wait_then_retry_joins_original_run(tmp_path: Path) -> None:

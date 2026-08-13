@@ -248,13 +248,15 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
       });
     if (path.includes("/editorial-groups")) {
       if (request.method() === "POST" && path.endsWith("/merge")) merged = true;
-      if (request.method() === "POST" && path.endsWith("/select"))
+      if (request.method() === "POST" && path.endsWith("/decisions"))
         selected = true;
       return route.fulfill({
         json: {
           groups: groups(),
           selected_briefs: selected ? 1 : 0,
           selected_major: 0,
+          ignored: 0,
+          undecided: selected ? 0 : merged ? 1 : 2,
           target_briefs: 2,
           target_major: 1,
           automatic_selection: false,
@@ -265,7 +267,9 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
   });
 
   await page.goto(`/editions/${editionId}`);
-  await page.getByRole("button", { name: "Rechercher les sujets" }).click();
+  await page
+    .getByRole("button", { name: "Rechercher les sujets" })
+    .dispatchEvent("click");
   await expect(
     page.getByRole("heading", { name: cyfirma.title }).first(),
   ).toBeVisible();
@@ -273,22 +277,27 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
     page.getByRole("heading", { name: ncc.title }).first(),
   ).toBeVisible();
 
+  await page.getByText("Organiser les publications").click();
   const firstGroup = page
-    .getByRole("heading", { name: cyfirma.title })
-    .last()
-    .locator("..");
+    .locator(".advanced-group-card")
+    .filter({ hasText: cyfirma.title });
   const secondGroup = page
-    .getByRole("heading", { name: ncc.title })
-    .last()
-    .locator("..");
+    .locator(".advanced-group-card")
+    .filter({ hasText: ncc.title });
   await firstGroup.getByLabel("Retenir pour une fusion").check();
   await secondGroup.getByLabel("Retenir pour une fusion").check();
   await page
     .getByRole("button", { name: "Fusionner les groupes cochés" })
     .click();
+  await expect(page.locator(".editorial-group-card")).toHaveCount(1);
   await page
-    .getByRole("button", { name: "Sélectionner comme brève" })
-    .first()
+    .locator(".editorial-group-card")
+    .getByRole("radio", { name: "Brève" })
+    .check();
+  await page
+    .getByRole("button", { name: "Confirmer la sélection (1)" })
     .click();
-  await expect(page.getByText("1/2")).toBeVisible();
+  await expect(
+    page.getByText("1 sujets prêts · 1 brève · 0 article principal"),
+  ).toBeVisible();
 });

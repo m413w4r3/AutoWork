@@ -272,14 +272,152 @@ a:focus-visible {
 
 .editorial-group-list {
   display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
   gap: 1rem;
+  align-items: start;
 }
 
 .editorial-group-card {
+  display: grid;
+  gap: 0.8rem;
   padding: 1.1rem;
   border: 1px solid #d4ded7;
   border-radius: 0.85rem;
   background: #fbfcfa;
+}
+
+.editorial-group-card h4,
+.editorial-group-card p {
+  margin: 0;
+}
+
+.group-facts {
+  display: grid;
+  gap: 0.6rem;
+  margin: 0;
+}
+
+.group-facts div {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.group-facts dt,
+.ready-subject-list small {
+  color: #5b6b62;
+  font-size: 0.86rem;
+}
+
+.group-facts dd {
+  margin: 0;
+}
+
+.main-publications ul,
+.provisional-ioc-summary ul {
+  margin-bottom: 0;
+  padding-left: 1.2rem;
+  overflow-wrap: anywhere;
+}
+
+.metadata-note {
+  color: #5b6b62;
+  font-size: 0.9rem;
+}
+
+.provisional-ioc-summary {
+  padding: 0.8rem;
+  border-left: 4px solid #c47a00;
+  background: #fffaf0;
+  overflow: hidden;
+}
+
+.provisional-ioc-summary code {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.decision-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0.8rem;
+  border: 1px solid #aabdb0;
+  border-radius: 0.65rem;
+}
+
+.decision-options label {
+  display: flex;
+  gap: 0.45rem;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.decision-options input {
+  flex: 0 0 auto;
+  min-height: auto;
+}
+
+.confirm-selection {
+  margin-top: 1rem;
+}
+
+.ready-subjects,
+.advanced-editorial-panel {
+  padding-top: 1rem;
+  border-top: 1px solid #d4ded7;
+}
+
+.ready-indicator {
+  font-weight: 700;
+}
+
+.ready-subject-list {
+  display: grid;
+  gap: 0.7rem;
+  padding: 0;
+  list-style: none;
+}
+
+.ready-subject-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.8rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.65rem;
+}
+
+.ready-subject-list div {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.advanced-editorial-panel > summary,
+.technical-discovery-details > summary,
+.report-diagnostics > summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.advanced-group-list {
+  display: grid;
+  gap: 0.8rem;
+  margin-top: 1rem;
+}
+
+.advanced-group-card,
+.diagnostic-batch {
+  padding: 1rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.75rem;
+}
+
+.technical-discovery-details[open],
+.report-diagnostics[open] {
+  display: grid;
+  gap: 1rem;
 }
 
 .group-check,
@@ -797,5 +935,24 @@ h1 {
   .brief-block__heading,
   .brief-sentence {
     display: block;
+  }
+
+  .editorial-board__heading,
+  .discovery-heading,
+  .ready-subject-list li {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .selection-counter {
+    overflow-wrap: anywhere;
+  }
+
+  .decision-options {
+    grid-template-columns: 1fr;
+  }
+
+  .source-list li {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

@@ -14,6 +14,34 @@ const groups = [
     status: "proposed",
     editorial_type: null,
     subject_id: null,
+    presentation: "Présentation éditoriale A",
+    actor_or_campaign: "MuddyWater",
+    technical_potential: 4,
+    technical_potential_reason: "IOC et configurations visibles.",
+    artifacts: ["ioc", "configurations"],
+    publications: [
+      {
+        title: "Publication A",
+        url: "https://a.example/report",
+        publisher: "Vendor Research",
+        role: "primary",
+        published_at: "2026-07-02",
+      },
+    ],
+    uncertainties: ["Attribution à confirmer"],
+    publisher_ioc_count_total: 52,
+    provisional_ioc_count: 1,
+    provisional_ioc_type_counts: { sha256: 1 },
+    provisional_iocs: [
+      {
+        raw_value: "a".repeat(64),
+        normalized_value: "a".repeat(64),
+        proposed_type: "sha256",
+        declared_type: "sha256",
+        warnings: [],
+      },
+    ],
+    metadata_incomplete: false,
     candidates: [
       {
         id: "cccccccc-cccc-4ccc-8ccc-ccccccccccc1",
@@ -101,11 +129,13 @@ const groups = [
 
 afterEach(() => vi.unstubAllGlobals());
 
-it("avertit sur la couverture et permet une brève et un article principal", async () => {
+it("propose quatre choix exclusifs et confirme les décisions dans un seul lot", async () => {
   const board = {
     groups,
     selected_briefs: 0,
     selected_major: 0,
+    ignored: 0,
+    undecided: 2,
     target_briefs: 4,
     target_major: 2,
     automatic_selection: false,
@@ -131,32 +161,64 @@ it("avertit sur la couverture et permet une brève et un article principal", asy
 
   expect(
     await screen.findByText(
-      "Les métadonnées et comptes IOC de découverte sont provisoires. Ils seront vérifiés depuis les documents archivés après la sélection.",
+      "IOC repérés pendant la recherche — non encore vérifiés depuis les sources.",
     ),
   ).toBeInTheDocument();
-  expect(screen.getByText("Campagne du mois précédent")).toBeInTheDocument();
+  expect(
+    screen.getByText("52 annoncés · 1 valeur visible"),
+  ).toBeInTheDocument();
+  expect(screen.getByText("Campagne du mois précédent")).not.toBeVisible();
 
   const first = screen
-    .getByRole("heading", { name: "Campagne A" })
+    .getAllByRole("heading", { name: "Campagne A" })[0]!
     .closest("article")!;
-  await user.click(
-    within(first).getByRole("button", { name: "Sélectionner comme brève" }),
-  );
-  const second = screen
-    .getByRole("heading", { name: "Campagne B" })
-    .closest("article")!;
-  await user.selectOptions(
-    within(second).getByLabelText("Format éditorial"),
-    "major",
-  );
-  await user.click(
-    within(second).getByRole("button", {
-      name: "Sélectionner comme article principal",
+  expect(within(first).getByRole("radio", { name: "À décider" })).toBeChecked();
+  expect(
+    within(first).getByRole("radio", { name: "Brève" }),
+  ).toBeInTheDocument();
+  expect(
+    within(first).getByRole("radio", {
+      name: "Article approfondi + pivots",
     }),
+  ).toBeInTheDocument();
+  expect(
+    within(first).getByRole("radio", { name: "Ignorer" }),
+  ).toBeInTheDocument();
+  await user.click(within(first).getByRole("radio", { name: "Ignorer" }));
+  expect(
+    screen.getByRole("button", { name: "Confirmer la sélection (1)" }),
+  ).toBeEnabled();
+  await user.click(within(first).getByRole("radio", { name: "À décider" }));
+  expect(
+    screen.getByRole("button", { name: "Confirmer la sélection (0)" }),
+  ).toBeDisabled();
+  await user.click(within(first).getByRole("radio", { name: "Brève" }));
+  const second = screen
+    .getAllByRole("heading", { name: "Campagne B" })[0]!
+    .closest("article")!;
+  await user.click(
+    within(second).getByRole("radio", {
+      name: "Article approfondi + pivots",
+    }),
+  );
+  await user.click(
+    screen.getByRole("button", { name: "Confirmer la sélection (2)" }),
   );
 
   expect(postedBodies).toEqual([
-    { editorial_type: "brief" },
-    { editorial_type: "major" },
+    {
+      decisions: [
+        {
+          group_id: "11111111-1111-4111-8111-111111111111",
+          version: 1,
+          decision: "brief",
+        },
+        {
+          group_id: "22222222-2222-4222-8222-222222222222",
+          version: 1,
+          decision: "major",
+        },
+      ],
+    },
   ]);
 });

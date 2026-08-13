@@ -1,4 +1,5 @@
 from datetime import UTC, date, datetime
+from uuid import uuid4
 
 import pytest
 
@@ -6,9 +7,12 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryIocType,
     IncompleteSourceCandidate,
     IocPresence,
     PeriodRelation,
+    ProvisionalDiscoveryIoc,
+    ProvisionalIocPublicationRelation,
     SourceCandidate,
     SourceRole,
     SourceVerificationStatus,
@@ -74,6 +78,24 @@ async def test_discovery_batch_round_trip_and_source_status(
         countries=("Iran",),
         likely_artifacts=("ioc", "configurations"),
         sources=[source],
+        provisional_iocs=[
+            ProvisionalDiscoveryIoc(
+                raw_value="192.0.2.1",
+                normalized_value="192.0.2.1",
+                declared_type="ipv4",
+                proposed_type=DiscoveryIocType.IPV4,
+                publication_relations=(
+                    ProvisionalIocPublicationRelation(
+                        publication_id=source.id,
+                        publication_ref="P1",
+                        raw_value="192.0.2.1",
+                        markdown_block="visible-iocs: 192.0.2.1",
+                    ),
+                ),
+                model_run_id=research_run.id,
+                markdown_block="visible-iocs: 192.0.2.1",
+            )
+        ],
         incomplete_sources=[
             IncompleteSourceCandidate(
                 title="Source sans URL",
@@ -112,6 +134,16 @@ async def test_discovery_batch_round_trip_and_source_status(
         parser_version="chatgpt-markdown-v1",
         parsing_status="report_parsing_partial",
         parsing_warnings=("Métadonnées provisoires",),
+        unattached_visible_citations=(
+            {
+                "label": "Citation orpheline",
+                "url": "https://relay.example/context",
+                "canonical_url": "https://relay.example/context",
+                "excerpt": None,
+            },
+        ),
+        parsing_revision=2,
+        supersedes_batch_id=uuid4(),
     )
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
@@ -133,6 +165,13 @@ async def test_discovery_batch_round_trip_and_source_status(
                 "ftp://invalid.example/report"
             )
             assert persisted.report_sha256 == "d" * 64
+            assert persisted.parsing_revision == 2
+            assert persisted.supersedes_batch_id == batch.supersedes_batch_id
+            assert persisted.unattached_visible_citations[0]["label"] == "Citation orpheline"
+            persisted_ioc = persisted.candidates[0].provisional_iocs[0]
+            assert persisted_ioc.status.value == "provisional_visible"
+            assert persisted_ioc.model_run_id == research_run.id
+            assert persisted_ioc.publication_relations[0].publication_id == source.id
             persisted_source.mark(SourceVerificationStatus.INVALID, actor_id="dev-analyst")
             await uow.discovery_batches.save(persisted)
             await uow.commit()

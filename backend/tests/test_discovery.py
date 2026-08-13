@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date
 from uuid import UUID, uuid4
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from cti_app.application.discovery import (
     DISCOVERY_JOB_KIND,
@@ -25,7 +26,12 @@ from cti_app.application.jobs import (
     SynchronousJobDispatcher,
     create_job_registry,
 )
-from cti_app.application.model_gateway import ModelGateway, ModelRouter
+from cti_app.application.model_gateway import (
+    AdapterResult,
+    ModelGateway,
+    ModelRouter,
+    SafeModelRequest,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     DiscoverySourceMode,
@@ -34,8 +40,12 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
 )
 from cti_app.domain.jobs import JobStatus
-from cti_app.domain.model_runs import ModelProvider
-from cti_app.integrations.models import FakeModelAdapter, InMemoryModelOutputStore
+from cti_app.domain.model_runs import ModelProvider, ModelRole
+from cti_app.integrations.models import (
+    BridgeTransportError,
+    FakeModelAdapter,
+    InMemoryModelOutputStore,
+)
 from tests.discovery_support import InMemoryDiscoveryUnitOfWorkFactory
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
@@ -51,6 +61,23 @@ class FakeBridgeCapabilities:
 
     async def archive_conversation(self, conversation_id: UUID) -> None:
         del conversation_id
+
+
+class TransientResearchAdapter(FakeModelAdapter):
+    async def invoke(
+        self,
+        request: SafeModelRequest,
+        *,
+        role: ModelRole,
+        output_schema: type[BaseModel] | None = None,
+    ) -> AdapterResult:
+        del role, output_schema
+        self.calls.append(request)
+        raise BridgeTransportError(
+            "bridge_unreachable",
+            "Bridge temporairement indisponible.",
+            retryable=True,
+        )
 
 
 def research_fixture() -> ResearchBatch:
@@ -298,6 +325,7 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
         )
     assert len(await discovery.list_batches(params.edition_id)) == 1
     assert len(fake.calls) == 1
+    immutable_first_batch = deepcopy((await discovery.list_batches(params.edition_id))[0])
 
     complementary = params.model_copy(update={"complementary_axis": "configurations publiées"})
     second_job = await jobs.submit(
@@ -311,7 +339,8 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     await dispatcher.dispatch(second_job.id)
     batches = await discovery.list_batches(params.edition_id)
     assert len(batches) == 2
-    assert sum(len(batch.candidates) for batch in batches) == 1
+    assert sum(len(batch.candidates) for batch in batches) == 2
+    assert batches[0] == immutable_first_batch
     assert len(fake.calls) == 2
     assert fake.calls[1].conversation is not None
     assert fake.calls[1].conversation.mode == "fresh"
@@ -423,6 +452,45 @@ async def test_totally_invalid_output_is_archived_before_safe_failure(
     assert raw_output not in caplog.text
 
 
+async def test_transient_job_error_never_creates_a_second_research() -> None:
+    fake = TransientResearchAdapter()
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=fake,
+            openai_structured=fake,
+            qwen=fake,
+            fake=fake,
+        ),
+        model_uow,
+        InMemoryModelOutputStore(),
+    )
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    params = parameters()
+    job = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="edition",
+        aggregate_id=params.edition_id,
+        idempotency_key=discovery_idempotency_key(params),
+        correlation_id="transient-single-attempt",
+        input_parameters=params.model_dump(mode="json"),
+        max_attempts=1,
+    )
+
+    await dispatcher.dispatch(job.id)
+    await dispatcher.dispatch(job.id)
+
+    failed = await jobs.get(job.id)
+    assert failed.status is JobStatus.FAILED
+    assert failed.attempt == failed.max_attempts == 1
+    assert len(fake.calls) == 1
+    assert len(model_uow.state) == 1
+
+
 def test_research_batch_rejects_non_http_urls() -> None:
     payload = research_fixture().model_dump()
     payload["topics"][0]["sources"][0]["url"] = "file:///etc/passwd"
@@ -431,11 +499,33 @@ def test_research_batch_rejects_non_http_urls() -> None:
 
 
 def test_research_prompt_is_the_documented_markdown_contract() -> None:
-    prompt = _research_prompt(parameters().model_copy(update={"period_end": date(2027, 7, 31)}))
+    prompt = _research_prompt(
+        parameters().model_copy(
+            update={
+                "country_aliases": [
+                    "Iran",
+                    "IR",
+                    "ir",
+                    "République islamique d'Iran",
+                    "république islamique d'iran",
+                ],
+                "languages": ["fr", "EN", "en", "fa"],
+                "period_end": date(2027, 7, 31),
+                "as_of_date": date(2026, 8, 13),
+            }
+        )
+    )
 
     assert "# SUJETS CANDIDATS" in prompt
     assert "## SUBJECT S1" in prompt
     assert "### PUBLICATION P1" in prompt
-    assert "N’invente jamais une URL, une date, un nombre d’IOC" in prompt  # noqa: RUF001
-    assert "ioc_visible_count: <entier ou unknown>" in prompt
+    assert "Date de recherche : 2026-08-13" in prompt
+    assert "Période demandée : 2026-07-01 au 2027-07-31" in prompt
+    assert "Période observable : 2026-07-01 au 2026-08-13" in prompt
+    assert "Iran (alias : IR, République islamique d'Iran)" in prompt
+    assert "Langues : fr, EN, fa" in prompt
+    assert "Il n’existe aucune limite ni" in prompt  # noqa: RUF001
+    assert "N’invente aucune URL, date, attribution" in prompt  # noqa: RUF001
+    assert "visible-iocs: <valeurs exactes explicitement visibles ou none/unknown>" in prompt
+    assert "N’échappe pas les tirets des noms de champs." in prompt  # noqa: RUF001
     assert "donnée non fiable" not in prompt

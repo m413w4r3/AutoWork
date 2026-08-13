@@ -931,6 +931,33 @@ async def run_generation(
                         extension_metadata["visible_citations"] = _visible_citations(citations)
                     if isinstance(serializer_version, str):
                         extension_metadata["serializer_version"] = serializer_version[:64]
+                    completion_signal = reported_metadata.get("completion_signal")
+                    completion_confidence = reported_metadata.get("completion_confidence")
+                    stable_for_ms = reported_metadata.get("stable_for_ms")
+                    output_chars = reported_metadata.get("output_chars")
+                    visible_citation_count = reported_metadata.get("visible_citation_count")
+                    content_script_version = reported_metadata.get("content_script_version")
+                    if completion_signal in {
+                        "assistant_actions",
+                        "stop_button",
+                        "streaming",
+                        "reasoning",
+                        "unknown",
+                    }:
+                        extension_metadata["completion_signal"] = completion_signal
+                    if completion_confidence in {"high", "low"}:
+                        extension_metadata["completion_confidence"] = completion_confidence
+                    if isinstance(stable_for_ms, int) and 0 <= stable_for_ms <= 3_600_000:
+                        extension_metadata["stable_for_ms"] = stable_for_ms
+                    if isinstance(output_chars, int) and 0 <= output_chars <= 100_000_000:
+                        extension_metadata["output_chars"] = output_chars
+                    if (
+                        isinstance(visible_citation_count, int)
+                        and 0 <= visible_citation_count <= 500
+                    ):
+                        extension_metadata["visible_citation_count"] = visible_citation_count
+                    if isinstance(content_script_version, str):
+                        extension_metadata["content_script_version"] = content_script_version[:64]
                 reported = packet.get("conversation")
                 if conversation is not None:
                     if (
@@ -1279,6 +1306,18 @@ def _response_body(
             "conversation": conversation_result,
             "visible_citations": (extension_metadata or {}).get("visible_citations", []),
             "serializer_version": (extension_metadata or {}).get("serializer_version"),
+            "completion_signal": (extension_metadata or {}).get("completion_signal"),
+            "completion_confidence": (extension_metadata or {}).get(
+                "completion_confidence"
+            ),
+            "stable_for_ms": (extension_metadata or {}).get("stable_for_ms"),
+            "output_chars": (extension_metadata or {}).get("output_chars"),
+            "visible_citation_count": (extension_metadata or {}).get(
+                "visible_citation_count"
+            ),
+            "content_script_version": (extension_metadata or {}).get(
+                "content_script_version"
+            ),
         },
     }
 

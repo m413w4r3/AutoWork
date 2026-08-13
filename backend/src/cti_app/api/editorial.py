@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Iterable
 from datetime import date
-from typing import NoReturn
+from typing import Literal, NoReturn
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -10,11 +12,17 @@ from pydantic import BaseModel, ConfigDict, Field
 from cti_app.application.editorial import (
     EditorialActionError,
     EditorialBoard,
+    EditorialDecisionCommand,
+    EditorialDecisionValue,
     EditorialGroupingService,
     EditorialGroupNotFoundError,
 )
 from cti_app.application.identity import IdentityProvider
-from cti_app.domain.discovery import SourceRelationshipStatus
+from cti_app.domain.discovery import (
+    ProvisionalDiscoveryIoc,
+    SourceCandidate,
+    SourceRelationshipStatus,
+)
 from cti_app.domain.editorial import (
     EditorialGroup,
     EditorialGroupStatus,
@@ -59,6 +67,22 @@ class HistoricalComparisonView(BaseModel):
     subject_id: UUID | None
 
 
+class EditorialPublicationView(BaseModel):
+    title: str
+    url: str
+    publisher: str | None
+    role: str
+    published_at: date | None
+
+
+class ProvisionalIocView(BaseModel):
+    raw_value: str
+    normalized_value: str | None
+    proposed_type: str
+    declared_type: str | None
+    warnings: list[str]
+
+
 class EditorialGroupView(BaseModel):
     id: UUID
     edition_id: UUID
@@ -67,6 +91,19 @@ class EditorialGroupView(BaseModel):
     status: EditorialGroupStatus
     editorial_type: EditorialType | None
     subject_id: UUID | None
+    presentation: str | None
+    actor_or_campaign: str | None
+    technical_potential: int
+    technical_potential_reason: str | None
+    artifacts: list[str]
+    publications: list[EditorialPublicationView]
+    uncertainties: list[str]
+    publisher_ioc_count_total: int | None
+    publisher_ioc_counts: list[int]
+    provisional_ioc_count: int
+    provisional_ioc_type_counts: dict[str, int]
+    provisional_iocs: list[ProvisionalIocView]
+    metadata_incomplete: bool
     candidates: list[CandidateSummaryView]
     score: ScoreView
     source_relationship_status: SourceRelationshipStatus
@@ -82,6 +119,8 @@ class EditorialBoardView(BaseModel):
     groups: list[EditorialGroupView]
     selected_briefs: int
     selected_major: int
+    ignored: int
+    undecided: int
     target_briefs: int
     target_major: int
     automatic_selection: bool = False
@@ -109,6 +148,20 @@ class SelectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     editorial_type: EditorialType
+
+
+class EditorialDecisionItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    group_id: UUID
+    version: int = Field(ge=1)
+    decision: Literal["brief", "major", "ignore"]
+
+
+class EditorialDecisionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decisions: list[EditorialDecisionItem] = Field(min_length=1, max_length=500)
 
 
 class HumanDecisionView(BaseModel):
@@ -209,6 +262,30 @@ async def select_group(
         _raise_api_error(exc)
 
 
+@router.post("/decisions", response_model=EditorialBoardView)
+async def apply_decisions(
+    edition_id: UUID, payload: EditorialDecisionsRequest, request: Request
+) -> EditorialBoardView:
+    service, actor_id = await _runtime(request)
+    try:
+        await service.decide_many(
+            edition_id,
+            tuple(
+                EditorialDecisionCommand(
+                    group_id=item.group_id,
+                    version=item.version,
+                    decision=EditorialDecisionValue(item.decision),
+                )
+                for item in payload.decisions
+            ),
+            actor_id=actor_id,
+            correlation_id=get_correlation_id(),
+        )
+        return _board_view(await service.board(edition_id))
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
 @router.get("/decisions", response_model=list[HumanDecisionView])
 async def decisions(edition_id: UUID, request: Request) -> list[HumanDecisionView]:
     return [_decision_view(item) for item in await _service(request).decisions(edition_id)]
@@ -229,6 +306,8 @@ def _board_view(board: EditorialBoard) -> EditorialBoardView:
         groups=[_group_view(group, board) for group in board.groups],
         selected_briefs=board.selected_briefs,
         selected_major=board.selected_major,
+        ignored=board.ignored,
+        undecided=board.undecided,
         target_briefs=board.target_briefs,
         target_major=board.target_major,
     )
@@ -240,6 +319,73 @@ def _group_view(group: EditorialGroup, board: EditorialBoard) -> EditorialGroupV
         if group.potential_historical_group_id
         else None
     )
+    candidates = [
+        candidate
+        for reference in group.candidate_references
+        if (candidate := board.candidates.get(reference)) is not None
+    ]
+    representative = max(candidates, key=lambda item: item.technical_potential, default=None)
+    actor_values = _meaningful_values(
+        value
+        for candidate in candidates
+        for value in (
+            candidate.actor_or_campaign,
+            *candidate.actors,
+            *candidate.campaigns,
+        )
+    )
+    artifacts = _meaningful_values(
+        item for candidate in candidates for item in candidate.likely_artifacts
+    )
+    uncertainties = _meaningful_values(
+        item for candidate in candidates for item in candidate.uncertainties
+    )
+
+    role_order = {"primary": 0, "independent": 1, "relay": 2, "aggregator": 3}
+    publications_by_url: dict[str, SourceCandidate] = {}
+    for candidate in candidates:
+        for source in candidate.sources:
+            previous = publications_by_url.get(source.canonical_url)
+            if previous is None or role_order.get(
+                source.role.value, 9
+            ) < role_order.get(previous.role.value, 9):
+                publications_by_url[source.canonical_url] = source
+    publications = sorted(
+        publications_by_url.values(),
+        key=lambda source: (
+            role_order.get(source.role.value, 9),
+            source.published_at is None,
+            source.published_at or date.min,
+            source.title.casefold(),
+        ),
+    )
+
+    provisional_by_value: dict[str, ProvisionalDiscoveryIoc] = {}
+    for candidate in candidates:
+        for ioc in candidate.provisional_iocs:
+            key = (ioc.normalized_value or ioc.raw_value).casefold()
+            provisional_by_value.setdefault(key, ioc)
+    provisional_iocs = list(provisional_by_value.values())
+    type_counts = Counter(item.proposed_type.value for item in provisional_iocs)
+    declared_counts = sorted(
+        {
+            source.ioc_declared_count
+            for source in publications
+            if source.ioc_declared_count is not None
+        }
+    )
+    presentation = next((item.summary for item in candidates if item.summary.strip()), None)
+    actor_or_campaign = " · ".join(actor_values) if actor_values else None
+    technical_reason = (
+        representative.technical_potential_reason
+        if representative
+        and _is_meaningful(representative.technical_potential_reason)
+        else None
+    )
+    metadata_incomplete = not all(
+        (presentation, actor_or_campaign, publications, technical_reason)
+    )
+
     return EditorialGroupView(
         id=group.id,
         edition_id=group.edition_id,
@@ -248,6 +394,39 @@ def _group_view(group: EditorialGroup, board: EditorialBoard) -> EditorialGroupV
         status=group.status,
         editorial_type=group.editorial_type,
         subject_id=group.subject_id,
+        presentation=presentation,
+        actor_or_campaign=actor_or_campaign,
+        technical_potential=(representative.technical_potential if representative else 0),
+        technical_potential_reason=technical_reason,
+        artifacts=artifacts,
+        publications=[
+            EditorialPublicationView(
+                title=source.title,
+                url=source.canonical_url,
+                publisher=source.publisher if _is_meaningful(source.publisher) else None,
+                role=source.role.value,
+                published_at=source.published_at,
+            )
+            for source in publications
+        ],
+        uncertainties=uncertainties,
+        publisher_ioc_count_total=(declared_counts[0] if len(declared_counts) == 1 else None),
+        publisher_ioc_counts=declared_counts,
+        provisional_ioc_count=len(provisional_iocs),
+        provisional_ioc_type_counts=dict(sorted(type_counts.items())),
+        provisional_iocs=[
+            ProvisionalIocView(
+                raw_value=item.raw_value,
+                normalized_value=item.normalized_value,
+                proposed_type=item.proposed_type.value,
+                declared_type=(
+                    item.declared_type if _is_meaningful(item.declared_type) else None
+                ),
+                warnings=list(item.warnings),
+            )
+            for item in provisional_iocs
+        ],
+        metadata_incomplete=metadata_incomplete,
         candidates=[
             CandidateSummaryView(
                 id=candidate.id,
@@ -287,6 +466,24 @@ def _group_view(group: EditorialGroup, board: EditorialBoard) -> EditorialGroupV
         ),
         version=group.version,
     )
+
+
+def _is_meaningful(value: str) -> bool:
+    return bool(value.strip()) and value.strip().casefold() not in {"unknown", "none"}
+
+
+def _meaningful_values(values: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not _is_meaningful(value):
+            continue
+        key = value.strip().casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value.strip())
+    return result
 
 
 def _decision_view(decision: HumanDecision) -> HumanDecisionView:

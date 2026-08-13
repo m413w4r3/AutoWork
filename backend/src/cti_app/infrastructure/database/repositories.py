@@ -34,10 +34,14 @@ from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
     DiscoveryBatchStatus,
+    DiscoveryIocStatus,
+    DiscoveryIocType,
     DiscoverySourceMode,
     IncompleteSourceCandidate,
     IocPresence,
     PeriodRelation,
+    ProvisionalDiscoveryIoc,
+    ProvisionalIocPublicationRelation,
     SourceCandidate,
     SourceRelationshipStatus,
     SourceRole,
@@ -1665,6 +1669,14 @@ def _discovery_batch_values(batch: DiscoveryBatch) -> dict[str, object]:
             "parser_version": batch.parser_version,
             "parsing_status": batch.parsing_status,
             "parsing_warnings": list(batch.parsing_warnings),
+            "unattached_visible_citations": list(batch.unattached_visible_citations),
+            "parsing_revision": batch.parsing_revision,
+            "supersedes_batch_id": (
+                str(batch.supersedes_batch_id) if batch.supersedes_batch_id else None
+            ),
+            "replaced_by_batch_id": (
+                str(batch.replaced_by_batch_id) if batch.replaced_by_batch_id else None
+            ),
             "source_mode": batch.source_mode.value,
             "bridge_capabilities": batch.bridge_capabilities,
             "citation_count": batch.citation_count,
@@ -1697,6 +1709,7 @@ def _candidate_payload(candidate: CandidateTopic) -> dict[str, object]:
         "sectors": list(candidate.sectors),
         "countries": list(candidate.countries),
         "iocs": list(candidate.iocs),
+        "provisional_iocs": [_provisional_ioc_payload(ioc) for ioc in candidate.provisional_iocs],
         "likely_artifacts": list(candidate.likely_artifacts),
         "tlp": candidate.tlp.value,
         "sensitivity": candidate.sensitivity,
@@ -1764,6 +1777,29 @@ def _incomplete_source_payload(source: IncompleteSourceCandidate) -> dict[str, o
     }
 
 
+def _provisional_ioc_payload(ioc: ProvisionalDiscoveryIoc) -> dict[str, object]:
+    return {
+        "id": str(ioc.id),
+        "raw_value": ioc.raw_value,
+        "normalized_value": ioc.normalized_value,
+        "declared_type": ioc.declared_type,
+        "proposed_type": ioc.proposed_type.value,
+        "status": ioc.status.value,
+        "model_run_id": str(ioc.model_run_id) if ioc.model_run_id else None,
+        "markdown_block": ioc.markdown_block,
+        "warnings": list(ioc.warnings),
+        "publication_relations": [
+            {
+                "publication_id": str(relation.publication_id),
+                "publication_ref": relation.publication_ref,
+                "raw_value": relation.raw_value,
+                "markdown_block": relation.markdown_block,
+            }
+            for relation in ioc.publication_relations
+        ],
+    }
+
+
 def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
     payload = row.payload
     return DiscoveryBatch(
@@ -1784,6 +1820,18 @@ def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
         parser_version=str(payload.get("parser_version", "legacy-model-structured")),
         parsing_status=str(payload.get("parsing_status", "completed")),
         parsing_warnings=_string_tuple(payload.get("parsing_warnings", [])),
+        unattached_visible_citations=tuple(payload.get("unattached_visible_citations", [])),
+        parsing_revision=int(payload.get("parsing_revision", 1)),
+        supersedes_batch_id=(
+            UUID(str(payload["supersedes_batch_id"]))
+            if payload.get("supersedes_batch_id")
+            else None
+        ),
+        replaced_by_batch_id=(
+            UUID(str(payload["replaced_by_batch_id"]))
+            if payload.get("replaced_by_batch_id")
+            else None
+        ),
         source_mode=DiscoverySourceMode(
             str(payload.get("source_mode", DiscoverySourceMode.VISIBLE_CITATIONS_ONLY.value))
         ),
@@ -1819,6 +1867,10 @@ def _candidate_from_payload(value: dict[str, object]) -> CandidateTopic:
         sectors=_string_tuple(value.get("sectors", [])),
         countries=_string_tuple(value.get("countries", [])),
         iocs=_string_tuple(value.get("iocs", [])),
+        provisional_iocs=[
+            _provisional_ioc_from_payload(item)
+            for item in cast(list[dict[str, object]], value.get("provisional_iocs", []))
+        ],
         likely_artifacts=_string_tuple(value.get("likely_artifacts", [])),
         sources=[
             _source_from_payload(item)
@@ -1916,6 +1968,34 @@ def _incomplete_source_from_payload(value: dict[str, object]) -> IncompleteSourc
         ),
         parsing_warnings=_string_tuple(value.get("parsing_warnings", [])),
         markdown_block=(str(value["markdown_block"]) if value.get("markdown_block") else None),
+    )
+
+
+def _provisional_ioc_from_payload(value: dict[str, object]) -> ProvisionalDiscoveryIoc:
+    relations = cast(list[dict[str, object]], value.get("publication_relations", []))
+    return ProvisionalDiscoveryIoc(
+        id=UUID(str(value["id"])),
+        raw_value=str(value["raw_value"]),
+        normalized_value=(
+            str(value["normalized_value"]) if value.get("normalized_value") is not None else None
+        ),
+        declared_type=str(value.get("declared_type", "unknown")),
+        proposed_type=DiscoveryIocType(str(value.get("proposed_type", "unknown"))),
+        status=DiscoveryIocStatus(str(value.get("status", "provisional_visible"))),
+        publication_relations=tuple(
+            ProvisionalIocPublicationRelation(
+                publication_id=UUID(str(item["publication_id"])),
+                publication_ref=str(item["publication_ref"]),
+                raw_value=str(item["raw_value"]),
+                markdown_block=str(item["markdown_block"]),
+            )
+            for item in relations
+        ),
+        model_run_id=(
+            UUID(str(value["model_run_id"])) if value.get("model_run_id") is not None else None
+        ),
+        markdown_block=str(value.get("markdown_block", "")),
+        warnings=_string_tuple(value.get("warnings", [])),
     )
 
 

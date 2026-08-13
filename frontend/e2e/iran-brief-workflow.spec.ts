@@ -152,13 +152,15 @@ test("parcourt candidat Iran, brève fondée sur preuves, puis validation", asyn
         json: { batches: [], candidates: [], total: 0, warning: "" },
       });
     if (path.includes("/editorial-groups")) {
-      if (request.method() === "POST" && path.endsWith("/select"))
+      if (request.method() === "POST" && path.endsWith("/decisions"))
         selected = true;
       return route.fulfill({
         json: {
           groups: [group()],
           selected_briefs: selected ? 1 : 0,
           selected_major: 0,
+          ignored: 0,
+          undecided: selected ? 0 : 1,
           target_briefs: 1,
           target_major: 1,
           automatic_selection: false,
@@ -224,8 +226,11 @@ test("parcourt candidat Iran, brève fondée sur preuves, puis validation", asyn
   });
 
   await page.goto(`/editions/${editionId}`);
-  await page.getByRole("button", { name: "Sélectionner comme brève" }).click();
-  await page.getByRole("link", { name: "Ouvrir le Workbench Sujet" }).click();
+  await page.getByRole("radio", { name: "Brève" }).check();
+  await page
+    .getByRole("button", { name: "Confirmer la sélection (1)" })
+    .click();
+  await page.getByRole("link", { name: "Ouvrir le sujet" }).click();
   await page.getByRole("button", { name: "Brève" }).click();
   await page.getByRole("button", { name: "Geler les preuves" }).click();
   await page.getByRole("button", { name: "Générer la brève" }).click();

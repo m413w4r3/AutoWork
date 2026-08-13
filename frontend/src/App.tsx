@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useState } from "react";
 
 import {
   fetchDiscovery,
@@ -23,6 +23,7 @@ import {
 import { JobStatusCard } from "./components/JobStatusCard";
 import { EditorialBoard } from "./components/EditorialBoard";
 import { SubjectWorkbench } from "./components/SubjectWorkbench";
+import { terminalJobStatuses, type JobStatus, type JobView } from "./api/jobs";
 
 const statusLabels: Record<EditionStatus, string> = {
   draft: "Brouillon",
@@ -307,6 +308,9 @@ function EditionCreatePage() {
 }
 
 function EditionDetailPage({ editionId }: { editionId: string }) {
+  const [discoveryRunning, setDiscoveryRunning] = useState(() =>
+    Boolean(window.localStorage.getItem(discoveryJobStorageKey(editionId))),
+  );
   const queryClient = useQueryClient();
   const [showDeletion, setShowDeletion] = useState(false);
   const [deletionConfirmation, setDeletionConfirmation] = useState("");
@@ -393,8 +397,11 @@ function EditionDetailPage({ editionId }: { editionId: string }) {
           </dd>
         </div>
       </dl>
-      <DiscoveryPanel editionId={current.id} />
-      <EditorialBoard editionId={current.id} />
+      <DiscoveryPanel
+        editionId={current.id}
+        onRunningChange={setDiscoveryRunning}
+      />
+      {!discoveryRunning ? <EditorialBoard editionId={current.id} /> : null}
       <section className="actions-panel" aria-labelledby="edition-actions">
         <h2 id="edition-actions">Actions disponibles</h2>
         {transition.error ? (
@@ -485,9 +492,24 @@ function EditionDetailPage({ editionId }: { editionId: string }) {
   );
 }
 
-function DiscoveryPanel({ editionId }: { editionId: string }) {
+function discoveryJobStorageKey(editionId: string) {
+  return `cti-discovery-job:${editionId}`;
+}
+
+function DiscoveryPanel({
+  editionId,
+  onRunningChange,
+}: {
+  editionId: string;
+  onRunningChange: (running: boolean) => void;
+}) {
   const queryClient = useQueryClient();
-  const [jobId, setJobId] = useState<string | null>(null);
+  const storageKey = discoveryJobStorageKey(editionId);
+  const [jobId, setJobId] = useState<string | null>(() =>
+    window.localStorage.getItem(storageKey),
+  );
+  const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
+  const [lastJob, setLastJob] = useState<JobView | null>(null);
   const [axis, setAxis] = useState("initial");
   const [search, setSearch] = useState("");
   const [minimum, setMinimum] = useState(0);
@@ -506,12 +528,18 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
         sourceStatus,
         sort,
       }),
-    refetchInterval: jobId ? 2_000 : false,
+    refetchInterval:
+      jobId && (jobStatus === null || !terminalJobStatuses.has(jobStatus))
+        ? 2_000
+        : false,
   });
   const launch = useMutation({
     mutationFn: () => launchDiscovery(editionId, axis.trim() || "initial"),
     onSuccess: (result) => {
       setJobId(result.job_id);
+      setJobStatus(null);
+      window.localStorage.setItem(storageKey, result.job_id);
+      onRunningChange(true);
       void queryClient.invalidateQueries({
         queryKey: ["discovery", editionId],
       });
@@ -522,6 +550,9 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
       launchDiscovery(editionId, axis.trim() || "initial", true),
     onSuccess: (result) => {
       setJobId(result.job_id);
+      setJobStatus(null);
+      window.localStorage.setItem(storageKey, result.job_id);
+      onRunningChange(true);
       void queryClient.invalidateQueries({
         queryKey: ["discovery", editionId],
       });
@@ -545,10 +576,32 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
         researchModelRunId,
         axis.trim() || "initial",
       ),
-    onSuccess: (result) => setJobId(result.job_id),
+    onSuccess: (result) => {
+      setJobId(result.job_id);
+      setJobStatus(null);
+      window.localStorage.setItem(storageKey, result.job_id);
+      onRunningChange(true);
+    },
   });
   const candidates = discovery.data?.candidates ?? [];
   const batches = discovery.data?.batches ?? [];
+  const searchRunning =
+    Boolean(jobId) &&
+    (jobStatus === null || !terminalJobStatuses.has(jobStatus));
+  const handleJobUpdate = useCallback((job: JobView) => {
+    setLastJob(job);
+    setJobStatus(job.status);
+  }, []);
+  const handleJobTerminal = useCallback(() => {
+    window.localStorage.removeItem(storageKey);
+    onRunningChange(false);
+    void queryClient.invalidateQueries({
+      queryKey: ["discovery", editionId],
+    });
+    void queryClient.invalidateQueries({
+      queryKey: ["editorial-board", editionId],
+    });
+  }, [editionId, onRunningChange, queryClient, storageKey]);
 
   return (
     <section className="discovery-panel" aria-labelledby="discovery-heading">
@@ -559,7 +612,7 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
         </div>
         <button
           className="button"
-          disabled={launch.isPending}
+          disabled={launch.isPending || searchRunning}
           onClick={() => launch.mutate()}
         >
           {launch.isPending ? "Lancement…" : "Rechercher les sujets"}
@@ -588,240 +641,331 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
       {jobId ? (
         <JobStatusCard
           jobId={jobId}
+          onUpdate={handleJobUpdate}
+          onTerminal={handleJobTerminal}
           onReprocessReport={(researchModelRunId) =>
             reprocessReport.mutate(researchModelRunId)
           }
         />
       ) : null}
-      <div className="candidate-filters" aria-label="Filtres des candidats">
-        <label>
-          Recherche
-          <input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
+      <details className="technical-discovery-details">
+        <summary>Détails techniques de la découverte</summary>
+        <div className="candidate-filters" aria-label="Filtres des candidats">
+          <label>
+            Recherche
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+            />
+          </label>
+          <label>
+            Potentiel technique minimal
+            <select
+              value={minimum}
+              onChange={(event) => setMinimum(Number(event.target.value))}
+            >
+              {[0, 1, 2, 3, 4].map((value) => (
+                <option key={value} value={value}>
+                  {value}/4
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            État des sources
+            <select
+              value={sourceStatus}
+              onChange={(event) =>
+                setSourceStatus(
+                  event.target.value as SourceVerificationStatus | "",
+                )
+              }
+            >
+              <option value="">Tous</option>
+              <option value="unverified">Non vérifiée</option>
+              <option value="verify_later">À vérifier</option>
+              <option value="invalid">Invalide</option>
+              <option value="unavailable">Indisponible</option>
+            </select>
+          </label>
+          <label>
+            Tri
+            <select
+              value={sort}
+              onChange={(event) => setSort(event.target.value as typeof sort)}
+            >
+              <option value="technical">Potentiel technique</option>
+              <option value="newest">Date de l’événement</option>
+              <option value="novelty">Nouveauté</option>
+              <option value="title">Titre</option>
+            </select>
+          </label>
+        </div>
+        {discovery.isPending ? (
+          <p role="status">Chargement des candidats…</p>
+        ) : null}
+        {discovery.isError ? (
+          <ErrorMessage
+            error={discovery.error}
+            fallback="Candidats inaccessibles."
           />
-        </label>
-        <label>
-          Potentiel technique minimal
-          <select
-            value={minimum}
-            onChange={(event) => setMinimum(Number(event.target.value))}
-          >
-            {[0, 1, 2, 3, 4].map((value) => (
-              <option key={value} value={value}>
-                {value}/4
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          État des sources
-          <select
-            value={sourceStatus}
-            onChange={(event) =>
-              setSourceStatus(
-                event.target.value as SourceVerificationStatus | "",
-              )
-            }
-          >
-            <option value="">Tous</option>
-            <option value="unverified">Non vérifiée</option>
-            <option value="verify_later">À vérifier</option>
-            <option value="invalid">Invalide</option>
-            <option value="unavailable">Indisponible</option>
-          </select>
-        </label>
-        <label>
-          Tri
-          <select
-            value={sort}
-            onChange={(event) => setSort(event.target.value as typeof sort)}
-          >
-            <option value="technical">Potentiel technique</option>
-            <option value="newest">Date de l’événement</option>
-            <option value="novelty">Nouveauté</option>
-            <option value="title">Titre</option>
-          </select>
-        </label>
-      </div>
-      {discovery.isPending ? (
-        <p role="status">Chargement des candidats…</p>
-      ) : null}
-      {discovery.isError ? (
-        <ErrorMessage
-          error={discovery.error}
-          fallback="Candidats inaccessibles."
-        />
-      ) : null}
-      <div className="candidate-list">
-        {candidates.map((candidate) => (
-          <article className="candidate-card" key={candidate.id}>
-            <div className="candidate-card__heading">
-              <h3>{candidate.title}</h3>
-              <span>Technique {candidate.technical_potential}/4</span>
-            </div>
-            <p>{candidate.summary}</p>
-            <p>
-              <strong>Acteur ou campagne proposé :</strong>{" "}
-              {candidate.actor_or_campaign ?? "unknown"}
-            </p>
-            <p>
-              <strong>Potentiel technique :</strong>{" "}
-              {candidate.technical_potential_reason ?? "Non précisé."}
-            </p>
-            <p>
-              <strong>Artefacts annoncés :</strong>{" "}
-              {candidate.likely_artifacts.join(", ") || "non signalée"}
-            </p>
-            <p>
-              <strong>Publications :</strong>{" "}
-              {candidate.valid_publication_count ?? candidate.sources.length}{" "}
-              valides ·{" "}
-              {candidate.incomplete_publication_count ??
-                candidate.incomplete_sources?.length ??
-                0}{" "}
-              incomplètes
-              {candidate.context_only ? " · contexte uniquement" : ""}
-            </p>
-            {candidate.uncertainties.length ? (
-              <div className="uncertainties">
-                <strong>Incertitudes</strong>
-                <ul>
-                  {candidate.uncertainties.map((item) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ul>
+        ) : null}
+        <div className="candidate-list">
+          {candidates.map((candidate) => (
+            <article className="candidate-card" key={candidate.id}>
+              <div className="candidate-card__heading">
+                <h3>{candidate.title}</h3>
+                <span>Technique {candidate.technical_potential}/4</span>
               </div>
-            ) : null}
-            {(candidate.parsing_warnings ?? []).length ? (
-              <div className="uncertainties" role="note">
-                <strong>Avertissements de parsing</strong>
+              <p>{candidate.summary}</p>
+              <p>
+                <strong>Acteur ou campagne proposé :</strong>{" "}
+                {candidate.actor_or_campaign ?? "unknown"}
+              </p>
+              <p>
+                <strong>Potentiel technique :</strong>{" "}
+                {candidate.technical_potential_reason ?? "Non précisé."}
+              </p>
+              <p>
+                <strong>Artefacts annoncés :</strong>{" "}
+                {candidate.likely_artifacts.join(", ") || "non signalée"}
+              </p>
+              <p>
+                <strong>Publications :</strong>{" "}
+                {candidate.valid_publication_count ?? candidate.sources.length}{" "}
+                valides ·{" "}
+                {candidate.incomplete_publication_count ??
+                  candidate.incomplete_sources?.length ??
+                  0}{" "}
+                incomplètes
+                {candidate.context_only ? " · contexte uniquement" : ""}
+              </p>
+              <p className="verification-warning" role="note">
+                IOC repérés pendant la recherche — non encore vérifiés depuis
+                les sources.
+              </p>
+              <p>
+                <strong>IOC provisoirement visibles :</strong>{" "}
+                {candidate.provisional_ioc_count ?? 0} ·{" "}
+                {Object.entries(candidate.provisional_ioc_type_counts ?? {})
+                  .map(([type, count]) => `${type}: ${count}`)
+                  .join(", ") || "aucun"}
+                {candidate.has_publisher_ioc_count
+                  ? " · total éditeur annoncé"
+                  : ""}
+              </p>
+              {(candidate.provisional_iocs ?? []).length ? (
+                <>
+                  <p>
+                    Exemples :{" "}
+                    {(candidate.provisional_iocs ?? [])
+                      .slice(0, 5)
+                      .map((ioc) => ioc.raw_value)
+                      .join(", ")}
+                  </p>
+                  <details className="research-trace">
+                    <summary>
+                      Voir la liste complète (
+                      {candidate.provisional_ioc_count ?? 0})
+                    </summary>
+                    <ul>
+                      {(candidate.provisional_iocs ?? []).map((ioc) => (
+                        <li key={ioc.id}>
+                          <code>{ioc.raw_value}</code> — {ioc.proposed_type}
+                          {ioc.warnings.length
+                            ? ` — ${ioc.warnings.join(", ")}`
+                            : ""}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                </>
+              ) : null}
+              {candidate.uncertainties.length ? (
+                <div className="uncertainties">
+                  <strong>Incertitudes</strong>
+                  <ul>
+                    {candidate.uncertainties.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              {(candidate.parsing_warnings ?? []).length ? (
+                <div className="uncertainties" role="note">
+                  <strong>Avertissements de parsing</strong>
+                  <ul>
+                    {(candidate.parsing_warnings ?? []).map((warning) => (
+                      <li key={warning}>{warning}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              <h4>Publications proposées</h4>
+              <ul className="source-list">
+                {candidate.sources.map((source) => (
+                  <li key={source.id}>
+                    <a href={source.url} target="_blank" rel="noreferrer">
+                      {source.title}
+                    </a>
+                    <span>
+                      {source.publisher} ·{" "}
+                      {source.published_at ?? "date inconnue"}
+                    </span>
+                    <span>
+                      {source.period_relation ?? "unknown"} · {source.role} ·{" "}
+                      {source.verification_status}
+                    </span>
+                    <span>
+                      IOC provisoires : {source.ioc_presence ?? "unknown"} ·
+                      déclarés {source.ioc_declared_count ?? "unknown"} ·
+                      visibles {source.ioc_visible_count ?? "unknown"}
+                    </span>
+                    {(source.parsing_warnings ?? []).map((warning) => (
+                      <small key={warning}>{warning}</small>
+                    ))}
+                    <select
+                      aria-label={`État de ${source.title}`}
+                      value={source.verification_status}
+                      disabled={markSource.isPending}
+                      onChange={(event) =>
+                        markSource.mutate({
+                          sourceId: source.id,
+                          status: event.target
+                            .value as SourceVerificationStatus,
+                        })
+                      }
+                    >
+                      <option value="unverified">Non vérifiée</option>
+                      <option value="verify_later">À vérifier</option>
+                      <option value="invalid">Invalide</option>
+                      <option value="unavailable">Indisponible</option>
+                    </select>
+                  </li>
+                ))}
+                {(candidate.incomplete_sources ?? []).map((source) => (
+                  <li key={source.id}>
+                    <strong>{source.title}</strong>
+                    <span>
+                      Publication incomplète · {source.publisher} · URL{" "}
+                      {source.raw_url ?? "absente"}
+                    </span>
+                    <span>
+                      {source.period_relation} · {source.role} · IOC provisoires
+                      : {source.ioc_presence}
+                    </span>
+                    {source.parsing_warnings.map((warning) => (
+                      <small key={warning}>{warning}</small>
+                    ))}
+                  </li>
+                ))}
+              </ul>
+            </article>
+          ))}
+        </div>
+      </details>
+      {batches.length ? (
+        <details className="research-trace report-diagnostics">
+          <summary>Rapport et diagnostic</summary>
+          {batches.map((batch) => (
+            <article className="diagnostic-batch" key={batch.id}>
+              <h3>{batch.complementary_axis}</h3>
+              <p>
+                Parsing : {batch.parsing_status ?? "historique"} · parseur{" "}
+                {batch.parser_version ?? "historique"}
+              </p>
+              {(batch.parsing_warnings ?? []).length ? (
                 <ul>
-                  {(candidate.parsing_warnings ?? []).map((warning) => (
+                  {batch.parsing_warnings.map((warning) => (
                     <li key={warning}>{warning}</li>
                   ))}
                 </ul>
+              ) : null}
+              <dl className="job-diagnostics">
+                <div>
+                  <dt>ModelRun de recherche</dt>
+                  <dd>{batch.discovery_model_run_id}</dd>
+                </div>
+                <div>
+                  <dt>ModelRun de parsing</dt>
+                  <dd>{batch.structuring_model_run_id}</dd>
+                </div>
+                <div>
+                  <dt>Correlation ID</dt>
+                  <dd>{lastJob?.correlation_id ?? "Non disponible"}</dd>
+                </div>
+              </dl>
+              <a
+                href={batch.archived_report_url}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Consulter le rapport Markdown ChatGPT archivé
+              </a>
+              <p>
+                Le rapport ChatGPT archivé sera réutilisé. Aucun nouvel appel au
+                bridge ne sera effectué.
+              </p>
+              <div className="editorial-actions">
+                <button
+                  className="button button--secondary"
+                  disabled={reprocessReport.isPending}
+                  onClick={() =>
+                    reprocessReport.mutate(batch.discovery_model_run_id)
+                  }
+                >
+                  Retraiter le rapport archivé
+                </button>
+                <button
+                  className="button button--secondary"
+                  disabled={relaunch.isPending}
+                  onClick={() => {
+                    if (
+                      window.confirm(
+                        "Relancer la recherche web créera une nouvelle conversation ChatGPT et conservera le rapport actuel. Continuer ?",
+                      )
+                    )
+                      relaunch.mutate();
+                  }}
+                >
+                  Relancer la recherche web
+                </button>
               </div>
-            ) : null}
-            <h4>Publications proposées</h4>
-            <ul className="source-list">
-              {candidate.sources.map((source) => (
-                <li key={source.id}>
-                  <a href={source.url} target="_blank" rel="noreferrer">
-                    {source.title}
-                  </a>
-                  <span>
-                    {source.publisher} ·{" "}
-                    {source.published_at ?? "date inconnue"}
-                  </span>
-                  <span>
-                    {source.period_relation ?? "unknown"} · {source.role} ·{" "}
-                    {source.verification_status}
-                  </span>
-                  <span>
-                    IOC provisoires : {source.ioc_presence ?? "unknown"} ·
-                    déclarés {source.ioc_declared_count ?? "unknown"} · visibles{" "}
-                    {source.ioc_visible_count ?? "unknown"}
-                  </span>
-                  {(source.parsing_warnings ?? []).map((warning) => (
-                    <small key={warning}>{warning}</small>
-                  ))}
-                  <select
-                    aria-label={`État de ${source.title}`}
-                    value={source.verification_status}
-                    disabled={markSource.isPending}
-                    onChange={(event) =>
-                      markSource.mutate({
-                        sourceId: source.id,
-                        status: event.target.value as SourceVerificationStatus,
-                      })
-                    }
-                  >
-                    <option value="unverified">Non vérifiée</option>
-                    <option value="verify_later">À vérifier</option>
-                    <option value="invalid">Invalide</option>
-                    <option value="unavailable">Indisponible</option>
-                  </select>
-                </li>
-              ))}
-              {(candidate.incomplete_sources ?? []).map((source) => (
-                <li key={source.id}>
-                  <strong>{source.title}</strong>
-                  <span>
-                    Publication incomplète · {source.publisher} · URL{" "}
-                    {source.raw_url ?? "absente"}
-                  </span>
-                  <span>
-                    {source.period_relation} · {source.role} · IOC provisoires :{" "}
-                    {source.ioc_presence}
-                  </span>
-                  {source.parsing_warnings.map((warning) => (
-                    <small key={warning}>{warning}</small>
-                  ))}
-                </li>
-              ))}
-            </ul>
-          </article>
-        ))}
-      </div>
-      {batches.map((batch) => (
-        <details className="research-trace" key={batch.id}>
-          <summary>Rapport et diagnostic — {batch.complementary_axis}</summary>
-          <p>
-            Parsing : {batch.parsing_status ?? "historique"} · parseur{" "}
-            {batch.parser_version ?? "historique"}
-          </p>
-          <a href={batch.archived_report_url} target="_blank" rel="noreferrer">
-            Consulter le rapport Markdown ChatGPT archivé
-          </a>
-          <p>
-            Le rapport ChatGPT archivé sera réutilisé. Aucun nouvel appel au
-            bridge ne sera effectué.
-          </p>
-          <div className="editorial-actions">
-            <button
-              className="button button--secondary"
-              disabled={reprocessReport.isPending}
-              onClick={() =>
-                reprocessReport.mutate(batch.discovery_model_run_id)
-              }
-            >
-              Retraiter le rapport archivé
-            </button>
-            <button
-              className="button button--secondary"
-              disabled={relaunch.isPending}
-              onClick={() => {
-                if (
-                  window.confirm(
-                    "Relancer la recherche web créera une nouvelle conversation ChatGPT et conservera le rapport actuel. Continuer ?",
-                  )
-                )
-                  relaunch.mutate();
-              }}
-            >
-              Relancer la recherche web
-            </button>
-          </div>
-          <h3>Requêtes</h3>
-          <ul>
-            {batch.queries.map((query) => (
-              <li key={query}>{query}</li>
-            ))}
-          </ul>
-          <h3>Citations du modèle</h3>
-          <ul>
-            {batch.citations.map((citation) => (
-              <li key={`${citation.url}-${citation.label}`}>
-                <a href={citation.url} target="_blank" rel="noreferrer">
-                  {citation.label}
-                </a>
-                {citation.excerpt ? <p>{citation.excerpt}</p> : null}
-              </li>
-            ))}
-          </ul>
+              <h3>Requêtes</h3>
+              <ul>
+                {batch.queries.map((query) => (
+                  <li key={query}>{query}</li>
+                ))}
+              </ul>
+              <h3>Citations du modèle</h3>
+              <ul>
+                {batch.citations.map((citation) => (
+                  <li key={`${citation.url}-${citation.label}`}>
+                    <a href={citation.url} target="_blank" rel="noreferrer">
+                      {citation.label}
+                    </a>
+                    {citation.excerpt ? <p>{citation.excerpt}</p> : null}
+                  </li>
+                ))}
+              </ul>
+              {(batch.unattached_visible_citations ?? []).length ? (
+                <>
+                  <h3>Citations visibles non rattachées</h3>
+                  <ul>
+                    {batch.unattached_visible_citations.map((citation) => (
+                      <li key={`${citation.canonical_url}-${citation.label}`}>
+                        <a href={citation.url} target="_blank" rel="noreferrer">
+                          {citation.label}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              ) : null}
+            </article>
+          ))}
         </details>
-      ))}
+      ) : null}
     </section>
   );
 }

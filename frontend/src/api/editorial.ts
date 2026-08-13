@@ -1,6 +1,7 @@
 import { ApiError } from "./editions";
 
 export type EditorialType = "brief" | "major";
+export type EditorialDecision = EditorialType | "ignore";
 export type EditorialGroupStatus =
   "proposed" | "rejected" | "selected" | "superseded";
 export type GroupingOutcome =
@@ -38,6 +39,31 @@ export interface EditorialGroup {
   status: EditorialGroupStatus;
   editorial_type: EditorialType | null;
   subject_id: string | null;
+  presentation?: string | null;
+  actor_or_campaign?: string | null;
+  technical_potential?: number;
+  technical_potential_reason?: string | null;
+  artifacts?: string[];
+  publications?: Array<{
+    title: string;
+    url: string;
+    publisher: string | null;
+    role: string;
+    published_at: string | null;
+  }>;
+  uncertainties?: string[];
+  publisher_ioc_count_total?: number | null;
+  publisher_ioc_counts?: number[];
+  provisional_ioc_count?: number;
+  provisional_ioc_type_counts?: Record<string, number>;
+  provisional_iocs?: Array<{
+    raw_value: string;
+    normalized_value: string | null;
+    proposed_type: string;
+    declared_type: string | null;
+    warnings: string[];
+  }>;
+  metadata_incomplete?: boolean;
   candidates: EditorialCandidate[];
   score: EditorialScore;
   source_relationship_status: "provisional" | "verified";
@@ -58,6 +84,8 @@ export interface EditorialBoardResult {
   groups: EditorialGroup[];
   selected_briefs: number;
   selected_major: number;
+  ignored?: number;
+  undecided?: number;
   target_briefs: number;
   target_major: number;
   automatic_selection: false;
@@ -106,6 +134,17 @@ export function selectEditorialGroup(
   return mutate(editionId, `/${encodeURIComponent(groupId)}/select`, {
     editorial_type: editorialType,
   });
+}
+
+export function confirmEditorialDecisions(
+  editionId: string,
+  decisions: Array<{
+    group_id: string;
+    version: number;
+    decision: EditorialDecision;
+  }>,
+): Promise<EditorialBoardResult> {
+  return mutate(editionId, "/decisions", { decisions });
 }
 
 function mutate(

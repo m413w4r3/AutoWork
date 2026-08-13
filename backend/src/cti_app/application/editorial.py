@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from difflib import SequenceMatcher
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -52,6 +53,19 @@ class EditorialActionError(ValueError):
     pass
 
 
+class EditorialDecisionValue(StrEnum):
+    BRIEF = "brief"
+    MAJOR = "major"
+    IGNORE = "ignore"
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialDecisionCommand:
+    group_id: UUID
+    version: int
+    decision: EditorialDecisionValue
+
+
 class AmbiguousGroupingResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -78,6 +92,8 @@ class EditorialBoard:
     historical_groups: dict[UUID, EditorialGroup]
     selected_briefs: int
     selected_major: int
+    ignored: int
+    undecided: int
     target_briefs: int
     target_major: int
 
@@ -100,7 +116,8 @@ class EditorialGroupingService:
         self, edition_id: UUID, *, resolve_ambiguous: bool = True
     ) -> list[EditorialGroup]:
         async with self._uow_factory() as uow:
-            batches = list(await uow.discovery_batches.list_for_edition(edition_id))
+            all_batches = list(await uow.discovery_batches.list_for_edition(edition_id))
+            batches = [batch for batch in all_batches if batch.is_active_revision]
             existing = list(await uow.editorial_groups.list_for_edition(edition_id))
             historical = list(await uow.editorial_groups.list_historical(edition_id))
             archived_urls: dict[UUID, set[str]] = {}
@@ -115,6 +132,12 @@ class EditorialGroupingService:
                         )
                     except ValueError:
                         continue
+            replacements = _revision_reference_replacements(all_batches)
+            for group in existing:
+                before = group.candidate_references
+                group.replace_candidate_references(replacements)
+                if group.candidate_references != before:
+                    await uow.editorial_groups.save(group)
             candidate_map = _candidate_map(batches)
             reference_map = {
                 reference for group in existing for reference in group.candidate_references
@@ -141,10 +164,10 @@ class EditorialGroupingService:
                 if reference in reference_map:
                     continue
                 current_match = _best_group_match(
-                    candidate, existing, comparison_candidates, archived_urls
+                    reference, candidate, existing, comparison_candidates, archived_urls
                 )
                 historical_match = _best_group_match(
-                    candidate, historical, comparison_candidates, archived_urls
+                    reference, candidate, historical, comparison_candidates, archived_urls
                 )
                 best = _prefer_match(current_match, historical_match)
                 if (
@@ -255,8 +278,14 @@ class EditorialGroupingService:
                 raise EditorialGroupNotFoundError(str(edition_id))
             groups = list(await uow.editorial_groups.list_for_edition(edition_id))
             historical = list(await uow.editorial_groups.list_historical(edition_id))
-            batches = list(await uow.discovery_batches.list_for_edition(edition_id))
+            batches = [
+                batch
+                for batch in await uow.discovery_batches.list_for_edition(edition_id)
+                if batch.is_active_revision
+            ]
             selected = [group for group in groups if group.status is EditorialGroupStatus.SELECTED]
+            ignored = [group for group in groups if group.status is EditorialGroupStatus.REJECTED]
+            undecided = [group for group in groups if group.status is EditorialGroupStatus.PROPOSED]
             return EditorialBoard(
                 groups=groups,
                 candidates=_candidate_map(batches),
@@ -267,9 +296,96 @@ class EditorialGroupingService:
                 selected_major=sum(
                     group.editorial_type is EditorialType.MAJOR for group in selected
                 ),
+                ignored=len(ignored),
+                undecided=len(undecided),
                 target_briefs=edition.target_briefs,
                 target_major=edition.target_major_articles,
             )
+
+    async def decide_many(
+        self,
+        edition_id: UUID,
+        commands: Sequence[EditorialDecisionCommand],
+        *,
+        actor_id: str,
+        correlation_id: str,
+    ) -> None:
+        if not commands:
+            raise EditorialActionError("At least one editorial decision is required")
+        if len({command.group_id for command in commands}) != len(commands):
+            raise EditorialActionError("A group can only be decided once per confirmation")
+
+        ordered = sorted(commands, key=lambda command: command.group_id.hex)
+        async with self._uow_factory() as uow:
+            edition = await uow.editions.get(edition_id)
+            if edition is None:
+                raise EditorialGroupNotFoundError(str(edition_id))
+
+            locked: list[tuple[EditorialDecisionCommand, EditorialGroup]] = []
+            for command in ordered:
+                group = await uow.editorial_groups.get_for_update(command.group_id)
+                if group is None or group.edition_id != edition_id:
+                    raise EditorialGroupNotFoundError(str(command.group_id))
+                if group.version != command.version:
+                    raise EditorialActionError(
+                        f"Editorial group {group.id} has changed; reload before confirming"
+                    )
+                if group.status is not EditorialGroupStatus.PROPOSED:
+                    raise EditorialActionError(
+                        f"Editorial group {group.id} is no longer awaiting a decision"
+                    )
+                locked.append((command, group))
+
+            # All groups and versions are validated before the first mutation.
+            for command, group in locked:
+                if command.decision is EditorialDecisionValue.IGNORE:
+                    group.reject()
+                    await uow.editorial_groups.save(group)
+                    await uow.human_decisions.append(
+                        HumanDecision(
+                            edition_id=edition_id,
+                            decision_type=HumanDecisionType.REJECT,
+                            group_ids=(group.id,),
+                            actor_id=actor_id,
+                            correlation_id=correlation_id,
+                            payload={
+                                "reason": "Ignoré lors de la sélection éditoriale",
+                                "batch_confirmation": True,
+                            },
+                        )
+                    )
+                    continue
+
+                editorial_type = EditorialType(command.decision.value)
+                subject = Subject(
+                    external_id=f"edition:{edition_id}:group:{group.id}",
+                    slug=_subject_slug(group.title, group.id),
+                    tlp=edition.tlp,
+                )
+                await uow.subjects.add(subject)
+                if self._materializer is not None:
+                    await self._materializer.materialize(
+                        subject, (), (), {}, self._workspace_root
+                    )
+                group.select(editorial_type, subject.id)
+                await uow.editorial_groups.save(group)
+                await uow.human_decisions.append(
+                    HumanDecision(
+                        edition_id=edition_id,
+                        decision_type=HumanDecisionType.SELECT,
+                        group_ids=(group.id,),
+                        actor_id=actor_id,
+                        correlation_id=correlation_id,
+                        payload={
+                            "editorial_type": editorial_type.value,
+                            "subject_id": str(subject.id),
+                            "score_total": group.score.total,
+                            "automatic": False,
+                            "batch_confirmation": True,
+                        },
+                    )
+                )
+            await uow.commit()
 
     async def merge(
         self,
@@ -503,6 +619,7 @@ def _candidate_map(batches: Sequence[DiscoveryBatch]) -> dict[CandidateReference
 
 
 def _best_group_match(
+    reference: CandidateReference,
     candidate: CandidateTopic,
     groups: Sequence[EditorialGroup],
     candidates: Mapping[CandidateReference, CandidateTopic],
@@ -512,11 +629,24 @@ def _best_group_match(
     for group in groups:
         if group.status is EditorialGroupStatus.SUPERSEDED:
             continue
-        other = _representative(group, candidates)
-        candidate_urls = {source.canonical_url for source in candidate.sources}
-        if candidate_urls & archived_urls.get(group.id, set()):
-            matches.append(_GroupMatch(group, 1.0, "URL canonique archivée identique"))
+        if any(item.batch_id == reference.batch_id for item in group.candidate_references):
             continue
+        other = _representative(group, candidates)
+        candidate_urls = {
+            source.canonical_url
+            for source in candidate.sources
+            if source.role in {SourceRole.PRIMARY, SourceRole.INDEPENDENT}
+        }
+        if candidate_urls & archived_urls.get(group.id, set()):
+            if other is not None and _has_other_strong_signal(candidate, other):
+                matches.append(
+                    _GroupMatch(
+                        group,
+                        0.9,
+                        "URL canonique archivée et autre signal éditorial concordant",
+                    )
+                )
+                continue
         if other is None:
             continue
         score, reasons = _similarity(candidate, other)
@@ -541,10 +671,17 @@ def _representative(
 
 
 def _similarity(left: CandidateTopic, right: CandidateTopic) -> tuple[float, list[str]]:
-    left_urls = {source.canonical_url for source in left.sources}
-    right_urls = {source.canonical_url for source in right.sources}
-    if left_urls & right_urls:
-        return 1.0, ["URL canonique identique"]
+    shared_strong_urls = {
+        source.canonical_url
+        for source in left.sources
+        if source.role in {SourceRole.PRIMARY, SourceRole.INDEPENDENT}
+    } & {
+        source.canonical_url
+        for source in right.sources
+        if source.role in {SourceRole.PRIMARY, SourceRole.INDEPENDENT}
+    }
+    if shared_strong_urls and _has_other_strong_signal(left, right):
+        return 1.0, ["URL primary/independent et autre signal éditorial concordant"]
     if left.title_fingerprint == right.title_fingerprint:
         return 0.95, ["titre normalisé identique"]
     score = 0.0
@@ -646,8 +783,53 @@ def _dates_close(left: date | None, right: date | None) -> bool:
 
 def _only_relay_sources(candidate: CandidateTopic) -> bool:
     return bool(candidate.sources) and all(
-        source.role in {SourceRole.RELAY, SourceRole.AGGREGATOR} for source in candidate.sources
+        source.role in {SourceRole.RELAY, SourceRole.AGGREGATOR, SourceRole.SOCIAL}
+        for source in candidate.sources
     )
+
+
+def _has_other_strong_signal(left: CandidateTopic, right: CandidateTopic) -> bool:
+    title_score = SequenceMatcher(None, _normalize(left.title), _normalize(right.title)).ratio()
+    if title_score >= 0.75:
+        return True
+    for left_values, right_values in (
+        (left.actors, right.actors),
+        (left.campaigns, right.campaigns),
+        (left.malware, right.malware),
+    ):
+        left_tokens = {token for item in left_values for token in _explicit_entity_tokens(item)}
+        right_tokens = {token for item in right_values for token in _explicit_entity_tokens(item)}
+        if left_tokens & right_tokens:
+            return True
+    return False
+
+
+def _explicit_entity_tokens(value: str) -> set[str]:
+    return {
+        normalized
+        for part in re.split(r"[/,;|]", value)
+        if (normalized := _normalize(part)) and normalized != "unknown"
+    }
+
+
+def _revision_reference_replacements(
+    batches: Sequence[DiscoveryBatch],
+) -> dict[CandidateReference, CandidateReference]:
+    active_by_run = {
+        batch.discovery_model_run_id: batch for batch in batches if batch.is_active_revision
+    }
+    replacements: dict[CandidateReference, CandidateReference] = {}
+    for batch in batches:
+        active = active_by_run.get(batch.discovery_model_run_id)
+        if active is None or active.id == batch.id:
+            continue
+        active_ids = {candidate.id for candidate in active.candidates}
+        for candidate in batch.candidates:
+            if candidate.id in active_ids:
+                replacements[CandidateReference(batch.id, candidate.id)] = CandidateReference(
+                    active.id, candidate.id
+                )
+    return replacements
 
 
 def _normalize(value: str) -> str:

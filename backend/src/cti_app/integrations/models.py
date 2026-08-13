@@ -765,6 +765,14 @@ def _response_metadata(raw: dict[str, Any]) -> dict[str, Any]:
             and isinstance(citation.get("url"), str)
             and isinstance(citation.get("canonical_url"), str)
         ]
+    for name in ("completion_signal", "completion_confidence", "content_script_version"):
+        value = metadata.get(name)
+        if isinstance(value, str):
+            result[name] = value[:64]
+    for name in ("stable_for_ms", "output_chars", "visible_citation_count"):
+        value = metadata.get(name)
+        if isinstance(value, int) and value >= 0:
+            result[name] = value
     return result
 
 

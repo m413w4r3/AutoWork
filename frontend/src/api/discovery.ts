@@ -64,6 +64,10 @@ export interface CandidateTopic {
   countries: string[];
   likely_artifacts: string[];
   iocs: string[];
+  provisional_iocs?: ProvisionalDiscoveryIoc[];
+  provisional_ioc_count?: number;
+  provisional_ioc_type_counts?: Record<string, number>;
+  has_publisher_ioc_count?: boolean;
   editorial_status: "proposed";
   sources: SourceCandidate[];
   incomplete_sources: IncompleteSourceCandidate[];
@@ -75,6 +79,28 @@ export interface CandidateTopic {
   selectable: boolean;
   valid_publication_count: number;
   incomplete_publication_count: number;
+}
+
+export interface ProvisionalDiscoveryIoc {
+  id: string;
+  raw_value: string;
+  normalized_value: string | null;
+  declared_type: string;
+  proposed_type:
+    | "ipv4"
+    | "ipv6"
+    | "domain"
+    | "url"
+    | "md5"
+    | "sha1"
+    | "sha256"
+    | "email"
+    | "cve"
+    | "other"
+    | "unknown";
+  status: "provisional_visible";
+  publication_refs: string[];
+  warnings: string[];
 }
 
 export interface DiscoveryBatch {
@@ -98,6 +124,16 @@ export interface DiscoveryBatch {
   parser_version: string;
   parsing_status: string;
   parsing_warnings: string[];
+  unattached_visible_citations: Array<{
+    label: string;
+    url: string;
+    canonical_url: string;
+    excerpt: string | null;
+  }>;
+  parsing_revision: number;
+  supersedes_batch_id: string | null;
+  replaced_by_batch_id: string | null;
+  is_active_revision: boolean;
   archived_report_url: string;
 }
 

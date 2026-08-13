@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -11,20 +12,24 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
+    DiscoveryIocType,
     IncompleteSourceCandidate,
     IocPresence,
     PeriodRelation,
+    ProvisionalDiscoveryIoc,
+    ProvisionalIocPublicationRelation,
     SourceCandidate,
     SourceRole,
     canonicalize_http_url,
 )
 
-PARSER_VERSION = "chatgpt-markdown-v1"
-_SUBJECT = re.compile(r"^\s*##\s+SUBJECT\b\s*[:#-]?\s*(.*?)\s*$", re.IGNORECASE)
-_PUBLICATION = re.compile(r"^\s*###\s+PUBLICATION\b\s*[:#-]?\s*(.*?)\s*$", re.IGNORECASE)
+PARSER_VERSION = "chatgpt-markdown-v2"
+_SUBJECT = re.compile(r"^\s*(?:##\s+)?SUBJECT\b\s*[:#-]?\s*(.*?)\s*$", re.IGNORECASE)
+_PUBLICATION = re.compile(r"^\s*(?:###\s+)?PUBLICATION\b\s*[:#-]?\s*(.*?)\s*$", re.IGNORECASE)
 _HEADING = re.compile(r"^\s*(#{1,6})\s+(.+?)\s*$")
 _FIELD = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:\*\*)?([\wÀ-ÿ][\wÀ-ÿ ./'-]*?)(?:\*\*)?\s*[:\N{FULLWIDTH COLON}]\s*(.*)$"
+    r"^\s*(?:[-*]\s*)?(?:\*\*)?([\wÀ-ÿ\\][\wÀ-ÿ\\ ./'-]*?)(?:\*\*)?"
+    r"\s*[:\N{FULLWIDTH COLON}]\s*(.*)$"
 )
 _MARKDOWN_URL = re.compile(r"\[[^\]]*\]\(\s*(https?://[^\s)>]+)\s*\)", re.IGNORECASE)
 _ANGLE_URL = re.compile(r"<\s*(https?://[^>\s]+)\s*>", re.IGNORECASE)
@@ -54,6 +59,19 @@ _KNOWN_PUBLICATION_FIELDS = {
     "ioc_presence",
     "ioc_declared_count",
     "ioc_visible_count",
+    "visible_ioc_types",
+    "visible_iocs",
+    "ioc_note",
+}
+_KEY_ALIASES = {
+    "actor_campaign": "actor_or_campaign",
+    "technical_reason": "technical_potential_reason",
+    "uncertainty": "uncertainties",
+    "published_at": "published_at",
+    "period": "period_relation",
+    "role": "source_role",
+    "ioc_visibility": "ioc_presence",
+    "publisher_ioc_count": "ioc_declared_count",
 }
 _ARTIFACTS = {"ioc", "samples", "configurations", "pcap", "yara", "suricata", "none", "unknown"}
 
@@ -72,6 +90,7 @@ class ParsedDiscoveryReport:
     warnings: tuple[str, ...]
     report_sha256: str
     status: str
+    unattached_visible_citations: tuple[dict[str, str | None], ...] = ()
 
 
 def parse_discovery_report(
@@ -83,6 +102,7 @@ def parse_discovery_report(
     tlp: TLP,
     sensitivity: str,
     external_llm_allowed: bool,
+    research_model_run_id: UUID | None = None,
 ) -> ParsedDiscoveryReport:
     del period_start, period_end  # Dates are never inferred from the edition window.
     if not report.strip():
@@ -110,15 +130,14 @@ def parse_discovery_report(
             sensitivity=sensitivity,
             external_llm_allowed=external_llm_allowed,
         )
-    _preserve_unattached_citations(
-        candidates,
-        citation_values,
-        report_sha=report_sha,
-        tlp=tlp,
-        sensitivity=sensitivity,
-        external_llm_allowed=external_llm_allowed,
-        warnings=warnings,
+    candidates = _best_candidate_revision_by_subject(candidates)
+    attached = {source.canonical_url for candidate in candidates for source in candidate.sources}
+    unattached = tuple(
+        item for item in citation_values if item.get("canonical_url") not in attached
     )
+    for candidate in candidates:
+        for ioc in candidate.provisional_iocs:
+            ioc.model_run_id = research_model_run_id
     if not candidates:
         raise ReportParsingError(
             "report_parsing_failed", "Aucun sujet ni aucune URL explicite n'a pu être extrait."
@@ -133,6 +152,7 @@ def parse_discovery_report(
         warnings=tuple(dict.fromkeys(warnings)),
         report_sha256=report_sha,
         status=status,
+        unattached_visible_citations=unattached,
     )
 
 
@@ -186,6 +206,7 @@ def _parse_current(
         ]
         sources: list[SourceCandidate] = []
         incomplete: list[IncompleteSourceCandidate] = []
+        provisional_iocs: list[ProvisionalDiscoveryIoc] = []
         publication_starts.append(end)
         for pub_ordinal, (pub_start, pub_end) in enumerate(pairwise(publication_starts), 1):
             pub_header = _PUBLICATION.match(lines[pub_start])
@@ -196,7 +217,11 @@ def _parse_current(
             pub_warnings = [
                 f"publication {pub_ref}: champ non reconnu '{name}'" for name in unknown
             ]
-            urls = extract_http_urls("\n".join((fields.get("url", ""), pub_block)))
+            urls = extract_http_urls(fields.get("url", ""))
+            if not urls:
+                # Compatibility for archived bridge output where citation injection
+                # split the `url:` field. This fallback never runs for a valid URL field.
+                urls = extract_http_urls(pub_block)
             if not urls:
                 raw_url = fields.get("url") or None
                 pub_warnings.append(f"publication {pub_ref}: no_explicit_url")
@@ -204,27 +229,32 @@ def _parse_current(
                     _incomplete_source(pub_ref, fields, raw_url, pub_warnings, pub_block)
                 )
                 continue
-            for raw_url, canonical_url in urls:
-                sources.append(
-                    _valid_source(
-                        pub_ref,
-                        fields,
-                        raw_url,
-                        canonical_url,
-                        pub_warnings,
-                        pub_block,
-                        report_sha,
-                        tlp,
-                        sensitivity,
-                        external_llm_allowed,
-                    )
+            publication_sources = [
+                _valid_source(
+                    pub_ref,
+                    fields,
+                    raw_url,
+                    canonical_url,
+                    pub_warnings,
+                    pub_block,
+                    report_sha,
+                    tlp,
+                    sensitivity,
+                    external_llm_allowed,
                 )
+                for raw_url, canonical_url in urls
+            ]
+            sources.extend(publication_sources)
+            provisional_iocs.extend(
+                _provisional_iocs(pub_ref, fields, publication_sources, pub_block)
+            )
             topic_warnings.extend(pub_warnings)
         candidate = _candidate(
             local_ref,
             topic_fields,
             sources,
             incomplete,
+            _deduplicate_provisional_iocs(provisional_iocs),
             topic_warnings,
             block,
             report_sha,
@@ -340,17 +370,22 @@ def _parse_fields(lines: list[str]) -> tuple[dict[str, str], list[str]]:
     unknown: list[str] = []
     current: str | None = None
     for line in lines:
+        if current == "visible_iocs" and re.match(r"^\s*[-*]\s+\S", line):
+            fields[current] = f"{fields[current]}\n{line.strip()}".strip()
+            continue
         match = _FIELD.match(line)
         if match:
             key = _normalize_key(match.group(1))
-            current = key
             value = match.group(2).strip().strip("*")
             fields[key] = value
             known = _KNOWN_TOPIC_FIELDS | _KNOWN_PUBLICATION_FIELDS
             if key not in known:
                 unknown.append(key)
+                current = None
+            else:
+                current = key
             continue
-        if current is not None and line.strip() and not _HEADING.match(line):
+        if current is not None and _is_explicit_continuation(line, current):
             fields[current] = f"{fields[current]}\n{line.strip()}".strip()
     return fields, unknown
 
@@ -360,6 +395,7 @@ def _candidate(
     fields: dict[str, str],
     sources: list[SourceCandidate],
     incomplete: list[IncompleteSourceCandidate],
+    provisional_iocs: list[ProvisionalDiscoveryIoc],
     warnings: list[str],
     block: str,
     report_sha: str,
@@ -405,6 +441,7 @@ def _candidate(
         likely_artifacts=artifacts,
         sources=sources,
         incomplete_sources=incomplete,
+        provisional_iocs=provisional_iocs,
         tlp=tlp,
         sensitivity=sensitivity,
         external_llm_allowed=external_llm_allowed,
@@ -503,65 +540,169 @@ def _normalize_citations(value: object) -> list[dict[str, str | None]]:
     return normalized
 
 
-def _preserve_unattached_citations(
+def _best_candidate_revision_by_subject(
     candidates: list[CandidateTopic],
-    citations: list[dict[str, str | None]],
-    *,
-    report_sha: str,
-    tlp: TLP,
-    sensitivity: str,
-    external_llm_allowed: bool,
-    warnings: list[str],
-) -> None:
-    attached = {source.canonical_url for candidate in candidates for source in candidate.sources}
-    missing = [item for item in citations if item.get("canonical_url") not in attached]
-    if not missing:
-        return
-    sources = [
-        SourceCandidate(
-            id=uuid5(NAMESPACE_URL, f"{report_sha}:{item['canonical_url']}"),
-            url=str(item["canonical_url"]),
-            raw_url=str(item["url"]),
-            title=str(item["label"]),
-            publisher="unknown",
-            role=SourceRole.UNKNOWN,
-            citation=item.get("excerpt"),
-            local_ref=f"C{index}",
-            parsing_warnings=("Citation visible non rattachée à un bloc publication.",),
-            tlp=tlp,
-            sensitivity=sensitivity,
-            external_llm_allowed=external_llm_allowed,
-        )
-        for index, item in enumerate(missing, 1)
-    ]
-    candidates.append(
-        CandidateTopic(
-            id=uuid5(NAMESPACE_URL, f"{report_sha}:unattached-citations"),
-            local_ref="CONTEXT-CITATIONS",
-            title="Citations visibles non regroupées",
-            summary="URLs conservées depuis les citations visibles du bridge.",
-            novelty="Contexte de découverte non sélectionnable isolément.",
-            technical_potential=0,
-            technical_potential_reason="Non évalué.",
-            uncertainties=("Rattachement éditorial inconnu.",),
-            relevance_reasons=("Préservation déterministe des URLs trouvées.",),
-            actors=(),
-            campaigns=(),
-            malware=(),
-            cves=(),
-            victims=(),
-            sectors=(),
-            countries=(),
-            likely_artifacts=("unknown",),
-            sources=sources,
-            tlp=tlp,
-            sensitivity=sensitivity,
-            external_llm_allowed=external_llm_allowed,
-            parsing_warnings=("Citations non rattachées conservées comme contexte.",),
-            context_only=True,
-        )
+) -> list[CandidateTopic]:
+    """Keep the most complete serialization when a bridge output repeats a subject."""
+    selected: dict[str, CandidateTopic] = {}
+    order: list[str] = []
+    for candidate in candidates:
+        key = (candidate.local_ref or str(candidate.id)).casefold()
+        if key not in selected:
+            selected[key] = candidate
+            order.append(key)
+            continue
+        if _candidate_quality(candidate) > _candidate_quality(selected[key]):
+            selected[key] = candidate
+    return [selected[key] for key in order]
+
+
+def _candidate_quality(candidate: CandidateTopic) -> tuple[int, int, int, int, int]:
+    return (
+        int(not candidate.title.startswith("Sujet ")),
+        int(candidate.technical_potential > 0),
+        int(candidate.actor_or_campaign.casefold() != "unknown"),
+        int(not candidate.technical_potential_reason.startswith("Non précisé")),
+        len(candidate.sources),
     )
-    warnings.append("Des citations visibles non rattachées ont été conservées comme contexte.")
+
+
+def _provisional_iocs(
+    publication_ref: str,
+    fields: dict[str, str],
+    sources: list[SourceCandidate],
+    markdown_block: str,
+) -> list[ProvisionalDiscoveryIoc]:
+    values = _split_ioc_values(fields.get("visible_iocs"))
+    declared_types = _split_list(fields.get("visible_ioc_types", "unknown"), normalized=True)
+    if not values or not sources:
+        return []
+    result: list[ProvisionalDiscoveryIoc] = []
+    for index, raw_value in enumerate(values):
+        declared = (
+            declared_types[index]
+            if len(declared_types) == len(values)
+            else declared_types[0]
+            if len(declared_types) == 1
+            else "unknown"
+        )
+        proposed, normalized, validation_warnings = _classify_ioc(raw_value)
+        declared_canonical = _declared_ioc_type(declared)
+        warnings = list(validation_warnings)
+        if (
+            declared_canonical is not DiscoveryIocType.UNKNOWN
+            and proposed is not DiscoveryIocType.UNKNOWN
+            and declared_canonical is not proposed
+        ):
+            warnings.append("type_conflict")
+        relations = tuple(
+            ProvisionalIocPublicationRelation(
+                publication_id=source.id,
+                publication_ref=publication_ref,
+                raw_value=raw_value,
+                markdown_block=markdown_block,
+            )
+            for source in sources
+        )
+        result.append(
+            ProvisionalDiscoveryIoc(
+                id=uuid5(
+                    NAMESPACE_URL,
+                    f"{sources[0].id}:ioc:{normalized or raw_value}",
+                ),
+                raw_value=raw_value,
+                normalized_value=normalized,
+                declared_type=declared,
+                proposed_type=proposed,
+                publication_relations=relations,
+                model_run_id=None,
+                markdown_block=markdown_block,
+                warnings=tuple(dict.fromkeys(warnings)),
+            )
+        )
+    return result
+
+
+def _split_ioc_values(value: str | None) -> list[str]:
+    if value is None or _normalize_enum(value) in {"none", "unknown"}:
+        return []
+    values: list[str] = []
+    for line in value.splitlines():
+        cleaned = re.sub(r"^\s*[-*]\s+", "", line).strip()
+        values.extend(item.strip() for item in re.split(r"[,;]", cleaned) if item.strip())
+    return [item for item in values if _normalize_enum(item) not in {"none", "unknown"}]
+
+
+def _classify_ioc(value: str) -> tuple[DiscoveryIocType, str | None, tuple[str, ...]]:
+    raw = value.strip()
+    try:
+        address = ipaddress.ip_address(raw)
+    except ValueError:
+        pass
+    else:
+        kind = DiscoveryIocType.IPV4 if address.version == 4 else DiscoveryIocType.IPV6
+        return kind, address.compressed, ()
+    if re.fullmatch(r"[0-9a-fA-F]{32}", raw):
+        return DiscoveryIocType.MD5, raw.lower(), ()
+    if re.fullmatch(r"[0-9a-fA-F]{40}", raw):
+        return DiscoveryIocType.SHA1, raw.lower(), ()
+    if re.fullmatch(r"[0-9a-fA-F]{64}", raw):
+        return DiscoveryIocType.SHA256, raw.lower(), ()
+    if re.fullmatch(r"CVE-\d{4}-\d{4,}", raw, re.IGNORECASE):
+        return DiscoveryIocType.CVE, raw.upper(), ()
+    if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", raw):
+        return DiscoveryIocType.EMAIL, raw.casefold(), ()
+    try:
+        canonical_url = canonicalize_http_url(raw)
+    except ValueError:
+        pass
+    else:
+        return DiscoveryIocType.URL, canonical_url, ()
+    if re.fullmatch(
+        r"(?=.{1,253}\Z)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
+        r"[a-zA-Z]{2,63}",
+        raw,
+    ):
+        return DiscoveryIocType.DOMAIN, raw.casefold().rstrip("."), ()
+    return DiscoveryIocType.OTHER, None, ("ambiguous_text",)
+
+
+def _declared_ioc_type(value: str) -> DiscoveryIocType:
+    aliases = {
+        "ip": DiscoveryIocType.UNKNOWN,
+        "ipv4": DiscoveryIocType.IPV4,
+        "ipv6": DiscoveryIocType.IPV6,
+        "domain": DiscoveryIocType.DOMAIN,
+        "domaine": DiscoveryIocType.DOMAIN,
+        "url": DiscoveryIocType.URL,
+        "md5": DiscoveryIocType.MD5,
+        "sha1": DiscoveryIocType.SHA1,
+        "sha_1": DiscoveryIocType.SHA1,
+        "sha256": DiscoveryIocType.SHA256,
+        "sha_256": DiscoveryIocType.SHA256,
+        "email": DiscoveryIocType.EMAIL,
+        "cve": DiscoveryIocType.CVE,
+        "other": DiscoveryIocType.OTHER,
+        "unknown": DiscoveryIocType.UNKNOWN,
+    }
+    return aliases.get(_normalize_enum(value), DiscoveryIocType.UNKNOWN)
+
+
+def _deduplicate_provisional_iocs(
+    values: list[ProvisionalDiscoveryIoc],
+) -> list[ProvisionalDiscoveryIoc]:
+    unique: dict[str, ProvisionalDiscoveryIoc] = {}
+    for value in values:
+        key = value.normalized_value or f"raw:{value.raw_value}"
+        existing = unique.get(key)
+        if existing is None:
+            unique[key] = value
+            continue
+        existing.publication_relations = tuple(
+            dict.fromkeys((*existing.publication_relations, *value.publication_relations))
+        )
+        existing.warnings = tuple(dict.fromkeys((*existing.warnings, *value.warnings)))
+    return list(unique.values())
 
 
 def _is_contract_echo(report: str) -> bool:
@@ -574,7 +715,9 @@ def _is_contract_echo(report: str) -> bool:
 
 
 def _normalize_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", _normalize_text(value)).strip("_")
+    escaped = value.replace(r"\_", "_")
+    normalized = re.sub(r"[^a-z0-9]+", "_", _normalize_text(escaped)).strip("_")
+    return _KEY_ALIASES.get(normalized, normalized)
 
 
 def _normalize_text(value: str) -> str:
@@ -587,7 +730,19 @@ def _normalize_text(value: str) -> str:
 def _split_list(value: str, *, normalized: bool = False) -> list[str]:
     cleaned = value.strip().strip("[]")
     items = [item.strip() for item in re.split(r"[,;|]", cleaned) if item.strip()]
-    return [item.casefold() for item in items] if normalized else items
+    return [_normalize_enum(item) for item in items] if normalized else items
+
+
+def _is_explicit_continuation(line: str, current: str) -> bool:
+    if not line.strip() or _SUBJECT.match(line) or _PUBLICATION.match(line):
+        return False
+    if line[:1].isspace():
+        return True
+    return current == "visible_iocs" and bool(re.match(r"^\s*[-*]\s+\S", line))
+
+
+def _normalize_enum(value: str) -> str:
+    return re.sub(r"[-_\s]+", "_", value.replace(r"\_", "_").strip().casefold())
 
 
 def _bounded_int(value: str | None, minimum: int, maximum: int) -> int | None:
@@ -621,6 +776,6 @@ def _enum_or_default(enum_type: Any, value: str | None, default: Any) -> Any:
     if value is None:
         return default
     try:
-        return enum_type(value.strip().casefold())
+        return enum_type(_normalize_enum(value))
     except ValueError:
         return default

@@ -24,10 +24,12 @@ from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobServic
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryIocType,
     DiscoverySourceMode,
     IncompleteSourceCandidate,
     IocPresence,
     PeriodRelation,
+    ProvisionalDiscoveryIoc,
     SourceCandidate,
     SourceRelationshipStatus,
     SourceRole,
@@ -100,6 +102,17 @@ class IncompleteSourceView(BaseModel):
     parsing_warnings: list[str]
 
 
+class ProvisionalIocView(BaseModel):
+    id: UUID
+    raw_value: str
+    normalized_value: str | None
+    declared_type: str
+    proposed_type: DiscoveryIocType
+    status: Literal["provisional_visible"]
+    publication_refs: list[str]
+    warnings: list[str]
+
+
 class CandidateView(BaseModel):
     id: UUID
     batch_id: UUID
@@ -119,6 +132,10 @@ class CandidateView(BaseModel):
     countries: list[str]
     likely_artifacts: list[str]
     iocs: list[str]
+    provisional_iocs: list[ProvisionalIocView]
+    provisional_ioc_count: int
+    provisional_ioc_type_counts: dict[str, int]
+    has_publisher_ioc_count: bool
     editorial_status: Literal["proposed"]
     sources: list[SourceView]
     incomplete_sources: list[IncompleteSourceView]
@@ -149,6 +166,11 @@ class BatchView(BaseModel):
     parser_version: str
     parsing_status: str
     parsing_warnings: list[str]
+    unattached_visible_citations: list[dict[str, str | None]]
+    parsing_revision: int
+    supersedes_batch_id: UUID | None
+    replaced_by_batch_id: UUID | None
+    is_active_revision: bool
     archived_report_url: str
 
 
@@ -208,7 +230,7 @@ async def launch_discovery(
                 idempotency_key=discovery_idempotency_key(parameters),
                 correlation_id=get_correlation_id(),
                 input_parameters=parameters.model_dump(mode="json"),
-                max_attempts=3,
+                max_attempts=1,
                 actor_id=identity.actor_id,
             )
             await dispatcher.dispatch(job.id)
@@ -228,10 +250,14 @@ async def read_candidates(
     min_technical_potential: Annotated[int, Query(ge=0, le=4)] = 0,
     source_status: SourceVerificationStatus | None = None,
     sort: Literal["newest", "technical", "novelty", "title"] = "technical",
+    include_replaced: bool = False,
 ) -> DiscoveryView:
     service: DiscoveryService = request.app.state.discovery_service
-    batches = await service.list_batches(edition_id)
-    candidates = [(batch.id, candidate) for batch in batches for candidate in batch.candidates]
+    batches = await service.list_batches(edition_id, include_replaced=include_replaced)
+    active_batches = [batch for batch in batches if batch.is_active_revision]
+    candidates = [
+        (batch.id, candidate) for batch in active_batches for candidate in batch.candidates
+    ]
     if search:
         needle = search.casefold()
         candidates = [
@@ -376,6 +402,11 @@ def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
         parser_version=batch.parser_version,
         parsing_status=batch.parsing_status,
         parsing_warnings=list(batch.parsing_warnings),
+        unattached_visible_citations=list(batch.unattached_visible_citations),
+        parsing_revision=batch.parsing_revision,
+        supersedes_batch_id=batch.supersedes_batch_id,
+        replaced_by_batch_id=batch.replaced_by_batch_id,
+        is_active_revision=batch.is_active_revision,
         archived_report_url=(
             f"/api/editions/{edition_id}/discovery/reports/{batch.discovery_model_run_id}"
         ),
@@ -383,6 +414,9 @@ def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
 
 
 def _candidate_view(batch_id: UUID, candidate: CandidateTopic) -> CandidateView:
+    type_counts: dict[str, int] = {}
+    for ioc in candidate.provisional_iocs:
+        type_counts[ioc.proposed_type.value] = type_counts.get(ioc.proposed_type.value, 0) + 1
     return CandidateView(
         id=candidate.id,
         batch_id=batch_id,
@@ -402,6 +436,12 @@ def _candidate_view(batch_id: UUID, candidate: CandidateTopic) -> CandidateView:
         countries=list(candidate.countries),
         likely_artifacts=list(candidate.likely_artifacts),
         iocs=list(candidate.iocs),
+        provisional_iocs=[_provisional_ioc_view(ioc) for ioc in candidate.provisional_iocs],
+        provisional_ioc_count=len(candidate.provisional_iocs),
+        provisional_ioc_type_counts=type_counts,
+        has_publisher_ioc_count=any(
+            source.ioc_declared_count is not None for source in candidate.sources
+        ),
         editorial_status="proposed",
         sources=[_source_view(source) for source in candidate.sources],
         incomplete_sources=[
@@ -415,6 +455,21 @@ def _candidate_view(batch_id: UUID, candidate: CandidateTopic) -> CandidateView:
         selectable=candidate.selectable,
         valid_publication_count=len(candidate.sources),
         incomplete_publication_count=len(candidate.incomplete_sources),
+    )
+
+
+def _provisional_ioc_view(ioc: ProvisionalDiscoveryIoc) -> ProvisionalIocView:
+    return ProvisionalIocView(
+        id=ioc.id,
+        raw_value=ioc.raw_value,
+        normalized_value=ioc.normalized_value,
+        declared_type=ioc.declared_type,
+        proposed_type=ioc.proposed_type,
+        status=ioc.status.value,
+        publication_refs=list(
+            dict.fromkeys(relation.publication_ref for relation in ioc.publication_relations)
+        ),
+        warnings=list(ioc.warnings),
     )
 
 

@@ -98,6 +98,9 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
         reprocessed_candidates = await client.get(
             f"/api/editions/{edition.id}/discovery/candidates?sort=technical"
         )
+        reprocessed_diagnostic = await client.get(
+            f"/api/editions/{edition.id}/discovery/candidates?include_replaced=true"
+        )
         source_id = candidates.json()["candidates"][0]["sources"][0]["id"]
         marked = await client.patch(
             f"/api/editions/{edition.id}/discovery/sources/{source_id}",
@@ -115,6 +118,7 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
 
     assert launched.status_code == 202
     assert job.json()["status"] == "succeeded"
+    assert job.json()["max_attempts"] == 1
     assert candidates.json()["total"] == 1
     assert candidates.json()["warning"] == (
         "Les métadonnées et comptes IOC de découverte sont provisoires. Ils seront vérifiés "
@@ -134,9 +138,12 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
     assert duplicate.json()["job_id"] == launched.json()["job_id"]
     assert retried.status_code == 202
     assert retried_job.json()["status"] == "succeeded"
-    assert len(reprocessed_candidates.json()["batches"]) == 2
+    assert len(reprocessed_candidates.json()["batches"]) == 1
+    assert reprocessed_candidates.json()["batches"][0]["parsing_revision"] == 2
+    assert len(reprocessed_diagnostic.json()["batches"]) == 2
+    assert reprocessed_diagnostic.json()["batches"][0]["is_active_revision"] is False
     assert (
-        reprocessed_candidates.json()["batches"][0]["report_sha256"]
-        == (reprocessed_candidates.json()["batches"][1]["report_sha256"])
+        reprocessed_diagnostic.json()["batches"][0]["report_sha256"]
+        == reprocessed_diagnostic.json()["batches"][1]["report_sha256"]
     )
     assert len(fake.calls) == 1  # une recherche ; retraitement strictement local

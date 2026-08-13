@@ -254,6 +254,12 @@ async def test_bridge_visible_citations_are_exposed_as_adapter_metadata() -> Non
             "output_text": "Texte propre",
             "metadata": {
                 "serializer_version": "chatgpt-dom-v2",
+                "completion_signal": "assistant_actions",
+                "completion_confidence": "high",
+                "stable_for_ms": 2100,
+                "output_chars": 12,
+                "visible_citation_count": 1,
+                "content_script_version": "13",
                 "visible_citations": [
                     {
                         "label": "Publisher",
@@ -272,6 +278,12 @@ async def test_bridge_visible_citations_are_exposed_as_adapter_metadata() -> Non
     assert result.output_text == "Texte propre"
     assert result.metadata["serializer_version"] == "chatgpt-dom-v2"
     assert result.metadata["visible_citations"][0]["label"] == "Publisher"
+    assert result.metadata["completion_signal"] == "assistant_actions"
+    assert result.metadata["completion_confidence"] == "high"
+    assert result.metadata["stable_for_ms"] == 2100
+    assert result.metadata["output_chars"] == 12
+    assert result.metadata["visible_citation_count"] == 1
+    assert result.metadata["content_script_version"] == "13"
 
 
 async def test_chatgpt_bridge_transport_uses_native_capabilities() -> None:
