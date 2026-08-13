@@ -22,7 +22,7 @@ describe("JobStatusCard", () => {
           aggregate_type: "edition",
           aggregate_id: "b131b279-d486-4af2-a1b8-c3579583b97e",
           status: "running",
-          progress_current: 1,
+          progress_current: 2,
           progress_total: 4,
           user_message: null,
           attempt: 1,
@@ -33,7 +33,16 @@ describe("JobStatusCard", () => {
           heartbeat_at: startedAt,
           error_code: null,
           error_message: null,
-          error_details: null,
+          error_details: {
+            phase: "background_bridge_wait",
+            model_run_id: "model-run-42",
+            bridge_run_id: "bridge-run-42",
+            last_job_heartbeat: startedAt,
+            bridge_state: "waiting_background",
+            poll_count: 7,
+            elapsed_seconds: 182.5,
+            correlation_id: "discovery-test",
+          },
           correlation_id: "discovery-test",
           output_reference: null,
           cancellation_requested: false,
@@ -59,6 +68,11 @@ describe("JobStatusCard", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/Temps écoulé : [2-9] s/)).toBeInTheDocument();
     expect(screen.queryByText(/Tentative 1\/1/)).not.toBeInTheDocument();
+    expect(screen.getByText("model-run-42")).toBeInTheDocument();
+    expect(screen.getByText("bridge-run-42")).toBeInTheDocument();
+    expect(screen.getByText("waiting_background")).toBeInTheDocument();
+    expect(screen.getByText("182.5 s")).toBeInTheDocument();
+    expect(screen.getByText("discovery-test")).toBeInTheDocument();
   });
 
   it("utilise le suivi HTTP périodique quand EventSource est indisponible", async () => {

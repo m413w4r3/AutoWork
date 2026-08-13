@@ -717,7 +717,7 @@ def _responses_result(
     status = str(raw.get("status", "completed"))
     response_id = _optional_string(raw.get("id"))
     requested_model = _optional_string(raw.get("model")) or "unknown"
-    if status in {"queued", "in_progress"}:
+    if status in {"queued", "running", "in_progress"}:
         return AdapterResult(
             status=AdapterResultStatus.WAITING_BACKGROUND,
             provider=provider,
@@ -725,6 +725,7 @@ def _responses_result(
             actual_model_version=requested_model,
             response_id=response_id,
             usage=_usage(raw.get("usage")),
+            metadata={"background_status": status},
         )
     if status != "completed":
         raise ModelGatewayError(f"Model response reached terminal status {status}")

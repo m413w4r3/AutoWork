@@ -484,6 +484,62 @@ async def test_three_http_retries_with_same_key_submit_one_prompt_and_replay_res
     assert first["metadata"]["content_script_version"] == "14"
 
 
+async def test_background_bridge_run_returns_immediately_and_is_polled_to_completion(
+    tmp_path: Path,
+) -> None:
+    module = load_bridge()
+    isolated_registry(module, tmp_path)
+    generation_started = asyncio.Event()
+    release_generation = asyncio.Event()
+
+    class ControlledExtension(FakeExtension):
+        async def _respond(self, payload: dict[str, Any]) -> None:
+            if payload["type"] != "prompt":
+                await super()._respond(payload)
+                return
+            self.prompt_count += 1
+            generation_started.set()
+            await release_generation.wait()
+            self.module["bridge"].dispatch(
+                {
+                    "type": "done",
+                    "id": payload["id"],
+                    "event_id": "1",
+                    "text": "snapshot final unique",
+                    "metadata": {
+                        "completion_signal": "assistant_actions",
+                        "completion_confidence": "high",
+                        "stable_for_ms": 2_100,
+                        "output_chars": 21,
+                        "visible_citation_count": 0,
+                        "content_script_version": "14",
+                    },
+                }
+            )
+
+    extension = ControlledExtension(module)
+    module["bridge"].ws = extension
+    request = module["BridgeRunRequest"](input="durable", background=True)
+
+    accepted = await module["create_bridge_run"](request, request_with_key("durable-background"))
+    replay = await module["create_bridge_run"](request, request_with_key("durable-background"))
+    await generation_started.wait()
+    running = await module["retrieve_bridge_run"](accepted["id"])
+
+    assert accepted["status"] in {"queued", "running"}
+    assert replay["id"] == accepted["id"]
+    assert running["status"] == "running"
+    assert extension.prompt_count == 1
+
+    release_generation.set()
+    await module["idempotent_tasks"][accepted["id"]]
+    completed = await module["retrieve_bridge_run"](accepted["id"])
+
+    assert completed["status"] == "completed"
+    assert completed["output_text"] == "snapshot final unique"
+    assert extension.prompt_count == 1
+
+
 async def test_done_snapshot_replaces_rewritten_legacy_chunks(tmp_path: Path) -> None:
     module = load_bridge()
     isolated_registry(module, tmp_path)

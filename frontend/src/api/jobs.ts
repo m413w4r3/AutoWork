@@ -25,6 +25,11 @@ export interface JobView {
     rejected_count?: number;
     model_run_id?: string | null;
     research_model_run_id?: string | null;
+    bridge_run_id?: string | null;
+    last_job_heartbeat?: string;
+    bridge_state?: string;
+    poll_count?: number;
+    elapsed_seconds?: number;
     correlation_id?: string;
     diagnostic_available?: boolean;
     can_retry_structuring?: boolean;

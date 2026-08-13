@@ -61,6 +61,12 @@ Le hash SHA-256 canonique couvre le payload JSON hors `request_id`. La table
 SQLite associe atomiquement clé, hash, `bridge_run_id`, état, timestamps et
 réponse ou erreur finale.
 
+Avec `background=true`, le POST crée ou retrouve ce run puis retourne
+immédiatement son identifiant et l'état `queued`/`running`. Une unique tâche
+détachée pilote l'extension et écrit le snapshot final dans SQLite. Le client
+interroge `GET /v1/bridge/runs/{id}` jusqu'à `completed` ou `failed` ; les
+heartbeats de l'extension ne sont jamais concaténés au contenu final.
+
 - même clé et même payload : même run, jointure si en cours, replay si terminé ;
 - même clé et payload différent : `409 bridge_payload_conflict` ;
 - timeout ou déconnexion du client : la tâche bridge continue et le retry joint

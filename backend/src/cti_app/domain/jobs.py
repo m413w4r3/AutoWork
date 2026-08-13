@@ -101,6 +101,17 @@ class Job:
         self.heartbeat_at = timestamp
         self.updated_at = timestamp
 
+    def record_diagnostics(
+        self,
+        details: dict[str, Any],
+        now: datetime | None = None,
+    ) -> None:
+        self._require_status(JobStatus.RUNNING)
+        timestamp = now or datetime.now(UTC)
+        self.error_details = details
+        self.heartbeat_at = timestamp
+        self.updated_at = timestamp
+
     def wait_for_human(self, message: str, now: datetime | None = None) -> None:
         self._require_status(JobStatus.RUNNING)
         timestamp = now or datetime.now(UTC)
@@ -118,6 +129,7 @@ class Job:
         self.heartbeat_at = timestamp
         self.error_code = None
         self.error_message = None
+        self.error_details = None
         self.updated_at = timestamp
 
     def fail(
@@ -204,11 +216,26 @@ class Job:
         self.next_retry_at = None
         self.updated_at = timestamp
 
-    def recover_abandoned(self, now: datetime | None = None) -> None:
+    def recover_abandoned(
+        self,
+        now: datetime | None = None,
+        *,
+        resume_current_attempt: bool = False,
+    ) -> None:
         self._require_status(JobStatus.RUNNING)
         timestamp = now or datetime.now(UTC)
         if self.cancellation_requested:
             self.mark_cancelled(timestamp)
+        elif resume_current_attempt:
+            # A durable external run survives its worker. Requeueing resumes
+            # the same business attempt; `start()` will restore this counter.
+            self.status = JobStatus.QUEUED
+            self.attempt = max(0, self.attempt - 1)
+            self.next_retry_at = timestamp
+            self.error_code = "worker_interrupted"
+            self.error_message = "La tâche reprend son attente durable après une interruption."
+            self.user_message = "Reprise de l'attente planifiée"
+            self.updated_at = timestamp
         elif self.attempt < self.max_attempts:
             self.status = JobStatus.QUEUED
             self.next_retry_at = timestamp

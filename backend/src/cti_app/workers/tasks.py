@@ -73,6 +73,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             model_gateway,
             bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
             after_discovery=partial(editorial_service.synchronize, resolve_ambiguous=False),
+            background_poll_interval_seconds=settings.discovery_bridge_poll_interval_seconds,
         )
         blob_store = MinioBlobStore(
             Minio(

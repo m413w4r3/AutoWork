@@ -229,29 +229,71 @@ export function JobStatusCard({
             <dt>Phase</dt>
             <dd>{details.phase || "inconnue"}</dd>
           </div>
-          <div>
-            <dt>Validation</dt>
-            <dd>{details.validation_kind || "non applicable"}</dd>
-          </div>
-          <div>
-            <dt>Éléments</dt>
-            <dd>
-              {details.valid_count ?? 0} valides · {details.rejected_count ?? 0}{" "}
-              rejetés
-            </dd>
-          </div>
+          {details.phase !== "background_bridge_wait" ? (
+            <>
+              <div>
+                <dt>Validation</dt>
+                <dd>{details.validation_kind || "non applicable"}</dd>
+              </div>
+              <div>
+                <dt>Éléments</dt>
+                <dd>
+                  {details.valid_count ?? 0} valides ·{" "}
+                  {details.rejected_count ?? 0} rejetés
+                </dd>
+              </div>
+            </>
+          ) : null}
           {details.model_run_id ? (
             <div>
               <dt>ModelRun</dt>
               <dd>{details.model_run_id}</dd>
             </div>
           ) : null}
-          <div>
-            <dt>Artefact diagnostic</dt>
-            <dd>
-              {details.diagnostic_available ? "disponible" : "indisponible"}
-            </dd>
-          </div>
+          {details.bridge_run_id ? (
+            <div>
+              <dt>Run bridge</dt>
+              <dd>{details.bridge_run_id}</dd>
+            </div>
+          ) : null}
+          {details.bridge_state ? (
+            <div>
+              <dt>État bridge</dt>
+              <dd>{details.bridge_state}</dd>
+            </div>
+          ) : null}
+          {details.poll_count !== undefined ? (
+            <div>
+              <dt>Interrogations</dt>
+              <dd>{details.poll_count}</dd>
+            </div>
+          ) : null}
+          {details.elapsed_seconds !== undefined ? (
+            <div>
+              <dt>Attente bridge</dt>
+              <dd>{details.elapsed_seconds} s</dd>
+            </div>
+          ) : null}
+          {details.last_job_heartbeat ? (
+            <div>
+              <dt>Dernier heartbeat du job</dt>
+              <dd>{details.last_job_heartbeat}</dd>
+            </div>
+          ) : null}
+          {details.correlation_id ? (
+            <div>
+              <dt>Corrélation</dt>
+              <dd>{details.correlation_id}</dd>
+            </div>
+          ) : null}
+          {details.phase !== "background_bridge_wait" ? (
+            <div>
+              <dt>Artefact diagnostic</dt>
+              <dd>
+                {details.diagnostic_available ? "disponible" : "indisponible"}
+              </dd>
+            </div>
+          ) : null}
         </dl>
       ) : null}
       {canRetryStructuring ? (

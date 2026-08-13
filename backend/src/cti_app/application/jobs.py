@@ -73,6 +73,7 @@ class DemoJobParameters(JobParameters):
 class JobDefinition:
     parameter_model: type[JobParameters]
     handler: JobHandler
+    resume_after_worker_loss: bool = False
 
 
 JobHandler = Callable[[JobParameters, "JobExecutionContext"], Awaitable[str | None]]
@@ -87,10 +88,16 @@ class JobRegistry:
         kind: str,
         parameter_model: type[JobParameters],
         handler: JobHandler,
+        *,
+        resume_after_worker_loss: bool = False,
     ) -> None:
         if kind in self._definitions:
             raise ValueError(f"Job kind {kind!r} is already registered")
-        self._definitions[kind] = JobDefinition(parameter_model, handler)
+        self._definitions[kind] = JobDefinition(
+            parameter_model,
+            handler,
+            resume_after_worker_loss=resume_after_worker_loss,
+        )
 
     def validate(self, kind: str, parameters: dict[str, Any]) -> JobParameters:
         definition = self._definition(kind)
@@ -98,6 +105,9 @@ class JobRegistry:
 
     def handler(self, kind: str) -> JobHandler:
         return self._definition(kind).handler
+
+    def resumes_after_worker_loss(self, kind: str) -> bool:
+        return self._definition(kind).resume_after_worker_loss
 
     def _definition(self, kind: str) -> JobDefinition:
         try:
@@ -172,6 +182,28 @@ class JobExecutionContext:
                 await uow.commit()
                 raise JobCancelledError
             job.report_progress(job.progress_current, job.progress_total, job.user_message)
+            await uow.jobs.save(job)
+            await uow.commit()
+
+    async def record_diagnostics(self, details: dict[str, Any]) -> None:
+        async with self._uow_factory() as uow:
+            job = await uow.jobs.get_for_update(self.job_id)
+            if job is None:
+                raise JobNotFoundError(str(self.job_id))
+            if job.cancellation_requested:
+                previous_status = job.status
+                job.mark_cancelled()
+                await uow.jobs.save(job)
+                await _append_job_event(
+                    uow,
+                    job,
+                    previous_status,
+                    "job.cancelled",
+                    "system:worker",
+                )
+                await uow.commit()
+                raise JobCancelledError
+            job.record_diagnostics(details)
             await uow.jobs.save(job)
             await uow.commit()
 
@@ -254,7 +286,9 @@ class JobService:
             abandoned = list(await uow.jobs.list_abandoned(cutoff))
             for job in abandoned:
                 previous_status = job.status
-                job.recover_abandoned()
+                job.recover_abandoned(
+                    resume_current_attempt=self._registry.resumes_after_worker_loss(job.kind)
+                )
                 await uow.jobs.save(job)
                 await _append_job_event(
                     uow, job, previous_status, "job.heartbeat_recovered", "system:recovery"

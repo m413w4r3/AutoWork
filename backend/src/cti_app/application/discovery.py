@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 # ruff: noqa: RUF001 - The exact French business prompt intentionally uses typographic apostrophes.
+import asyncio
 import hashlib
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from typing import Any, Literal, Protocol, cast
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -25,6 +27,7 @@ from cti_app.application.jobs import (
     JobRegistry,
 )
 from cti_app.application.model_gateway import (
+    BackgroundResponsePendingError,
     ConversationContext,
     ModelExecution,
     ModelGatewayError,
@@ -49,7 +52,7 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
     canonicalize_http_url,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelRun
+from cti_app.domain.model_runs import ModelProvider, ModelRun, ModelRunStatus
 from cti_app.logging import get_correlation_id
 
 DISCOVERY_JOB_KIND = "discover_edition"
@@ -197,6 +200,8 @@ class ModelOutputArchive(Protocol):
 
     async def archive_output(self, content: bytes, *, mime_type: str) -> str: ...
 
+    async def resume(self, run_id: UUID) -> ModelExecution: ...
+
     async def record_output_diagnostics(
         self,
         run_id: UUID,
@@ -265,6 +270,8 @@ class DiscoveryService:
         bridge_capabilities_provider: BridgeCapabilitiesProvider | None = None,
         after_discovery: Callable[[UUID], Awaitable[object]] | None = None,
         allow_chatgpt_structuring_fallback: bool = False,
+        background_poll_interval_seconds: float = 5.0,
+        background_waiter: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._uow_factory = uow_factory
         self._research_model = research_model
@@ -274,6 +281,8 @@ class DiscoveryService:
         self._bridge_capabilities_provider = bridge_capabilities_provider
         self._after_discovery = after_discovery
         self._allow_chatgpt_structuring_fallback = allow_chatgpt_structuring_fallback
+        self._background_poll_interval_seconds = background_poll_interval_seconds
+        self._background_waiter = background_waiter
         self._output_archive = (
             cast(ModelOutputArchive, structured_model)
             if all(
@@ -282,6 +291,7 @@ class DiscoveryService:
                     "get_run",
                     "read_output",
                     "archive_output",
+                    "resume",
                     "record_output_diagnostics",
                 )
             )
@@ -312,7 +322,8 @@ class DiscoveryService:
 
         await context.report_progress(1, 4, "Préparation de la recherche sourcée")
         bridge_capabilities = await self._capabilities_snapshot()
-        fresh_conversation_id = uuid4()
+        research_run_id = uuid5(NAMESPACE_URL, f"cti-discovery-model-run:{request_hash}")
+        fresh_conversation_id = uuid5(NAMESPACE_URL, f"cti-discovery-conversation:{request_hash}")
         research_request = ModelRequest(
             text=_research_prompt(parameters),
             prompt_template_id=PROMPT_TEMPLATE_ID,
@@ -329,10 +340,12 @@ class DiscoveryService:
                 "collected_at": datetime.now(UTC).isoformat(),
             },
             parameters={"reasoning": {"effort": "high"}},
+            background=True,
             conversation=ConversationContext(mode="fresh", id=fresh_conversation_id),
+            run_id=research_run_id,
         )
-        await context.report_progress(2, 4, "Recherche web en cours")
-        research = await self._research_model.research(research_request)
+        await context.report_progress(2, 4, "ChatGPT recherche et analyse les sources")
+        research = await self._research_or_resume(research_request, context)
         if not research.output_text:
             raise ModelGatewayError("Research model returned no text")
 
@@ -373,6 +386,141 @@ class DiscoveryService:
             await self._after_discovery(parameters.edition_id)
         await context.report_progress(4, 4, "Candidats proposés — vérification humaine requise")
         return batch
+
+    async def _research_or_resume(
+        self,
+        request: ModelRequest,
+        context: JobExecutionContext,
+    ) -> ModelExecution:
+        """Submit once, then durably poll the persisted background ModelRun."""
+        if request.run_id is None:
+            raise ModelGatewayError("Discovery research requires a stable ModelRun id")
+        existing = (
+            await self._output_archive.get_run(request.run_id)
+            if self._output_archive is not None
+            else None
+        )
+        if existing is not None:
+            if existing.status is ModelRunStatus.SUCCEEDED:
+                return await self._completed_execution_from_archive(existing)
+            if existing.status is ModelRunStatus.WAITING_BACKGROUND:
+                return await self._poll_background_research(existing.id, context)
+            if existing.status in {ModelRunStatus.FAILED, ModelRunStatus.BLOCKED}:
+                error = ModelGatewayError(existing.error_message or "Research ModelRun failed")
+                error.code = existing.error_code or "research_failed"
+                raise error
+
+        # RUNNING signifie que l'identité a pu être persistée avant une réponse
+        # HTTP incertaine. Le POST idempotent avec le même run id peut alors
+        # uniquement rejoindre le run bridge ; il ne produit jamais un second clic.
+        execution = await self._research_model.research(request)
+        if execution.run.status is ModelRunStatus.WAITING_BACKGROUND:
+            return await self._poll_background_research(execution.run.id, context)
+        if execution.run.status is ModelRunStatus.SUCCEEDED and not execution.output_text:
+            return await self._completed_execution_from_archive(execution.run)
+        return execution
+
+    async def _poll_background_research(
+        self,
+        model_run_id: UUID,
+        context: JobExecutionContext,
+    ) -> ModelExecution:
+        if self._output_archive is None:
+            raise ModelGatewayError("Background research cannot be resumed")
+        started = time.monotonic()
+        polls = 0
+        while True:
+            await context.check_cancelled()
+            await context.heartbeat()
+            current = await self._output_archive.get_run(model_run_id)
+            if current is None:
+                raise ModelGatewayError(f"Model run {model_run_id} does not exist")
+            if current.status is ModelRunStatus.SUCCEEDED:
+                return await self._completed_execution_from_archive(current)
+            if current.status in {ModelRunStatus.FAILED, ModelRunStatus.BLOCKED}:
+                error = ModelGatewayError(current.error_message or "Research ModelRun failed")
+                error.code = current.error_code or "research_failed"
+                raise error
+            try:
+                execution = await self._output_archive.resume(model_run_id)
+            except BackgroundResponsePendingError as exc:
+                polls += 1
+                await self._record_background_observation(
+                    context,
+                    model_run_id=model_run_id,
+                    bridge_run_id=exc.response_id or current.response_id,
+                    bridge_state=exc.background_status,
+                    polls=polls,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+                await self._background_waiter(self._background_poll_interval_seconds)
+                continue
+            polls += 1
+            await self._record_background_observation(
+                context,
+                model_run_id=model_run_id,
+                bridge_run_id=execution.run.response_id or current.response_id,
+                bridge_state="completed",
+                polls=polls,
+                elapsed_seconds=time.monotonic() - started,
+            )
+            if execution.run.status is not ModelRunStatus.SUCCEEDED:
+                raise ModelGatewayError("Background research returned a non-terminal result")
+            if execution.output_text:
+                return execution
+            return await self._completed_execution_from_archive(execution.run)
+
+    @staticmethod
+    async def _record_background_observation(
+        context: JobExecutionContext,
+        *,
+        model_run_id: UUID,
+        bridge_run_id: str | None,
+        bridge_state: str,
+        polls: int,
+        elapsed_seconds: float,
+    ) -> None:
+        job_heartbeat_at = datetime.now(UTC).isoformat()
+        correlation_id = get_correlation_id()
+        await context.record_diagnostics(
+            {
+                "phase": "background_bridge_wait",
+                "model_run_id": str(model_run_id),
+                "bridge_run_id": bridge_run_id,
+                "last_job_heartbeat": job_heartbeat_at,
+                "bridge_state": bridge_state,
+                "poll_count": polls,
+                "elapsed_seconds": round(elapsed_seconds, 3),
+                "correlation_id": correlation_id,
+            }
+        )
+        logger.info(
+            "discovery_background_poll model_run_id=%s bridge_run_id=%s "
+            "job_heartbeat_at=%s bridge_state=%s poll_count=%s elapsed_seconds=%.3f "
+            "correlation_id=%s",
+            model_run_id,
+            bridge_run_id or "pending",
+            job_heartbeat_at,
+            bridge_state,
+            polls,
+            elapsed_seconds,
+            correlation_id,
+        )
+
+    async def _completed_execution_from_archive(self, run: ModelRun) -> ModelExecution:
+        if self._output_archive is None or not run.output_references:
+            raise ModelGatewayError("Completed research has no archived output")
+        output = await self._output_archive.read_output(
+            run.output_references[0], max_bytes=10_000_000
+        )
+        text = output.decode("utf-8")
+        if not text.strip():
+            raise ModelGatewayError("Completed research output is empty")
+        return ModelExecution(
+            run=run,
+            output_text=text,
+            metadata={"visible_citations": list(run.visible_citations)},
+        )
 
     async def _structure(
         self,
@@ -769,7 +917,12 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
             ) from exc
         return f"discovery-batch://{batch.id}"
 
-    registry.register(DISCOVERY_JOB_KIND, DiscoverEditionParameters, handler)
+    registry.register(
+        DISCOVERY_JOB_KIND,
+        DiscoverEditionParameters,
+        handler,
+        resume_after_worker_loss=True,
+    )
 
     async def retry_handler(parameters: JobParameters, context: JobExecutionContext) -> str:
         if not isinstance(parameters, RetryStructuringParameters):

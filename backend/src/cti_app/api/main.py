@@ -83,6 +83,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
         after_discovery=partial(editorial_service.synchronize, resolve_ambiguous=False),
         allow_chatgpt_structuring_fallback=settings.discovery_chatgpt_structuring_fallback,
+        background_poll_interval_seconds=settings.discovery_bridge_poll_interval_seconds,
     )
     collection_service = SubjectCollectionService(
         uow_factory,

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date
-from uuid import UUID, uuid4
+from datetime import UTC, date, datetime, timedelta
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -18,6 +18,7 @@ from cti_app.application.discovery import (
     ResearchTopic,
     _research_prompt,
     discovery_idempotency_key,
+    discovery_request_hash,
 )
 from cti_app.application.jobs import (
     DuplicateJobError,
@@ -28,6 +29,7 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.model_gateway import (
     AdapterResult,
+    AdapterResultStatus,
     ModelGateway,
     ModelRouter,
     SafeModelRequest,
@@ -40,7 +42,13 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
 )
 from cti_app.domain.jobs import JobStatus
-from cti_app.domain.model_runs import ModelProvider, ModelRole
+from cti_app.domain.model_runs import (
+    ModelProvider,
+    ModelRole,
+    ModelRun,
+    ModelRunStatus,
+    ModelUsage,
+)
 from cti_app.integrations.models import (
     BridgeTransportError,
     FakeModelAdapter,
@@ -78,6 +86,104 @@ class TransientResearchAdapter(FakeModelAdapter):
             "Bridge temporairement indisponible.",
             retryable=True,
         )
+
+
+class DeferredResearchAdapter(FakeModelAdapter):
+    def __init__(
+        self,
+        *,
+        pending_resumes: int = 0,
+        terminal_error: BridgeTransportError | None = None,
+    ) -> None:
+        super().__init__(research_text=research_markdown_fixture())
+        self.pending_resumes = pending_resumes
+        self.terminal_error = terminal_error
+        self.resume_calls = 0
+
+    async def resume(
+        self,
+        response_id: str,
+        *,
+        role: ModelRole,
+        output_schema: type[BaseModel] | None = None,
+    ) -> AdapterResult:
+        del role, output_schema
+        self.resume_calls += 1
+        if self.terminal_error is not None:
+            raise self.terminal_error
+        if self.pending_resumes > 0:
+            self.pending_resumes -= 1
+            return AdapterResult(
+                status=AdapterResultStatus.WAITING_BACKGROUND,
+                provider=self.provider,
+                requested_model=self.requested_model,
+                actual_model_version=self.requested_model,
+                response_id=response_id,
+                usage=ModelUsage(),
+            )
+        return AdapterResult(
+            status=AdapterResultStatus.COMPLETED,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            response_id=response_id,
+            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            output_text=research_markdown_fixture(),
+        )
+
+
+def gateway_for_adapter(
+    adapter: FakeModelAdapter,
+) -> tuple[ModelGateway, InMemoryModelRunUnitOfWorkFactory, InMemoryModelOutputStore]:
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    output_store = InMemoryModelOutputStore()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=adapter,
+            openai_structured=adapter,
+            qwen=adapter,
+            fake=adapter,
+            forced_provider=ModelProvider.FAKE,
+        ),
+        model_uow,
+        output_store,
+    )
+    return gateway, model_uow, output_store
+
+
+def persisted_research_run(
+    params: DiscoverEditionParameters,
+    *,
+    status: ModelRunStatus,
+    output_reference: str | None = None,
+) -> ModelRun:
+    request_hash = discovery_request_hash(params)
+    run = ModelRun(
+        provider=ModelProvider.FAKE,
+        model_role=ModelRole.RESEARCH,
+        requested_model="fake-deterministic-v1",
+        prompt_template_id="monthly-cti-discovery",
+        prompt_template_version="4.0",
+        authorized_input_hash="a" * 64,
+        evidence_pack_hash=request_hash,
+        parameters={},
+        id=uuid5(NAMESPACE_URL, f"cti-discovery-model-run:{request_hash}"),
+    )
+    if status is ModelRunStatus.WAITING_BACKGROUND:
+        run.wait_for_background(
+            response_id="bridge-durable-run",
+            actual_model_version="chatgpt-web",
+            usage=ModelUsage(),
+        )
+    elif status is ModelRunStatus.SUCCEEDED and output_reference is not None:
+        run.succeed(
+            actual_model_version="chatgpt-web",
+            duration_ms=180_000,
+            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            output_references=(output_reference,),
+            response_id="bridge-durable-run",
+        )
+    return run
 
 
 def research_fixture() -> ResearchBatch:
@@ -346,6 +452,222 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     assert fake.calls[1].conversation.mode == "fresh"
     assert fake.calls[1].conversation.id != fake.calls[0].conversation.id
     assert grouped_editions == [params.edition_id, params.edition_id]
+
+
+async def test_discovery_renews_job_heartbeat_while_bridge_remains_running() -> None:
+    adapter = DeferredResearchAdapter(pending_resumes=4)
+    gateway, model_uow, _ = gateway_for_adapter(adapter)
+    discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    recovery_passes: list[list[object]] = []
+    heartbeat_values: list[datetime] = []
+
+    async def poll_cycle(_: float) -> None:
+        running = next(iter(job_uow.state.values()))
+        # Simule un job démarré depuis bien plus de trois anciens timeouts,
+        # tout en laissant son bail courant être renouvelé par le poller.
+        running.started_at = datetime.now(UTC) - timedelta(minutes=10)
+        assert running.heartbeat_at is not None
+        heartbeat_values.append(running.heartbeat_at)
+        recovery_passes.append(list(await jobs.recover_abandoned(timedelta(seconds=120))))
+
+    discovery = DiscoveryService(
+        discovery_uow,
+        gateway,
+        gateway,
+        background_poll_interval_seconds=5,
+        background_waiter=poll_cycle,
+    )
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    params = parameters()
+    job = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="edition",
+        aggregate_id=params.edition_id,
+        idempotency_key=discovery_idempotency_key(params),
+        correlation_id="durable-heartbeat",
+        input_parameters=params.model_dump(mode="json"),
+        max_attempts=1,
+    )
+
+    await dispatcher.dispatch(job.id)
+
+    completed = await jobs.get(job.id)
+    run = next(iter(model_uow.state.values()))
+    assert completed.status is JobStatus.SUCCEEDED
+    assert completed.progress_current == completed.progress_total == 4
+    assert adapter.resume_calls == 5
+    assert len(adapter.calls) == 1
+    assert run.status is ModelRunStatus.SUCCEEDED
+    assert run.response_id is not None
+    assert recovery_passes == [[], [], [], []]
+    assert heartbeat_values == sorted(heartbeat_values)
+    assert len(await discovery.list_batches(params.edition_id)) == 1
+
+
+async def test_worker_restart_resumes_waiting_model_run_by_get_without_second_post() -> None:
+    params = parameters()
+    adapter = DeferredResearchAdapter()
+    gateway, model_uow, _ = gateway_for_adapter(adapter)
+    waiting = persisted_research_run(params, status=ModelRunStatus.WAITING_BACKGROUND)
+    model_uow.state[waiting.id] = waiting
+    discovery = DiscoveryService(
+        InMemoryDiscoveryUnitOfWorkFactory(),
+        gateway,
+        gateway,
+        background_waiter=lambda _: _completed_wait(),
+    )
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    job = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="edition",
+        aggregate_id=params.edition_id,
+        idempotency_key=discovery_idempotency_key(params),
+        correlation_id="worker-restart",
+        input_parameters=params.model_dump(mode="json"),
+        max_attempts=1,
+    )
+    persisted_job = job_uow.state[job.id]
+    persisted_job.start(datetime.now(UTC) - timedelta(minutes=5))
+    persisted_job.report_progress(
+        2,
+        4,
+        "ChatGPT recherche et analyse les sources",
+        datetime.now(UTC) - timedelta(minutes=3),
+    )
+
+    recovered = await jobs.recover_abandoned(timedelta(seconds=120))
+    await dispatcher.dispatch(job.id)
+
+    completed = await jobs.get(job.id)
+    assert [item.id for item in recovered] == [job.id]
+    assert completed.status is JobStatus.SUCCEEDED
+    assert completed.attempt == completed.max_attempts == 1
+    assert adapter.calls == []
+    assert adapter.resume_calls == 1
+    assert len(model_uow.state) == 1
+
+
+async def _completed_wait() -> None:
+    return None
+
+
+async def test_completed_model_run_is_reparsed_after_resume_without_bridge_call() -> None:
+    params = parameters()
+    adapter = DeferredResearchAdapter()
+    gateway, model_uow, output_store = gateway_for_adapter(adapter)
+    reference = await output_store.store(
+        research_markdown_fixture().encode(), mime_type="text/markdown"
+    )
+    completed_run = persisted_research_run(
+        params,
+        status=ModelRunStatus.SUCCEEDED,
+        output_reference=reference,
+    )
+    model_uow.state[completed_run.id] = completed_run
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    job = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="edition",
+        aggregate_id=params.edition_id,
+        idempotency_key=discovery_idempotency_key(params),
+        correlation_id="completed-resume",
+        input_parameters=params.model_dump(mode="json"),
+        max_attempts=1,
+    )
+
+    await dispatcher.dispatch(job.id)
+
+    assert (await jobs.get(job.id)).status is JobStatus.SUCCEEDED
+    assert adapter.calls == []
+    assert adapter.resume_calls == 0
+
+
+async def test_terminal_bridge_error_fails_discovery_without_parsing() -> None:
+    params = parameters()
+    adapter = DeferredResearchAdapter(
+        terminal_error=BridgeTransportError(
+            "bridge_extension_disconnected",
+            "L'extension ChatGPT est déconnectée.",
+            retryable=True,
+        )
+    )
+    gateway, model_uow, _ = gateway_for_adapter(adapter)
+    waiting = persisted_research_run(params, status=ModelRunStatus.WAITING_BACKGROUND)
+    model_uow.state[waiting.id] = waiting
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    job = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="edition",
+        aggregate_id=params.edition_id,
+        idempotency_key=discovery_idempotency_key(params),
+        correlation_id="terminal-bridge-error",
+        input_parameters=params.model_dump(mode="json"),
+        max_attempts=1,
+    )
+
+    await dispatcher.dispatch(job.id)
+
+    failed = await jobs.get(job.id)
+    assert failed.status is JobStatus.FAILED
+    assert failed.error_code == "bridge_extension_disconnected"
+    assert model_uow.state[waiting.id].status is ModelRunStatus.FAILED
+    assert adapter.calls == []
+    assert adapter.resume_calls == 1
+
+
+async def test_human_cancellation_stops_background_polling_without_resubmission() -> None:
+    adapter = DeferredResearchAdapter(pending_resumes=2)
+    gateway, _, _ = gateway_for_adapter(adapter)
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    cancellation_requested = False
+
+    async def cancel_during_wait(_: float) -> None:
+        nonlocal cancellation_requested
+        if not cancellation_requested:
+            cancellation_requested = True
+            running = next(iter(job_uow.state.values()))
+            await jobs.cancel(running.id, actor_id="analyst")
+
+    discovery = DiscoveryService(
+        InMemoryDiscoveryUnitOfWorkFactory(),
+        gateway,
+        gateway,
+        background_waiter=cancel_during_wait,
+    )
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    params = parameters()
+    job = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="edition",
+        aggregate_id=params.edition_id,
+        idempotency_key=discovery_idempotency_key(params),
+        correlation_id="cancel-background",
+        input_parameters=params.model_dump(mode="json"),
+        max_attempts=1,
+    )
+
+    await dispatcher.dispatch(job.id)
+
+    cancelled = await jobs.get(job.id)
+    assert cancelled.status is JobStatus.CANCELLED
+    assert len(adapter.calls) == 1
+    assert adapter.resume_calls == 1
 
 
 async def test_partial_invalid_output_keeps_topics_and_archives_diagnostics() -> None:

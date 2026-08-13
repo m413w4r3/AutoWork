@@ -1,9 +1,28 @@
 # Découverte CTI mensuelle
 
 Le parcours comporte trois étapes visibles : recherche ChatGPT, analyse locale du rapport,
-puis sélection éditoriale. Une recherche normale effectue un seul `POST /v1/bridge/runs` dans
-une conversation `fresh`. Le bridge archive la réponse dans le `ModelRun` de recherche avant
-que l'application ne la parse. L'API OpenAI officielle n'est pas utilisée.
+puis sélection éditoriale. Une recherche normale effectue un seul `POST /v1/bridge/runs` avec
+`background=true` dans une conversation `fresh`. Le bridge répond immédiatement avec l'identité
+SQLite durable du run ; le worker reprend ensuite exclusivement par `GET /v1/bridge/runs/{id}`
+jusqu'au snapshot final. L'API OpenAI officielle n'est pas utilisée.
+
+Pendant cette attente, le `ModelRun` reste en `WAITING_BACKGROUND` et le job reste à l'étape 2/4
+« ChatGPT recherche et analyse les sources ». Chaque poll vérifie l'annulation et renouvelle le
+heartbeat PostgreSQL, indépendamment des heartbeats WebSocket entre l'extension et le bridge.
+L'intervalle est configurable par `DISCOVERY_BRIDGE_POLL_INTERVAL_SECONDS` (5 secondes par
+défaut, borné entre 3 et 10 secondes). Un run de dix à quinze minutes reste donc actif sans
+modifier le timeout de récupération des jobs.
+
+L'identité du ModelRun et de la conversation est déterministe pour une même demande. Après un
+redémarrage du worker, un run `WAITING_BACKGROUND` reprend par GET, et un run `SUCCEEDED` relit
+directement son blob. La récupération de bail reprend le même essai métier même avec
+`max_attempts=1` ; elle ne crée ni ModelRun, ni conversation, ni second clic. Seule l'action
+humaine explicite de relance crée une nouvelle identité.
+
+La vue du job expose pendant l'attente le ModelRun, le run bridge, l'état bridge, le nombre de
+polls, le temps écoulé, le dernier heartbeat du job et l'identifiant de corrélation, sans contenu
+de prompt ni de réponse. Le parsing ne commence qu'après `completed` et n'accepte jamais un
+résultat `queued`, `running`, partiel ou vide.
 
 ## Prompt métier `monthly-cti-discovery` 4.0
 

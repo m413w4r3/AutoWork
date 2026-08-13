@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 
 from cti_app.config import Settings
 
@@ -30,3 +31,14 @@ def test_qwen_trust_boundary_is_explicit(monkeypatch: pytest.MonkeyPatch) -> Non
     settings = Settings(_env_file=None)
 
     assert settings.qwen_is_external is False
+
+
+def test_discovery_bridge_poll_interval_is_configurable_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISCOVERY_BRIDGE_POLL_INTERVAL_SECONDS", "7")
+    assert Settings(_env_file=None).discovery_bridge_poll_interval_seconds == 7
+
+    monkeypatch.setenv("DISCOVERY_BRIDGE_POLL_INTERVAL_SECONDS", "11")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)

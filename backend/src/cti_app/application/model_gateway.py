@@ -51,7 +51,16 @@ class StructuredModelUnavailableError(ModelGatewayError):
 
 
 class BackgroundResponsePendingError(ModelGatewayError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        response_id: str | None = None,
+        background_status: str = "unknown",
+    ) -> None:
+        super().__init__(message)
+        self.response_id = response_id
+        self.background_status = background_status
 
 
 class ModelRoutingHint(StrEnum):
@@ -420,7 +429,11 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     )
                     await uow.model_runs.save(run)
                     await uow.commit()
-                    raise BackgroundResponsePendingError("Background response is still pending")
+                    raise BackgroundResponsePendingError(
+                        "Background response is still pending",
+                        response_id=result.response_id or run.response_id,
+                        background_status=str(result.metadata.get("background_status", "unknown")),
+                    )
                 execution = await self._complete_run(run, result, duration_ms=elapsed_ms)
                 await uow.model_runs.save(run)
                 await uow.commit()

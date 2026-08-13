@@ -5,6 +5,8 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
 }) => {
   const editionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   let searched = false;
+  let jobCompleted = false;
+  let jobPolls = 0;
   let merged = false;
   let selected = false;
   const edition = {
@@ -178,33 +180,34 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
     if (path.endsWith("/discovery/candidates"))
       return route.fulfill({
         json: {
-          batches: searched
-            ? [
-                {
-                  id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-                  complementary_axis: "initial",
-                  queries: [],
-                  citations: [],
-                  discovery_model_run_id:
-                    "ffffffff-ffff-4fff-8fff-ffffffffffff",
-                  structuring_model_run_id:
-                    "ffffffff-ffff-4fff-8fff-ffffffffffff",
-                  created_at: "2026-06-01T00:00:00Z",
-                  source_mode: "model_declared_urls",
-                  bridge_capabilities: {},
-                  citation_count: 0,
-                  source_coverage_complete: false,
-                  source_coverage_incomplete_reason: "non exhaustif",
-                  report_sha256: "a".repeat(64),
-                  parser_version: "chatgpt-markdown-v1",
-                  parsing_status: "completed",
-                  parsing_warnings: [],
-                  archived_report_url: "/report.md",
-                },
-              ]
-            : [],
-          candidates: searched ? [cyfirma, ncc] : [],
-          total: searched ? 2 : 0,
+          batches:
+            searched && jobCompleted
+              ? [
+                  {
+                    id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    complementary_axis: "initial",
+                    queries: [],
+                    citations: [],
+                    discovery_model_run_id:
+                      "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                    structuring_model_run_id:
+                      "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                    created_at: "2026-06-01T00:00:00Z",
+                    source_mode: "model_declared_urls",
+                    bridge_capabilities: {},
+                    citation_count: 0,
+                    source_coverage_complete: false,
+                    source_coverage_incomplete_reason: "non exhaustif",
+                    report_sha256: "a".repeat(64),
+                    parser_version: "chatgpt-markdown-v1",
+                    parsing_status: "completed",
+                    parsing_warnings: [],
+                    archived_report_url: "/report.md",
+                  },
+                ]
+              : [],
+          candidates: searched && jobCompleted ? [cyfirma, ncc] : [],
+          total: searched && jobCompleted ? 2 : 0,
           warning: "provisoire",
         },
       });
@@ -214,38 +217,58 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
         status: 202,
         json: {
           job_id: "99999999-9999-4999-8999-999999999999",
-          status: "succeeded",
+          status: "running",
           reused: false,
         },
       });
     }
-    if (path.startsWith("/api/jobs/"))
+    if (path.endsWith("/events")) return route.fulfill({ status: 204 });
+    if (path.startsWith("/api/jobs/")) {
+      jobPolls += 1;
+      const running = jobPolls === 1;
+      jobCompleted = !running;
       return route.fulfill({
         json: {
           id: "99999999-9999-4999-8999-999999999999",
           kind: "discover_edition",
           aggregate_type: "edition",
           aggregate_id: editionId,
-          status: "succeeded",
-          progress_current: 4,
+          status: running ? "running" : "succeeded",
+          progress_current: running ? 2 : 4,
           progress_total: 4,
-          user_message: "Analyse locale terminée",
+          user_message: running
+            ? "ChatGPT recherche et analyse les sources"
+            : "Analyse locale terminée",
           attempt: 1,
           max_attempts: 1,
           next_retry_at: null,
           started_at: "2026-06-01T00:00:00Z",
-          finished_at: "2026-06-01T00:00:01Z",
-          heartbeat_at: "2026-06-01T00:00:01Z",
+          finished_at: running ? null : "2026-06-01T00:10:02Z",
+          heartbeat_at: running
+            ? "2026-06-01T00:10:00Z"
+            : "2026-06-01T00:10:02Z",
           error_code: null,
           error_message: null,
-          error_details: null,
+          error_details: running
+            ? {
+                phase: "background_bridge_wait",
+                model_run_id: "model-run-e2e",
+                bridge_run_id: "bridge-run-e2e",
+                last_job_heartbeat: "2026-06-01T00:10:00Z",
+                bridge_state: "waiting_background",
+                poll_count: 31,
+                elapsed_seconds: 600,
+                correlation_id: "iran-e2e",
+              }
+            : null,
           correlation_id: "iran-e2e",
           output_reference: "discovery-batch://test",
           cancellation_requested: false,
           created_at: "2026-06-01T00:00:00Z",
-          updated_at: "2026-06-01T00:00:01Z",
+          updated_at: running ? "2026-06-01T00:10:00Z" : "2026-06-01T00:10:02Z",
         },
       });
+    }
     if (path.includes("/editorial-groups")) {
       if (request.method() === "POST" && path.endsWith("/merge")) merged = true;
       if (request.method() === "POST" && path.endsWith("/decisions"))
@@ -266,10 +289,23 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
     return route.fulfill({ status: 404, body: "{}" });
   });
 
+  await page.clock.install({ time: new Date("2026-06-01T00:10:00Z") });
   await page.goto(`/editions/${editionId}`);
   await page
     .getByRole("button", { name: "Rechercher les sujets" })
     .dispatchEvent("click");
+  await expect(
+    page.getByRole("heading", {
+      name: "ChatGPT recherche et analyse les sources",
+    }),
+  ).toBeVisible();
+  await expect(page.getByText("Temps écoulé : 600 s")).toBeVisible();
+  await expect(page.getByText("bridge-run-e2e")).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: cyfirma.title }).first(),
+  ).not.toBeVisible();
+
+  await page.clock.fastForward(2_100);
   await expect(
     page.getByRole("heading", { name: cyfirma.title }).first(),
   ).toBeVisible();

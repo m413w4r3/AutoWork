@@ -530,6 +530,14 @@ background_tasks: Dict[str, asyncio.Task] = {}
 accepting_runs = True
 
 
+def _consume_task_exception(task: asyncio.Task) -> None:
+    """Observe detached failures; the typed result already lives in SQLite."""
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+
+
 async def keepalive_loop() -> None:
     """Ping périodique : réveille le service worker MV3 et détecte les sockets morts."""
     while True:
@@ -1569,7 +1577,10 @@ async def create_bridge_run(req: BridgeRunRequest, http_req: Request):
         )
         try:
             response = await _create_response(
-                _bridge_response_request(req),
+                # Le mode background du contrat natif est géré par ce registre
+                # SQLite. La façade Responses interne doit donc exécuter une
+                # seule génération synchrone dans cette tâche détachée.
+                _bridge_response_request(req).model_copy(update={"background": False}),
                 _BackgroundRequest(),
                 _bridge_controls(req),
                 allow_unverified_model=req.allow_unverified_model,
@@ -1631,6 +1642,16 @@ async def create_bridge_run(req: BridgeRunRequest, http_req: Request):
         # Une déconnexion HTTP ne doit ni annuler ni resoumettre un clic coûteux.
         task = asyncio.create_task(execute_once())
         idempotent_tasks[run_id] = task
+        task.add_done_callback(_consume_task_exception)
+    if req.background:
+        # Le client reprend exclusivement par GET. Le résultat final sera écrit
+        # par execute_once dans SQLite, même si cette requête HTTP disparaît.
+        current = run_registry.get_by_run_id(run_id) or record
+        return {
+            "id": run_id,
+            "object": "response",
+            "status": current["state"],
+        }
     return await asyncio.shield(task)
 
 
@@ -1733,7 +1754,7 @@ async def bridge_capabilities(probe: bool = False, fresh: bool = False):
         "new_chat": True,
         "web_search": "ui_toggle" if search_ok else "prompt_instructed",
         "structured_output": "prompt_and_client_validation",
-        "background": "synchronous_durable_result",
+        "background": "asynchronous_durable_result",
         "streaming": "final_delta_only",
         # Vrai seulement quand le libellé du sélecteur a pu être relu : c'est le
         # modèle *affiché* par l'UI, pas le snapshot exact servi par OpenAI.
