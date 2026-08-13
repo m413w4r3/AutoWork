@@ -23,13 +23,12 @@ from tests.discovery_support import InMemoryDiscoveryUnitOfWorkFactory
 from tests.edition_support import InMemoryEditionUnitOfWorkFactory
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
-from tests.test_discovery import research_fixture
+from tests.test_discovery import research_markdown_fixture
 
 
 async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
     fake = FakeModelAdapter(
-        research_text="Résultat de recherche sourcé.",
-        structured_outputs={"ResearchBatch": research_fixture()},
+        research_text=research_markdown_fixture(),
     )
     gateway = ModelGateway(
         ModelRouter(
@@ -87,14 +86,18 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
             f"/api/editions/{edition.id}/discovery/candidates?sort=technical"
         )
         research_run_id = candidates.json()["batches"][0]["discovery_model_run_id"]
+        report = await client.get(f"/api/editions/{edition.id}/discovery/reports/{research_run_id}")
         retried = await client.post(
-            f"/api/editions/{edition.id}/discovery/structuring/retry",
+            f"/api/editions/{edition.id}/discovery/reports/reprocess",
             json={
                 "research_model_run_id": research_run_id,
                 "complementary_axis": "initial",
             },
         )
         retried_job = await client.get(f"/api/jobs/{retried.json()['job_id']}")
+        reprocessed_candidates = await client.get(
+            f"/api/editions/{edition.id}/discovery/candidates?sort=technical"
+        )
         source_id = candidates.json()["candidates"][0]["sources"][0]["id"]
         marked = await client.patch(
             f"/api/editions/{edition.id}/discovery/sources/{source_id}",
@@ -114,17 +117,26 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
     assert job.json()["status"] == "succeeded"
     assert candidates.json()["total"] == 1
     assert candidates.json()["warning"] == (
-        "Recherche effectuée depuis les citations visibles de ChatGPT. La liste des sources "
-        "et leurs relations seront vérifiées lors de la collecte."
+        "Les métadonnées et comptes IOC de découverte sont provisoires. Ils seront vérifiés "
+        "depuis les documents archivés après la sélection."
     )
+    assert report.status_code == 200
+    assert report.text == research_markdown_fixture()
     assert candidates.json()["batches"][0]["source_coverage_complete"] is False
     assert candidates.json()["candidates"][0]["sources"][0]["relationship_status"] == (
         "provisional"
     )
     assert candidates.json()["candidates"][0]["editorial_status"] == "proposed"
+    assert candidates.json()["candidates"][0]["selectable"] is True
+    assert candidates.json()["candidates"][0]["valid_publication_count"] == 3
     assert marked.json()["verification_status"] == "verify_later"
     assert duplicate.json()["reused"] is True
     assert duplicate.json()["job_id"] == launched.json()["job_id"]
     assert retried.status_code == 202
     assert retried_job.json()["status"] == "succeeded"
-    assert len(fake.calls) == 3  # recherche + structuration nominale + structuration seule
+    assert len(reprocessed_candidates.json()["batches"]) == 2
+    assert (
+        reprocessed_candidates.json()["batches"][0]["report_sha256"]
+        == (reprocessed_candidates.json()["batches"][1]["report_sha256"])
+    )
+    assert len(fake.calls) == 1  # une recherche ; retraitement strictement local

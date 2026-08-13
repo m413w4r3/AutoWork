@@ -14,6 +14,10 @@ const bridgeErrors: Record<
   string,
   { message: string; kind: "transient" | "configuration" | "terminal" }
 > = {
+  bridge_unavailable: {
+    message: "Le bridge ChatGPT est inaccessible.",
+    kind: "transient",
+  },
   bridge_unreachable: {
     message: "Le bridge ChatGPT est inaccessible.",
     kind: "transient",
@@ -97,11 +101,11 @@ function useJobTracking(jobId: string) {
 export function JobStatusCard({
   jobId,
   onTerminal,
-  onRetryStructuring,
+  onReprocessReport,
 }: {
   jobId: string;
   onTerminal?: (status: JobStatus) => void;
-  onRetryStructuring?: (researchModelRunId: string) => void;
+  onReprocessReport?: (researchModelRunId: string) => void;
 }) {
   const job = useJobTracking(jobId);
   const queryClient = useQueryClient();
@@ -146,7 +150,7 @@ export function JobStatusCard({
     job.data.status === "failed" &&
     details?.can_retry_structuring === true &&
     typeof details.research_model_run_id === "string" &&
-    Boolean(onRetryStructuring);
+    Boolean(onReprocessReport);
 
   return (
     <article className={`job-card job-card--${job.data.status}`}>
@@ -230,10 +234,10 @@ export function JobStatusCard({
         <button
           className="button button--secondary"
           onClick={() =>
-            onRetryStructuring?.(details.research_model_run_id as string)
+            onReprocessReport?.(details.research_model_run_id as string)
           }
         >
-          Retenter la structuration
+          Retraiter le rapport archivé
         </button>
       ) : null}
       {canRetry ? (

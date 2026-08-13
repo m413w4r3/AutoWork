@@ -68,3 +68,27 @@ async def test_optimistic_concurrency_and_complete_audit() -> None:
         "edition.transitioned",
     ]
     assert all(event.actor_id == "dev-analyst" for event in audit)
+
+
+async def test_delete_removes_edition_and_its_audit() -> None:
+    factory = InMemoryEditionUnitOfWorkFactory()
+    service = EditionService(factory)
+    edition = await service.create(
+        country="Iran",
+        country_code="IR",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        tlp=TLP.AMBER,
+        languages=("fr", "en"),
+        target_major_articles=2,
+        target_briefs=6,
+        previous_edition_id=None,
+        source_profile="iran-default",
+        actor_id="dev-analyst",
+        correlation_id="delete-test",
+    )
+
+    await service.delete(edition.id, expected_version=edition.version)
+
+    assert edition.id not in factory.state
+    assert factory.events == []

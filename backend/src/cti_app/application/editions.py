@@ -208,6 +208,19 @@ class EditionService:
                 raise EditionNotFoundError(str(edition_id))
             return list(await uow.edition_audit.list_for_edition(edition_id))
 
+    async def delete(self, edition_id: UUID, *, expected_version: int) -> None:
+        """Permanently remove an edition and all of its edition-owned records."""
+        async with self._uow_factory() as uow:
+            edition = await uow.editions.get(edition_id)
+            if edition is None:
+                raise EditionNotFoundError(str(edition_id))
+            if edition.version != expected_version:
+                raise EditionConcurrencyError("Edition was modified by another request")
+            await uow.edition_audit.delete_for_edition(edition_id)
+            if not await uow.editions.delete(edition_id, expected_version):
+                raise EditionConcurrencyError("Edition was modified by another request")
+            await uow.commit()
+
     @staticmethod
     async def _validate_previous(
         uow: EditionUnitOfWork, previous_edition_id: UUID | None, edition_id: UUID

@@ -104,6 +104,8 @@ class EditionRepository(Protocol):
 
     async def update(self, edition: Edition, expected_version: int) -> bool: ...
 
+    async def delete(self, edition_id: UUID, expected_version: int) -> bool: ...
+
     async def list(
         self,
         *,
@@ -120,6 +122,8 @@ class EditionAuditRepository(Protocol):
     async def append(self, event: EditionAuditEvent) -> None: ...
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[EditionAuditEvent]: ...
+
+    async def delete_for_edition(self, edition_id: UUID) -> None: ...
 
 
 class ModelRunRepository(Protocol):

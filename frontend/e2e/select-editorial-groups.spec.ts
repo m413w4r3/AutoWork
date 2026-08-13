@@ -129,7 +129,9 @@ test("sélectionne une brève et un article principal depuis le board", async ({
   expect(selections).toEqual(["brief", "major"]);
   await expect(
     page
-      .getByText(/Recherche effectuée depuis les citations visibles de ChatGPT/)
+      .getByText(
+        /Les métadonnées et comptes IOC de découverte sont provisoires/,
+      )
       .first(),
   ).toBeVisible();
 });

@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from uuid import UUID
 
 import dramatiq
@@ -71,7 +72,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             model_gateway,
             model_gateway,
             bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
-            after_discovery=editorial_service.synchronize,
+            after_discovery=partial(editorial_service.synchronize, resolve_ambiguous=False),
         )
         blob_store = MinioBlobStore(
             Minio(

@@ -5,6 +5,7 @@ from typing import Annotated, Literal, NoReturn
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.discovery import (
@@ -16,6 +17,7 @@ from cti_app.application.discovery import (
     SourceCandidateNotFoundError,
     discovery_idempotency_key,
 )
+from cti_app.application.discovery_report_parser import ReportParsingError
 from cti_app.application.editions import EditionNotFoundError, EditionService
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobService
@@ -23,6 +25,9 @@ from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
     DiscoverySourceMode,
+    IncompleteSourceCandidate,
+    IocPresence,
+    PeriodRelation,
     SourceCandidate,
     SourceRelationshipStatus,
     SourceRole,
@@ -43,6 +48,7 @@ class DiscoveryLaunch(BaseModel):
     complementary_axis: str = Field(default="initial", min_length=1, max_length=500)
     sensitivity: str = Field(default="internal", min_length=1, max_length=64)
     external_llm_allowed: bool = True
+    confirm_new_research: bool = False
 
 
 class DiscoveryLaunchView(BaseModel):
@@ -59,16 +65,39 @@ class SourceView(BaseModel):
     id: UUID
     url: str
     canonical_url: str
+    raw_url: str | None
+    local_ref: str | None
+    source_ref: str
     title: str
     publisher: str
     role: SourceRole
     published_at: date | None
     event_date: date | None
     citation: str | None
+    period_relation: PeriodRelation
+    ioc_presence: IocPresence
+    ioc_declared_count: int | None
+    ioc_visible_count: int | None
+    parsing_warnings: list[str]
     verification_status: SourceVerificationStatus
     relationship_status: SourceRelationshipStatus
     verification_changed_at: datetime | None
     verification_changed_by: str | None
+
+
+class IncompleteSourceView(BaseModel):
+    id: UUID
+    title: str
+    publisher: str
+    raw_url: str | None
+    local_ref: str | None
+    published_at: date | None
+    period_relation: PeriodRelation
+    role: SourceRole
+    ioc_presence: IocPresence
+    ioc_declared_count: int | None
+    ioc_visible_count: int | None
+    parsing_warnings: list[str]
 
 
 class CandidateView(BaseModel):
@@ -92,6 +121,15 @@ class CandidateView(BaseModel):
     iocs: list[str]
     editorial_status: Literal["proposed"]
     sources: list[SourceView]
+    incomplete_sources: list[IncompleteSourceView]
+    local_ref: str | None
+    actor_or_campaign: str
+    technical_potential_reason: str
+    parsing_warnings: list[str]
+    context_only: bool
+    selectable: bool
+    valid_publication_count: int
+    incomplete_publication_count: int
 
 
 class BatchView(BaseModel):
@@ -107,6 +145,11 @@ class BatchView(BaseModel):
     citation_count: int
     source_coverage_complete: bool
     source_coverage_incomplete_reason: str | None
+    report_sha256: str | None
+    parser_version: str
+    parsing_status: str
+    parsing_warnings: list[str]
+    archived_report_url: str
 
 
 class DiscoveryView(BaseModel):
@@ -114,8 +157,8 @@ class DiscoveryView(BaseModel):
     candidates: list[CandidateView]
     total: int
     warning: str = (
-        "Recherche effectuée depuis les citations visibles de ChatGPT. La liste des sources "
-        "et leurs relations seront vérifiées lors de la collecte."
+        "Les métadonnées et comptes IOC de découverte sont provisoires. Ils seront vérifiés "
+        "depuis les documents archivés après la sélection."
     )
 
 
@@ -154,6 +197,7 @@ async def launch_discovery(
             tlp=edition.tlp,
             sensitivity=payload.sensitivity,
             external_llm_allowed=payload.external_llm_allowed,
+            research_nonce=uuid4() if payload.confirm_new_research else None,
         )
         identity = await provider.current()
         try:
@@ -212,16 +256,38 @@ async def read_candidates(
     }[sort]
     ordered = sorted(candidates, key=key, reverse=sort != "title")
     return DiscoveryView(
-        batches=[_batch_view(batch) for batch in batches],
+        batches=[_batch_view(edition_id, batch) for batch in batches],
         candidates=[_candidate_view(batch_id, candidate) for batch_id, candidate in ordered],
         total=len(ordered),
     )
 
 
+@router.get("/reports/{research_model_run_id}", response_class=PlainTextResponse)
+async def read_archived_report(
+    edition_id: UUID, research_model_run_id: UUID, request: Request
+) -> PlainTextResponse:
+    service: DiscoveryService = request.app.state.discovery_service
+    try:
+        report = await service.read_archived_report(edition_id, research_model_run_id)
+        return PlainTextResponse(
+            report,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": 'inline; filename="chatgpt-discovery-report.md"'},
+        )
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.post(
+    "/reports/reprocess",
+    response_model=DiscoveryLaunchView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 @router.post(
     "/structuring/retry",
     response_model=DiscoveryLaunchView,
     status_code=status.HTTP_202_ACCEPTED,
+    include_in_schema=False,
 )
 async def retry_structuring(
     edition_id: UUID, payload: StructuringRetryLaunch, request: Request
@@ -262,8 +328,7 @@ async def retry_structuring(
             aggregate_type="edition",
             aggregate_id=edition.id,
             idempotency_key=(
-                f"retry-discovery-structuring:{edition.id}:"
-                f"{payload.research_model_run_id}:{nonce}"
+                f"retry-discovery-structuring:{edition.id}:{payload.research_model_run_id}:{nonce}"
             ),
             correlation_id=get_correlation_id(),
             input_parameters=parameters.model_dump(mode="json"),
@@ -293,7 +358,7 @@ async def mark_source(
         _raise_api_error(exc)
 
 
-def _batch_view(batch: DiscoveryBatch) -> BatchView:
+def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
     return BatchView(
         id=batch.id,
         complementary_axis=batch.complementary_axis,
@@ -307,6 +372,13 @@ def _batch_view(batch: DiscoveryBatch) -> BatchView:
         citation_count=batch.citation_count,
         source_coverage_complete=batch.source_coverage_complete,
         source_coverage_incomplete_reason=batch.source_coverage_incomplete_reason,
+        report_sha256=batch.report_sha256,
+        parser_version=batch.parser_version,
+        parsing_status=batch.parsing_status,
+        parsing_warnings=list(batch.parsing_warnings),
+        archived_report_url=(
+            f"/api/editions/{edition_id}/discovery/reports/{batch.discovery_model_run_id}"
+        ),
     )
 
 
@@ -332,6 +404,17 @@ def _candidate_view(batch_id: UUID, candidate: CandidateTopic) -> CandidateView:
         iocs=list(candidate.iocs),
         editorial_status="proposed",
         sources=[_source_view(source) for source in candidate.sources],
+        incomplete_sources=[
+            _incomplete_source_view(source) for source in candidate.incomplete_sources
+        ],
+        local_ref=candidate.local_ref,
+        actor_or_campaign=candidate.actor_or_campaign,
+        technical_potential_reason=candidate.technical_potential_reason,
+        parsing_warnings=list(candidate.parsing_warnings),
+        context_only=candidate.context_only,
+        selectable=candidate.selectable,
+        valid_publication_count=len(candidate.sources),
+        incomplete_publication_count=len(candidate.incomplete_sources),
     )
 
 
@@ -340,16 +423,41 @@ def _source_view(source: SourceCandidate) -> SourceView:
         id=source.id,
         url=source.url,
         canonical_url=source.canonical_url,
+        raw_url=source.raw_url,
+        local_ref=source.local_ref,
+        source_ref=source.source_ref,
         title=source.title,
         publisher=source.publisher,
         role=source.role,
         published_at=source.published_at,
         event_date=source.event_date,
         citation=source.citation,
+        period_relation=source.period_relation,
+        ioc_presence=source.ioc_presence,
+        ioc_declared_count=source.ioc_declared_count,
+        ioc_visible_count=source.ioc_visible_count,
+        parsing_warnings=list(source.parsing_warnings),
         verification_status=source.verification_status,
         relationship_status=source.relationship_status,
         verification_changed_at=source.verification_changed_at,
         verification_changed_by=source.verification_changed_by,
+    )
+
+
+def _incomplete_source_view(source: IncompleteSourceCandidate) -> IncompleteSourceView:
+    return IncompleteSourceView(
+        id=source.id,
+        title=source.title,
+        publisher=source.publisher,
+        raw_url=source.raw_url,
+        local_ref=source.local_ref,
+        published_at=source.published_at,
+        period_relation=source.period_relation,
+        role=source.role,
+        ioc_presence=source.ioc_presence,
+        ioc_declared_count=source.ioc_declared_count,
+        ioc_visible_count=source.ioc_visible_count,
+        parsing_warnings=list(source.parsing_warnings),
     )
 
 
@@ -358,6 +466,12 @@ def _raise_api_error(exc: Exception) -> NoReturn:
         raise HTTPException(status_code=404, detail={"code": "edition_not_found"}) from exc
     if isinstance(exc, SourceCandidateNotFoundError):
         raise HTTPException(status_code=404, detail={"code": "source_candidate_not_found"}) from exc
+    if isinstance(exc, ReportParsingError):
+        status_code = 404 if exc.code == "report_unavailable" else 422
+        raise HTTPException(
+            status_code=status_code,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
     if isinstance(exc, ValueError):
         raise HTTPException(
             status_code=422,

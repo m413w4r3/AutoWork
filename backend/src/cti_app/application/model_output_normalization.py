@@ -91,9 +91,7 @@ def _decode_unique_object(text: str) -> tuple[Any, bool]:
         outermost = [
             candidate
             for candidate in objects
-            if not any(
-                other[0] < candidate[0] and candidate[1] <= other[1] for other in objects
-            )
+            if not any(other[0] < candidate[0] and candidate[1] <= other[1] for other in objects)
         ]
         if len(outermost) == 1:
             return outermost[0][2], True

@@ -3,7 +3,7 @@ from datetime import UTC, date, datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,6 +35,9 @@ from cti_app.domain.discovery import (
     DiscoveryBatch,
     DiscoveryBatchStatus,
     DiscoverySourceMode,
+    IncompleteSourceCandidate,
+    IocPresence,
+    PeriodRelation,
     SourceCandidate,
     SourceRelationshipStatus,
     SourceRole,
@@ -452,6 +455,190 @@ class SqlAlchemyEditionRepository:
         )
         return result.scalar_one_or_none() is not None
 
+    async def delete(self, edition_id: UUID, expected_version: int) -> bool:
+        """Delete the edition aggregate in dependency order in one transaction."""
+        group_ids = list(
+            await self._session.scalars(
+                select(EditorialGroupRow.id).where(EditorialGroupRow.edition_id == edition_id)
+            )
+        )
+        batch_rows = list(
+            (
+                await self._session.execute(
+                    select(
+                        DiscoveryBatchRow.id,
+                        DiscoveryBatchRow.discovery_model_run_id,
+                        DiscoveryBatchRow.structuring_model_run_id,
+                    ).where(DiscoveryBatchRow.edition_id == edition_id)
+                )
+            ).all()
+        )
+        conversation_ids = list(
+            await self._session.scalars(
+                select(ModelConversationRow.id).where(ModelConversationRow.edition_id == edition_id)
+            )
+        )
+        turn_model_run_ids = list(
+            await self._session.scalars(
+                select(ModelConversationTurnRow.model_run_id).where(
+                    ModelConversationTurnRow.conversation_id.in_(conversation_ids)
+                )
+            )
+        )
+        collection_rows = list(
+            (
+                await self._session.execute(
+                    select(SourceCollectionRow.id, SourceCollectionRow.fetch_job_id).where(
+                        SourceCollectionRow.edition_id == edition_id
+                    )
+                )
+            ).all()
+        )
+        collection_ids = [row.id for row in collection_rows]
+        collection_job_ids = [row.fetch_job_id for row in collection_rows if row.fetch_job_id]
+        claim_model_run_ids = list(
+            await self._session.scalars(
+                select(ClaimRow.model_run_id).where(
+                    ClaimRow.edition_id == edition_id, ClaimRow.model_run_id.is_not(None)
+                )
+            )
+        )
+        draft_model_run_ids = list(
+            await self._session.scalars(
+                select(BriefDraftRow.model_run_id).where(BriefDraftRow.edition_id == edition_id)
+            )
+        )
+        model_run_ids = {
+            *turn_model_run_ids,
+            *claim_model_run_ids,
+            *draft_model_run_ids,
+            *(row.discovery_model_run_id for row in batch_rows),
+            *(row.structuring_model_run_id for row in batch_rows),
+        }
+
+        # Break the two explicit parent/head cycles before deleting their children.
+        if conversation_ids:
+            await self._session.execute(
+                update(ModelConversationRow)
+                .where(ModelConversationRow.id.in_(conversation_ids))
+                .values(head_turn_id=None)
+            )
+            await self._session.execute(
+                delete(ModelConversationTurnRow).where(
+                    ModelConversationTurnRow.conversation_id.in_(conversation_ids)
+                )
+            )
+        if collection_ids:
+            await self._session.execute(
+                update(SourceCollectionRow)
+                .where(SourceCollectionRow.id.in_(collection_ids))
+                .values(latest_attempt_id=None)
+            )
+            await self._session.execute(
+                delete(CollectionAttemptRow).where(
+                    CollectionAttemptRow.collection_id.in_(collection_ids)
+                )
+            )
+
+        await self._session.execute(
+            delete(BriefDraftRow).where(BriefDraftRow.edition_id == edition_id)
+        )
+        await self._session.execute(
+            delete(BriefEvidencePackRow).where(BriefEvidencePackRow.edition_id == edition_id)
+        )
+        await self._session.execute(delete(ClaimRow).where(ClaimRow.edition_id == edition_id))
+        await self._session.execute(
+            delete(IndicatorRow).where(IndicatorRow.edition_id == edition_id)
+        )
+        await self._session.execute(
+            delete(SourceCollectionRow).where(SourceCollectionRow.edition_id == edition_id)
+        )
+        await self._session.execute(
+            delete(HumanDecisionRow).where(HumanDecisionRow.edition_id == edition_id)
+        )
+        if group_ids:
+            await self._session.execute(
+                update(EditorialGroupRow)
+                .where(EditorialGroupRow.potential_historical_group_id.in_(group_ids))
+                .values(potential_historical_group_id=None)
+            )
+        await self._session.execute(
+            delete(EditorialGroupRow).where(EditorialGroupRow.edition_id == edition_id)
+        )
+        await self._session.execute(
+            delete(DiscoveryBatchRow).where(DiscoveryBatchRow.edition_id == edition_id)
+        )
+        await self._session.execute(
+            delete(ModelConversationRow).where(ModelConversationRow.edition_id == edition_id)
+        )
+
+        job_ids = set(collection_job_ids)
+        job_ids.update(
+            await self._session.scalars(
+                select(JobRow.id).where(
+                    JobRow.aggregate_type == "edition", JobRow.aggregate_id == edition_id
+                )
+            )
+        )
+        if job_ids:
+            await self._session.execute(delete(JobEventRow).where(JobEventRow.job_id.in_(job_ids)))
+            await self._session.execute(delete(JobRow).where(JobRow.id.in_(job_ids)))
+
+        await self._session.execute(
+            delete(ProvenanceEventRow).where(
+                ProvenanceEventRow.aggregate_type == "edition",
+                ProvenanceEventRow.aggregate_id == edition_id,
+            )
+        )
+
+        # Model runs have no edition column. Remove only runs reached from this
+        # aggregate which no surviving record still references.
+        if model_run_ids:
+            referenced_run_ids = set(
+                await self._session.scalars(
+                    select(ModelConversationTurnRow.model_run_id).where(
+                        ModelConversationTurnRow.model_run_id.in_(model_run_ids)
+                    )
+                )
+            )
+            referenced_run_ids.update(
+                await self._session.scalars(
+                    select(DiscoveryBatchRow.discovery_model_run_id).where(
+                        DiscoveryBatchRow.discovery_model_run_id.in_(model_run_ids)
+                    )
+                )
+            )
+            referenced_run_ids.update(
+                await self._session.scalars(
+                    select(DiscoveryBatchRow.structuring_model_run_id).where(
+                        DiscoveryBatchRow.structuring_model_run_id.in_(model_run_ids)
+                    )
+                )
+            )
+            for model in (ClaimRow, RejectedModelProposalRow, BriefDraftRow):
+                referenced_run_ids.update(
+                    await self._session.scalars(
+                        select(model.model_run_id).where(model.model_run_id.in_(model_run_ids))
+                    )
+                )
+            deletable_run_ids = model_run_ids - referenced_run_ids
+            if deletable_run_ids:
+                await self._session.execute(
+                    delete(ModelOutputRejectionRow).where(
+                        ModelOutputRejectionRow.model_run_id.in_(deletable_run_ids)
+                    )
+                )
+                await self._session.execute(
+                    delete(ModelRunRow).where(ModelRunRow.id.in_(deletable_run_ids))
+                )
+
+        result = await self._session.execute(
+            delete(EditionRow)
+            .where(EditionRow.id == edition_id, EditionRow.version == expected_version)
+            .returning(EditionRow.id)
+        )
+        return result.scalar_one_or_none() is not None
+
     async def list(
         self,
         *,
@@ -511,6 +698,12 @@ class SqlAlchemyEditionAuditRepository:
             .order_by(EditionAuditEventRow.occurred_at, EditionAuditEventRow.id)
         )
         return [_edition_audit_from_row(row) for row in rows]
+
+    async def delete_for_edition(self, edition_id: UUID) -> None:
+        await self._session.execute(text("SET LOCAL cti.allow_destructive_edition_delete = 'on'"))
+        await self._session.execute(
+            delete(EditionAuditEventRow).where(EditionAuditEventRow.edition_id == edition_id)
+        )
 
 
 class SqlAlchemyModelRunRepository:
@@ -1468,6 +1661,10 @@ def _discovery_batch_values(batch: DiscoveryBatch) -> dict[str, object]:
         "sensitivity": batch.sensitivity,
         "external_llm_allowed": batch.external_llm_allowed,
         "payload": {
+            "report_sha256": batch.report_sha256,
+            "parser_version": batch.parser_version,
+            "parsing_status": batch.parsing_status,
+            "parsing_warnings": list(batch.parsing_warnings),
             "source_mode": batch.source_mode.value,
             "bridge_capabilities": batch.bridge_capabilities,
             "citation_count": batch.citation_count,
@@ -1506,6 +1703,15 @@ def _candidate_payload(candidate: CandidateTopic) -> dict[str, object]:
         "external_llm_allowed": candidate.external_llm_allowed,
         "editorial_status": candidate.editorial_status,
         "sources": [_source_payload(source) for source in candidate.sources],
+        "incomplete_sources": [
+            _incomplete_source_payload(source) for source in candidate.incomplete_sources
+        ],
+        "local_ref": candidate.local_ref,
+        "actor_or_campaign": candidate.actor_or_campaign,
+        "technical_potential_reason": candidate.technical_potential_reason,
+        "parsing_warnings": list(candidate.parsing_warnings),
+        "markdown_block": candidate.markdown_block,
+        "context_only": candidate.context_only,
     }
 
 
@@ -1513,12 +1719,21 @@ def _source_payload(source: SourceCandidate) -> dict[str, object]:
     return {
         "id": str(source.id),
         "url": source.url,
+        "raw_url": source.raw_url,
+        "local_ref": source.local_ref,
+        "source_ref": source.source_ref,
         "title": source.title,
         "publisher": source.publisher,
         "role": source.role.value,
         "published_at": source.published_at.isoformat() if source.published_at else None,
         "event_date": source.event_date.isoformat() if source.event_date else None,
         "citation": source.citation,
+        "period_relation": source.period_relation.value,
+        "ioc_presence": source.ioc_presence.value,
+        "ioc_declared_count": source.ioc_declared_count,
+        "ioc_visible_count": source.ioc_visible_count,
+        "parsing_warnings": list(source.parsing_warnings),
+        "markdown_block": source.markdown_block,
         "verification_status": source.verification_status.value,
         "relationship_status": source.relationship_status.value,
         "verification_changed_at": (
@@ -1528,6 +1743,24 @@ def _source_payload(source: SourceCandidate) -> dict[str, object]:
         "tlp": source.tlp.value,
         "sensitivity": source.sensitivity,
         "external_llm_allowed": source.external_llm_allowed,
+    }
+
+
+def _incomplete_source_payload(source: IncompleteSourceCandidate) -> dict[str, object]:
+    return {
+        "id": str(source.id),
+        "title": source.title,
+        "publisher": source.publisher,
+        "raw_url": source.raw_url,
+        "local_ref": source.local_ref,
+        "published_at": source.published_at.isoformat() if source.published_at else None,
+        "period_relation": source.period_relation.value,
+        "role": source.role.value,
+        "ioc_presence": source.ioc_presence.value,
+        "ioc_declared_count": source.ioc_declared_count,
+        "ioc_visible_count": source.ioc_visible_count,
+        "parsing_warnings": list(source.parsing_warnings),
+        "markdown_block": source.markdown_block,
     }
 
 
@@ -1547,6 +1780,10 @@ def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
         queries=tuple(payload.get("queries", [])),
         citations=tuple(payload.get("citations", [])),
         candidates=[_candidate_from_payload(item) for item in payload.get("candidates", [])],
+        report_sha256=(str(payload["report_sha256"]) if payload.get("report_sha256") else None),
+        parser_version=str(payload.get("parser_version", "legacy-model-structured")),
+        parsing_status=str(payload.get("parsing_status", "completed")),
+        parsing_warnings=_string_tuple(payload.get("parsing_warnings", [])),
         source_mode=DiscoverySourceMode(
             str(payload.get("source_mode", DiscoverySourceMode.VISIBLE_CITATIONS_ONLY.value))
         ),
@@ -1587,9 +1824,21 @@ def _candidate_from_payload(value: dict[str, object]) -> CandidateTopic:
             _source_from_payload(item)
             for item in cast(list[dict[str, object]], value.get("sources", []))
         ],
+        incomplete_sources=[
+            _incomplete_source_from_payload(item)
+            for item in cast(list[dict[str, object]], value.get("incomplete_sources", []))
+        ],
         tlp=TLP(str(value["tlp"])),
         sensitivity=str(value["sensitivity"]),
         external_llm_allowed=bool(value["external_llm_allowed"]),
+        local_ref=str(value["local_ref"]) if value.get("local_ref") else None,
+        actor_or_campaign=str(value.get("actor_or_campaign", "unknown")),
+        technical_potential_reason=str(
+            value.get("technical_potential_reason", "Non précisé dans le rapport de découverte.")
+        ),
+        parsing_warnings=_string_tuple(value.get("parsing_warnings", [])),
+        markdown_block=(str(value["markdown_block"]) if value.get("markdown_block") else None),
+        context_only=bool(value.get("context_only", False)),
         editorial_status=str(value.get("editorial_status", "proposed")),
     )
 
@@ -1607,6 +1856,24 @@ def _source_from_payload(value: dict[str, object]) -> SourceCandidate:
         published_at=date.fromisoformat(str(published_at)) if published_at else None,
         event_date=date.fromisoformat(str(event_date)) if event_date else None,
         citation=str(value["citation"]) if value.get("citation") is not None else None,
+        raw_url=str(value["raw_url"]) if value.get("raw_url") else None,
+        local_ref=str(value["local_ref"]) if value.get("local_ref") else None,
+        period_relation=PeriodRelation(
+            str(value.get("period_relation", PeriodRelation.UNKNOWN.value))
+        ),
+        ioc_presence=IocPresence(str(value.get("ioc_presence", IocPresence.UNKNOWN.value))),
+        ioc_declared_count=(
+            int(str(value["ioc_declared_count"]))
+            if value.get("ioc_declared_count") is not None
+            else None
+        ),
+        ioc_visible_count=(
+            int(str(value["ioc_visible_count"]))
+            if value.get("ioc_visible_count") is not None
+            else None
+        ),
+        parsing_warnings=_string_tuple(value.get("parsing_warnings", [])),
+        markdown_block=(str(value["markdown_block"]) if value.get("markdown_block") else None),
         verification_status=SourceVerificationStatus(str(value["verification_status"])),
         relationship_status=SourceRelationshipStatus(
             str(value.get("relationship_status", SourceRelationshipStatus.PROVISIONAL.value))
@@ -1620,6 +1887,35 @@ def _source_from_payload(value: dict[str, object]) -> SourceCandidate:
         tlp=TLP(str(value["tlp"])),
         sensitivity=str(value["sensitivity"]),
         external_llm_allowed=bool(value["external_llm_allowed"]),
+    )
+
+
+def _incomplete_source_from_payload(value: dict[str, object]) -> IncompleteSourceCandidate:
+    published_at = value.get("published_at")
+    return IncompleteSourceCandidate(
+        id=UUID(str(value["id"])),
+        title=str(value["title"]),
+        publisher=str(value.get("publisher", "unknown")),
+        raw_url=str(value["raw_url"]) if value.get("raw_url") else None,
+        local_ref=str(value["local_ref"]) if value.get("local_ref") else None,
+        published_at=date.fromisoformat(str(published_at)) if published_at else None,
+        period_relation=PeriodRelation(
+            str(value.get("period_relation", PeriodRelation.UNKNOWN.value))
+        ),
+        role=SourceRole(str(value.get("role", SourceRole.UNKNOWN.value))),
+        ioc_presence=IocPresence(str(value.get("ioc_presence", IocPresence.UNKNOWN.value))),
+        ioc_declared_count=(
+            int(str(value["ioc_declared_count"]))
+            if value.get("ioc_declared_count") is not None
+            else None
+        ),
+        ioc_visible_count=(
+            int(str(value["ioc_visible_count"]))
+            if value.get("ioc_visible_count") is not None
+            else None
+        ),
+        parsing_warnings=_string_tuple(value.get("parsing_warnings", [])),
+        markdown_block=(str(value["markdown_block"]) if value.get("markdown_block") else None),
     )
 
 

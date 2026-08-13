@@ -23,6 +23,7 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
     updated_at: "2026-08-08T00:00:00Z",
   };
   let submitted: Record<string, unknown> | null = null;
+  let deletedUrl: string | null = null;
 
   await page.route(
     (url) => url.pathname.startsWith("/api/editions"),
@@ -38,6 +39,14 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
           contentType: "application/json",
           body: JSON.stringify(edition),
         });
+        return;
+      }
+      if (
+        request.method() === "DELETE" &&
+        new URL(request.url()).pathname.endsWith(edition.id)
+      ) {
+        deletedUrl = request.url();
+        await route.fulfill({ status: 204, body: "" });
         return;
       }
       if (request.url().endsWith(edition.id)) {
@@ -88,4 +97,22 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
     languages: ["fr", "en", "fa"],
     previous_edition_id: null,
   });
+
+  await page
+    .getByRole("button", { name: "Supprimer définitivement l’édition" })
+    .click();
+  const confirmation = page.getByLabel(
+    "Pour confirmer, saisissez le nom du pays : Iran",
+  );
+  await confirmation.fill("IRAN");
+  await expect(
+    page.getByRole("button", { name: "Effacer toutes les données" }),
+  ).toBeDisabled();
+  await confirmation.fill("Iran");
+  await page
+    .getByRole("button", { name: "Effacer toutes les données" })
+    .click();
+
+  await expect(page).toHaveURL("/editions");
+  expect(deletedUrl).toContain(`/api/editions/${edition.id}?version=1`);
 });

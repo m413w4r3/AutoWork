@@ -32,9 +32,7 @@ async def _run(run_id: UUID, export: str | None) -> int:
         if run is None:
             print(f"ModelRun {run_id} introuvable", file=sys.stderr)
             return 2
-        reference = (
-            run.raw_output_reference if export == "raw" else run.normalized_output_reference
-        )
+        reference = run.raw_output_reference if export == "raw" else run.normalized_output_reference
         if export:
             if not reference or not reference.startswith("blob://"):
                 print(f"Artefact {export} indisponible", file=sys.stderr)

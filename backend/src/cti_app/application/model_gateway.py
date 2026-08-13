@@ -532,17 +532,23 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         run.raw_output_chars = len(content.decode(errors="replace"))
         run.serializer_version = _optional_metadata_text(result.metadata, "serializer_version")
         citations = result.metadata.get("visible_citations")
-        run.visible_citations = tuple(
-            item for item in citations if isinstance(item, dict)
-        ) if isinstance(citations, list) else ()
+        run.visible_citations = (
+            tuple(item for item in citations if isinstance(item, dict))
+            if isinstance(citations, list)
+            else ()
+        )
         run.citation_count = len(citations) if isinstance(citations, list) else 0
-        run.extracted_url_count = len(
-            {
-                item.get("canonical_url")
-                for item in citations
-                if isinstance(item, dict) and isinstance(item.get("canonical_url"), str)
-            }
-        ) if isinstance(citations, list) else 0
+        run.extracted_url_count = (
+            len(
+                {
+                    item.get("canonical_url")
+                    for item in citations
+                    if isinstance(item, dict) and isinstance(item.get("canonical_url"), str)
+                }
+            )
+            if isinstance(citations, list)
+            else 0
+        )
         run.succeed(
             actual_model_version=result.actual_model_version,
             duration_ms=duration_ms,

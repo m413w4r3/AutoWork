@@ -11,6 +11,7 @@ import {
 import {
   ApiError,
   createEdition,
+  deleteEdition,
   type Edition,
   type EditionFields,
   type EditionStatus,
@@ -307,6 +308,8 @@ function EditionCreatePage() {
 
 function EditionDetailPage({ editionId }: { editionId: string }) {
   const queryClient = useQueryClient();
+  const [showDeletion, setShowDeletion] = useState(false);
+  const [deletionConfirmation, setDeletionConfirmation] = useState("");
   const edition = useQuery({
     queryKey: ["edition", editionId],
     queryFn: () => getEdition(editionId),
@@ -322,6 +325,14 @@ function EditionDetailPage({ editionId }: { editionId: string }) {
     onSuccess: (updated) => {
       queryClient.setQueryData(["edition", editionId], updated);
       void queryClient.invalidateQueries({ queryKey: ["editions"] });
+    },
+  });
+  const deletion = useMutation({
+    mutationFn: deleteEdition,
+    onSuccess: () => {
+      queryClient.removeQueries({ queryKey: ["edition", editionId] });
+      void queryClient.invalidateQueries({ queryKey: ["editions"] });
+      navigate("/editions");
     },
   });
 
@@ -411,6 +422,65 @@ function EditionDetailPage({ editionId }: { editionId: string }) {
           </div>
         )}
       </section>
+      <section className="danger-zone" aria-labelledby="edition-deletion">
+        <h2 id="edition-deletion">Zone dangereuse</h2>
+        <p>
+          Cette action efface définitivement l’édition et toutes ses données de
+          découverte, de sélection et de production. Elle est irréversible.
+        </p>
+        {!showDeletion ? (
+          <button
+            type="button"
+            className="button button--danger"
+            onClick={() => setShowDeletion(true)}
+          >
+            Supprimer définitivement l’édition
+          </button>
+        ) : (
+          <div className="deletion-confirmation">
+            <label htmlFor="edition-deletion-confirmation">
+              Pour confirmer, saisissez le nom du pays : {current.country}
+            </label>
+            <input
+              id="edition-deletion-confirmation"
+              autoComplete="off"
+              value={deletionConfirmation}
+              onChange={(event) => setDeletionConfirmation(event.target.value)}
+            />
+            {deletion.error ? (
+              <ErrorMessage
+                error={deletion.error}
+                fallback="Suppression impossible."
+              />
+            ) : null}
+            <div className="action-list">
+              <button
+                type="button"
+                className="button button--secondary"
+                disabled={deletion.isPending}
+                onClick={() => {
+                  setShowDeletion(false);
+                  setDeletionConfirmation("");
+                }}
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                className="button button--danger"
+                disabled={
+                  deletion.isPending || deletionConfirmation !== current.country
+                }
+                onClick={() => deletion.mutate(current)}
+              >
+                {deletion.isPending
+                  ? "Suppression…"
+                  : "Effacer toutes les données"}
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
     </section>
   );
 }
@@ -447,6 +517,16 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
       });
     },
   });
+  const relaunch = useMutation({
+    mutationFn: () =>
+      launchDiscovery(editionId, axis.trim() || "initial", true),
+    onSuccess: (result) => {
+      setJobId(result.job_id);
+      void queryClient.invalidateQueries({
+        queryKey: ["discovery", editionId],
+      });
+    },
+  });
   const markSource = useMutation({
     mutationFn: ({
       sourceId,
@@ -458,7 +538,7 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: ["discovery", editionId] }),
   });
-  const retryStructuring = useMutation({
+  const reprocessReport = useMutation({
     mutationFn: (researchModelRunId: string) =>
       retryDiscoveryStructuring(
         editionId,
@@ -474,7 +554,7 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
     <section className="discovery-panel" aria-labelledby="discovery-heading">
       <div className="discovery-heading">
         <div>
-          <p className="eyebrow">Découverte ponctuelle</p>
+          <p className="eyebrow">Découverte mensuelle</p>
           <h2 id="discovery-heading">Sujets candidats</h2>
         </div>
         <button
@@ -485,6 +565,11 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
           {launch.isPending ? "Lancement…" : "Rechercher les sujets"}
         </button>
       </div>
+      <ol className="discovery-steps" aria-label="Étapes de découverte">
+        <li>1. Recherche ChatGPT</li>
+        <li>2. Analyse locale du rapport</li>
+        <li>3. Sélection éditoriale</li>
+      </ol>
       <label className="axis-field">
         Axe de recherche
         <input
@@ -494,8 +579,8 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
         />
       </label>
       <p className="verification-warning" role="note">
-        Recherche effectuée depuis les citations visibles de ChatGPT. La liste
-        des sources et leurs relations seront vérifiées lors de la collecte.
+        Les métadonnées et comptes IOC de découverte sont provisoires. Ils
+        seront vérifiés depuis les documents archivés après la sélection.
       </p>
       {launch.error ? (
         <ErrorMessage error={launch.error} fallback="Recherche impossible." />
@@ -503,8 +588,8 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
       {jobId ? (
         <JobStatusCard
           jobId={jobId}
-          onRetryStructuring={(researchModelRunId) =>
-            retryStructuring.mutate(researchModelRunId)
+          onReprocessReport={(researchModelRunId) =>
+            reprocessReport.mutate(researchModelRunId)
           }
         />
       ) : null}
@@ -577,15 +662,26 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
             </div>
             <p>{candidate.summary}</p>
             <p>
-              <strong>Nouveauté :</strong> {candidate.novelty}
+              <strong>Acteur ou campagne proposé :</strong>{" "}
+              {candidate.actor_or_campaign ?? "unknown"}
             </p>
             <p>
-              <strong>Pertinence :</strong>{" "}
-              {candidate.relevance_reasons.join(", ")}
+              <strong>Potentiel technique :</strong>{" "}
+              {candidate.technical_potential_reason ?? "Non précisé."}
             </p>
             <p>
-              <strong>Matière probable :</strong>{" "}
+              <strong>Artefacts annoncés :</strong>{" "}
               {candidate.likely_artifacts.join(", ") || "non signalée"}
+            </p>
+            <p>
+              <strong>Publications :</strong>{" "}
+              {candidate.valid_publication_count ?? candidate.sources.length}{" "}
+              valides ·{" "}
+              {candidate.incomplete_publication_count ??
+                candidate.incomplete_sources?.length ??
+                0}{" "}
+              incomplètes
+              {candidate.context_only ? " · contexte uniquement" : ""}
             </p>
             {candidate.uncertainties.length ? (
               <div className="uncertainties">
@@ -597,7 +693,17 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
                 </ul>
               </div>
             ) : null}
-            <h4>Sources proposées</h4>
+            {(candidate.parsing_warnings ?? []).length ? (
+              <div className="uncertainties" role="note">
+                <strong>Avertissements de parsing</strong>
+                <ul>
+                  {(candidate.parsing_warnings ?? []).map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            <h4>Publications proposées</h4>
             <ul className="source-list">
               {candidate.sources.map((source) => (
                 <li key={source.id}>
@@ -605,8 +711,21 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
                     {source.title}
                   </a>
                   <span>
-                    {source.role} · {source.verification_status}
+                    {source.publisher} ·{" "}
+                    {source.published_at ?? "date inconnue"}
                   </span>
+                  <span>
+                    {source.period_relation ?? "unknown"} · {source.role} ·{" "}
+                    {source.verification_status}
+                  </span>
+                  <span>
+                    IOC provisoires : {source.ioc_presence ?? "unknown"} ·
+                    déclarés {source.ioc_declared_count ?? "unknown"} · visibles{" "}
+                    {source.ioc_visible_count ?? "unknown"}
+                  </span>
+                  {(source.parsing_warnings ?? []).map((warning) => (
+                    <small key={warning}>{warning}</small>
+                  ))}
                   <select
                     aria-label={`État de ${source.title}`}
                     value={source.verification_status}
@@ -625,13 +744,65 @@ function DiscoveryPanel({ editionId }: { editionId: string }) {
                   </select>
                 </li>
               ))}
+              {(candidate.incomplete_sources ?? []).map((source) => (
+                <li key={source.id}>
+                  <strong>{source.title}</strong>
+                  <span>
+                    Publication incomplète · {source.publisher} · URL{" "}
+                    {source.raw_url ?? "absente"}
+                  </span>
+                  <span>
+                    {source.period_relation} · {source.role} · IOC provisoires :{" "}
+                    {source.ioc_presence}
+                  </span>
+                  {source.parsing_warnings.map((warning) => (
+                    <small key={warning}>{warning}</small>
+                  ))}
+                </li>
+              ))}
             </ul>
           </article>
         ))}
       </div>
       {batches.map((batch) => (
         <details className="research-trace" key={batch.id}>
-          <summary>Requêtes et citations — {batch.complementary_axis}</summary>
+          <summary>Rapport et diagnostic — {batch.complementary_axis}</summary>
+          <p>
+            Parsing : {batch.parsing_status ?? "historique"} · parseur{" "}
+            {batch.parser_version ?? "historique"}
+          </p>
+          <a href={batch.archived_report_url} target="_blank" rel="noreferrer">
+            Consulter le rapport Markdown ChatGPT archivé
+          </a>
+          <p>
+            Le rapport ChatGPT archivé sera réutilisé. Aucun nouvel appel au
+            bridge ne sera effectué.
+          </p>
+          <div className="editorial-actions">
+            <button
+              className="button button--secondary"
+              disabled={reprocessReport.isPending}
+              onClick={() =>
+                reprocessReport.mutate(batch.discovery_model_run_id)
+              }
+            >
+              Retraiter le rapport archivé
+            </button>
+            <button
+              className="button button--secondary"
+              disabled={relaunch.isPending}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    "Relancer la recherche web créera une nouvelle conversation ChatGPT et conservera le rapport actuel. Continuer ?",
+                  )
+                )
+                  relaunch.mutate();
+              }}
+            >
+              Relancer la recherche web
+            </button>
+          </div>
           <h3>Requêtes</h3>
           <ul>
             {batch.queries.map((query) => (

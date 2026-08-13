@@ -10,16 +10,39 @@ export interface SourceCandidate {
   id: string;
   url: string;
   canonical_url: string;
+  raw_url: string | null;
+  local_ref: string | null;
+  source_ref: string;
   title: string;
   publisher: string;
   role: SourceRole;
   published_at: string | null;
   event_date: string | null;
   citation: string | null;
+  period_relation: "in_period" | "outside_period" | "unknown";
+  ioc_presence: "none" | "declared" | "visible" | "unknown";
+  ioc_declared_count: number | null;
+  ioc_visible_count: number | null;
+  parsing_warnings: string[];
   verification_status: SourceVerificationStatus;
   relationship_status: "provisional" | "verified";
   verification_changed_at: string | null;
   verification_changed_by: string | null;
+}
+
+export interface IncompleteSourceCandidate {
+  id: string;
+  title: string;
+  publisher: string;
+  raw_url: string | null;
+  local_ref: string | null;
+  published_at: string | null;
+  period_relation: "in_period" | "outside_period" | "unknown";
+  role: SourceRole;
+  ioc_presence: "none" | "declared" | "visible" | "unknown";
+  ioc_declared_count: number | null;
+  ioc_visible_count: number | null;
+  parsing_warnings: string[];
 }
 
 export interface CandidateTopic {
@@ -43,6 +66,15 @@ export interface CandidateTopic {
   iocs: string[];
   editorial_status: "proposed";
   sources: SourceCandidate[];
+  incomplete_sources: IncompleteSourceCandidate[];
+  local_ref: string | null;
+  actor_or_campaign: string;
+  technical_potential_reason: string;
+  parsing_warnings: string[];
+  context_only: boolean;
+  selectable: boolean;
+  valid_publication_count: number;
+  incomplete_publication_count: number;
 }
 
 export interface DiscoveryBatch {
@@ -62,6 +94,11 @@ export interface DiscoveryBatch {
   citation_count: number;
   source_coverage_complete: boolean;
   source_coverage_incomplete_reason: string | null;
+  report_sha256: string | null;
+  parser_version: string;
+  parsing_status: string;
+  parsing_warnings: string[];
+  archived_report_url: string;
 }
 
 export interface DiscoveryResult {
@@ -80,11 +117,15 @@ export interface DiscoveryLaunchResult {
 export function launchDiscovery(
   editionId: string,
   complementaryAxis: string,
+  confirmNewResearch = false,
 ): Promise<DiscoveryLaunchResult> {
   return request(`/api/editions/${encodeURIComponent(editionId)}/discovery`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ complementary_axis: complementaryAxis }),
+    body: JSON.stringify({
+      complementary_axis: complementaryAxis,
+      confirm_new_research: confirmNewResearch,
+    }),
   });
 }
 
@@ -94,7 +135,7 @@ export function retryDiscoveryStructuring(
   complementaryAxis: string,
 ): Promise<DiscoveryLaunchResult> {
   return request(
-    `/api/editions/${encodeURIComponent(editionId)}/discovery/structuring/retry`,
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/reports/reprocess`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },

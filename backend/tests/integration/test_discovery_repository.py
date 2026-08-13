@@ -6,6 +6,9 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    IncompleteSourceCandidate,
+    IocPresence,
+    PeriodRelation,
     SourceCandidate,
     SourceRole,
     SourceVerificationStatus,
@@ -44,6 +47,12 @@ async def test_discovery_batch_round_trip_and_source_status(
         published_at=date(2026, 7, 10),
         event_date=date(2026, 7, 2),
         citation="Citation conservée",
+        local_ref="P1",
+        raw_url="https://vendor.example/report?utm_source=test",
+        period_relation=PeriodRelation.IN_PERIOD,
+        ioc_presence=IocPresence.DECLARED,
+        ioc_declared_count=12,
+        parsing_warnings=("Compte non vérifié",),
         tlp=TLP.AMBER,
         sensitivity="internal",
         external_llm_allowed=True,
@@ -65,9 +74,21 @@ async def test_discovery_batch_round_trip_and_source_status(
         countries=("Iran",),
         likely_artifacts=("ioc", "configurations"),
         sources=[source],
+        incomplete_sources=[
+            IncompleteSourceCandidate(
+                title="Source sans URL",
+                raw_url="ftp://invalid.example/report",
+                local_ref="P2",
+                parsing_warnings=("no_explicit_url",),
+            )
+        ],
         tlp=TLP.AMBER,
         sensitivity="internal",
         external_llm_allowed=True,
+        local_ref="S1",
+        actor_or_campaign="Example actor",
+        technical_potential_reason="Configurations annoncées.",
+        parsing_warnings=("Métadonnées provisoires",),
     )
     batch = DiscoveryBatch(
         edition_id=edition.id,
@@ -87,6 +108,10 @@ async def test_discovery_batch_round_trip_and_source_status(
         tlp=TLP.AMBER,
         sensitivity="internal",
         external_llm_allowed=True,
+        report_sha256="d" * 64,
+        parser_version="chatgpt-markdown-v1",
+        parsing_status="report_parsing_partial",
+        parsing_warnings=("Métadonnées provisoires",),
     )
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
@@ -102,6 +127,12 @@ async def test_discovery_batch_round_trip_and_source_status(
             persisted_source = persisted.candidates[0].sources[0]
             assert persisted_source.canonical_url == "https://vendor.example/report"
             assert persisted_source.verification_status is SourceVerificationStatus.UNVERIFIED
+            assert persisted_source.source_ref.startswith("source-")
+            assert persisted_source.ioc_declared_count == 12
+            assert persisted.candidates[0].incomplete_sources[0].raw_url == (
+                "ftp://invalid.example/report"
+            )
+            assert persisted.report_sha256 == "d" * 64
             persisted_source.mark(SourceVerificationStatus.INVALID, actor_id="dev-analyst")
             await uow.discovery_batches.save(persisted)
             await uow.commit()
@@ -113,6 +144,16 @@ async def test_discovery_batch_round_trip_and_source_status(
             reread.candidates[0].sources[0].verification_status is SourceVerificationStatus.INVALID
         )
         assert reread.citations[0]["label"] == "Original report"
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.delete(edition.id, edition.version)
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.get(edition.id) is None
+            assert await uow.discovery_batches.get(batch.id) is None
+            assert await uow.model_runs.get(research_run.id) is None
+            assert await uow.model_runs.get(structuring_run.id) is None
     finally:
         await engine.dispose()
 

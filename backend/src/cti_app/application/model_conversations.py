@@ -393,9 +393,7 @@ class ModelConversationService:
         ):
             raise ConversationNotFoundError("Conversation introuvable dans ce sujet")
 
-    async def _read_reference(
-        self, reference: str, blobs: dict[UUID, BlobRecord | None]
-    ) -> str:
+    async def _read_reference(self, reference: str, blobs: dict[UUID, BlobRecord | None]) -> str:
         blob_id = _blob_id(reference)
         if blob_id is None:
             raise ModelConversationError("Référence de blob conversationnel invalide")

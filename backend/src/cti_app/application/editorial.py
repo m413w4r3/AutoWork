@@ -498,6 +498,7 @@ def _candidate_map(batches: Sequence[DiscoveryBatch]) -> dict[CandidateReference
         CandidateReference(batch.id, candidate.id): candidate
         for batch in batches
         for candidate in batch.candidates
+        if candidate.selectable
     }
 
 

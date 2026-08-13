@@ -74,8 +74,8 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
         </div>
       </div>
       <p className="verification-warning" role="note">
-        Recherche effectuée depuis les citations visibles de ChatGPT. La liste
-        des sources et leurs relations seront vérifiées lors de la collecte.
+        Les métadonnées et comptes IOC de découverte sont provisoires. Ils
+        seront vérifiés depuis les documents archivés après la sélection.
       </p>
       <p>
         Le score aide à comparer les groupes. Il ne déclenche jamais une

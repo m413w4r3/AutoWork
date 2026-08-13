@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# ruff: noqa: RUF001 - The exact French business prompt intentionally uses typographic apostrophes.
 import hashlib
 import json
 import logging
@@ -11,6 +12,12 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from cti_app.application.discovery_report_parser import (
+    PARSER_VERSION,
+    ParsedDiscoveryReport,
+    ReportParsingError,
+    parse_discovery_report,
+)
 from cti_app.application.jobs import (
     JobExecutionContext,
     JobHandlerError,
@@ -47,9 +54,11 @@ from cti_app.domain.model_runs import ModelProvider, ModelRun
 from cti_app.logging import get_correlation_id
 
 DISCOVERY_JOB_KIND = "discover_edition"
-RETRY_STRUCTURING_JOB_KIND = "retry_discovery_structuring"
+REPROCESS_DISCOVERY_REPORT_JOB_KIND = "reprocess_discovery_report"
+# Compatibility import for callers compiled against the previous name.
+RETRY_STRUCTURING_JOB_KIND = REPROCESS_DISCOVERY_REPORT_JOB_KIND
 PROMPT_TEMPLATE_ID = "monthly-cti-discovery"
-PROMPT_TEMPLATE_VERSION = "2.0"
+PROMPT_TEMPLATE_VERSION = "3.0"
 COMPACT_CONTRACT_VERSION = "research-batch-compact-v1"
 logger = logging.getLogger(__name__)
 
@@ -142,11 +151,12 @@ class DiscoverEditionParameters(JobParameters):
     tlp: TLP
     sensitivity: str = Field(default="internal", min_length=1, max_length=64)
     external_llm_allowed: bool = True
+    research_nonce: UUID | None = None
 
-    @field_validator("edition_id", mode="before")
+    @field_validator("edition_id", "research_nonce", mode="before")
     @classmethod
     def parse_edition_id(cls, value: object) -> object:
-        return UUID(value) if isinstance(value, str) else value
+        return UUID(value) if isinstance(value, str) and value else value
 
     @field_validator("period_start", "period_end", mode="before")
     @classmethod
@@ -258,6 +268,8 @@ class DiscoveryService:
     ) -> None:
         self._uow_factory = uow_factory
         self._research_model = research_model
+        # Kept as an archive provider for historical ModelRun outputs. Discovery never
+        # calls its structured-extraction method.
         self._structured_model = structured_model
         self._bridge_capabilities_provider = bridge_capabilities_provider
         self._after_discovery = after_discovery
@@ -300,9 +312,7 @@ class DiscoveryService:
 
         await context.report_progress(1, 4, "Préparation de la recherche sourcée")
         bridge_capabilities = await self._capabilities_snapshot()
-        ephemeral_conversation_id = (
-            uuid4() if self._allow_chatgpt_structuring_fallback else None
-        )
+        fresh_conversation_id = uuid4()
         research_request = ModelRequest(
             text=_research_prompt(parameters),
             prompt_template_id=PROMPT_TEMPLATE_ID,
@@ -319,53 +329,33 @@ class DiscoveryService:
                 "collected_at": datetime.now(UTC).isoformat(),
             },
             parameters={"reasoning": {"effort": "high"}},
-            conversation=(
-                ConversationContext(mode="fresh", id=ephemeral_conversation_id)
-                if ephemeral_conversation_id is not None
-                else None
-            ),
+            conversation=ConversationContext(mode="fresh", id=fresh_conversation_id),
         )
         await context.report_progress(2, 4, "Recherche web en cours")
         research = await self._research_model.research(research_request)
         if not research.output_text:
             raise ModelGatewayError("Research model returned no text")
 
-        await context.report_progress(3, 4, "Structuration et validation des propositions")
-        raw_hash = hashlib.sha256(research.output_text.encode()).hexdigest()
-        fallback_conversation = None
-        if ephemeral_conversation_id is not None:
-            if (
-                research.conversation is None
-                or not research.conversation.verified
-                or not research.conversation.external_locator
-            ):
-                raise ModelGatewayError(
-                    "La conversation éphémère de recherche n'a pas été vérifiée."
-                )
-            fallback_conversation = ConversationContext(
-                mode="continue",
-                id=ephemeral_conversation_id,
-                external_locator=research.conversation.external_locator,
-            )
+        await context.report_progress(3, 4, "Analyse locale du rapport archivé")
         try:
-            structured = await self._structure(
-                parameters,
+            parsed = parse_discovery_report(
                 research.output_text,
-                research.metadata.get("visible_citations", []),
-                research.run.id,
-                raw_hash,
-                fallback_conversation=fallback_conversation,
+                visible_citations=research.metadata.get("visible_citations", []),
+                period_start=parameters.period_start,
+                period_end=parameters.period_end,
+                tlp=parameters.tlp,
+                sensitivity=parameters.sensitivity,
+                external_llm_allowed=parameters.external_llm_allowed,
             )
-        except Exception:
-            await self._archive_ephemeral_conversation(ephemeral_conversation_id)
+        except ReportParsingError as exc:
+            exc.research_model_run_id = research.run.id
             raise
-        await self._archive_ephemeral_conversation(ephemeral_conversation_id)
-        batch = _to_domain_batch(
+        await self._record_parser_diagnostics(research.run.id, parsed)
+        batch = _parsed_to_domain_batch(
             parameters,
             request_hash,
-            structured.batch,
+            parsed,
             research.run.id,
-            structured.run_id,
             bridge_capabilities,
         )
         async with self._uow_factory() as uow:
@@ -572,6 +562,7 @@ class DiscoveryService:
         self,
         parameters: DiscoverEditionParameters,
         research_run_id: UUID,
+        retry_nonce: UUID,
         context: JobExecutionContext,
     ) -> DiscoveryBatch:
         if self._output_archive is None:
@@ -582,34 +573,71 @@ class DiscoveryService:
         research_text = (
             await self._output_archive.read_output(run.output_references[0], max_bytes=10_000_000)
         ).decode()
-        await context.report_progress(1, 2, "Reprise du résultat de recherche archivé")
-        structured = await self._structure(
-            parameters,
+        await context.report_progress(1, 2, "Le rapport ChatGPT archivé est réutilisé")
+        parsed = parse_discovery_report(
             research_text,
-            list(run.visible_citations),
-            research_run_id,
-            hashlib.sha256(research_text.encode()).hexdigest(),
+            visible_citations=list(run.visible_citations),
+            period_start=parameters.period_start,
+            period_end=parameters.period_end,
+            tlp=parameters.tlp,
+            sensitivity=parameters.sensitivity,
+            external_llm_allowed=parameters.external_llm_allowed,
         )
-        await context.report_progress(2, 2, "Structuration relancée sans recherche web")
-        batch = _to_domain_batch(
+        await self._record_parser_diagnostics(research_run_id, parsed)
+        await context.report_progress(2, 2, "Analyse locale terminée sans appel au bridge")
+        reparse_hash = hashlib.sha256(
+            f"reparse:{discovery_request_hash(parameters)}:{research_run_id}:{retry_nonce}".encode()
+        ).hexdigest()
+        batch = _parsed_to_domain_batch(
             parameters,
-            discovery_request_hash(parameters),
-            structured.batch,
+            reparse_hash,
+            parsed,
             research_run_id,
-            structured.run_id,
             await self._capabilities_snapshot(),
         )
         async with self._uow_factory() as uow:
-            existing = await uow.discovery_batches.get_by_request_hash(
-                parameters.edition_id, batch.request_hash
-            )
-            if existing is not None:
-                return existing
             await uow.discovery_batches.add_if_absent(batch)
             await uow.commit()
         if self._after_discovery is not None:
             await self._after_discovery(parameters.edition_id)
         return batch
+
+    async def read_archived_report(self, edition_id: UUID, research_run_id: UUID) -> str:
+        if self._output_archive is None:
+            raise ReportParsingError("report_unavailable", "Archive de rapports indisponible.")
+        batches = await self.list_batches(edition_id)
+        if not any(batch.discovery_model_run_id == research_run_id for batch in batches):
+            raise ReportParsingError("report_unavailable", "Rapport archivé introuvable.")
+        run = await self._output_archive.get_run(research_run_id)
+        if run is None or not run.output_references:
+            raise ReportParsingError("report_unavailable", "Rapport archivé introuvable.")
+        content = await self._output_archive.read_output(
+            run.output_references[0], max_bytes=10_000_000
+        )
+        if not content:
+            raise ReportParsingError("report_empty", "Le rapport archivé est vide.")
+        return content.decode(errors="replace")
+
+    async def _record_parser_diagnostics(self, run_id: UUID, parsed: ParsedDiscoveryReport) -> None:
+        if self._output_archive is None:
+            return
+        validation_errors = tuple(
+            {
+                "path": ["report"],
+                "code": warning.split(":", 1)[0][:128],
+                "value_sha256": hashlib.sha256(warning.encode()).hexdigest(),
+            }
+            for warning in parsed.warnings
+        )
+        await self._output_archive.record_output_diagnostics(
+            run_id,
+            normalized_reference=None,
+            normalized_sha256=parsed.report_sha256,
+            parser_stage=("report_parsing_partial" if parsed.status == "partial" else "completed"),
+            normalization_version=PARSER_VERSION,
+            transformations=("deterministic_markdown_parsing",),
+            validation_errors=validation_errors,
+        )
 
     async def _capabilities_snapshot(self) -> dict[str, object]:
         if self._bridge_capabilities_provider is None:
@@ -668,7 +696,7 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
             raise TypeError("Invalid discovery parameters")
         try:
             batch = await service.discover_edition(parameters, context)
-        except ModelGatewayError as exc:
+        except (ModelGatewayError, ReportParsingError) as exc:
             details = None
             if isinstance(exc, DiscoveryStructuringError):
                 details = {
@@ -697,8 +725,23 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
                     "diagnostic_available": True,
                     "can_retry_structuring": True,
                 }
+            elif isinstance(exc, ReportParsingError):
+                details = {
+                    "phase": "local_parsing",
+                    "research_model_run_id": (
+                        str(exc.research_model_run_id)
+                        if exc.research_model_run_id is not None
+                        else None
+                    ),
+                    "correlation_id": get_correlation_id(),
+                    "diagnostic_available": exc.research_model_run_id is not None,
+                    "can_retry_structuring": exc.research_model_run_id is not None,
+                }
+            error_code = str(getattr(exc, "code", "research_failed"))
+            if error_code == "bridge_unreachable":
+                error_code = "bridge_unavailable"
             raise JobHandlerError(
-                str(getattr(exc, "code", "discovery_model_failed")),
+                error_code,
                 str(exc),
                 transient=bool(getattr(exc, "retryable", False)),
                 details=details,
@@ -712,9 +755,12 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
             raise TypeError("Invalid discovery structuring retry parameters")
         try:
             batch = await service.retry_structuring(
-                parameters.discovery, parameters.research_model_run_id, context
+                parameters.discovery,
+                parameters.research_model_run_id,
+                parameters.retry_nonce,
+                context,
             )
-        except ModelGatewayError as exc:
+        except (ModelGatewayError, ReportParsingError) as exc:
             details = {
                 "phase": str(getattr(exc, "phase", "structuring")),
                 "research_model_run_id": str(parameters.research_model_run_id),
@@ -746,36 +792,69 @@ def discovery_idempotency_key(parameters: DiscoverEditionParameters) -> str:
 
 
 def _research_prompt(parameters: DiscoverEditionParameters) -> str:
-    collected_at = datetime.now(UTC).date()
-    future_limit = (
-        "La fin de l'édition est future : ne recherche et n'infère aucun événement postérieur "
-        f"au {collected_at.isoformat()}."
-        if parameters.period_end > collected_at
-        else ""
-    )
+    languages = ", ".join(parameters.languages)
+    period = f"{parameters.period_start.isoformat()} et {parameters.period_end.isoformat()}"
     return f"""Mission : rechercher les publications CTI significatives concernant
-{parameters.country} et ses alias
-{", ".join(parameters.country_aliases)}, entre {parameters.period_start.isoformat()} et
-{parameters.period_end.isoformat()}, dans les langues {", ".join(parameters.languages)}.
-Date réelle de collecte (as_of_date) : {collected_at.isoformat()}. {future_limit}
-Profil effectif de sources : {_source_profile_description(parameters.source_profile)}.
-Axe complémentaire : {parameters.complementary_axis}.
-Mots-clés : {", ".join(parameters.keywords) or "aucun"}. Exclusions :
-{", ".join(parameters.exclusions) or "aucune"}.
+{parameters.country} et ses alias {", ".join(parameters.country_aliases)}, publiées entre
+{period}, dans les langues {languages}.
 
-Priorise les activités APT étatiques ou supposées étatiques et les rapports techniques riches
-en IOC, échantillons, configurations, PCAP, règles ou TTP. Pour chaque publication, donne la
-source originale, les sources réellement indépendantes, les simples reprises/agrégateurs,
-la date de l'événement et de publication, les acteurs, campagnes, malwares, CVE, victimes,
-secteurs et pays, la présence probable d'artefacts techniques, les incertitudes et les raisons
-de pertinence. Cite explicitement chaque source effectivement utilisée et fournis son URL
-HTTP(S) dans la réponse lorsque cette URL est visible. N'invente jamais une URL absente.
-La liste peut être incomplète : ne présente aucun ensemble de sources comme exhaustif, ne
-déduis jamais qu'une source n'existe pas parce qu'elle n'est pas visible. Ne formule aucune
-attribution nouvelle et ne sélectionne aucun sujet pour publication.
+Axe complémentaire : {parameters.complementary_axis}
 
-Retourne un compte rendu Markdown lisible avec les champs demandés et les URLs visibles ;
-ne retourne pas de JSON strict."""
+Priorise les activités APT étatiques ou supposées étatiques et les publications
+techniques comportant des IOC, des échantillons, des configurations, une chaîne
+d’infection ou des règles de détection.
+
+Regroupe les publications qui décrivent manifestement la même campagne, le même
+incident ou la même recherche. Distingue le rapport original, les analyses
+réellement indépendantes et les simples reprises.
+
+N’invente jamais une URL, une date, un nombre d’IOC ou une attribution.
+Utilise `unknown` lorsqu’une information n’est pas disponible.
+
+Les publications hors période peuvent être rattachées comme contexte à un sujet
+dans la période. Elles ne doivent pas devenir seules un sujet candidat, sauf si
+l’axe complémentaire le demande explicitement.
+
+Ne présente pas les résultats comme exhaustifs.
+
+Retourne uniquement un rapport Markdown utilisant autant que possible le format
+suivant :
+
+# SUJETS CANDIDATS
+
+## SUBJECT S1
+
+title: <intitulé proposé>
+presentation: <deux phrases neutres maximum>
+actor_or_campaign: <valeur explicite ou unknown>
+technical_potential: <entier de 0 à 4>
+technical_potential_reason: <une phrase>
+artifacts: <liste parmi ioc, samples, configurations, pcap, yara, suricata, none, unknown>
+uncertainties: <une ou deux incertitudes courtes>
+
+### PUBLICATION P1
+
+title: <titre>
+url: <URL HTTP(S) exacte>
+publisher: <entité éditrice ou unknown>
+published_at: <YYYY-MM-DD ou unknown>
+period_relation: <in_period, outside_period ou unknown>
+source_role: <primary, independent, relay ou unknown>
+ioc_presence: <none, declared, visible ou unknown>
+ioc_declared_count: <entier ou unknown>
+ioc_visible_count: <entier ou unknown>
+
+### PUBLICATION P2
+
+...
+
+## SUBJECT S2
+
+...
+
+# LIMITES
+
+<limites principales de la recherche>"""
 
 
 def _source_profile_description(profile_id: str) -> str:
@@ -881,9 +960,7 @@ def _compact_contract() -> dict[str, object]:
     }
 
 
-def _repair_prompt(
-    previous: NormalizedModelOutput, errors: tuple[dict[str, Any], ...]
-) -> str:
+def _repair_prompt(previous: NormalizedModelOutput, errors: tuple[dict[str, Any], ...]) -> str:
     return (
         "Répare une seule fois le JSON ci-dessous en corrigeant uniquement les erreurs listées. "
         "Il est interdit d'ajouter une source, un IOC ou une attribution. Supprime une valeur "
@@ -926,9 +1003,7 @@ def _validate_partially(value: dict[str, Any]) -> tuple[ResearchBatch, tuple[dic
         for index, citation in enumerate(citations_value):
             try:
                 citations.append(
-                    ResearchCitation.model_validate_json(
-                        json.dumps(citation, ensure_ascii=False)
-                    )
+                    ResearchCitation.model_validate_json(json.dumps(citation, ensure_ascii=False))
                 )
             except ValidationError as exc:
                 rejected.extend(_pydantic_rejections(("citations", index), exc, citation))
@@ -1071,6 +1146,42 @@ def _to_domain_batch(
         source_coverage_incomplete_reason=(
             "Recherche effectuée depuis les citations visibles de ChatGPT ; "
             "la liste native complète des sources consultées n'est pas disponible."
+        ),
+    )
+
+
+def _parsed_to_domain_batch(
+    parameters: DiscoverEditionParameters,
+    request_hash: str,
+    result: ParsedDiscoveryReport,
+    research_run_id: UUID,
+    bridge_capabilities: Mapping[str, object],
+) -> DiscoveryBatch:
+    return DiscoveryBatch(
+        edition_id=parameters.edition_id,
+        request_hash=request_hash,
+        complementary_axis=parameters.complementary_axis,
+        queries=(),
+        citations=result.citations,
+        candidates=result.candidates,
+        discovery_model_run_id=research_run_id,
+        # The historical column remains non-null for backwards compatibility. Reusing
+        # the research run ID explicitly means that no structuring ModelRun was created.
+        structuring_model_run_id=research_run_id,
+        tlp=parameters.tlp,
+        sensitivity=parameters.sensitivity,
+        external_llm_allowed=parameters.external_llm_allowed,
+        report_sha256=result.report_sha256,
+        parser_version=PARSER_VERSION,
+        parsing_status=("report_parsing_partial" if result.status == "partial" else "completed"),
+        parsing_warnings=result.warnings,
+        source_mode=DiscoverySourceMode.MODEL_DECLARED_URLS,
+        bridge_capabilities=dict(bridge_capabilities),
+        citation_count=len(result.citations),
+        source_coverage_complete=False,
+        source_coverage_incomplete_reason=(
+            "Le rapport Markdown et les citations visibles ne constituent pas une liste "
+            "exhaustive des sources consultées."
         ),
     )
 

@@ -131,7 +131,7 @@ it("avertit sur la couverture et permet une brève et un article principal", asy
 
   expect(
     await screen.findByText(
-      "Recherche effectuée depuis les citations visibles de ChatGPT. La liste des sources et leurs relations seront vérifiées lors de la collecte.",
+      "Les métadonnées et comptes IOC de découverte sont provisoires. Ils seront vérifiés depuis les documents archivés après la sélection.",
     ),
   ).toBeInTheDocument();
   expect(screen.getByText("Campagne du mois précédent")).toBeInTheDocument();

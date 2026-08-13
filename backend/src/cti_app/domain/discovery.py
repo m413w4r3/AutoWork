@@ -44,6 +44,19 @@ class DiscoveryBatchStatus(StrEnum):
     COMPLETED = "completed"
 
 
+class PeriodRelation(StrEnum):
+    IN_PERIOD = "in_period"
+    OUTSIDE_PERIOD = "outside_period"
+    UNKNOWN = "unknown"
+
+
+class IocPresence(StrEnum):
+    NONE = "none"
+    DECLARED = "declared"
+    VISIBLE = "visible"
+    UNKNOWN = "unknown"
+
+
 @dataclass(slots=True)
 class SourceCandidate:
     url: str
@@ -56,6 +69,15 @@ class SourceCandidate:
     published_at: date | None = None
     event_date: date | None = None
     citation: str | None = None
+    local_ref: str | None = None
+    source_ref: str = field(init=False)
+    raw_url: str | None = None
+    period_relation: PeriodRelation = PeriodRelation.UNKNOWN
+    ioc_presence: IocPresence = IocPresence.UNKNOWN
+    ioc_declared_count: int | None = None
+    ioc_visible_count: int | None = None
+    parsing_warnings: tuple[str, ...] = ()
+    markdown_block: str | None = None
     id: UUID = field(default_factory=uuid4)
     verification_status: SourceVerificationStatus = SourceVerificationStatus.UNVERIFIED
     relationship_status: SourceRelationshipStatus = SourceRelationshipStatus.PROVISIONAL
@@ -66,12 +88,18 @@ class SourceCandidate:
 
     def __post_init__(self) -> None:
         self.canonical_url = canonicalize_http_url(self.url)
+        self.raw_url = self.raw_url or self.url
+        self.source_ref = "source-" + hashlib.sha256(self.canonical_url.encode()).hexdigest()[:20]
         self.title = self.title.strip()
         self.publisher = self.publisher.strip()
         self.sensitivity = self.sensitivity.strip()
         self.title_fingerprint = fingerprint_title(self.title)
         if not self.title or not self.publisher or not self.sensitivity:
             raise ValueError("Source title, publisher and sensitivity are required")
+        if self.ioc_declared_count is not None and self.ioc_declared_count < 0:
+            raise ValueError("Declared IOC count cannot be negative")
+        if self.ioc_visible_count is not None and self.ioc_visible_count < 0:
+            raise ValueError("Visible IOC count cannot be negative")
 
     def mark(self, status: SourceVerificationStatus, *, actor_id: str) -> None:
         if not actor_id.strip():
@@ -79,6 +107,27 @@ class SourceCandidate:
         self.verification_status = status
         self.verification_changed_at = datetime.now(UTC)
         self.verification_changed_by = actor_id.strip()
+
+
+@dataclass(slots=True)
+class IncompleteSourceCandidate:
+    title: str
+    publisher: str = "unknown"
+    raw_url: str | None = None
+    local_ref: str | None = None
+    published_at: date | None = None
+    period_relation: PeriodRelation = PeriodRelation.UNKNOWN
+    role: SourceRole = SourceRole.UNKNOWN
+    ioc_presence: IocPresence = IocPresence.UNKNOWN
+    ioc_declared_count: int | None = None
+    ioc_visible_count: int | None = None
+    parsing_warnings: tuple[str, ...] = ()
+    markdown_block: str | None = None
+    id: UUID = field(default_factory=uuid4)
+
+    def __post_init__(self) -> None:
+        self.title = self.title.strip() or "Publication incomplète"
+        self.publisher = self.publisher.strip() or "unknown"
 
 
 @dataclass(slots=True)
@@ -101,8 +150,15 @@ class CandidateTopic:
     tlp: TLP
     sensitivity: str
     external_llm_allowed: bool
+    incomplete_sources: list[IncompleteSourceCandidate] = field(default_factory=list)
     event_date: date | None = None
     iocs: tuple[str, ...] = ()
+    local_ref: str | None = None
+    actor_or_campaign: str = "unknown"
+    technical_potential_reason: str = "Non précisé dans le rapport de découverte."
+    parsing_warnings: tuple[str, ...] = ()
+    markdown_block: str | None = None
+    context_only: bool = False
     id: UUID = field(default_factory=uuid4)
     title_fingerprint: str = field(init=False)
     editorial_status: str = "proposed"
@@ -121,6 +177,10 @@ class CandidateTopic:
             raise ValueError("Discovery cannot select a topic automatically")
         self.sources = deduplicate_sources(self.sources)
 
+    @property
+    def selectable(self) -> bool:
+        return bool(self.sources) and not self.context_only
+
 
 @dataclass(slots=True)
 class DiscoveryBatch:
@@ -135,6 +195,10 @@ class DiscoveryBatch:
     tlp: TLP
     sensitivity: str
     external_llm_allowed: bool
+    report_sha256: str | None = None
+    parser_version: str = "legacy-model-structured"
+    parsing_status: str = "completed"
+    parsing_warnings: tuple[str, ...] = ()
     source_mode: DiscoverySourceMode = DiscoverySourceMode.VISIBLE_CITATIONS_ONLY
     bridge_capabilities: dict[str, object] = field(default_factory=dict)
     citation_count: int = 0
@@ -210,13 +274,11 @@ def fingerprint_title(value: str) -> str:
 
 def deduplicate_sources(sources: list[SourceCandidate]) -> list[SourceCandidate]:
     seen_urls: set[str] = set()
-    seen_titles: set[str] = set()
     unique: list[SourceCandidate] = []
     for source in sources:
-        if source.canonical_url in seen_urls or source.title_fingerprint in seen_titles:
+        if source.canonical_url in seen_urls:
             continue
         seen_urls.add(source.canonical_url)
-        seen_titles.add(source.title_fingerprint)
         unique.append(source)
     return unique
 

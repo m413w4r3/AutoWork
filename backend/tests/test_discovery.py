@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import date
 from uuid import UUID, uuid4
 
@@ -133,6 +132,56 @@ def research_fixture() -> ResearchBatch:
     )
 
 
+def research_markdown_fixture() -> str:
+    return """# SUJETS CANDIDATS
+
+## SUBJECT S1
+title: MuddyWater déploie une nouvelle chaîne d'infection
+presentation: Une campagne expose une chaîne technique documentée.
+actor_or_campaign: MuddyWater
+technical_potential: 4
+technical_potential_reason: Configurations et règles sont annoncées.
+artifacts: ioc, samples, configurations, yara
+uncertainties: Attribution reprise de la source; victimologie incomplète
+
+### PUBLICATION P1
+title: MuddyWater technical report
+url: https://vendor.example/reports/muddywater?utm_source=feed
+publisher: Vendor Research
+published_at: 2026-07-10
+period_relation: in_period
+source_role: primary
+ioc_presence: declared
+ioc_declared_count: 42
+ioc_visible_count: unknown
+
+### PUBLICATION P2
+title: A new MuddyWater campaign
+url: https://relay.example/news/muddywater
+publisher: Security News
+published_at: 2026-07-11
+period_relation: in_period
+source_role: relay
+ioc_presence: none
+ioc_declared_count: unknown
+ioc_visible_count: unknown
+
+### PUBLICATION P3
+title: CERT advisory on the campaign
+url: https://cert.example/advisories/42
+publisher: National CERT
+published_at: 2026-07-12
+period_relation: in_period
+source_role: independent
+ioc_presence: visible
+ioc_declared_count: unknown
+ioc_visible_count: 3
+
+# LIMITES
+Recherche non exhaustive.
+"""
+
+
 def parameters(axis: str = "initial") -> DiscoverEditionParameters:
     return DiscoverEditionParameters(
         edition_id=uuid4(),
@@ -152,11 +201,16 @@ def parameters(axis: str = "initial") -> DiscoverEditionParameters:
 
 
 async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempotent() -> None:
-    fixture = research_fixture()
     fake = FakeModelAdapter(
-        research_text="Recherche sourcée avec rapport original, relais et corroboration.",
-        structured_outputs={"ResearchBatch": fixture},
+        research_text=research_markdown_fixture(),
+        structured_outputs={
+            "ResearchBatch": (
+                '{"minimal_example":{"citations":[],"queries":[],"topics":[]},'
+                '"version":"research-batch-compact-v1"}'
+            )
+        },
     )
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
     gateway = ModelGateway(
         ModelRouter(
             openai_research=fake,
@@ -165,7 +219,7 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
             fake=fake,
             forced_provider=ModelProvider.FAKE,
         ),
-        InMemoryModelRunUnitOfWorkFactory(),
+        model_uow,
         InMemoryModelOutputStore(),
     )
     discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
@@ -202,9 +256,9 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     batches = await discovery.list_batches(params.edition_id)
     assert len(batches) == 1
     assert len(batches[0].candidates) == 1
-    assert batches[0].source_mode is DiscoverySourceMode.VISIBLE_CITATIONS_ONLY
+    assert batches[0].source_mode is DiscoverySourceMode.MODEL_DECLARED_URLS
     assert batches[0].source_coverage_complete is False
-    assert batches[0].citation_count == 1
+    assert batches[0].citation_count == 0
     assert batches[0].bridge_capabilities == {
         "web_search": True,
         "native_sources": False,
@@ -227,7 +281,10 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
         for source in candidate.sources
     )
     assert len({source.canonical_url for source in candidate.sources}) == len(candidate.sources)
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 1
+    assert fake.calls[0].conversation is not None
+    assert fake.calls[0].conversation.mode == "fresh"
+    assert all(run.model_role.value == "research" for run in model_uow.state.values())
     assert grouped_editions == [params.edition_id]
 
     with pytest.raises(DuplicateJobError):
@@ -240,7 +297,7 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
             input_parameters=params.model_dump(mode="json"),
         )
     assert len(await discovery.list_batches(params.edition_id)) == 1
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 1
 
     complementary = params.model_copy(update={"complementary_axis": "configurations publiées"})
     second_job = await jobs.submit(
@@ -255,25 +312,26 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     batches = await discovery.list_batches(params.edition_id)
     assert len(batches) == 2
     assert sum(len(batch.candidates) for batch in batches) == 1
+    assert len(fake.calls) == 2
+    assert fake.calls[1].conversation is not None
+    assert fake.calls[1].conversation.mode == "fresh"
+    assert fake.calls[1].conversation.id != fake.calls[0].conversation.id
     assert grouped_editions == [params.edition_id, params.edition_id]
 
 
 async def test_partial_invalid_output_keeps_topics_and_archives_diagnostics() -> None:
-    payload = research_fixture().model_dump(mode="json")
-    payload["topics"][0]["sources"].append(
-        {
-            "url": "[ambigu](https://one.example) ou https://two.example",
-            "title": "Ambiguous source",
-            "publisher": "Unknown",
-            "published_at": None,
-            "event_date": None,
-            "source_role": "independent",
-            "citation": None,
-        }
-    )
     fake = FakeModelAdapter(
-        research_text="Recherche sourcée en Markdown.",
-        structured_outputs={"ResearchBatch": json.dumps(payload, ensure_ascii=False)},
+        research_text=research_markdown_fixture()
+        + """
+## SUBJECT S2
+title: Sujet incomplet
+presentation: Publication conservée malgré une URL absente.
+technical_potential: unknown
+champ_surprise: valeur
+### PUBLICATION P4
+title: Sans URL
+url: ftp://invalid.example/report
+""",
     )
     model_uow = InMemoryModelRunUnitOfWorkFactory()
     output_store = InMemoryModelOutputStore()
@@ -308,12 +366,12 @@ async def test_partial_invalid_output_keeps_topics_and_archives_diagnostics() ->
     assert completed.status is JobStatus.SUCCEEDED
     batches = await discovery.list_batches(params.edition_id)
     assert batches[0].candidates
-    structured_runs = [
-        run for run in model_uow.state.values() if run.model_role.value == "structured_extraction"
-    ]
-    assert len(structured_runs) == 2  # sortie initiale puis unique réparation Qwen
-    assert all(run.raw_output_reference for run in structured_runs)
-    assert all(run.validation_errors for run in structured_runs)
+    assert len(fake.calls) == 1
+    assert all(run.model_role.value == "research" for run in model_uow.state.values())
+    research_run = next(iter(model_uow.state.values()))
+    assert research_run.raw_output_reference
+    assert research_run.parser_stage == "report_parsing_partial"
+    assert research_run.validation_errors
 
 
 async def test_totally_invalid_output_is_archived_before_safe_failure(
@@ -321,8 +379,7 @@ async def test_totally_invalid_output_is_archived_before_safe_failure(
 ) -> None:
     raw_output = "```json\n{invalid\\_json:SECRET_MODEL_OUTPUT}\n```"
     fake = FakeModelAdapter(
-        research_text="Recherche sourcée en Markdown.",
-        structured_outputs={"ResearchBatch": raw_output},
+        research_text=raw_output,
     )
     model_uow = InMemoryModelRunUnitOfWorkFactory()
     output_store = InMemoryModelOutputStore()
@@ -356,14 +413,11 @@ async def test_totally_invalid_output_is_archived_before_safe_failure(
 
     failed = await jobs.get(job.id)
     assert failed.status is JobStatus.FAILED
-    assert failed.error_code == "discovery_structuring_invalid"
+    assert failed.error_code == "report_parsing_failed"
     assert failed.error_details is not None
-    assert failed.error_details["validation_kind"] == "json_invalid"
-    structured_run = next(
-        run for run in model_uow.state.values() if run.model_role.value == "structured_extraction"
-    )
-    assert structured_run.raw_output_reference in structured_run.output_references
-    assert structured_run.parser_stage == "json_parse"
+    assert failed.error_details["phase"] == "local_parsing"
+    research_run = next(iter(model_uow.state.values()))
+    assert research_run.raw_output_reference in research_run.output_references
     assert output_store.objects
     assert "SECRET_MODEL_OUTPUT" not in caplog.text
     assert raw_output not in caplog.text
@@ -376,14 +430,12 @@ def test_research_batch_rejects_non_http_urls() -> None:
         ResearchBatch.model_validate(payload)
 
 
-def test_research_prompt_is_markdown_oriented_dated_and_uses_effective_profile() -> None:
-    prompt = _research_prompt(
-        parameters().model_copy(update={"period_end": date(2027, 7, 31)})
-    )
+def test_research_prompt_is_the_documented_markdown_contract() -> None:
+    prompt = _research_prompt(parameters().model_copy(update={"period_end": date(2027, 7, 31)}))
 
-    assert "as_of_date" in prompt
-    assert "aucun événement postérieur" in prompt
-    assert "iran-default" not in prompt
-    assert "sources CTI primaires" in prompt
-    assert "Markdown lisible" in prompt
+    assert "# SUJETS CANDIDATS" in prompt
+    assert "## SUBJECT S1" in prompt
+    assert "### PUBLICATION P1" in prompt
+    assert "N’invente jamais une URL, une date, un nombre d’IOC" in prompt  # noqa: RUF001
+    assert "ioc_visible_count: <entier ou unknown>" in prompt
     assert "donnée non fiable" not in prompt

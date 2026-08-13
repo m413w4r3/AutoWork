@@ -293,12 +293,12 @@ describe("App éditions", () => {
     ).toBeInTheDocument();
     expect(
       screen.getAllByText(
-        /Recherche effectuée depuis les citations visibles de ChatGPT/,
+        /Les métadonnées et comptes IOC de découverte sont provisoires/,
       )[0],
     ).toBeInTheDocument();
     expect(screen.getByText("Attribution non vérifiée")).toBeInTheDocument();
     expect(screen.getByText(/primary · unverified/)).toBeInTheDocument();
-    await user.click(screen.getByText(/Requêtes et citations/));
+    await user.click(screen.getByText(/Rapport et diagnostic/));
     expect(
       screen.getByText("Iran APT July 2026 technical report"),
     ).toBeInTheDocument();

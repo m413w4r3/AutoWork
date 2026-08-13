@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from functools import partial
 
 from fastapi import FastAPI
 from minio import Minio
@@ -80,7 +81,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model_gateway,
         model_gateway,
         bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
-        after_discovery=editorial_service.synchronize,
+        after_discovery=partial(editorial_service.synchronize, resolve_ambiguous=False),
         allow_chatgpt_structuring_fallback=settings.discovery_chatgpt_structuring_fallback,
     )
     collection_service = SubjectCollectionService(

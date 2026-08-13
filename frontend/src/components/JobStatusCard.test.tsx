@@ -133,10 +133,10 @@ describe("JobStatusCard", () => {
     });
   });
 
-  it("affiche le diagnostic structuré et relance uniquement la structuration", async () => {
+  it("affiche le diagnostic et retraite uniquement le rapport archivé", async () => {
     const user = userEvent.setup();
     vi.stubGlobal("EventSource", undefined);
-    const retryStructuring = vi.fn();
+    const reprocessReport = vi.fn();
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -186,7 +186,7 @@ describe("JobStatusCard", () => {
       <QueryClientProvider client={client}>
         <JobStatusCard
           jobId="4de4af61-811e-4c1c-ad4a-9b39a5c06c94"
-          onRetryStructuring={retryStructuring}
+          onReprocessReport={reprocessReport}
         />
       </QueryClientProvider>,
     );
@@ -195,9 +195,9 @@ describe("JobStatusCard", () => {
     expect(screen.getByText("1 valides · 2 rejetés")).toBeInTheDocument();
     expect(screen.getByText("disponible")).toBeInTheDocument();
     await user.click(
-      screen.getByRole("button", { name: "Retenter la structuration" }),
+      screen.getByRole("button", { name: "Retraiter le rapport archivé" }),
     );
-    expect(retryStructuring).toHaveBeenCalledWith(
+    expect(reprocessReport).toHaveBeenCalledWith(
       "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
     );
   });

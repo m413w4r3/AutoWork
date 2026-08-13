@@ -102,9 +102,19 @@ export function transitionEdition(
   );
 }
 
+export function deleteEdition(edition: Edition): Promise<void> {
+  return request<void>(
+    `/api/editions/${encodeURIComponent(edition.id)}?version=${edition.version}`,
+    { method: "DELETE" },
+  );
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
-  if (response.ok) return (await response.json()) as T;
+  if (response.ok) {
+    if (response.status === 204) return undefined as T;
+    return (await response.json()) as T;
+  }
   const body = (await response.json().catch(() => null)) as {
     detail?: { code?: string; message?: string } | string;
   } | null;
