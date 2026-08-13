@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 
@@ -127,7 +127,50 @@ const groups = [
   },
 ] as const;
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
+it("désactive le polling malgré la valeur globale de production", async () => {
+  vi.useFakeTimers();
+  const board = {
+    groups: [],
+    selected_briefs: 0,
+    selected_major: 0,
+    ignored: 0,
+    undecided: 0,
+    target_briefs: 4,
+    target_major: 2,
+    automatic_selection: false,
+  };
+  const fetchMock = vi.fn().mockResolvedValue(Response.json(board));
+  vi.stubGlobal("fetch", fetchMock);
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: 1,
+        refetchInterval: 30_000,
+        refetchOnWindowFocus: false,
+      },
+    },
+  });
+
+  render(
+    <QueryClientProvider client={client}>
+      <EditorialBoard editionId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" />
+    </QueryClientProvider>,
+  );
+
+  await vi.waitFor(() => {
+    expect(
+      screen.getByText("Aucun groupe en attente de décision."),
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+  await act(() => vi.advanceTimersByTimeAsync(60_000));
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
 
 it("propose quatre choix exclusifs et confirme les décisions dans un seul lot", async () => {
   const board = {

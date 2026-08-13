@@ -217,11 +217,11 @@ def _parse_current(
             pub_warnings = [
                 f"publication {pub_ref}: champ non reconnu '{name}'" for name in unknown
             ]
-            urls = extract_http_urls(fields.get("url", ""))
-            if not urls:
-                # Compatibility for archived bridge output where citation injection
-                # split the `url:` field. This fallback never runs for a valid URL field.
-                urls = extract_http_urls(pub_block)
+            url_field = fields.get("url", "")
+            # Les anciens rapports peuvent avoir une injection de citation ayant
+            # séparé `url:` de sa valeur. Dans ce cas seulement, inspecter le bloc.
+            url_source = url_field if re.search(r"https?://", url_field, re.I) else pub_block
+            urls = extract_http_urls(url_source)
             if not urls:
                 raw_url = fields.get("url") or None
                 pub_warnings.append(f"publication {pub_ref}: no_explicit_url")
