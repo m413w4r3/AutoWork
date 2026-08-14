@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "14";
+const VERSION = "15";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -105,6 +105,7 @@ const APPEAR_TIMEOUT_MS = 30000; // délai d'apparition de la bulle de réponse
 const UPLOAD_TIMEOUT_MS = 120000; // upload des pièces jointes
 const SETTLE_MS = 2000; // stabilité exigée quand un signal de fin est confirmé
 const SETTLE_UNKNOWN_MS = 8000; // stabilité exigée quand aucun signal n'est reconnu
+const EMPTY_FINAL_SETTLE_MS = 10000; // fin fiable sans corps final
 const NO_MARKDOWN_FALLBACK_MS = 25000; // au-delà, on lit le tour entier faute de mieux
 const HEARTBEAT_INTERVAL_MS = 20000; // réarme l'idle timeout sans transmettre le texte
 
@@ -974,9 +975,33 @@ async function streamAnswer(job, locator, before) {
       stableSince = Date.now();
     }
 
-    const need = finished === null ? SETTLE_UNKNOWN_MS : SETTLE_MS;
+    const need =
+      finished === true && full.length === 0
+        ? EMPTY_FINAL_SETTLE_MS
+        : finished === null
+          ? SETTLE_UNKNOWN_MS
+          : SETTLE_MS;
     stableForMs = stableSince === null ? 0 : Date.now() - stableSince;
     const stable = stableForMs >= need;
+    const outcome = globalThis.ChatGPTBridgeFinalOutput.settledOutcome({
+      completion,
+      text: full,
+      stableForMs,
+      emptySettleMs: EMPTY_FINAL_SETTLE_MS,
+    });
+    if (outcome === "incomplete") {
+      return {
+        text: "",
+        visible_citations: [],
+        serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
+        completion_signal: completion.signal,
+        completion_confidence: completion.confidence,
+        stable_for_ms: stableForMs,
+        incomplete: true,
+        incomplete_reason: "no_final_answer",
+        turn_locator: turnLocator(turn),
+      };
+    }
     if (stable && finished !== false && full.length > 0) {
       const verificationRoot = answerRoot(turn, true);
       const verification = verificationRoot
@@ -1063,6 +1088,9 @@ async function handlePrompt({
       "composer introuvable",
     );
     const before = document.querySelectorAll(SELECTORS.assistant).length;
+    const baselineTurn = before
+      ? document.querySelectorAll(SELECTORS.assistant)[before - 1]
+      : null;
 
     if (files && files.length) await attachFiles(files);
     if (prompt) typePrompt(composer, prompt);
@@ -1089,6 +1117,24 @@ async function handlePrompt({
         )
       : null;
 
+    if (conversation) {
+      reply({
+        type: "conversation_bound",
+        id,
+        conversation: {
+          id: conversation.id,
+          external_locator: externalLocator,
+          assistant_turns_before: before,
+          initial_assistant_turn_id: baselineTurn
+            ? turnLocator(baselineTurn) ||
+              baselineTurn.getAttribute("data-message-id")
+            : null,
+          verified: true,
+          verified_at: new Date().toISOString(),
+        },
+      });
+    }
+
     // Attendre la bulle de réponse *nouvelle* (pas la précédente).
     const premier = await waitFor(
       () => {
@@ -1107,8 +1153,9 @@ async function handlePrompt({
         premier.getAttribute("data-message-id") ||
         null;
       reply({
-        type: "done",
+        type: serialized.incomplete ? "incomplete" : "done",
         id,
+        reason: serialized.incomplete_reason,
         text: serialized.text,
         metadata: {
           visible_citations: serialized.visible_citations,
@@ -1120,6 +1167,7 @@ async function handlePrompt({
             globalThis.ChatGPTBridgeFinalOutput.outputChars(serialized.text),
           visible_citation_count: serialized.visible_citations.length,
           content_script_version: VERSION,
+          initial_turn_id: externalTurnId || serialized.turn_locator || null,
         },
         conversation: conversation
           ? {
@@ -1139,11 +1187,56 @@ async function handlePrompt({
   }
 }
 
+async function captureLaterResponse(msg) {
+  const expected = Number(msg.conversation?.assistant_turns_before || 0);
+  const turns = [...document.querySelectorAll(SELECTORS.assistant)];
+  const later = turns.slice(expected);
+  for (let index = later.length - 1; index >= 0; index -= 1) {
+    const turn = later[index];
+    const completion = completionState(turn);
+    if (completion.finished !== true) continue;
+    const root = answerRoot(turn, true);
+    const serialized = root ? readAnswer(root, false) : null;
+    if (!serialized?.text?.trim()) continue;
+    const container = closestOf(turn, SELECTORS.turnContainer);
+    return {
+      type: "recovery_preview",
+      id: msg.id,
+      text: serialized.text,
+      conversation_id: msg.conversation.id,
+      external_locator: verifiedLocator(),
+      turn_id:
+        container?.getAttribute("data-testid") ||
+        turn.getAttribute("data-message-id") ||
+        null,
+      metadata: {
+        visible_citations: serialized.visible_citations,
+        serializer_version: serialized.serializer_version,
+        output_chars: globalThis.ChatGPTBridgeFinalOutput.outputChars(
+          serialized.text,
+        ),
+        completion_signal: completion.signal,
+        completion_confidence: completion.confidence,
+        content_script_version: VERSION,
+      },
+    };
+  }
+  return {
+    type: "recovery_preview",
+    id: msg.id,
+    error: "aucune réponse finale postérieure au tour initial",
+  };
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "ui_state" || msg?.type === "ui_control") {
     // Requête/réponse : le service worker attend la valeur, d'où le `return true`
     // sans acquittement immédiat (un seul `sendResponse` est autorisé).
     handleUi(msg).then(sendResponse);
+    return true;
+  }
+  if (msg?.type === "recovery_capture") {
+    captureLaterResponse(msg).then(sendResponse);
     return true;
   }
   if (msg?.type === "prompt") {

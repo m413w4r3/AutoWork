@@ -70,6 +70,10 @@ class FakeBridgeCapabilities:
     async def archive_conversation(self, conversation_id: UUID) -> None:
         del conversation_id
 
+    async def preview_visible_recovery(self, bridge_run_id: str) -> dict[str, object]:
+        del bridge_run_id
+        return {}
+
 
 class TransientResearchAdapter(FakeModelAdapter):
     async def invoke(
@@ -94,10 +98,12 @@ class DeferredResearchAdapter(FakeModelAdapter):
         *,
         pending_resumes: int = 0,
         terminal_error: BridgeTransportError | None = None,
+        needs_review: bool = False,
     ) -> None:
         super().__init__(research_text=research_markdown_fixture())
         self.pending_resumes = pending_resumes
         self.terminal_error = terminal_error
+        self.needs_review = needs_review
         self.resume_calls = 0
 
     async def resume(
@@ -111,6 +117,28 @@ class DeferredResearchAdapter(FakeModelAdapter):
         self.resume_calls += 1
         if self.terminal_error is not None:
             raise self.terminal_error
+        if self.needs_review:
+            return AdapterResult(
+                status=AdapterResultStatus.NEEDS_REVIEW,
+                provider=self.provider,
+                requested_model=self.requested_model,
+                actual_model_version=self.requested_model,
+                response_id=response_id,
+                usage=ModelUsage(),
+                metadata={
+                    "reason": "no_final_answer",
+                    "conversation": {
+                        "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        "external_locator": (
+                            "https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                        ),
+                        "assistant_turns_before": 1,
+                    },
+                    "completion_signal": "assistant_actions",
+                    "completion_confidence": "high",
+                    "output_chars": 0,
+                },
+            )
         if self.pending_resumes > 0:
             self.pending_resumes -= 1
             return AdapterResult(
@@ -592,6 +620,138 @@ async def test_completed_model_run_is_reparsed_after_resume_without_bridge_call(
     assert adapter.resume_calls == 0
 
 
+async def test_incomplete_model_run_waits_for_human_without_automatic_relaunch() -> None:
+    params = parameters()
+    adapter = DeferredResearchAdapter(needs_review=True)
+    gateway, model_uow, _ = gateway_for_adapter(adapter)
+    waiting = persisted_research_run(params, status=ModelRunStatus.WAITING_BACKGROUND)
+    model_uow.state[waiting.id] = waiting
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    job = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="edition",
+        aggregate_id=params.edition_id,
+        idempotency_key=discovery_idempotency_key(params),
+        correlation_id="incomplete-review",
+        input_parameters=params.model_dump(mode="json"),
+        max_attempts=1,
+    )
+
+    await dispatcher.dispatch(job.id)
+    first = await jobs.get(job.id)
+    await dispatcher.dispatch(job.id)
+    unchanged = await jobs.get(job.id)
+
+    assert first.status is JobStatus.WAITING_HUMAN
+    assert unchanged.status is JobStatus.WAITING_HUMAN
+    assert first.user_message == (
+        "ChatGPT s'est arrêté sans produire de réponse finale. "
+        "La conversation a été conservée et peut être reprise."
+    )
+    assert first.error_details is not None
+    assert first.error_details["reason"] == "no_final_answer"
+    assert model_uow.state[waiting.id].status is ModelRunStatus.NEEDS_REVIEW
+    assert adapter.calls == []
+    assert adapter.resume_calls == 1
+
+
+async def test_manual_recovery_archives_exact_report_and_resumes_original_job() -> None:
+    params = parameters()
+    adapter = DeferredResearchAdapter(needs_review=True)
+    gateway, model_uow, output_store = gateway_for_adapter(adapter)
+    waiting = persisted_research_run(params, status=ModelRunStatus.WAITING_BACKGROUND)
+    model_uow.state[waiting.id] = waiting
+    discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
+    discovery = DiscoveryService(discovery_uow, gateway, gateway)
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    job = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="edition",
+        aggregate_id=params.edition_id,
+        idempotency_key=discovery_idempotency_key(params),
+        correlation_id="manual-recovery",
+        input_parameters=params.model_dump(mode="json"),
+        max_attempts=1,
+    )
+    await dispatcher.dispatch(job.id)
+    assert (await jobs.get(job.id)).status is JobStatus.WAITING_HUMAN
+
+    markdown = research_markdown_fixture() + "\n<!-- exact manual import -->\n"
+    preview = await discovery.preview_manual_recovery(params, waiting.id, markdown)
+    await discovery.adopt_recovery_report(
+        params,
+        waiting.id,
+        markdown,
+        expected_sha256=preview["sha256"],
+        provenance="manual_import",
+        actor_id="analyst:test",
+    )
+    await jobs.resume_waiting_human(job.id, actor_id="analyst:test")
+    await dispatcher.dispatch(job.id)
+
+    completed = await jobs.get(job.id)
+    recovered = model_uow.state[waiting.id]
+    assert completed.status is JobStatus.SUCCEEDED
+    assert recovered.status is ModelRunStatus.SUCCEEDED
+    assert recovered.raw_output_reference is not None
+    assert (
+        await output_store.read(recovered.raw_output_reference, max_bytes=10_000_000)
+    ).decode() == markdown
+    assert recovered.error_details is not None
+    assert recovered.error_details["recovery"]["provenance"] == "manual_import"
+    batches = await discovery.list_batches(params.edition_id)
+    assert len(batches) == 1
+    assert batches[0].parsing_revision == 1
+
+
+async def test_controlled_completion_is_idempotent_and_keeps_exact_conversation() -> None:
+    params = parameters()
+    adapter = FakeModelAdapter(research_text=research_markdown_fixture())
+    gateway, model_uow, _ = gateway_for_adapter(adapter)
+    parent = persisted_research_run(params, status=ModelRunStatus.WAITING_BACKGROUND)
+    parent.require_review(
+        "no_final_answer",
+        "incomplete",
+        details={
+            "conversation": {
+                "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "external_locator": ("https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            }
+        },
+    )
+    model_uow.state[parent.id] = parent
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+
+    first = await discovery.start_completion_recovery(params, parent.id)
+    second = await discovery.start_completion_recovery(params, parent.id)
+
+    assert first == second
+    assert len(adapter.calls) == 1
+    submitted = adapter.calls[0]
+    assert submitted.text == (
+        "Ta réponse précédente ne contient pas de résultat final. Termine maintenant "
+        "la mission initiale et fournis directement le rapport Markdown demandé, sans "
+        "recommencer toute la recherche."
+    )
+    assert submitted.conversation is not None
+    assert submitted.conversation.mode == "continue"
+    assert submitted.conversation.id == UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    assert submitted.conversation.external_locator == (
+        "https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    )
+    assert submitted.parameters["bridge_recovery"] is True
+    details = model_uow.state[parent.id].error_details
+    assert details is not None
+    assert details["recovery_child_model_run_id"] == str(first)
+
+
 async def test_terminal_bridge_error_fails_discovery_without_parsing() -> None:
     params = parameters()
     adapter = DeferredResearchAdapter(
@@ -848,6 +1008,7 @@ def test_research_prompt_is_the_documented_markdown_contract() -> None:
     assert "Langues : fr, EN, fa" in prompt
     assert "Il n’existe aucune limite ni" in prompt  # noqa: RUF001
     assert "N’invente aucune URL, date, attribution" in prompt  # noqa: RUF001
-    assert "visible-iocs: <valeurs exactes explicitement visibles ou none/unknown>" in prompt
+    assert "visible-iocs: <jusqu’à 10 valeurs exactes" in prompt  # noqa: RUF001
+    assert "period: <" not in prompt
     assert "N’échappe pas les tirets des noms de champs." in prompt  # noqa: RUF001
     assert "donnée non fiable" not in prompt

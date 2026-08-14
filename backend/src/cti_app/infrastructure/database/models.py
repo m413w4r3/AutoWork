@@ -26,7 +26,9 @@ EDITION_STATUS_VALUES_SQL = (
 )
 MODEL_PROVIDER_VALUES_SQL = "'openai', 'qwen', 'fake'"
 MODEL_ROLE_VALUES_SQL = "'research', 'structured_extraction', 'drafting', 'critic'"
-MODEL_RUN_STATUS_VALUES_SQL = "'running', 'waiting_background', 'succeeded', 'failed', 'blocked'"
+MODEL_RUN_STATUS_VALUES_SQL = (
+    "'running', 'waiting_background', 'needs_review', 'succeeded', 'failed', 'blocked'"
+)
 EDITORIAL_GROUP_STATUS_VALUES_SQL = "'proposed', 'rejected', 'selected', 'superseded'"
 GROUPING_OUTCOME_VALUES_SQL = (
     "'new_subject', 'duplicate_same_publication', 'update_previous_subject', "

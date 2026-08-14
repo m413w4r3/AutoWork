@@ -150,6 +150,16 @@ export interface DiscoveryLaunchResult {
   reused: boolean;
 }
 
+export interface DiscoveryRecoveryPreview {
+  sha256: string;
+  subject_count: number;
+  publication_count: number;
+  ioc_count: number;
+  ioc_type_counts: Record<string, number>;
+  warnings: string[];
+  subjects: string[];
+}
+
 export function launchDiscovery(
   editionId: string,
   complementaryAxis: string,
@@ -178,6 +188,92 @@ export function retryDiscoveryStructuring(
       body: JSON.stringify({
         research_model_run_id: researchModelRunId,
         complementary_axis: complementaryAxis,
+      }),
+    },
+  );
+}
+
+export function previewVisibleDiscoveryRecovery(
+  editionId: string,
+  modelRunId: string,
+  jobId: string,
+): Promise<DiscoveryRecoveryPreview> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/recovery/${encodeURIComponent(modelRunId)}/visible/preview`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId }),
+    },
+  );
+}
+
+export function confirmVisibleDiscoveryRecovery(
+  editionId: string,
+  modelRunId: string,
+  jobId: string,
+  expectedSha256: string,
+): Promise<DiscoveryLaunchResult> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/recovery/${encodeURIComponent(modelRunId)}/visible/confirm`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        job_id: jobId,
+        expected_sha256: expectedSha256,
+      }),
+    },
+  );
+}
+
+export function requestDiscoveryCompletion(
+  editionId: string,
+  modelRunId: string,
+  jobId: string,
+): Promise<DiscoveryLaunchResult> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/recovery/${encodeURIComponent(modelRunId)}/complete`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId }),
+    },
+  );
+}
+
+export function previewManualDiscoveryRecovery(
+  editionId: string,
+  modelRunId: string,
+  jobId: string,
+  markdown: string,
+): Promise<DiscoveryRecoveryPreview> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/recovery/${encodeURIComponent(modelRunId)}/manual/preview`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId, markdown }),
+    },
+  );
+}
+
+export function confirmManualDiscoveryRecovery(
+  editionId: string,
+  modelRunId: string,
+  jobId: string,
+  markdown: string,
+  expectedSha256: string,
+): Promise<DiscoveryLaunchResult> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/recovery/${encodeURIComponent(modelRunId)}/manual/confirm`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        job_id: jobId,
+        markdown,
+        expected_sha256: expectedSha256,
       }),
     },
   );

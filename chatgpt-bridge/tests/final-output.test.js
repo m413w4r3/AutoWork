@@ -2,7 +2,8 @@ const assert = require("node:assert/strict");
 
 require("../extension/final-output.js");
 
-const { createAccumulator, outputChars } = globalThis.ChatGPTBridgeFinalOutput;
+const { createAccumulator, outputChars, settledOutcome } =
+  globalThis.ChatGPTBridgeFinalOutput;
 
 const rewritten = createAccumulator();
 rewritten.observe("ABC");
@@ -11,6 +12,44 @@ rewritten.observe("ABXYZ");
 assert.equal(rewritten.final(), "ABXYZ");
 assert.notEqual(rewritten.final(), "ABCDEXYZ");
 assert.equal(outputChars("A😀B"), 3);
+assert.equal(
+  settledOutcome({
+    completion: { finished: true },
+    text: "",
+    stableForMs: 10_000,
+    emptySettleMs: 10_000,
+  }),
+  "incomplete",
+);
+assert.equal(
+  settledOutcome({
+    completion: { finished: false },
+    text: "",
+    stableForMs: 60_000,
+    emptySettleMs: 10_000,
+  }),
+  "active",
+  "un raisonnement actif ne devient jamais incomplet par durée seule",
+);
+assert.equal(
+  settledOutcome({
+    completion: { finished: true },
+    text: "rapport final",
+    stableForMs: 2_000,
+    emptySettleMs: 10_000,
+  }),
+  "complete",
+);
+assert.equal(
+  settledOutcome({
+    completion: { finished: null },
+    text: "",
+    stableForMs: 60_000,
+    emptySettleMs: 10_000,
+  }),
+  "unknown",
+  "une longue durée ne transforme pas un état DOM inconnu en fin fiable",
+);
 
 const fiveSubjects = createAccumulator();
 fiveSubjects.observe(

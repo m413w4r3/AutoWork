@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol, cast
+from typing import Any, NoReturn, Protocol, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -53,6 +53,10 @@ class JobHandlerError(Exception):
 
 
 class JobCancelledError(Exception):
+    pass
+
+
+class JobWaitingHumanError(Exception):
     pass
 
 
@@ -207,6 +211,17 @@ class JobExecutionContext:
             await uow.jobs.save(job)
             await uow.commit()
 
+    async def wait_for_human(self, message: str, details: dict[str, Any]) -> NoReturn:
+        async with self._uow_factory() as uow:
+            job = await uow.jobs.get_for_update(self.job_id)
+            if job is None:
+                raise JobNotFoundError(str(self.job_id))
+            job.record_diagnostics(details)
+            job.wait_for_human(message)
+            await uow.jobs.save(job)
+            await uow.commit()
+        raise JobWaitingHumanError
+
 
 class JobService:
     def __init__(self, uow_factory: JobUnitOfWorkFactory, registry: JobRegistry) -> None:
@@ -280,6 +295,18 @@ class JobService:
             await uow.commit()
             return job
 
+    async def resume_waiting_human(self, job_id: UUID, *, actor_id: str = "system") -> Job:
+        async with self._uow_factory() as uow:
+            job = await uow.jobs.get_for_update(job_id)
+            if job is None:
+                raise JobNotFoundError(str(job_id))
+            previous_status = job.status
+            job.resume_after_human()
+            await uow.jobs.save(job)
+            await _append_job_event(uow, job, previous_status, "job.human_resumed", actor_id)
+            await uow.commit()
+            return job
+
     async def recover_abandoned(self, heartbeat_timeout: timedelta) -> list[Job]:
         cutoff = datetime.now(UTC) - heartbeat_timeout
         async with self._uow_factory() as uow:
@@ -337,6 +364,8 @@ class JobExecutor:
             )
             return await self._succeed(job_id, output_reference)
         except JobCancelledError:
+            return await self._get(job_id)
+        except JobWaitingHumanError:
             return await self._get(job_id)
         except JobHandlerError as exc:
             return await self._handle_controlled_failure(job_id, exc)

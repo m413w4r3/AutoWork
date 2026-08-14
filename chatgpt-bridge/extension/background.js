@@ -27,6 +27,7 @@ const busyTabs = new Set();
 const requestConversationResults = new Map();
 const requestExtensionMetadata = new Map();
 const requestFinalOutputs = new Map();
+const requestConversationBindings = new Map();
 
 const requestStatesReady = chrome.storage.local.get("bridgeRequestStates").then(({ bridgeRequestStates }) => {
   for (const [id, state] of Object.entries(bridgeRequestStates || {})) requestStates.set(id, state);
@@ -37,6 +38,7 @@ const conversationRegistryReady = chrome.storage.local
     "bridgeRequestConversationResults",
     "bridgeRequestExtensionMetadata",
     "bridgeRequestFinalOutputs",
+    "bridgeRequestConversationBindings",
   ])
   .then(
     ({
@@ -44,6 +46,7 @@ const conversationRegistryReady = chrome.storage.local
       bridgeRequestConversationResults,
       bridgeRequestExtensionMetadata,
       bridgeRequestFinalOutputs,
+      bridgeRequestConversationBindings,
     }) => {
     for (const [id, entry] of Object.entries(bridgeConversationRegistry || {})) {
       conversationRegistry.set(id, { ...entry, tab_id: null, window_id: null });
@@ -56,6 +59,9 @@ const conversationRegistryReady = chrome.storage.local
     }
     for (const [id, value] of Object.entries(bridgeRequestFinalOutputs || {})) {
       if (typeof value === "string") requestFinalOutputs.set(id, value);
+    }
+    for (const [id, value] of Object.entries(bridgeRequestConversationBindings || {})) {
+      requestConversationBindings.set(id, value);
     }
   },
   );
@@ -74,6 +80,9 @@ function persistConversationRegistry() {
     bridgeRequestConversationResults: Object.fromEntries([...requestConversationResults.entries()].slice(-1000)),
     bridgeRequestExtensionMetadata: Object.fromEntries([...requestExtensionMetadata.entries()].slice(-1000)),
     bridgeRequestFinalOutputs: Object.fromEntries([...requestFinalOutputs.entries()].slice(-50)),
+    bridgeRequestConversationBindings: Object.fromEntries(
+      [...requestConversationBindings.entries()].slice(-1000),
+    ),
   });
 }
 
@@ -138,6 +147,8 @@ async function connect() {
       handleUiRequest(msg);
     } else if (msg.type === "conversation_archive") {
       handleConversationArchive(msg);
+    } else if (msg.type === "recovery_capture") {
+      handleRecoveryCapture(msg);
     } else if (msg.type === "abort") {
       const tabId = inflight.get(msg.id);
       inflight.delete(msg.id);
@@ -158,6 +169,25 @@ async function connect() {
     scheduleReconnect(null);
   };
   socket.onerror = () => setStatus({ lastError: "serveur injoignable" });
+}
+
+async function handleRecoveryCapture(msg) {
+  let tab;
+  try {
+    tab = await resolveConversationTab({
+      mode: "continue",
+      id: msg.conversation.id,
+      external_locator: msg.conversation.external_locator,
+    });
+    const result = await sendToTab(tab.id, msg);
+    send({ ...result, type: "recovery_preview", id: msg.id });
+  } catch (err) {
+    send({
+      type: "recovery_preview",
+      id: msg.id,
+      error: err.message,
+    });
+  }
 }
 
 async function handleConversationArchive(msg) {
@@ -318,6 +348,16 @@ async function handlePrompt(msg) {
         conversation: requestConversationResults.get(msg.id) || null,
         metadata: requestExtensionMetadata.get(msg.id) || null,
       });
+    } else if (known === "needs_review") {
+      send({
+        type: "incomplete",
+        id: msg.id,
+        replayed: true,
+        reason: "no_final_answer",
+        text: "",
+        conversation: requestConversationResults.get(msg.id) || null,
+        metadata: requestExtensionMetadata.get(msg.id) || null,
+      });
     }
     return;
   }
@@ -396,14 +436,48 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
-  if (["ack", "chunk", "heartbeat", "done", "error"].includes(msg?.type)) {
+  if (
+    [
+      "ack",
+      "chunk",
+      "heartbeat",
+      "conversation_bound",
+      "incomplete",
+      "done",
+      "error",
+    ].includes(msg?.type)
+  ) {
     const sequence = (eventCounters.get(msg.id) || 0) + 1;
     eventCounters.set(msg.id, sequence);
-    if (["done", "error"].includes(msg.type)) {
+    if (msg.type === "conversation_bound" && msg.conversation?.id) {
+      const binding = {
+        ...msg.conversation,
+        tab_id: sender.tab?.id || null,
+        window_id: sender.tab?.windowId || null,
+        bridge_run_id: msg.id,
+      };
+      requestConversationBindings.set(msg.id, binding);
+      msg = { ...msg, conversation: binding };
+      conversationRegistry.set(msg.conversation.id, {
+        external_locator: msg.conversation.external_locator,
+        tab_id: sender.tab?.id || null,
+        window_id: sender.tab?.windowId || null,
+        last_verified_at: Date.now(),
+      });
+      persistConversationRegistry();
+    }
+    if (["done", "incomplete", "error"].includes(msg.type)) {
       const tabId = inflight.get(msg.id);
       inflight.delete(msg.id);
       if (tabId !== undefined) busyTabs.delete(tabId);
-      requestStates.set(msg.id, msg.type === "done" ? "completed" : "failed");
+      requestStates.set(
+        msg.id,
+        msg.type === "done"
+          ? "completed"
+          : msg.type === "incomplete"
+            ? "needs_review"
+            : "failed",
+      );
       if (msg.type === "done" && msg.conversation?.id) {
         requestConversationResults.set(msg.id, msg.conversation);
         conversationRegistry.set(msg.conversation.id, {
@@ -412,6 +486,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           window_id: sender.tab?.windowId || null,
           last_verified_at: Date.now(),
         });
+        persistConversationRegistry();
+      }
+      if (msg.type === "incomplete") {
+        const binding = requestConversationBindings.get(msg.id);
+        if (binding) {
+          const completedBinding = {
+            ...binding,
+            initial_assistant_turn_id:
+              msg.metadata?.initial_turn_id ||
+              binding.initial_assistant_turn_id ||
+              null,
+          };
+          requestConversationBindings.set(msg.id, completedBinding);
+          requestConversationResults.set(msg.id, completedBinding);
+        }
+        if (msg.metadata) requestExtensionMetadata.set(msg.id, msg.metadata);
         persistConversationRegistry();
       }
       if (msg.type === "done" && msg.metadata) {

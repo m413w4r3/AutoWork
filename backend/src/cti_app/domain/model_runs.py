@@ -23,6 +23,7 @@ class ModelRole(StrEnum):
 class ModelRunStatus(StrEnum):
     RUNNING = "running"
     WAITING_BACKGROUND = "waiting_background"
+    NEEDS_REVIEW = "needs_review"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     BLOCKED = "blocked"
@@ -159,6 +160,57 @@ class ModelRun:
         self.error_code = code[:64]
         self.error_message = " ".join(public_message.replace("\x00", "").split())[:500]
         self.error_details = details
+        self.finished_at = timestamp
+        self.updated_at = timestamp
+
+    def require_review(
+        self,
+        code: str,
+        public_message: str,
+        *,
+        details: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        self._require_active()
+        timestamp = now or datetime.now(UTC)
+        self.status = ModelRunStatus.NEEDS_REVIEW
+        self.error_code = code[:64]
+        self.error_message = " ".join(public_message.replace("\x00", "").split())[:500]
+        self.error_details = details
+        self.finished_at = timestamp
+        self.updated_at = timestamp
+
+    def adopt_recovery(
+        self,
+        *,
+        output_reference: str,
+        output_sha256: str,
+        output_chars: int,
+        provenance: str,
+        actor_id: str,
+        source_model_run_id: UUID | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        if self.status is not ModelRunStatus.NEEDS_REVIEW:
+            raise ValueError("Model run is not waiting for recovery")
+        timestamp = now or datetime.now(UTC)
+        previous = dict(self.error_details or {})
+        previous["recovery"] = {
+            "provenance": provenance,
+            "actor_id": actor_id,
+            "adopted_at": timestamp.isoformat(),
+            "source_model_run_id": str(source_model_run_id) if source_model_run_id else None,
+        }
+        self.status = ModelRunStatus.SUCCEEDED
+        self.output_references = (*self.output_references, output_reference)
+        self.raw_output_reference = output_reference
+        self.raw_output_sha256 = output_sha256
+        self.raw_output_chars = output_chars
+        self.error_code = None
+        self.error_message = None
+        self.error_details = previous
+        self.duration_ms = max(0, int((timestamp - self.started_at).total_seconds() * 1000))
+        self.usage = self.usage or ModelUsage(estimated=True)
         self.finished_at = timestamp
         self.updated_at = timestamp
 

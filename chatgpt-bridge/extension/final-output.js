@@ -21,5 +21,18 @@
     };
   }
 
-  root.ChatGPTBridgeFinalOutput = { createAccumulator, outputChars };
+  function settledOutcome({ completion, text, stableForMs, emptySettleMs }) {
+    if (completion?.finished === false) return "active";
+    if (completion?.finished === true && text.length === 0) {
+      return stableForMs >= emptySettleMs ? "incomplete" : "waiting";
+    }
+    if (completion?.finished !== false && text.length > 0) return "complete";
+    return "unknown";
+  }
+
+  root.ChatGPTBridgeFinalOutput = {
+    createAccumulator,
+    outputChars,
+    settledOutcome,
+  };
 })(globalThis);

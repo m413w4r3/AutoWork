@@ -75,6 +75,7 @@ class ModelRoutingHint(StrEnum):
 class AdapterResultStatus(StrEnum):
     COMPLETED = "completed"
     WAITING_BACKGROUND = "waiting_background"
+    NEEDS_REVIEW = "needs_review"
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,6 +348,64 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
     async def archive_output(self, content: bytes, *, mime_type: str) -> str:
         return await self._output_store.store(content, mime_type=mime_type)
 
+    async def adopt_recovery_output(
+        self,
+        run_id: UUID,
+        content: bytes,
+        *,
+        provenance: str,
+        actor_id: str,
+        source_model_run_id: UUID | None = None,
+    ) -> ModelRun:
+        digest = hashlib.sha256(content).hexdigest()
+        async with self._uow_factory() as uow:
+            existing = await uow.model_runs.get(run_id)
+            if existing is None:
+                raise ModelGatewayError(f"Model run {run_id} does not exist")
+            recovery = (existing.error_details or {}).get("recovery")
+            if (
+                existing.status is ModelRunStatus.SUCCEEDED
+                and existing.raw_output_sha256 == digest
+                and isinstance(recovery, dict)
+                and recovery.get("provenance") == provenance
+                and recovery.get("source_model_run_id")
+                == (str(source_model_run_id) if source_model_run_id else None)
+            ):
+                return existing
+            if existing.status is not ModelRunStatus.NEEDS_REVIEW:
+                raise ModelGatewayError("ModelRun is not waiting for this recovery")
+        reference = await self._output_store.store(
+            content, mime_type="text/markdown; charset=utf-8"
+        )
+        async with self._uow_factory() as uow:
+            run = await uow.model_runs.get_for_update(run_id)
+            if run is None:
+                raise ModelGatewayError(f"Model run {run_id} does not exist")
+            run.adopt_recovery(
+                output_reference=reference,
+                output_sha256=digest,
+                output_chars=len(content.decode(errors="replace")),
+                provenance=provenance,
+                actor_id=actor_id,
+                source_model_run_id=source_model_run_id,
+            )
+            await uow.model_runs.save(run)
+            await uow.commit()
+            return run
+
+    async def link_recovery_child(self, parent_run_id: UUID, child_run_id: UUID) -> None:
+        async with self._uow_factory() as uow:
+            run = await uow.model_runs.get_for_update(parent_run_id)
+            if run is None or run.status is not ModelRunStatus.NEEDS_REVIEW:
+                raise ModelGatewayError("Parent ModelRun is not recoverable")
+            run.error_details = {
+                **(run.error_details or {}),
+                "recovery_child_model_run_id": str(child_run_id),
+            }
+            run.updated_at = datetime.now(UTC)
+            await uow.model_runs.save(run)
+            await uow.commit()
+
     async def record_output_diagnostics(
         self,
         run_id: UUID,
@@ -434,6 +493,15 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         response_id=result.response_id or run.response_id,
                         background_status=str(result.metadata.get("background_status", "unknown")),
                     )
+                if result.status is AdapterResultStatus.NEEDS_REVIEW:
+                    run.require_review(
+                        str(result.metadata.get("reason", "no_final_answer")),
+                        "ChatGPT s'est arrêté sans produire de réponse finale.",
+                        details=result.metadata,
+                    )
+                    await uow.model_runs.save(run)
+                    await uow.commit()
+                    return ModelExecution(run, metadata=result.metadata)
                 execution = await self._complete_run(run, result, duration_ms=elapsed_ms)
                 await uow.model_runs.save(run)
                 await uow.commit()
@@ -504,6 +572,15 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     await uow.model_runs.save(persisted)
                     await uow.commit()
                     return ModelExecution(persisted)
+                if result.status is AdapterResultStatus.NEEDS_REVIEW:
+                    persisted.require_review(
+                        str(result.metadata.get("reason", "no_final_answer")),
+                        "ChatGPT s'est arrêté sans produire de réponse finale.",
+                        details=result.metadata,
+                    )
+                    await uow.model_runs.save(persisted)
+                    await uow.commit()
+                    return ModelExecution(persisted, metadata=result.metadata)
                 execution = await self._complete_run(
                     persisted,
                     result,

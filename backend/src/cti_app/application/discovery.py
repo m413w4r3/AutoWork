@@ -9,7 +9,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, NoReturn, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -60,7 +60,7 @@ REPROCESS_DISCOVERY_REPORT_JOB_KIND = "reprocess_discovery_report"
 # Compatibility import for callers compiled against the previous name.
 RETRY_STRUCTURING_JOB_KIND = REPROCESS_DISCOVERY_REPORT_JOB_KIND
 PROMPT_TEMPLATE_ID = "monthly-cti-discovery"
-PROMPT_TEMPLATE_VERSION = "4.0"
+PROMPT_TEMPLATE_VERSION = "4.1"
 COMPACT_CONTRACT_VERSION = "research-batch-compact-v1"
 logger = logging.getLogger(__name__)
 
@@ -192,6 +192,8 @@ class BridgeCapabilitiesProvider(Protocol):
 
     async def archive_conversation(self, conversation_id: UUID) -> None: ...
 
+    async def preview_visible_recovery(self, bridge_run_id: str) -> dict[str, Any]: ...
+
 
 class ModelOutputArchive(Protocol):
     async def get_run(self, run_id: UUID) -> ModelRun | None: ...
@@ -201,6 +203,18 @@ class ModelOutputArchive(Protocol):
     async def archive_output(self, content: bytes, *, mime_type: str) -> str: ...
 
     async def resume(self, run_id: UUID) -> ModelExecution: ...
+
+    async def adopt_recovery_output(
+        self,
+        run_id: UUID,
+        content: bytes,
+        *,
+        provenance: str,
+        actor_id: str,
+        source_model_run_id: UUID | None = None,
+    ) -> ModelRun: ...
+
+    async def link_recovery_child(self, parent_run_id: UUID, child_run_id: UUID) -> None: ...
 
     async def record_output_diagnostics(
         self,
@@ -292,6 +306,8 @@ class DiscoveryService:
                     "read_output",
                     "archive_output",
                     "resume",
+                    "adopt_recovery_output",
+                    "link_recovery_child",
                     "record_output_diagnostics",
                 )
             )
@@ -405,6 +421,11 @@ class DiscoveryService:
                 return await self._completed_execution_from_archive(existing)
             if existing.status is ModelRunStatus.WAITING_BACKGROUND:
                 return await self._poll_background_research(existing.id, context)
+            if existing.status is ModelRunStatus.NEEDS_REVIEW:
+                recovered = await self._resume_recovery_child(existing, context)
+                if recovered is not None:
+                    return recovered
+                await self._wait_for_incomplete_review(existing, context)
             if existing.status in {ModelRunStatus.FAILED, ModelRunStatus.BLOCKED}:
                 error = ModelGatewayError(existing.error_message or "Research ModelRun failed")
                 error.code = existing.error_code or "research_failed"
@@ -419,6 +440,221 @@ class DiscoveryService:
         if execution.run.status is ModelRunStatus.SUCCEEDED and not execution.output_text:
             return await self._completed_execution_from_archive(execution.run)
         return execution
+
+    async def _resume_recovery_child(
+        self, parent: ModelRun, context: JobExecutionContext
+    ) -> ModelExecution | None:
+        if self._output_archive is None:
+            return None
+        raw_child_id = (parent.error_details or {}).get("recovery_child_model_run_id")
+        if not isinstance(raw_child_id, str):
+            return None
+        try:
+            child_id = UUID(raw_child_id)
+        except ValueError:
+            return None
+        child = await self._output_archive.get_run(child_id)
+        if child is None:
+            raise ModelGatewayError("Recovery child ModelRun is unavailable")
+        if child.status is ModelRunStatus.WAITING_BACKGROUND:
+            execution = await self._poll_background_research(child.id, context)
+        elif child.status is ModelRunStatus.SUCCEEDED:
+            execution = await self._completed_execution_from_archive(child)
+        elif child.status is ModelRunStatus.NEEDS_REVIEW:
+            await self._wait_for_incomplete_review(child, context)
+        else:
+            raise ModelGatewayError(child.error_message or "Recovery child failed")
+        if not execution.output_text:
+            raise ModelGatewayError("Recovery child produced no final output")
+        adopted = await self._output_archive.adopt_recovery_output(
+            parent.id,
+            execution.output_text.encode(),
+            provenance="recovery_continuation",
+            actor_id="system:recovery",
+            source_model_run_id=child.id,
+        )
+        return ModelExecution(
+            run=adopted,
+            output_text=execution.output_text,
+            metadata=execution.metadata,
+        )
+
+    async def preview_visible_recovery(
+        self,
+        parameters: DiscoverEditionParameters,
+        parent_run_id: UUID,
+    ) -> dict[str, Any]:
+        if self._output_archive is None or self._bridge_capabilities_provider is None:
+            raise ModelGatewayError("Recovery infrastructure is unavailable")
+        parent = await self._output_archive.get_run(parent_run_id)
+        if (
+            parent is None
+            or not parent.response_id
+            or (
+                parent.status is not ModelRunStatus.NEEDS_REVIEW
+                and not _has_recovery_provenance(parent, "visible_recovery")
+            )
+        ):
+            raise ModelGatewayError("ModelRun is not waiting for recovery")
+        recovered = await self._bridge_capabilities_provider.preview_visible_recovery(
+            parent.response_id
+        )
+        text = recovered.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ModelGatewayError("No visible final response is recoverable")
+        return {
+            **self._preview_report(parameters, parent_run_id, text),
+            "report_markdown": text,
+        }
+
+    async def preview_manual_recovery(
+        self,
+        parameters: DiscoverEditionParameters,
+        parent_run_id: UUID,
+        text: str,
+    ) -> dict[str, Any]:
+        if self._output_archive is None:
+            raise ModelGatewayError("Model output archive is unavailable")
+        parent = await self._output_archive.get_run(parent_run_id)
+        if parent is None or (
+            parent.status is not ModelRunStatus.NEEDS_REVIEW
+            and not _has_recovery_provenance(parent, "manual_import")
+        ):
+            raise ModelGatewayError("ModelRun is not waiting for recovery")
+        return self._preview_report(parameters, parent_run_id, text)
+
+    async def adopt_visible_recovery(
+        self,
+        parameters: DiscoverEditionParameters,
+        parent_run_id: UUID,
+        *,
+        expected_sha256: str,
+        actor_id: str,
+    ) -> None:
+        preview = await self.preview_visible_recovery(parameters, parent_run_id)
+        text = preview.get("report_markdown")
+        if not isinstance(text, str) or preview["sha256"] != expected_sha256:
+            raise ValueError("Recovery preview no longer matches the confirmed report")
+        if self._output_archive is None:
+            raise ModelGatewayError("Model output archive is unavailable")
+        await self._output_archive.adopt_recovery_output(
+            parent_run_id,
+            text.encode(),
+            provenance="visible_recovery",
+            actor_id=actor_id,
+        )
+
+    def _preview_report(
+        self,
+        parameters: DiscoverEditionParameters,
+        parent_run_id: UUID,
+        text: str,
+    ) -> dict[str, Any]:
+        parsed = parse_discovery_report(
+            text,
+            visible_citations=[],
+            period_start=parameters.period_start,
+            period_end=parameters.period_end,
+            tlp=parameters.tlp,
+            sensitivity=parameters.sensitivity,
+            external_llm_allowed=parameters.external_llm_allowed,
+            research_model_run_id=parent_run_id,
+        )
+        iocs = [ioc for candidate in parsed.candidates for ioc in candidate.provisional_iocs]
+        counts: dict[str, int] = {}
+        for ioc in iocs:
+            counts[ioc.proposed_type.value] = counts.get(ioc.proposed_type.value, 0) + 1
+        return {
+            "sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "subject_count": len(parsed.candidates),
+            "publication_count": sum(
+                len(candidate.sources) + len(candidate.incomplete_sources)
+                for candidate in parsed.candidates
+            ),
+            "ioc_count": len(iocs),
+            "ioc_type_counts": counts,
+            "warnings": list(parsed.warnings),
+            "subjects": [candidate.title for candidate in parsed.candidates],
+        }
+
+    async def adopt_recovery_report(
+        self,
+        parameters: DiscoverEditionParameters,
+        parent_run_id: UUID,
+        text: str,
+        *,
+        expected_sha256: str,
+        provenance: str,
+        actor_id: str,
+    ) -> None:
+        preview = self._preview_report(parameters, parent_run_id, text)
+        if preview["sha256"] != expected_sha256:
+            raise ValueError("Recovery preview no longer matches the confirmed report")
+        if self._output_archive is None:
+            raise ModelGatewayError("Model output archive is unavailable")
+        await self._output_archive.adopt_recovery_output(
+            parent_run_id,
+            text.encode(),
+            provenance=provenance,
+            actor_id=actor_id,
+        )
+
+    async def start_completion_recovery(
+        self,
+        parameters: DiscoverEditionParameters,
+        parent_run_id: UUID,
+    ) -> UUID:
+        if self._output_archive is None:
+            raise ModelGatewayError("Model output archive is unavailable")
+        parent = await self._output_archive.get_run(parent_run_id)
+        details = parent.error_details if parent else None
+        if parent is not None and _has_recovery_provenance(parent, "recovery_continuation"):
+            recovery = (parent.error_details or {}).get("recovery")
+            source_id = recovery.get("source_model_run_id") if isinstance(recovery, dict) else None
+            if isinstance(source_id, str):
+                return UUID(source_id)
+        conversation = details.get("conversation") if isinstance(details, dict) else None
+        if (
+            parent is None
+            or parent.status is not ModelRunStatus.NEEDS_REVIEW
+            or not isinstance(conversation, dict)
+            or not isinstance(conversation.get("id"), str)
+            or not isinstance(conversation.get("external_locator"), str)
+        ):
+            raise ModelGatewayError("Verified discovery conversation is unavailable")
+        child_id = uuid5(NAMESPACE_URL, f"{parent_run_id}:complete-initial-response:v1")
+        request = ModelRequest(
+            text=(
+                "Ta réponse précédente ne contient pas de résultat final. Termine maintenant "
+                "la mission initiale et fournis directement le rapport Markdown demandé, sans "
+                "recommencer toute la recherche."
+            ),
+            prompt_template_id="monthly-cti-discovery-recovery",
+            prompt_template_version="1.0",
+            evidence_pack_hash=parent.evidence_pack_hash,
+            external_llm_allowed=parameters.external_llm_allowed,
+            routing_hint=ModelRoutingHint.WEB_RESEARCH,
+            provider=parent.provider,
+            sensitivity=parameters.sensitivity,
+            parameters={
+                "bridge_recovery": True,
+                "recovery_parent_model_run_id": str(parent_run_id),
+            },
+            background=True,
+            conversation=ConversationContext(
+                mode="continue",
+                id=UUID(conversation["id"]),
+                external_locator=conversation["external_locator"],
+            ),
+            run_id=child_id,
+        )
+        child = await self._output_archive.get_run(child_id)
+        if child is None:
+            await self._research_model.research(request)
+        elif child.status in {ModelRunStatus.FAILED, ModelRunStatus.BLOCKED}:
+            raise ModelGatewayError(child.error_message or "Recovery child failed")
+        await self._output_archive.link_recovery_child(parent_run_id, child_id)
+        return child_id
 
     async def _poll_background_research(
         self,
@@ -437,6 +673,8 @@ class DiscoveryService:
                 raise ModelGatewayError(f"Model run {model_run_id} does not exist")
             if current.status is ModelRunStatus.SUCCEEDED:
                 return await self._completed_execution_from_archive(current)
+            if current.status is ModelRunStatus.NEEDS_REVIEW:
+                await self._wait_for_incomplete_review(current, context)
             if current.status in {ModelRunStatus.FAILED, ModelRunStatus.BLOCKED}:
                 error = ModelGatewayError(current.error_message or "Research ModelRun failed")
                 error.code = current.error_code or "research_failed"
@@ -465,10 +703,31 @@ class DiscoveryService:
                 elapsed_seconds=time.monotonic() - started,
             )
             if execution.run.status is not ModelRunStatus.SUCCEEDED:
+                if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
+                    await self._wait_for_incomplete_review(execution.run, context)
                 raise ModelGatewayError("Background research returned a non-terminal result")
             if execution.output_text:
                 return execution
             return await self._completed_execution_from_archive(execution.run)
+
+    @staticmethod
+    async def _wait_for_incomplete_review(
+        run: ModelRun,
+        context: JobExecutionContext,
+    ) -> NoReturn:
+        details = {
+            "phase": "chatgpt_incomplete",
+            "reason": run.error_code or "no_final_answer",
+            "model_run_id": str(run.id),
+            "bridge_run_id": run.response_id,
+            "correlation_id": get_correlation_id(),
+            **(run.error_details or {}),
+        }
+        await context.wait_for_human(
+            "ChatGPT s'est arrêté sans produire de réponse finale. "
+            "La conversation a été conservée et peut être reprise.",
+            details,
+        )
 
     @staticmethod
     async def _record_background_observation(
@@ -510,9 +769,8 @@ class DiscoveryService:
     async def _completed_execution_from_archive(self, run: ModelRun) -> ModelExecution:
         if self._output_archive is None or not run.output_references:
             raise ModelGatewayError("Completed research has no archived output")
-        output = await self._output_archive.read_output(
-            run.output_references[0], max_bytes=10_000_000
-        )
+        reference = run.raw_output_reference or run.output_references[-1]
+        output = await self._output_archive.read_output(reference, max_bytes=10_000_000)
         text = output.decode("utf-8")
         if not text.strip():
             raise ModelGatewayError("Completed research output is empty")
@@ -716,7 +974,10 @@ class DiscoveryService:
         if run is None or not run.output_references:
             raise ModelGatewayError("Archived research ModelRun is unavailable")
         research_text = (
-            await self._output_archive.read_output(run.output_references[0], max_bytes=10_000_000)
+            await self._output_archive.read_output(
+                run.raw_output_reference or run.output_references[-1],
+                max_bytes=10_000_000,
+            )
         ).decode()
         await context.report_progress(1, 2, "Le rapport ChatGPT archivé est réutilisé")
         parsed = parse_discovery_report(
@@ -774,7 +1035,7 @@ class DiscoveryService:
         if run is None or not run.output_references:
             raise ReportParsingError("report_unavailable", "Rapport archivé introuvable.")
         content = await self._output_archive.read_output(
-            run.output_references[0], max_bytes=10_000_000
+            run.raw_output_reference or run.output_references[-1], max_bytes=10_000_000
         )
         if not content:
             raise ReportParsingError("report_empty", "Le rapport archivé est vide.")
@@ -1019,6 +1280,9 @@ Chaque SUBJECT doit normalement comporter au moins une publication dans la
 période observable. Les publications antérieures peuvent être ajoutées comme
 rapport original, analyse indépendante ou contexte technique.
 
+Limite cette phase à la sélection éditoriale. N’effectue pas encore l’analyse
+exhaustive de la chaîne d’infection, des TTP, des outils ou de la victimologie.
+
 Pour les IOC :
 
 - signale uniquement les IOC explicitement visibles dans les pages consultées ;
@@ -1059,11 +1323,10 @@ title: <titre exact>
 url: <URL HTTP(S) exacte>
 publisher: <éditeur ou unknown>
 published-at: <YYYY-MM-DD ou unknown>
-period: <in-period, outside-period ou unknown>
 role: <primary, independent, relay, aggregator ou unknown>
 ioc-visibility: <none, declared, visible ou unknown>
 visible-ioc-types: <liste des types visibles ou none/unknown>
-visible-iocs: <valeurs exactes explicitement visibles ou none/unknown>
+visible-iocs: <jusqu’à 10 valeurs exactes explicitement visibles ou none/unknown>
 publisher-ioc-count: <entier explicitement annoncé ou unknown>
 ioc-note: <une phrase courte ou none>
 
@@ -1091,6 +1354,15 @@ def _source_profile_description(profile_id: str) -> str:
         profile_id,
         "sources primaires et institutionnelles, corroborations techniques indépendantes, "
         "puis relais explicitement étiquetés",
+    )
+
+
+def _has_recovery_provenance(run: ModelRun, provenance: str) -> bool:
+    recovery = (run.error_details or {}).get("recovery")
+    return (
+        run.status is ModelRunStatus.SUCCEEDED
+        and isinstance(recovery, dict)
+        and recovery.get("provenance") == provenance
     )
 
 

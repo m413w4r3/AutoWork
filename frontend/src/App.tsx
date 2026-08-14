@@ -2,10 +2,16 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useCallback, useEffect, useState } from "react";
 
 import {
+  confirmManualDiscoveryRecovery,
+  confirmVisibleDiscoveryRecovery,
   fetchDiscovery,
   launchDiscovery,
   markDiscoverySource,
+  previewManualDiscoveryRecovery,
+  previewVisibleDiscoveryRecovery,
+  requestDiscoveryCompletion,
   retryDiscoveryStructuring,
+  type DiscoveryRecoveryPreview,
   type SourceVerificationStatus,
 } from "./api/discovery";
 import {
@@ -23,7 +29,12 @@ import {
 import { JobStatusCard } from "./components/JobStatusCard";
 import { EditorialBoard } from "./components/EditorialBoard";
 import { SubjectWorkbench } from "./components/SubjectWorkbench";
-import { terminalJobStatuses, type JobStatus, type JobView } from "./api/jobs";
+import {
+  cancelJob,
+  terminalJobStatuses,
+  type JobStatus,
+  type JobView,
+} from "./api/jobs";
 
 const statusLabels: Record<EditionStatus, string> = {
   draft: "Brouillon",
@@ -515,6 +526,12 @@ function DiscoveryPanel({
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
   const [lastJob, setLastJob] = useState<JobView | null>(null);
   const [axis, setAxis] = useState("initial");
+  const [manualMarkdown, setManualMarkdown] = useState("");
+  const [showManualRecovery, setShowManualRecovery] = useState(false);
+  const [recoveryPreview, setRecoveryPreview] = useState<{
+    mode: "visible" | "manual";
+    value: DiscoveryRecoveryPreview;
+  } | null>(null);
   const [search, setSearch] = useState("");
   const [minimum, setMinimum] = useState(0);
   const [sourceStatus, setSourceStatus] = useState<
@@ -587,6 +604,75 @@ function DiscoveryPanel({
       onRunningChange(true);
     },
   });
+  const recoveryRunId =
+    lastJob?.status === "waiting_human" &&
+    lastJob.error_details?.phase === "chatgpt_incomplete" &&
+    typeof lastJob.error_details.model_run_id === "string"
+      ? lastJob.error_details.model_run_id
+      : null;
+  const refreshRecoveredJob = useCallback(
+    (result: { status: string }) => {
+      setJobStatus(result.status as JobStatus);
+      setRecoveryPreview(null);
+      setShowManualRecovery(false);
+      onRunningChange(true);
+      void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
+    },
+    [jobId, onRunningChange, queryClient],
+  );
+  const visibleRecovery = useMutation({
+    mutationFn: () =>
+      previewVisibleDiscoveryRecovery(editionId, recoveryRunId!, jobId!),
+    onSuccess: (value) => setRecoveryPreview({ mode: "visible", value }),
+  });
+  const manualRecovery = useMutation({
+    mutationFn: () =>
+      previewManualDiscoveryRecovery(
+        editionId,
+        recoveryRunId!,
+        jobId!,
+        manualMarkdown,
+      ),
+    onSuccess: (value) => setRecoveryPreview({ mode: "manual", value }),
+  });
+  const confirmRecovery = useMutation({
+    mutationFn: () => {
+      if (!recoveryPreview || !recoveryRunId || !jobId) {
+        throw new Error("Aucun aperçu de récupération à confirmer");
+      }
+      return recoveryPreview.mode === "visible"
+        ? confirmVisibleDiscoveryRecovery(
+            editionId,
+            recoveryRunId,
+            jobId,
+            recoveryPreview.value.sha256,
+          )
+        : confirmManualDiscoveryRecovery(
+            editionId,
+            recoveryRunId,
+            jobId,
+            manualMarkdown,
+            recoveryPreview.value.sha256,
+          );
+    },
+    onSuccess: refreshRecoveredJob,
+  });
+  const completionRecovery = useMutation({
+    mutationFn: () =>
+      requestDiscoveryCompletion(editionId, recoveryRunId!, jobId!),
+    onSuccess: refreshRecoveredJob,
+  });
+  const abandonRecovery = useMutation({
+    mutationFn: () => cancelJob(jobId!),
+    onSuccess: (job) => {
+      setJobStatus(job.status);
+      setLastJob(job);
+      setRecoveryPreview(null);
+      setShowManualRecovery(false);
+      onRunningChange(false);
+      void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
+    },
+  });
   const candidates = discovery.data?.candidates ?? [];
   const batches = discovery.data?.batches ?? [];
   const searchRunning =
@@ -651,6 +737,144 @@ function DiscoveryPanel({
             reprocessReport.mutate(researchModelRunId)
           }
         />
+      ) : null}
+      {jobId && recoveryRunId ? (
+        <section className="recovery-panel" aria-labelledby="recovery-heading">
+          <h3 id="recovery-heading">Reprendre la recherche ChatGPT</h3>
+          <p>
+            ChatGPT s’est arrêté sans produire de réponse finale. La
+            conversation a été conservée et peut être reprise.
+          </p>
+          <div className="action-list">
+            <button
+              className="button button--secondary"
+              disabled={visibleRecovery.isPending}
+              onClick={() => visibleRecovery.mutate()}
+            >
+              Récupérer la réponse déjà affichée
+            </button>
+            <button
+              className="button button--secondary"
+              disabled={completionRecovery.isPending}
+              onClick={() => completionRecovery.mutate()}
+            >
+              Demander à ChatGPT de terminer
+            </button>
+            <button
+              className="button button--secondary"
+              onClick={() => {
+                setShowManualRecovery(true);
+                setRecoveryPreview(null);
+              }}
+            >
+              Coller une réponse
+            </button>
+          </div>
+          {showManualRecovery ? (
+            <div className="manual-recovery">
+              <label htmlFor="manual-discovery-report">Rapport Markdown</label>
+              <textarea
+                id="manual-discovery-report"
+                rows={14}
+                value={manualMarkdown}
+                onChange={(event) => {
+                  setManualMarkdown(event.target.value);
+                  setRecoveryPreview(null);
+                }}
+              />
+              <label>
+                Charger un fichier .md ou .txt
+                <input
+                  type="file"
+                  accept=".md,.txt,text/markdown,text/plain"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) {
+                      void file.text().then((text) => {
+                        setManualMarkdown(text);
+                        setRecoveryPreview(null);
+                      });
+                    }
+                  }}
+                />
+              </label>
+              <button
+                className="button button--secondary"
+                disabled={!manualMarkdown.trim() || manualRecovery.isPending}
+                onClick={() => manualRecovery.mutate()}
+              >
+                Prévisualiser le rapport
+              </button>
+            </div>
+          ) : null}
+          {recoveryPreview ? (
+            <article
+              className="recovery-preview"
+              aria-label="Aperçu du rapport"
+            >
+              <h4>Aperçu avant intégration</h4>
+              <p>
+                {recoveryPreview.value.subject_count} sujets ·{" "}
+                {recoveryPreview.value.publication_count} publications ·{" "}
+                {recoveryPreview.value.ioc_count} IOC provisoires
+              </p>
+              <p>
+                IOC par type :{" "}
+                {Object.entries(recoveryPreview.value.ioc_type_counts)
+                  .map(([type, count]) => `${type}: ${count}`)
+                  .join(" · ") || "aucun"}
+              </p>
+              <ul>
+                {recoveryPreview.value.subjects.map((subject) => (
+                  <li key={subject}>{subject}</li>
+                ))}
+              </ul>
+              {recoveryPreview.value.warnings.length ? (
+                <details>
+                  <summary>
+                    {recoveryPreview.value.warnings.length} avertissement(s)
+                  </summary>
+                  <ul>
+                    {recoveryPreview.value.warnings.map((warning) => (
+                      <li key={warning}>{warning}</li>
+                    ))}
+                  </ul>
+                </details>
+              ) : null}
+              <div className="action-list">
+                <button
+                  className="button"
+                  disabled={confirmRecovery.isPending}
+                  onClick={() => confirmRecovery.mutate()}
+                >
+                  Confirmer et intégrer
+                </button>
+                <button
+                  className="button button--secondary"
+                  onClick={() => setRecoveryPreview(null)}
+                >
+                  Annuler
+                </button>
+              </div>
+            </article>
+          ) : null}
+          {visibleRecovery.isError ||
+          manualRecovery.isError ||
+          completionRecovery.isError ||
+          confirmRecovery.isError ||
+          abandonRecovery.isError ? (
+            <p role="alert" className="error-message">
+              La récupération n’a pas pu être effectuée.
+            </p>
+          ) : null}
+          <button
+            className="button button--danger"
+            disabled={abandonRecovery.isPending}
+            onClick={() => abandonRecovery.mutate()}
+          >
+            Abandonner la recherche
+          </button>
+        </section>
       ) : null}
       <details className="technical-discovery-details">
         <summary>Détails techniques de la découverte</summary>

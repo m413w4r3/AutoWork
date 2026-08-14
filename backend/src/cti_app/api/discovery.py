@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from typing import Annotated, Literal, NoReturn
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
@@ -16,11 +16,18 @@ from cti_app.application.discovery import (
     RetryStructuringParameters,
     SourceCandidateNotFoundError,
     discovery_idempotency_key,
+    discovery_request_hash,
 )
 from cti_app.application.discovery_report_parser import ReportParsingError
 from cti_app.application.editions import EditionNotFoundError, EditionService
 from cti_app.application.identity import IdentityProvider
-from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobService
+from cti_app.application.jobs import (
+    DuplicateJobError,
+    JobDispatcher,
+    JobNotFoundError,
+    JobService,
+)
+from cti_app.application.model_gateway import ModelGatewayError
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
@@ -36,6 +43,7 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
 )
 from cti_app.domain.editions import EditionStatus
+from cti_app.domain.jobs import Job, JobStatus
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api/editions/{edition_id}/discovery", tags=["discovery"])
@@ -190,6 +198,34 @@ class SourceStatusUpdate(BaseModel):
     status: SourceVerificationStatus
 
 
+class RecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: UUID
+
+
+class RecoveryConfirmation(RecoveryRequest):
+    expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ManualRecoveryRequest(RecoveryRequest):
+    markdown: str = Field(min_length=1, max_length=10_000_000)
+
+
+class ManualRecoveryConfirmation(ManualRecoveryRequest):
+    expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class RecoveryPreviewView(BaseModel):
+    sha256: str
+    subject_count: int
+    publication_count: int
+    ioc_count: int
+    ioc_type_counts: dict[str, int]
+    warnings: list[str]
+    subjects: list[str]
+
+
 @router.post("", response_model=DiscoveryLaunchView, status_code=status.HTTP_202_ACCEPTED)
 async def launch_discovery(
     edition_id: UUID, payload: DiscoveryLaunch, request: Request
@@ -305,6 +341,139 @@ async def read_archived_report(
 
 
 @router.post(
+    "/recovery/{research_model_run_id}/visible/preview",
+    response_model=RecoveryPreviewView,
+)
+async def preview_visible_recovery(
+    edition_id: UUID,
+    research_model_run_id: UUID,
+    payload: RecoveryRequest,
+    request: Request,
+) -> RecoveryPreviewView:
+    service: DiscoveryService = request.app.state.discovery_service
+    try:
+        parameters, _ = await _recovery_context(
+            edition_id, research_model_run_id, payload.job_id, request
+        )
+        return RecoveryPreviewView.model_validate(
+            await service.preview_visible_recovery(parameters, research_model_run_id)
+        )
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.post(
+    "/recovery/{research_model_run_id}/visible/confirm",
+    response_model=DiscoveryLaunchView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def confirm_visible_recovery(
+    edition_id: UUID,
+    research_model_run_id: UUID,
+    payload: RecoveryConfirmation,
+    request: Request,
+) -> DiscoveryLaunchView:
+    service: DiscoveryService = request.app.state.discovery_service
+    try:
+        parameters, job = await _recovery_context(
+            edition_id, research_model_run_id, payload.job_id, request
+        )
+        identity: IdentityProvider = request.app.state.identity_provider
+        actor = await identity.current()
+        await service.adopt_visible_recovery(
+            parameters,
+            research_model_run_id,
+            expected_sha256=payload.expected_sha256,
+            actor_id=actor.actor_id,
+        )
+        resumed = await _resume_recovery_job(job, actor.actor_id, request)
+        return DiscoveryLaunchView(job_id=resumed.id, status=resumed.status.value, reused=True)
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.post(
+    "/recovery/{research_model_run_id}/manual/preview",
+    response_model=RecoveryPreviewView,
+)
+async def preview_manual_recovery(
+    edition_id: UUID,
+    research_model_run_id: UUID,
+    payload: ManualRecoveryRequest,
+    request: Request,
+) -> RecoveryPreviewView:
+    service: DiscoveryService = request.app.state.discovery_service
+    try:
+        parameters, _ = await _recovery_context(
+            edition_id, research_model_run_id, payload.job_id, request
+        )
+        return RecoveryPreviewView.model_validate(
+            await service.preview_manual_recovery(
+                parameters, research_model_run_id, payload.markdown
+            )
+        )
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.post(
+    "/recovery/{research_model_run_id}/manual/confirm",
+    response_model=DiscoveryLaunchView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def confirm_manual_recovery(
+    edition_id: UUID,
+    research_model_run_id: UUID,
+    payload: ManualRecoveryConfirmation,
+    request: Request,
+) -> DiscoveryLaunchView:
+    service: DiscoveryService = request.app.state.discovery_service
+    try:
+        parameters, job = await _recovery_context(
+            edition_id, research_model_run_id, payload.job_id, request
+        )
+        identity: IdentityProvider = request.app.state.identity_provider
+        actor = await identity.current()
+        await service.adopt_recovery_report(
+            parameters,
+            research_model_run_id,
+            payload.markdown,
+            expected_sha256=payload.expected_sha256,
+            provenance="manual_import",
+            actor_id=actor.actor_id,
+        )
+        resumed = await _resume_recovery_job(job, actor.actor_id, request)
+        return DiscoveryLaunchView(job_id=resumed.id, status=resumed.status.value, reused=True)
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.post(
+    "/recovery/{research_model_run_id}/complete",
+    response_model=DiscoveryLaunchView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def request_completion_recovery(
+    edition_id: UUID,
+    research_model_run_id: UUID,
+    payload: RecoveryRequest,
+    request: Request,
+) -> DiscoveryLaunchView:
+    service: DiscoveryService = request.app.state.discovery_service
+    try:
+        parameters, job = await _recovery_context(
+            edition_id, research_model_run_id, payload.job_id, request
+        )
+        identity: IdentityProvider = request.app.state.identity_provider
+        actor = await identity.current()
+        await service.start_completion_recovery(parameters, research_model_run_id)
+        resumed = await _resume_recovery_job(job, actor.actor_id, request)
+        return DiscoveryLaunchView(job_id=resumed.id, status=resumed.status.value, reused=True)
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.post(
     "/reports/reprocess",
     response_model=DiscoveryLaunchView,
     status_code=status.HTTP_202_ACCEPTED,
@@ -382,6 +551,54 @@ async def mark_source(
         )
     except Exception as exc:
         _raise_api_error(exc)
+
+
+async def _recovery_context(
+    edition_id: UUID,
+    research_model_run_id: UUID,
+    job_id: UUID,
+    request: Request,
+) -> tuple[DiscoverEditionParameters, Job]:
+    jobs: JobService = request.app.state.job_service
+    try:
+        job = await jobs.get(job_id)
+    except JobNotFoundError as exc:
+        raise ValueError("Recovery job does not exist") from exc
+    if (
+        job.kind != DISCOVERY_JOB_KIND
+        or job.aggregate_type != "edition"
+        or job.aggregate_id != edition_id
+        or job.status
+        not in {
+            JobStatus.WAITING_HUMAN,
+            JobStatus.QUEUED,
+            JobStatus.RUNNING,
+            JobStatus.SUCCEEDED,
+        }
+    ):
+        raise ValueError("Job is not waiting for this discovery recovery")
+    parameters = DiscoverEditionParameters.model_validate(job.input_parameters)
+    details = job.error_details or {}
+    expected_original = uuid5(
+        NAMESPACE_URL,
+        f"cti-discovery-model-run:{discovery_request_hash(parameters)}",
+    )
+    if (
+        details.get("model_run_id") != str(research_model_run_id)
+        and research_model_run_id != expected_original
+    ):
+        raise ValueError("ModelRun does not belong to this recovery job")
+    return parameters, job
+
+
+async def _resume_recovery_job(job: Job, actor_id: str, request: Request) -> Job:
+    jobs: JobService = request.app.state.job_service
+    dispatcher: JobDispatcher = request.app.state.job_dispatcher
+    if job.status is not JobStatus.WAITING_HUMAN:
+        return job
+    resumed = await jobs.resume_waiting_human(job.id, actor_id=actor_id)
+    await dispatcher.dispatch(resumed.id)
+    return resumed
 
 
 def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
@@ -526,6 +743,11 @@ def _raise_api_error(exc: Exception) -> NoReturn:
         raise HTTPException(
             status_code=status_code,
             detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    if isinstance(exc, ModelGatewayError):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "recovery_unavailable", "message": str(exc)},
         ) from exc
     if isinstance(exc, ValueError):
         raise HTTPException(

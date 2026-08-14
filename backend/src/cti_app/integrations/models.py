@@ -319,6 +319,8 @@ class ChatGPTBridgeTransport(HttpResponsesTransport):
             "response_format": response_format,
             "background": bool(payload.get("background", False)),
         }
+        if payload.get("bridge_recovery") is True:
+            bridge_payload["recovery"] = True
         if idempotency_key:
             bridge_payload["request_id"] = idempotency_key
         conversation = payload.get("conversation")
@@ -341,6 +343,9 @@ class ChatGPTBridgeTransport(HttpResponsesTransport):
 
     async def retrieve(self, response_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/bridge/runs/{response_id}")
+
+    async def preview_visible_recovery(self, bridge_run_id: str) -> dict[str, Any]:
+        return await self._request("POST", f"/bridge/runs/{bridge_run_id}/recovery/visible")
 
     async def capabilities(self) -> dict[str, Any]:
         return await self._request(
@@ -410,7 +415,7 @@ class OpenAIResearchAdapter:
             payload["conversation"] = request.conversation.bridge_payload()
             payload["bridge_profile"] = request.conversation.expected_profile
             payload["bridge_ui_model"] = request.conversation.requested_model
-        if role is ModelRole.RESEARCH:
+        if role is ModelRole.RESEARCH and request.parameters.get("bridge_recovery") is not True:
             payload["tools"] = [{"type": "web_search"}]
             payload["include"] = ["web_search_call.action.sources"]
         payload.update(_allowed_parameters(request.parameters, _RESPONSES_PARAMETERS))
@@ -727,6 +732,20 @@ def _responses_result(
             usage=_usage(raw.get("usage")),
             metadata={"background_status": status},
         )
+    if status == "needs_review":
+        metadata = _response_metadata(raw)
+        error = raw.get("error")
+        if isinstance(error, dict):
+            metadata["reason"] = str(error.get("code", "no_final_answer"))
+        return AdapterResult(
+            status=AdapterResultStatus.NEEDS_REVIEW,
+            provider=provider,
+            requested_model=requested_model,
+            actual_model_version=requested_model,
+            response_id=response_id,
+            usage=_usage(raw.get("usage")),
+            metadata=metadata,
+        )
     if status != "completed":
         raise ModelGatewayError(f"Model response reached terminal status {status}")
     output_text = _responses_output_text(raw)
@@ -754,6 +773,32 @@ def _response_metadata(raw: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(metadata, dict):
         return {}
     result: dict[str, Any] = {}
+    reason = metadata.get("reason")
+    if isinstance(reason, str):
+        result["reason"] = reason[:64]
+    conversation = metadata.get("conversation")
+    if isinstance(conversation, dict):
+        result["conversation"] = {
+            key: value
+            for key, value in conversation.items()
+            if key
+            in {
+                "id",
+                "external_locator",
+                "assistant_turns_before",
+                "initial_assistant_turn_id",
+                "tab_id",
+                "window_id",
+                "bridge_run_id",
+                "model_run_id",
+                "verified",
+                "verified_at",
+            }
+            and isinstance(value, (str, int, bool, type(None)))
+        }
+    initial_turn_id = metadata.get("initial_turn_id")
+    if isinstance(initial_turn_id, str):
+        result["initial_turn_id"] = initial_turn_id[:512]
     serializer_version = metadata.get("serializer_version")
     if isinstance(serializer_version, str):
         result["serializer_version"] = serializer_version[:64]
@@ -889,7 +934,9 @@ def _strict_json_schema(schema: type[BaseModel]) -> dict[str, Any]:
     return result
 
 
-_RESPONSES_PARAMETERS = frozenset({"reasoning", "temperature", "top_p", "max_output_tokens"})
+_RESPONSES_PARAMETERS = frozenset(
+    {"reasoning", "temperature", "top_p", "max_output_tokens", "bridge_recovery"}
+)
 _CHAT_PARAMETERS = frozenset({"temperature", "top_p", "max_tokens"})
 
 

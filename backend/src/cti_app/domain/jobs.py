@@ -187,6 +187,18 @@ class Job:
         self.user_message = "Relance demandée"
         self.updated_at = timestamp
 
+    def resume_after_human(self, now: datetime | None = None) -> None:
+        self._require_status(JobStatus.WAITING_HUMAN)
+        timestamp = now or datetime.now(UTC)
+        self.status = JobStatus.QUEUED
+        self.attempt = max(0, self.attempt - 1)
+        self.next_retry_at = timestamp
+        self.finished_at = None
+        self.error_code = None
+        self.error_message = None
+        self.user_message = "Reprise validée par l'analyste"
+        self.updated_at = timestamp
+
     def request_cancellation(self, now: datetime | None = None) -> None:
         if self.is_terminal:
             raise InvalidJobTransitionError(f"Cannot cancel a job in status {self.status.value}")

@@ -12,7 +12,12 @@ from cti_app.application.discovery_report_parser import (
     parse_discovery_report,
 )
 from cti_app.domain.classification import TLP
-from cti_app.domain.discovery import IocPresence, PeriodRelation, SourceRole
+from cti_app.domain.discovery import (
+    DiscoveryIocType,
+    IocPresence,
+    PeriodRelation,
+    SourceRole,
+)
 
 
 def parse(report: str, citations: object = None) -> ParsedDiscoveryReport:
@@ -159,7 +164,15 @@ def test_contract_echo_is_never_a_valid_discovery() -> None:
 def test_real_escaped_iran_report_keeps_all_five_subjects_and_metadata() -> None:
     report = (Path(__file__).parent / "fixtures/chatgpt_iran_2026_08_escaped.md").read_text()
 
-    result = parse(report)
+    result = parse_discovery_report(
+        report,
+        visible_citations=[],
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+    )
 
     assert hashlib.sha256(report.encode()).hexdigest() == (
         "b7243f1ed8e8bab4e49e08021d73abe4248236d01a65f7c4dd84ab8e4bceebc8"
@@ -187,7 +200,7 @@ def test_real_escaped_iran_report_keeps_all_five_subjects_and_metadata() -> None
         (date(2026, 8, 3), PeriodRelation.IN_PERIOD, SourceRole.RELAY),
         (date(2026, 5, 12), PeriodRelation.OUTSIDE_PERIOD, SourceRole.PRIMARY),
         (date(2026, 8, 3), PeriodRelation.IN_PERIOD, SourceRole.RELAY),
-        (None, PeriodRelation.OUTSIDE_PERIOD, SourceRole.PRIMARY),
+        (None, PeriodRelation.UNKNOWN, SourceRole.PRIMARY),
     ]
     assert [source.canonical_url for source in sources] == [
         "https://ics-cert.kaspersky.com/publications/reports/2026/08/03/"
@@ -222,6 +235,50 @@ def test_real_escaped_iran_report_keeps_all_five_subjects_and_metadata() -> None
         "\npublished" not in source.publisher
         for candidate in result.candidates
         for source in candidate.sources
+    )
+
+
+def test_realistic_defanged_ioc_fixture_has_exact_expected_distribution() -> None:
+    report = (Path(__file__).parent / "fixtures/chatgpt_recovery_iocs_63.md").read_text()
+
+    result = parse_discovery_report(
+        report,
+        visible_citations=[],
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+    )
+
+    assert len(result.candidates) == 5
+    assert sum(len(candidate.sources) for candidate in result.candidates) == 14
+    iocs = [ioc for candidate in result.candidates for ioc in candidate.provisional_iocs]
+    assert len(iocs) == 63
+    assert {
+        ioc_type: sum(ioc.proposed_type is ioc_type for ioc in iocs)
+        for ioc_type in (
+            DiscoveryIocType.MD5,
+            DiscoveryIocType.DOMAIN,
+            DiscoveryIocType.IPV4,
+        )
+    } == {
+        DiscoveryIocType.MD5: 17,
+        DiscoveryIocType.DOMAIN: 33,
+        DiscoveryIocType.IPV4: 13,
+    }
+    assert all(ioc.proposed_type is not DiscoveryIocType.OTHER for ioc in iocs)
+    md5 = next(ioc for ioc in iocs if "904784" in ioc.raw_value)
+    assert md5.raw_value == "`904784c9943d019da332bea2cd03996f`"
+    assert md5.normalized_value == "904784c9943d019da332bea2cd03996f"
+    defanged = next(ioc for ioc in iocs if "studiotikva" in ioc.raw_value)
+    assert defanged.raw_value == "studiotikva[.]com"
+    assert defanged.normalized_value == "studiotikva.com"
+    assert next(
+        ioc for ioc in iocs if ioc.raw_value == "update-service(.)net"
+    ).normalized_value == ("update-service.net")
+    assert next(ioc for ioc in iocs if ioc.raw_value == "185.220.101{.}14").normalized_value == (
+        "185.220.101.14"
     )
 
 
@@ -286,6 +343,7 @@ visible-ioc-types: ipv4, url
 visible-iocs:
   - 192.0.2.1
   - https://evil.example/path?x=1
+  - https://two.example/report
 """,
         visible_citations=[],
         period_start=date(2026, 5, 1),

@@ -104,7 +104,6 @@ def parse_discovery_report(
     external_llm_allowed: bool,
     research_model_run_id: UUID | None = None,
 ) -> ParsedDiscoveryReport:
-    del period_start, period_end  # Dates are never inferred from the edition window.
     if not report.strip():
         raise ReportParsingError("report_empty", "Le rapport ChatGPT archivé est vide.")
     if _is_contract_echo(report):
@@ -131,6 +130,7 @@ def parse_discovery_report(
             external_llm_allowed=external_llm_allowed,
         )
     candidates = _best_candidate_revision_by_subject(candidates)
+    _apply_period_relations(candidates, period_start, period_end)
     attached = {source.canonical_url for candidate in candidates for source in candidate.sources}
     unattached = tuple(
         item for item in citation_values if item.get("canonical_url") not in attached
@@ -587,6 +587,10 @@ def _provisional_iocs(
             else "unknown"
         )
         proposed, normalized, validation_warnings = _classify_ioc(raw_value)
+        if proposed is DiscoveryIocType.URL and normalized in {
+            source.canonical_url for source in sources
+        }:
+            continue
         declared_canonical = _declared_ioc_type(declared)
         warnings = list(validation_warnings)
         if (
@@ -635,25 +639,29 @@ def _split_ioc_values(value: str | None) -> list[str]:
 
 def _classify_ioc(value: str) -> tuple[DiscoveryIocType, str | None, tuple[str, ...]]:
     raw = value.strip()
+    classified = re.sub(r"^(?:`{1,3}|\*\*|__)(.*?)(?:`{1,3}|\*\*|__)$", r"\1", raw)
+    classified = re.sub(
+        r"\[(?:\.|dot)\]|\((?:\.|dot)\)|\{(?:\.|dot)\}", ".", classified, flags=re.I
+    )
     try:
-        address = ipaddress.ip_address(raw)
+        address = ipaddress.ip_address(classified)
     except ValueError:
         pass
     else:
         kind = DiscoveryIocType.IPV4 if address.version == 4 else DiscoveryIocType.IPV6
         return kind, address.compressed, ()
-    if re.fullmatch(r"[0-9a-fA-F]{32}", raw):
-        return DiscoveryIocType.MD5, raw.lower(), ()
-    if re.fullmatch(r"[0-9a-fA-F]{40}", raw):
-        return DiscoveryIocType.SHA1, raw.lower(), ()
-    if re.fullmatch(r"[0-9a-fA-F]{64}", raw):
-        return DiscoveryIocType.SHA256, raw.lower(), ()
-    if re.fullmatch(r"CVE-\d{4}-\d{4,}", raw, re.IGNORECASE):
-        return DiscoveryIocType.CVE, raw.upper(), ()
-    if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", raw):
-        return DiscoveryIocType.EMAIL, raw.casefold(), ()
+    if re.fullmatch(r"[0-9a-fA-F]{32}", classified):
+        return DiscoveryIocType.MD5, classified.lower(), ()
+    if re.fullmatch(r"[0-9a-fA-F]{40}", classified):
+        return DiscoveryIocType.SHA1, classified.lower(), ()
+    if re.fullmatch(r"[0-9a-fA-F]{64}", classified):
+        return DiscoveryIocType.SHA256, classified.lower(), ()
+    if re.fullmatch(r"CVE-\d{4}-\d{4,}", classified, re.IGNORECASE):
+        return DiscoveryIocType.CVE, classified.upper(), ()
+    if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", classified):
+        return DiscoveryIocType.EMAIL, classified.casefold(), ()
     try:
-        canonical_url = canonicalize_http_url(raw)
+        canonical_url = canonicalize_http_url(classified)
     except ValueError:
         pass
     else:
@@ -661,10 +669,30 @@ def _classify_ioc(value: str) -> tuple[DiscoveryIocType, str | None, tuple[str, 
     if re.fullmatch(
         r"(?=.{1,253}\Z)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
         r"[a-zA-Z]{2,63}",
-        raw,
+        classified,
     ):
-        return DiscoveryIocType.DOMAIN, raw.casefold().rstrip("."), ()
+        return DiscoveryIocType.DOMAIN, classified.casefold().rstrip("."), ()
     return DiscoveryIocType.OTHER, None, ("ambiguous_text",)
+
+
+def _apply_period_relations(
+    candidates: list[CandidateTopic], period_start: date, period_end: date
+) -> None:
+    for candidate in candidates:
+        for publication in candidate.sources:
+            if publication.published_at is None:
+                publication.period_relation = PeriodRelation.UNKNOWN
+            elif period_start <= publication.published_at <= period_end:
+                publication.period_relation = PeriodRelation.IN_PERIOD
+            else:
+                publication.period_relation = PeriodRelation.OUTSIDE_PERIOD
+        for incomplete_publication in candidate.incomplete_sources:
+            if incomplete_publication.published_at is None:
+                incomplete_publication.period_relation = PeriodRelation.UNKNOWN
+            elif period_start <= incomplete_publication.published_at <= period_end:
+                incomplete_publication.period_relation = PeriodRelation.IN_PERIOD
+            else:
+                incomplete_publication.period_relation = PeriodRelation.OUTSIDE_PERIOD
 
 
 def _declared_ioc_type(value: str) -> DiscoveryIocType:
