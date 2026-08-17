@@ -1053,7 +1053,9 @@ class ProductionArtifactRow(Base):
     conversation_turn_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("model_conversation_turns.id", ondelete="SET NULL")
     )
-    metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    artifact_metadata: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, name="metadata", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 

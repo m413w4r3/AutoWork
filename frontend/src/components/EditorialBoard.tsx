@@ -10,6 +10,7 @@ import {
   type EditorialDecision,
   type EditorialGroup,
 } from "../api/editorial";
+import { ProductionQueue } from "./ProductionQueue";
 
 const scoreLabels: Record<string, string> = {
   impact: "Impact",
@@ -66,6 +67,13 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
   const proposed = board.data.groups.filter(
     (group) => group.status === "proposed",
   );
+
+  // Production queue for batch brief generation
+  const productionQueue = (
+    <div className="production-queue-section">
+      <ProductionQueue editionId={editionId} />
+    </div>
+  );
   const ready = board.data.groups.filter(
     (group) => group.status === "selected",
   );
@@ -92,11 +100,13 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
   const checkedProposed = checkedGroups.filter((id) => proposedIds.has(id));
 
   return (
-    <section
-      className="editorial-board"
-      aria-labelledby="editorial-board-heading"
-    >
-      <div className="editorial-board__heading">
+    <>
+      {productionQueue}
+      <section
+        className="editorial-board"
+        aria-labelledby="editorial-board-heading"
+      >
+        <div className="editorial-board__heading">
         <div>
           <p className="eyebrow">Choix éditorial</p>
           <h2 id="editorial-board-heading">Sélection des sujets</h2>
@@ -483,5 +493,7 @@ function AdvancedGroupControls({
         Séparer les publications cochées
       </button>
     </article>
+      </section>
+    </>
   );
 }

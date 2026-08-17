@@ -2619,7 +2619,7 @@ class SqlAlchemyProductionArtifactRepository:
             rendered_blob_id=artifact.rendered_blob_id,
             model_run_id=artifact.model_run_id,
             conversation_turn_id=artifact.conversation_turn_id,
-            metadata=artifact.metadata,
+            artifact_metadata=artifact.metadata,
             created_at=artifact.created_at,
         )
         self._session.add(row)
@@ -2799,7 +2799,7 @@ def _production_artifact_from_row(row: ProductionArtifactRow) -> ProductionArtif
         rendered_blob_id=row.rendered_blob_id,
         model_run_id=row.model_run_id,
         conversation_turn_id=row.conversation_turn_id,
-        metadata=row.metadata,
+        metadata=row.artifact_metadata,
         created_at=row.created_at,
     )
 

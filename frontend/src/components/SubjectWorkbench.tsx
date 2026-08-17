@@ -17,9 +17,16 @@ import {
 import { JobStatusCard } from "./JobStatusCard";
 import { BriefEditor } from "./BriefEditor";
 import { AnalysisConversations } from "./AnalysisConversations";
+import { SubjectProduction } from "./SubjectProduction";
 
 type Tab =
-  "sources" | "evidence" | "ioc" | "extraction" | "brief" | "conversations";
+  | "sources"
+  | "evidence"
+  | "ioc"
+  | "extraction"
+  | "brief"
+  | "conversations"
+  | "production";
 
 export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
   const queryClient = useQueryClient();
@@ -88,6 +95,7 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
               ["extraction", "Extraction"],
               ["brief", "Rédaction"],
               ["conversations", "Conversations"],
+              ["production", "Briefing auto"],
             ] as const
           ).map(([value, label]) => (
             <button
@@ -126,6 +134,9 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
       ) : null}
       {workbench.data && tab === "conversations" ? (
         <AnalysisConversations subjectId={subjectId} />
+      ) : null}
+      {tab === "production" ? (
+        <SubjectProduction subjectId={subjectId} />
       ) : null}
     </section>
   );
