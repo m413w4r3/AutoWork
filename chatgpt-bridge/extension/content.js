@@ -113,7 +113,7 @@ const SETTLE_MS = 2000; // fin UI confirmée
 const SETTLE_UNKNOWN_MS = 15000; // pas de signal UI fiable : prudence
 const EMPTY_FINAL_SETTLE_MS = 10000;
 const NO_MARKDOWN_FALLBACK_MS = 25000;
-const HEARTBEAT_INTERVAL_MS = 20000;
+const HEARTBEAT_INTERVAL_MS = 5000;
 
 // Une réponse non vide et inchangée ne doit jamais rester "running"
 // pendant plusieurs minutes uniquement à cause d'un signal DOM périmé.
@@ -1041,7 +1041,11 @@ async function streamAnswer(job, locator, before) {
       };
     }
 
-    if (full.length > 0 && stableForMs >= FINALIZATION_STALL_MS) {
+    if (
+      full.length > 0 &&
+      finished !== false &&
+      stableForMs >= FINALIZATION_STALL_MS
+    ) {
       return {
         text: full,
         visible_citations: snapshot?.visible_citations || [],

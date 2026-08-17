@@ -7,15 +7,15 @@
     if (signals.streamingVisible) {
       return { finished: false, signal: "streaming", confidence: "high" };
     }
-    if (signals.reasoningVisible) {
-      return { finished: false, signal: "reasoning", confidence: "high" };
-    }
     if (signals.actionsVisible) {
       return {
         finished: true,
         signal: "assistant_actions",
         confidence: "high",
       };
+    }
+    if (signals.reasoningVisible) {
+      return { finished: false, signal: "reasoning", confidence: "high" };
     }
     return { finished: null, signal: "unknown", confidence: "low" };
   }

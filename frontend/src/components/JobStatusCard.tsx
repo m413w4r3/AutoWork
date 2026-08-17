@@ -198,6 +198,42 @@ export function JobStatusCard({
       </p>
       {active ? <p>Temps écoulé : {elapsedSeconds} s</p> : null}
       {job.data.user_message ? <p>{job.data.user_message}</p> : null}
+      {isDiscovery &&
+      details?.phase === "background_bridge_wait" ? (
+        <div className="chatgpt-live-status" role="status" aria-live="polite">
+          <p>
+            <strong>
+              {details.chatgpt_phase === "reasoning"
+                ? "ChatGPT recherche et réfléchit"
+                : details.chatgpt_phase === "generating"
+                  ? "ChatGPT génère la réponse"
+                  : details.chatgpt_phase === "answering"
+                    ? "ChatGPT rédige la réponse"
+                    : details.chatgpt_phase === "stabilizing"
+                      ? "Réponse reçue — vérification en cours"
+                      : details.chatgpt_phase === "waiting_answer"
+                        ? "En attente de la réponse ChatGPT"
+                        : "ChatGPT travaille"}
+            </strong>
+          </p>
+
+          {typeof details.chatgpt_output_chars === "number" &&
+          details.chatgpt_output_chars > 0 ? (
+            <p>
+              Réponse visible :{" "}
+              {details.chatgpt_output_chars.toLocaleString()} caractères
+            </p>
+          ) : null}
+
+          {typeof details.chatgpt_stable_for_ms === "number" &&
+          details.chatgpt_stable_for_ms > 0 ? (
+            <p>
+              Inchangée depuis{" "}
+              {(details.chatgpt_stable_for_ms / 1000).toFixed(1)} s
+            </p>
+          ) : null}
+        </div>
+      ) : null}
       {job.data.status === "queued" || job.data.status === "running" ? (
         <button
           className="button button--secondary"

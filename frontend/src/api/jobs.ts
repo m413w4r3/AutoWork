@@ -33,6 +33,10 @@ export interface JobView {
     correlation_id?: string;
     diagnostic_available?: boolean;
     can_retry_structuring?: boolean;
+    chatgpt_phase?: string | null;
+    chatgpt_output_chars?: number | null;
+    chatgpt_stable_for_ms?: number | null;
+    chatgpt_completion_signal?: string | null;
   } | null;
   correlation_id: string;
   output_reference: string | null;

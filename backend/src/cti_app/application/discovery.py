@@ -517,10 +517,15 @@ class DiscoveryService:
             raise ModelGatewayError("Model output archive is unavailable")
         parent = await self._output_archive.get_run(parent_run_id)
         if parent is None or (
-            parent.status is not ModelRunStatus.NEEDS_REVIEW
+            parent.status
+            not in {
+                ModelRunStatus.NEEDS_REVIEW,
+                ModelRunStatus.WAITING_BACKGROUND,
+                ModelRunStatus.FAILED,
+            }
             and not _has_recovery_provenance(parent, "manual_import")
         ):
-            raise ModelGatewayError("ModelRun is not waiting for recovery")
+            raise ModelGatewayError("ModelRun is not eligible for manual recovery")
         return self._preview_report(parameters, parent_run_id, text)
 
     async def adopt_visible_recovery(
