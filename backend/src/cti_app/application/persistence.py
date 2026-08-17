@@ -27,6 +27,12 @@ from cti_app.domain.model_conversations import (
     ModelConversationTurn,
 )
 from cti_app.domain.model_runs import ModelOutputRejection, ModelProvider, ModelRun
+from cti_app.domain.production import (
+    EditionProductionBatch,
+    EditionProductionBatchItem,
+    ProductionArtifact,
+    SubjectProductionRun,
+)
 
 
 class BlobRepository(Protocol):
@@ -400,3 +406,75 @@ class DiscoveryUnitOfWork(Protocol):
 
 class DiscoveryUnitOfWorkFactory(Protocol):
     def __call__(self) -> DiscoveryUnitOfWork: ...
+
+
+class SubjectProductionRunRepository(Protocol):
+    async def add(self, run: SubjectProductionRun) -> None: ...
+
+    async def get(self, run_id: UUID) -> SubjectProductionRun | None: ...
+
+    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None: ...
+
+    async def save(self, run: SubjectProductionRun) -> None: ...
+
+    async def get_current_for_subject(self, subject_id: UUID) -> SubjectProductionRun | None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectProductionRun]: ...
+
+
+class ProductionArtifactRepository(Protocol):
+    async def append(self, artifact: ProductionArtifact) -> None: ...
+
+    async def get(self, artifact_id: UUID) -> ProductionArtifact | None: ...
+
+    async def get_current(
+        self, run_id: UUID, stage: str
+    ) -> ProductionArtifact | None: ...
+
+    async def list_for_run(self, run_id: UUID) -> Sequence[ProductionArtifact]: ...
+
+    async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None: ...
+
+
+class EditionProductionBatchRepository(Protocol):
+    async def add(self, batch: EditionProductionBatch) -> None: ...
+
+    async def get(self, batch_id: UUID) -> EditionProductionBatch | None: ...
+
+    async def get_for_update(self, batch_id: UUID) -> EditionProductionBatch | None: ...
+
+    async def save(self, batch: EditionProductionBatch) -> None: ...
+
+    async def get_active_for_edition(
+        self, edition_id: UUID
+    ) -> EditionProductionBatch | None: ...
+
+
+class EditionProductionBatchItemRepository(Protocol):
+    async def append_many(self, items: Sequence[EditionProductionBatchItem]) -> None: ...
+
+    async def list_for_batch(self, batch_id: UUID) -> Sequence[EditionProductionBatchItem]: ...
+
+
+class ProductionUnitOfWork(Protocol):
+    subject_production_runs: SubjectProductionRunRepository
+    production_artifacts: ProductionArtifactRepository
+    edition_production_batches: EditionProductionBatchRepository
+    edition_production_batch_items: EditionProductionBatchItemRepository
+
+    async def __aenter__(self) -> Self: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+    async def commit(self) -> None: ...
+
+    async def rollback(self) -> None: ...
+
+
+class ProductionUnitOfWorkFactory(Protocol):
+    def __call__(self) -> ProductionUnitOfWork: ...

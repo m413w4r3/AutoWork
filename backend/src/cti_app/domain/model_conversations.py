@@ -21,6 +21,7 @@ class ConversationPurpose(StrEnum):
     PIVOT_RESEARCH = "pivot_research"
     DRAFTING = "drafting"
     CRITIC = "critic"
+    SUBJECT_PRODUCTION = "subject_production"
 
 
 class ConversationStatus(StrEnum):
@@ -50,6 +51,7 @@ class ConversationTurnStatus(StrEnum):
 CONTINUABLE_PURPOSES = {
     ConversationPurpose.ANALYST_ASSISTANCE,
     ConversationPurpose.PIVOT_RESEARCH,
+    ConversationPurpose.SUBJECT_PRODUCTION,
 }
 
 

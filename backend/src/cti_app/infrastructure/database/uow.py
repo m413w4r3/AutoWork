@@ -13,6 +13,8 @@ from cti_app.application.persistence import (
     DiscoveryBatchRepository,
     EditionAuditRepository,
     EditionRepository,
+    EditionProductionBatchItemRepository,
+    EditionProductionBatchRepository,
     EditorialGroupRepository,
     HumanDecisionRepository,
     IndicatorRepository,
@@ -22,12 +24,14 @@ from cti_app.application.persistence import (
     ModelConversationTurnRepository,
     ModelOutputRejectionRepository,
     ModelRunRepository,
+    ProductionArtifactRepository,
     ProvenanceRepository,
     RejectedModelProposalRepository,
     SampleRepository,
     SourceCollectionRepository,
     SourceDocumentRepository,
     SubjectRepository,
+    SubjectProductionRunRepository,
 )
 from cti_app.infrastructure.database.repositories import (
     SqlAlchemyBlobRepository,
@@ -40,6 +44,8 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyDiscoveryBatchRepository,
     SqlAlchemyEditionAuditRepository,
     SqlAlchemyEditionRepository,
+    SqlAlchemyEditionProductionBatchItemRepository,
+    SqlAlchemyEditionProductionBatchRepository,
     SqlAlchemyEditorialGroupRepository,
     SqlAlchemyHumanDecisionRepository,
     SqlAlchemyIndicatorRepository,
@@ -49,12 +55,14 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyModelConversationTurnRepository,
     SqlAlchemyModelOutputRejectionRepository,
     SqlAlchemyModelRunRepository,
+    SqlAlchemyProductionArtifactRepository,
     SqlAlchemyProvenanceRepository,
     SqlAlchemyRejectedModelProposalRepository,
     SqlAlchemySampleRepository,
     SqlAlchemySourceCollectionRepository,
     SqlAlchemySourceDocumentRepository,
     SqlAlchemySubjectRepository,
+    SqlAlchemySubjectProductionRunRepository,
 )
 
 
@@ -84,6 +92,10 @@ class SqlAlchemyUnitOfWork:
     rejected_model_proposals: RejectedModelProposalRepository
     brief_evidence_packs: BriefEvidencePackRepository
     brief_drafts: BriefDraftRepository
+    subject_production_runs: SubjectProductionRunRepository
+    production_artifacts: ProductionArtifactRepository
+    edition_production_batches: EditionProductionBatchRepository
+    edition_production_batch_items: EditionProductionBatchItemRepository
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -119,6 +131,10 @@ class SqlAlchemyUnitOfWork:
         self.rejected_model_proposals = SqlAlchemyRejectedModelProposalRepository(self._session)
         self.brief_evidence_packs = SqlAlchemyBriefEvidencePackRepository(self._session)
         self.brief_drafts = SqlAlchemyBriefDraftRepository(self._session)
+        self.subject_production_runs = SqlAlchemySubjectProductionRunRepository(self._session)
+        self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)
+        self.edition_production_batches = SqlAlchemyEditionProductionBatchRepository(self._session)
+        self.edition_production_batch_items = SqlAlchemyEditionProductionBatchItemRepository(self._session)
         self._committed = False
         return self
 
