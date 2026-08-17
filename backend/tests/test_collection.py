@@ -655,3 +655,87 @@ async def test_postgresql_commit_failure_remains_systemic(
 
     with pytest.raises(RuntimeError, match="PostgreSQL unavailable"):
         await app.archive_one(source.id, uuid4())
+
+
+async def test_new_contribution_does_not_recollect_an_already_known_url(
+    tmp_path: Path,
+) -> None:
+    """§28 : une URL déjà rattachée au sujet n'est pas retéléchargée.
+
+    Une contribution ultérieure réintroduit la même publication sous un
+    SourceCandidate.id différent ; seule la nouvelle URL doit être collectée.
+    """
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    app = service(factory, Transport([response(), response()]), tmp_path / "blobs")
+
+    first = await app.initialize(subject.id)
+    assert [collection.requested_url for collection in first] == [
+        "https://one.example/report"
+    ]
+
+    # Deuxième contribution : même publication (nouvel id) + une nouvelle URL.
+    group = next(iter(factory.groups.values()))
+    known_batch = next(iter(factory.batches.values()))
+    known_candidate = known_batch.candidates[0]
+    complement_candidate = CandidateTopic(
+        title=known_candidate.title,
+        summary=known_candidate.summary,
+        novelty=known_candidate.novelty,
+        technical_potential=4,
+        uncertainties=(),
+        relevance_reasons=("technical",),
+        actors=(),
+        campaigns=(),
+        malware=("ExampleRAT",),
+        cves=(),
+        victims=(),
+        sectors=(),
+        countries=("Iran",),
+        likely_artifacts=("ioc",),
+        sources=[
+            SourceCandidate(
+                url="https://one.example/report?utm_source=newsletter",
+                title="Report 1",
+                publisher="Research team",
+                role=SourceRole.PRIMARY,
+                tlp=TLP.AMBER,
+                sensitivity="internal",
+                external_llm_allowed=False,
+            ),
+            SourceCandidate(
+                url="https://three.example/report",
+                title="Report 3",
+                publisher="Research team",
+                role=SourceRole.INDEPENDENT,
+                tlp=TLP.AMBER,
+                sensitivity="internal",
+                external_llm_allowed=False,
+            ),
+        ],
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=False,
+    )
+    complement = DiscoveryBatch(
+        edition_id=known_batch.edition_id,
+        request_hash="b" * 64,
+        complementary_axis="complement",
+        queries=("query",),
+        citations=(),
+        candidates=[complement_candidate],
+        discovery_model_run_id=uuid4(),
+        structuring_model_run_id=uuid4(),
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=False,
+    )
+    factory.batches[complement.id] = complement
+    group.add_candidates((CandidateReference(complement.id, complement_candidate.id),))
+
+    collections = await app.initialize(subject.id)
+
+    assert sorted(collection.requested_url for collection in collections) == [
+        "https://one.example/report",
+        "https://three.example/report",
+    ]

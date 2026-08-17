@@ -1,36 +1,47 @@
-"""Consolidation of multiple discovery batches into a coherent view.
+"""Projection consolidée de plusieurs DiscoveryBatch en une vue cohérente.
 
-Algorithm (conservative):
-1. Group candidates by title fingerprint (exact match)
-2. Merge if strong signal (shared entity, title similarity, etc.)
-3. Deduplicate URLs by canonical_url within each cluster
-4. Preserve all metadata with enrichment strategy
+Algorithme conservatif (§20) :
+1. Regroupement certain par titre normalisé identique.
+2. Rapprochement fort : URL PRIMARY/INDEPENDENT commune ET autre signal fort.
+3. Sinon, les sujets restent séparés.
+
+Cette projection est en lecture seule : les batches d'origine ne sont jamais
+mutés, ils restent auditables tels que produits par chaque contribution.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Sequence
 from uuid import UUID
 
+from cti_app.application.discovery_identity import (
+    candidates_match_strongly,
+    canonical_source_key,
+)
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
     SourceCandidate,
-    SourceVerificationStatus,
+    SourceRole,
 )
-from cti_app.application.discovery_identity import (
-    canonical_source_key,
-    explicit_entity_tokens,
-    has_strong_signal,
-    title_fingerprint,
-)
+
+# Richesse relative d'un rôle de source : une contribution moins précise ne doit
+# jamais dégrader un rôle déjà établi (§22).
+_ROLE_PRIORITY = {
+    SourceRole.PRIMARY: 5,
+    SourceRole.INDEPENDENT: 4,
+    SourceRole.RELAY: 3,
+    SourceRole.AGGREGATOR: 2,
+    SourceRole.SOCIAL: 2,
+    SourceRole.UNKNOWN: 1,
+}
 
 
 @dataclass(frozen=True, slots=True)
 class CandidateOccurrence:
-    """Reference to a single candidate in a batch."""
+    """Référence vers un candidat précis dans un batch précis."""
 
     batch_id: UUID
     candidate_id: UUID
@@ -38,14 +49,7 @@ class CandidateOccurrence:
 
 @dataclass(slots=True)
 class ConsolidatedCandidate:
-    """Consolidated view of one or more candidates from multiple batches.
-
-    Represents a single subject with:
-    - A representative candidate (most recent/richest)
-    - References to all member occurrences
-    - Deduplicated sources
-    - Warnings about conflicts
-    """
+    """Vue consolidée d'un sujet couvert par une ou plusieurs contributions."""
 
     representative: CandidateTopic
     member_references: tuple[CandidateOccurrence, ...]
@@ -55,112 +59,82 @@ class ConsolidatedCandidate:
 
     @property
     def contribution_count(self) -> int:
-        """Number of distinct batches contributing to this candidate."""
-        batch_ids = {ref.batch_id for ref in self.member_references}
-        return len(batch_ids)
+        return len({ref.batch_id for ref in self.member_references})
 
 
 def consolidate_discovery_batches(
     batches: Sequence[DiscoveryBatch],
 ) -> list[ConsolidatedCandidate]:
-    """Consolidate multiple discovery batches into a single coherent view.
+    """Consolide plusieurs batches de découverte en une vue unique.
 
     Args:
-        batches: Active discovery batches for an edition (chronological order expected)
+        batches: batches actifs d'une édition, dans l'ordre chronologique.
 
     Returns:
-        List of consolidated candidates with merged metadata and deduped URLs.
+        Les sujets consolidés, publications dédupliquées et métadonnées fusionnées.
     """
     if not batches:
         return []
 
-    # Map (title_fingerprint, candidate_id) → CandidateOccurrence for clustering
-    candidates_by_batch: list[dict[UUID, CandidateTopic]] = [
-        {c.id: c for c in batch.candidates} for batch in batches
-    ]
+    # Index (batch_id, candidate_id) -> candidat, et rang chronologique du batch.
+    candidates_by_batch: dict[UUID, dict[UUID, CandidateTopic]] = {
+        batch.id: {candidate.id: candidate for candidate in batch.candidates}
+        for batch in batches
+    }
+    batch_order: dict[UUID, int] = {batch.id: index for index, batch in enumerate(batches)}
 
-    # Cluster candidates: {representative_id} → [occurrence1, occurrence2, ...]
-    # We'll use a merge-find approach to handle transitive matches
-    clusters: dict[tuple[UUID, UUID], list[CandidateOccurrence]] = {}
+    # Chaque cluster est identifié par l'occurrence qui l'a ouvert.
+    clusters: dict[CandidateOccurrence, list[CandidateOccurrence]] = {}
 
-    for batch_idx, batch in enumerate(batches):
+    for batch in batches:
         for candidate in batch.candidates:
             occurrence = CandidateOccurrence(batch_id=batch.id, candidate_id=candidate.id)
 
-            # Check if this candidate belongs to an existing cluster
-            matched_cluster_key = None
-
-            # Step 1: Exact match by title fingerprint
-            current_fp = title_fingerprint(candidate.title)
-            for (repr_batch_idx, repr_cand_id), members in clusters.items():
-                if repr_batch_idx < len(candidates_by_batch):
-                    repr_cand = candidates_by_batch[repr_batch_idx].get(repr_cand_id)
-                    if repr_cand and title_fingerprint(repr_cand.title) == current_fp:
-                        matched_cluster_key = (repr_batch_idx, repr_cand_id)
+            matched_key: CandidateOccurrence | None = None
+            for key, members in clusters.items():
+                # Comparer à tous les membres déjà rattachés : le rapprochement
+                # peut porter sur une occurrence enrichie plutôt que sur celle
+                # qui a ouvert le cluster.
+                for member in members:
+                    other = candidates_by_batch[member.batch_id].get(member.candidate_id)
+                    if other is not None and candidates_match_strongly(candidate, other):
+                        matched_key = key
                         break
+                if matched_key is not None:
+                    break
 
-            # Step 2: Strong signal match (only if no exact match)
-            if matched_cluster_key is None:
-                current_entities = explicit_entity_tokens(candidate)
-                current_campaigns = {s.lower() for s in candidate.campaigns}
-                current_malware = {s.lower() for s in candidate.malware}
-
-                for (repr_batch_idx, repr_cand_id), members in clusters.items():
-                    if repr_batch_idx < len(candidates_by_batch):
-                        repr_cand = candidates_by_batch[repr_batch_idx].get(repr_cand_id)
-                        if repr_cand:
-                            repr_entities = explicit_entity_tokens(repr_cand)
-                            repr_campaigns = {s.lower() for s in repr_cand.campaigns}
-                            repr_malware = {s.lower() for s in repr_cand.malware}
-
-                            if has_strong_signal(
-                                candidate.title,
-                                repr_cand.title,
-                                current_entities,
-                                repr_entities,
-                                current_campaigns,
-                                repr_campaigns,
-                                current_malware,
-                                repr_malware,
-                            ):
-                                matched_cluster_key = (repr_batch_idx, repr_cand_id)
-                                break
-
-            # Add to cluster
-            if matched_cluster_key:
-                clusters[matched_cluster_key].append(occurrence)
+            if matched_key is not None:
+                clusters[matched_key].append(occurrence)
             else:
-                # Start new cluster with this candidate as representative
-                clusters[(batch_idx, candidate.id)] = [occurrence]
+                clusters[occurrence] = [occurrence]
 
-    # Step 3: Merge clusters into ConsolidatedCandidate
     consolidated: list[ConsolidatedCandidate] = []
-
-    for (repr_batch_idx, repr_cand_id), occurrences in clusters.items():
-        # Retrieve representative candidate
-        repr_cand = candidates_by_batch[repr_batch_idx].get(repr_cand_id)
-        if not repr_cand:
+    for occurrences in clusters.values():
+        members = [
+            candidate
+            for occurrence in occurrences
+            if (candidate := candidates_by_batch[occurrence.batch_id].get(occurrence.candidate_id))
+            is not None
+        ]
+        if not members:
             continue
 
-        # Collect all candidates in this cluster
-        all_candidates_in_cluster = [
-            candidates_by_batch[occ.batch_id].get(occ.candidate_id)
-            for occ in occurrences
-        ]
-        all_candidates_in_cluster = [c for c in all_candidates_in_cluster if c is not None]
+        representative = _pick_representative(occurrences, candidates_by_batch, batch_order)
+        if representative is None:
+            continue
 
-        # Merge sources with deduplication and metadata enrichment
-        merged_sources, duplicate_count, merge_warnings = _merge_sources_in_cluster(
-            all_candidates_in_cluster
-        )
-
-        # Merge candidate metadata (uncertainties, entities, IOCs)
-        merged_candidate = _merge_candidate_metadata(repr_cand, all_candidates_in_cluster)
+        merged_sources, duplicate_count, merge_warnings = _merge_sources_in_cluster(members)
+        merged_candidate = _merge_candidate_metadata(representative, members, merged_sources)
 
         consolidated.append(
             ConsolidatedCandidate(
                 representative=merged_candidate,
-                member_references=tuple(sorted(occurrences, key=lambda o: (o.batch_id, o.candidate_id))),
+                member_references=tuple(
+                    sorted(
+                        occurrences,
+                        key=lambda occ: (batch_order[occ.batch_id], str(occ.candidate_id)),
+                    )
+                ),
                 sources=merged_sources,
                 duplicate_publication_count=duplicate_count,
                 merge_warnings=tuple(merge_warnings),
@@ -170,31 +144,52 @@ def consolidate_discovery_batches(
     return consolidated
 
 
+def _pick_representative(
+    occurrences: Sequence[CandidateOccurrence],
+    candidates_by_batch: dict[UUID, dict[UUID, CandidateTopic]],
+    batch_order: dict[UUID, int],
+) -> CandidateTopic | None:
+    """Représentant = contribution la plus récente disposant de sources valides (§24)."""
+    ranked = sorted(
+        occurrences,
+        key=lambda occ: (batch_order[occ.batch_id], str(occ.candidate_id)),
+        reverse=True,
+    )
+    fallback: CandidateTopic | None = None
+    for occurrence in ranked:
+        candidate = candidates_by_batch[occurrence.batch_id].get(occurrence.candidate_id)
+        if candidate is None:
+            continue
+        if candidate.selectable:
+            return candidate
+        fallback = fallback or candidate
+    return fallback
+
+
 def _merge_sources_in_cluster(
-    candidates: list[CandidateTopic],
+    candidates: Sequence[CandidateTopic],
 ) -> tuple[list[SourceCandidate], int, list[str]]:
-    """Merge sources from multiple candidates in a cluster.
+    """Fusionne les publications d'un cluster en dédupliquant par URL canonique.
 
     Returns:
-        (merged_sources, duplicate_count, merge_warnings)
+        (publications fusionnées, nombre d'occurrences déjà connues, avertissements)
     """
-    seen_urls: dict[str, SourceCandidate] = {}
+    merged: dict[str, SourceCandidate] = {}
     duplicate_count = 0
     merge_warnings: list[str] = []
 
     for candidate in candidates:
         for source in candidate.sources:
             url_key = canonical_source_key(source.canonical_url)
+            existing = merged.get(url_key)
+            if existing is None:
+                # Copie défensive : la projection ne doit jamais muter le batch source.
+                merged[url_key] = deepcopy(source)
+                continue
+            duplicate_count += 1
+            _merge_source_metadata(existing, source, merge_warnings)
 
-            if url_key in seen_urls:
-                duplicate_count += 1
-                # Optionally enrich existing entry
-                existing = seen_urls[url_key]
-                _merge_source_metadata(existing, source, merge_warnings)
-            else:
-                seen_urls[url_key] = source
-
-    return list(seen_urls.values()), duplicate_count, merge_warnings
+    return list(merged.values()), duplicate_count, merge_warnings
 
 
 def _merge_source_metadata(
@@ -202,110 +197,94 @@ def _merge_source_metadata(
     new: SourceCandidate,
     warnings: list[str],
 ) -> None:
-    """Enrich source metadata in-place, preferring non-empty/known values.
+    """Enrichit ``existing`` (déjà copié) à partir de ``new``.
 
-    Known values should override unknown/empty values without warning.
-    Conflicts between two non-empty values generate a warning.
+    Une valeur connue comble une valeur inconnue sans avertissement ; deux valeurs
+    connues contradictoires produisent un ``merge_warning`` et un choix déterministe.
     """
-    # Publisher enrichment
-    if not existing.publisher or existing.publisher.lower() == "unknown":
-        if new.publisher and new.publisher.lower() != "unknown":
+    if _is_unknown(existing.publisher):
+        if not _is_unknown(new.publisher):
             existing.publisher = new.publisher
-    elif new.publisher and new.publisher.lower() != "unknown" and new.publisher != existing.publisher:
-        warnings.append(f"conflicting_publisher: {existing.publisher} vs {new.publisher}")
+    elif not _is_unknown(new.publisher) and new.publisher != existing.publisher:
+        warnings.append(
+            f"publisher divergent pour {existing.canonical_url} : "
+            f"{existing.publisher} / {new.publisher}"
+        )
 
-    # Published date enrichment
-    if existing.published_at is None and new.published_at is not None:
-        existing.published_at = new.published_at
-    elif (
-        existing.published_at is not None
-        and new.published_at is not None
-        and existing.published_at != new.published_at
+    for field_name, label in (
+        ("published_at", "date de publication"),
+        ("event_date", "date d'événement"),
     ):
-        warnings.append(f"conflicting_published_at: {existing.published_at} vs {new.published_at}")
+        current = getattr(existing, field_name)
+        incoming = getattr(new, field_name)
+        if current is None:
+            if incoming is not None:
+                setattr(existing, field_name, incoming)
+        elif incoming is not None and incoming != current:
+            # Choix déterministe : la plus ancienne, mais le conflit reste tracé.
+            setattr(existing, field_name, min(current, incoming))
+            warnings.append(
+                f"{label} divergente pour {existing.canonical_url} : "
+                f"{current.isoformat()} / {incoming.isoformat()}"
+            )
 
-    # Event date enrichment
-    if existing.event_date is None and new.event_date is not None:
-        existing.event_date = new.event_date
-    elif (
-        existing.event_date is not None
-        and new.event_date is not None
-        and existing.event_date != new.event_date
-    ):
-        warnings.append(f"conflicting_event_date: {existing.event_date} vs {new.event_date}")
-
-    # Role: prefer richer role (primary > independent > relay > aggregator > unknown)
-    role_priority = {"primary": 5, "independent": 4, "relay": 3, "aggregator": 2, "unknown": 1}
-    existing_priority = role_priority.get(existing.role.value.lower(), 0)
-    new_priority = role_priority.get(new.role.value.lower(), 0)
-    if new_priority > existing_priority:
+    if _ROLE_PRIORITY.get(new.role, 0) > _ROLE_PRIORITY.get(existing.role, 0):
         existing.role = new.role
 
-    # Verification status: use most recently changed
-    if new.verification_changed_at and existing.verification_changed_at:
-        if new.verification_changed_at > existing.verification_changed_at:
-            existing.verification_status = new.verification_status
-            existing.verification_changed_at = new.verification_changed_at
-            existing.verification_changed_by = new.verification_changed_by
-    elif new.verification_changed_at and not existing.verification_changed_at:
+    # Statut de vérification : le marquage humain le plus récent l'emporte (§23).
+    if new.verification_changed_at is not None and (
+        existing.verification_changed_at is None
+        or new.verification_changed_at > existing.verification_changed_at
+    ):
         existing.verification_status = new.verification_status
         existing.verification_changed_at = new.verification_changed_at
         existing.verification_changed_by = new.verification_changed_by
 
 
+def _is_unknown(value: str | None) -> bool:
+    return not value or value.strip().lower() == "unknown"
+
+
 def _merge_candidate_metadata(
     representative: CandidateTopic,
-    all_candidates: list[CandidateTopic],
+    members: Sequence[CandidateTopic],
+    merged_sources: list[SourceCandidate],
 ) -> CandidateTopic:
-    """Merge metadata from multiple candidates while preserving the representative.
-
-    Returns a new candidate with merged uncertainties, actors, campaigns, etc.
-    """
-    from copy import deepcopy
-
+    """Retourne une copie du représentant enrichie de l'union des métadonnées (§24)."""
     result = deepcopy(representative)
 
-    # Union sets (deduplicated)
-    all_uncertainties = set(result.uncertainties)
-    all_actors = set(result.actors)
-    all_campaigns = set(result.campaigns)
-    all_malware = set(result.malware)
-    all_cves = set(result.cves)
-    all_victims = set(result.victims)
-    all_sectors = set(result.sectors)
-    all_countries = set(result.countries)
-    all_artifacts = set(result.likely_artifacts)
-    all_iocs = set(result.iocs)
+    for field_name in (
+        "uncertainties",
+        "relevance_reasons",
+        "actors",
+        "campaigns",
+        "malware",
+        "cves",
+        "victims",
+        "sectors",
+        "countries",
+        "likely_artifacts",
+        "iocs",
+    ):
+        # Union stable : ordre du représentant d'abord, puis les apports suivants.
+        merged: dict[str, None] = dict.fromkeys(getattr(result, field_name))
+        for member in members:
+            merged.update(dict.fromkeys(getattr(member, field_name)))
+        setattr(result, field_name, tuple(merged))
 
-    for candidate in all_candidates[1:]:  # Skip representative (already included)
-        all_uncertainties.update(candidate.uncertainties)
-        all_actors.update(candidate.actors)
-        all_campaigns.update(candidate.campaigns)
-        all_malware.update(candidate.malware)
-        all_cves.update(candidate.cves)
-        all_victims.update(candidate.victims)
-        all_sectors.update(candidate.sectors)
-        all_countries.update(candidate.countries)
-        all_artifacts.update(candidate.likely_artifacts)
-        all_iocs.update(candidate.iocs)
+    result.technical_potential = max(member.technical_potential for member in members)
 
-    result.uncertainties = tuple(sorted(all_uncertainties))
-    result.actors = tuple(sorted(all_actors))
-    result.campaigns = tuple(sorted(all_campaigns))
-    result.malware = tuple(sorted(all_malware))
-    result.cves = tuple(sorted(all_cves))
-    result.victims = tuple(sorted(all_victims))
-    result.sectors = tuple(sorted(all_sectors))
-    result.countries = tuple(sorted(all_countries))
-    result.likely_artifacts = tuple(sorted(all_artifacts))
-    result.iocs = tuple(sorted(all_iocs))
+    seen_ioc_keys: set[tuple[str, str]] = set()
+    provisional: list = []
+    for member in members:
+        for ioc in member.provisional_iocs:
+            key = (str(getattr(ioc, "type", "")).lower(), str(getattr(ioc, "value", "")).lower())
+            if key in seen_ioc_keys:
+                continue
+            seen_ioc_keys.add(key)
+            provisional.append(deepcopy(ioc))
+    result.provisional_iocs = provisional
 
-    # Max technical potential
-    result.technical_potential = max(
-        (c.technical_potential for c in all_candidates),
-        default=representative.technical_potential,
-    )
-
+    # Les sources fusionnées remplacent celles du seul représentant.
+    result.sources = merged_sources
     return result
-
-

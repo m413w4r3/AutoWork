@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -34,6 +34,58 @@ const emptyEditorialBoard = {
   target_major: 2,
   automatic_selection: false,
 };
+
+/** Backend minimal pour une édition sans découverte ni job en cours. */
+function discoveryFetchMock() {
+  return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    if (url.endsWith("/discovery/import/preview")) {
+      return Response.json({
+        sha256: "b".repeat(64),
+        subject_count: 2,
+        publication_count: 3,
+        ioc_count: 5,
+        ioc_type_counts: { ipv4: 5 },
+        subjects: ["Campagne A", "Campagne B"],
+        warnings: ["Avertissement parser"],
+      });
+    }
+    if (url.endsWith("/discovery/import/confirm")) {
+      return Response.json({
+        batch_id: "9e2f4a1c-1d2b-4a3f-8c5e-6a7b8c9d0e1f",
+        reused: false,
+        source_mode: "manual_import",
+        subject_count: 2,
+        publication_count: 3,
+      });
+    }
+    if (url.includes("/discovery/candidates")) {
+      return Response.json({
+        batches: [],
+        candidates: [],
+        total: 0,
+        merge_stats: {
+          raw_batch_count: 0,
+          raw_candidate_count: 0,
+          consolidated_candidate_count: 0,
+          unique_publication_count: 0,
+          duplicate_publication_occurrence_count: 0,
+        },
+        warning: "",
+      });
+    }
+    if (url.includes("/editorial-groups"))
+      return Response.json(emptyEditorialBoard);
+    if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+    void init;
+    return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
+  });
+}
 
 function renderApp() {
   const client = new QueryClient({
@@ -428,7 +480,7 @@ describe("App éditions", () => {
       screen.getByText("Iran APT July 2026 technical report"),
     ).toBeInTheDocument();
     await user.click(
-      screen.getByRole("button", { name: "Rechercher les sujets" }),
+      screen.getByRole("button", { name: "Nouvelle recherche ChatGPT" }),
     );
     expect(await screen.findByText("Terminée")).toBeInTheDocument();
     expect(
@@ -442,5 +494,69 @@ describe("App éditions", () => {
         return url.endsWith("/discovery") && init?.method === "POST";
       }),
     ).toBe(true);
+  });
+
+  it("ouvre le collage d’une réponse ChatGPT sans job ni recherche préalable", async () => {
+    const fetchMock = discoveryFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Coller une réponse ChatGPT" }),
+    );
+
+    // Ce test protège la régression : l'ancien bouton disparaissait sans rien
+    // afficher parce que le formulaire dépendait d'un jobId inexistant.
+    expect(await screen.findByLabelText("Réponse ChatGPT")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Nouvelle recherche ChatGPT" }),
+    ).toBeInTheDocument();
+  });
+
+  it("prévisualise puis confirme un import et rafraîchit découverte et chemin de fer", async () => {
+    const fetchMock = discoveryFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Coller une réponse ChatGPT" }),
+    );
+    await user.type(
+      await screen.findByLabelText("Réponse ChatGPT"),
+      "# SUJETS CANDIDATS",
+    );
+    await user.click(screen.getByRole("button", { name: "Prévisualiser" }));
+
+    expect(
+      await screen.findByText(/2 sujets · 3 publications · 5 IOC provisoires/),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Avertissement parser")).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: "Confirmer et intégrer" }),
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.queryByLabelText("Réponse ChatGPT"),
+      ).not.toBeInTheDocument();
+    });
+    const urls = fetchMock.mock.calls.map(([input]) =>
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url,
+    );
+    expect(urls.some((url) => url.endsWith("/discovery/import/preview"))).toBe(
+      true,
+    );
+    expect(urls.some((url) => url.endsWith("/discovery/import/confirm"))).toBe(
+      true,
+    );
   });
 });

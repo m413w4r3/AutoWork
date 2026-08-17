@@ -46,7 +46,7 @@ from cti_app.domain.discovery import (
     SourceRole,
     SourceVerificationStatus,
 )
-from cti_app.domain.editions import EditionStatus
+from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.jobs import Job, JobStatus
 from cti_app.logging import get_correlation_id
 
@@ -137,8 +137,12 @@ class DiscoveryMergeStats(BaseModel):
 
     raw_batch_count: int = Field(description="Total number of active batches")
     raw_candidate_count: int = Field(description="Total number of candidates across all batches")
-    consolidated_candidate_count: int = Field(description="Number of unique subjects after consolidation")
-    unique_publication_count: int = Field(description="Total number of unique URLs across consolidated candidates")
+    consolidated_candidate_count: int = Field(
+        description="Number of unique subjects after consolidation"
+    )
+    unique_publication_count: int = Field(
+        description="Total number of unique URLs across consolidated candidates"
+    )
     duplicate_publication_occurrence_count: int = Field(
         description="Number of duplicate URL occurrences merged away"
     )
@@ -180,9 +184,15 @@ class CandidateView(BaseModel):
     incomplete_publication_count: int
     # Consolidation tracking (P2)
     member_references: list[CandidateReferenceView] = Field(default_factory=list)
-    contribution_count: int = Field(default=1, description="Number of batches contributing to this candidate")
-    duplicate_publication_count: int = Field(default=0, description="Number of duplicate URLs merged")
-    merge_warnings: list[str] = Field(default_factory=list, description="Metadata conflicts during consolidation")
+    contribution_count: int = Field(
+        default=1, description="Number of batches contributing to this candidate"
+    )
+    duplicate_publication_count: int = Field(
+        default=0, description="Number of duplicate URLs merged"
+    )
+    merge_warnings: list[str] = Field(
+        default_factory=list, description="Metadata conflicts during consolidation"
+    )
 
 
 class BatchView(BaseModel):
@@ -371,7 +381,10 @@ async def read_candidates(
         # Search filter
         if search:
             needle = search.casefold()
-            if needle not in candidate.title.casefold() and needle not in candidate.summary.casefold():
+            if (
+                needle not in candidate.title.casefold()
+                and needle not in candidate.summary.casefold()
+            ):
                 continue
 
         # Technical potential filter
@@ -387,7 +400,12 @@ async def read_candidates(
         filtered.append(
             (
                 candidate,
-                [CandidateReferenceView(batch_id=ref.batch_id, candidate_id=ref.candidate_id) for ref in cand.member_references],
+                [
+                    CandidateReferenceView(
+                        batch_id=ref.batch_id, candidate_id=ref.candidate_id
+                    )
+                    for ref in cand.member_references
+                ],
                 cand.contribution_count,
                 cand.duplicate_publication_count,
                 cand.merge_warnings,
@@ -485,7 +503,9 @@ async def confirm_visible_recovery(
             expected_sha256=payload.expected_sha256,
             actor_id=actor.actor_id,
         )
-        resumed = await _resume_recovery_job(job, actor.actor_id, request)
+        resumed = await _continue_after_recovery(
+            job, research_model_run_id, actor.actor_id, request
+        )
         return DiscoveryLaunchView(job_id=resumed.id, status=resumed.status.value, reused=True)
     except Exception as exc:
         _raise_api_error(exc)
@@ -541,7 +561,9 @@ async def confirm_manual_recovery(
             provenance="manual_import",
             actor_id=actor.actor_id,
         )
-        resumed = await _resume_recovery_job(job, actor.actor_id, request)
+        resumed = await _continue_after_recovery(
+            job, research_model_run_id, actor.actor_id, request
+        )
         return DiscoveryLaunchView(job_id=resumed.id, status=resumed.status.value, reused=True)
     except Exception as exc:
         _raise_api_error(exc)
@@ -566,7 +588,9 @@ async def request_completion_recovery(
         identity: IdentityProvider = request.app.state.identity_provider
         actor = await identity.current()
         await service.start_completion_recovery(parameters, research_model_run_id)
-        resumed = await _resume_recovery_job(job, actor.actor_id, request)
+        resumed = await _continue_after_recovery(
+            job, research_model_run_id, actor.actor_id, request
+        )
         return DiscoveryLaunchView(job_id=resumed.id, status=resumed.status.value, reused=True)
     except Exception as exc:
         _raise_api_error(exc)
@@ -765,14 +789,19 @@ async def _recovery_context(
     return parameters, job
 
 
-async def _resume_recovery_job(job: Job, actor_id: str, request: Request) -> Job:
-    """Continue after a recovery operation (visible or manual recovery).
+async def _continue_after_recovery(
+    job: Job,
+    research_model_run_id: UUID,
+    actor_id: str,
+    request: Request,
+) -> Job:
+    """Poursuit le traitement après une récupération (visible ou manuelle).
 
-    Règles:
-    - WAITING_HUMAN: reprendre le job existant
-    - FAILED/CANCELLED: créer un NEW job local reprocess_discovery_report
-      (l'historique reste exact)
-    - autres: retourner le job tel quel (impossible en pratique)
+    Règles :
+    - WAITING_HUMAN : reprendre le job existant ;
+    - FAILED/CANCELLED : créer un NOUVEAU job local reprocess_discovery_report,
+      l'ancien job terminal restant inchangé dans l'historique ;
+    - autre statut : retourner le job tel quel.
     """
     jobs: JobService = request.app.state.job_service
     dispatcher: JobDispatcher = request.app.state.job_dispatcher
@@ -783,13 +812,13 @@ async def _resume_recovery_job(job: Job, actor_id: str, request: Request) -> Job
         return resumed
 
     if job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
-        # Créer un nouveau job pour retraiter le rapport récupéré.
-        # L'ancien job terminal reste dans l'historique, inchangé.
         parameters = DiscoverEditionParameters.model_validate(job.input_parameters)
         nonce = uuid4()
+        # Le reparse relit le ModelRun de recherche archivé, jamais le Job :
+        # passer job.id ici rendrait le nouveau job systématiquement en échec.
         retry_parameters = RetryStructuringParameters(
             discovery=parameters,
-            research_model_run_id=job.id,  # reference du job original
+            research_model_run_id=research_model_run_id,
             retry_nonce=nonce,
         )
         new_job = await jobs.submit(
@@ -797,7 +826,7 @@ async def _resume_recovery_job(job: Job, actor_id: str, request: Request) -> Job
             aggregate_type="edition",
             aggregate_id=job.aggregate_id,
             idempotency_key=(
-                f"recovery-reprocess:{job.id}:{nonce}"
+                f"recovery-reprocess:{job.id}:{research_model_run_id}:{nonce}"
             ),
             correlation_id=get_correlation_id(),
             input_parameters=retry_parameters.model_dump(mode="json"),
@@ -840,7 +869,7 @@ def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
 
 
 def _discovery_parameters_from_edition(
-    edition,
+    edition: Edition,
     *,
     complementary_axis: str,
     sensitivity: str,
@@ -850,26 +879,30 @@ def _discovery_parameters_from_edition(
     exclusions: list[str] | None = None,
     research_nonce: UUID | None = None,
 ) -> DiscoverEditionParameters:
-    """Construire les paramètres de découverte à partir d'une édition.
+    """Construit les paramètres de découverte à partir d'une édition.
 
-    Utilisé par :
-    - launch_discovery (recherche neuve)
-    - retry_structuring (retraitement)
-    - preview_discovery_import (import preview)
-    - confirm_discovery_import (import confirm)
-
-    Garantit la cohérence des paramètres entre tous les chemins.
+    Point unique utilisé par le lancement d'une recherche, le retraitement et
+    les deux endpoints d'import, pour que le périmètre (pays, période, langues,
+    profil de sources) soit identique quel que soit le chemin emprunté.
     """
+    aliases = list(
+        dict.fromkeys([edition.country, edition.country_code, *(country_aliases or [])])
+    )
     return DiscoverEditionParameters(
         edition_id=edition.id,
-        edition_title=edition.title,
-        country_aliases=country_aliases or getattr(edition, "country_aliases", []),
-        keywords=keywords or getattr(edition, "keywords", []),
-        exclusions=exclusions or getattr(edition, "exclusions", []),
+        country=edition.country,
+        country_aliases=aliases,
+        period_start=edition.period_start,
+        period_end=edition.period_end,
+        languages=list(edition.languages),
+        source_profile=edition.source_profile,
+        keywords=keywords or [],
+        exclusions=exclusions or [],
         complementary_axis=complementary_axis,
+        tlp=edition.tlp,
         sensitivity=sensitivity,
         external_llm_allowed=external_llm_allowed,
-        research_nonce=research_nonce or uuid4(),
+        research_nonce=research_nonce,
     )
 
 
@@ -884,7 +917,7 @@ def _candidate_view(
 
     Args:
         candidate: The representative candidate
-        member_references: References to all member candidates in the cluster (optional for backwards compat)
+        member_references: All member candidates of the cluster, oldest contribution first
         contribution_count: Number of batches contributing to this candidate
         duplicate_publication_count: Number of duplicate URLs merged
         merge_warnings: Metadata conflict warnings

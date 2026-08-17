@@ -220,6 +220,44 @@ class ModelRun:
         self.finished_at = timestamp
         self.updated_at = timestamp
 
+    def succeed_manual_import(
+        self,
+        *,
+        output_reference: str,
+        output_sha256: str,
+        output_chars: int,
+        actor_id: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Clôture un run synthétique représentant un Markdown fourni par un humain.
+
+        Aucun modèle n'a été appelé : l'usage est marqué estimé et la provenance
+        est conservée dans ``error_details["recovery"]`` — nom historique, format
+        attendu par ``_has_recovery_provenance``.
+        """
+        if self.status is not ModelRunStatus.RUNNING:
+            raise ValueError("A manual import can only complete a running run")
+        timestamp = now or datetime.now(UTC)
+        self.status = ModelRunStatus.SUCCEEDED
+        self.output_references = (*self.output_references, output_reference)
+        self.raw_output_reference = output_reference
+        self.raw_output_sha256 = output_sha256
+        self.raw_output_chars = output_chars
+        self.duration_ms = 0
+        self.usage = ModelUsage(estimated=True)
+        self.error_code = None
+        self.error_message = None
+        self.error_details = {
+            "recovery": {
+                "provenance": "manual_import",
+                "actor_id": actor_id,
+                "adopted_at": timestamp.isoformat(),
+                "source_model_run_id": None,
+            }
+        }
+        self.finished_at = timestamp
+        self.updated_at = timestamp
+
     def _require_active(self) -> None:
         if self.status not in {ModelRunStatus.RUNNING, ModelRunStatus.WAITING_BACKGROUND}:
             raise ValueError(f"Model run is already terminal: {self.status.value}")

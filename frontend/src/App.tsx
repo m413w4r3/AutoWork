@@ -7,6 +7,8 @@ import {
   fetchDiscovery,
   launchDiscovery,
   markDiscoverySource,
+  previewDiscoveryImport,
+  confirmDiscoveryImport,
   previewManualDiscoveryRecovery,
   previewVisibleDiscoveryRecovery,
   requestDiscoveryCompletion,
@@ -528,9 +530,12 @@ function DiscoveryPanel({
   const [axis, setAxis] = useState("initial");
   const [manualMarkdown, setManualMarkdown] = useState("");
   const [showManualRecovery, setShowManualRecovery] = useState(false);
-  const [showInitialInputChoice, setShowInitialInputChoice] = useState(
-    !window.localStorage.getItem(storageKey),
-  );
+  // L'import autonome d'une réponse ChatGPT est un flux distinct de la
+  // récupération d'un run échoué : état, endpoints et cycle de vie séparés.
+  const [showManualImport, setShowManualImport] = useState(false);
+  const [manualImportMarkdown, setManualImportMarkdown] = useState("");
+  const [manualImportPreview, setManualImportPreview] =
+    useState<DiscoveryRecoveryPreview | null>(null);
   const [recoveryPreview, setRecoveryPreview] = useState<{
     mode: "visible" | "manual";
     value: DiscoveryRecoveryPreview;
@@ -608,11 +613,11 @@ function DiscoveryPanel({
     },
   });
   // const recoveryRunId =
-    // lastJob?.status === "waiting_human" &&
-    // lastJob.error_details?.phase === "chatgpt_incomplete" &&
-    // typeof lastJob.error_details.model_run_id === "string"
-      // ? lastJob.error_details.model_run_id
-      // : null;
+  // lastJob?.status === "waiting_human" &&
+  // lastJob.error_details?.phase === "chatgpt_incomplete" &&
+  // typeof lastJob.error_details.model_run_id === "string"
+  // ? lastJob.error_details.model_run_id
+  // : null;
   const recoveryRunId =
     lastJob &&
     ["waiting_human", "failed", "cancelled"].includes(lastJob.status) &&
@@ -671,6 +676,40 @@ function DiscoveryPanel({
       requestDiscoveryCompletion(editionId, recoveryRunId!, jobId!),
     onSuccess: refreshRecoveredJob,
   });
+  const previewImport = useMutation({
+    mutationFn: () =>
+      previewDiscoveryImport(
+        editionId,
+        manualImportMarkdown,
+        axis.trim() || "manual-import",
+      ),
+    onSuccess: setManualImportPreview,
+  });
+  const confirmImport = useMutation({
+    mutationFn: () => {
+      if (!manualImportPreview) {
+        throw new Error("Aucun aperçu d’import à confirmer");
+      }
+      return confirmDiscoveryImport(
+        editionId,
+        manualImportMarkdown,
+        manualImportPreview.sha256,
+        axis.trim() || "manual-import",
+      );
+    },
+    onSuccess: () => {
+      // L'import est parsé localement : aucun job, aucun ModelRun à suivre.
+      setShowManualImport(false);
+      setManualImportMarkdown("");
+      setManualImportPreview(null);
+      void queryClient.invalidateQueries({
+        queryKey: ["discovery", editionId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["editorial-board", editionId],
+      });
+    },
+  });
   const abandonRecovery = useMutation({
     mutationFn: () => cancelJob(jobId!),
     onSuccess: (job) => {
@@ -710,39 +749,24 @@ function DiscoveryPanel({
           <p className="eyebrow">Découverte mensuelle</p>
           <h2 id="discovery-heading">Sujets candidats</h2>
         </div>
-        {showInitialInputChoice && !jobId ? (
-          <div className="input-choice-buttons">
-            <button
-              className="button"
-              onClick={() => {
-                setShowInitialInputChoice(false);
-                launch.mutate();
-              }}
-              disabled={launch.isPending}
-            >
-              {launch.isPending
-                ? "Lancement…"
-                : "Rechercher avec ChatGPT"}
-            </button>
-            <button
-              className="button button--secondary"
-              onClick={() => {
-                setShowInitialInputChoice(false);
-                setShowManualRecovery(true);
-              }}
-            >
-              Importer un rapport existant
-            </button>
-          </div>
-        ) : (
+        {/* Les deux actions restent disponibles tout au long du cycle de vie :
+            avant la première recherche, après un import, après plusieurs lots. */}
+        <div className="input-choice-buttons">
           <button
             className="button"
             disabled={launch.isPending || searchRunning}
             onClick={() => launch.mutate()}
           >
-            {launch.isPending ? "Lancement…" : "Rechercher les sujets"}
+            {launch.isPending ? "Lancement…" : "Nouvelle recherche ChatGPT"}
           </button>
-        )}
+          <button
+            className="button button--secondary"
+            disabled={confirmImport.isPending}
+            onClick={() => setShowManualImport((open) => !open)}
+          >
+            Coller une réponse ChatGPT
+          </button>
+        </div>
       </div>
       <ol className="discovery-steps" aria-label="Étapes de découverte">
         <li>1. Recherche ChatGPT</li>
@@ -763,6 +787,111 @@ function DiscoveryPanel({
       </p>
       {launch.error ? (
         <ErrorMessage error={launch.error} fallback="Recherche impossible." />
+      ) : null}
+      {showManualImport ? (
+        <section
+          className="manual-import"
+          aria-labelledby="manual-import-heading"
+        >
+          <h3 id="manual-import-heading">Réponse ChatGPT existante</h3>
+          <p>
+            Utilisez cette option si vous avez déjà exécuté le prompt de
+            découverte dans ChatGPT et disposez de sa réponse Markdown.
+          </p>
+          <label htmlFor="manual-discovery-import">Réponse ChatGPT</label>
+          <textarea
+            id="manual-discovery-import"
+            rows={14}
+            value={manualImportMarkdown}
+            onChange={(event) => {
+              setManualImportMarkdown(event.target.value);
+              setManualImportPreview(null);
+            }}
+          />
+          <label>
+            Charger un fichier .md ou .txt
+            <input
+              type="file"
+              accept=".md,.txt,text/markdown,text/plain"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  void file.text().then((text) => {
+                    setManualImportMarkdown(text);
+                    setManualImportPreview(null);
+                  });
+                }
+              }}
+            />
+          </label>
+          <div className="action-list">
+            <button
+              className="button button--secondary"
+              disabled={!manualImportMarkdown.trim() || previewImport.isPending}
+              onClick={() => previewImport.mutate()}
+            >
+              Prévisualiser
+            </button>
+            <button
+              className="button button--secondary"
+              onClick={() => {
+                setShowManualImport(false);
+                setManualImportPreview(null);
+              }}
+            >
+              Fermer
+            </button>
+          </div>
+          {manualImportPreview ? (
+            <article
+              className="recovery-preview"
+              aria-label="Aperçu de l’import"
+            >
+              <p>
+                {manualImportPreview.subject_count} sujets ·{" "}
+                {manualImportPreview.publication_count} publications ·{" "}
+                {manualImportPreview.ioc_count} IOC provisoires
+              </p>
+              <ul>
+                {manualImportPreview.subjects.map((subject) => (
+                  <li key={subject}>{subject}</li>
+                ))}
+              </ul>
+              {manualImportPreview.warnings.length ? (
+                <details>
+                  <summary>
+                    {manualImportPreview.warnings.length} avertissement(s)
+                  </summary>
+                  <ul>
+                    {manualImportPreview.warnings.map((warning) => (
+                      <li key={warning}>{warning}</li>
+                    ))}
+                  </ul>
+                </details>
+              ) : null}
+              <div className="action-list">
+                <button
+                  className="button"
+                  disabled={confirmImport.isPending}
+                  onClick={() => confirmImport.mutate()}
+                >
+                  Confirmer et intégrer
+                </button>
+                <button
+                  className="button button--secondary"
+                  onClick={() => setManualImportPreview(null)}
+                >
+                  Modifier
+                </button>
+              </div>
+            </article>
+          ) : null}
+          {previewImport.isError || confirmImport.isError ? (
+            <p role="alert" className="error-message">
+              L’import de la réponse ChatGPT a échoué.
+            </p>
+          ) : null}
+        </section>
       ) : null}
       {jobId ? (
         <JobStatusCard
@@ -1001,13 +1130,9 @@ function DiscoveryPanel({
                 </span>
               </div>
               <div className="stat-item">
-                <span className="stat-label">
-                  Doublons fusionnés
-                </span>
+                <span className="stat-label">Doublons fusionnés</span>
                 <span className="stat-value">
-                  {
-                    mergeStats.duplicate_publication_occurrence_count
-                  }
+                  {mergeStats.duplicate_publication_occurrence_count}
                 </span>
               </div>
             </div>

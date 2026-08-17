@@ -1013,77 +1013,101 @@ def test_research_prompt_is_the_documented_markdown_contract() -> None:
     assert "N’échappe pas les tirets des noms de champs." in prompt  # noqa: RUF001
 
 
-async def test_standalone_import_creates_idempotent_batch_without_model_call(
-    tmp_path: Path,
-) -> None:
-    """Import d’une réponse ChatGPT existante (Markdown) sans appel API.
+def _import_service() -> tuple[DiscoveryService, InMemoryDiscoveryUnitOfWorkFactory, list[UUID]]:
+    """Service de découverte dont l'adaptateur modèle échouerait s'il était appelé.
 
-    Doit:
-    - Créer un ModelRun synthétique manual-import
-    - Créer un batch MANUAL_IMPORT
-    - Être idempotent: deux imports identiques = un seul batch
+    L'import d'une réponse ChatGPT existante ne doit provoquer aucun appel modèle.
     """
-    service, provider, edition = await _make_service_edition_discovery(tmp_path)
+    adapter = TransientResearchAdapter()
+    gateway, _, _ = gateway_for_adapter(adapter)
+    discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
+    grouped: list[UUID] = []
 
-    markdown_sample = """\
-# SUJETS CANDIDATS
+    async def after_discovery(edition_id: UUID) -> None:
+        grouped.append(edition_id)
 
-## SUBJECT S1
-Titre : APT Campaign X
+    service = DiscoveryService(
+        discovery_uow,
+        gateway,
+        gateway,
+        bridge_capabilities_provider=FakeBridgeCapabilities(),
+        after_discovery=after_discovery,
+    )
+    return service, discovery_uow, grouped
 
-### PUBLICATION P1
-URL: https://example.com/report1
-Publisher: Example Inc
-Published: 2026-08-01
-"""
 
-    parameters = DiscoverEditionParameters(
-        edition_id=edition.id,
-        edition_title=edition.title,
-        country_aliases=[],
-        keywords=[],
-        exclusions=[],
-        complementary_axis="manual-import",
-        sensitivity="internal",
-        external_llm_allowed=True,
-        research_nonce=uuid4(),
+async def test_standalone_import_creates_batch_without_job_or_model_call() -> None:
+    """§32.5 : import initial sans job ni ModelRun préalable."""
+    service, _, grouped = _import_service()
+    params = parameters(axis="manual-import")
+    markdown = research_markdown_fixture()
+
+    preview = await service.preview_standalone_import(params, markdown)
+
+    assert preview["subject_count"] >= 1
+    assert preview["publication_count"] >= 1
+
+    batch, reused = await service.import_standalone_report(
+        params,
+        markdown,
+        expected_sha256=preview["sha256"],
+        actor_id="dev-analyst",
     )
 
-    # 1. Preview (pas de persistance)
-    preview1 = await service.preview_standalone_import(parameters, markdown_sample)
-    assert preview1["subject_count"] >= 1
-    assert preview1["publication_count"] >= 1
-    sha256 = preview1["sha256"]
+    assert reused is False
+    assert batch.source_mode is DiscoverySourceMode.MANUAL_IMPORT
+    assert batch.candidates
+    assert grouped == [params.edition_id]
 
-    # 2. Premier import
-    batch1, reused1 = await service.import_standalone_report(
-        parameters,
-        markdown_sample,
-        expected_sha256=sha256,
-        actor_id="test-user",
+    # Le rapport reste relisible comme n'importe quelle contribution archivée.
+    archived = await service.read_archived_report(
+        params.edition_id, batch.discovery_model_run_id
     )
-    assert batch1.source_mode == DiscoverySourceMode.MANUAL_IMPORT
-    assert reused1 is False
-    batch1_id = batch1.id
+    assert archived == markdown
 
-    # 3. Deuxième import identique → réutilise le batch
-    parameters2 = DiscoverEditionParameters(
-        edition_id=edition.id,
-        edition_title=edition.title,
-        country_aliases=[],
-        keywords=[],
-        exclusions=[],
-        complementary_axis="manual-import",  # Même axe
-        sensitivity="internal",
-        external_llm_allowed=True,
-        research_nonce=uuid4(),
+
+async def test_standalone_import_is_idempotent_on_identical_markdown() -> None:
+    """§32.6 : réimporter exactement le même Markdown ne crée pas de doublon."""
+    service, _, _ = _import_service()
+    params = parameters(axis="manual-import")
+    markdown = research_markdown_fixture()
+    digest = (await service.preview_standalone_import(params, markdown))["sha256"]
+
+    first, reused_first = await service.import_standalone_report(
+        params, markdown, expected_sha256=digest, actor_id="dev-analyst"
     )
-    batch2, reused2 = await service.import_standalone_report(
-        parameters2,
-        markdown_sample,  # Exact même contenu
-        expected_sha256=sha256,
-        actor_id="test-user",
+    # L'axe ne doit pas entrer dans l'idempotence du contenu.
+    second, reused_second = await service.import_standalone_report(
+        parameters(axis="axe-renomme").model_copy(update={"edition_id": params.edition_id}),
+        markdown,
+        expected_sha256=digest,
+        actor_id="dev-analyst",
     )
-    assert reused2 is True
-    assert batch2.id == batch1_id  # Même batch, pas de doublons
-    assert "donnée non fiable" not in prompt
+
+    assert reused_first is False
+    assert reused_second is True
+    assert second.id == first.id
+
+    active = [
+        batch
+        for batch in await service.list_batches(params.edition_id)
+        if batch.is_active_revision
+    ]
+    assert len(active) == 1
+
+
+async def test_standalone_import_rejects_stale_confirmation() -> None:
+    """§32.7 : une confirmation dont le contenu a changé ne persiste rien."""
+    service, _, _ = _import_service()
+    params = parameters(axis="manual-import")
+    markdown = research_markdown_fixture()
+
+    with pytest.raises(ValueError, match="no longer matches"):
+        await service.import_standalone_report(
+            params,
+            markdown,
+            expected_sha256="0" * 64,
+            actor_id="dev-analyst",
+        )
+
+    assert await service.list_batches(params.edition_id) == []

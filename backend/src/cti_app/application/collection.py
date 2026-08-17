@@ -37,7 +37,7 @@ from cti_app.domain.collection import (
     Indicator,
     SourceCollection,
 )
-from cti_app.domain.discovery import SourceCandidate, SourceRole
+from cti_app.domain.discovery import SourceCandidate, SourceRole, canonicalize_http_url
 from cti_app.domain.editorial import EditorialGroupStatus, HumanDecision, HumanDecisionType
 from cti_app.domain.entities import ProvenanceEvent, SourceDocument
 from cti_app.logging import get_correlation_id
@@ -137,7 +137,19 @@ class SubjectCollectionService:
                 batch.id: batch
                 for batch in await uow.discovery_batches.list_for_edition(group.edition_id)
             }
-            seen_urls: set[str] = set()
+            # Une nouvelle contribution peut réintroduire une URL déjà rattachée au
+            # sujet sous un SourceCandidate.id différent. La clé d'unicité en base
+            # étant (subject_id, source_candidate_id), il faut dédupliquer sur
+            # l'URL canonique face à ce qui est déjà collecté ou archivé (§28).
+            seen_urls: set[str] = {
+                canonicalize_http_url(collection.requested_url)
+                for collection in await uow.source_collections.list_for_subject(subject_id)
+            }
+            seen_urls.update(
+                canonicalize_http_url(document.origin)
+                for document in await uow.source_documents.list_for_subject(subject_id)
+                if document.origin
+            )
             for reference in group.candidate_references:
                 batch = batches.get(reference.batch_id)
                 candidate = (

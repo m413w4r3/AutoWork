@@ -28,6 +28,7 @@ from cti_app.domain.editions import Edition
 from cti_app.domain.editorial import (
     CandidateReference,
     EditorialGroup,
+    EditorialGroupStatus,
     EditorialScore,
     EditorialType,
     GroupingConfidence,
@@ -371,7 +372,7 @@ async def test_complementary_batch_enriches_group_without_duplicate_reference() 
     assert len(set(groups[0].candidate_references)) == 2
 
 
-async def test_match_against_selected_current_subject_remains_visible_for_review() -> None:
+async def test_new_publication_enriches_a_selected_subject_in_place() -> None:
     uow = InMemoryEditorialUnitOfWorkFactory()
     edition = _edition()
     uow.editions[edition.id] = edition
@@ -382,7 +383,7 @@ async def test_match_against_selected_current_subject_remains_visible_for_review
     uow.batches[initial.id] = initial
     service = EditorialGroupingService(uow, None)
     first = (await service.synchronize(edition.id))[0]
-    await service.select(
+    selected = await service.select(
         edition.id,
         first.id,
         EditorialType.MAJOR,
@@ -403,10 +404,66 @@ async def test_match_against_selected_current_subject_remains_visible_for_review
 
     groups = await service.synchronize(edition.id)
 
-    assert len(groups) == 2
-    proposed = next(group for group in groups if group.status.value == "proposed")
-    assert proposed.outcome is GroupingOutcome.AMBIGUOUS_REVIEW
-    assert proposed.potential_historical_group_id == first.id
+    # §27.1 : le sujet déjà sélectionné absorbe la nouvelle contribution plutôt
+    # que de faire apparaître un second sujet concurrent dans le chemin de fer.
+    assert len(groups) == 1
+    enriched = groups[0]
+    assert enriched.id == first.id
+    assert enriched.status is EditorialGroupStatus.SELECTED
+    assert enriched.subject_id == selected.subject_id
+    assert enriched.editorial_type is EditorialType.MAJOR
+    assert len(enriched.candidate_references) == 2
+    # Les nouvelles sources doivent être collectées et vérifiées, sans réécrire
+    # le livrable déjà validé par l'analyste.
+    assert enriched.needs_source_expansion is True
+    assert enriched.needs_source_verification is True
+
+
+async def test_rejected_group_is_not_resurrected_by_a_similar_candidate() -> None:
+    """§27.2 : un rejet humain n'est jamais annulé automatiquement."""
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+    initial = _batch(
+        edition.id,
+        [_candidate("Campagne MuddyWater", "https://a.example/report", iocs=("1.2.3.4",))],
+    )
+    uow.batches[initial.id] = initial
+    service = EditorialGroupingService(uow, None)
+    first = (await service.synchronize(edition.id))[0]
+    await service.decide_many(
+        edition.id,
+        [
+            EditorialDecisionCommand(
+                group_id=first.id,
+                version=first.version,
+                decision=EditorialDecisionValue.IGNORE,
+            )
+        ],
+        actor_id="dev-analyst",
+        correlation_id="rejection",
+    )
+    complement = _batch(
+        edition.id,
+        [
+            _candidate(
+                "Mise à jour de la campagne MuddyWater",
+                "https://b.example/report",
+                iocs=("1.2.3.4",),
+            )
+        ],
+    )
+    uow.batches[complement.id] = complement
+
+    groups = await service.synchronize(edition.id)
+
+    rejected = next(group for group in groups if group.id == first.id)
+    assert rejected.status is EditorialGroupStatus.REJECTED
+    assert len(rejected.candidate_references) == 1
+    # La nouvelle contribution existe, mais sous un sujet distinct à arbitrer.
+    others = [group for group in groups if group.id != first.id]
+    assert len(others) == 1
+    assert others[0].status is EditorialGroupStatus.PROPOSED
 
 
 async def test_merge_split_and_selection_append_new_human_decisions() -> None:

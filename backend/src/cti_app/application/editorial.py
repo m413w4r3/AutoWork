@@ -170,12 +170,13 @@ class EditorialGroupingService:
                     reference, candidate, historical, comparison_candidates, archived_urls
                 )
                 best = _prefer_match(current_match, historical_match)
-                # Enrichir les groupes PROPOSED et SELECTED (P2: enrichissement des groupes SELECTED)
+                # Enrichir en place les groupes PROPOSED et SELECTED (§27.1).
                 if (
                     best is not None
                     and best.score >= 0.85
                     and best.group in existing
-                    and best.group.status in (EditorialGroupStatus.PROPOSED, EditorialGroupStatus.SELECTED)
+                    and best.group.status
+                    in (EditorialGroupStatus.PROPOSED, EditorialGroupStatus.SELECTED)
                 ):
                     best.group.add_candidates((reference,))
                     best.group.needs_source_expansion = True

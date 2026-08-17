@@ -737,7 +737,9 @@ class DiscoveryService:
         await self._output_archive.create_manual_research_output(
             manual_run_id,
             markdown.encode(),
-            evidence_pack_hash="",
+            # Le hash de requête manuelle tient lieu d'empreinte d'entrée : il est
+            # déterministe pour (édition, contenu) et satisfait l'invariant SHA-256.
+            evidence_pack_hash=manual_request_hash,
             actor_id=actor_id,
         )
 
@@ -753,10 +755,8 @@ class DiscoveryService:
             research_model_run_id=manual_run_id,
         )
 
-        # 5. Enregistrer les diagnostics parser
-        await self._output_archive.save_parsing_diagnostics(
-            manual_run_id, parsed.diagnostics
-        )
+        # 5. Enregistrer les diagnostics parser, comme pour une recherche ChatGPT.
+        await self._record_parser_diagnostics(manual_run_id, parsed)
 
         # 6. Transformer en DiscoveryBatch
         batch = _parsed_to_domain_batch(
@@ -774,12 +774,21 @@ class DiscoveryService:
             source_mode=DiscoverySourceMode.MANUAL_IMPORT,
         )
 
-        # 7. Ajouter et committer
+        # 7. Ajouter et committer. Une insertion concurrente du même Markdown
+        # partage le même request_hash : on adopte le batch canonique.
         async with self._uow_factory() as uow:
-            await uow.discovery_batches.add_if_absent(parameters.edition_id, batch)
+            inserted = await uow.discovery_batches.add_if_absent(batch)
+            if not inserted:
+                existing = await uow.discovery_batches.get_by_request_hash(
+                    parameters.edition_id, manual_request_hash
+                )
+                if existing is None:
+                    raise RuntimeError("Discovery conflict without canonical batch")
+                await uow.commit()
+                return existing, True
             await uow.commit()
 
-        # 8. Appeler _after_discovery si disponible
+        # 8. Regrouper éditorialement la nouvelle contribution.
         if self._after_discovery is not None:
             await self._after_discovery(parameters.edition_id)
 

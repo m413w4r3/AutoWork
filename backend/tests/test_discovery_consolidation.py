@@ -1,19 +1,18 @@
-"""Tests for discovery consolidation (P2)."""
+"""Tests de la projection consolidée des batches de découverte (§33)."""
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from uuid import uuid4
-
-import pytest
 
 from cti_app.application.discovery_consolidation import consolidate_discovery_batches
 from cti_app.application.discovery_identity import (
+    candidates_match_strongly,
     canonical_source_key,
     explicit_entity_tokens,
-    has_strong_signal,
-    normalize_title,
-    title_fingerprint,
+    has_other_strong_signal,
+    normalize,
+    shared_strong_urls,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
@@ -25,380 +24,401 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
 )
 
+REQUEST_HASH = "a" * 64
+
+
+def _source(
+    url: str,
+    *,
+    publisher: str = "Vendor Research",
+    role: SourceRole = SourceRole.PRIMARY,
+    published_at: date | None = date(2026, 7, 16),
+    verification_status: SourceVerificationStatus = SourceVerificationStatus.UNVERIFIED,
+    verification_changed_at: datetime | None = None,
+    verification_changed_by: str | None = None,
+) -> SourceCandidate:
+    return SourceCandidate(
+        url=url,
+        title="Rapport technique",
+        publisher=publisher,
+        role=role,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        published_at=published_at,
+        verification_status=verification_status,
+        verification_changed_at=verification_changed_at,
+        verification_changed_by=verification_changed_by,
+    )
+
+
+def _candidate(
+    title: str,
+    sources: list[SourceCandidate],
+    *,
+    actors: tuple[str, ...] = ("MuddyWater",),
+    campaigns: tuple[str, ...] = ("Example Campaign",),
+    malware: tuple[str, ...] = ("ExampleRAT",),
+    technical_potential: int = 3,
+    iocs: tuple[str, ...] = (),
+    uncertainties: tuple[str, ...] = (),
+) -> CandidateTopic:
+    return CandidateTopic(
+        title=title,
+        summary="Publication technique décrivant une campagne et ses indicateurs.",
+        novelty="Nouveau rapport technique",
+        technical_potential=technical_potential,
+        event_date=date(2026, 7, 10),
+        uncertainties=uncertainties,
+        relevance_reasons=("Artefacts techniques",),
+        actors=actors,
+        campaigns=campaigns,
+        malware=malware,
+        cves=(),
+        victims=("administration",),
+        sectors=("gouvernement",),
+        countries=("Iran",),
+        likely_artifacts=("ioc",),
+        iocs=iocs,
+        sources=sources,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+    )
+
+
+def _batch(candidates: list[CandidateTopic], *, edition_id=None) -> DiscoveryBatch:
+    return DiscoveryBatch(
+        edition_id=edition_id or uuid4(),
+        request_hash=REQUEST_HASH,
+        complementary_axis="initial",
+        queries=(),
+        citations=(),
+        candidates=candidates,
+        discovery_model_run_id=uuid4(),
+        structuring_model_run_id=uuid4(),
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        source_mode=DiscoverySourceMode.MODEL_DECLARED_URLS,
+        source_coverage_complete=True,
+    )
+
 
 class TestDiscoveryIdentity:
-    """Tests for discovery_identity helpers."""
+    def test_normalize_strips_accents_case_and_whitespace(self) -> None:
+        assert normalize("Café  \n  Élève") == "cafe eleve"
 
-    def test_normalize_title_removes_accents(self) -> None:
-        assert normalize_title("café") == "cafe"
-        assert normalize_title("Élève") == "eleve"
+    def test_explicit_entity_tokens_splits_and_drops_unknown(self) -> None:
+        assert explicit_entity_tokens("WIZARD SPIDER / Evil Corp") == {
+            "wizard spider",
+            "evil corp",
+        }
+        assert explicit_entity_tokens("unknown") == set()
 
-    def test_normalize_title_lowercases(self) -> None:
-        assert normalize_title("Hello World") == "hello world"
+    def test_has_other_strong_signal_on_close_titles(self) -> None:
+        left = _candidate("Campagne Cavern contre l'énergie", [_source("https://a.example/1")])
+        right = _candidate("Campagne Cavern contre l'énergie iranienne", [_source("https://b.example/1")])
+        assert has_other_strong_signal(left, right)
 
-    def test_normalize_title_normalizes_whitespace(self) -> None:
-        assert normalize_title("Hello  \n  World") == "hello world"
-
-    def test_title_fingerprint_deterministic(self) -> None:
-        fp1 = title_fingerprint("Cavern Malware Campaign")
-        fp2 = title_fingerprint("cavern malware campaign")
-        assert fp1 == fp2
-
-    def test_explicit_entity_tokens(self) -> None:
-        candidate = CandidateTopic(
-            id=uuid4(),
-            title="Test",
-            summary="Test",
-            novelty="high",
-            technical_potential=3,
-            event_date=None,
-            uncertainties=(),
-            relevance_reasons=(),
-            actors=("WIZARD SPIDER", "Evil Corp"),
-            campaigns=(),
-            malware=(),
-            cves=(),
-            victims=(),
-            sectors=(),
-            countries=(),
-            likely_artifacts=(),
-            iocs=(),
-            provisional_iocs=(),
-            sources=(),
-            incomplete_sources=(),
-            local_ref=None,
-            actor_or_campaign="WIZARD SPIDER",
-            technical_potential_reason="",
-            parsing_warnings=(),
-            context_only=False,
-            selectable=True,
+    def test_has_other_strong_signal_ignores_sector_and_country(self) -> None:
+        left = _candidate(
+            "Sujet totalement distinct alpha",
+            [_source("https://a.example/1")],
+            actors=("Actor A",),
+            campaigns=("Campaign A",),
+            malware=("MalwareA",),
         )
-        tokens = explicit_entity_tokens(candidate)
-        assert "wizard spider" in tokens
-        assert "evil corp" in tokens
+        right = _candidate(
+            "Autre histoire sans rapport beta",
+            [_source("https://b.example/1")],
+            actors=("Actor B",),
+            campaigns=("Campaign B",),
+            malware=("MalwareB",),
+        )
+        # Même secteur et même pays dans le helper `_candidate`, ce qui ne doit
+        # jamais suffire à rapprocher deux sujets.
+        assert not has_other_strong_signal(left, right)
 
-    def test_has_strong_signal_title_similarity(self) -> None:
-        # 70%+ similarity should trigger
-        assert has_strong_signal(
-            "Cavern Malware Campaign",
-            "Cavern Malware",
-            set(),
-            set(),
-            set(),
-            set(),
-            set(),
-            set(),
+    def test_shared_strong_urls_ignores_relay_sources(self) -> None:
+        left = _candidate("Sujet", [_source("https://a.example/1", role=SourceRole.RELAY)])
+        right = _candidate("Autre", [_source("https://a.example/1", role=SourceRole.RELAY)])
+        assert shared_strong_urls(left, right) == set()
+
+    def test_canonical_source_key_is_case_insensitive(self) -> None:
+        assert canonical_source_key("https://example.com/report") == canonical_source_key(
+            "HTTPS://EXAMPLE.COM/report"
         )
 
-    def test_has_strong_signal_shared_entity(self) -> None:
-        assert has_strong_signal(
-            "Topic A",
-            "Topic B",
-            {"wizard spider"},
-            {"wizard spider", "other"},
-            set(),
-            set(),
-            set(),
-            set(),
+    def test_shared_url_alone_does_not_match(self) -> None:
+        left = _candidate(
+            "Campagne alpha contre le secteur bancaire",
+            [_source("https://a.example/synthese")],
+            actors=("Actor A",),
+            campaigns=("Campaign A",),
+            malware=("MalwareA",),
         )
-
-    def test_canonical_source_key(self) -> None:
-        url1 = "https://example.com/report"
-        url2 = "HTTPS://EXAMPLE.COM/report"
-        assert canonical_source_key(url1) == canonical_source_key(url2)
+        right = _candidate(
+            "Opération beta visant des ONG",
+            [_source("https://a.example/synthese")],
+            actors=("Actor B",),
+            campaigns=("Campaign B",),
+            malware=("MalwareB",),
+        )
+        assert shared_strong_urls(left, right)
+        assert not candidates_match_strongly(left, right)
 
 
 class TestDiscoveryConsolidation:
-    """Tests for discovery batch consolidation."""
+    def test_no_batches_returns_empty(self) -> None:
+        assert consolidate_discovery_batches([]) == []
 
-    @staticmethod
-    def _make_source(url: str, publisher: str = "Test Publisher") -> SourceCandidate:
-        return SourceCandidate(
-            id=uuid4(),
-            url=url,
-            canonical_url=url.lower(),
-            raw_url=url,
-            title="Test",
-            publisher=publisher,
-            role=SourceRole.PRIMARY,
-            published_at=date(2026, 7, 16),
-            event_date=None,
-            citation=None,
-            ioc_presence="none",
-            ioc_declared_count=None,
-            ioc_visible_count=0,
-            parsing_warnings=(),
-            verification_status=SourceVerificationStatus.UNVERIFIED,
-            relationship_status="direct",
-            verification_changed_at=None,
-            verification_changed_by=None,
-            local_ref=None,
-            source_ref=None,
-            period_relation=None,
-        )
+    def test_case_a_same_subject_same_url(self) -> None:
+        """Cas A : même sujet, même URL → 1 sujet, 1 URL, 1 doublon."""
+        first = _batch([_candidate("Campagne Cavern", [_source("https://example.com/report")])])
+        second = _batch([_candidate("Campagne Cavern", [_source("https://example.com/report")])])
 
-    @staticmethod
-    def _make_candidate(
-        title: str,
-        sources: list[SourceCandidate] | None = None,
-        actors: tuple[str, ...] = (),
-        campaigns: tuple[str, ...] = (),
-    ) -> CandidateTopic:
-        return CandidateTopic(
-            id=uuid4(),
-            title=title,
-            summary="Test summary",
-            novelty="high",
-            technical_potential=3,
-            event_date=date(2026, 7, 16),
-            uncertainties=(),
-            relevance_reasons=(),
-            actors=actors,
-            campaigns=campaigns,
-            malware=(),
-            cves=(),
-            victims=(),
-            sectors=(),
-            countries=(),
-            likely_artifacts=(),
-            iocs=(),
-            provisional_iocs=(),
-            sources=tuple(sources) if sources else (),
-            incomplete_sources=(),
-            local_ref=None,
-            actor_or_campaign=actors[0] if actors else "",
-            technical_potential_reason="",
-            parsing_warnings=(),
-            context_only=False,
-            selectable=True,
-        )
-
-    @staticmethod
-    def _make_batch(
-        candidates: list[CandidateTopic],
-    ) -> DiscoveryBatch:
-        batch_id = uuid4()
-        return DiscoveryBatch(
-            id=batch_id,
-            edition_id=uuid4(),
-            request_hash="test-hash",
-            complementary_axis="test",
-            queries=(),
-            citations=(),
-            candidates=tuple(candidates),
-            discovery_model_run_id=uuid4(),
-            structuring_model_run_id=uuid4(),
-            tlp=TLP.AMBER,
-            sensitivity="internal",
-            external_llm_allowed=True,
-            report_sha256="abc123",
-            parser_version="1.0",
-            parsing_status="completed",
-            parsing_warnings=(),
-            unattached_visible_citations=(),
-            source_mode=DiscoverySourceMode.MODEL_DECLARED_URLS,
-            bridge_capabilities={},
-            citation_count=0,
-            source_coverage_complete=False,
-            source_coverage_incomplete_reason=None,
-            created_at=None,
-            parsing_revision=1,
-            supersedes_batch_id=None,
-            replaced_by_batch_id=None,
-            is_active_revision=True,
-        )
-
-    def test_consolidate_same_subject_same_url(self) -> None:
-        """Case A: Same subject, same URL → 1 subject, 1 URL, duplicate count = 1."""
-        source_a = self._make_source("https://example.com/report")
-        source_b = self._make_source("https://example.com/report")
-
-        cand1 = self._make_candidate("Cavern Campaign", sources=[source_a])
-        cand2 = self._make_candidate("Cavern Campaign", sources=[source_b])
-
-        batch1 = self._make_batch([cand1])
-        batch2 = self._make_batch([cand2])
-
-        consolidated = consolidate_discovery_batches([batch1, batch2])
+        consolidated = consolidate_discovery_batches([first, second])
 
         assert len(consolidated) == 1
         assert consolidated[0].contribution_count == 2
         assert len(consolidated[0].sources) == 1
         assert consolidated[0].duplicate_publication_count == 1
+        assert len(consolidated[0].member_references) == 2
 
-    def test_consolidate_update_subject_add_url(self) -> None:
-        """Case B: Subject update (A, B) + (A, C) → A, B, C with 2 contributions."""
-        source_a = self._make_source("https://example.com/a")
-        source_b = self._make_source("https://example.com/b")
-        source_c = self._make_source("https://example.com/c")
+    def test_case_b_subject_update_adds_new_url(self) -> None:
+        """Cas B : (A, B) puis (A, C) → A, B, C."""
+        first = _batch(
+            [
+                _candidate(
+                    "Campagne Cavern",
+                    [_source("https://example.com/a"), _source("https://example.com/b")],
+                )
+            ]
+        )
+        second = _batch(
+            [
+                _candidate(
+                    "Campagne Cavern",
+                    [_source("https://example.com/a"), _source("https://example.com/c")],
+                )
+            ]
+        )
 
-        cand1 = self._make_candidate("Cavern", sources=[source_a, source_b])
-        cand2 = self._make_candidate("Cavern", sources=[source_a, source_c])
-
-        batch1 = self._make_batch([cand1])
-        batch2 = self._make_batch([cand2])
-
-        consolidated = consolidate_discovery_batches([batch1, batch2])
+        consolidated = consolidate_discovery_batches([first, second])
 
         assert len(consolidated) == 1
         assert consolidated[0].contribution_count == 2
-        assert len(consolidated[0].sources) == 3
-        assert consolidated[0].duplicate_publication_count == 1  # source_a appears twice
+        assert {source.canonical_url for source in consolidated[0].sources} == {
+            "https://example.com/a",
+            "https://example.com/b",
+            "https://example.com/c",
+        }
+        assert consolidated[0].duplicate_publication_count == 1
 
-    def test_consolidate_url_deduplication(self) -> None:
-        """Case C: UTM params removed by parser → 1 URL."""
-        # Assuming parser already canonicalizes URLs (UTM removal)
-        source_base = self._make_source("https://example.com/article")
-        source_utm = self._make_source("https://example.com/article")  # already canonicalized
+    def test_case_c_tracking_parameters_are_ignored(self) -> None:
+        """Cas C : les paramètres utm_* sont retirés à la canonicalisation."""
+        first = _batch(
+            [_candidate("Story", [_source("https://example.com/a?utm_source=newsletter")])]
+        )
+        second = _batch([_candidate("Story", [_source("https://example.com/a")])])
 
-        cand1 = self._make_candidate("Story", sources=[source_base])
-        cand2 = self._make_candidate("Story", sources=[source_utm])
-
-        batch1 = self._make_batch([cand1])
-        batch2 = self._make_batch([cand2])
-
-        consolidated = consolidate_discovery_batches([batch1, batch2])
+        consolidated = consolidate_discovery_batches([first, second])
 
         assert len(consolidated) == 1
         assert len(consolidated[0].sources) == 1
         assert consolidated[0].duplicate_publication_count == 1
 
-    def test_consolidate_separate_subjects_same_url(self) -> None:
-        """Case D: Synthesis covering 2 subjects → 2 consolidated, URL in both."""
-        shared_url = self._make_source("https://example.com/synthesis")
-
-        cand_a = self._make_candidate("Campaign A", sources=[shared_url], campaigns=("Campaign A",))
-        cand_b = self._make_candidate("Campaign B", sources=[shared_url], campaigns=("Campaign B",))
-
-        batch = self._make_batch([cand_a, cand_b])
+    def test_case_d_synthesis_shared_by_two_subjects(self) -> None:
+        """Cas D : une synthèse commune reste rattachée aux deux sujets distincts."""
+        synthesis = "https://example.com/synthese-trimestrielle"
+        batch = _batch(
+            [
+                _candidate(
+                    "Campagne alpha contre le secteur bancaire",
+                    [_source(synthesis)],
+                    actors=("Actor A",),
+                    campaigns=("Campaign A",),
+                    malware=("MalwareA",),
+                ),
+                _candidate(
+                    "Opération beta visant des ONG",
+                    [_source(synthesis)],
+                    actors=("Actor B",),
+                    campaigns=("Campaign B",),
+                    malware=("MalwareB",),
+                ),
+            ]
+        )
 
         consolidated = consolidate_discovery_batches([batch])
 
-        # Should NOT merge because campaigns differ
         assert len(consolidated) == 2
+        for candidate in consolidated:
+            assert [source.canonical_url for source in candidate.sources] == [synthesis]
 
-    def test_consolidate_metadata_enrichment(self) -> None:
-        """Case E: Metadata enrichment (unknown → known value)."""
-        source_unknown = SourceCandidate(
-            id=uuid4(),
-            url="https://example.com/report",
-            canonical_url="https://example.com/report",
-            raw_url="https://example.com/report",
-            title="Test",
-            publisher="unknown",
-            role=SourceRole.PRIMARY,
-            published_at=None,
-            event_date=None,
-            citation=None,
-            ioc_presence="none",
-            ioc_declared_count=None,
-            ioc_visible_count=0,
-            parsing_warnings=(),
-            verification_status=SourceVerificationStatus.UNVERIFIED,
-            relationship_status="direct",
-            verification_changed_at=None,
-            verification_changed_by=None,
-            local_ref=None,
-            source_ref=None,
-            period_relation=None,
+    def test_case_e_metadata_enrichment(self) -> None:
+        """Cas E : une valeur connue comble une valeur inconnue, sans avertissement."""
+        first = _batch(
+            [
+                _candidate(
+                    "Rapport",
+                    [_source("https://example.com/r", publisher="unknown", published_at=None)],
+                )
+            ]
+        )
+        second = _batch(
+            [
+                _candidate(
+                    "Rapport",
+                    [
+                        _source(
+                            "https://example.com/r",
+                            publisher="Recorded Future",
+                            published_at=date(2026, 7, 16),
+                        )
+                    ],
+                )
+            ]
         )
 
-        source_known = SourceCandidate(
-            id=uuid4(),
-            url="https://example.com/report",
-            canonical_url="https://example.com/report",
-            raw_url="https://example.com/report",
-            title="Test",
-            publisher="Recorded Future",
-            role=SourceRole.PRIMARY,
-            published_at=date(2026, 7, 16),
-            event_date=None,
-            citation=None,
-            ioc_presence="none",
-            ioc_declared_count=None,
-            ioc_visible_count=0,
-            parsing_warnings=(),
-            verification_status=SourceVerificationStatus.UNVERIFIED,
-            relationship_status="direct",
-            verification_changed_at=None,
-            verification_changed_by=None,
-            local_ref=None,
-            source_ref=None,
-            period_relation=None,
-        )
-
-        cand1 = self._make_candidate("Report", sources=[source_unknown])
-        cand2 = self._make_candidate("Report", sources=[source_known])
-
-        batch1 = self._make_batch([cand1])
-        batch2 = self._make_batch([cand2])
-
-        consolidated = consolidate_discovery_batches([batch1, batch2])
+        consolidated = consolidate_discovery_batches([first, second])
 
         assert len(consolidated) == 1
-        assert consolidated[0].sources[0].publisher == "Recorded Future"
+        merged = consolidated[0].sources[0]
+        assert merged.publisher == "Recorded Future"
+        assert merged.published_at == date(2026, 7, 16)
+        assert consolidated[0].merge_warnings == ()
+
+    def test_case_f_metadata_conflict_is_traced(self) -> None:
+        """Cas F : deux valeurs connues contradictoires → choix déterministe + warning."""
+        first = _batch(
+            [
+                _candidate(
+                    "Rapport",
+                    [
+                        _source(
+                            "https://example.com/r",
+                            publisher="Publisher A",
+                            published_at=date(2026, 7, 16),
+                        )
+                    ],
+                )
+            ]
+        )
+        second = _batch(
+            [
+                _candidate(
+                    "Rapport",
+                    [
+                        _source(
+                            "https://example.com/r",
+                            publisher="Publisher B",
+                            published_at=date(2026, 7, 17),
+                        )
+                    ],
+                )
+            ]
+        )
+
+        consolidated = consolidate_discovery_batches([first, second])
+
+        assert len(consolidated) == 1
+        warnings = consolidated[0].merge_warnings
+        assert any("publisher divergent" in warning for warning in warnings)
+        assert any("date de publication divergente" in warning for warning in warnings)
+        # Choix déterministe, reproductible d'un appel à l'autre.
         assert consolidated[0].sources[0].published_at == date(2026, 7, 16)
+        replayed = consolidate_discovery_batches([first, second])
+        assert replayed[0].sources[0].publisher == "Publisher A"
 
-    def test_consolidate_metadata_conflict(self) -> None:
-        """Case F: Metadata conflict → merge_warnings."""
-        source_v1 = SourceCandidate(
-            id=uuid4(),
-            url="https://example.com/report",
-            canonical_url="https://example.com/report",
-            raw_url="https://example.com/report",
-            title="Test",
-            publisher="Publisher A",
-            role=SourceRole.PRIMARY,
-            published_at=date(2026, 7, 16),
-            event_date=None,
-            citation=None,
-            ioc_presence="none",
-            ioc_declared_count=None,
-            ioc_visible_count=0,
-            parsing_warnings=(),
-            verification_status=SourceVerificationStatus.UNVERIFIED,
-            relationship_status="direct",
-            verification_changed_at=None,
-            verification_changed_by=None,
-            local_ref=None,
-            source_ref=None,
-            period_relation=None,
+    def test_richer_role_wins_over_later_vaguer_contribution(self) -> None:
+        first = _batch(
+            [_candidate("Rapport", [_source("https://example.com/r", role=SourceRole.PRIMARY)])]
+        )
+        second = _batch(
+            [_candidate("Rapport", [_source("https://example.com/r", role=SourceRole.AGGREGATOR)])]
         )
 
-        source_v2 = SourceCandidate(
-            id=uuid4(),
-            url="https://example.com/report",
-            canonical_url="https://example.com/report",
-            raw_url="https://example.com/report",
-            title="Test",
-            publisher="Publisher B",
-            role=SourceRole.PRIMARY,
-            published_at=date(2026, 7, 17),
-            event_date=None,
-            citation=None,
-            ioc_presence="none",
-            ioc_declared_count=None,
-            ioc_visible_count=0,
-            parsing_warnings=(),
-            verification_status=SourceVerificationStatus.UNVERIFIED,
-            relationship_status="direct",
-            verification_changed_at=None,
-            verification_changed_by=None,
-            local_ref=None,
-            source_ref=None,
-            period_relation=None,
+        consolidated = consolidate_discovery_batches([first, second])
+
+        assert consolidated[0].sources[0].role is SourceRole.PRIMARY
+
+    def test_human_verification_is_never_lost(self) -> None:
+        """§23 : un marquage humain n'est pas écrasé par un import plus récent."""
+        verified = _source(
+            "https://example.com/r",
+            verification_status=SourceVerificationStatus.VERIFY_LATER,
+            verification_changed_at=datetime(2026, 7, 16, 10, 0, tzinfo=UTC),
+            verification_changed_by="dev-analyst",
+        )
+        first = _batch([_candidate("Rapport", [verified])])
+        second = _batch([_candidate("Rapport", [_source("https://example.com/r")])])
+
+        consolidated = consolidate_discovery_batches([first, second])
+
+        merged = consolidated[0].sources[0]
+        assert merged.verification_status is SourceVerificationStatus.VERIFY_LATER
+        assert merged.verification_changed_by == "dev-analyst"
+
+    def test_candidate_metadata_is_unioned_and_potential_maximised(self) -> None:
+        first = _batch(
+            [
+                _candidate(
+                    "Rapport",
+                    [_source("https://example.com/a")],
+                    technical_potential=2,
+                    iocs=("1.2.3.4",),
+                    uncertainties=("Doute A",),
+                )
+            ]
+        )
+        second = _batch(
+            [
+                _candidate(
+                    "Rapport",
+                    [_source("https://example.com/a")],
+                    technical_potential=4,
+                    iocs=("5.6.7.8",),
+                    uncertainties=("Doute B",),
+                )
+            ]
         )
 
-        cand1 = self._make_candidate("Report", sources=[source_v1])
-        cand2 = self._make_candidate("Report", sources=[source_v2])
+        consolidated = consolidate_discovery_batches([first, second])
 
-        batch1 = self._make_batch([cand1])
-        batch2 = self._make_batch([cand2])
+        representative = consolidated[0].representative
+        assert representative.technical_potential == 4
+        assert set(representative.iocs) == {"1.2.3.4", "5.6.7.8"}
+        assert set(representative.uncertainties) == {"Doute A", "Doute B"}
 
-        consolidated = consolidate_discovery_batches([batch1, batch2])
+    def test_original_batches_are_not_mutated(self) -> None:
+        """La projection est en lecture seule : les contributions restent auditables."""
+        first = _batch(
+            [
+                _candidate(
+                    "Rapport",
+                    [_source("https://example.com/r", publisher="unknown", published_at=None)],
+                )
+            ]
+        )
+        second = _batch(
+            [
+                _candidate(
+                    "Rapport",
+                    [
+                        _source(
+                            "https://example.com/r",
+                            publisher="Recorded Future",
+                            published_at=date(2026, 7, 16),
+                        )
+                    ],
+                )
+            ]
+        )
 
-        assert len(consolidated) == 1
-        assert len(consolidated[0].merge_warnings) > 0
-        # Conflict warnings should be present
-        conflict_warnings = [w for w in consolidated[0].merge_warnings if "conflict" in w.lower()]
-        assert len(conflict_warnings) > 0
+        consolidate_discovery_batches([first, second])
+
+        original = first.candidates[0].sources[0]
+        assert original.publisher == "unknown"
+        assert original.published_at is None

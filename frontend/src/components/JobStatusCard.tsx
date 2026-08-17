@@ -198,8 +198,7 @@ export function JobStatusCard({
       </p>
       {active ? <p>Temps écoulé : {elapsedSeconds} s</p> : null}
       {job.data.user_message ? <p>{job.data.user_message}</p> : null}
-      {isDiscovery &&
-      details?.phase === "background_bridge_wait" ? (
+      {isDiscovery && details?.phase === "background_bridge_wait" ? (
         <div className="chatgpt-live-status" role="status" aria-live="polite">
           <p>
             <strong>
@@ -220,8 +219,8 @@ export function JobStatusCard({
           {typeof details.chatgpt_output_chars === "number" &&
           details.chatgpt_output_chars > 0 ? (
             <p>
-              Réponse visible :{" "}
-              {details.chatgpt_output_chars.toLocaleString()} caractères
+              Réponse visible : {details.chatgpt_output_chars.toLocaleString()}{" "}
+              caractères
             </p>
           ) : null}
 

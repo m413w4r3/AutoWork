@@ -234,3 +234,132 @@ async def test_manual_recovery_previews_then_resumes_the_original_job() -> None:
     assert (
         await output_store.read(run.raw_output_reference, max_bytes=10_000_000)
     ).decode() == markdown
+
+
+async def _recovery_application() -> tuple[FastAPI, object, InMemoryJobUnitOfWorkFactory, object]:
+    """Application minimale exposant découverte + jobs, ChatGPT en needs_review."""
+    adapter = DeferredResearchAdapter(needs_review=True)
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=adapter,
+            openai_structured=adapter,
+            qwen=adapter,
+            fake=adapter,
+            forced_provider=ModelProvider.FAKE,
+        ),
+        model_uow,
+        InMemoryModelOutputStore(),
+    )
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    edition_service = EditionService(InMemoryEditionUnitOfWorkFactory())
+    edition = await edition_service.create(
+        country="Iran",
+        country_code="IR",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        tlp=TLP.AMBER,
+        languages=("fr", "en"),
+        target_major_articles=2,
+        target_briefs=6,
+        previous_edition_id=None,
+        source_profile="iran-default",
+        actor_id="dev-analyst",
+        correlation_id="create-recovery",
+    )
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    registry = create_job_registry(gateway, discovery)
+    application = FastAPI()
+    application.include_router(discovery_router)
+    application.include_router(jobs_router)
+    application.state.edition_service = edition_service
+    application.state.discovery_service = discovery
+    application.state.job_service = JobService(job_uow, registry)
+    application.state.job_dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    application.state.identity_provider = LocalIdentityProvider()
+    return application, edition, job_uow, discovery
+
+
+async def test_recovery_of_cancelled_job_creates_a_new_reprocess_job() -> None:
+    """§32.4 : le job terminal reste intact, un nouveau job reparse le rapport."""
+    application, edition, job_uow, _ = await _recovery_application()
+    markdown = research_markdown_fixture()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        launched = await client.post(
+            f"/api/editions/{edition.id}/discovery",
+            json={"complementary_axis": "initial"},
+        )
+        job_id = launched.json()["job_id"]
+        waiting = await client.get(f"/api/jobs/{job_id}")
+        model_run_id = waiting.json()["error_details"]["model_run_id"]
+
+        cancelled = await client.post(f"/api/jobs/{job_id}/cancel")
+        assert cancelled.status_code in {200, 202}
+
+        preview = await client.post(
+            f"/api/editions/{edition.id}/discovery/recovery/{model_run_id}/manual/preview",
+            json={"job_id": job_id, "markdown": markdown},
+        )
+        confirmed = await client.post(
+            f"/api/editions/{edition.id}/discovery/recovery/{model_run_id}/manual/confirm",
+            json={
+                "job_id": job_id,
+                "markdown": markdown,
+                "expected_sha256": preview.json()["sha256"],
+            },
+        )
+        original = await client.get(f"/api/jobs/{job_id}")
+        candidates = await client.get(f"/api/editions/{edition.id}/discovery/candidates")
+
+    assert preview.status_code == 200
+    assert confirmed.status_code == 202
+
+    new_job_id = confirmed.json()["job_id"]
+    assert new_job_id != job_id
+    # L'historique du job annulé n'est pas réécrit.
+    assert original.json()["status"] == "cancelled"
+
+    new_job = job_uow.state[__import__("uuid").UUID(new_job_id)]
+    assert new_job.kind == "reprocess_discovery_report"
+    # Le nouveau job doit viser le ModelRun de recherche, pas l'ancien Job.
+    assert new_job.input_parameters["research_model_run_id"] == model_run_id
+    assert candidates.json()["total"] == 1
+
+
+async def test_discovery_import_works_without_any_job_or_model_run() -> None:
+    """§32.5 : l'import initial ne dépend d'aucun job ni ModelRun préalable."""
+    application, edition, job_uow, _ = await _recovery_application()
+    markdown = research_markdown_fixture()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        preview = await client.post(
+            f"/api/editions/{edition.id}/discovery/import/preview",
+            json={"markdown": markdown},
+        )
+        confirmed = await client.post(
+            f"/api/editions/{edition.id}/discovery/import/confirm",
+            json={"markdown": markdown, "expected_sha256": preview.json()["sha256"]},
+        )
+        replay = await client.post(
+            f"/api/editions/{edition.id}/discovery/import/confirm",
+            json={"markdown": markdown, "expected_sha256": preview.json()["sha256"]},
+        )
+        candidates = await client.get(f"/api/editions/{edition.id}/discovery/candidates")
+
+    assert preview.status_code == 200
+    assert preview.json()["subject_count"] == 1
+    assert preview.json()["publication_count"] == 3
+    assert confirmed.status_code == 200
+    assert confirmed.json()["source_mode"] == "manual_import"
+    assert confirmed.json()["reused"] is False
+    # Réimport idempotent, sans second batch.
+    assert replay.json()["reused"] is True
+    assert replay.json()["batch_id"] == confirmed.json()["batch_id"]
+    assert len(candidates.json()["batches"]) == 1
+    # Aucun job n'a été créé par ce chemin.
+    assert not job_uow.state

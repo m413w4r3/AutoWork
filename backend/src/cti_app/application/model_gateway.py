@@ -457,9 +457,9 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             content, mime_type="text/markdown; charset=utf-8"
         )
 
-        # Créer le run synthétique
+        # Créer le run synthétique, puis le clôturer via le domaine plutôt que
+        # de renseigner une dizaine de champs terminaux depuis le gateway.
         async with self._uow_factory() as uow:
-            now = datetime.now(UTC)
             run = ModelRun(
                 id=run_id,
                 provider=ModelProvider.FAKE,
@@ -468,27 +468,18 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 actual_model_version="manual-import",
                 prompt_template_id="manual-import",
                 prompt_template_version="1.0",
-                authorized_input_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",  # sha256("")
+                # Aucun prompt n'a été soumis : sha256 de la chaîne vide.
+                authorized_input_hash=hashlib.sha256(b"").hexdigest(),
                 evidence_pack_hash=evidence_pack_hash,
                 parameters={},
-                status=ModelRunStatus.SUCCEEDED,
-                started_at=now,
-                finished_at=now,
-                duration_ms=0,
-                raw_output_reference=reference,
-                raw_output_sha256=digest,
-                raw_output_chars=len(content.decode(errors="replace")),
-                usage=ModelUsage(estimated=True),
-                error_details={
-                    "recovery": {
-                        "provenance": "manual_import",
-                        "actor_id": actor_id,
-                        "adopted_at": now.isoformat(),
-                        "source_model_run_id": None,
-                    }
-                },
             )
-            await uow.model_runs.save(run)
+            run.succeed_manual_import(
+                output_reference=reference,
+                output_sha256=digest,
+                output_chars=len(content.decode(errors="replace")),
+                actor_id=actor_id,
+            )
+            await uow.model_runs.add(run)
             await uow.commit()
             return run
 
