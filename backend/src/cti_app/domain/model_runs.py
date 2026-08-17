@@ -192,7 +192,7 @@ class ModelRun:
         now: datetime | None = None,
     ) -> None:
         allowed = {ModelRunStatus.NEEDS_REVIEW}
-        if provenance == "manual_import":
+        if provenance in {"manual_import", "visible_recovery"}:
             allowed |= {
                 ModelRunStatus.WAITING_BACKGROUND,
                 ModelRunStatus.FAILED,

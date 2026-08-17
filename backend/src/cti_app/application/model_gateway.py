@@ -376,7 +376,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 return existing
             # Vérifier que le ModelRun peut être adopté avec cette provenance
             allowed = {ModelRunStatus.NEEDS_REVIEW}
-            if provenance == "manual_import":
+            if provenance in {"manual_import", "visible_recovery"}:
                 allowed |= {
                     ModelRunStatus.WAITING_BACKGROUND,
                     ModelRunStatus.FAILED,
@@ -414,6 +414,83 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             run.updated_at = datetime.now(UTC)
             await uow.model_runs.save(run)
             await uow.commit()
+
+    async def create_manual_research_output(
+        self,
+        run_id: UUID,
+        content: bytes,
+        *,
+        evidence_pack_hash: str,
+        actor_id: str,
+    ) -> ModelRun:
+        """Créer un ModelRun synthétique pour un import manuel de Markdown.
+
+        Le run n'est pas un véritable appel API : c'est un enregistrement
+        du contenu fourni par l'utilisateur, avec marquage manuel_import.
+
+        Calcule le SHA et crée le run directement en SUCCEEDED.
+        """
+        digest = hashlib.sha256(content).hexdigest()
+
+        async with self._uow_factory() as uow:
+            # Vérifier s'il existe déjà un run avec ce run_id
+            existing = await uow.model_runs.get(run_id)
+            if existing is not None:
+                # Vérifier que c'est le même contenu
+                if (
+                    existing.raw_output_sha256 == digest
+                    and existing.status is ModelRunStatus.SUCCEEDED
+                ):
+                    recovery = (existing.error_details or {}).get("recovery")
+                    if (
+                        isinstance(recovery, dict)
+                        and recovery.get("provenance") == "manual_import"
+                    ):
+                        return existing
+                # Collision : un run différent existe déjà
+                raise ModelGatewayError(
+                    f"Model run {run_id} already exists with different content"
+                )
+
+        # Archiver le contenu
+        reference = await self._output_store.store(
+            content, mime_type="text/markdown; charset=utf-8"
+        )
+
+        # Créer le run synthétique
+        async with self._uow_factory() as uow:
+            now = datetime.now(UTC)
+            run = ModelRun(
+                id=run_id,
+                provider=ModelProvider.FAKE,
+                model_role=ModelRole.RESEARCH,
+                requested_model="manual-import",
+                actual_model_version="manual-import",
+                prompt_template_id="manual-import",
+                prompt_template_version="1.0",
+                authorized_input_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",  # sha256("")
+                evidence_pack_hash=evidence_pack_hash,
+                parameters={},
+                status=ModelRunStatus.SUCCEEDED,
+                started_at=now,
+                finished_at=now,
+                duration_ms=0,
+                raw_output_reference=reference,
+                raw_output_sha256=digest,
+                raw_output_chars=len(content.decode(errors="replace")),
+                usage=ModelUsage(estimated=True),
+                error_details={
+                    "recovery": {
+                        "provenance": "manual_import",
+                        "actor_id": actor_id,
+                        "adopted_at": now.isoformat(),
+                        "source_model_run_id": None,
+                    }
+                },
+            )
+            await uow.model_runs.save(run)
+            await uow.commit()
+            return run
 
     async def record_output_diagnostics(
         self,

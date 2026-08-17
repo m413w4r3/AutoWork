@@ -487,11 +487,20 @@ class DiscoveryService:
         if self._output_archive is None or self._bridge_capabilities_provider is None:
             raise ModelGatewayError("Recovery infrastructure is unavailable")
         parent = await self._output_archive.get_run(parent_run_id)
+
+        # Un run peut être terminal (FAILED, WAITING_BACKGROUND) mais ChatGPT
+        # a pu continuer et produire une réponse. Autoriser la récupération DOM.
+        recoverable_statuses = {
+            ModelRunStatus.NEEDS_REVIEW,
+            ModelRunStatus.WAITING_BACKGROUND,
+            ModelRunStatus.FAILED,
+        }
+
         if (
             parent is None
             or not parent.response_id
             or (
-                parent.status is not ModelRunStatus.NEEDS_REVIEW
+                parent.status not in recoverable_statuses
                 and not _has_recovery_provenance(parent, "visible_recovery")
             )
         ):
@@ -660,6 +669,121 @@ class DiscoveryService:
             raise ModelGatewayError(child.error_message or "Recovery child failed")
         await self._output_archive.link_recovery_child(parent_run_id, child_id)
         return child_id
+
+    async def preview_standalone_import(
+        self,
+        parameters: DiscoverEditionParameters,
+        markdown: str,
+    ) -> dict[str, Any]:
+        """Prévisualiser l'import d'une réponse ChatGPT Markdown existante.
+
+        Aucune persistance au preview : permet à l'utilisateur de vérifier
+        le contenu avant de confirmer.
+        """
+        digest = hashlib.sha256(markdown.encode()).hexdigest()
+        manual_run_id = uuid5(
+            NAMESPACE_URL,
+            f"cti-discovery-manual-import:{parameters.edition_id}:{digest}",
+        )
+        return self._preview_report(parameters, manual_run_id, markdown)
+
+    async def import_standalone_report(
+        self,
+        parameters: DiscoverEditionParameters,
+        markdown: str,
+        *,
+        expected_sha256: str,
+        actor_id: str,
+    ) -> tuple[DiscoveryBatch, bool]:
+        """Importer une réponse ChatGPT Markdown en tant que contribution autonome.
+
+        Étapes:
+        1. Refaire preview et vérifier expected_sha256
+        2. Calculer manual_run_id et manual_request_hash
+        3. Vérifier si un batch avec ce request_hash existe → retourner (batch, reused=True)
+        4. Créer/obtenir le ModelRun synthétique manual-import
+        5. Parser le rapport
+        6. Enregistrer les diagnostics parser
+        7. Transformer en DiscoveryBatch
+        8. Appeler _after_discovery()
+        9. Retourner (batch, reused=False)
+        """
+        if self._output_archive is None:
+            raise ModelGatewayError("Model output archive is unavailable")
+
+        digest = hashlib.sha256(markdown.encode()).hexdigest()
+        manual_run_id = uuid5(
+            NAMESPACE_URL,
+            f"cti-discovery-manual-import:{parameters.edition_id}:{digest}",
+        )
+        manual_request_hash = hashlib.sha256(
+            f"manual-import:v1:{parameters.edition_id}:{digest}".encode()
+        ).hexdigest()
+
+        # 1. Refaire preview et vérifier expected_sha256
+        preview = self._preview_report(parameters, manual_run_id, markdown)
+        if preview["sha256"] != expected_sha256:
+            raise ValueError("Import preview no longer matches the confirmed report")
+
+        # 2. Vérifier si un batch avec ce request_hash existe (idempotence)
+        async with self._uow_factory() as uow:
+            existing_batch = await uow.discovery_batches.get_by_request_hash(
+                parameters.edition_id, manual_request_hash
+            )
+            if existing_batch is not None:
+                return existing_batch, True
+
+        # 3. Créer le ModelRun synthétique manual-import
+        await self._output_archive.create_manual_research_output(
+            manual_run_id,
+            markdown.encode(),
+            evidence_pack_hash="",
+            actor_id=actor_id,
+        )
+
+        # 4. Parser le rapport
+        parsed = parse_discovery_report(
+            markdown,
+            visible_citations=[],
+            period_start=parameters.period_start,
+            period_end=parameters.period_end,
+            tlp=parameters.tlp,
+            sensitivity=parameters.sensitivity,
+            external_llm_allowed=parameters.external_llm_allowed,
+            research_model_run_id=manual_run_id,
+        )
+
+        # 5. Enregistrer les diagnostics parser
+        await self._output_archive.save_parsing_diagnostics(
+            manual_run_id, parsed.diagnostics
+        )
+
+        # 6. Transformer en DiscoveryBatch
+        batch = _parsed_to_domain_batch(
+            parameters,
+            manual_request_hash,
+            parsed,
+            manual_run_id,
+            bridge_capabilities={
+                "transport": "manual_import",
+                "web_search": "performed_outside_autowork",
+                "native_sources": False,
+                "native_usage": False,
+                "snapshot_available": False,
+            },
+            source_mode=DiscoverySourceMode.MANUAL_IMPORT,
+        )
+
+        # 7. Ajouter et committer
+        async with self._uow_factory() as uow:
+            await uow.discovery_batches.add_if_absent(parameters.edition_id, batch)
+            await uow.commit()
+
+        # 8. Appeler _after_discovery si disponible
+        if self._after_discovery is not None:
+            await self._after_discovery(parameters.edition_id)
+
+        return batch, False
 
     async def _poll_background_research(
         self,
@@ -1663,6 +1787,8 @@ def _parsed_to_domain_batch(
     result: ParsedDiscoveryReport,
     research_run_id: UUID,
     bridge_capabilities: Mapping[str, object],
+    *,
+    source_mode: DiscoverySourceMode = DiscoverySourceMode.MODEL_DECLARED_URLS,
 ) -> DiscoveryBatch:
     return DiscoveryBatch(
         edition_id=parameters.edition_id,
@@ -1683,7 +1809,7 @@ def _parsed_to_domain_batch(
         parsing_status=("report_parsing_partial" if result.status == "partial" else "completed"),
         parsing_warnings=result.warnings,
         unattached_visible_citations=result.unattached_visible_citations,
-        source_mode=DiscoverySourceMode.MODEL_DECLARED_URLS,
+        source_mode=source_mode,
         bridge_capabilities=dict(bridge_capabilities),
         citation_count=len(result.citations),
         source_coverage_complete=False,
