@@ -3,13 +3,12 @@
  * Shows batch production status for an edition
  */
 
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   getEditionBriefProduction,
   startEditionBriefProduction,
-  BatchStatus,
-} from "@/api/production";
+} from "../api/production";
 
 interface ProductionQueueProps {
   editionId: string;

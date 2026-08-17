@@ -107,17 +107,17 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
         aria-labelledby="editorial-board-heading"
       >
         <div className="editorial-board__heading">
-        <div>
-          <p className="eyebrow">Choix éditorial</p>
-          <h2 id="editorial-board-heading">Sélection des sujets</h2>
+          <div>
+            <p className="eyebrow">Choix éditorial</p>
+            <h2 id="editorial-board-heading">Sélection des sujets</h2>
+          </div>
+          <div className="selection-counter" aria-label="Décisions courantes">
+            <strong>{currentBriefs}</strong> brèves ·{" "}
+            <strong>{currentMajor}</strong> articles approfondis ·{" "}
+            <strong>{currentIgnored}</strong> ignorés ·{" "}
+            <strong>{currentUndecided}</strong> encore à décider
+          </div>
         </div>
-        <div className="selection-counter" aria-label="Décisions courantes">
-          <strong>{currentBriefs}</strong> brèves ·{" "}
-          <strong>{currentMajor}</strong> articles approfondis ·{" "}
-          <strong>{currentIgnored}</strong> ignorés ·{" "}
-          <strong>{currentUndecided}</strong> encore à décider
-        </div>
-      </div>
       <p className="verification-warning" role="note">
         IOC repérés pendant la recherche — non encore vérifiés depuis les
         sources.
@@ -245,7 +245,8 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
           ))}
         </div>
       </details>
-    </section>
+      </section>
+    </>
   );
 }
 
@@ -493,7 +494,5 @@ function AdvancedGroupControls({
         Séparer les publications cochées
       </button>
     </article>
-      </section>
-    </>
   );
 }

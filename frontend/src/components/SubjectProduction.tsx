@@ -3,15 +3,14 @@
  * Displays production status and controls for a subject
  */
 
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   getSubjectProduction,
   retryReferences,
   retrySynthesis,
   cancelSubjectProduction,
-  ProductionStatus,
-} from "@/api/production";
+} from "../api/production";
 import { ProductionStageCard } from "./ProductionStageCard";
 
 interface SubjectProductionProps {
@@ -29,7 +28,7 @@ export function SubjectProduction({
   const { data: status, isLoading, error, refetch } = useQuery({
     queryKey: ["production", subjectId],
     queryFn: () => getSubjectProduction(subjectId),
-    refetchInterval: autoRefresh && status?.status === "running" ? 2000 : false,
+    refetchInterval: autoRefresh ? 2000 : false,
   });
 
   // Mutations
@@ -70,7 +69,7 @@ export function SubjectProduction({
     "assembly",
   ];
   const completedStages = stageList.filter(
-    (stage) => status.stages[stage]?.status === "verified"
+    (stage) => status.stages[stage]?.status === "succeeded"
   ).length;
 
   return (

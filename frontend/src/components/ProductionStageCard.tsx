@@ -3,7 +3,6 @@
  * Shows the status of a single production stage
  */
 
-import React from "react";
 
 interface ProductionStageCardProps {
   stage: string;
@@ -35,7 +34,7 @@ export function ProductionStageCard({
   stageNumber,
   isActive,
 }: ProductionStageCardProps) {
-  const statusInfo = STATUS_ICONS[status] || STATUS_ICONS.pending;
+  const statusInfo = (STATUS_ICONS[status] || STATUS_ICONS["pending"]) as { icon: string; color: string };
 
   const bgColor = isActive ? "bg-blue-50 border-blue-300" : "bg-white border-gray-200";
   const borderColor = isActive ? "border-2" : "border";
