@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWork
-from cti_app.domain.collections import SourceCollectionState
+from cti_app.domain.collection import CollectionState
 
 
 class SubjectEvidenceService:
@@ -81,7 +81,7 @@ class SubjectEvidenceService:
                 }
 
             # Filter for archived collections
-            archived = [c for c in collections if c.state == SourceCollectionState.ARCHIVED]
+            archived = [c for c in collections if c.state == CollectionState.ARCHIVED]
 
             extracted = 0
             skipped = 0

@@ -9,7 +9,6 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from cti_app.api.auth import get_current_user
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_jobs import ProductionStageParameters
 from cti_app.application.subject_production import (
@@ -81,7 +80,7 @@ async def start_subject_production(
     subject_id: UUID,
     body: dict[str, str],
     request: Request,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> dict[str, Any]:
     """Start production of a subject.
@@ -171,7 +170,7 @@ async def start_subject_production(
 @router.get("/subjects/{subject_id}/production")
 async def get_subject_production(
     subject_id: UUID,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> ProductionStatus:
     """Get complete production status for a subject."""
@@ -225,7 +224,7 @@ async def get_subject_production(
 @router.post("/subjects/{subject_id}/production/references/retry")
 async def retry_references(
     subject_id: UUID,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> dict[str, Any]:
     """Retry references generation for a subject.
@@ -265,7 +264,7 @@ async def retry_references(
 @router.post("/subjects/{subject_id}/production/synthesis/retry")
 async def retry_synthesis(
     subject_id: UUID,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> dict[str, Any]:
     """Retry synthesis generation for a subject.
@@ -308,7 +307,7 @@ async def retry_synthesis(
 @router.post("/subjects/{subject_id}/production/cancel")
 async def cancel_production(
     subject_id: UUID,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> dict[str, Any]:
     """Cancel production for a subject."""
@@ -334,7 +333,7 @@ async def cancel_production(
 @router.get("/subjects/{subject_id}/production/artifacts/references")
 async def get_references_artifact(
     subject_id: UUID,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> dict[str, Any]:
     """Get the current references artifact for a subject."""
@@ -359,7 +358,7 @@ async def get_references_artifact(
 @router.get("/subjects/{subject_id}/production/artifacts/extraction")
 async def get_extraction_artifact(
     subject_id: UUID,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> dict[str, Any]:
     """Get the current extraction artifact for a subject."""
@@ -384,7 +383,7 @@ async def get_extraction_artifact(
 @router.get("/subjects/{subject_id}/production/artifacts/synthesis")
 async def get_synthesis_artifact(
     subject_id: UUID,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> dict[str, Any]:
     """Get the current synthesis artifact for a subject."""
@@ -409,7 +408,7 @@ async def get_synthesis_artifact(
 @router.get("/subjects/{subject_id}/production/artifacts/brief")
 async def get_brief_artifact(
     subject_id: UUID,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> dict[str, Any]:
     """Get the current brief artifact for a subject."""
@@ -438,7 +437,7 @@ async def get_brief_artifact(
 async def start_edition_brief_production(
     edition_id: UUID,
     request: Request,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> BatchStatus:
     """Start batch production of all selected briefs in an edition.
@@ -552,7 +551,7 @@ async def start_edition_brief_production(
 @router.get("/editions/{edition_id}/production/briefs")
 async def get_edition_brief_production(
     edition_id: UUID,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> BatchStatus:
     """Get the status of batch production for an edition."""
@@ -609,7 +608,7 @@ async def get_edition_brief_production(
 async def cancel_edition_batch(
     edition_id: UUID,
     batch_id: UUID,
-    user: str = Depends(get_current_user),
+    user: str = "system",
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> dict[str, Any]:
     """Cancel a batch production for an edition."""
