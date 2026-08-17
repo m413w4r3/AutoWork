@@ -2,6 +2,7 @@
 
 Tests domain models, state machines, and logic without database dependencies.
 """
+
 from __future__ import annotations
 
 from datetime import UTC, datetime

@@ -1,4 +1,5 @@
 """Business logic for each production stage."""
+
 from __future__ import annotations
 
 import hashlib
@@ -13,7 +14,6 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
 )
 
 
@@ -352,26 +352,73 @@ class BriefAssemblyService:
     ) -> str:
         """Render brief markdown from artifact metadata.
 
-        This is a placeholder - actual implementation would:
-        1. Load artifact content
-        2. Build IOC table from extraction
-        3. Build references list
-        4. Assemble sections
+        Assembles references, synthesis, and IOC from extracted artifacts.
         """
-        return f"""# {subject_title}
+        # Parse synthesis markdown content if available
+        synthesis_content = synthesis_metadata.get("markdown_content", "")
+        if not synthesis_content:
+            synthesis_content = (
+                f"(Synthèse technique — {synthesis_metadata.get('word_count', 0)} mots)"
+            )
 
-## Références
+        # Build references section
+        references_section = "## Références\n\n"
+        sources = references_metadata.get("sources", [])
+        if sources:
+            for i, source in enumerate(sources[:10], 1):
+                url = source.get("url", "")
+                title = source.get("title", "Source")
+                references_section += f"[{i}] {title}\n"
+                if url:
+                    references_section += f"    {url}\n"
+        else:
+            references_section += (
+                f"{references_metadata.get('source_count', 0)} publications identifiées\n"
+            )
 
-{references_metadata.get('event_count', 0)} événements · {references_metadata.get('source_count', 0)} publications
+        # Build IOC section
+        ioc_section = "## Indicateurs de Compromission (IOC)\n\n"
+        indicators = extraction_metadata.get("indicators", {})
+        if indicators:
+            # Network indicators
+            if indicators.get("network_artifacts"):
+                ioc_section += "### Artefacts Réseau\n\n"
+                for artifact in indicators["network_artifacts"][:20]:
+                    ioc_section += f"- {artifact}\n"
+            # Malware hashes
+            if indicators.get("malware_hashes"):
+                ioc_section += "\n### Hachés de Malware\n\n"
+                for hash_val in indicators["malware_hashes"][:10]:
+                    ioc_section += f"- {hash_val}\n"
+            # CVEs
+            if indicators.get("cves"):
+                ioc_section += "\n### Vulnérabilités (CVE)\n\n"
+                for cve in indicators["cves"][:10]:
+                    ioc_section += f"- {cve}\n"
+        else:
+            ioc_section += f"{extraction_metadata.get('element_counts', {}).get('network_artifacts', 0)} artefacts réseau identifiés\n"
+
+        # Build final brief
+        brief = f"""# {subject_title}
+
+## Contexte
+
+Analyse produite automatiquement basée sur les sources collectées et l'analyse technique.
+
+{references_section}
 
 ## Synthèse Technique
 
-({synthesis_metadata.get('word_count', 0)} mots)
+{synthesis_content}
 
-## IOC
+{ioc_section}
 
-{extraction_metadata.get('element_counts', {}).get('network_artifacts', 0)} artefacts réseau
+---
+
+*Brève générée automatiquement par le système de production CTI.*
 """
+
+        return brief
 
 
 class ProductionQAService:
@@ -436,9 +483,7 @@ class ProductionQAService:
                 synthesis_artifact.status != ProductionArtifactStatus.STALE.value
             )
         if brief_artifact:
-            checks["no_stale_brief"] = (
-                brief_artifact.status != ProductionArtifactStatus.STALE.value
-            )
+            checks["no_stale_brief"] = brief_artifact.status != ProductionArtifactStatus.STALE.value
 
         # Overall result
         passed = all(checks.values()) and not errors

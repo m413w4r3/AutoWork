@@ -12,9 +12,9 @@ from cti_app.application.persistence import (
     DerivedArtifactRepository,
     DiscoveryBatchRepository,
     EditionAuditRepository,
-    EditionRepository,
     EditionProductionBatchItemRepository,
     EditionProductionBatchRepository,
+    EditionRepository,
     EditorialGroupRepository,
     HumanDecisionRepository,
     IndicatorRepository,
@@ -30,8 +30,8 @@ from cti_app.application.persistence import (
     SampleRepository,
     SourceCollectionRepository,
     SourceDocumentRepository,
-    SubjectRepository,
     SubjectProductionRunRepository,
+    SubjectRepository,
 )
 from cti_app.infrastructure.database.repositories import (
     SqlAlchemyBlobRepository,
@@ -43,9 +43,9 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyDerivedArtifactRepository,
     SqlAlchemyDiscoveryBatchRepository,
     SqlAlchemyEditionAuditRepository,
-    SqlAlchemyEditionRepository,
     SqlAlchemyEditionProductionBatchItemRepository,
     SqlAlchemyEditionProductionBatchRepository,
+    SqlAlchemyEditionRepository,
     SqlAlchemyEditorialGroupRepository,
     SqlAlchemyHumanDecisionRepository,
     SqlAlchemyIndicatorRepository,
@@ -61,8 +61,8 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemySampleRepository,
     SqlAlchemySourceCollectionRepository,
     SqlAlchemySourceDocumentRepository,
-    SqlAlchemySubjectRepository,
     SqlAlchemySubjectProductionRunRepository,
+    SqlAlchemySubjectRepository,
 )
 
 
@@ -134,7 +134,9 @@ class SqlAlchemyUnitOfWork:
         self.subject_production_runs = SqlAlchemySubjectProductionRunRepository(self._session)
         self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)
         self.edition_production_batches = SqlAlchemyEditionProductionBatchRepository(self._session)
-        self.edition_production_batch_items = SqlAlchemyEditionProductionBatchItemRepository(self._session)
+        self.edition_production_batch_items = SqlAlchemyEditionProductionBatchItemRepository(
+            self._session
+        )
         self._committed = False
         return self
 

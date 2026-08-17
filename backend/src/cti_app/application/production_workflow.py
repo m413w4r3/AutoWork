@@ -1,4 +1,5 @@
 """Main production workflow orchestration service."""
+
 from __future__ import annotations
 
 import json
@@ -53,8 +54,7 @@ class ProductionWorkflowOrchestrator:
             # Verify we're on expected stage
             if run.current_stage != expected_stage:
                 raise ValueError(
-                    f"Run on stage {run.current_stage.value}, "
-                    f"expected {expected_stage.value}"
+                    f"Run on stage {run.current_stage.value}, expected {expected_stage.value}"
                 )
 
             # Check for cached result with same input_hash
@@ -82,17 +82,36 @@ class ProductionWorkflowOrchestrator:
         This stage doesn't require LLM - it retrieves existing sources
         from the subject and prepares them for archive.
         """
-        # Implementation would:
-        # 1. Get source collections for subject
-        # 2. Filter for archived sources
-        # 3. Count total sources
-        # 4. Store source metadata in artifact
+        from cti_app.application.evidence import SubjectEvidenceService
 
-        return {
-            "stage": "sources",
-            "status": "success",
-            "sources_count": 0,  # Would be actual count
-        }
+        evidence_service = SubjectEvidenceService(self._uow_factory)
+
+        try:
+            # Extract evidence from all archived sources
+            result = await evidence_service.extract_subject(
+                subject_id=run.subject_id,
+                only_pending=True,
+            )
+
+            if result.get("status") != "success":
+                return {
+                    "stage": "sources",
+                    "status": "error",
+                    "error": result.get("error", "Unknown error"),
+                }
+
+            return {
+                "stage": "sources",
+                "status": "success",
+                "sources_count": result.get("collections_processed", 0),
+                "extracted": result.get("extracted", 0),
+            }
+        except Exception as e:
+            return {
+                "stage": "sources",
+                "status": "error",
+                "error": str(e),
+            }
 
     async def _execute_references_stage(self, run) -> dict:
         """Execute references research stage.
@@ -377,9 +396,7 @@ class ProductionWorkflowOrchestrator:
         """
         async with self._uow_factory() as uow:
             # Get all artifacts
-            references = await uow.production_artifacts.get_current(
-                run.id, "references"
-            )
+            references = await uow.production_artifacts.get_current(run.id, "references")
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
             synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
 

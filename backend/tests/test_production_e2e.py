@@ -7,16 +7,15 @@ Tests cover:
 4. Error handling and state management
 5. Idempotence and caching
 """
+
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
 from cti_app.application.persistence import ProductionUnitOfWork
-from cti_app.application.production_jobs import ProductionJobDispatcher
 from cti_app.application.production_stages import compute_input_hash
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import (
@@ -24,8 +23,6 @@ from cti_app.application.subject_production import (
     SubjectProductionService,
 )
 from cti_app.domain.production import (
-    EditionProductionBatch,
-    EditionProductionBatchItem,
     ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
@@ -116,9 +113,7 @@ async def test_batch_production_multiple_subjects(
     assert batch.id is not None
     assert batch.edition_id == edition_id
     assert len(batch.items) == 3
-    assert all(
-        item.subject_id in subject_ids for item in batch.items
-    )
+    assert all(item.subject_id in subject_ids for item in batch.items)
 
     # Start batch
     started_batch = await batch_service.get_batch(batch.id)
@@ -305,12 +300,8 @@ async def test_downstream_invalidation(
 
     # Verify downstream artifacts marked stale
     async with uow_factory() as uow:
-        extraction = await uow.production_artifacts.get_current(
-            run.id, "extraction"
-        )
-        synthesis = await uow.production_artifacts.get_current(
-            run.id, "synthesis"
-        )
+        extraction = await uow.production_artifacts.get_current(run.id, "extraction")
+        synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
         brief = await uow.production_artifacts.get_current(run.id, "brief")
 
         assert extraction.status == "stale"

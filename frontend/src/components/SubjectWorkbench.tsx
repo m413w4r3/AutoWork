@@ -53,9 +53,24 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
       <div className="detail-heading">
         <div>
           <p className="eyebrow">Production éditoriale</p>
-          <h1>Sources du sujet</h1>
+          <h1>Briefing automatique</h1>
         </div>
-        {!jobId ? (
+      </div>
+
+      {/* Main workflow: SubjectProduction */}
+      {tab === "production" || (tab !== "sources" && tab !== "evidence" && tab !== "ioc" && tab !== "extraction" && tab !== "brief" && tab !== "conversations") ? (
+        <SubjectProduction subjectId={subjectId} />
+      ) : null}
+
+      {/* Advanced features */}
+      <details className="advanced-workbench">
+        <summary>Sources brutes & Outils avancés</summary>
+        <p className="verification-warning" role="note">
+          La collecte des sources est une action explicite. Le contenu distant
+          est traité comme une donnée non fiable et aucun JavaScript n’est
+          exécuté.
+        </p>
+        {!jobId && tab === "sources" ? (
           <button
             className="button"
             disabled={launch.isPending}
@@ -64,38 +79,25 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
             {launch.isPending ? "Démarrage…" : "Collecter les sources"}
           </button>
         ) : null}
-      </div>
-      <p className="verification-warning" role="note">
-        La collecte est une action explicite. Le contenu distant est traité
-        comme une donnée non fiable et aucun JavaScript n’est exécuté.
-      </p>
-      {launch.error ? (
-        <p role="alert" className="error-message">
-          {launch.error.message}
-        </p>
-      ) : null}
-      {jobId ? <JobStatusCard jobId={jobId} /> : null}
-      <ol className="workflow-steps" aria-label="Progression éditoriale">
-        <li aria-current="step">1. Sources</li>
-        <li>2. Analyse</li>
-        <li>3. Rédaction</li>
-        <li>4. Validation</li>
-      </ol>
-      <details className="advanced-workbench">
-        <summary>Avancé</summary>
+        {launch.error ? (
+          <p role="alert" className="error-message">
+            {launch.error.message}
+          </p>
+        ) : null}
+        {jobId ? <JobStatusCard jobId={jobId} /> : null}
+
         <nav
           className="workbench-tabs"
-          aria-label="Fonctions avancées du sujet"
+          aria-label="Outils avancés du sujet"
         >
           {(
             [
-              ["sources", "Sources"],
-              ["evidence", "Preuves"],
-              ["ioc", "IOC"],
-              ["extraction", "Extraction"],
-              ["brief", "Rédaction"],
+              ["sources", "Sources brutes"],
+              ["evidence", "Preuves extraites"],
+              ["ioc", "Indicateurs"],
+              ["extraction", "Extraction technique"],
+              ["brief", "Brouillon manuel"],
               ["conversations", "Conversations"],
-              ["production", "Briefing auto"],
             ] as const
           ).map(([value, label]) => (
             <button
@@ -134,9 +136,6 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
       ) : null}
       {workbench.data && tab === "conversations" ? (
         <AnalysisConversations subjectId={subjectId} />
-      ) : null}
-      {tab === "production" ? (
-        <SubjectProduction subjectId={subjectId} />
       ) : null}
     </section>
   );

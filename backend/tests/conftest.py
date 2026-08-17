@@ -1,5 +1,4 @@
 from collections.abc import AsyncIterator
-from typing import Callable
 
 import pytest
 from fastapi import FastAPI

@@ -1,15 +1,17 @@
 """API endpoints for subject production workflow."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
 from cti_app.api.auth import get_current_user
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.production_jobs import ProductionStageParameters
 from cti_app.application.subject_production import (
     EditionProductionService,
     SubjectProductionService,
@@ -19,11 +21,13 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
+from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api", tags=["production"])
 
 
 # Response Models
+
 
 class StageStatus(BaseModel):
     """Status of a production stage."""
@@ -76,6 +80,7 @@ class BatchStatus(BaseModel):
 async def start_subject_production(
     subject_id: UUID,
     body: dict[str, str],
+    request: Request,
     user: str = Depends(get_current_user),
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> dict[str, Any]:
@@ -111,6 +116,8 @@ async def start_subject_production(
         )
 
     service = SubjectProductionService(uow_factory)
+    jobs = request.app.state.job_service
+    dispatcher = request.app.state.job_dispatcher
 
     try:
         run = await service.create_run(
@@ -122,12 +129,31 @@ async def start_subject_production(
         # Start the run
         await service.start_run(run.id)
 
+        # Dispatch the first job (SOURCES stage)
+        parameters = ProductionStageParameters(
+            run_id=run.id,
+            expected_stage=SubjectProductionStage.SOURCES.value,
+        )
+
+        job = await jobs.submit(
+            kind="production.subject.sources",
+            aggregate_type="subject",
+            aggregate_id=run.subject_id,
+            idempotency_key=f"production-sources-{run.id}",
+            correlation_id=get_correlation_id(),
+            input_parameters=parameters.model_dump(mode="json"),
+            max_attempts=1,
+            actor_id=user,
+        )
+        await dispatcher.dispatch(job.id)
+
         return {
             "run_id": str(run.id),
             "subject_id": str(run.subject_id),
             "profile": run.profile.value,
             "status": run.status.value,
             "stage": run.current_stage.value,
+            "job_id": str(job.id),
             "created_at": run.created_at.isoformat(),
         }
     except ValueError as e:
@@ -138,7 +164,7 @@ async def start_subject_production(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Production start failed: {str(e)}",
+            detail=f"Production start failed: {e!s}",
         )
 
 
@@ -317,9 +343,7 @@ async def get_references_artifact(
         if not run:
             raise HTTPException(status_code=404, detail="No production run found")
 
-        artifact = await uow.production_artifacts.get_current(
-            run.id, "references"
-        )
+        artifact = await uow.production_artifacts.get_current(run.id, "references")
         if not artifact:
             raise HTTPException(status_code=404, detail="References artifact not found")
 
@@ -344,9 +368,7 @@ async def get_extraction_artifact(
         if not run:
             raise HTTPException(status_code=404, detail="No production run found")
 
-        artifact = await uow.production_artifacts.get_current(
-            run.id, "extraction"
-        )
+        artifact = await uow.production_artifacts.get_current(run.id, "extraction")
         if not artifact:
             raise HTTPException(status_code=404, detail="Extraction artifact not found")
 
@@ -371,9 +393,7 @@ async def get_synthesis_artifact(
         if not run:
             raise HTTPException(status_code=404, detail="No production run found")
 
-        artifact = await uow.production_artifacts.get_current(
-            run.id, "synthesis"
-        )
+        artifact = await uow.production_artifacts.get_current(run.id, "synthesis")
         if not artifact:
             raise HTTPException(status_code=404, detail="Synthesis artifact not found")
 
@@ -398,9 +418,7 @@ async def get_brief_artifact(
         if not run:
             raise HTTPException(status_code=404, detail="No production run found")
 
-        artifact = await uow.production_artifacts.get_current(
-            run.id, "brief"
-        )
+        artifact = await uow.production_artifacts.get_current(run.id, "brief")
         if not artifact:
             raise HTTPException(status_code=404, detail="Brief artifact not found")
 
@@ -419,6 +437,7 @@ async def get_brief_artifact(
 @router.post("/editions/{edition_id}/production/briefs")
 async def start_edition_brief_production(
     edition_id: UUID,
+    request: Request,
     user: str = Depends(get_current_user),
     uow_factory: ProductionUnitOfWorkFactory = Depends(),
 ) -> BatchStatus:
@@ -427,18 +446,82 @@ async def start_edition_brief_production(
     Idempotent: returns existing active batch if one exists.
     """
     service = EditionProductionService(uow_factory)
+    jobs = request.app.state.job_service
+    dispatcher = request.app.state.job_dispatcher
 
     try:
         async with uow_factory() as uow:
-            # Get all selected briefs for this edition
-            # (would query editorial_groups where status=selected, editorial_type=brief)
-            subject_ids = []  # Would be populated from query
+            # Check if active batch exists
+            active_batch = await uow.edition_production_batches.get_active_for_edition(edition_id)
+            if active_batch:
+                # Return existing batch
+                return BatchStatus(
+                    batch_id=str(active_batch.id),
+                    edition_id=str(active_batch.edition_id),
+                    profile=active_batch.profile.value,
+                    status=active_batch.status,
+                    items=0,  # TODO: Count from batch items
+                    completed=0,
+                    needs_review=0,
+                    failed=0,
+                    current_subject_index=None,
+                    created_at=active_batch.created_at.isoformat(),
+                    started_at=active_batch.started_at.isoformat()
+                    if active_batch.started_at
+                    else None,
+                    finished_at=active_batch.finished_at.isoformat()
+                    if active_batch.finished_at
+                    else None,
+                )
+
+        # Get all selected briefs for this edition
+        async with uow_factory() as uow:
+            groups = await uow.editorial_groups.list_for_edition(edition_id)
+            subject_ids = [
+                g.subject_id
+                for g in groups
+                if g.status == "selected" and g.editorial_type == "brief"
+            ]
+
+            if not subject_ids:
+                raise ValueError("No selected briefs found for edition")
 
             batch = await service.create_batch(
                 edition_id=edition_id,
                 profile=ProductionProfile.BRIEF_AUTO,
                 subject_ids=subject_ids,
             )
+
+            # Start the batch
+            batch.start()
+            await uow.edition_production_batches.save(batch)
+            await uow.commit()
+
+            # Dispatch the first job for the first subject
+            if subject_ids:
+                first_subject_id = subject_ids[0]
+                subject_run = await service.create_batch_item_run(
+                    batch_id=batch.id,
+                    subject_id=first_subject_id,
+                    position=0,
+                )
+
+                if subject_run:
+                    parameters = ProductionStageParameters(
+                        run_id=subject_run.id,
+                        expected_stage=SubjectProductionStage.SOURCES.value,
+                    )
+                    job = await jobs.submit(
+                        kind="production.subject.sources",
+                        aggregate_type="subject",
+                        aggregate_id=first_subject_id,
+                        idempotency_key=f"production-batch-{batch.id}-{first_subject_id}",
+                        correlation_id=get_correlation_id(),
+                        input_parameters=parameters.model_dump(mode="json"),
+                        max_attempts=1,
+                        actor_id=user,
+                    )
+                    await dispatcher.dispatch(job.id)
 
             return BatchStatus(
                 batch_id=str(batch.id),
@@ -449,15 +532,20 @@ async def start_edition_brief_production(
                 completed=0,
                 needs_review=0,
                 failed=0,
-                current_subject_index=None,
+                current_subject_index=0 if subject_ids else None,
                 created_at=batch.created_at.isoformat(),
-                started_at=None,
+                started_at=batch.started_at.isoformat() if batch.started_at else None,
                 finished_at=None,
             )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Batch creation failed: {str(e)}",
+            detail=f"Batch creation failed: {e!s}",
         )
 
 

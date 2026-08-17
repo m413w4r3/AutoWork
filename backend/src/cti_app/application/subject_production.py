@@ -1,4 +1,5 @@
 """Service orchestrating subject production workflow."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -8,10 +9,8 @@ from cti_app.application.persistence import ProductionUnitOfWork
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
-    ProductionArtifact,
     ProductionProfile,
     SubjectProductionRun,
-    SubjectProductionStage,
     SubjectProductionStatus,
 )
 
@@ -28,10 +27,19 @@ class SubjectProductionService:
         edition_id: UUID,
         profile: ProductionProfile,
     ) -> SubjectProductionRun:
-        """Create a new production run for a subject."""
+        """Create a new production run for a subject.
+
+        Idempotent: returns existing active run if one exists.
+        """
         async with self._uow_factory() as uow:
-            # Check if active run exists
+            # Check if active run already exists for this subject
             existing = await uow.subject_production_runs.get_current_for_subject(subject_id)
+            if existing and existing.status in (
+                SubjectProductionStatus.QUEUED,
+                SubjectProductionStatus.RUNNING,
+            ):
+                # Return existing active run instead of creating new one
+                return existing
 
             # Get next run number
             all_runs = await uow.subject_production_runs.list_for_edition(edition_id)
@@ -182,10 +190,43 @@ class EditionProductionService:
             await uow.commit()
             return batch
 
-    async def get_batch(self, batch_id: UUID) -> EditionProductionBatch | None:
-        """Get a production batch by ID."""
+    async def get_batch(self, batch_id_or_edition_id: UUID) -> EditionProductionBatch | None:
+        """Get a production batch by ID or get active batch for edition."""
         async with self._uow_factory() as uow:
-            return await uow.edition_production_batches.get(batch_id)
+            # Try to get by ID first
+            batch = await uow.edition_production_batches.get(batch_id_or_edition_id)
+            if batch:
+                return batch
+
+            # If not found, try to get active batch for edition
+            batch = await uow.edition_production_batches.get_active_for_edition(
+                batch_id_or_edition_id
+            )
+            return batch
+
+    async def create_batch_item_run(
+        self,
+        batch_id: UUID,
+        subject_id: UUID,
+        position: int,
+    ) -> SubjectProductionRun | None:
+        """Create a production run for a subject in a batch.
+
+        Used to create runs for batch items that don't have runs yet.
+        """
+        async with self._uow_factory() as uow:
+            batch = await uow.edition_production_batches.get(batch_id)
+            if not batch:
+                return None
+
+            run = SubjectProductionRun(
+                subject_id=subject_id,
+                edition_id=batch.edition_id,
+                profile=batch.profile,
+            )
+            await uow.subject_production_runs.add(run)
+            await uow.commit()
+            return run
 
     async def start_next(self, batch_id: UUID) -> SubjectProductionRun | None:
         """Start the next subject in a batch (dispatch first item not yet running)."""
@@ -240,13 +281,14 @@ class EditionProductionService:
                 # No more subjects to start - check if batch is done
                 items = await uow.edition_production_batch_items.list_for_batch(batch_id)
                 all_runs = [
-                    await uow.subject_production_runs.get(item.production_run_id)
-                    for item in items
+                    await uow.subject_production_runs.get(item.production_run_id) for item in items
                 ]
 
                 # Check if all are in terminal states
                 all_terminal = all(
-                    r and r.status in {
+                    r
+                    and r.status
+                    in {
                         SubjectProductionStatus.READY,
                         SubjectProductionStatus.NEEDS_REVIEW,
                         SubjectProductionStatus.FAILED,

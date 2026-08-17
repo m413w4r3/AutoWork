@@ -1,4 +1,5 @@
 """Domain models for subject production workflow (brief_auto)."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -169,9 +170,7 @@ class ProductionArtifact:
     def __post_init__(self) -> None:
         if self.version < 1:
             raise ValueError("version must be >= 1")
-        if len(self.input_hash) != 64 or any(
-            c not in "0123456789abcdef" for c in self.input_hash
-        ):
+        if len(self.input_hash) != 64 or any(c not in "0123456789abcdef" for c in self.input_hash):
             raise ValueError("input_hash must be lowercase SHA-256")
 
 
@@ -207,15 +206,11 @@ class EditionProductionBatch:
         self.started_at = now or datetime.now(UTC)
         self.version += 1
 
-    def finish(
-        self, *, completed_with_issues: bool = False, now: datetime | None = None
-    ) -> None:
+    def finish(self, *, completed_with_issues: bool = False, now: datetime | None = None) -> None:
         """Mark batch as completed."""
         if self.status != "running":
             raise ValueError("Can only finish from running status")
-        self.status = (
-            "completed_with_issues" if completed_with_issues else "completed"
-        )
+        self.status = "completed_with_issues" if completed_with_issues else "completed"
         self.finished_at = now or datetime.now(UTC)
         self.version += 1
 

@@ -112,9 +112,7 @@ def consolidate_discovery_batches(
     for occurrences in clusters.values():
         cluster_candidates: list[CandidateTopic] = []
         for occurrence in occurrences:
-            member_candidate = candidates_by_batch[occurrence.batch_id].get(
-                occurrence.candidate_id
-            )
+            member_candidate = candidates_by_batch[occurrence.batch_id].get(occurrence.candidate_id)
             if member_candidate is not None:
                 cluster_candidates.append(member_candidate)
         if not cluster_candidates:

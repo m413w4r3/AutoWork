@@ -96,6 +96,8 @@ from cti_app.infrastructure.database.models import (
     DerivedArtifactRow,
     DiscoveryBatchRow,
     EditionAuditEventRow,
+    EditionProductionBatchItemRow,
+    EditionProductionBatchRow,
     EditionRow,
     EditorialGroupRow,
     HumanDecisionRow,
@@ -106,16 +108,14 @@ from cti_app.infrastructure.database.models import (
     ModelConversationTurnRow,
     ModelOutputRejectionRow,
     ModelRunRow,
+    ProductionArtifactRow,
     ProvenanceEventRow,
     RejectedModelProposalRow,
     SampleRow,
     SourceCollectionRow,
     SourceDocumentRow,
-    SubjectRow,
-    EditionProductionBatchItemRow,
-    EditionProductionBatchRow,
-    ProductionArtifactRow,
     SubjectProductionRunRow,
+    SubjectRow,
 )
 
 
@@ -2558,27 +2558,31 @@ class SqlAlchemySubjectProductionRunRepository:
         return _subject_production_run_from_row(row) if row else None
 
     async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
-        query = select(SubjectProductionRunRow).where(
-            SubjectProductionRunRow.id == run_id
-        ).with_for_update()
+        query = (
+            select(SubjectProductionRunRow)
+            .where(SubjectProductionRunRow.id == run_id)
+            .with_for_update()
+        )
         result = await self._session.execute(query)
         row = result.scalar_one_or_none()
         return _subject_production_run_from_row(row) if row else None
 
     async def save(self, run: SubjectProductionRun) -> None:
-        stmt = update(SubjectProductionRunRow).where(
-            SubjectProductionRunRow.id == run.id
-        ).values(
-            status=run.status.value,
-            current_stage=run.current_stage.value,
-            conversation_id=run.conversation_id,
-            error_code=run.error_code,
-            error_message=run.error_message,
-            error_details=run.error_details,
-            started_at=run.started_at,
-            finished_at=run.finished_at,
-            updated_at=run.updated_at,
-            version=run.version,
+        stmt = (
+            update(SubjectProductionRunRow)
+            .where(SubjectProductionRunRow.id == run.id)
+            .values(
+                status=run.status.value,
+                current_stage=run.current_stage.value,
+                conversation_id=run.conversation_id,
+                error_code=run.error_code,
+                error_message=run.error_message,
+                error_details=run.error_details,
+                started_at=run.started_at,
+                finished_at=run.finished_at,
+                updated_at=run.updated_at,
+                version=run.version,
+            )
         )
         await self._session.execute(stmt)
 
@@ -2594,9 +2598,11 @@ class SqlAlchemySubjectProductionRunRepository:
         return _subject_production_run_from_row(row) if row else None
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectProductionRun]:
-        query = select(SubjectProductionRunRow).where(
-            SubjectProductionRunRow.edition_id == edition_id
-        ).order_by(SubjectProductionRunRow.created_at)
+        query = (
+            select(SubjectProductionRunRow)
+            .where(SubjectProductionRunRow.edition_id == edition_id)
+            .order_by(SubjectProductionRunRow.created_at)
+        )
         result = await self._session.execute(query)
         return [_subject_production_run_from_row(row) for row in result.scalars()]
 
@@ -2632,9 +2638,9 @@ class SqlAlchemyProductionArtifactRepository:
         query = (
             select(ProductionArtifactRow)
             .where(
-                (ProductionArtifactRow.production_run_id == run_id) &
-                (ProductionArtifactRow.stage == stage) &
-                (ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value)
+                (ProductionArtifactRow.production_run_id == run_id)
+                & (ProductionArtifactRow.stage == stage)
+                & (ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value)
             )
             .order_by(ProductionArtifactRow.version.desc())
             .limit(1)
@@ -2644,9 +2650,11 @@ class SqlAlchemyProductionArtifactRepository:
         return _production_artifact_from_row(row) if row else None
 
     async def list_for_run(self, run_id: UUID) -> Sequence[ProductionArtifact]:
-        query = select(ProductionArtifactRow).where(
-            ProductionArtifactRow.production_run_id == run_id
-        ).order_by(ProductionArtifactRow.stage, ProductionArtifactRow.version)
+        query = (
+            select(ProductionArtifactRow)
+            .where(ProductionArtifactRow.production_run_id == run_id)
+            .order_by(ProductionArtifactRow.stage, ProductionArtifactRow.version)
+        )
         result = await self._session.execute(query)
         return [_production_artifact_from_row(row) for row in result.scalars()]
 
@@ -2660,15 +2668,19 @@ class SqlAlchemyProductionArtifactRepository:
         ]
         if stage not in stages:
             return
-        
+
         stage_idx = stages.index(stage)
-        downstream_stages = stages[stage_idx + 1:]
-        
+        downstream_stages = stages[stage_idx + 1 :]
+
         if downstream_stages:
-            stmt = update(ProductionArtifactRow).where(
-                (ProductionArtifactRow.production_run_id == run_id) &
-                (ProductionArtifactRow.stage.in_(downstream_stages))
-            ).values(status=ProductionArtifactStatus.STALE.value)
+            stmt = (
+                update(ProductionArtifactRow)
+                .where(
+                    (ProductionArtifactRow.production_run_id == run_id)
+                    & (ProductionArtifactRow.stage.in_(downstream_stages))
+                )
+                .values(status=ProductionArtifactStatus.STALE.value)
+            )
             await self._session.execute(stmt)
 
 
@@ -2694,21 +2706,25 @@ class SqlAlchemyEditionProductionBatchRepository:
         return _edition_production_batch_from_row(row) if row else None
 
     async def get_for_update(self, batch_id: UUID) -> EditionProductionBatch | None:
-        query = select(EditionProductionBatchRow).where(
-            EditionProductionBatchRow.id == batch_id
-        ).with_for_update()
+        query = (
+            select(EditionProductionBatchRow)
+            .where(EditionProductionBatchRow.id == batch_id)
+            .with_for_update()
+        )
         result = await self._session.execute(query)
         row = result.scalar_one_or_none()
         return _edition_production_batch_from_row(row) if row else None
 
     async def save(self, batch: EditionProductionBatch) -> None:
-        stmt = update(EditionProductionBatchRow).where(
-            EditionProductionBatchRow.id == batch.id
-        ).values(
-            status=batch.status,
-            started_at=batch.started_at,
-            finished_at=batch.finished_at,
-            version=batch.version,
+        stmt = (
+            update(EditionProductionBatchRow)
+            .where(EditionProductionBatchRow.id == batch.id)
+            .values(
+                status=batch.status,
+                started_at=batch.started_at,
+                finished_at=batch.finished_at,
+                version=batch.version,
+            )
         )
         await self._session.execute(stmt)
 
@@ -2716,8 +2732,8 @@ class SqlAlchemyEditionProductionBatchRepository:
         query = (
             select(EditionProductionBatchRow)
             .where(
-                (EditionProductionBatchRow.edition_id == edition_id) &
-                (EditionProductionBatchRow.status.in_(["queued", "running"]))
+                (EditionProductionBatchRow.edition_id == edition_id)
+                & (EditionProductionBatchRow.status.in_(["queued", "running"]))
             )
             .order_by(EditionProductionBatchRow.created_at.desc())
             .limit(1)
@@ -2744,9 +2760,11 @@ class SqlAlchemyEditionProductionBatchItemRepository:
             self._session.add(row)
 
     async def list_for_batch(self, batch_id: UUID) -> Sequence[EditionProductionBatchItem]:
-        query = select(EditionProductionBatchItemRow).where(
-            EditionProductionBatchItemRow.batch_id == batch_id
-        ).order_by(EditionProductionBatchItemRow.position)
+        query = (
+            select(EditionProductionBatchItemRow)
+            .where(EditionProductionBatchItemRow.batch_id == batch_id)
+            .order_by(EditionProductionBatchItemRow.position)
+        )
         result = await self._session.execute(query)
         return [_edition_production_batch_item_from_row(row) for row in result.scalars()]
 
@@ -2758,7 +2776,7 @@ def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectPro
         SubjectProductionStage,
         SubjectProductionStatus,
     )
-    
+
     return SubjectProductionRun(
         id=row.id,
         subject_id=row.subject_id,
@@ -2785,7 +2803,7 @@ def _production_artifact_from_row(row: ProductionArtifactRow) -> ProductionArtif
         ProductionArtifactStage,
         ProductionArtifactStatus,
     )
-    
+
     return ProductionArtifact(
         id=row.id,
         production_run_id=row.production_run_id,
@@ -2809,7 +2827,7 @@ def _edition_production_batch_from_row(row: EditionProductionBatchRow) -> Editio
         EditionProductionBatch,
         ProductionProfile,
     )
-    
+
     return EditionProductionBatch(
         id=row.id,
         edition_id=row.edition_id,
@@ -2822,9 +2840,11 @@ def _edition_production_batch_from_row(row: EditionProductionBatchRow) -> Editio
     )
 
 
-def _edition_production_batch_item_from_row(row: EditionProductionBatchItemRow) -> EditionProductionBatchItem:
+def _edition_production_batch_item_from_row(
+    row: EditionProductionBatchItemRow,
+) -> EditionProductionBatchItem:
     from cti_app.domain.production import EditionProductionBatchItem
-    
+
     return EditionProductionBatchItem(
         id=row.id,
         batch_id=row.batch_id,

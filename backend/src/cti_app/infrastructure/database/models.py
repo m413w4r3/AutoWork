@@ -59,9 +59,7 @@ HUMAN_DECISION_VALUES_SQL = (
 )
 BRIEF_DRAFT_STATUS_VALUES_SQL = "'draft', 'changes_requested', 'approved', 'promoted'"
 CONVERSATION_TRANSPORT_VALUES_SQL = "'chatgpt_bridge', 'openai_responses', 'application_managed'"
-CONVERSATION_PURPOSE_VALUES_SQL = (
-    "'discovery', 'analyst_assistance', 'pivot_research', 'drafting', 'critic', 'subject_production'"
-)
+CONVERSATION_PURPOSE_VALUES_SQL = "'discovery', 'analyst_assistance', 'pivot_research', 'drafting', 'critic', 'subject_production'"
 CONVERSATION_STATUS_VALUES_SQL = (
     "'pending', 'ready', 'busy', 'needs_review', 'unavailable', 'archived'"
 )
@@ -71,7 +69,9 @@ PRODUCTION_STATUS_VALUES_SQL = "'queued', 'running', 'ready', 'needs_review', 'f
 PRODUCTION_STAGE_VALUES_SQL = "'sources', 'references', 'extraction', 'synthesis', 'assembly'"
 PRODUCTION_ARTIFACT_STAGE_VALUES_SQL = "'references', 'extraction', 'synthesis', 'brief'"
 PRODUCTION_ARTIFACT_STATUS_VALUES_SQL = "'verified', 'stale', 'needs_review'"
-PRODUCTION_BATCH_STATUS_VALUES_SQL = "'queued', 'running', 'completed', 'completed_with_issues', 'cancelled'"
+PRODUCTION_BATCH_STATUS_VALUES_SQL = (
+    "'queued', 'running', 'completed', 'completed_with_issues', 'cancelled'"
+)
 
 
 class Base(DeclarativeBase):
@@ -972,15 +972,9 @@ class SubjectProductionRunRow(Base):
         UniqueConstraint("subject_id", "run_number", name="uq_subject_run_number"),
         CheckConstraint("version >= 1", name="ck_run_version"),
         CheckConstraint("run_number >= 1", name="ck_run_number"),
-        CheckConstraint(
-            f"status IN ({PRODUCTION_STATUS_VALUES_SQL})", name="ck_run_status"
-        ),
-        CheckConstraint(
-            f"current_stage IN ({PRODUCTION_STAGE_VALUES_SQL})", name="ck_run_stage"
-        ),
-        CheckConstraint(
-            f"profile IN ({PRODUCTION_PROFILE_VALUES_SQL})", name="ck_run_profile"
-        ),
+        CheckConstraint(f"status IN ({PRODUCTION_STATUS_VALUES_SQL})", name="ck_run_status"),
+        CheckConstraint(f"current_stage IN ({PRODUCTION_STAGE_VALUES_SQL})", name="ck_run_stage"),
+        CheckConstraint(f"profile IN ({PRODUCTION_PROFILE_VALUES_SQL})", name="ck_run_profile"),
         Index("ix_subject_production_runs_subject_id_created_at", "subject_id", "created_at"),
         Index("ix_subject_production_runs_edition_id_status", "edition_id", "status"),
     )
@@ -1029,7 +1023,9 @@ class ProductionArtifactRow(Base):
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     production_run_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("subject_production_runs.id", ondelete="CASCADE"), nullable=False
+        Uuid(as_uuid=True),
+        ForeignKey("subject_production_runs.id", ondelete="CASCADE"),
+        nullable=False,
     )
     subject_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
@@ -1065,9 +1061,7 @@ class EditionProductionBatchRow(Base):
         CheckConstraint(
             f"status IN ({PRODUCTION_BATCH_STATUS_VALUES_SQL})", name="ck_batch_status"
         ),
-        CheckConstraint(
-            f"profile IN ({PRODUCTION_PROFILE_VALUES_SQL})", name="ck_batch_profile"
-        ),
+        CheckConstraint(f"profile IN ({PRODUCTION_PROFILE_VALUES_SQL})", name="ck_batch_profile"),
         Index("ix_edition_production_batches_edition_id_status", "edition_id", "status"),
     )
 
@@ -1093,13 +1087,17 @@ class EditionProductionBatchItemRow(Base):
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     batch_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("edition_production_batches.id", ondelete="CASCADE"), nullable=False
+        Uuid(as_uuid=True),
+        ForeignKey("edition_production_batches.id", ondelete="CASCADE"),
+        nullable=False,
     )
     subject_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
     )
     production_run_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("subject_production_runs.id", ondelete="RESTRICT"), nullable=False
+        Uuid(as_uuid=True),
+        ForeignKey("subject_production_runs.id", ondelete="RESTRICT"),
+        nullable=False,
     )
     position: Mapped[int] = mapped_column(nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

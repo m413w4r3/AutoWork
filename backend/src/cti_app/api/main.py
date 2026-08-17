@@ -13,11 +13,13 @@ from cti_app.api.editorial import router as editorial_router
 from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
+from cti_app.api.production import router as production_router
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.discovery import DiscoveryService
 from cti_app.application.editions import EditionService
 from cti_app.application.editorial import EditorialGroupingService
+from cti_app.application.evidence import SubjectEvidenceService
 from cti_app.application.http_collection import (
     CollectionPolicy,
     SafeHttpCollector,
@@ -28,6 +30,11 @@ from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import JobService, create_job_registry
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork
+from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
+from cti_app.application.subject_production import (
+    EditionProductionService,
+    SubjectProductionService,
+)
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
@@ -101,8 +108,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         workspace_root=settings.subject_workspace_root,
     )
     brief_service = BriefService(uow_factory, blob_store, model_gateway)
+    model_conversation_service = ModelConversationService(
+        uow_factory,
+        model_gateway,
+        blob_store,
+        retention_days=settings.model_conversation_retention_days,
+    )
+
+    # Production services
+    subject_production_service = SubjectProductionService(uow_factory)
+    edition_production_service = EditionProductionService(uow_factory)
+    evidence_service = SubjectEvidenceService(uow_factory)
+    workflow_orchestrator = ProductionWorkflowOrchestrator(
+        uow_factory,
+        model_service=model_conversation_service,
+    )
+
     registry = create_job_registry(
-        model_gateway, discovery_service, collection_service, brief_service
+        model_gateway,
+        discovery_service,
+        collection_service,
+        brief_service,
+        uow_factory,
     )
     app.state.readiness = readiness
     app.state.job_service = JobService(uow_factory, registry)
@@ -110,16 +137,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.edition_service = EditionService(uow_factory)
     app.state.identity_provider = LocalIdentityProvider()
     app.state.model_gateway = model_gateway
-    app.state.model_conversation_service = ModelConversationService(
-        uow_factory,
-        model_gateway,
-        blob_store,
-        retention_days=settings.model_conversation_retention_days,
-    )
+    app.state.model_conversation_service = model_conversation_service
     app.state.discovery_service = discovery_service
     app.state.editorial_service = editorial_service
     app.state.collection_service = collection_service
     app.state.brief_service = brief_service
+    app.state.subject_production_service = subject_production_service
+    app.state.edition_production_service = edition_production_service
+    app.state.evidence_service = evidence_service
+    app.state.workflow_orchestrator = workflow_orchestrator
     yield
     await readiness.close()
     await job_engine.dispose()
@@ -136,6 +162,7 @@ def create_app() -> FastAPI:
     application.include_router(collection_router)
     application.include_router(briefs_router)
     application.include_router(model_conversations_router)
+    application.include_router(production_router)
     return application
 
 

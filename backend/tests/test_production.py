@@ -1,20 +1,21 @@
 """Tests for production workflow domain and services."""
-import pytest
-from datetime import datetime, UTC
+
 from uuid import uuid4
 
+import pytest
+
+from cti_app.application.production_stages import compute_input_hash
 from cti_app.domain.production import (
-    ProductionProfile,
-    SubjectProductionRun,
-    SubjectProductionStatus,
-    SubjectProductionStage,
+    EditionProductionBatch,
+    EditionProductionBatchItem,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    EditionProductionBatch,
-    EditionProductionBatchItem,
+    ProductionProfile,
+    SubjectProductionRun,
+    SubjectProductionStage,
+    SubjectProductionStatus,
 )
-from cti_app.application.production_stages import compute_input_hash
 
 
 class TestSubjectProductionRun:
@@ -161,7 +162,7 @@ class TestProductionArtifact:
                 input_hash="a" * 32,
             )
 
-        # Invalid hash (non-hex)
+            # Invalid hash (non-hex)
             ProductionArtifact(
                 production_run_id=run_id,
                 subject_id=subject_id,

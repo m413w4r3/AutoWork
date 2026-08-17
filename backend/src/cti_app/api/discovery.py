@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import date, datetime
 from collections.abc import Sequence
+from datetime import date, datetime
 from typing import Annotated, Literal, NoReturn
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
