@@ -36,8 +36,10 @@ PORT = int(os.getenv("BRIDGE_PORT", "8001"))
 API_KEY = os.getenv("BRIDGE_API_KEY")
 # Délai max sans le moindre paquet depuis l'extension avant d'abandonner.
 IDLE_TIMEOUT = float(os.getenv("BRIDGE_IDLE_TIMEOUT", "120"))
-# Délai max pour une génération complète.
-TOTAL_TIMEOUT = float(os.getenv("BRIDGE_TOTAL_TIMEOUT", "900"))
+# Délai max pour une génération complète. Une recherche approfondie ChatGPT
+# dépasse couramment le quart d'heure : cette borne protège d'une génération
+# réellement bloquée, elle ne doit pas arbitrer la durée normale d'une recherche.
+TOTAL_TIMEOUT = float(os.getenv("BRIDGE_TOTAL_TIMEOUT", "3600"))
 KEEPALIVE_INTERVAL = 20.0  # garde le service worker MV3 en vie
 # Délai laissé à l'extension pour se reconnecter sans perdre la requête en cours.
 RECONNECT_GRACE = float(os.getenv("BRIDGE_RECONNECT_GRACE", "20"))
@@ -971,7 +973,9 @@ async def run_generation(
         raise UpstreamError("aucun contenu exploitable dans `messages`")
 
     queue = bridge.open_channel(request_id)
-    deadline = time.monotonic() + TOTAL_TIMEOUT
+    started_at = time.monotonic()
+    total_deadline = started_at + TOTAL_TIMEOUT
+    last_packet_at = started_at
     try:
         logger.info("bridge_run_phase bridge_run_id=%s phase=submission", request_id)
         await bridge.send(
@@ -986,28 +990,72 @@ async def run_generation(
         )
         generation_announced = False
         legacy_chunks: List[str] = []
+
+        def expired(code: str, now: float) -> UpstreamError:
+            """Journalise le dernier état connu, puis nomme l'échéance atteinte.
+
+            Les deux échéances ne disent pas la même chose : `bridge_idle_timeout`
+            accuse l'extension d'être muette, `bridge_total_timeout` constate une
+            génération anormalement longue mais bien vivante. Les confondre a déjà
+            fait diagnostiquer une extension déconnectée qui envoyait pourtant un
+            heartbeat toutes les cinq secondes.
+            """
+            progress = bridge_live_progress.get(request_id, {})
+            logger.warning(
+                "%s bridge_run_id=%s phase=%s output_chars=%s stable_for_ms=%s "
+                "completion_signal=%s elapsed_seconds=%.3f idle_seconds=%.3f "
+                "total_timeout=%s idle_timeout=%s",
+                code,
+                request_id,
+                progress.get("phase"),
+                progress.get("output_chars"),
+                progress.get("stable_for_ms"),
+                progress.get("completion_signal"),
+                now - started_at,
+                now - last_packet_at,
+                TOTAL_TIMEOUT,
+                IDLE_TIMEOUT,
+            )
+            if code == "bridge_total_timeout":
+                return UpstreamError(
+                    f"génération non terminée après {TOTAL_TIMEOUT:.0f}s",
+                    code=code,
+                )
+            return UpstreamError(
+                f"aucune donnée de l'extension depuis {IDLE_TIMEOUT:.0f}s",
+                code=code,
+            )
+
         while True:
             if await http_req.is_disconnected():
                 raise UpstreamError("client parti")
-            remaining = min(IDLE_TIMEOUT, deadline - time.monotonic())
-            if remaining <= 0:
-                raise UpstreamError(f"génération non terminée après {TOTAL_TIMEOUT:.0f}s")
+            now = time.monotonic()
+            if now >= total_deadline:
+                raise expired("bridge_total_timeout", now)
+            if now - last_packet_at >= IDLE_TIMEOUT:
+                raise expired("bridge_idle_timeout", now)
             try:
-                packet = await asyncio.wait_for(queue.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                # Avant de lever l'erreur, journaliser le dernier état connu.
-                progress = bridge_live_progress.get(request_id, {})
-                logger.warning(
-                    "bridge_idle_timeout bridge_run_id=%s phase=%s output_chars=%s "
-                    "stable_for_ms=%s completion_signal=%s idle_timeout=%s",
-                    request_id,
-                    progress.get("phase"),
-                    progress.get("output_chars"),
-                    progress.get("stable_for_ms"),
-                    progress.get("completion_signal"),
-                    IDLE_TIMEOUT,
+                packet = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=min(
+                        total_deadline - now,
+                        IDLE_TIMEOUT - (now - last_packet_at),
+                    ),
                 )
-                raise UpstreamError(f"aucune donnée de l'extension depuis {IDLE_TIMEOUT:.0f}s")
+            except asyncio.TimeoutError:
+                # `wait_for` expire indifféremment sur l'une ou l'autre des deux
+                # échéances : seule une nouvelle mesure du temps dit laquelle.
+                now = time.monotonic()
+                if now >= total_deadline:
+                    raise expired("bridge_total_timeout", now) from None
+                if now - last_packet_at >= IDLE_TIMEOUT:
+                    raise expired("bridge_idle_timeout", now) from None
+                # Course d'ordonnancement très courte : aucune échéance n'est
+                # réellement atteinte, on se remet simplement en attente.
+                continue
+
+            # Recevoir un paquet, quel qu'il soit, prouve que l'extension est vivante.
+            last_packet_at = time.monotonic()
 
             kind = packet.get("type")
             if kind == "chunk":

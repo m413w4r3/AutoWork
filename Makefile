@@ -1,4 +1,4 @@
-.PHONY: up down status logs bridge-status bridge-logs restart-bridge model-run-diagnostics dev stop test test-integration lint format typecheck
+.PHONY: up down status logs bridge-status bridge-logs bridge-soak restart-bridge model-run-diagnostics dev stop test test-integration lint format typecheck
 
 UV ?= uv
 PNPM ?= pnpm
@@ -26,6 +26,10 @@ bridge-logs:
 model-run-diagnostics:
 	@test -n "$(RUN_ID)" || (echo "Usage: make model-run-diagnostics RUN_ID=<uuid>" >&2; exit 2)
 	$(COMPOSE) exec -T backend python -m cti_app.model_run_diagnostics "$(RUN_ID)"
+
+bridge-soak:
+	$(COMPOSE) --profile bridge-test run --rm --build bridge-soak
+	$(COMPOSE) --profile bridge-test down -v
 
 restart-bridge:
 	$(COMPOSE) up -d --build --wait --force-recreate --no-deps chatgpt-bridge

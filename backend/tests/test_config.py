@@ -48,7 +48,9 @@ def test_job_actor_time_limit_outlives_the_dramatiq_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Le défaut Dramatiq de 600 s tuait le worker en pleine attente du bridge.
-    assert Settings(_env_file=None).job_actor_time_limit_seconds >= 1800.0
+    # La marge doit aussi couvrir la borne totale du bridge (3600 s) plus le
+    # parsing, la persistance et le regroupement éditorial qui la suivent.
+    assert Settings(_env_file=None).job_actor_time_limit_seconds >= 4500.0
 
     monkeypatch.setenv("JOB_ACTOR_TIME_LIMIT_SECONDS", "3600")
     assert Settings(_env_file=None).job_actor_time_limit_seconds == 3600.0

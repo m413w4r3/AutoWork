@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import runpy
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -1029,3 +1030,205 @@ async def test_idle_timeout_does_not_send_abort_to_extension() -> None:
     assert [msg for msg in silent.sent if msg.get("type") == "prompt"], (
         "Le prompt aurait dû être transmis à l'extension"
     )
+
+
+class HeartbeatingExtension:
+    """Extension vivante : heartbeat régulier, `done` optionnel.
+
+    Elle reproduit le cas qui a fait diagnostiquer à tort une extension muette :
+    ChatGPT travaille, les heartbeats arrivent toutes les quelques secondes, mais
+    la génération dépasse la borne totale du bridge.
+    """
+
+    def __init__(
+        self,
+        module: dict[str, Any],
+        *,
+        interval: float,
+        done_after: float | None = None,
+    ) -> None:
+        self.module = module
+        self.interval = interval
+        self.done_after = done_after
+        self.sent: list[dict[str, Any]] = []
+        self.beats = 0
+        self.task: asyncio.Task[None] | None = None
+        self.closed: tuple[int, str] | None = None
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        self.sent.append(payload)
+        if payload.get("type") == "prompt":
+            self.task = asyncio.create_task(self._beat(payload["id"]))
+
+    async def _beat(self, request_id: str) -> None:
+        started = asyncio.get_running_loop().time()
+        while True:
+            await asyncio.sleep(self.interval)
+            if (
+                self.done_after is not None
+                and asyncio.get_running_loop().time() - started >= self.done_after
+            ):
+                self.module["bridge"].dispatch(
+                    {
+                        "type": "done",
+                        "id": request_id,
+                        "event_id": "done",
+                        "text": "rapport final",
+                        "metadata": {
+                            "completion_signal": "assistant_actions",
+                            "completion_confidence": "high",
+                            "stable_for_ms": 2_100,
+                            "output_chars": len("rapport final"),
+                            "visible_citation_count": 0,
+                            "content_script_version": "16",
+                        },
+                    }
+                )
+                return
+            self.beats += 1
+            self.module["bridge"].dispatch(
+                {
+                    "type": "heartbeat",
+                    "id": request_id,
+                    "event_id": f"hb-{self.beats}",
+                    "progress": {
+                        "phase": "generating",
+                        "output_chars": 30_454,
+                        "stable_for_ms": 0,
+                        "completion_signal": "streaming",
+                        "completion_confidence": "high",
+                    },
+                }
+            )
+
+    async def close(self, code: int, reason: str) -> None:
+        self.closed = (code, reason)
+
+    def stop(self) -> None:
+        if self.task is not None:
+            self.task.cancel()
+
+
+async def _generate(
+    module: dict[str, Any],
+    extension: Any,
+    request_id: str,
+    *,
+    total_timeout: float,
+    idle_timeout: float,
+) -> tuple[list[str], Exception | None, float]:
+    """Exécute une génération complète avec des échéances accélérées."""
+    module["bridge"].ws = extension
+    chat_request = module["ChatRequest"](messages=[{"role": "user", "content": "recherche"}])
+
+    async def never_disconnects() -> dict[str, Any]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    http_req = request_with_key(request_id)
+    http_req._receive = never_disconnects
+
+    globals_ = module["run_generation"].__globals__
+    previous = (globals_["TOTAL_TIMEOUT"], globals_["IDLE_TIMEOUT"])
+    globals_["TOTAL_TIMEOUT"] = total_timeout
+    globals_["IDLE_TIMEOUT"] = idle_timeout
+    chunks: list[str] = []
+    failure: Exception | None = None
+    started = asyncio.get_running_loop().time()
+    try:
+        async for text in module["run_generation"](request_id, chat_request, http_req):
+            chunks.append(text)
+    except Exception as exc:
+        # Le test inspecte lui-même le type et le code de l'échec.
+        failure = exc
+    finally:
+        elapsed = asyncio.get_running_loop().time() - started
+        globals_["TOTAL_TIMEOUT"], globals_["IDLE_TIMEOUT"] = previous
+        if hasattr(extension, "stop"):
+            extension.stop()
+    return chunks, failure, elapsed
+
+
+async def test_live_generation_reaching_the_total_deadline_is_never_called_idle() -> None:
+    """Le bug du 17/08 : 900 s pile, heartbeats reçus, message « aucune donnée ».
+
+    `asyncio.wait_for` expirait sur la borne totale, mais la branche d'erreur
+    accusait systématiquement l'extension d'être muette.
+    """
+    module = load_bridge()
+    extension = HeartbeatingExtension(module, interval=0.05)
+
+    _, failure, elapsed = await _generate(
+        module, extension, "total-timeout", total_timeout=0.5, idle_timeout=0.15
+    )
+
+    assert isinstance(failure, module["UpstreamError"])
+    assert failure.code == "bridge_total_timeout"
+    assert "génération non terminée après" in str(failure)
+    assert "aucune donnée de l'extension" not in str(failure)
+    # La borne totale, et elle seule, a mis fin au run : les heartbeats
+    # réarmaient l'attente d'inactivité à chaque paquet.
+    assert elapsed >= 0.5
+    assert extension.beats >= 3
+
+
+async def test_silent_extension_is_reported_as_idle_well_before_the_total_deadline() -> None:
+    module = load_bridge()
+
+    class SilentExtension:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            self.sent.append(payload)
+
+        async def close(self, code: int, reason: str) -> None:
+            return None
+
+    _, failure, elapsed = await _generate(
+        module, SilentExtension(), "idle-timeout", total_timeout=2.0, idle_timeout=0.2
+    )
+
+    assert isinstance(failure, module["UpstreamError"])
+    assert failure.code == "bridge_idle_timeout"
+    assert "aucune donnée de l'extension depuis" in str(failure)
+    assert elapsed < 1.0
+
+
+async def test_long_but_live_generation_completes_before_the_total_deadline() -> None:
+    module = load_bridge()
+    extension = HeartbeatingExtension(module, interval=0.05, done_after=0.6)
+
+    chunks, failure, _ = await _generate(
+        module, extension, "live-completion", total_timeout=1.5, idle_timeout=0.15
+    )
+
+    assert failure is None
+    assert "".join(chunks) == "rapport final"
+    # Le run a duré bien plus longtemps que l'idle timeout sans jamais expirer.
+    assert extension.beats >= 3
+
+
+def test_worker_time_limit_outlives_the_bridge_total_timeout() -> None:
+    """Le worker doit survivre au bridge, jamais l'inverse.
+
+    Les deux bornes vivent dans deux composants différents ; les laisser dériver
+    l'une par rapport à l'autre a déjà tué le worker en pleine attente. Le défaut
+    du bridge fut aussi longtemps recopié depuis MODEL_REQUEST_TIMEOUT_SECONDS,
+    qui borne un appel HTTP court et n'a rien à dire sur la durée d'une recherche.
+    """
+    compose = (Path(__file__).parents[2] / "compose.yaml").read_text()
+
+    def default_of(variable: str) -> float:
+        match = re.search(rf"\$\{{{variable}:-([0-9.]+)\}}", compose)
+        assert match, f"{variable} n'a plus de défaut dans compose.yaml"
+        return float(match.group(1))
+
+    bridge_total = default_of("BRIDGE_TOTAL_TIMEOUT_SECONDS")
+    actor_limit = default_of("JOB_ACTOR_TIME_LIMIT_SECONDS")
+
+    # Une recherche approfondie ChatGPT doit pouvoir occuper l'heure entière
+    # sans être coupée, et le worker doit lui survivre avec de la marge.
+    assert bridge_total >= 3600
+    assert actor_limit >= bridge_total + 600
+    assert "BRIDGE_TOTAL_TIMEOUT: ${MODEL_REQUEST_TIMEOUT_SECONDS" not in compose

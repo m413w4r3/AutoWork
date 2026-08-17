@@ -76,3 +76,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker compose config --quiet
+      # `--build` est obligatoire : sans lui, `run` réutilise une image existante
+      # et le soak validerait du code qui n'est pas celui du commit.
+      - run: docker compose --profile bridge-test run --rm --build bridge-soak
+      - if: always()
+        run: docker compose --profile bridge-test down -v

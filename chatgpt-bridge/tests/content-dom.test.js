@@ -214,9 +214,13 @@ const WATCHED = `document.querySelector("[data-testid='conversation-turn-3'] [da
   assert.equal(result.incomplete_reason, "active_signal_stalled");
   assert.equal(result.completion_signal, "streaming");
   assert.equal(result.text, "réponse finale");
+  // Le seuil est relu dans le script : le test protège le garde-fou, pas une
+  // valeur particulière, qui peut être desserrée quand ChatGPT ralentit.
+  const seuil = run("ACTIVE_SIGNAL_STALL_MS");
+  assert.ok(seuil >= 120_000, `garde-fou trop court : ${seuil} ms`);
   assert.ok(
-    result.stable_for_ms >= 120_000,
-    `stabilité attendue >= 120000 ms, vue ${result.stable_for_ms}`,
+    result.stable_for_ms >= seuil,
+    `stabilité attendue >= ${seuil} ms, vue ${result.stable_for_ms}`,
   );
   assert.ok(sleeps > 0, "la boucle doit réellement avoir tourné");
 

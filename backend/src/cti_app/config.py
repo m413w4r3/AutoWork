@@ -30,7 +30,9 @@ class Settings(BaseSettings):
     job_retry_max_seconds: float = Field(default=300.0, gt=0, le=86400)
     job_heartbeat_timeout_seconds: float = Field(default=120.0, gt=1, le=86400)
     job_recovery_interval_seconds: float = Field(default=30.0, gt=1, le=3600)
-    job_actor_time_limit_seconds: float = Field(default=1800.0, gt=600, le=86400)
+    # Doit rester supérieur au BRIDGE_TOTAL_TIMEOUT du bridge : le worker attend
+    # la fin de la génération, puis parse, persiste et regroupe.
+    job_actor_time_limit_seconds: float = Field(default=4500.0, gt=600, le=86400)
     openai_bridge_base_url: str = "http://127.0.0.1:8001/v1"
     openai_bridge_api_key: SecretStr | None = None
     openai_bridge_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)

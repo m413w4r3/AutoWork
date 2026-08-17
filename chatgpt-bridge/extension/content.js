@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "16";
+const VERSION = "17";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -124,7 +124,10 @@ const FINALIZATION_STALL_MS = 45000;
 // d'un caractère. On ne conclut pas « terminé » — un Stop réellement visible
 // peut signifier que ChatGPT travaille — mais on rend la main en `incomplete`
 // plutôt que de rester « running » indéfiniment.
-const ACTIVE_SIGNAL_STALL_MS = 120000;
+// Volontairement large : une recherche approfondie marque de vraies pauses de
+// plusieurs minutes sans écrire un caractère. Ce garde-fou vise la boucle
+// infinie, jamais une génération lente encore en cours.
+const ACTIVE_SIGNAL_STALL_MS = 300000;
 
 let currentJob = null;
 const claimedRequestIds = new Set();
