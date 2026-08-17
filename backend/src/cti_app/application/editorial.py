@@ -170,14 +170,16 @@ class EditorialGroupingService:
                     reference, candidate, historical, comparison_candidates, archived_urls
                 )
                 best = _prefer_match(current_match, historical_match)
+                # Enrichir les groupes PROPOSED et SELECTED (P2: enrichissement des groupes SELECTED)
                 if (
                     best is not None
                     and best.score >= 0.85
                     and best.group in existing
-                    and best.group.status is EditorialGroupStatus.PROPOSED
+                    and best.group.status in (EditorialGroupStatus.PROPOSED, EditorialGroupStatus.SELECTED)
                 ):
                     best.group.add_candidates((reference,))
                     best.group.needs_source_expansion = True
+                    best.group.needs_source_verification = True
                     await uow.editorial_groups.save(best.group)
                     reference_map.add(reference)
                     continue
