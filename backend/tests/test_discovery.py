@@ -1005,7 +1005,13 @@ def test_research_prompt_is_the_documented_markdown_contract() -> None:
     assert "Période demandée : 2026-07-01 au 2027-07-31" in prompt
     assert "Période observable : 2026-07-01 au 2026-08-13" in prompt
     assert "Iran (alias : IR, République islamique d'Iran)" in prompt
-    assert "Langues : fr, EN, fa" in prompt
+    assert "Langues de travail de l'édition : fr, EN, fa" in prompt
+    # La langue ne doit jamais restreindre la recherche : les langues de
+    # l'édition restent une information de contexte, pas un filtre.
+    assert "La langue n'est jamais un critère de sélection" in prompt
+    assert "le japonais" in prompt
+    assert "l'espagnol" in prompt
+    assert "le coréen" in prompt
     assert "Il n’existe aucune limite ni" in prompt  # noqa: RUF001
     assert "N’invente aucune URL, date, attribution" in prompt  # noqa: RUF001
     assert "visible-iocs: <jusqu’à 10 valeurs exactes" in prompt  # noqa: RUF001

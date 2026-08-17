@@ -1410,8 +1410,20 @@ def _research_prompt(parameters: DiscoverEditionParameters) -> str:
 Date de recherche : {parameters.as_of_date.isoformat()}
 Période demandée : {parameters.period_start.isoformat()} au {parameters.period_end.isoformat()}
 Période observable : {parameters.period_start.isoformat()} au {observable_end.isoformat()}
-Langues : {", ".join(languages)}
+Langues de travail de l'édition : {", ".join(languages)}
 Axe complémentaire : {parameters.complementary_axis}
+
+La langue n'est jamais un critère de sélection. Recherche dans toutes les
+langues et n'écarte aucune publication au motif qu'elle n'est pas rédigée dans
+une langue de travail de l'édition. Couvre notamment l'anglais, le français,
+l'espagnol, le portugais, l'allemand, l'italien, le néerlandais, le polonais,
+l'ukrainien, le russe, le turc, l'arabe, le persan, l'hébreu, le chinois,
+le japonais, le coréen, le vietnamien, l'indonésien, le thaï et l'hindi,
+qui concentrent une part importante de la production CTI publique.
+
+Conserve le titre exact de chaque publication dans sa langue d'origine, sans le
+traduire ni le translittérer. Les champs de description que tu rédiges restent
+en français.
 
 Ne recherche pas de publication postérieure à la date de recherche.
 
