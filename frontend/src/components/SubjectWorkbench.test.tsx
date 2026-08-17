@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SubjectWorkbench } from "./SubjectWorkbench";
+import { withProductionNotStarted } from "../test-utils/fetchStubs";
 
 const subjectId = "30e5b0b8-2dba-48c3-81ca-9eaed5c22c62";
 const workbench = {
@@ -89,7 +90,10 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe("SubjectWorkbench", () => {
   it("affiche les détails archivés et conserve la relation LLM provisoire", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(workbench)));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(withProductionNotStarted(() => Response.json(workbench))),
+    );
     renderWorkbench();
 
     expect(
@@ -121,17 +125,20 @@ describe("SubjectWorkbench", () => {
   });
 
   it("présente les passages surlignés et les IOC originaux et normalisés", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(workbench)));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(withProductionNotStarted(() => Response.json(workbench))),
+    );
     const user = userEvent.setup();
     renderWorkbench();
     await screen.findByText("https://research.example/final");
 
-    await user.click(screen.getByRole("button", { name: "Preuves" }));
+    await user.click(screen.getByRole("button", { name: "Preuves extraites" }));
     expect(
       screen.getByText("PowerShell lance ExampleRAT", { selector: "mark" }),
     ).toBeVisible();
 
-    await user.click(screen.getByRole("button", { name: "IOC" }));
+    await user.click(screen.getByRole("button", { name: "Indicateurs" }));
     expect(screen.getByText(/Original : evil\[\.\]example/)).toHaveTextContent(
       "normalisé : evil.example",
     );

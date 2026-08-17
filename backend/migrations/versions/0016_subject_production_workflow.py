@@ -104,20 +104,14 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["raw_blob_id"], ["blobs.id"], ondelete="SET NULL"),
-        sa.ForeignKeyConstraint(
-            ["canonical_blob_id"], ["blobs.id"], ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["rendered_blob_id"], ["blobs.id"], ondelete="SET NULL"
-        ),
+        sa.ForeignKeyConstraint(["canonical_blob_id"], ["blobs.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(["rendered_blob_id"], ["blobs.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["model_run_id"], ["model_runs.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(
             ["conversation_turn_id"], ["model_conversation_turns.id"], ondelete="SET NULL"
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "production_run_id", "stage", "version", name="uq_run_stage_version"
-        ),
+        sa.UniqueConstraint("production_run_id", "stage", "version", name="uq_run_stage_version"),
     )
     op.create_index(
         "ix_production_artifacts_run_stage_version",
@@ -169,7 +163,9 @@ def upgrade() -> None:
             server_default=sa.func.now(),
         ),
         sa.CheckConstraint("position >= 1"),
-        sa.ForeignKeyConstraint(["batch_id"], ["edition_production_batches.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(
+            ["batch_id"], ["edition_production_batches.id"], ondelete="CASCADE"
+        ),
         sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
             ["production_run_id"], ["subject_production_runs.id"], ondelete="RESTRICT"

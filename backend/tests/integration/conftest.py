@@ -11,6 +11,13 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.infrastructure.database.session import (
+    create_postgres_engine,
+    create_session_factory,
+)
+from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -76,3 +83,15 @@ def migrated_postgres_url() -> Iterator[str]:
         yield database_url
     finally:
         asyncio.run(_drop_database(admin_url, database_name))
+
+
+@pytest.fixture
+def uow_factory(migrated_postgres_url: str) -> UnitOfWorkFactory:
+    """Postgres-backed UnitOfWork factory for production workflow tests."""
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+
+    def factory() -> SqlAlchemyUnitOfWork:
+        return SqlAlchemyUnitOfWork(session_factory)
+
+    return factory

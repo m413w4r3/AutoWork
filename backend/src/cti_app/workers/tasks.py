@@ -17,7 +17,9 @@ from cti_app.application.http_collection import (
     parse_domain_policy,
 )
 from cti_app.application.jobs import JobExecutor, JobService, create_job_registry
+from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
+from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
 from cti_app.domain.jobs import JobStatus
@@ -25,6 +27,7 @@ from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
+from cti_app.infrastructure.jobs import DramatiqJobDispatcher
 from cti_app.integrations.model_factory import (
     create_bridge_capabilities_provider,
     create_model_gateway,
@@ -109,11 +112,28 @@ async def _execute_job(job_id: UUID) -> int | None:
             workspace_root=settings.subject_workspace_root,
         )
         brief_service = BriefService(uow_factory, blob_store, model_gateway)
+        model_conversation_service = ModelConversationService(
+            uow_factory,
+            model_gateway,
+            blob_store,
+            retention_days=settings.model_conversation_retention_days,
+        )
+        # Production stage jobs run here, so the worker needs the production
+        # registrations and a bound chain to queue the following stage.
+        production_chain = ProductionStageChain()
+        registry = create_job_registry(
+            model_gateway,
+            discovery_service,
+            collection_service,
+            brief_service,
+            uow_factory,
+            model_conversation_service=model_conversation_service,
+            production_chain=production_chain,
+        )
+        production_chain.bind(JobService(uow_factory, registry), DramatiqJobDispatcher())
         executor = JobExecutor(
             uow_factory,
-            create_job_registry(
-                model_gateway, discovery_service, collection_service, brief_service
-            ),
+            registry,
             retry_base_seconds=settings.job_retry_base_seconds,
             retry_max_seconds=settings.job_retry_max_seconds,
             heartbeat_interval_seconds=min(20.0, settings.job_heartbeat_timeout_seconds / 3),

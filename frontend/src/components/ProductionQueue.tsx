@@ -1,34 +1,54 @@
 /**
  * Production Queue Component
- * Shows batch production status for an edition
+ * Shows batch production status for an edition, or the entry point to start it.
  */
 
-import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   getEditionBriefProduction,
   startEditionBriefProduction,
 } from "../api/production";
 
-interface ProductionQueueProps {
-  editionId: string;
+export interface ProductionQueueBrief {
+  subjectId: string;
+  title: string;
 }
 
-export function ProductionQueue({ editionId }: ProductionQueueProps) {
-  const [autoRefresh, setAutoRefresh] = useState(true);
+interface ProductionQueueProps {
+  editionId: string;
+  /** Selected briefs of the edition, i.e. what is eligible for production. */
+  briefs?: ProductionQueueBrief[];
+}
 
-  const { data: batch, isLoading, error, refetch } = useQuery({
+export function ProductionQueue({
+  editionId,
+  briefs = [],
+}: ProductionQueueProps) {
+  const [selected, setSelected] = useState<string[]>([]);
+
+  const {
+    data: batch,
+    isLoading,
+    error,
+    refetch,
+  } = useQuery({
     queryKey: ["batch", editionId],
     queryFn: () => getEditionBriefProduction(editionId),
-    refetchInterval: autoRefresh ? 2000 : false,
+    // Only poll while a batch is actually in flight. With no batch there is
+    // nothing to watch, and polling then would make every editorial board
+    // page chatter against the API.
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "queued" || status === "running" ? 2000 : false;
+    },
   });
 
-  // Auto-stop refresh when complete
-  useEffect(() => {
-    if (batch?.status === "completed" || batch?.status === "completed_with_issues") {
-      setAutoRefresh(false);
-    }
-  }, [batch?.status]);
+  const start = useMutation({
+    mutationFn: (subjectIds?: string[]) =>
+      startEditionBriefProduction(editionId, subjectIds),
+    onSuccess: () => void refetch(),
+  });
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -43,25 +63,86 @@ export function ProductionQueue({ editionId }: ProductionQueueProps) {
     }
   };
 
-  if (isLoading) return <div className="p-4">Loading batch status...</div>;
-  if (error) return <div className="p-4 text-red-600">Error: {String(error)}</div>;
-  if (!batch) {
+  const toggle = (subjectId: string) =>
+    setSelected((current) =>
+      current.includes(subjectId)
+        ? current.filter((id) => id !== subjectId)
+        : [...current, subjectId],
+    );
+
+  if (isLoading)
+    return <div className="p-4">Chargement du lot de production…</div>;
+  if (error)
     return (
-      <div className="p-4 border rounded-lg bg-gray-50">
-        <p className="text-gray-600">No batch found</p>
-        <button
-          onClick={() => startEditionBriefProduction(editionId).then(() => refetch())}
-          className="mt-2 px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
-        >
-          Start Production
-        </button>
+      <div className="p-4 text-red-600" role="alert">
+        Le lot de production est inaccessible : {String(error)}
       </div>
+    );
+
+  // No batch yet: this is the entry point, not an error.
+  if (!batch) {
+    if (briefs.length === 0) {
+      return (
+        <div className="p-4 border rounded-lg bg-gray-50">
+          <p className="text-gray-600">
+            Aucune brève sélectionnée n’est prête à être produite.
+          </p>
+        </div>
+      );
+    }
+
+    return (
+      <section className="production-start space-y-3 p-4 border rounded-lg bg-gray-50">
+        <h2 className="text-xl font-bold">
+          {briefs.length} brève{briefs.length > 1 ? "s" : ""} prête
+          {briefs.length > 1 ? "s" : ""}
+        </h2>
+        {start.error ? (
+          <p className="text-red-600 text-sm" role="alert">
+            {String(start.error)}
+          </p>
+        ) : null}
+
+        <button
+          className="button px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+          disabled={start.isPending}
+          onClick={() => start.mutate(undefined)}
+        >
+          {start.isPending
+            ? "Démarrage…"
+            : `Traiter les ${briefs.length} brèves`}
+        </button>
+
+        <ul className="space-y-1">
+          {briefs.map((brief) => (
+            <li key={brief.subjectId}>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={selected.includes(brief.subjectId)}
+                  onChange={() => toggle(brief.subjectId)}
+                />
+                {brief.title}
+              </label>
+            </li>
+          ))}
+        </ul>
+
+        <button
+          className="button px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+          disabled={start.isPending || selected.length === 0}
+          onClick={() => start.mutate(selected)}
+        >
+          {`Traiter les ${selected.length} sélectionnées`}
+        </button>
+      </section>
     );
   }
 
   const totalItems = batch.items;
   const processedItems = batch.completed + batch.needs_review + batch.failed;
-  const progressPercent = totalItems > 0 ? (processedItems / totalItems) * 100 : 0;
+  const progressPercent =
+    totalItems > 0 ? (processedItems / totalItems) * 100 : 0;
 
   return (
     <div className="space-y-4">
@@ -69,9 +150,10 @@ export function ProductionQueue({ editionId }: ProductionQueueProps) {
       <div className="border-b pb-4">
         <div className="flex items-center justify-between">
           <div>
-            <h2 className="text-xl font-bold">Batch Production</h2>
+            <h2 className="text-xl font-bold">Production par lot</h2>
             <p className="text-sm text-gray-600">
-              {totalItems} briefs {batch.status === "running" ? "in progress" : batch.status}
+              {totalItems} brèves{" "}
+              {batch.status === "running" ? "en cours" : batch.status}
             </p>
           </div>
           <div
@@ -85,16 +167,20 @@ export function ProductionQueue({ editionId }: ProductionQueueProps) {
       {/* Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <div className="bg-gray-50 p-3 rounded">
-          <div className="text-2xl font-bold text-gray-800">{batch.completed}</div>
-          <div className="text-xs text-gray-600">Completed</div>
+          <div className="text-2xl font-bold text-gray-800">
+            {batch.completed}
+          </div>
+          <div className="text-xs text-gray-600">Terminées</div>
         </div>
         <div className="bg-yellow-50 p-3 rounded">
-          <div className="text-2xl font-bold text-yellow-800">{batch.needs_review}</div>
-          <div className="text-xs text-gray-600">Needs Review</div>
+          <div className="text-2xl font-bold text-yellow-800">
+            {batch.needs_review}
+          </div>
+          <div className="text-xs text-gray-600">À revoir</div>
         </div>
         <div className="bg-red-50 p-3 rounded">
           <div className="text-2xl font-bold text-red-800">{batch.failed}</div>
-          <div className="text-xs text-gray-600">Failed</div>
+          <div className="text-xs text-gray-600">En échec</div>
         </div>
         <div className="bg-blue-50 p-3 rounded">
           <div className="text-2xl font-bold text-blue-800">
@@ -102,16 +188,16 @@ export function ProductionQueue({ editionId }: ProductionQueueProps) {
               ? batch.current_subject_index + 1
               : "-"}
           </div>
-          <div className="text-xs text-gray-600">Current Item</div>
+          <div className="text-xs text-gray-600">Élément courant</div>
         </div>
       </div>
 
       {/* Progress Bar */}
       <div className="space-y-2">
         <div className="flex justify-between text-sm">
-          <span className="font-semibold">Overall Progress</span>
+          <span className="font-semibold">Progression globale</span>
           <span>
-            {processedItems} / {totalItems} briefs
+            {processedItems} / {totalItems} brèves
           </span>
         </div>
         <div className="w-full bg-gray-200 rounded-full h-3">
@@ -126,7 +212,8 @@ export function ProductionQueue({ editionId }: ProductionQueueProps) {
       {batch.status === "running" && batch.current_subject_index !== null && (
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
           <h3 className="font-semibold text-blue-900">
-            Processing Item {batch.current_subject_index + 1} of {totalItems}
+            Traitement de l’élément {batch.current_subject_index + 1} sur{" "}
+            {totalItems}
           </h3>
           <div className="mt-2 flex space-x-1">
             <div className="w-2 h-2 bg-blue-500 rounded-full animate-bounce"></div>
@@ -138,15 +225,15 @@ export function ProductionQueue({ editionId }: ProductionQueueProps) {
 
       {/* Summary */}
       <div className="text-xs text-gray-500 border-t pt-4">
-        <p>Batch ID: {batch.batch_id}</p>
-        <p>Edition ID: {batch.edition_id}</p>
-        <p>Profile: {batch.profile}</p>
-        <p>Created: {new Date(batch.created_at).toLocaleString()}</p>
+        <p>Identifiant du lot : {batch.batch_id}</p>
+        <p>Identifiant de l’édition : {batch.edition_id}</p>
+        <p>Profil : {batch.profile}</p>
+        <p>Créé : {new Date(batch.created_at).toLocaleString()}</p>
         {batch.started_at && (
-          <p>Started: {new Date(batch.started_at).toLocaleString()}</p>
+          <p>Démarré : {new Date(batch.started_at).toLocaleString()}</p>
         )}
         {batch.finished_at && (
-          <p>Finished: {new Date(batch.finished_at).toLocaleString()}</p>
+          <p>Terminé : {new Date(batch.finished_at).toLocaleString()}</p>
         )}
       </div>
     </div>

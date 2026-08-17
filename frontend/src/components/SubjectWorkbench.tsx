@@ -20,17 +20,11 @@ import { AnalysisConversations } from "./AnalysisConversations";
 import { SubjectProduction } from "./SubjectProduction";
 
 type Tab =
-  | "sources"
-  | "evidence"
-  | "ioc"
-  | "extraction"
-  | "brief"
-  | "conversations"
-  | "production";
+  "sources" | "evidence" | "ioc" | "extraction" | "brief" | "conversations";
 
 export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<Tab>("production");
+  const [tab, setTab] = useState<Tab>("sources");
   const [jobId, setJobId] = useState<string | null>(null);
   const workbench = useQuery({
     queryKey: ["subject-workbench", subjectId],
@@ -84,10 +78,7 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
         ) : null}
         {jobId ? <JobStatusCard jobId={jobId} /> : null}
 
-        <nav
-          className="workbench-tabs"
-          aria-label="Outils avancés du sujet"
-        >
+        <nav className="workbench-tabs" aria-label="Outils avancés du sujet">
           {(
             [
               ["sources", "Sources brutes"],

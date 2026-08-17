@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { EditorialBoard } from "./EditorialBoard";
+import { withProductionNotStarted } from "../test-utils/fetchStubs";
 
 const groups = [
   {
@@ -144,7 +145,7 @@ it("désactive le polling malgré la valeur globale de production", async () => 
     target_major: 2,
     automatic_selection: false,
   };
-  const fetchMock = vi.fn().mockResolvedValue(Response.json(board));
+  const fetchMock = vi.fn(withProductionNotStarted(() => Response.json(board)));
   vi.stubGlobal("fetch", fetchMock);
   const client = new QueryClient({
     defaultOptions: {
@@ -166,10 +167,11 @@ it("désactive le polling malgré la valeur globale de production", async () => 
     expect(
       screen.getByText("Aucun groupe en attente de décision."),
     ).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // One for the board, one for the production batch status.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
   await act(() => vi.advanceTimersByTimeAsync(60_000));
-  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(fetchMock).toHaveBeenCalledTimes(2);
 });
 
 it("propose quatre choix exclusifs et confirme les décisions dans un seul lot", async () => {
@@ -184,12 +186,16 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
     automatic_selection: false,
   };
   const postedBodies: unknown[] = [];
-  const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
-    if (init?.method === "POST" && typeof init.body === "string") {
-      postedBodies.push(JSON.parse(init.body) as unknown);
-    }
-    return Promise.resolve(Response.json(board));
-  });
+  const fetchMock = vi.fn(
+    withProductionNotStarted(
+      (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "POST" && typeof init.body === "string") {
+          postedBodies.push(JSON.parse(init.body) as unknown);
+        }
+        return Response.json(board);
+      },
+    ),
+  );
   vi.stubGlobal("fetch", fetchMock);
   const user = userEvent.setup();
   render(

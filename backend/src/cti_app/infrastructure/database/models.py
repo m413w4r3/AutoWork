@@ -59,7 +59,10 @@ HUMAN_DECISION_VALUES_SQL = (
 )
 BRIEF_DRAFT_STATUS_VALUES_SQL = "'draft', 'changes_requested', 'approved', 'promoted'"
 CONVERSATION_TRANSPORT_VALUES_SQL = "'chatgpt_bridge', 'openai_responses', 'application_managed'"
-CONVERSATION_PURPOSE_VALUES_SQL = "'discovery', 'analyst_assistance', 'pivot_research', 'drafting', 'critic', 'subject_production'"
+CONVERSATION_PURPOSE_VALUES_SQL = (
+    "'discovery', 'analyst_assistance', 'pivot_research', "
+    "'drafting', 'critic', 'subject_production'"
+)
 CONVERSATION_STATUS_VALUES_SQL = (
     "'pending', 'ready', 'busy', 'needs_review', 'unavailable', 'archived'"
 )

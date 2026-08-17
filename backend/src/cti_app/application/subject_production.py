@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from cti_app.application.persistence import ProductionUnitOfWork
+from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
@@ -18,7 +18,7 @@ from cti_app.domain.production import (
 class SubjectProductionService:
     """Orchestrates production of a single subject."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWork) -> None:
+    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
 
     async def create_run(
@@ -142,7 +142,7 @@ class SubjectProductionService:
 class EditionProductionService:
     """Orchestrates batch production for an entire edition."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWork) -> None:
+    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
 
     async def create_batch(

@@ -1,3 +1,5 @@
+import { ApiError } from "./editions";
+
 /**
  * Frontend API client for subject production workflow
  */
@@ -14,12 +16,7 @@ export interface ProductionStatus {
   title: string;
   editorial_type: string;
   status:
-    | "queued"
-    | "running"
-    | "ready"
-    | "needs_review"
-    | "failed"
-    | "cancelled";
+    "queued" | "running" | "ready" | "needs_review" | "failed" | "cancelled";
   current_stage: string;
   progress_current: number;
   progress_total: number;
@@ -35,7 +32,8 @@ export interface BatchStatus {
   batch_id: string;
   edition_id: string;
   profile: string;
-  status: "queued" | "running" | "completed" | "completed_with_issues" | "cancelled";
+  status:
+    "queued" | "running" | "completed" | "completed_with_issues" | "cancelled";
   items: number;
   completed: number;
   needs_review: number;
@@ -55,205 +53,131 @@ export interface ArtifactResponse {
 }
 
 /**
- * Start production of a subject
+ * Start production of a subject.
+ *
+ * The edition is resolved server-side from the subject's editorial group, so
+ * the subject page only needs the subject id.
  */
 export async function startSubjectProduction(
   subjectId: string,
-  editionId: string,
-  profile: "brief_auto" | "major_assisted" = "brief_auto"
+  profile: "brief_auto" | "major_assisted" = "brief_auto",
 ): Promise<{ run_id: string; status: string }> {
-  const response = await fetch(`/api/subjects/${subjectId}/production`, {
+  return request(`/api/subjects/${subjectId}/production`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      profile,
-      edition_id: editionId,
-    }),
+    body: JSON.stringify({ profile }),
   });
-
-  if (!response.ok) {
-    throw new Error(`Failed to start production: ${response.statusText}`);
-  }
-
-  return response.json();
 }
 
 /**
- * Get production status for a subject
+ * Get production status for a subject.
+ *
+ * Returns null when no production has been started yet — that is a normal
+ * state, not an error, and it is what makes the UI offer a start button.
  */
 export async function getSubjectProduction(
-  subjectId: string
-): Promise<ProductionStatus> {
-  const response = await fetch(`/api/subjects/${subjectId}/production`, {
-    method: "GET",
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch production status: ${response.statusText}`);
-  }
-
-  return response.json();
+  subjectId: string,
+): Promise<ProductionStatus | null> {
+  return requestOrNull(`/api/subjects/${subjectId}/production`);
 }
 
 /**
  * Retry references generation
  */
-export async function retryReferences(subjectId: string): Promise<{ status: string }> {
-  const response = await fetch(
-    `/api/subjects/${subjectId}/production/references/retry`,
-    {
-      method: "POST",
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(`Failed to retry references: ${response.statusText}`);
-  }
-
-  return response.json();
+export async function retryReferences(
+  subjectId: string,
+): Promise<{ status: string }> {
+  return request(`/api/subjects/${subjectId}/production/references/retry`, {
+    method: "POST",
+  });
 }
 
 /**
  * Retry synthesis generation
  */
-export async function retrySynthesis(subjectId: string): Promise<{ status: string }> {
-  const response = await fetch(
-    `/api/subjects/${subjectId}/production/synthesis/retry`,
-    {
-      method: "POST",
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(`Failed to retry synthesis: ${response.statusText}`);
-  }
-
-  return response.json();
+export async function retrySynthesis(
+  subjectId: string,
+): Promise<{ status: string }> {
+  return request(`/api/subjects/${subjectId}/production/synthesis/retry`, {
+    method: "POST",
+  });
 }
 
 /**
  * Cancel subject production
  */
 export async function cancelSubjectProduction(
-  subjectId: string
+  subjectId: string,
 ): Promise<{ status: string }> {
-  const response = await fetch(`/api/subjects/${subjectId}/production/cancel`, {
+  return request(`/api/subjects/${subjectId}/production/cancel`, {
     method: "POST",
   });
-
-  if (!response.ok) {
-    throw new Error(`Failed to cancel production: ${response.statusText}`);
-  }
-
-  return response.json();
 }
 
 /**
  * Get references artifact
  */
 export async function getReferencesArtifact(
-  subjectId: string
+  subjectId: string,
 ): Promise<ArtifactResponse> {
-  const response = await fetch(
-    `/api/subjects/${subjectId}/production/artifacts/references`,
-    { method: "GET" }
-  );
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch references: ${response.statusText}`);
-  }
-
-  return response.json();
+  return request(`/api/subjects/${subjectId}/production/artifacts/references`);
 }
 
 /**
  * Get extraction artifact
  */
 export async function getExtractionArtifact(
-  subjectId: string
+  subjectId: string,
 ): Promise<ArtifactResponse> {
-  const response = await fetch(
-    `/api/subjects/${subjectId}/production/artifacts/extraction`,
-    { method: "GET" }
-  );
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch extraction: ${response.statusText}`);
-  }
-
-  return response.json();
+  return request(`/api/subjects/${subjectId}/production/artifacts/extraction`);
 }
 
 /**
  * Get synthesis artifact
  */
 export async function getSynthesisArtifact(
-  subjectId: string
+  subjectId: string,
 ): Promise<ArtifactResponse> {
-  const response = await fetch(
-    `/api/subjects/${subjectId}/production/artifacts/synthesis`,
-    { method: "GET" }
-  );
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch synthesis: ${response.statusText}`);
-  }
-
-  return response.json();
+  return request(`/api/subjects/${subjectId}/production/artifacts/synthesis`);
 }
 
 /**
  * Get brief artifact
  */
 export async function getBriefArtifact(
-  subjectId: string
+  subjectId: string,
 ): Promise<ArtifactResponse> {
-  const response = await fetch(
-    `/api/subjects/${subjectId}/production/artifacts/brief`,
-    { method: "GET" }
-  );
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch brief: ${response.statusText}`);
-  }
-
-  return response.json();
+  return request(`/api/subjects/${subjectId}/production/artifacts/brief`);
 }
 
 // Edition Production API
 
 /**
- * Start batch production for an edition
+ * Start batch production for an edition.
+ *
+ * Without `subjectIds` every selected brief of the edition is produced;
+ * with it, only that subset.
  */
 export async function startEditionBriefProduction(
-  editionId: string
+  editionId: string,
+  subjectIds?: string[],
 ): Promise<BatchStatus> {
-  const response = await fetch(`/api/editions/${editionId}/production/briefs`, {
+  return request(`/api/editions/${editionId}/production/briefs`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ subject_ids: subjectIds ?? null }),
   });
-
-  if (!response.ok) {
-    throw new Error(`Failed to start batch production: ${response.statusText}`);
-  }
-
-  return response.json();
 }
 
 /**
- * Get batch production status
+ * Get batch production status.
+ *
+ * Returns null when no batch has been started yet.
  */
 export async function getEditionBriefProduction(
-  editionId: string
-): Promise<BatchStatus> {
-  const response = await fetch(`/api/editions/${editionId}/production/briefs`, {
-    method: "GET",
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch batch status: ${response.statusText}`);
-  }
-
-  return response.json();
+  editionId: string,
+): Promise<BatchStatus | null> {
+  return requestOrNull(`/api/editions/${editionId}/production/briefs`);
 }
 
 /**
@@ -261,18 +185,48 @@ export async function getEditionBriefProduction(
  */
 export async function cancelEditionBatch(
   editionId: string,
-  batchId: string
+  batchId: string,
 ): Promise<{ status: string }> {
-  const response = await fetch(
+  return request(
     `/api/editions/${editionId}/production/briefs/${batchId}/cancel`,
-    {
-      method: "POST",
-    }
+    { method: "POST" },
   );
+}
 
-  if (!response.ok) {
-    throw new Error(`Failed to cancel batch: ${response.statusText}`);
-  }
+async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init);
+  if (response.ok) return (await response.json()) as T;
+  throw await apiError(response);
+}
 
-  return response.json();
+/**
+ * Like `request`, but treats 404 as "nothing here yet" rather than a failure.
+ */
+async function requestOrNull<T>(
+  url: string,
+  init?: RequestInit,
+): Promise<T | null> {
+  const response = await fetch(url, init);
+  if (response.status === 404) return null;
+  if (response.ok) return (await response.json()) as T;
+  throw await apiError(response);
+}
+
+async function apiError(response: Response): Promise<ApiError> {
+  const body = (await response.json().catch(() => null)) as {
+    detail?: { code?: string; message?: string } | string;
+  } | null;
+  const detail = body?.detail;
+  const message =
+    typeof detail === "string"
+      ? detail
+      : detail?.message ||
+        "La production n\u2019a pas pu \u00eatre effectu\u00e9e.";
+  return new ApiError(
+    message,
+    typeof detail === "object" && detail?.code
+      ? detail.code
+      : "production_error",
+    response.status,
+  );
 }

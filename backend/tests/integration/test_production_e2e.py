@@ -15,7 +15,7 @@ from uuid import uuid4
 
 import pytest
 
-from cti_app.application.persistence import ProductionUnitOfWork
+from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_stages import compute_input_hash
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import (
@@ -29,10 +29,12 @@ from cti_app.domain.production import (
     SubjectProductionStatus,
 )
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_subject_production_complete_pipeline(
-    uow_factory: ProductionUnitOfWork,
+    uow_factory: ProductionUnitOfWorkFactory,
 ) -> None:
     """Test complete subject production from sources to assembly.
 
@@ -85,7 +87,7 @@ async def test_subject_production_complete_pipeline(
 
 @pytest.mark.asyncio
 async def test_batch_production_multiple_subjects(
-    uow_factory: ProductionUnitOfWork,
+    uow_factory: ProductionUnitOfWorkFactory,
 ) -> None:
     """Test batch production processing multiple subjects sequentially.
 
@@ -99,7 +101,6 @@ async def test_batch_production_multiple_subjects(
     edition_id = uuid4()
 
     batch_service = EditionProductionService(uow_factory)
-    subject_service = SubjectProductionService(uow_factory)
 
     # Create batch with 3 subjects
     subject_ids = [uuid4() for _ in range(3)]
@@ -169,7 +170,7 @@ async def test_input_hash_idempotence() -> None:
 
 @pytest.mark.asyncio
 async def test_production_run_state_transitions(
-    uow_factory: ProductionUnitOfWork,
+    uow_factory: ProductionUnitOfWorkFactory,
 ) -> None:
     """Test valid state transitions through production lifecycle.
 
@@ -208,7 +209,7 @@ async def test_production_run_state_transitions(
 
 @pytest.mark.asyncio
 async def test_production_needs_review_state(
-    uow_factory: ProductionUnitOfWork,
+    uow_factory: ProductionUnitOfWorkFactory,
 ) -> None:
     """Test NEEDS_REVIEW state for controlled problems.
 
@@ -244,7 +245,7 @@ async def test_production_needs_review_state(
 
 @pytest.mark.asyncio
 async def test_downstream_invalidation(
-    uow_factory: ProductionUnitOfWork,
+    uow_factory: ProductionUnitOfWorkFactory,
 ) -> None:
     """Test that changing earlier stages marks downstream as stale.
 
@@ -311,7 +312,7 @@ async def test_downstream_invalidation(
 
 @pytest.mark.asyncio
 async def test_batch_sequential_processing(
-    uow_factory: ProductionUnitOfWork,
+    uow_factory: ProductionUnitOfWorkFactory,
 ) -> None:
     """Test that batch processes subjects sequentially (max 1 active).
 
@@ -323,7 +324,6 @@ async def test_batch_sequential_processing(
     edition_id = uuid4()
 
     batch_service = EditionProductionService(uow_factory)
-    subject_service = SubjectProductionService(uow_factory)
 
     # Create batch
     subject_ids = [uuid4() for _ in range(3)]
@@ -343,7 +343,7 @@ async def test_batch_sequential_processing(
 
 @pytest.mark.asyncio
 async def test_production_error_states(
-    uow_factory: ProductionUnitOfWork,
+    uow_factory: ProductionUnitOfWorkFactory,
 ) -> None:
     """Test error handling in different scenarios.
 
@@ -391,7 +391,7 @@ async def test_production_error_states(
 
 @pytest.mark.asyncio
 async def test_production_batch_progress_calculation(
-    uow_factory: ProductionUnitOfWork,
+    uow_factory: ProductionUnitOfWorkFactory,
 ) -> None:
     """Test batch progress calculation from items.
 
@@ -418,7 +418,7 @@ async def test_production_batch_progress_calculation(
         assert all(item.status == "queued" for item in items)
 
         # Simulate completion of items
-        for i, item in enumerate(items[:3]):
+        for item in items[:3]:
             item.status = "completed"
             item.finished_at = datetime.now(UTC)
             await uow.edition_production_batch_items.save(item)
@@ -427,7 +427,6 @@ async def test_production_batch_progress_calculation(
 
     # Verify batch reflects progress
     async with uow_factory() as uow:
-        updated_batch = await uow.edition_production_batches.get(batch.id)
         items = await uow.edition_production_batch_items.list_for_batch(batch.id)
 
         completed = sum(1 for item in items if item.status == "completed")
@@ -436,7 +435,7 @@ async def test_production_batch_progress_calculation(
 
 @pytest.mark.asyncio
 async def test_production_cancellation_flow(
-    uow_factory: ProductionUnitOfWork,
+    uow_factory: ProductionUnitOfWorkFactory,
 ) -> None:
     """Test cancellation of subject and batch production.
 
@@ -469,7 +468,7 @@ async def test_production_cancellation_flow(
 
 @pytest.mark.asyncio
 async def test_production_conversation_management(
-    uow_factory: ProductionUnitOfWork,
+    uow_factory: ProductionUnitOfWorkFactory,
 ) -> None:
     """Test conversation lifecycle in production.
 

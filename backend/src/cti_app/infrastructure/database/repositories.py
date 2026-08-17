@@ -2768,6 +2768,14 @@ class SqlAlchemyEditionProductionBatchItemRepository:
         result = await self._session.execute(query)
         return [_edition_production_batch_item_from_row(row) for row in result.scalars()]
 
+    async def get_by_run(self, run_id: UUID) -> EditionProductionBatchItem | None:
+        query = select(EditionProductionBatchItemRow).where(
+            EditionProductionBatchItemRow.production_run_id == run_id
+        )
+        result = await self._session.execute(query)
+        row = result.scalars().first()
+        return _edition_production_batch_item_from_row(row) if row else None
+
 
 def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectProductionRun:
     from cti_app.domain.production import (

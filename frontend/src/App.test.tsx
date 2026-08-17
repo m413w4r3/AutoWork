@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 import type { Edition } from "./api/editions";
+import { withProductionNotStarted } from "./test-utils/fetchStubs";
 
 const iranEdition: Edition = {
   id: "30e5b0b8-2dba-48c3-81ca-9eaed5c22c62",
@@ -37,54 +38,56 @@ const emptyEditorialBoard = {
 
 /** Backend minimal pour une édition sans découverte ni job en cours. */
 function discoveryFetchMock() {
-  return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
-    const url =
-      typeof input === "string"
-        ? input
-        : input instanceof URL
-          ? input.href
-          : input.url;
-    if (url.endsWith("/discovery/import/preview")) {
-      return Response.json({
-        sha256: "b".repeat(64),
-        subject_count: 2,
-        publication_count: 3,
-        ioc_count: 5,
-        ioc_type_counts: { ipv4: 5 },
-        subjects: ["Campagne A", "Campagne B"],
-        warnings: ["Avertissement parser"],
-      });
-    }
-    if (url.endsWith("/discovery/import/confirm")) {
-      return Response.json({
-        batch_id: "9e2f4a1c-1d2b-4a3f-8c5e-6a7b8c9d0e1f",
-        reused: false,
-        source_mode: "manual_import",
-        subject_count: 2,
-        publication_count: 3,
-      });
-    }
-    if (url.includes("/discovery/candidates")) {
-      return Response.json({
-        batches: [],
-        candidates: [],
-        total: 0,
-        merge_stats: {
-          raw_batch_count: 0,
-          raw_candidate_count: 0,
-          consolidated_candidate_count: 0,
-          unique_publication_count: 0,
-          duplicate_publication_occurrence_count: 0,
-        },
-        warning: "",
-      });
-    }
-    if (url.includes("/editorial-groups"))
-      return Response.json(emptyEditorialBoard);
-    if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
-    void init;
-    return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
-  });
+  return vi.fn(
+    withProductionNotStarted((input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      if (url.endsWith("/discovery/import/preview")) {
+        return Response.json({
+          sha256: "b".repeat(64),
+          subject_count: 2,
+          publication_count: 3,
+          ioc_count: 5,
+          ioc_type_counts: { ipv4: 5 },
+          subjects: ["Campagne A", "Campagne B"],
+          warnings: ["Avertissement parser"],
+        });
+      }
+      if (url.endsWith("/discovery/import/confirm")) {
+        return Response.json({
+          batch_id: "9e2f4a1c-1d2b-4a3f-8c5e-6a7b8c9d0e1f",
+          reused: false,
+          source_mode: "manual_import",
+          subject_count: 2,
+          publication_count: 3,
+        });
+      }
+      if (url.includes("/discovery/candidates")) {
+        return Response.json({
+          batches: [],
+          candidates: [],
+          total: 0,
+          merge_stats: {
+            raw_batch_count: 0,
+            raw_candidate_count: 0,
+            consolidated_candidate_count: 0,
+            unique_publication_count: 0,
+            duplicate_publication_occurrence_count: 0,
+          },
+          warning: "",
+        });
+      }
+      if (url.includes("/editorial-groups"))
+        return Response.json(emptyEditorialBoard);
+      if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+      void init;
+      return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
+    }),
+  );
 }
 
 function renderApp() {
@@ -108,13 +111,15 @@ describe("App éditions", () => {
   it("affiche la liste avec badges, progression et lien détail", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(
-        Response.json({
-          items: [iranEdition],
-          total: 1,
-          page: 1,
-          page_size: 20,
-        }),
+      vi.fn(
+        withProductionNotStarted(() =>
+          Response.json({
+            items: [iranEdition],
+            total: 1,
+            page: 1,
+            page_size: 20,
+          }),
+        ),
       ),
     );
     renderApp();
@@ -146,21 +151,25 @@ describe("App éditions", () => {
   });
 
   it("crée une édition Iran et n’affiche que les transitions autorisées", async () => {
-    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.href
-            : input.url;
-      if (url === "/api/editions" && init?.method === "POST") {
-        return Response.json(iranEdition, { status: 201 });
-      }
-      if (url.includes("/editorial-groups"))
-        return Response.json(emptyEditorialBoard);
-      if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
-      return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
-    });
+    const fetchMock = vi.fn(
+      withProductionNotStarted(
+        (input: RequestInfo | URL, init?: RequestInit) => {
+          const url =
+            typeof input === "string"
+              ? input
+              : input instanceof URL
+                ? input.href
+                : input.url;
+          if (url === "/api/editions" && init?.method === "POST") {
+            return Response.json(iranEdition, { status: 201 });
+          }
+          if (url.includes("/editorial-groups"))
+            return Response.json(emptyEditorialBoard);
+          if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+          return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
+        },
+      ),
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState({}, "", "/editions/new");
     const user = userEvent.setup();
@@ -221,15 +230,17 @@ describe("App éditions", () => {
   it("rend les erreurs API accessibles", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(
-        Response.json(
-          {
-            detail: {
-              code: "storage_error",
-              message: "Service indisponible.",
+      vi.fn(
+        withProductionNotStarted(() =>
+          Response.json(
+            {
+              detail: {
+                code: "storage_error",
+                message: "Service indisponible.",
+              },
             },
-          },
-          { status: 503 },
+            { status: 503 },
+          ),
         ),
       ),
     );
@@ -243,50 +254,52 @@ describe("App éditions", () => {
   it("reprend le suivi d’une recherche après rechargement", async () => {
     const jobId = "20658589-a6d5-4af5-b026-d5c6fcb3b7f0";
     window.localStorage.setItem(`cti-discovery-job:${iranEdition.id}`, jobId);
-    const fetchMock = vi.fn((input: RequestInfo | URL) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.href
-            : input.url;
-      if (url.includes(`/api/jobs/${jobId}`))
-        return Response.json({
-          id: jobId,
-          kind: "discover_edition",
-          aggregate_type: "edition",
-          aggregate_id: iranEdition.id,
-          status: "succeeded",
-          progress_current: 4,
-          progress_total: 4,
-          user_message: "Lot persisté",
-          attempt: 1,
-          max_attempts: 1,
-          next_retry_at: null,
-          started_at: "2026-08-10T10:00:00Z",
-          finished_at: "2026-08-10T10:01:00Z",
-          heartbeat_at: "2026-08-10T10:01:00Z",
-          error_code: null,
-          error_message: null,
-          error_details: null,
-          correlation_id: "reload-test",
-          output_reference: "discovery-batch://batch",
-          cancellation_requested: false,
-          created_at: "2026-08-10T10:00:00Z",
-          updated_at: "2026-08-10T10:01:00Z",
-        });
-      if (url.includes("/discovery/candidates"))
-        return Response.json({
-          batches: [],
-          candidates: [],
-          total: 0,
-          warning: "",
-        });
-      if (url.includes("/editorial-groups"))
-        return Response.json(emptyEditorialBoard);
-      if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
-      return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
-    });
+    const fetchMock = vi.fn(
+      withProductionNotStarted((input: RequestInfo | URL) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (url.includes(`/api/jobs/${jobId}`))
+          return Response.json({
+            id: jobId,
+            kind: "discover_edition",
+            aggregate_type: "edition",
+            aggregate_id: iranEdition.id,
+            status: "succeeded",
+            progress_current: 4,
+            progress_total: 4,
+            user_message: "Lot persisté",
+            attempt: 1,
+            max_attempts: 1,
+            next_retry_at: null,
+            started_at: "2026-08-10T10:00:00Z",
+            finished_at: "2026-08-10T10:01:00Z",
+            heartbeat_at: "2026-08-10T10:01:00Z",
+            error_code: null,
+            error_message: null,
+            error_details: null,
+            correlation_id: "reload-test",
+            output_reference: "discovery-batch://batch",
+            cancellation_requested: false,
+            created_at: "2026-08-10T10:00:00Z",
+            updated_at: "2026-08-10T10:01:00Z",
+          });
+        if (url.includes("/discovery/candidates"))
+          return Response.json({
+            batches: [],
+            candidates: [],
+            total: 0,
+            warning: "",
+          });
+        if (url.includes("/editorial-groups"))
+          return Response.json(emptyEditorialBoard);
+        if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+        return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
+      }),
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
 
@@ -386,55 +399,59 @@ describe("App éditions", () => {
       total: 1,
       warning: "Propositions non vérifiées",
     };
-    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.href
-            : input.url;
-      if (url.includes("/discovery/candidates"))
-        return Response.json(candidateResult);
-      if (url.includes("/editorial-groups"))
-        return Response.json(emptyEditorialBoard);
-      if (url.endsWith("/discovery") && init?.method === "POST") {
-        return Response.json(
-          {
-            job_id: "20658589-a6d5-4af5-b026-d5c6fcb3b7f0",
-            status: "queued",
-            reused: false,
-          },
-          { status: 202 },
-        );
-      }
-      if (url.includes("/api/jobs/")) {
-        return Response.json({
-          id: "20658589-a6d5-4af5-b026-d5c6fcb3b7f0",
-          kind: "discover_edition",
-          aggregate_type: "edition",
-          aggregate_id: iranEdition.id,
-          status: "succeeded",
-          progress_current: 4,
-          progress_total: 4,
-          user_message: "Candidats proposés — vérification humaine requise",
-          attempt: 1,
-          max_attempts: 1,
-          next_retry_at: null,
-          started_at: "2026-08-10T10:00:00Z",
-          finished_at: "2026-08-10T10:01:00Z",
-          heartbeat_at: "2026-08-10T10:01:00Z",
-          error_code: null,
-          error_message: null,
-          correlation_id: "test",
-          output_reference: "discovery-batch://batch",
-          cancellation_requested: false,
-          created_at: "2026-08-10T10:00:00Z",
-          updated_at: "2026-08-10T10:01:00Z",
-        });
-      }
-      if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
-      return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
-    });
+    const fetchMock = vi.fn(
+      withProductionNotStarted(
+        (input: RequestInfo | URL, init?: RequestInit) => {
+          const url =
+            typeof input === "string"
+              ? input
+              : input instanceof URL
+                ? input.href
+                : input.url;
+          if (url.includes("/discovery/candidates"))
+            return Response.json(candidateResult);
+          if (url.includes("/editorial-groups"))
+            return Response.json(emptyEditorialBoard);
+          if (url.endsWith("/discovery") && init?.method === "POST") {
+            return Response.json(
+              {
+                job_id: "20658589-a6d5-4af5-b026-d5c6fcb3b7f0",
+                status: "queued",
+                reused: false,
+              },
+              { status: 202 },
+            );
+          }
+          if (url.includes("/api/jobs/")) {
+            return Response.json({
+              id: "20658589-a6d5-4af5-b026-d5c6fcb3b7f0",
+              kind: "discover_edition",
+              aggregate_type: "edition",
+              aggregate_id: iranEdition.id,
+              status: "succeeded",
+              progress_current: 4,
+              progress_total: 4,
+              user_message: "Candidats proposés — vérification humaine requise",
+              attempt: 1,
+              max_attempts: 1,
+              next_retry_at: null,
+              started_at: "2026-08-10T10:00:00Z",
+              finished_at: "2026-08-10T10:01:00Z",
+              heartbeat_at: "2026-08-10T10:01:00Z",
+              error_code: null,
+              error_message: null,
+              correlation_id: "test",
+              output_reference: "discovery-batch://batch",
+              cancellation_requested: false,
+              created_at: "2026-08-10T10:00:00Z",
+              updated_at: "2026-08-10T10:01:00Z",
+            });
+          }
+          if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+          return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
+        },
+      ),
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
     const user = userEvent.setup();

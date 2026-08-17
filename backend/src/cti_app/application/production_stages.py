@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from cti_app.application.persistence import ProductionUnitOfWork
+from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_prompts import ProductionPromptTemplates
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -26,7 +26,7 @@ def compute_input_hash(input_data: dict[str, Any]) -> str:
 class ReferenceResearchService:
     """Manages reference research stage."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWork) -> None:
+    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
 
     async def prepare_references_stage(
@@ -118,7 +118,7 @@ class ReferenceResearchService:
 class ExtractionService:
     """Manages technical CTI extraction stage."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWork) -> None:
+    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
 
     async def prepare_extraction_stage(
@@ -203,7 +203,7 @@ class ExtractionService:
 class SynthesisService:
     """Manages technical synthesis stage."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWork) -> None:
+    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
 
     async def prepare_synthesis_stage(
@@ -286,7 +286,7 @@ class SynthesisService:
 class BriefAssemblyService:
     """Manages brief assembly stage (deterministic)."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWork) -> None:
+    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
 
     async def assemble_brief(
@@ -396,7 +396,10 @@ class BriefAssemblyService:
                 for cve in indicators["cves"][:10]:
                     ioc_section += f"- {cve}\n"
         else:
-            ioc_section += f"{extraction_metadata.get('element_counts', {}).get('network_artifacts', 0)} artefacts réseau identifiés\n"
+            network_artifacts = extraction_metadata.get("element_counts", {}).get(
+                "network_artifacts", 0
+            )
+            ioc_section += f"{network_artifacts} artefacts réseau identifiés\n"
 
         # Build final brief
         brief = f"""# {subject_title}
@@ -424,7 +427,7 @@ Analyse produite automatiquement basée sur les sources collectées et l'analyse
 class ProductionQAService:
     """Automated QA checks for production."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWork) -> None:
+    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
 
     async def run_qa(
@@ -447,7 +450,7 @@ class ProductionQAService:
         """
         checks = {}
         errors = []
-        warnings = []
+        warnings: list[str] = []
 
         # Check 1: References present
         checks["references_present"] = references_artifact is not None

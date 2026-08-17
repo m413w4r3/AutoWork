@@ -68,14 +68,22 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
     (group) => group.status === "proposed",
   );
 
+  const ready = board.data.groups.filter(
+    (group) => group.status === "selected",
+  );
+
+  // Selected briefs are what the batch production can act on.
+  const eligibleBriefs = ready.flatMap((group) =>
+    group.editorial_type === "brief" && group.subject_id
+      ? [{ subjectId: group.subject_id, title: group.title }]
+      : [],
+  );
+
   // Production queue for batch brief generation
   const productionQueue = (
     <div className="production-queue-section">
-      <ProductionQueue editionId={editionId} />
+      <ProductionQueue editionId={editionId} briefs={eligibleBriefs} />
     </div>
-  );
-  const ready = board.data.groups.filter(
-    (group) => group.status === "selected",
   );
   const proposedIds = new Set(proposed.map((group) => group.id));
   const activeDraftEntries = draftEntries.filter(([groupId]) =>
@@ -118,133 +126,135 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
             <strong>{currentUndecided}</strong> encore à décider
           </div>
         </div>
-      <p className="verification-warning" role="note">
-        IOC repérés pendant la recherche — non encore vérifiés depuis les
-        sources.
-      </p>
-      {action.error ? (
-        <p role="alert" className="error-message">
-          {action.error.message}
+        <p className="verification-warning" role="note">
+          IOC repérés pendant la recherche — non encore vérifiés depuis les
+          sources.
         </p>
-      ) : null}
+        {action.error ? (
+          <p role="alert" className="error-message">
+            {action.error.message}
+          </p>
+        ) : null}
 
-      <section aria-labelledby="to-review-heading">
-        <h3 id="to-review-heading">À examiner</h3>
-        {proposed.length === 0 ? (
-          <p className="empty-state">Aucun groupe en attente de décision.</p>
-        ) : (
-          <div className="editorial-group-list">
+        <section aria-labelledby="to-review-heading">
+          <h3 id="to-review-heading">À examiner</h3>
+          {proposed.length === 0 ? (
+            <p className="empty-state">Aucun groupe en attente de décision.</p>
+          ) : (
+            <div className="editorial-group-list">
+              {proposed.map((group) => (
+                <EditorialDecisionCard
+                  key={group.id}
+                  group={group}
+                  decision={drafts[group.id] ?? "undecided"}
+                  pending={action.isPending}
+                  onDecision={(decision) =>
+                    setDrafts((current) => {
+                      if (decision === "undecided") {
+                        const next = { ...current };
+                        delete next[group.id];
+                        return next;
+                      }
+                      return { ...current, [group.id]: decision };
+                    })
+                  }
+                />
+              ))}
+            </div>
+          )}
+          <button
+            className="button confirm-selection"
+            disabled={activeDraftEntries.length === 0 || action.isPending}
+            onClick={() =>
+              action.mutate(() =>
+                confirmEditorialDecisions(
+                  editionId,
+                  activeDraftEntries.map(([groupId, decision]) => ({
+                    group_id: groupId,
+                    version:
+                      proposed.find((group) => group.id === groupId)?.version ??
+                      0,
+                    decision,
+                  })),
+                ),
+              )
+            }
+          >
+            Confirmer la sélection ({activeDraftEntries.length})
+          </button>
+        </section>
+
+        <section className="ready-subjects" aria-labelledby="ready-heading">
+          <h3 id="ready-heading">Prêts à traiter</h3>
+          <p className="ready-indicator">
+            {ready.length} sujets prêts · {board.data.selected_briefs} brève
+            {board.data.selected_briefs > 1 ? "s" : ""} ·{" "}
+            {board.data.selected_major} article
+            {board.data.selected_major > 1 ? "s" : ""} principal
+            {board.data.selected_major > 1 ? "ux" : ""}
+          </p>
+          {ready.length === 0 ? (
+            <p className="empty-state">Aucun sujet confirmé pour le moment.</p>
+          ) : (
+            <ul className="ready-subject-list">
+              {ready.map((group) => (
+                <li key={group.id}>
+                  <div>
+                    <strong>{group.title}</strong>
+                    <small>
+                      {group.editorial_type === "brief"
+                        ? "Brève"
+                        : "Article principal + pivots"}
+                    </small>
+                  </div>
+                  {group.subject_id ? (
+                    <a href={`/subjects/${group.subject_id}`}>
+                      Ouvrir le sujet
+                    </a>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <details className="advanced-editorial-panel">
+          <summary>Organiser les publications</summary>
+          <p>
+            Fusion, séparation et signaux de regroupement restent disponibles
+            pour les cas ambigus.
+          </p>
+          <button
+            className="button button--secondary"
+            disabled={checkedProposed.length < 2 || action.isPending}
+            onClick={() =>
+              action.mutate(() =>
+                mergeEditorialGroups(editionId, checkedProposed),
+              )
+            }
+          >
+            Fusionner les groupes cochés
+          </button>
+          <div className="advanced-group-list">
             {proposed.map((group) => (
-              <EditorialDecisionCard
+              <AdvancedGroupControls
                 key={group.id}
                 group={group}
-                decision={drafts[group.id] ?? "undecided"}
+                checked={checkedGroups.includes(group.id)}
                 pending={action.isPending}
-                onDecision={(decision) =>
-                  setDrafts((current) => {
-                    if (decision === "undecided") {
-                      const next = { ...current };
-                      delete next[group.id];
-                      return next;
-                    }
-                    return { ...current, [group.id]: decision };
-                  })
+                editionId={editionId}
+                onChecked={(checked) =>
+                  setCheckedGroups((current) =>
+                    checked
+                      ? [...new Set([...current, group.id])]
+                      : current.filter((id) => id !== group.id),
+                  )
                 }
+                onAction={(operation) => action.mutate(operation)}
               />
             ))}
           </div>
-        )}
-        <button
-          className="button confirm-selection"
-          disabled={activeDraftEntries.length === 0 || action.isPending}
-          onClick={() =>
-            action.mutate(() =>
-              confirmEditorialDecisions(
-                editionId,
-                activeDraftEntries.map(([groupId, decision]) => ({
-                  group_id: groupId,
-                  version:
-                    proposed.find((group) => group.id === groupId)?.version ??
-                    0,
-                  decision,
-                })),
-              ),
-            )
-          }
-        >
-          Confirmer la sélection ({activeDraftEntries.length})
-        </button>
-      </section>
-
-      <section className="ready-subjects" aria-labelledby="ready-heading">
-        <h3 id="ready-heading">Prêts à traiter</h3>
-        <p className="ready-indicator">
-          {ready.length} sujets prêts · {board.data.selected_briefs} brève
-          {board.data.selected_briefs > 1 ? "s" : ""} ·{" "}
-          {board.data.selected_major} article
-          {board.data.selected_major > 1 ? "s" : ""} principal
-          {board.data.selected_major > 1 ? "ux" : ""}
-        </p>
-        {ready.length === 0 ? (
-          <p className="empty-state">Aucun sujet confirmé pour le moment.</p>
-        ) : (
-          <ul className="ready-subject-list">
-            {ready.map((group) => (
-              <li key={group.id}>
-                <div>
-                  <strong>{group.title}</strong>
-                  <small>
-                    {group.editorial_type === "brief"
-                      ? "Brève"
-                      : "Article principal + pivots"}
-                  </small>
-                </div>
-                {group.subject_id ? (
-                  <a href={`/subjects/${group.subject_id}`}>Ouvrir le sujet</a>
-                ) : null}
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-
-      <details className="advanced-editorial-panel">
-        <summary>Organiser les publications</summary>
-        <p>
-          Fusion, séparation et signaux de regroupement restent disponibles pour
-          les cas ambigus.
-        </p>
-        <button
-          className="button button--secondary"
-          disabled={checkedProposed.length < 2 || action.isPending}
-          onClick={() =>
-            action.mutate(() =>
-              mergeEditorialGroups(editionId, checkedProposed),
-            )
-          }
-        >
-          Fusionner les groupes cochés
-        </button>
-        <div className="advanced-group-list">
-          {proposed.map((group) => (
-            <AdvancedGroupControls
-              key={group.id}
-              group={group}
-              checked={checkedGroups.includes(group.id)}
-              pending={action.isPending}
-              editionId={editionId}
-              onChecked={(checked) =>
-                setCheckedGroups((current) =>
-                  checked
-                    ? [...new Set([...current, group.id])]
-                    : current.filter((id) => id !== group.id),
-                )
-              }
-              onAction={(operation) => action.mutate(operation)}
-            />
-          ))}
-        </div>
-      </details>
+        </details>
       </section>
     </>
   );

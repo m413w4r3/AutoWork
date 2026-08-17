@@ -3,14 +3,15 @@
  * Displays production status and controls for a subject
  */
 
-import { useEffect, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   getSubjectProduction,
   retryReferences,
   retrySynthesis,
   cancelSubjectProduction,
+  startSubjectProduction,
 } from "../api/production";
+import type { StageStatus } from "../api/production";
 import { ProductionStageCard } from "./ProductionStageCard";
 
 interface SubjectProductionProps {
@@ -22,13 +23,21 @@ export function SubjectProduction({
   subjectId,
   onClose,
 }: SubjectProductionProps) {
-  const [autoRefresh, setAutoRefresh] = useState(true);
-
   // Fetch production status
-  const { data: status, isLoading, error, refetch } = useQuery({
+  const {
+    data: status,
+    isLoading,
+    error,
+    refetch,
+  } = useQuery({
     queryKey: ["production", subjectId],
     queryFn: () => getSubjectProduction(subjectId),
-    refetchInterval: autoRefresh ? 2000 : false,
+    // Only poll while a run is actually in flight; a finished or absent run
+    // has nothing left to watch.
+    refetchInterval: (query) => {
+      const runStatus = query.state.data?.status;
+      return runStatus === "queued" || runStatus === "running" ? 2000 : false;
+    },
   });
 
   // Mutations
@@ -45,21 +54,49 @@ export function SubjectProduction({
   const cancelMutation = useMutation({
     mutationFn: () => cancelSubjectProduction(subjectId),
     onSuccess: () => {
-      refetch();
+      void refetch();
       setTimeout(() => onClose?.(), 1000);
     },
   });
 
-  // Auto-stop refresh when complete
-  useEffect(() => {
-    if (status?.status === "ready" || status?.status === "needs_review" || status?.status === "failed") {
-      setAutoRefresh(false);
-    }
-  }, [status?.status]);
+  const startMutation = useMutation({
+    mutationFn: () => startSubjectProduction(subjectId),
+    onSuccess: () => void refetch(),
+  });
 
-  if (isLoading) return <div className="p-4">Loading production status...</div>;
-  if (error) return <div className="p-4 text-red-600">Error: {String(error)}</div>;
-  if (!status) return <div className="p-4">No production data</div>;
+  if (isLoading)
+    return <div className="p-4">Chargement de l’état de production…</div>;
+  if (error)
+    return (
+      <div className="p-4 text-red-600" role="alert">
+        L’état de production est inaccessible : {String(error)}
+      </div>
+    );
+
+  // No run yet: this is the entry point, not an error.
+  if (!status) {
+    return (
+      <section className="production-start space-y-3">
+        <h2 className="text-xl font-bold">Production de la brève</h2>
+        <p className="text-sm text-gray-600">
+          Les sources seront collectées, puis ChatGPT effectuera la recherche
+          des références, l’extraction CTI et la synthèse.
+        </p>
+        {startMutation.error ? (
+          <p className="text-red-600 text-sm" role="alert">
+            {String(startMutation.error)}
+          </p>
+        ) : null}
+        <button
+          className="button px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+          disabled={startMutation.isPending}
+          onClick={() => startMutation.mutate()}
+        >
+          {startMutation.isPending ? "Démarrage…" : "Produire cette brève"}
+        </button>
+      </section>
+    );
+  }
 
   const stageList = [
     "sources",
@@ -68,8 +105,10 @@ export function SubjectProduction({
     "synthesis",
     "assembly",
   ];
+  // Tolerate a response without per-stage detail rather than crashing the page.
+  const stages: Partial<Record<string, StageStatus>> = status.stages ?? {};
   const completedStages = stageList.filter(
-    (stage) => status.stages[stage]?.status === "succeeded"
+    (stage) => stages[stage]?.status === "succeeded",
   ).length;
 
   return (
@@ -80,7 +119,7 @@ export function SubjectProduction({
           <div>
             <h1 className="text-2xl font-bold">{status.title}</h1>
             <p className="text-sm text-gray-600">
-              Type: {status.editorial_type}
+              Type : {status.editorial_type}
             </p>
           </div>
           <div className="text-right">
@@ -104,8 +143,8 @@ export function SubjectProduction({
       {/* Progress Bar */}
       <div className="space-y-2">
         <div className="flex justify-between text-sm">
-          <span className="font-semibold">Progress</span>
-          <span>{completedStages} / 5 stages</span>
+          <span className="font-semibold">Progression</span>
+          <span>{completedStages} / 5 étapes</span>
         </div>
         <div className="w-full bg-gray-200 rounded-full h-2">
           <div
@@ -121,7 +160,7 @@ export function SubjectProduction({
           <ProductionStageCard
             key={stage}
             stage={stage}
-            status={status.stages[stage]?.status || "pending"}
+            status={stages[stage]?.status || "pending"}
             stageNumber={i + 1}
             isActive={status.current_stage === stage}
           />
@@ -129,14 +168,14 @@ export function SubjectProduction({
       </div>
 
       {/* Current Stage Details */}
-      {status.stages[status.current_stage] && (
+      {stages[status.current_stage] && (
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
           <h3 className="font-semibold text-blue-900">
-            Current: {status.current_stage.toUpperCase()}
+            En cours : {status.current_stage.toUpperCase()}
           </h3>
           <p className="text-sm text-blue-700 mt-2">
-            {status.stages[status.current_stage]?.error_message ||
-              "Processing..."}
+            {stages[status.current_stage]?.error_message ||
+              "Traitement en cours…"}
           </p>
         </div>
       )}
@@ -144,12 +183,12 @@ export function SubjectProduction({
       {/* Error Display */}
       {status.status === "needs_review" && (
         <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
-          <h3 className="font-semibold text-yellow-900">Review Needed</h3>
+          <h3 className="font-semibold text-yellow-900">Revue nécessaire</h3>
           <p className="text-sm text-yellow-700 mt-2">
-            Code: {status.stages[status.current_stage]?.error_code || "unknown"}
+            Code : {stages[status.current_stage]?.error_code || "inconnu"}
           </p>
           <p className="text-sm text-yellow-700 mt-1">
-            {status.stages[status.current_stage]?.error_message}
+            {stages[status.current_stage]?.error_message}
           </p>
         </div>
       )}
@@ -164,8 +203,8 @@ export function SubjectProduction({
               className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
             >
               {retryReferencesMutation.isPending
-                ? "Retrying..."
-                : "Retry References"}
+                ? "Relance…"
+                : "Relancer les références"}
             </button>
             <button
               onClick={() => retrySynthesisMutation.mutate()}
@@ -173,8 +212,8 @@ export function SubjectProduction({
               className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
             >
               {retrySynthesisMutation.isPending
-                ? "Retrying..."
-                : "Retry Synthesis"}
+                ? "Relance…"
+                : "Relancer la synthèse"}
             </button>
           </>
         )}
@@ -185,7 +224,7 @@ export function SubjectProduction({
             disabled={cancelMutation.isPending}
             className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50"
           >
-            {cancelMutation.isPending ? "Cancelling..." : "Cancel"}
+            {cancelMutation.isPending ? "Annulation…" : "Annuler"}
           </button>
         )}
 
@@ -194,20 +233,20 @@ export function SubjectProduction({
             onClick={onClose}
             className="px-4 py-2 bg-gray-300 text-gray-800 rounded hover:bg-gray-400 ml-auto"
           >
-            Close
+            Fermer
           </button>
         )}
       </div>
 
       {/* Metadata */}
       <div className="text-xs text-gray-500 border-t pt-4">
-        <p>Run ID: {status.run_id}</p>
-        <p>Created: {new Date(status.created_at).toLocaleString()}</p>
+        <p>Identifiant du run : {status.run_id}</p>
+        <p>Créé : {new Date(status.created_at).toLocaleString()}</p>
         {status.started_at && (
-          <p>Started: {new Date(status.started_at).toLocaleString()}</p>
+          <p>Démarré : {new Date(status.started_at).toLocaleString()}</p>
         )}
         {status.finished_at && (
-          <p>Finished: {new Date(status.finished_at).toLocaleString()}</p>
+          <p>Terminé : {new Date(status.finished_at).toLocaleString()}</p>
         )}
       </div>
     </div>

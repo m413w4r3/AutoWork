@@ -3,7 +3,6 @@
  * Shows the status of a single production stage
  */
 
-
 interface ProductionStageCardProps {
   stage: string;
   status: string;
@@ -34,9 +33,14 @@ export function ProductionStageCard({
   stageNumber,
   isActive,
 }: ProductionStageCardProps) {
-  const statusInfo = (STATUS_ICONS[status] || STATUS_ICONS["pending"]) as { icon: string; color: string };
+  const statusInfo = (STATUS_ICONS[status] || STATUS_ICONS["pending"]) as {
+    icon: string;
+    color: string;
+  };
 
-  const bgColor = isActive ? "bg-blue-50 border-blue-300" : "bg-white border-gray-200";
+  const bgColor = isActive
+    ? "bg-blue-50 border-blue-300"
+    : "bg-white border-gray-200";
   const borderColor = isActive ? "border-2" : "border";
 
   return (
@@ -54,9 +58,7 @@ export function ProductionStageCard({
       </h3>
 
       {/* Status Icon */}
-      <div className={`text-2xl ${statusInfo.color}`}>
-        {statusInfo.icon}
-      </div>
+      <div className={`text-2xl ${statusInfo.color}`}>{statusInfo.icon}</div>
 
       {/* Status Label */}
       <p className="text-xs text-center text-gray-600 capitalize">

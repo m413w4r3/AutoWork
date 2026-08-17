@@ -324,6 +324,11 @@ class UnitOfWork(Protocol):
     rejected_model_proposals: RejectedModelProposalRepository
     brief_evidence_packs: BriefEvidencePackRepository
     brief_drafts: BriefDraftRepository
+    # Defined further down in this module.
+    subject_production_runs: "SubjectProductionRunRepository"
+    production_artifacts: "ProductionArtifactRepository"
+    edition_production_batches: "EditionProductionBatchRepository"
+    edition_production_batch_items: "EditionProductionBatchItemRepository"
 
     async def __aenter__(self) -> Self: ...
 
@@ -450,6 +455,8 @@ class EditionProductionBatchItemRepository(Protocol):
     async def append_many(self, items: Sequence[EditionProductionBatchItem]) -> None: ...
 
     async def list_for_batch(self, batch_id: UUID) -> Sequence[EditionProductionBatchItem]: ...
+
+    async def get_by_run(self, run_id: UUID) -> EditionProductionBatchItem | None: ...
 
 
 class ProductionUnitOfWork(Protocol):

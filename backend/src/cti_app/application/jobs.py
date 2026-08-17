@@ -564,6 +564,8 @@ def create_job_registry(
     collection_service: object | None = None,
     brief_service: object | None = None,
     uow_factory: object | None = None,
+    model_conversation_service: object | None = None,
+    production_chain: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
@@ -596,11 +598,27 @@ def create_job_registry(
             raise TypeError("brief_service must be a BriefService")
         register_brief_jobs(registry, brief_service)
     if uow_factory is not None:
-        from cti_app.application.production_jobs import register_production_jobs
+        from cti_app.application.model_conversations import ModelConversationService
+        from cti_app.application.production_jobs import (
+            ProductionStageChain,
+            register_production_jobs,
+        )
 
         if not callable(uow_factory):
             raise TypeError("uow_factory must be callable")
-        register_production_jobs(registry, uow_factory)
+        if model_conversation_service is not None and not isinstance(
+            model_conversation_service, ModelConversationService
+        ):
+            raise TypeError("model_conversation_service must be a ModelConversationService")
+        if production_chain is not None and not isinstance(production_chain, ProductionStageChain):
+            raise TypeError("production_chain must be a ProductionStageChain")
+        register_production_jobs(
+            registry,
+            uow_factory,
+            chain=production_chain,
+            model_service=model_conversation_service,
+            collection_service=collection_service,
+        )
     return registry
 
 
