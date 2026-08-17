@@ -690,6 +690,7 @@ class DiscoveryService:
                     bridge_state=exc.background_status,
                     polls=polls,
                     elapsed_seconds=time.monotonic() - started,
+                    progress=exc.progress or {},
                 )
                 await self._background_waiter(self._background_poll_interval_seconds)
                 continue
@@ -701,6 +702,7 @@ class DiscoveryService:
                 bridge_state="completed",
                 polls=polls,
                 elapsed_seconds=time.monotonic() - started,
+                progress={},
             )
             if execution.run.status is not ModelRunStatus.SUCCEEDED:
                 if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
@@ -738,6 +740,7 @@ class DiscoveryService:
         bridge_state: str,
         polls: int,
         elapsed_seconds: float,
+        progress: dict[str, Any],
     ) -> None:
         job_heartbeat_at = datetime.now(UTC).isoformat()
         correlation_id = get_correlation_id()
@@ -751,6 +754,10 @@ class DiscoveryService:
                 "poll_count": polls,
                 "elapsed_seconds": round(elapsed_seconds, 3),
                 "correlation_id": correlation_id,
+                "chatgpt_phase": progress.get("phase"),
+                "chatgpt_output_chars": progress.get("output_chars"),
+                "chatgpt_stable_for_ms": progress.get("stable_for_ms"),
+                "chatgpt_completion_signal": progress.get("completion_signal"),
             }
         )
         logger.info(

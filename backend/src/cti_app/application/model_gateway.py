@@ -57,10 +57,12 @@ class BackgroundResponsePendingError(ModelGatewayError):
         *,
         response_id: str | None = None,
         background_status: str = "unknown",
+        progress: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.response_id = response_id
         self.background_status = background_status
+        self.progress = progress or {}
 
 
 class ModelRoutingHint(StrEnum):
@@ -372,8 +374,15 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 == (str(source_model_run_id) if source_model_run_id else None)
             ):
                 return existing
-            if existing.status is not ModelRunStatus.NEEDS_REVIEW:
-                raise ModelGatewayError("ModelRun is not waiting for this recovery")
+            # Vérifier que le ModelRun peut être adopté avec cette provenance
+            allowed = {ModelRunStatus.NEEDS_REVIEW}
+            if provenance == "manual_import":
+                allowed |= {
+                    ModelRunStatus.WAITING_BACKGROUND,
+                    ModelRunStatus.FAILED,
+                }
+            if existing.status not in allowed:
+                raise ModelGatewayError("ModelRun is not eligible for this recovery")
         reference = await self._output_store.store(
             content, mime_type="text/markdown; charset=utf-8"
         )
@@ -492,6 +501,11 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         "Background response is still pending",
                         response_id=result.response_id or run.response_id,
                         background_status=str(result.metadata.get("background_status", "unknown")),
+                        progress=(
+                            result.metadata.get("bridge_progress", {})
+                            if isinstance(result.metadata.get("bridge_progress"), dict)
+                            else {}
+                        ),
                     )
                 if result.status is AdapterResultStatus.NEEDS_REVIEW:
                     run.require_review(

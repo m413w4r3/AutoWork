@@ -574,6 +574,8 @@ async def _recovery_context(
             JobStatus.QUEUED,
             JobStatus.RUNNING,
             JobStatus.SUCCEEDED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
         }
     ):
         raise ValueError("Job is not waiting for this discovery recovery")

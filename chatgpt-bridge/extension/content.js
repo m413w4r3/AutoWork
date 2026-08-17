@@ -103,11 +103,21 @@ const MOTS_PLUS_MODELES = /plus de mod|autres mod|more models|legacy models/;
 const POLL_MS = 120;
 const APPEAR_TIMEOUT_MS = 30000; // délai d'apparition de la bulle de réponse
 const UPLOAD_TIMEOUT_MS = 120000; // upload des pièces jointes
-const SETTLE_MS = 2000; // stabilité exigée quand un signal de fin est confirmé
-const SETTLE_UNKNOWN_MS = 8000; // stabilité exigée quand aucun signal n'est reconnu
-const EMPTY_FINAL_SETTLE_MS = 10000; // fin fiable sans corps final
-const NO_MARKDOWN_FALLBACK_MS = 25000; // au-delà, on lit le tour entier faute de mieux
-const HEARTBEAT_INTERVAL_MS = 20000; // réarme l'idle timeout sans transmettre le texte
+// const SETTLE_MS = 2000; // stabilité exigée quand un signal de fin est confirmé
+// const SETTLE_UNKNOWN_MS = 8000; // stabilité exigée quand aucun signal n'est reconnu
+// const EMPTY_FINAL_SETTLE_MS = 10000; // fin fiable sans corps final
+// const NO_MARKDOWN_FALLBACK_MS = 25000; // au-delà, on lit le tour entier faute de mieux
+// const HEARTBEAT_INTERVAL_MS = 20000; // réarme l'idle timeout sans transmettre le texte
+
+const SETTLE_MS = 2000; // fin UI confirmée
+const SETTLE_UNKNOWN_MS = 15000; // pas de signal UI fiable : prudence
+const EMPTY_FINAL_SETTLE_MS = 10000;
+const NO_MARKDOWN_FALLBACK_MS = 25000;
+const HEARTBEAT_INTERVAL_MS = 20000;
+
+// Une réponse non vide et inchangée ne doit jamais rester "running"
+// pendant plusieurs minutes uniquement à cause d'un signal DOM périmé.
+const FINALIZATION_STALL_MS = 45000;
 
 let currentJob = null;
 const claimedRequestIds = new Set();
@@ -929,10 +939,11 @@ async function streamAnswer(job, locator, before) {
 
   while (!job.aborted) {
     await sleep(POLL_MS);
-    if (Date.now() - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
-      reply({ type: "heartbeat", id: job.id });
-      lastHeartbeatAt = Date.now();
-    }
+    // if (Date.now() - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+      // reply({ type: "heartbeat", id: job.id });
+      // lastHeartbeatAt = Date.now();
+    // }
+    // heartbeat envoyé plus bas, après l'observation du DOM
 
     // Re-recherche du tour à chaque itération, jamais de référence gardée :
     // React remplace le nœud du message entre la phase de réflexion et la
@@ -983,6 +994,33 @@ async function streamAnswer(job, locator, before) {
           : SETTLE_MS;
     stableForMs = stableSince === null ? 0 : Date.now() - stableSince;
     const stable = stableForMs >= need;
+    if (Date.now() - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+      const phase =
+        completion.signal === "reasoning"
+          ? "reasoning"
+          : completion.signal === "stop_button" ||
+              completion.signal === "streaming"
+            ? "generating"
+            : full.length === 0
+              ? "waiting_answer"
+              : stableForMs > 0
+                ? "stabilizing"
+                : "answering";
+
+      reply({
+        type: "heartbeat",
+        id: job.id,
+        progress: {
+          phase,
+          output_chars:
+            globalThis.ChatGPTBridgeFinalOutput.outputChars(full),
+          stable_for_ms: stableForMs,
+          completion_signal: completion.signal,
+          completion_confidence: completion.confidence,
+        },
+      });
+      lastHeartbeatAt = Date.now();
+    }
     const outcome = globalThis.ChatGPTBridgeFinalOutput.settledOutcome({
       completion,
       text: full,
@@ -1002,21 +1040,56 @@ async function streamAnswer(job, locator, before) {
         turn_locator: turnLocator(turn),
       };
     }
+
+    if (full.length > 0 && stableForMs >= FINALIZATION_STALL_MS) {
+      return {
+        text: full,
+        visible_citations: snapshot?.visible_citations || [],
+        serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
+        completion_signal: completion.signal,
+        completion_confidence: completion.confidence,
+        stable_for_ms: stableForMs,
+        incomplete: true,
+        incomplete_reason: "finalization_stalled",
+        turn_locator: turnLocator(turn),
+      };
+    }
+    //if (stable && finished !== false && full.length > 0) {
+      //const verificationRoot = answerRoot(turn, true);
+      //const verification = verificationRoot
+        //? readAnswer(verificationRoot, false)
+        //: null;
+      //const citationsIdentical =
+        //verification &&
+        //JSON.stringify(verification.visible_citations) ===
+          //JSON.stringify(snapshot.visible_citations);
+      //if (verification && verification.text === full && citationsIdentical) {
+        //output.observe(verification.text);
+        //finalSerialized = verification;
+        //finalCompletion = completion;
+        //break;
+      //}
+      //vu = verification ? verification.text : "";
+      //stableSince = null;
+    //}
     if (stable && finished !== false && full.length > 0) {
       const verificationRoot = answerRoot(turn, true);
       const verification = verificationRoot
         ? readAnswer(verificationRoot, false)
         : null;
-      const citationsIdentical =
-        verification &&
-        JSON.stringify(verification.visible_citations) ===
-          JSON.stringify(snapshot.visible_citations);
-      if (verification && verification.text === full && citationsIdentical) {
+
+      // La décision de fin porte uniquement sur le contenu textuel.
+      // Les citations restent des métadonnées et peuvent encore être
+      // réordonnées/enrichies par l'UI après la fin visible de la réponse.
+      if (verification && verification.text === full) {
         output.observe(verification.text);
         finalSerialized = verification;
         finalCompletion = completion;
         break;
       }
+
+      // Le texte a réellement changé entre les deux lectures :
+      // on recommence la fenêtre de stabilisation.
       vu = verification ? verification.text : "";
       stableSince = null;
     }
@@ -1193,8 +1266,15 @@ async function captureLaterResponse(msg) {
   const later = turns.slice(expected);
   for (let index = later.length - 1; index >= 0; index -= 1) {
     const turn = later[index];
+    //const completion = completionState(turn);
+    //if (completion.finished !== true) continue;
+    //const root = answerRoot(turn, true);
     const completion = completionState(turn);
-    if (completion.finished !== true) continue;
+
+    // On refuse seulement une réponse explicitement encore active.
+    // Un état DOM "unknown" est acceptable pour une PREVIEW humaine.
+    if (completion.finished === false) continue;
+
     const root = answerRoot(turn, true);
     const serialized = root ? readAnswer(root, false) : null;
     if (!serialized?.text?.trim()) continue;
@@ -1218,6 +1298,10 @@ async function captureLaterResponse(msg) {
         completion_signal: completion.signal,
         completion_confidence: completion.confidence,
         content_script_version: VERSION,
+        capture_confidence:
+          completion.finished === true
+          ? "verified_final"
+          : "visible_unknown",
       },
     };
   }

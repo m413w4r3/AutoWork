@@ -191,8 +191,14 @@ class ModelRun:
         source_model_run_id: UUID | None = None,
         now: datetime | None = None,
     ) -> None:
-        if self.status is not ModelRunStatus.NEEDS_REVIEW:
-            raise ValueError("Model run is not waiting for recovery")
+        allowed = {ModelRunStatus.NEEDS_REVIEW}
+        if provenance == "manual_import":
+            allowed |= {
+                ModelRunStatus.WAITING_BACKGROUND,
+                ModelRunStatus.FAILED,
+            }
+        if self.status not in allowed:
+            raise ValueError("Model run is not eligible for this recovery")
         timestamp = now or datetime.now(UTC)
         previous = dict(self.error_details or {})
         previous["recovery"] = {

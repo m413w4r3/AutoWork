@@ -583,6 +583,7 @@ class Bridge:
 bridge = Bridge()
 run_registry = RunRegistry(RUN_DB_PATH)
 idempotent_tasks: Dict[str, asyncio.Task] = {}
+bridge_live_progress: Dict[str, dict[str, Any]] = {}
 bridge_metrics: Dict[str, int] = {
     "runs_started": 0,
     "runs_completed": 0,
@@ -1007,12 +1008,33 @@ async def run_generation(
                 text = packet.get("text", "")
                 if isinstance(text, str) and text:
                     legacy_chunks.append(text)
+            # elif kind == "heartbeat":
+                # # Recevoir le paquet suffit à réarmer l'attente IDLE_TIMEOUT.
+                # # Le heartbeat ne contribue jamais au contenu de la réponse.
+                # if not generation_announced:
+                    # logger.info("bridge_run_phase bridge_run_id=%s phase=generation", request_id)
+                    # generation_announced = True
             elif kind == "heartbeat":
-                # Recevoir le paquet suffit à réarmer l'attente IDLE_TIMEOUT.
-                # Le heartbeat ne contribue jamais au contenu de la réponse.
                 if not generation_announced:
-                    logger.info("bridge_run_phase bridge_run_id=%s phase=generation", request_id)
+                    logger.info(
+                        "bridge_run_phase bridge_run_id=%s phase=generation",
+                        request_id,
+                    )
                     generation_announced = True
+
+                progress = packet.get("progress")
+                if isinstance(progress, dict):
+                    bridge_live_progress[request_id] = {
+                        "phase": str(progress.get("phase", "unknown"))[:32],
+                        "output_chars": max(0, int(progress.get("output_chars", 0) or 0)),
+                        "stable_for_ms": max(0, int(progress.get("stable_for_ms", 0) or 0)),
+                        "completion_signal": str(
+                            progress.get("completion_signal", "unknown")
+                        )[:32],
+                        "completion_confidence": str(
+                            progress.get("completion_confidence", "low")
+                        )[:16],
+                    }
             elif kind == "conversation_bound":
                 reported = packet.get("conversation")
                 if conversation is None or not isinstance(reported, dict):
@@ -1035,9 +1057,17 @@ async def run_generation(
                     request_id,
                     conversation.id,
                 )
+            # elif kind == "incomplete":
+                # reason = str(packet.get("reason", "no_final_answer"))
+                # if reason != "no_final_answer":
+                    # reason = "no_final_answer"
             elif kind == "incomplete":
                 reason = str(packet.get("reason", "no_final_answer"))
-                if reason != "no_final_answer":
+                if reason not in {
+                    "no_final_answer",
+                    "finalization_stalled",
+                    "dom_unstable",
+                }:
                     reason = "no_final_answer"
                 metadata = packet.get("metadata")
                 initial_turn_id = (
@@ -1822,7 +1852,15 @@ async def retrieve_bridge_run(response_id: str):
     if record["state"] == "failed" and record["error_json"]:
         stored = json.loads(record["error_json"])
         return JSONResponse(status_code=stored["status_code"], content=stored["body"])
-    return {"id": response_id, "object": "response", "status": record["state"]}
+    # return {"id": response_id, "object": "response", "status": record["state"]}
+    return {
+        "id": response_id,
+        "object": "response",
+        "status": record["state"],
+        "metadata": {
+            "bridge_progress": bridge_live_progress.get(response_id, {}),
+        },
+    }
 
 
 @app.post(
@@ -1833,8 +1871,14 @@ async def preview_visible_recovery(response_id: str):
     record = run_registry.get_by_run_id(response_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Run bridge inconnu")
-    if record["state"] != "needs_review" or not record.get("conversation_json"):
+    # if record["state"] != "needs_review" or not record.get("conversation_json"):
+        # raise HTTPException(status_code=409, detail="Run non récupérable")
+    if (
+        record["state"] not in {"running", "needs_review", "completed"}
+        or not record.get("conversation_json")
+    ):
         raise HTTPException(status_code=409, detail="Run non récupérable")
+
     conversation = json.loads(record["conversation_json"])
     packet = await bridge.request(
         {

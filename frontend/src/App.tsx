@@ -528,6 +528,9 @@ function DiscoveryPanel({
   const [axis, setAxis] = useState("initial");
   const [manualMarkdown, setManualMarkdown] = useState("");
   const [showManualRecovery, setShowManualRecovery] = useState(false);
+  const [showInitialInputChoice, setShowInitialInputChoice] = useState(
+    !window.localStorage.getItem(storageKey),
+  );
   const [recoveryPreview, setRecoveryPreview] = useState<{
     mode: "visible" | "manual";
     value: DiscoveryRecoveryPreview;
@@ -604,10 +607,16 @@ function DiscoveryPanel({
       onRunningChange(true);
     },
   });
+  // const recoveryRunId =
+    // lastJob?.status === "waiting_human" &&
+    // lastJob.error_details?.phase === "chatgpt_incomplete" &&
+    // typeof lastJob.error_details.model_run_id === "string"
+      // ? lastJob.error_details.model_run_id
+      // : null;
   const recoveryRunId =
-    lastJob?.status === "waiting_human" &&
-    lastJob.error_details?.phase === "chatgpt_incomplete" &&
-    typeof lastJob.error_details.model_run_id === "string"
+    lastJob &&
+    ["waiting_human", "failed", "cancelled"].includes(lastJob.status) &&
+    typeof lastJob.error_details?.model_run_id === "string"
       ? lastJob.error_details.model_run_id
       : null;
   const refreshRecoveredJob = useCallback(
@@ -700,13 +709,39 @@ function DiscoveryPanel({
           <p className="eyebrow">Découverte mensuelle</p>
           <h2 id="discovery-heading">Sujets candidats</h2>
         </div>
-        <button
-          className="button"
-          disabled={launch.isPending || searchRunning}
-          onClick={() => launch.mutate()}
-        >
-          {launch.isPending ? "Lancement…" : "Rechercher les sujets"}
-        </button>
+        {showInitialInputChoice && !jobId ? (
+          <div className="input-choice-buttons">
+            <button
+              className="button"
+              onClick={() => {
+                setShowInitialInputChoice(false);
+                launch.mutate();
+              }}
+              disabled={launch.isPending}
+            >
+              {launch.isPending
+                ? "Lancement…"
+                : "Rechercher avec ChatGPT"}
+            </button>
+            <button
+              className="button button--secondary"
+              onClick={() => {
+                setShowInitialInputChoice(false);
+                setShowManualRecovery(true);
+              }}
+            >
+              Importer un rapport existant
+            </button>
+          </div>
+        ) : (
+          <button
+            className="button"
+            disabled={launch.isPending || searchRunning}
+            onClick={() => launch.mutate()}
+          >
+            {launch.isPending ? "Lancement…" : "Rechercher les sujets"}
+          </button>
+        )}
       </div>
       <ol className="discovery-steps" aria-label="Étapes de découverte">
         <li>1. Recherche ChatGPT</li>
