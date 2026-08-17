@@ -460,9 +460,16 @@ a:focus-visible {
 .discovery-heading,
 .candidate-card__heading {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
+}
+
+.input-choice-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
 }
 
 .axis-field {

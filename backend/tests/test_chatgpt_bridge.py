@@ -1013,9 +1013,7 @@ async def test_idle_timeout_does_not_send_abort_to_extension() -> None:
     module["run_generation"].__globals__["IDLE_TIMEOUT"] = 0.1
     try:
         with pytest.raises(Exception) as caught:
-            async for _ in module["run_generation"](
-                "timeout-test", chat_request, http_req
-            ):
+            async for _ in module["run_generation"]("timeout-test", chat_request, http_req):
                 pass
     finally:
         module["run_generation"].__globals__["IDLE_TIMEOUT"] = old_idle

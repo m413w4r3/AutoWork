@@ -612,27 +612,27 @@ function DiscoveryPanel({
       onRunningChange(true);
     },
   });
-  // const recoveryRunId =
-  // lastJob?.status === "waiting_human" &&
-  // lastJob.error_details?.phase === "chatgpt_incomplete" &&
-  // typeof lastJob.error_details.model_run_id === "string"
-  // ? lastJob.error_details.model_run_id
-  // : null;
   const recoveryRunId =
     lastJob &&
     ["waiting_human", "failed", "cancelled"].includes(lastJob.status) &&
     typeof lastJob.error_details?.model_run_id === "string"
       ? lastJob.error_details.model_run_id
       : null;
+  // Sur un job terminal (FAILED/CANCELLED), la confirmation crée un NOUVEAU
+  // job reprocess_discovery_report : il faut suivre ce nouveau job, pas
+  // continuer à interroger l'ancien qui reste terminal dans l'historique.
   const refreshRecoveredJob = useCallback(
-    (result: { status: string }) => {
+    (result: { job_id: string; status: string }) => {
+      setJobId(result.job_id);
       setJobStatus(result.status as JobStatus);
+      setLastJob(null);
+      window.localStorage.setItem(storageKey, result.job_id);
       setRecoveryPreview(null);
       setShowManualRecovery(false);
       onRunningChange(true);
-      void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
+      void queryClient.invalidateQueries({ queryKey: ["job", result.job_id] });
     },
-    [jobId, onRunningChange, queryClient],
+    [onRunningChange, queryClient, storageKey],
   );
   const visibleRecovery = useMutation({
     mutationFn: () =>
@@ -918,13 +918,15 @@ function DiscoveryPanel({
             >
               Récupérer la réponse déjà affichée
             </button>
-            <button
-              className="button button--secondary"
-              disabled={completionRecovery.isPending}
-              onClick={() => completionRecovery.mutate()}
-            >
-              Demander à ChatGPT de terminer
-            </button>
+            {lastJob?.status === "waiting_human" ? (
+              <button
+                className="button button--secondary"
+                disabled={completionRecovery.isPending}
+                onClick={() => completionRecovery.mutate()}
+              >
+                Demander à ChatGPT de terminer
+              </button>
+            ) : null}
             <button
               className="button button--secondary"
               onClick={() => {

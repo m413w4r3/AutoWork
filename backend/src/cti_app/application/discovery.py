@@ -230,6 +230,15 @@ class ModelOutputArchive(Protocol):
         json_error_column: int | None = None,
     ) -> None: ...
 
+    async def create_manual_research_output(
+        self,
+        run_id: UUID,
+        content: bytes,
+        *,
+        evidence_pack_hash: str,
+        actor_id: str,
+    ) -> ModelRun: ...
+
 
 class DiscoveryStructuringError(ModelGatewayError):
     code = "discovery_structuring_invalid"

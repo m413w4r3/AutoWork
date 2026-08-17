@@ -23,6 +23,7 @@ from cti_app.application.discovery_identity import (
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    ProvisionalDiscoveryIoc,
     SourceCandidate,
     SourceRole,
 )
@@ -78,8 +79,7 @@ def consolidate_discovery_batches(
 
     # Index (batch_id, candidate_id) -> candidat, et rang chronologique du batch.
     candidates_by_batch: dict[UUID, dict[UUID, CandidateTopic]] = {
-        batch.id: {candidate.id: candidate for candidate in batch.candidates}
-        for batch in batches
+        batch.id: {candidate.id: candidate for candidate in batch.candidates} for batch in batches
     }
     batch_order: dict[UUID, int] = {batch.id: index for index, batch in enumerate(batches)}
 
@@ -110,21 +110,26 @@ def consolidate_discovery_batches(
 
     consolidated: list[ConsolidatedCandidate] = []
     for occurrences in clusters.values():
-        members = [
-            candidate
-            for occurrence in occurrences
-            if (candidate := candidates_by_batch[occurrence.batch_id].get(occurrence.candidate_id))
-            is not None
-        ]
-        if not members:
+        cluster_candidates: list[CandidateTopic] = []
+        for occurrence in occurrences:
+            member_candidate = candidates_by_batch[occurrence.batch_id].get(
+                occurrence.candidate_id
+            )
+            if member_candidate is not None:
+                cluster_candidates.append(member_candidate)
+        if not cluster_candidates:
             continue
 
         representative = _pick_representative(occurrences, candidates_by_batch, batch_order)
         if representative is None:
             continue
 
-        merged_sources, duplicate_count, merge_warnings = _merge_sources_in_cluster(members)
-        merged_candidate = _merge_candidate_metadata(representative, members, merged_sources)
+        merged_sources, duplicate_count, merge_warnings = _merge_sources_in_cluster(
+            cluster_candidates
+        )
+        merged_candidate = _merge_candidate_metadata(
+            representative, cluster_candidates, merged_sources
+        )
 
         consolidated.append(
             ConsolidatedCandidate(
@@ -275,7 +280,7 @@ def _merge_candidate_metadata(
     result.technical_potential = max(member.technical_potential for member in members)
 
     seen_ioc_keys: set[tuple[str, str]] = set()
-    provisional: list = []
+    provisional: list[ProvisionalDiscoveryIoc] = []
     for member in members:
         for ioc in member.provisional_iocs:
             key = (str(getattr(ioc, "type", "")).lower(), str(getattr(ioc, "value", "")).lower())

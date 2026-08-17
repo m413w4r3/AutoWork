@@ -442,15 +442,10 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     and existing.status is ModelRunStatus.SUCCEEDED
                 ):
                     recovery = (existing.error_details or {}).get("recovery")
-                    if (
-                        isinstance(recovery, dict)
-                        and recovery.get("provenance") == "manual_import"
-                    ):
+                    if isinstance(recovery, dict) and recovery.get("provenance") == "manual_import":
                         return existing
                 # Collision : un run différent existe déjà
-                raise ModelGatewayError(
-                    f"Model run {run_id} already exists with different content"
-                )
+                raise ModelGatewayError(f"Model run {run_id} already exists with different content")
 
         # Archiver le contenu
         reference = await self._output_store.store(

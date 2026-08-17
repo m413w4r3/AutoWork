@@ -670,9 +670,7 @@ async def test_new_contribution_does_not_recollect_an_already_known_url(
     app = service(factory, Transport([response(), response()]), tmp_path / "blobs")
 
     first = await app.initialize(subject.id)
-    assert [collection.requested_url for collection in first] == [
-        "https://one.example/report"
-    ]
+    assert [collection.requested_url for collection in first] == ["https://one.example/report"]
 
     # Deuxième contribution : même publication (nouvel id) + une nouvelle URL.
     group = next(iter(factory.groups.values()))

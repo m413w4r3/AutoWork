@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from collections.abc import Sequence
 from typing import Annotated, Literal, NoReturn
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -374,7 +375,9 @@ async def read_candidates(
     total_duplicate_count = sum(cand.duplicate_publication_count for cand in consolidated)
 
     # Apply filters to consolidated candidates
-    filtered: list[tuple[CandidateTopic, list[CandidateReferenceView], int, int, list[str]]] = []
+    filtered: list[
+        tuple[CandidateTopic, list[CandidateReferenceView], int, int, tuple[str, ...]]
+    ] = []
     for cand in consolidated:
         candidate = cand.representative
 
@@ -401,9 +404,7 @@ async def read_candidates(
             (
                 candidate,
                 [
-                    CandidateReferenceView(
-                        batch_id=ref.batch_id, candidate_id=ref.candidate_id
-                    )
+                    CandidateReferenceView(batch_id=ref.batch_id, candidate_id=ref.candidate_id)
                     for ref in cand.member_references
                 ],
                 cand.contribution_count,
@@ -825,9 +826,7 @@ async def _continue_after_recovery(
             kind=REPROCESS_DISCOVERY_REPORT_JOB_KIND,
             aggregate_type="edition",
             aggregate_id=job.aggregate_id,
-            idempotency_key=(
-                f"recovery-reprocess:{job.id}:{research_model_run_id}:{nonce}"
-            ),
+            idempotency_key=(f"recovery-reprocess:{job.id}:{research_model_run_id}:{nonce}"),
             correlation_id=get_correlation_id(),
             input_parameters=retry_parameters.model_dump(mode="json"),
             max_attempts=1,
@@ -885,9 +884,7 @@ def _discovery_parameters_from_edition(
     les deux endpoints d'import, pour que le périmètre (pays, période, langues,
     profil de sources) soit identique quel que soit le chemin emprunté.
     """
-    aliases = list(
-        dict.fromkeys([edition.country, edition.country_code, *(country_aliases or [])])
-    )
+    aliases = list(dict.fromkeys([edition.country, edition.country_code, *(country_aliases or [])]))
     return DiscoverEditionParameters(
         edition_id=edition.id,
         country=edition.country,
@@ -911,7 +908,7 @@ def _candidate_view(
     member_references: list[CandidateReferenceView] | None = None,
     contribution_count: int = 1,
     duplicate_publication_count: int = 0,
-    merge_warnings: list[str] | None = None,
+    merge_warnings: Sequence[str] | None = None,
 ) -> CandidateView:
     """Build a CandidateView with consolidation tracking.
 
@@ -927,9 +924,7 @@ def _candidate_view(
         type_counts[ioc.proposed_type.value] = type_counts.get(ioc.proposed_type.value, 0) + 1
 
     # Use first member reference's batch_id if available, else candidate's own id
-    batch_id = (
-        member_references[0].batch_id if member_references else candidate.id
-    )
+    batch_id = member_references[0].batch_id if member_references else candidate.id
 
     return CandidateView(
         id=candidate.id,
@@ -973,7 +968,7 @@ def _candidate_view(
         member_references=member_references or [],
         contribution_count=contribution_count,
         duplicate_publication_count=duplicate_publication_count,
-        merge_warnings=merge_warnings or [],
+        merge_warnings=list(merge_warnings or []),
     )
 
 

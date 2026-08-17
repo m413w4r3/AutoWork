@@ -1060,9 +1060,7 @@ async def test_standalone_import_creates_batch_without_job_or_model_call() -> No
     assert grouped == [params.edition_id]
 
     # Le rapport reste relisible comme n'importe quelle contribution archivée.
-    archived = await service.read_archived_report(
-        params.edition_id, batch.discovery_model_run_id
-    )
+    archived = await service.read_archived_report(params.edition_id, batch.discovery_model_run_id)
     assert archived == markdown
 
 
@@ -1089,9 +1087,7 @@ async def test_standalone_import_is_idempotent_on_identical_markdown() -> None:
     assert second.id == first.id
 
     active = [
-        batch
-        for batch in await service.list_batches(params.edition_id)
-        if batch.is_active_revision
+        batch for batch in await service.list_batches(params.edition_id) if batch.is_active_revision
     ]
     assert len(active) == 1
 

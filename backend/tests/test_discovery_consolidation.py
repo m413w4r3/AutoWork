@@ -118,7 +118,9 @@ class TestDiscoveryIdentity:
 
     def test_has_other_strong_signal_on_close_titles(self) -> None:
         left = _candidate("Campagne Cavern contre l'énergie", [_source("https://a.example/1")])
-        right = _candidate("Campagne Cavern contre l'énergie iranienne", [_source("https://b.example/1")])
+        right = _candidate(
+            "Campagne Cavern contre l'énergie iranienne", [_source("https://b.example/1")]
+        )
         assert has_other_strong_signal(left, right)
 
     def test_has_other_strong_signal_ignores_sector_and_country(self) -> None:

@@ -140,7 +140,7 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
     page.getByRole("button", { name: "Demander à ChatGPT de terminer" }),
   ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Coller une réponse" }),
+    page.getByRole("button", { name: "Coller une réponse", exact: true }),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Abandonner la recherche" }),
@@ -157,7 +157,9 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
   );
   await page.getByRole("button", { name: "Annuler" }).click();
 
-  await page.getByRole("button", { name: "Coller une réponse" }).click();
+  await page
+    .getByRole("button", { name: "Coller une réponse", exact: true })
+    .click();
   await page
     .getByLabel("Rapport Markdown")
     .fill("## SUBJECT S1\ntitle: Import manuel");
