@@ -684,6 +684,7 @@ function DiscoveryPanel({
   });
   const candidates = discovery.data?.candidates ?? [];
   const batches = discovery.data?.batches ?? [];
+  const mergeStats = discovery.data?.merge_stats;
   const searchRunning =
     Boolean(jobId) &&
     (jobStatus === null || !terminalJobStatuses.has(jobStatus));
@@ -972,6 +973,45 @@ function DiscoveryPanel({
             error={discovery.error}
             fallback="Candidats inaccessibles."
           />
+        ) : null}
+        {mergeStats ? (
+          <section className="discovery-consolidation-stats">
+            <h4>Découverte cumulée</h4>
+            <div className="stats-grid">
+              <div className="stat-item">
+                <span className="stat-label">Contributions</span>
+                <span className="stat-value">{mergeStats.raw_batch_count}</span>
+              </div>
+              <div className="stat-item">
+                <span className="stat-label">Candidats bruts</span>
+                <span className="stat-value">
+                  {mergeStats.raw_candidate_count}
+                </span>
+              </div>
+              <div className="stat-item">
+                <span className="stat-label">Sujets consolidés</span>
+                <span className="stat-value">
+                  {mergeStats.consolidated_candidate_count}
+                </span>
+              </div>
+              <div className="stat-item">
+                <span className="stat-label">Publications uniques</span>
+                <span className="stat-value">
+                  {mergeStats.unique_publication_count}
+                </span>
+              </div>
+              <div className="stat-item">
+                <span className="stat-label">
+                  Doublons fusionnés
+                </span>
+                <span className="stat-value">
+                  {
+                    mergeStats.duplicate_publication_occurrence_count
+                  }
+                </span>
+              </div>
+            </div>
+          </section>
         ) : null}
         <div className="candidate-list">
           {candidates.map((candidate) => (

@@ -45,6 +45,11 @@ export interface IncompleteSourceCandidate {
   parsing_warnings: string[];
 }
 
+export interface CandidateReference {
+  batch_id: string;
+  candidate_id: string;
+}
+
 export interface CandidateTopic {
   id: string;
   batch_id: string;
@@ -79,6 +84,11 @@ export interface CandidateTopic {
   selectable: boolean;
   valid_publication_count: number;
   incomplete_publication_count: number;
+  // Consolidation tracking (P2)
+  member_references?: CandidateReference[];
+  contribution_count?: number;
+  duplicate_publication_count?: number;
+  merge_warnings?: string[];
 }
 
 export interface ProvisionalDiscoveryIoc {
@@ -137,10 +147,19 @@ export interface DiscoveryBatch {
   archived_report_url: string;
 }
 
+export interface DiscoveryMergeStats {
+  raw_batch_count: number;
+  raw_candidate_count: number;
+  consolidated_candidate_count: number;
+  unique_publication_count: number;
+  duplicate_publication_occurrence_count: number;
+}
+
 export interface DiscoveryResult {
   batches: DiscoveryBatch[];
   candidates: CandidateTopic[];
   total: number;
+  merge_stats: DiscoveryMergeStats;
   warning: string;
 }
 
