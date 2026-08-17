@@ -30,7 +30,7 @@ type Tab =
 
 export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<Tab>("sources");
+  const [tab, setTab] = useState<Tab>("production");
   const [jobId, setJobId] = useState<string | null>(null);
   const workbench = useQuery({
     queryKey: ["subject-workbench", subjectId],
@@ -58,9 +58,7 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
       </div>
 
       {/* Main workflow: SubjectProduction */}
-      {tab === "production" || (tab !== "sources" && tab !== "evidence" && tab !== "ioc" && tab !== "extraction" && tab !== "brief" && tab !== "conversations") ? (
-        <SubjectProduction subjectId={subjectId} />
-      ) : null}
+      <SubjectProduction subjectId={subjectId} />
 
       {/* Advanced features */}
       <details className="advanced-workbench">
