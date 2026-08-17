@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.discovery import (
     DISCOVERY_JOB_KIND,
+    REPROCESS_DISCOVERY_REPORT_JOB_KIND,
     RETRY_STRUCTURING_JOB_KIND,
     DiscoverEditionParameters,
     DiscoveryService,
@@ -224,6 +225,37 @@ class RecoveryPreviewView(BaseModel):
     ioc_type_counts: dict[str, int]
     warnings: list[str]
     subjects: list[str]
+
+
+class DiscoveryImportRequest(BaseModel):
+    """Import d'une réponse ChatGPT existante (Markdown)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    markdown: str = Field(min_length=1, max_length=10_000_000)
+    complementary_axis: str = Field(
+        default="manual-import",
+        min_length=1,
+        max_length=500,
+    )
+    sensitivity: str = Field(default="internal", min_length=1, max_length=64)
+    external_llm_allowed: bool = True
+
+
+class DiscoveryImportConfirmation(DiscoveryImportRequest):
+    """Confirmation d'import avec hash de vérification."""
+
+    expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class DiscoveryImportConfirmView(BaseModel):
+    """Résultat de l'import d'une réponse ChatGPT."""
+
+    batch_id: UUID
+    reused: bool
+    source_mode: Literal["manual_import"]
+    subject_count: int
+    publication_count: int
 
 
 @router.post("", response_model=DiscoveryLaunchView, status_code=status.HTTP_202_ACCEPTED)
@@ -474,6 +506,79 @@ async def request_completion_recovery(
 
 
 @router.post(
+    "/import/preview",
+    response_model=RecoveryPreviewView,
+)
+async def preview_discovery_import(
+    edition_id: UUID, payload: DiscoveryImportRequest, request: Request
+) -> RecoveryPreviewView:
+    """Prévisualiser l'import d'une réponse ChatGPT Markdown existante.
+
+    Ne persiste rien : permet à l'utilisateur de vérifier avant de confirmer.
+    """
+    service: DiscoveryService = request.app.state.discovery_service
+    try:
+        edition = await request.app.state.edition_service.get(edition_id)
+        if edition.status in {EditionStatus.PUBLISHED, EditionStatus.ARCHIVED}:
+            raise ValueError("A published or archived edition cannot import discovery")
+
+        parameters = _discovery_parameters_from_edition(
+            edition,
+            complementary_axis=payload.complementary_axis,
+            sensitivity=payload.sensitivity,
+            external_llm_allowed=payload.external_llm_allowed,
+        )
+        return RecoveryPreviewView.model_validate(
+            await service.preview_standalone_import(parameters, payload.markdown)
+        )
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.post(
+    "/import/confirm",
+    response_model=DiscoveryImportConfirmView,
+)
+async def confirm_discovery_import(
+    edition_id: UUID, payload: DiscoveryImportConfirmation, request: Request
+) -> DiscoveryImportConfirmView:
+    """Confirmer et archiver l'import d'une réponse ChatGPT Markdown.
+
+    Crée un ModelRun synthétique et un DiscoveryBatch source_mode=manual_import.
+    """
+    service: DiscoveryService = request.app.state.discovery_service
+    provider: IdentityProvider = request.app.state.identity_provider
+    try:
+        edition = await request.app.state.edition_service.get(edition_id)
+        if edition.status in {EditionStatus.PUBLISHED, EditionStatus.ARCHIVED}:
+            raise ValueError("A published or archived edition cannot import discovery")
+
+        identity = await provider.current()
+        parameters = _discovery_parameters_from_edition(
+            edition,
+            complementary_axis=payload.complementary_axis,
+            sensitivity=payload.sensitivity,
+            external_llm_allowed=payload.external_llm_allowed,
+        )
+        batch, reused = await service.import_standalone_report(
+            parameters,
+            payload.markdown,
+            expected_sha256=payload.expected_sha256,
+            actor_id=identity.actor_id,
+        )
+
+        return DiscoveryImportConfirmView(
+            batch_id=batch.id,
+            reused=reused,
+            source_mode="manual_import",
+            subject_count=len(batch.candidates),
+            publication_count=sum(len(c.sources) for c in batch.candidates),
+        )
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.post(
     "/reports/reprocess",
     response_model=DiscoveryLaunchView,
     status_code=status.HTTP_202_ACCEPTED,
@@ -594,13 +699,48 @@ async def _recovery_context(
 
 
 async def _resume_recovery_job(job: Job, actor_id: str, request: Request) -> Job:
+    """Continue after a recovery operation (visible or manual recovery).
+
+    Règles:
+    - WAITING_HUMAN: reprendre le job existant
+    - FAILED/CANCELLED: créer un NEW job local reprocess_discovery_report
+      (l'historique reste exact)
+    - autres: retourner le job tel quel (impossible en pratique)
+    """
     jobs: JobService = request.app.state.job_service
     dispatcher: JobDispatcher = request.app.state.job_dispatcher
-    if job.status is not JobStatus.WAITING_HUMAN:
-        return job
-    resumed = await jobs.resume_waiting_human(job.id, actor_id=actor_id)
-    await dispatcher.dispatch(resumed.id)
-    return resumed
+
+    if job.status is JobStatus.WAITING_HUMAN:
+        resumed = await jobs.resume_waiting_human(job.id, actor_id=actor_id)
+        await dispatcher.dispatch(resumed.id)
+        return resumed
+
+    if job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+        # Créer un nouveau job pour retraiter le rapport récupéré.
+        # L'ancien job terminal reste dans l'historique, inchangé.
+        parameters = DiscoverEditionParameters.model_validate(job.input_parameters)
+        nonce = uuid4()
+        retry_parameters = RetryStructuringParameters(
+            discovery=parameters,
+            research_model_run_id=job.id,  # reference du job original
+            retry_nonce=nonce,
+        )
+        new_job = await jobs.submit(
+            kind=REPROCESS_DISCOVERY_REPORT_JOB_KIND,
+            aggregate_type="edition",
+            aggregate_id=job.aggregate_id,
+            idempotency_key=(
+                f"recovery-reprocess:{job.id}:{nonce}"
+            ),
+            correlation_id=get_correlation_id(),
+            input_parameters=retry_parameters.model_dump(mode="json"),
+            max_attempts=1,
+            actor_id=actor_id,
+        )
+        await dispatcher.dispatch(new_job.id)
+        return new_job
+
+    return job
 
 
 def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
@@ -629,6 +769,40 @@ def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
         archived_report_url=(
             f"/api/editions/{edition_id}/discovery/reports/{batch.discovery_model_run_id}"
         ),
+    )
+
+
+def _discovery_parameters_from_edition(
+    edition,
+    *,
+    complementary_axis: str,
+    sensitivity: str,
+    external_llm_allowed: bool,
+    country_aliases: list[str] | None = None,
+    keywords: list[str] | None = None,
+    exclusions: list[str] | None = None,
+    research_nonce: UUID | None = None,
+) -> DiscoverEditionParameters:
+    """Construire les paramètres de découverte à partir d'une édition.
+
+    Utilisé par :
+    - launch_discovery (recherche neuve)
+    - retry_structuring (retraitement)
+    - preview_discovery_import (import preview)
+    - confirm_discovery_import (import confirm)
+
+    Garantit la cohérence des paramètres entre tous les chemins.
+    """
+    return DiscoverEditionParameters(
+        edition_id=edition.id,
+        edition_title=edition.title,
+        country_aliases=country_aliases or getattr(edition, "country_aliases", []),
+        keywords=keywords or getattr(edition, "keywords", []),
+        exclusions=exclusions or getattr(edition, "exclusions", []),
+        complementary_axis=complementary_axis,
+        sensitivity=sensitivity,
+        external_llm_allowed=external_llm_allowed,
+        research_nonce=research_nonce or uuid4(),
     )
 
 
