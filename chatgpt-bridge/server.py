@@ -995,6 +995,18 @@ async def run_generation(
             try:
                 packet = await asyncio.wait_for(queue.get(), timeout=remaining)
             except asyncio.TimeoutError:
+                # Avant de lever l'erreur, journaliser le dernier état connu.
+                progress = bridge_live_progress.get(request_id, {})
+                logger.warning(
+                    "bridge_idle_timeout bridge_run_id=%s phase=%s output_chars=%s "
+                    "stable_for_ms=%s completion_signal=%s idle_timeout=%s",
+                    request_id,
+                    progress.get("phase"),
+                    progress.get("output_chars"),
+                    progress.get("stable_for_ms"),
+                    progress.get("completion_signal"),
+                    IDLE_TIMEOUT,
+                )
                 raise UpstreamError(f"aucune donnée de l'extension depuis {IDLE_TIMEOUT:.0f}s")
 
             kind = packet.get("type")
@@ -1180,12 +1192,10 @@ async def run_generation(
                     retryable=code == "bridge_server_error",
                 )
     finally:
+        # Une erreur interne du bridge ou la fermeture du canal HTTP ne doit
+        # jamais interrompre une génération ChatGPT encore en cours.
+        # L'arrêt de l'UI ChatGPT est réservé à une action utilisateur explicite.
         bridge.close_channel(request_id)
-        if bridge.online:
-            try:
-                await bridge.send({"type": "abort", "id": request_id})
-            except Exception:
-                pass
 
 
 class _BackgroundRequest:
@@ -1874,7 +1884,12 @@ async def preview_visible_recovery(response_id: str):
     # if record["state"] != "needs_review" or not record.get("conversation_json"):
         # raise HTTPException(status_code=409, detail="Run non récupérable")
     if (
-        record["state"] not in {"running", "needs_review", "completed"}
+        record["state"] not in {
+            "running",
+            "needs_review",
+            "completed",
+            "failed",
+        }
         or not record.get("conversation_json")
     ):
         raise HTTPException(status_code=409, detail="Run non récupérable")

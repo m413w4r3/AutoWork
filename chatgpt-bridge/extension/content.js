@@ -937,13 +937,31 @@ async function streamAnswer(job, locator, before) {
   };
   let stableForMs = 0;
 
+  // Progression persistante entre les itérations, indépendante de la présence du tour.
+  // Le heartbeat est un signal de liveness, pas une preuve que le DOM est lisible.
+  let lastProgress = {
+    phase: "waiting_answer",
+    output_chars: 0,
+    stable_for_ms: 0,
+    completion_signal: "unknown",
+    completion_confidence: "low",
+  };
+
   while (!job.aborted) {
     await sleep(POLL_MS);
-    // if (Date.now() - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
-      // reply({ type: "heartbeat", id: job.id });
-      // lastHeartbeatAt = Date.now();
-    // }
-    // heartbeat envoyé plus bas, après l'observation du DOM
+
+    const now = Date.now();
+
+    // Liveness indépendant du DOM : le heartbeat doit être émis même quand
+    // ChatGPT remplace temporairement le tour assistant (recherche web, reasoning).
+    if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+      reply({
+        type: "heartbeat",
+        id: job.id,
+        progress: lastProgress,
+      });
+      lastHeartbeatAt = now;
+    }
 
     // Re-recherche du tour à chaque itération, jamais de référence gardée :
     // React remplace le nœud du message entre la phase de réflexion et la
@@ -994,33 +1012,30 @@ async function streamAnswer(job, locator, before) {
           : SETTLE_MS;
     stableForMs = stableSince === null ? 0 : Date.now() - stableSince;
     const stable = stableForMs >= need;
-    if (Date.now() - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
-      const phase =
-        completion.signal === "reasoning"
-          ? "reasoning"
-          : completion.signal === "stop_button" ||
-              completion.signal === "streaming"
-            ? "generating"
-            : full.length === 0
-              ? "waiting_answer"
-              : stableForMs > 0
-                ? "stabilizing"
-                : "answering";
 
-      reply({
-        type: "heartbeat",
-        id: job.id,
-        progress: {
-          phase,
-          output_chars:
-            globalThis.ChatGPTBridgeFinalOutput.outputChars(full),
-          stable_for_ms: stableForMs,
-          completion_signal: completion.signal,
-          completion_confidence: completion.confidence,
-        },
-      });
-      lastHeartbeatAt = Date.now();
-    }
+    // Mettre à jour l'état courant pour le prochain heartbeat.
+    // Ce calcul n'envoie rien : le heartbeat lui-même est émis plus haut,
+    // indépendamment de la présence du tour.
+    const phase =
+      completion.signal === "reasoning"
+        ? "reasoning"
+        : completion.signal === "stop_button" ||
+            completion.signal === "streaming"
+          ? "generating"
+          : full.length === 0
+            ? "waiting_answer"
+            : stableForMs > 0
+              ? "stabilizing"
+              : "answering";
+
+    lastProgress = {
+      phase,
+      output_chars:
+        globalThis.ChatGPTBridgeFinalOutput.outputChars(full),
+      stable_for_ms: stableForMs,
+      completion_signal: completion.signal,
+      completion_confidence: completion.confidence,
+    };
     const outcome = globalThis.ChatGPTBridgeFinalOutput.settledOutcome({
       completion,
       text: full,

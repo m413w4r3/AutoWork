@@ -958,4 +958,73 @@ def test_compose_and_makefile_bridge_lifecycle_contract() -> None:
     server = (root / "chatgpt-bridge" / "server.py").read_text()
     assert "access_log=False" in server
     assert 'log_level="warning"' in server
+
+
+async def test_idle_timeout_does_not_send_abort_to_extension() -> None:
+    """Vérifier que le timeout de 120s ne déclenche plus un abort automatique.
+
+    Avant la correction :
+    - Timeout après 120s sans paquet
+    - finally envoie automatiquement {"type": "abort"}
+    - extension clique Stop dans ChatGPT
+    - → "Stopped thinking"
+
+    Après la correction :
+    - Timeout après 120s sans paquet
+    - finally ferme le canal HTTP uniquement
+    - ChatGPT continue dans son onglet
+    - récupération DOM possible via /recovery/visible
+    """
+    module = load_bridge()
+
+    # Extension qui n'envoie jamais de réponse (simulate un timeout)
+    class SilentExtension:
+        def __init__(self):
+            self.sent: list[dict[str, Any]] = []
+
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            self.sent.append(payload)
+            # Ne jamais envoyer de réponse, ne jamais appeler bridge.dispatch
+
+        async def receive_json(self) -> dict[str, Any]:
+            await asyncio.Event().wait()
+
+        async def send_text(self, _: str) -> None:
+            pass
+
+        async def accept(self) -> None:
+            pass
+
+        async def close(self, code: int = 1000, reason: str = ""):
+            self.closed = (code, reason)
+
+    silent = SilentExtension()
+    module["bridge"].ws = silent
+
+    # Lancer un run avec un timeout court
+    old_idle = module["run_generation"].__globals__["IDLE_TIMEOUT"]
+    module["run_generation"].__globals__["IDLE_TIMEOUT"] = 0.1
+
+    try:
+        req = module["BridgeRunRequest"](input="test")
+
+        with pytest.raises(Exception) as caught:  # UpstreamError
+            async for _ in module["run_generation"](req, request_with_key("timeout-test")):
+                pass
+
+        assert "aucune donnée de l'extension depuis" in str(caught.value)
+
+        # Vérification critique : aucun abort n'a été envoyé
+        abort_messages = [msg for msg in silent.sent if msg.get("type") == "abort"]
+        assert len(abort_messages) == 0, (
+            f"Un message abort ne doit jamais être envoyé automatiquement, "
+            f"mais {len(abort_messages)} message(s) abort ont été trouvé(s)"
+        )
+
+        # Les autres messages doivent être présents (prompt, etc.)
+        prompt_messages = [msg for msg in silent.sent if msg.get("type") == "prompt"]
+        assert len(prompt_messages) == 1, "Un message prompt devrait avoir été envoyé"
+
+    finally:
+        module["run_generation"].__globals__["IDLE_TIMEOUT"] = old_idle
     assert "logger.propagate = False" in server
