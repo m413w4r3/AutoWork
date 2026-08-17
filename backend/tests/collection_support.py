@@ -69,6 +69,9 @@ class InMemorySourceDocumentRepository:
         value = self._documents.get(document_id)
         return deepcopy(value) if value else None
 
+    async def save(self, document: SourceDocument) -> None:
+        self._documents[document.id] = deepcopy(document)
+
     async def list_for_subject(self, subject_id: UUID) -> list[SourceDocument]:
         return [
             deepcopy(item) for item in self._documents.values() if item.subject_id == subject_id

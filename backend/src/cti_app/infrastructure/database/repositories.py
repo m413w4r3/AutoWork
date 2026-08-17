@@ -60,6 +60,7 @@ from cti_app.domain.editorial import (
     HumanDecisionType,
 )
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
+from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics, JobStatus
 from cti_app.domain.model_conversations import (
     ConversationPurpose,
@@ -144,6 +145,11 @@ class SqlAlchemyBlobRepository:
             .select_from(SourceDocumentRow)
             .where(SourceDocumentRow.blob_id == blob_id)
         )
+        decoded_document_count = await self._session.scalar(
+            select(func.count())
+            .select_from(SourceDocumentRow)
+            .where(SourceDocumentRow.decoded_blob_id == blob_id)
+        )
         sample_count = await self._session.scalar(
             select(func.count()).select_from(SampleRow).where(SampleRow.blob_id == blob_id)
         )
@@ -179,6 +185,7 @@ class SqlAlchemyBlobRepository:
         )
         return (
             int(document_count or 0)
+            + int(decoded_document_count or 0)
             + int(sample_count or 0)
             + int(model_output_count or 0)
             + int(artifact_count or 0)
@@ -234,6 +241,32 @@ class SqlAlchemySourceDocumentRepository:
     async def get(self, document_id: UUID) -> SourceDocument | None:
         row = await self._session.get(SourceDocumentRow, document_id)
         return _source_document_from_row(row) if row else None
+
+    async def save(self, document: SourceDocument) -> None:
+        row = await self._session.get(SourceDocumentRow, document.id)
+        if row is None:
+            raise EntityNotFoundError(f"Source document {document.id} does not exist")
+        values = _source_document_to_row(document)
+        for column in (
+            "original_name",
+            "origin",
+            "logical_filename",
+            "source_collection_id",
+            "source_candidate_id",
+            "decoded_blob_id",
+            "title",
+            "publisher",
+            "published_at",
+            "final_url",
+            "declared_mime_type",
+            "detected_mime_type",
+            "encoded_sha256",
+            "decoded_sha256",
+            "encoded_size",
+            "decoded_size",
+        ):
+            setattr(row, column, getattr(values, column))
+        await self._session.flush()
 
     async def list_for_subject(self, subject_id: UUID) -> Sequence[SourceDocument]:
         rows = await self._session.scalars(
@@ -1273,6 +1306,20 @@ def _source_document_to_row(document: SourceDocument) -> SourceDocumentRow:
         tlp=document.tlp.value,
         do_not_submit=document.do_not_submit,
         external_llm_allowed=document.external_llm_allowed,
+        logical_filename=document.logical_filename,
+        source_collection_id=document.source_collection_id,
+        source_candidate_id=document.source_candidate_id,
+        decoded_blob_id=document.decoded_blob_id,
+        title=document.title,
+        publisher=document.publisher,
+        published_at=document.published_at,
+        final_url=document.final_url,
+        declared_mime_type=document.declared_mime_type,
+        detected_mime_type=document.detected_mime_type,
+        encoded_sha256=document.encoded_sha256,
+        decoded_sha256=document.decoded_sha256,
+        encoded_size=document.encoded_size,
+        decoded_size=document.decoded_size,
         created_at=document.created_at,
     )
 
@@ -1289,6 +1336,20 @@ def _source_document_from_row(row: SourceDocumentRow) -> SourceDocument:
         tlp=TLP(row.tlp),
         do_not_submit=row.do_not_submit,
         external_llm_allowed=row.external_llm_allowed,
+        logical_filename=row.logical_filename,
+        source_collection_id=row.source_collection_id,
+        source_candidate_id=row.source_candidate_id,
+        decoded_blob_id=row.decoded_blob_id,
+        title=row.title,
+        publisher=row.publisher,
+        published_at=row.published_at,
+        final_url=row.final_url,
+        declared_mime_type=row.declared_mime_type,
+        detected_mime_type=row.detected_mime_type,
+        encoded_sha256=row.encoded_sha256,
+        decoded_sha256=row.decoded_sha256,
+        encoded_size=row.encoded_size,
+        decoded_size=row.decoded_size,
         created_at=row.created_at,
     )
 

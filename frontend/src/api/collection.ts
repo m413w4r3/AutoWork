@@ -1,6 +1,7 @@
 import { ApiError } from "./editions";
 
 export type CollectionState =
+  | "pending"
   | "queued"
   | "fetching"
   | "archived"
@@ -42,6 +43,12 @@ export interface CollectedSource {
   error_reason: string | null;
   fetch_lease_expires_at: string | null;
   latest_attempt: CollectionAttempt | null;
+  title: string;
+  publisher: string;
+  published_at: string | null;
+  tlp: string | null;
+  logical_filename: string | null;
+  detected_mime_type: string | null;
 }
 
 export type SourceRole =
@@ -99,6 +106,13 @@ export function retryCollectedSource(
     `/api/subjects/${encodeURIComponent(subjectId)}/sources/${encodeURIComponent(sourceId)}/retry`,
     { method: "POST" },
   );
+}
+
+export function collectedSourceDownloadUrl(
+  subjectId: string,
+  sourceId: string,
+): string {
+  return `/api/subjects/${encodeURIComponent(subjectId)}/sources/${encodeURIComponent(sourceId)}/download`;
 }
 
 export function decideSourceRelationship(

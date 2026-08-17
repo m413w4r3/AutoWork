@@ -7,21 +7,19 @@ import hashlib
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 
 from cti_app.application.collection import SubjectCollectionService
-from cti_app.application.extraction import EvidenceExtractionService, QwenEvidenceOutput
 from cti_app.application.http_collection import (
+    CollectionPolicy,
     PinnedHttpRequest,
     RawHttpResponse,
     SafeHttpCollector,
 )
 from cti_app.application.jobs import JobCancelledError, JobExecutionContext, JobHandlerError
-from cti_app.application.model_gateway import StructuredExtractionModel
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import CandidateTopic, DiscoveryBatch, SourceCandidate, SourceRole
@@ -33,11 +31,13 @@ from cti_app.domain.editorial import (
     EditorialType,
     GroupingConfidence,
     GroupingOutcome,
-    HumanDecisionType,
 )
 from cti_app.domain.entities import Subject
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
-from tests.collection_support import InMemoryCollectionUnitOfWorkFactory
+from tests.collection_support import (
+    InMemoryCollectionUnitOfWork,
+    InMemoryCollectionUnitOfWorkFactory,
+)
 
 PUBLIC_IP = "93.184.216.34"
 HTML = b"""<!doctype html><html><head><title>Report</title></head>
@@ -77,16 +77,20 @@ class NoopContext:
     def __init__(self, job_id: UUID) -> None:
         self.job_id = job_id
         self.progress: list[tuple[int, int]] = []
+        self.messages: list[str | None] = []
 
     async def report_progress(self, current: int, total: int, message: str | None = None) -> None:
-        del message
         self.progress.append((current, total))
+        self.messages.append(message)
 
     async def heartbeat(self) -> None:
         return None
 
     async def check_cancelled(self) -> None:
         return None
+
+    async def record_diagnostics(self, details: dict[str, object]) -> None:
+        del details
 
 
 class CancelBeforeArchiveContext(NoopContext):
@@ -98,38 +102,6 @@ class CancelBeforeArchiveContext(NoopContext):
         self.checks += 1
         if self.checks >= 5:
             raise JobCancelledError
-
-
-class ClaimModel:
-    async def extract(self, request: object, output_schema: object) -> object:
-        del request, output_schema
-        return SimpleNamespace(
-            structured_output=QwenEvidenceOutput.model_validate(
-                {
-                    "actors": [
-                        {
-                            "kind": "name",
-                            "value": "ExampleRAT",
-                            "exact_quote": "ExampleRAT uses evil[.]example",
-                            "confidence": "high",
-                            "uncertainty": None,
-                        }
-                    ]
-                }
-            )
-        )
-
-
-class FlakyClaimModel:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def extract(self, request: object, output_schema: object) -> object:
-        del request, output_schema
-        self.calls += 1
-        if self.calls == 1:
-            raise RuntimeError("simulated extraction crash")
-        return SimpleNamespace(structured_output=QwenEvidenceOutput())
 
 
 def response(body: bytes = HTML, *, status: int = 200) -> RawHttpResponse:
@@ -227,12 +199,11 @@ def service(
     *,
     with_claims: bool = False,
 ) -> SubjectCollectionService:
-    model = cast(StructuredExtractionModel, ClaimModel()) if with_claims else None
+    del with_claims
     return SubjectCollectionService(
         factory,
         SafeHttpCollector(transport, Resolver()),
         FilesystemBlobStore(root),
-        EvidenceExtractionService(model),
     )
 
 
@@ -248,7 +219,7 @@ async def test_same_content_from_two_urls_reuses_blob_but_preserves_observations
     sources = await app.initialize(subject.id)
 
     for source in sources:
-        await app.collect_one(source.id, uuid4())
+        await app.archive_one(source.id, uuid4())
 
     raw_blobs = [
         item for item in factory.blobs.values() if item.descriptor.logical_bucket == "source-raw"
@@ -268,10 +239,10 @@ async def test_completed_source_relaunch_is_idempotent(tmp_path: Path) -> None:
     app = service(factory, transport, tmp_path / "blobs")
     source = (await app.initialize(subject.id))[0]
 
-    first = await app.collect_one(source.id, uuid4())
-    second = await app.collect_one(source.id, uuid4())
+    first = await app.archive_one(source.id, uuid4())
+    second = await app.archive_one(source.id, uuid4())
 
-    assert first is second is CollectionState.COMPLETED
+    assert first is second is CollectionState.ARCHIVED
     assert len(transport.requests) == 1
     assert len(factory.attempts) == 1
     assert len(factory.documents) == 1
@@ -288,12 +259,14 @@ async def test_transient_source_failure_is_resumable_without_duplicate_archive(
 
     with pytest.raises(JobHandlerError) as transient:
         await app.collect_subject(subject.id, context.job_id, context)
-    assert transient.value.transient is True
+    assert transient.value.code == "source_collection_no_success"
     assert (await app.list_sources(subject.id))[0].state is CollectionState.FAILED_RETRYABLE
 
-    await app.collect_subject(subject.id, context.job_id, context)
+    failed_source = (await app.list_sources(subject.id))[0]
+    await app.prepare_retry(failed_source.id)
+    await app.collect_subject(subject.id, context.job_id, context, collection_id=failed_source.id)
 
-    assert (await app.list_sources(subject.id))[0].state is CollectionState.COMPLETED
+    assert (await app.list_sources(subject.id))[0].state is CollectionState.ARCHIVED
     assert len(factory.attempts) == 2
     assert len(factory.documents) == 1
 
@@ -312,13 +285,13 @@ async def test_partial_batch_failure_keeps_candidate_and_completes_other_source(
     await app.collect_subject(subject.id, context.job_id, context)
 
     states = {item.requested_url: item.state for item in await app.list_sources(subject.id)}
-    assert states["https://one.example/report"] is CollectionState.COMPLETED
+    assert states["https://one.example/report"] is CollectionState.ARCHIVED
     assert states["https://missing.example/report"] is CollectionState.UNAVAILABLE
     assert len(factory.collections) == 2
     assert len(factory.attempts) == 2
 
 
-async def test_selected_collect_extract_validate_scenario(tmp_path: Path) -> None:
+async def test_selected_collection_does_not_create_evidence(tmp_path: Path) -> None:
     factory = InMemoryCollectionUnitOfWorkFactory()
     subject = selected_subject(factory, ("https://one.example/report",))
     app = service(
@@ -329,21 +302,11 @@ async def test_selected_collect_extract_validate_scenario(tmp_path: Path) -> Non
     )
     source = (await app.initialize(subject.id))[0]
 
-    assert await app.collect_one(source.id, uuid4()) is CollectionState.COMPLETED
-    claims, indicators = await app.list_evidence(subject.id)
-    assert claims[0].span.passage(await app.extracted_text(claims[0].derived_artifact_id)) == (
-        "ExampleRAT uses evil[.]example"
-    )
-    assert any(item.normalized_value == "evil.example" for item in indicators)
-
-    decision = await app.decide_claim(
-        claims[0].id,
-        HumanDecisionType.CLAIM_VALIDATE,
-        actor_id="dev-analyst",
-        correlation_id="scenario",
-    )
-    assert decision.payload["original_value"] == "ExampleRAT"
-    assert factory.claims[claims[0].id].value == "ExampleRAT"
+    assert await app.archive_one(source.id, uuid4()) is CollectionState.ARCHIVED
+    assert await app.list_evidence(subject.id) == ([], [])
+    assert not factory.artifacts
+    assert not factory.claims
+    assert not factory.indicators
 
 
 async def test_gzip_archives_encoded_and_decoded_representations(tmp_path: Path) -> None:
@@ -358,11 +321,10 @@ async def test_gzip_archives_encoded_and_decoded_representations(tmp_path: Path)
         factory,
         SafeHttpCollector(transport, Resolver()),
         blob_store,
-        EvidenceExtractionService(None),
     )
     source = (await app.initialize(subject.id))[0]
 
-    assert await app.collect_one(source.id, uuid4()) is CollectionState.COMPLETED
+    assert await app.archive_one(source.id, uuid4()) is CollectionState.ARCHIVED
 
     raw = next(
         item for item in factory.blobs.values() if item.descriptor.logical_bucket == "source-raw"
@@ -379,8 +341,8 @@ async def test_gzip_archives_encoded_and_decoded_representations(tmp_path: Path)
     assert attempt.decoded_sha256 == hashlib.sha256(HTML).hexdigest()
     snapshot = factory.snapshots[attempt.policy_snapshot_id]
     assert snapshot.user_agent == app.policy_snapshot.user_agent
-    assert snapshot.extraction_limits["parser_version"] == "2.0.0"
-    assert factory.artifacts
+    assert snapshot.extraction_limits == {}
+    assert not factory.artifacts
 
 
 async def test_distinct_gzip_streams_share_decoded_blob(tmp_path: Path) -> None:
@@ -399,7 +361,7 @@ async def test_distinct_gzip_streams_share_decoded_blob(tmp_path: Path) -> None:
     app = service(factory, transport, tmp_path / "blobs")
 
     for source in await app.initialize(subject.id):
-        await app.collect_one(source.id, uuid4())
+        await app.archive_one(source.id, uuid4())
 
     assert (
         len(
@@ -436,7 +398,7 @@ async def test_expired_fetch_lease_is_recovered_with_interruption_attempt(tmp_pa
     )
     factory.collections[source.id] = source
 
-    assert await app.collect_one(source.id, uuid4()) is CollectionState.COMPLETED
+    assert await app.archive_one(source.id, uuid4()) is CollectionState.ARCHIVED
 
     assert [item.outcome.value for item in factory.attempts] == ["interrupted", "succeeded"]
 
@@ -449,38 +411,27 @@ async def test_crash_after_download_before_archive_is_immediately_resumable(tmp_
     source = (await app.initialize(subject.id))[0]
 
     with pytest.raises(JobCancelledError):
-        await app.collect_one(
+        await app.archive_one(
             source.id,
             uuid4(),
             context=cast(JobExecutionContext, CancelBeforeArchiveContext(uuid4())),
         )
     assert factory.collections[source.id].state is CollectionState.FAILED_RETRYABLE
 
-    assert await app.collect_one(source.id, uuid4()) is CollectionState.COMPLETED
+    assert await app.archive_one(source.id, uuid4()) is CollectionState.ARCHIVED
     assert len(transport.requests) == 2
 
 
-async def test_archived_source_resumes_after_crash_without_network(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_archived_source_resumes_without_network(tmp_path: Path) -> None:
     factory = InMemoryCollectionUnitOfWorkFactory()
     subject = selected_subject(factory, ("https://one.example/report",))
     transport = Transport([response()])
     app = service(factory, transport, tmp_path / "blobs")
     source = (await app.initialize(subject.id))[0]
-    original_extract = app._extract
-
-    async def crash(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise RuntimeError("simulated crash after archival")
-
-    monkeypatch.setattr(app, "_extract", crash)
-    with pytest.raises(RuntimeError, match="simulated crash"):
-        await app.collect_one(source.id, uuid4())
+    await app.archive_one(source.id, uuid4())
     assert factory.collections[source.id].state is CollectionState.ARCHIVED
 
-    monkeypatch.setattr(app, "_extract", original_extract)
-    assert await app.collect_one(source.id, uuid4()) is CollectionState.COMPLETED
+    assert await app.archive_one(source.id, uuid4()) is CollectionState.ARCHIVED
     assert len(transport.requests) == 1
 
 
@@ -491,32 +442,216 @@ async def test_two_workers_never_download_same_source_concurrently(tmp_path: Pat
     app = service(factory, transport, tmp_path / "blobs")
     source = (await app.initialize(subject.id))[0]
 
-    first = asyncio.create_task(app.collect_one(source.id, uuid4()))
+    first = asyncio.create_task(app.archive_one(source.id, uuid4()))
     await transport.started.wait()
-    second_state = await app.collect_one(source.id, uuid4())
+    second_state = await app.archive_one(source.id, uuid4())
     transport.release.set()
 
     assert second_state is CollectionState.FETCHING
-    assert await first is CollectionState.COMPLETED
+    assert await first is CollectionState.ARCHIVED
     assert len(transport.requests) == 1
 
 
-async def test_crash_during_extraction_resumes_without_download(tmp_path: Path) -> None:
+async def test_collection_has_no_extraction_hook(tmp_path: Path) -> None:
     factory = InMemoryCollectionUnitOfWorkFactory()
     subject = selected_subject(factory, ("https://one.example/report",))
     transport = Transport([response()])
-    model = FlakyClaimModel()
     app = SubjectCollectionService(
         factory,
         SafeHttpCollector(transport, Resolver()),
         FilesystemBlobStore(tmp_path / "blobs"),
-        EvidenceExtractionService(cast(StructuredExtractionModel, model)),
     )
     source = (await app.initialize(subject.id))[0]
 
-    with pytest.raises(RuntimeError, match="extraction crash"):
-        await app.collect_one(source.id, uuid4())
+    assert not hasattr(app, "_extract")
+    await app.archive_one(source.id, uuid4())
     assert factory.collections[source.id].state is CollectionState.ARCHIVED
 
-    assert await app.collect_one(source.id, uuid4()) is CollectionState.COMPLETED
+    assert await app.archive_one(source.id, uuid4()) is CollectionState.ARCHIVED
     assert len(transport.requests) == 1
+
+
+async def test_tenable_resume_processes_all_seven_sources_with_exact_summary(
+    tmp_path: Path,
+) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(
+        factory,
+        (
+            "https://tenable.example/report",
+            "https://fbi.example/advisory",
+            "https://three.example/report",
+            "https://four.example/report",
+            "https://five.example/report",
+            "https://missing.example/report",
+            "https://blocked.example/report",
+        ),
+    )
+    transport = Transport(
+        [
+            response(),
+            response(),
+            response(),
+            response(),
+            response(),
+            response(status=404),
+        ]
+    )
+    app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(
+            transport,
+            Resolver(),
+            CollectionPolicy(blocked_domains=frozenset({"blocked.example"})),
+        ),
+        FilesystemBlobStore(tmp_path / "blobs"),
+    )
+    sources = await app.initialize(subject.id)
+    await app.archive_one(sources[0].id, uuid4())
+    tenable_document = factory.documents[factory.collections[sources[0].id].source_document_id]
+    tenable_document.title = None
+    tenable_document.logical_filename = tenable_document.original_name
+    context_value = NoopContext(uuid4())
+    context = cast(JobExecutionContext, context_value)
+
+    output_reference = await app.collect_subject(subject.id, context.job_id, context)
+
+    assert output_reference.startswith("provenance://events/")
+    assert len(transport.requests) == 6
+    assert context_value.progress[0] == (0, 7)
+    completed_progress = [
+        progress
+        for progress, message in zip(context_value.progress, context_value.messages, strict=True)
+        if message and message.startswith("Source ")
+    ]
+    assert completed_progress == [(index, 7) for index in range(1, 8)]
+    summary = next(
+        event.payload
+        for event in factory.provenance
+        if event.event_type == "source.collection_completed"
+    )
+    assert summary == {
+        "total": 7,
+        "already_archived": 1,
+        "newly_archived": 4,
+        "unavailable": 1,
+        "blocked": 1,
+        "failed_retryable": 0,
+        "failed_terminal": 0,
+    }
+    assert factory.collections[sources[0].id].attempt_count == 1
+    assert factory.documents[tenable_document.id].logical_filename.startswith(
+        "date-inconnue_TLP AMBER_Report 1_Research team"
+    )
+
+
+async def test_invalid_qwen_output_is_never_requested_during_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cti_app.application.extraction import EvidenceExtractionService
+
+    invalid_output = {
+        "dates": [],
+        "cve": [],
+        "campaigns": [{"kind": "campaigns"}],
+        "malware": [{"kind": "malware"}],
+        "tools": [{"kind": "tools"}],
+    }
+
+    async def forbidden_call(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError(f"Qwen must not receive this output: {invalid_output}")
+
+    monkeypatch.setattr(EvidenceExtractionService, "extract_claims", forbidden_call)
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    app = service(factory, Transport([response()]), tmp_path / "blobs")
+    context = cast(JobExecutionContext, NoopContext(uuid4()))
+
+    await app.collect_subject(subject.id, context.job_id, context)
+
+    assert not factory.artifacts
+    assert not factory.claims
+    assert not factory.indicators
+
+
+async def test_timeout_like_failure_does_not_stop_next_source(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(
+        factory,
+        ("https://timeout.example/report", "https://next.example/report"),
+    )
+    app = service(
+        factory,
+        Transport([response(status=503), response()]),
+        tmp_path / "blobs",
+    )
+    context = cast(JobExecutionContext, NoopContext(uuid4()))
+
+    await app.collect_subject(subject.id, context.job_id, context)
+
+    states = {item.requested_url: item.state for item in await app.list_sources(subject.id)}
+    assert states["https://timeout.example/report"] is CollectionState.FAILED_RETRYABLE
+    assert states["https://next.example/report"] is CollectionState.ARCHIVED
+
+
+async def test_size_limit_does_not_stop_next_source(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(
+        factory,
+        ("https://large.example/report", "https://next.example/report"),
+    )
+    transport = Transport([response(b"<html>" + b"x" * 10_000), response()])
+    app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(
+            transport,
+            Resolver(),
+            CollectionPolicy(max_download_bytes=len(HTML) + 10),
+        ),
+        FilesystemBlobStore(tmp_path / "blobs"),
+    )
+    context = cast(JobExecutionContext, NoopContext(uuid4()))
+
+    await app.collect_subject(subject.id, context.job_id, context)
+
+    states = {item.requested_url: item.state for item in await app.list_sources(subject.id)}
+    assert states["https://large.example/report"] is CollectionState.FAILED_TERMINAL
+    assert states["https://next.example/report"] is CollectionState.ARCHIVED
+
+
+async def test_blob_store_failure_remains_systemic(tmp_path: Path) -> None:
+    class FailingBlobStore(FilesystemBlobStore):
+        async def put(self, source: object, *, logical_bucket: str, mime_type: str) -> object:
+            del source, logical_bucket, mime_type
+            raise RuntimeError("blob store unavailable")
+
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(Transport([response()]), Resolver()),
+        cast(FilesystemBlobStore, FailingBlobStore(tmp_path / "blobs")),
+    )
+    source = (await app.initialize(subject.id))[0]
+
+    with pytest.raises(RuntimeError, match="blob store unavailable"):
+        await app.archive_one(source.id, uuid4())
+
+
+async def test_postgresql_commit_failure_remains_systemic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    app = service(factory, Transport([response()]), tmp_path / "blobs")
+    source = (await app.initialize(subject.id))[0]
+
+    async def failed_commit(self: InMemoryCollectionUnitOfWork) -> None:
+        del self
+        raise RuntimeError("PostgreSQL unavailable")
+
+    monkeypatch.setattr(InMemoryCollectionUnitOfWork, "commit", failed_commit)
+
+    with pytest.raises(RuntimeError, match="PostgreSQL unavailable"):
+        await app.archive_one(source.id, uuid4())

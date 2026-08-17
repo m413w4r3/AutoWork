@@ -1,22 +1,17 @@
 from __future__ import annotations
 
+import logging
+import time
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from uuid import UUID
 
 from pydantic import ConfigDict, Field
 
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.extraction import (
-    PARSER_NAME,
-    PARSER_VERSION,
-    DocumentParsingError,
-    EvidenceExtractionService,
-    extract_indicators,
-    parse_document,
-)
 from cti_app.application.http_collection import (
     CollectedResponse,
     CollectionError,
@@ -31,20 +26,62 @@ from cti_app.application.jobs import (
     JobRegistry,
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
+from cti_app.application.source_filenames import analyst_filename
+from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.domain.collection import (
     AttemptOutcome,
     Claim,
     CollectionAttempt,
     CollectionPolicySnapshot,
     CollectionState,
-    DerivedArtifact,
-    DetectedMimeType,
     Indicator,
     SourceCollection,
 )
 from cti_app.domain.discovery import SourceCandidate, SourceRole
 from cti_app.domain.editorial import EditorialGroupStatus, HumanDecision, HumanDecisionType
 from cti_app.domain.entities import ProvenanceEvent, SourceDocument
+from cti_app.logging import get_correlation_id
+
+logger = logging.getLogger(__name__)
+_COLLECTED_STATES = {
+    CollectionState.ARCHIVED,
+    CollectionState.EXTRACTED,
+    CollectionState.COMPLETED,
+}
+
+
+@dataclass(slots=True)
+class CollectionSummary:
+    total: int = 0
+    already_archived: int = 0
+    newly_archived: int = 0
+    unavailable: int = 0
+    blocked: int = 0
+    failed_retryable: int = 0
+    failed_terminal: int = 0
+
+    @property
+    def success_count(self) -> int:
+        return self.already_archived + self.newly_archived
+
+    @property
+    def warning_count(self) -> int:
+        return self.unavailable + self.blocked + self.failed_retryable + self.failed_terminal
+
+    def record(self, state: CollectionState, *, already_archived: bool = False) -> None:
+        if state in _COLLECTED_STATES:
+            if already_archived:
+                self.already_archived += 1
+            else:
+                self.newly_archived += 1
+        elif state is CollectionState.UNAVAILABLE:
+            self.unavailable += 1
+        elif state is CollectionState.BLOCKED:
+            self.blocked += 1
+        elif state in {CollectionState.FAILED_RETRYABLE, CollectionState.FETCHING}:
+            self.failed_retryable += 1
+        elif state is CollectionState.FAILED_TERMINAL:
+            self.failed_terminal += 1
 
 
 class CollectionNotAllowedError(ValueError):
@@ -69,19 +106,21 @@ class SubjectCollectionService:
         uow_factory: UnitOfWorkFactory,
         collector: SafeHttpCollector,
         blob_store: BlobStore,
-        extraction: EvidenceExtractionService,
         *,
         fetch_lease_seconds: float = 120.0,
+        workspace_materializer: SubjectWorkspaceMaterializer | None = None,
+        workspace_root: Path | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._collector = collector
         self._blob_store = blob_store
         self._catalog = BlobCatalogService(blob_store, uow_factory)
-        self._extraction = extraction
+        self._workspace_materializer = workspace_materializer
+        self._workspace_root = workspace_root
         self._fetch_lease = timedelta(
             seconds=max(fetch_lease_seconds, self._collector.policy.timeout_seconds + 5)
         )
-        self._policy_snapshot = self._collector.policy.snapshot(self._extraction.policy_values())
+        self._policy_snapshot = self._collector.policy.snapshot()
 
     async def initialize(self, subject_id: UUID) -> list[SourceCollection]:
         async with self._uow_factory() as uow:
@@ -156,6 +195,49 @@ class SubjectCollectionService:
                 raise CollectionItemNotFoundError(str(collection_id))
             return list(await uow.collection_attempts.list_for_collection(collection_id))
 
+    async def source_context(
+        self, source: SourceCollection
+    ) -> tuple[SourceCandidate | None, SourceDocument | None]:
+        async with self._uow_factory() as uow:
+            batch = await uow.discovery_batches.get(source.batch_id)
+            candidate = batch.source(source.source_candidate_id) if batch else None
+            document = (
+                await uow.source_documents.get(source.source_document_id)
+                if source.source_document_id
+                else None
+            )
+            return candidate, document
+
+    async def download_source(
+        self, subject_id: UUID, collection_id: UUID
+    ) -> tuple[SourceDocument, bytes]:
+        async with self._uow_factory() as uow:
+            collection = await uow.source_collections.get(collection_id)
+            if collection is None or collection.subject_id != subject_id:
+                raise CollectionItemNotFoundError(str(collection_id))
+            if collection.state not in _COLLECTED_STATES or not collection.source_document_id:
+                raise CollectionNotAllowedError("La source n'est pas archivée.")
+            document = await uow.source_documents.get(collection.source_document_id)
+            decoded_blob_id = document.decoded_blob_id if document else None
+            if document is None or decoded_blob_id is None:
+                raise CollectionNotAllowedError("Le contenu décodé archivé est indisponible.")
+            blob = await uow.blobs.get(decoded_blob_id)
+            if blob is None:
+                raise CollectionNotAllowedError("Le contenu décodé archivé est indisponible.")
+        content = await self._blob_store.read(
+            blob.descriptor,
+            max_bytes=self._collector.policy.max_expanded_bytes,
+        )
+        logger.info(
+            "source_downloaded",
+            extra={
+                "event": "source.downloaded",
+                "subject_id": str(subject_id),
+                "source_collection_id": str(collection_id),
+            },
+        )
+        return document, content
+
     async def prepare_retry(self, collection_id: UUID) -> SourceCollection:
         async with self._uow_factory() as uow:
             collection = await uow.source_collections.get_for_update(collection_id)
@@ -207,89 +289,157 @@ class SubjectCollectionService:
             sources = [item for item in sources if item.id == collection_id]
             if not sources:
                 raise CollectionItemNotFoundError(str(collection_id))
-        retryable = False
-        terminal_failure = False
+        summary = CollectionSummary(total=len(sources))
+        await context.report_progress(0, len(sources), "Préparation de la collecte")
         for index, source in enumerate(sources, start=1):
             await context.check_cancelled()
-            await context.report_progress(index - 1, len(sources), f"Collecte de la source {index}")
-            if source.state in {
-                CollectionState.COMPLETED,
+            candidate = await self._candidate_for(source)
+            await context.report_progress(
+                index - 1,
+                len(sources),
+                f"Préparation de la source {index}/{len(sources)}",
+            )
+            await context.record_diagnostics(
+                {
+                    "source_collection_id": str(source.id),
+                    "source_candidate_id": str(source.source_candidate_id),
+                    "number": index,
+                    "total": len(sources),
+                    "title": candidate.title if candidate else None,
+                    "publisher": candidate.publisher if candidate else None,
+                    "url": source.requested_url,
+                    "phase": "preparing",
+                    "correlation_id": get_correlation_id(),
+                }
+            )
+            already_archived = source.state in _COLLECTED_STATES
+            if already_archived:
+                await self._ensure_archived_document_metadata(source, candidate)
+            if already_archived or source.state in {
+                CollectionState.UNAVAILABLE,
                 CollectionState.BLOCKED,
+                CollectionState.FAILED_RETRYABLE,
                 CollectionState.FAILED_TERMINAL,
             }:
-                continue
-            state = await self.collect_one(source.id, job_id, context=context)
-            retryable = retryable or state in {
-                CollectionState.FAILED_RETRYABLE,
-                CollectionState.FETCHING,
-            }
-            terminal_failure = terminal_failure or state is CollectionState.FAILED_TERMINAL
+                state = source.state
+            else:
+                await context.report_progress(
+                    index - 1,
+                    len(sources),
+                    f"Téléchargement de la source {index}/{len(sources)}",
+                )
+                state = await self.archive_one(
+                    source.id,
+                    job_id,
+                    context=context,
+                    position=(index, len(sources)),
+                )
+            summary.record(state, already_archived=already_archived)
+            state_label = _state_label(state)
+            await context.report_progress(
+                index,
+                len(sources),
+                f"Source {index}/{len(sources)} {state_label}",
+            )
+            await context.record_diagnostics(
+                {
+                    "source_collection_id": str(source.id),
+                    "source_candidate_id": str(source.source_candidate_id),
+                    "number": index,
+                    "total": len(sources),
+                    "title": candidate.title if candidate else None,
+                    "publisher": candidate.publisher if candidate else None,
+                    "url": source.requested_url,
+                    "phase": "persisted",
+                    "state": state.value,
+                    "correlation_id": get_correlation_id(),
+                }
+            )
             await context.heartbeat()
-        await context.report_progress(len(sources), len(sources), "Collecte terminée")
-        if retryable:
+        message = _summary_message(summary)
+        await context.report_progress(len(sources), len(sources), message)
+        if summary.success_count:
+            await self._materialize_workspace(subject_id)
+        output_reference = await self._record_summary(subject_id, job_id, summary)
+        logger.info(
+            "source_collection_completed",
+            extra={
+                "event": "source.collection.completed",
+                "job_id": str(job_id),
+                "subject_id": str(subject_id),
+                "summary": asdict(summary),
+            },
+        )
+        if summary.success_count == 0:
             raise JobHandlerError(
-                "source_collection_transient",
-                "Certaines sources sont temporairement indisponibles.",
-                transient=True,
-            )
-        if terminal_failure:
-            raise JobHandlerError(
-                "source_collection_terminal",
-                "Une source a dépassé une limite sûre ou ne peut pas être extraite.",
+                "source_collection_no_success",
+                "Aucune publication n'a pu être archivée.",
                 transient=False,
+                details=asdict(summary),
             )
-        return f"subject-collection://{subject_id}"
+        return output_reference
 
-    async def collect_one(
+    async def archive_one(
         self,
         collection_id: UUID,
         job_id: UUID,
         *,
         context: JobExecutionContext | None = None,
+        position: tuple[int, int] | None = None,
     ) -> CollectionState:
+        operation_started = time.monotonic()
         async with self._uow_factory() as uow:
             collection = await uow.source_collections.get_for_update(collection_id)
             if collection is None:
                 raise CollectionItemNotFoundError(str(collection_id))
-            if collection.state is CollectionState.COMPLETED:
+            if collection.state in _COLLECTED_STATES:
                 return collection.state
             await uow.collection_policy_snapshots.add_if_absent(self._policy_snapshot)
-            if collection.state in {CollectionState.ARCHIVED, CollectionState.EXTRACTED}:
-                pass
-            else:
-                now = datetime.now(UTC)
-                if collection.state is CollectionState.FETCHING:
-                    if (
-                        collection.fetch_lease_expires_at
-                        and collection.fetch_lease_expires_at > now
-                    ):
-                        return collection.state
-                    await uow.collection_attempts.append(
-                        _interrupted_attempt(
-                            collection,
-                            now,
-                            fallback_job_id=job_id,
-                            fallback_policy_snapshot_id=self._policy_snapshot.id,
-                        )
-                    )
-                claimed = collection.claim_fetch(
-                    job_id,
-                    lease_duration=self._fetch_lease,
-                    policy_snapshot_id=self._policy_snapshot.id,
-                    now=now,
-                )
-                if not claimed:
+            now = datetime.now(UTC)
+            if collection.state is CollectionState.FETCHING:
+                if collection.fetch_lease_expires_at and collection.fetch_lease_expires_at > now:
                     return collection.state
-                await uow.source_collections.save(collection)
-                await uow.commit()
-
-        if collection.state is CollectionState.FETCHING:
-            started_at = collection.fetch_started_at or datetime.now(UTC)
-            try:
-                response = await self._collector.fetch(
-                    collection.requested_url,
-                    cancellation_check=context.check_cancelled if context else None,
+                await uow.collection_attempts.append(
+                    _interrupted_attempt(
+                        collection,
+                        now,
+                        fallback_job_id=job_id,
+                        fallback_policy_snapshot_id=self._policy_snapshot.id,
+                    )
                 )
+            claimed = collection.claim_fetch(
+                job_id,
+                lease_duration=self._fetch_lease,
+                policy_snapshot_id=self._policy_snapshot.id,
+                now=now,
+            )
+            if not claimed:
+                return collection.state
+            await uow.source_collections.save(collection)
+            await uow.commit()
+
+        started_at = collection.fetch_started_at or datetime.now(UTC)
+        try:
+            response = await self._collector.fetch(
+                collection.requested_url,
+                cancellation_check=context.check_cancelled if context else None,
+            )
+        except JobCancelledError:
+            await self._record_interruption(
+                collection.id,
+                job_id,
+                "Collection cancelled before archival",
+            )
+            raise
+        except CollectionError as exc:
+            state = await self._record_failure(collection.id, job_id, started_at, exc)
+            self._log_source_result(collection, job_id, state, operation_started, error=exc)
+            return state
+        if not await self._renew_fetch_lease(collection.id, job_id):
+            return CollectionState.FETCHING
+        if context is not None:
+            try:
+                await context.check_cancelled()
             except JobCancelledError:
                 await self._record_interruption(
                     collection.id,
@@ -297,28 +447,21 @@ class SubjectCollectionService:
                     "Collection cancelled before archival",
                 )
                 raise
-            except CollectionError as exc:
-                return await self._record_failure(collection.id, job_id, started_at, exc)
-            if not await self._renew_fetch_lease(collection.id, job_id):
-                return CollectionState.FETCHING
-            if context is not None:
-                try:
-                    await context.check_cancelled()
-                except JobCancelledError:
-                    await self._record_interruption(
-                        collection.id,
-                        job_id,
-                        "Collection cancelled before archival",
-                    )
-                    raise
-            await self._archive(collection.id, job_id, started_at, response)
-
-        await self._extract(collection.id, context=context)
-        async with self._uow_factory() as uow:
-            completed = await uow.source_collections.get(collection.id)
-            if completed is None:
-                raise CollectionItemNotFoundError(str(collection.id))
-            return completed.state
+            if position:
+                await context.report_progress(
+                    position[0] - 1,
+                    position[1],
+                    f"Archivage de la source {position[0]}/{position[1]}",
+                )
+        await self._archive(collection.id, job_id, started_at, response)
+        self._log_source_result(
+            collection,
+            job_id,
+            CollectionState.ARCHIVED,
+            operation_started,
+            size=response.decoded_size,
+        )
+        return CollectionState.ARCHIVED
 
     async def decide_claim(
         self,
@@ -436,6 +579,146 @@ class SubjectCollectionService:
             await uow.commit()
             return collection
 
+    async def _candidate_for(self, collection: SourceCollection) -> SourceCandidate | None:
+        async with self._uow_factory() as uow:
+            batch = await uow.discovery_batches.get(collection.batch_id)
+            return batch.source(collection.source_candidate_id) if batch else None
+
+    async def _ensure_archived_document_metadata(
+        self, collection: SourceCollection, candidate: SourceCandidate | None
+    ) -> None:
+        if candidate is None or collection.source_document_id is None:
+            raise CollectionNotAllowedError("Archived source lost its canonical metadata")
+        async with self._uow_factory() as uow:
+            document = await uow.source_documents.get(collection.source_document_id)
+            if document is None or collection.decoded_blob_id is None:
+                raise CollectionNotAllowedError("Archived source content is missing")
+            if document.title is not None and document.logical_filename is not None:
+                return
+            attempts = await uow.collection_attempts.list_for_collection(collection.id)
+            attempt = attempts[-1] if attempts else None
+            decoded_blob = await uow.blobs.get(collection.decoded_blob_id)
+            if decoded_blob is None:
+                raise CollectionNotAllowedError("Archived decoded blob is missing")
+            decoded_sha256 = (
+                attempt.decoded_sha256
+                if attempt and attempt.decoded_sha256
+                else decoded_blob.descriptor.sha256
+            )
+            detected_mime_type = (
+                attempt.detected_content_type
+                if attempt and attempt.detected_content_type
+                else decoded_blob.descriptor.mime_type
+            )
+            existing_names = {
+                item.logical_filename
+                for item in await uow.source_documents.list_for_subject(collection.subject_id)
+                if item.id != document.id and item.logical_filename
+            }
+            document.logical_filename = analyst_filename(
+                published_at=candidate.published_at,
+                tlp=candidate.tlp,
+                title=candidate.title,
+                publisher=candidate.publisher,
+                detected_mime_type=detected_mime_type,
+                decoded_sha256=decoded_sha256,
+                existing_names=existing_names,
+            )
+            document.source_collection_id = collection.id
+            document.source_candidate_id = candidate.id
+            document.decoded_blob_id = collection.decoded_blob_id
+            document.title = candidate.title
+            document.publisher = candidate.publisher
+            document.published_at = candidate.published_at
+            document.origin = collection.requested_url
+            document.final_url = attempt.final_url if attempt else document.origin
+            document.declared_mime_type = attempt.declared_content_type if attempt else None
+            document.detected_mime_type = detected_mime_type
+            document.encoded_sha256 = attempt.encoded_sha256 if attempt else None
+            document.decoded_sha256 = decoded_sha256
+            document.encoded_size = attempt.encoded_size if attempt else None
+            document.decoded_size = (
+                attempt.decoded_size if attempt else decoded_blob.descriptor.size
+            )
+            await uow.source_documents.save(document)
+            await uow.commit()
+
+    async def _record_summary(
+        self, subject_id: UUID, job_id: UUID, summary: CollectionSummary
+    ) -> str:
+        async with self._uow_factory() as uow:
+            subject = await uow.subjects.get(subject_id)
+            if subject is None:
+                raise CollectionItemNotFoundError(str(subject_id))
+            event = ProvenanceEvent(
+                subject_id=subject_id,
+                aggregate_type="source_collection_job",
+                aggregate_id=job_id,
+                event_type="source.collection_completed",
+                payload=asdict(summary),
+                tlp=subject.tlp,
+                actor_id="system:collector",
+            )
+            await uow.provenance.append(event)
+            await uow.commit()
+        return f"provenance://events/{event.id}"
+
+    async def _materialize_workspace(self, subject_id: UUID) -> None:
+        if self._workspace_materializer is None or self._workspace_root is None:
+            return
+        async with self._uow_factory() as uow:
+            subject = await uow.subjects.get(subject_id)
+            if subject is None:
+                raise CollectionItemNotFoundError(str(subject_id))
+            documents = list(await uow.source_documents.list_for_subject(subject_id))
+            samples = list(await uow.samples.list_for_subject(subject_id))
+            blob_ids = {
+                blob_id
+                for document in documents
+                for blob_id in (document.blob_id, document.decoded_blob_id)
+                if blob_id is not None
+            } | {sample.blob_id for sample in samples}
+            blobs = {}
+            for blob_id in blob_ids:
+                blob = await uow.blobs.get(blob_id)
+                if blob is None:
+                    raise CollectionItemNotFoundError(str(blob_id))
+                blobs[blob_id] = blob
+        await self._workspace_materializer.materialize(
+            subject,
+            documents,
+            samples,
+            blobs,
+            self._workspace_root,
+        )
+
+    @staticmethod
+    def _log_source_result(
+        collection: SourceCollection,
+        job_id: UUID,
+        state: CollectionState,
+        started: float,
+        *,
+        size: int | None = None,
+        error: CollectionError | None = None,
+    ) -> None:
+        logger.info(
+            "source_collection_result",
+            extra={
+                "event": "source.collection.persisted",
+                "job_id": str(job_id),
+                "subject_id": str(collection.subject_id),
+                "source_collection_id": str(collection.id),
+                "source_candidate_id": str(collection.source_candidate_id),
+                "requested_url": collection.requested_url,
+                "phase": "persisted",
+                "state": state.value,
+                "duration_ms": round((time.monotonic() - started) * 1000),
+                "size": size,
+                "error_code": type(error).__name__ if error else None,
+            },
+        )
+
     async def _archive(
         self,
         collection_id: UUID,
@@ -460,16 +743,44 @@ class SubjectCollectionService:
             source = batch.source(collection.source_candidate_id) if batch else None
             if subject is None or source is None:
                 raise CollectionNotAllowedError("Collection source lost its canonical context")
+            existing_names = {
+                item.logical_filename
+                for item in await uow.source_documents.list_for_subject(collection.subject_id)
+                if item.logical_filename
+            }
+            logical_filename = analyst_filename(
+                published_at=source.published_at,
+                tlp=source.tlp,
+                title=source.title,
+                publisher=source.publisher,
+                detected_mime_type=response.detected_content_type.value,
+                decoded_sha256=response.decoded_sha256,
+                existing_names=existing_names,
+            )
             document = SourceDocument(
                 subject_id=collection.subject_id,
                 blob_id=raw_blob.id,
                 original_name=_original_name(response.final_url),
-                origin=response.final_url,
+                origin=response.requested_url,
                 acquired_at=response.acquired_at,
                 license_restriction=None,
                 tlp=source.tlp,
                 do_not_submit=False,
                 external_llm_allowed=source.external_llm_allowed,
+                logical_filename=logical_filename,
+                source_collection_id=collection.id,
+                source_candidate_id=source.id,
+                decoded_blob_id=decoded_blob.id,
+                title=source.title,
+                publisher=source.publisher,
+                published_at=source.published_at,
+                final_url=response.final_url,
+                declared_mime_type=response.declared_content_type,
+                detected_mime_type=response.detected_content_type.value,
+                encoded_sha256=response.encoded_sha256,
+                decoded_sha256=response.decoded_sha256,
+                encoded_size=response.encoded_size,
+                decoded_size=response.decoded_size,
             )
             attempt = _successful_attempt(
                 collection,
@@ -498,6 +809,9 @@ class SubjectCollectionService:
                         "source_document_id": str(document.id),
                         "encoded_sha256": response.encoded_sha256,
                         "decoded_sha256": response.decoded_sha256,
+                        "logical_filename": logical_filename,
+                        "raw_blob_id": str(raw_blob.id),
+                        "decoded_blob_id": str(decoded_blob.id),
                         "content_encoding": response.content_encoding,
                         "job_id": str(job_id),
                     },
@@ -518,114 +832,6 @@ class SubjectCollectionService:
                 await uow.source_collections.save(collection)
                 await uow.commit()
             return renewed
-
-    async def _extract(
-        self,
-        collection_id: UUID,
-        *,
-        context: JobExecutionContext | None = None,
-    ) -> None:
-        async with self._uow_factory() as uow:
-            collection = await _require_collection(uow, collection_id)
-            if collection.state is CollectionState.COMPLETED:
-                return
-            if collection.state is CollectionState.EXTRACTED:
-                collection.complete()
-                await uow.source_collections.save(collection)
-                await uow.commit()
-                return
-            if (
-                collection.state is not CollectionState.ARCHIVED
-                or not collection.source_document_id
-                or not collection.decoded_blob_id
-            ):
-                return
-            document = await uow.source_documents.get(collection.source_document_id)
-            blob = await uow.blobs.get(collection.decoded_blob_id) if document else None
-            if document is None or blob is None:
-                raise CollectionItemNotFoundError("Archived source content is missing")
-        if context is not None:
-            await context.check_cancelled()
-        raw = await self._blob_store.read(
-            blob.descriptor, max_bytes=self._collector.policy.max_expanded_bytes
-        )
-        try:
-            parsed = parse_document(
-                raw,
-                _mime_from_value(blob.descriptor.mime_type),
-                self._extraction.pdf_policy,
-            )
-        except DocumentParsingError as exc:
-            await self._record_processing_failure(
-                collection.id,
-                f"{exc.code}: {exc}",
-            )
-            return
-        text_blob = await self._catalog.ingest(
-            BytesIO(parsed.text.encode()),
-            logical_bucket="source-text",
-            mime_type="text/plain; charset=utf-8",
-        )
-        artifact = DerivedArtifact(
-            source_document_id=document.id,
-            text_blob_id=text_blob.id,
-            parser_name=PARSER_NAME,
-            parser_version=PARSER_VERSION,
-            text_length=len(parsed.text),
-            publication_metadata=parsed.metadata,
-        )
-        indicators = extract_indicators(
-            parsed.text,
-            subject_id=collection.subject_id,
-            edition_id=collection.edition_id,
-            group_id=collection.group_id,
-            source_document_id=document.id,
-            artifact_id=artifact.id,
-        )
-        outcome = await self._extraction.extract_claims(
-            parsed.text,
-            subject_id=collection.subject_id,
-            edition_id=collection.edition_id,
-            group_id=collection.group_id,
-            source_document_id=document.id,
-            artifact_id=artifact.id,
-            external_llm_allowed=document.external_llm_allowed,
-            cancellation_check=context.check_cancelled if context else None,
-        )
-        if context is not None:
-            await context.check_cancelled()
-        async with self._uow_factory() as uow:
-            current = await _require_collection(uow, collection.id)
-            if current.state is CollectionState.ARCHIVED:
-                await uow.derived_artifacts.append(artifact)
-                await uow.indicators.append_many(indicators)
-                await uow.claims.append_many(outcome.claims)
-                await uow.rejected_model_proposals.append_many(outcome.rejected_proposals)
-                current.extracted(artifact.id)
-                current.complete()
-                await uow.source_collections.save(current)
-                await uow.commit()
-
-    async def _record_processing_failure(self, collection_id: UUID, reason: str) -> None:
-        async with self._uow_factory() as uow:
-            collection = await _require_collection(uow, collection_id)
-            subject = await uow.subjects.get(collection.subject_id)
-            if subject is None:
-                raise CollectionItemNotFoundError(str(collection.subject_id))
-            collection.fail_processing(reason=reason)
-            await uow.source_collections.save(collection)
-            await uow.provenance.append(
-                ProvenanceEvent(
-                    subject_id=collection.subject_id,
-                    aggregate_type="source_collection",
-                    aggregate_id=collection.id,
-                    event_type="source.extraction_failed",
-                    payload={"reason": reason},
-                    tlp=subject.tlp,
-                    actor_id="system:extractor",
-                )
-            )
-            await uow.commit()
 
     async def _record_interruption(
         self,
@@ -819,5 +1025,25 @@ def _original_name(url: str) -> str:
     return name[:500] if name else "source"
 
 
-def _mime_from_value(value: str) -> DetectedMimeType:
-    return DetectedMimeType(value)
+def _state_label(state: CollectionState) -> str:
+    return {
+        CollectionState.ARCHIVED: "archivée",
+        CollectionState.EXTRACTED: "déjà archivée",
+        CollectionState.COMPLETED: "déjà archivée",
+        CollectionState.UNAVAILABLE: "indisponible",
+        CollectionState.BLOCKED: "bloquée",
+        CollectionState.FAILED_RETRYABLE: "à réessayer",
+        CollectionState.FAILED_TERMINAL: "en échec définitif",
+        CollectionState.FETCHING: "déjà en cours",
+    }.get(state, state.value)
+
+
+def _summary_message(summary: CollectionSummary) -> str:
+    message = (
+        f"{summary.total} publications traitées · "
+        f"{summary.already_archived} déjà archivées · "
+        f"{summary.newly_archived} nouvellement archivées"
+    )
+    if summary.warning_count:
+        message += f" · {summary.warning_count} avertissements"
+    return message

@@ -86,6 +86,7 @@ test("crée, sélectionne, continue et archive une conversation d’analyse", as
   );
 
   await page.goto(`/subjects/${subjectId}`);
+  await page.getByText("Avancé", { exact: true }).click();
   await page.getByRole("button", { name: "Conversations" }).click();
   await page
     .getByLabel("Titre défini par l’application")

@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from cti_app.application.blob_storage import BlobStore
+from cti_app.application.source_filenames import validate_logical_filename
 from cti_app.domain.blobs import BlobRecord, utc_now
 from cti_app.domain.entities import Sample, SourceDocument, Subject
 from cti_app.domain.errors import EntityNotFoundError
@@ -72,17 +73,28 @@ class SubjectWorkspaceMaterializer:
         subject_path = self._prepare_directories(workspace_root, subject.slug)
         source_manifest = []
         for document in source_documents:
-            blob = self._require_blob(blobs, document.blob_id)
-            relative_path = Path("01_sources/original") / blob.descriptor.sha256
-            method = await self._store.materialize(blob.descriptor, subject_path / relative_path)
-            source_manifest.append(self._manifest_entry(document, blob, relative_path, method))
+            raw_blob = self._require_blob(blobs, document.blob_id)
+            decoded_blob = self._require_blob(blobs, document.decoded_blob_id or document.blob_id)
+            logical_filename = validate_logical_filename(
+                document.logical_filename or document.original_name
+            )
+            relative_path = Path("01_sources/original") / logical_filename
+            destination = subject_path / relative_path
+            if destination.parent.is_symlink() or not destination.parent.resolve().is_relative_to(
+                subject_path.resolve()
+            ):
+                raise ValueError("Source materialization escaped the workspace")
+            method = await self._store.materialize(decoded_blob.descriptor, destination)
+            source_manifest.append(
+                self._source_manifest_entry(document, raw_blob, decoded_blob, relative_path, method)
+            )
 
         sample_manifest = []
         for sample in samples:
             blob = self._require_blob(blobs, sample.blob_id)
             relative_path = Path("03_samples/original") / blob.descriptor.sha256
             method = await self._store.materialize(blob.descriptor, subject_path / relative_path)
-            sample_manifest.append(self._manifest_entry(sample, blob, relative_path, method))
+            sample_manifest.append(self._sample_manifest_entry(sample, blob, relative_path, method))
 
         manifest = {
             "subject": {
@@ -121,8 +133,44 @@ class SubjectWorkspaceMaterializer:
         return subject_path
 
     @staticmethod
-    def _manifest_entry(
-        asset: SourceDocument | Sample,
+    def _source_manifest_entry(
+        document: SourceDocument,
+        raw_blob: BlobRecord,
+        decoded_blob: BlobRecord,
+        relative_path: Path,
+        method: str,
+    ) -> dict[str, object]:
+        return {
+            "id": str(document.id),
+            "source_collection_id": (
+                str(document.source_collection_id) if document.source_collection_id else None
+            ),
+            "source_candidate_id": (
+                str(document.source_candidate_id) if document.source_candidate_id else None
+            ),
+            "logical_filename": document.logical_filename or document.original_name,
+            "path": relative_path.as_posix(),
+            "raw_blob_id": str(raw_blob.id),
+            "decoded_blob_id": str(decoded_blob.id),
+            "encoded_sha256": document.encoded_sha256 or raw_blob.descriptor.sha256,
+            "decoded_sha256": document.decoded_sha256 or decoded_blob.descriptor.sha256,
+            "encoded_size": document.encoded_size or raw_blob.descriptor.size,
+            "decoded_size": document.decoded_size or decoded_blob.descriptor.size,
+            "mime_type": document.detected_mime_type or decoded_blob.descriptor.mime_type,
+            "requested_url": document.origin,
+            "final_url": document.final_url or document.origin,
+            "published_at": document.published_at.isoformat() if document.published_at else None,
+            "publisher": document.publisher,
+            "title": document.title,
+            "tlp": document.tlp.value,
+            "acquired_at": document.acquired_at.isoformat(),
+            "materialization": method,
+            "canonical_status": "archived",
+        }
+
+    @staticmethod
+    def _sample_manifest_entry(
+        asset: Sample,
         blob: BlobRecord,
         relative_path: Path,
         method: str,

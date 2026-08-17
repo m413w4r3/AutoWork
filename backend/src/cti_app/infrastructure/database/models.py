@@ -6,6 +6,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -38,7 +39,7 @@ EDITORIAL_TYPE_VALUES_SQL = "'brief', 'major'"
 RELATIONSHIP_STATUS_VALUES_SQL = "'provisional', 'verified'"
 GROUPING_CONFIDENCE_VALUES_SQL = "'low', 'medium', 'high'"
 COLLECTION_STATE_VALUES_SQL = (
-    "'queued', 'fetching', 'archived', 'extracted', 'completed', 'unavailable', "
+    "'pending', 'queued', 'fetching', 'archived', 'extracted', 'completed', 'unavailable', "
     "'blocked', 'failed_retryable', 'failed_terminal'"
 )
 SOURCE_ROLE_VALUES_SQL = "'primary', 'independent', 'relay', 'aggregator', 'social', 'unknown'"
@@ -130,6 +131,22 @@ class SourceDocumentRow(Base):
     tlp: Mapped[str] = mapped_column(String(16), nullable=False)
     do_not_submit: Mapped[bool] = mapped_column(Boolean, nullable=False)
     external_llm_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    logical_filename: Mapped[str | None] = mapped_column(Text)
+    source_collection_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    source_candidate_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    decoded_blob_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT")
+    )
+    title: Mapped[str | None] = mapped_column(Text)
+    publisher: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[date | None] = mapped_column(Date)
+    final_url: Mapped[str | None] = mapped_column(Text)
+    declared_mime_type: Mapped[str | None] = mapped_column(String(255))
+    detected_mime_type: Mapped[str | None] = mapped_column(String(255))
+    encoded_sha256: Mapped[str | None] = mapped_column(String(64))
+    decoded_sha256: Mapped[str | None] = mapped_column(String(64))
+    encoded_size: Mapped[int | None] = mapped_column(BigInteger)
+    decoded_size: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 

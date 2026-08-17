@@ -231,7 +231,8 @@ test("parcourt candidat Iran, brève fondée sur preuves, puis validation", asyn
     .getByRole("button", { name: "Confirmer la sélection (1)" })
     .click();
   await page.getByRole("link", { name: "Ouvrir le sujet" }).click();
-  await page.getByRole("button", { name: "Brève" }).click();
+  await page.getByText("Avancé", { exact: true }).click();
+  await page.getByRole("button", { name: "Rédaction" }).click();
   await page.getByRole("button", { name: "Geler les preuves" }).click();
   await page.getByRole("button", { name: "Générer la brève" }).click();
 

@@ -1,13 +1,12 @@
 from collections.abc import Sequence
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import FastAPI
 
 from cti_app.api.collection import router
 from cti_app.application.collection import SubjectCollectionService, register_collection_jobs
-from cti_app.application.extraction import EvidenceExtractionService
 from cti_app.application.http_collection import (
     PinnedHttpRequest,
     RawHttpResponse,
@@ -52,7 +51,6 @@ async def test_api_and_synchronous_worker_collect_selected_subject(tmp_path: Pat
         collection_uow,
         SafeHttpCollector(Transport(), Resolver()),
         FilesystemBlobStore(tmp_path / "blobs"),
-        EvidenceExtractionService(None),
     )
     jobs_uow = InMemoryJobUnitOfWorkFactory()
     registry = JobRegistry()
@@ -75,13 +73,29 @@ async def test_api_and_synchronous_worker_collect_selected_subject(tmp_path: Pat
         assert job.status.value == "succeeded"
 
         workbench = await client.get(f"/api/subjects/{subject.id}/workbench")
+        source_payload = workbench.json()["sources"][0]
+        download = await client.get(
+            f"/api/subjects/{subject.id}/sources/{source_payload['id']}/download"
+        )
+        wrong_subject = await client.get(
+            f"/api/subjects/{uuid4()}/sources/{source_payload['id']}/download"
+        )
 
     assert workbench.status_code == 200
     source = workbench.json()["sources"][0]
-    assert source["state"] == "completed"
+    assert source["state"] == "archived"
     assert source["latest_attempt"]["encoded_sha256"]
     assert source["latest_attempt"]["decoded_sha256"]
     assert source["relationship_status"] == "provisional"
+    assert source["title"] == "Report 1"
+    assert source["logical_filename"].endswith(".html")
+    assert download.status_code == 200
+    assert download.content == HTML
+    assert download.headers["content-type"] == "text/html; charset=utf-8"
+    assert download.headers["content-disposition"].startswith("attachment;")
+    assert "filename*=UTF-8''" in download.headers["content-disposition"]
+    assert download.headers["x-content-type-options"] == "nosniff"
+    assert wrong_subject.status_code == 404
 
 
 async def test_retry_endpoint_processes_only_requested_source(tmp_path: Path) -> None:
@@ -101,7 +115,6 @@ async def test_retry_endpoint_processes_only_requested_source(tmp_path: Path) ->
         collection_uow,
         SafeHttpCollector(transport, Resolver()),
         FilesystemBlobStore(tmp_path / "blobs"),
-        EvidenceExtractionService(None),
     )
     jobs_uow = InMemoryJobUnitOfWorkFactory()
     registry = JobRegistry()
@@ -119,7 +132,7 @@ async def test_retry_endpoint_processes_only_requested_source(tmp_path: Path) ->
     ) as client:
         assert (await client.post(f"/api/subjects/{subject.id}/collection")).status_code == 202
         sources = (await client.get(f"/api/subjects/{subject.id}/workbench")).json()["sources"]
-        completed = next(item for item in sources if item["state"] == "completed")
+        completed = next(item for item in sources if item["state"] == "archived")
         unavailable = next(item for item in sources if item["state"] == "unavailable")
 
         retried = await client.post(f"/api/subjects/{subject.id}/sources/{unavailable['id']}/retry")
@@ -127,4 +140,4 @@ async def test_retry_endpoint_processes_only_requested_source(tmp_path: Path) ->
     assert retried.status_code == 202
     assert transport.calls == 3
     assert collection_uow.collections[UUID(completed["id"])].attempt_count == 1
-    assert collection_uow.collections[UUID(unavailable["id"])].state.value == "completed"
+    assert collection_uow.collections[UUID(unavailable["id"])].state.value == "archived"

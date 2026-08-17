@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -51,6 +51,20 @@ class SourceDocument:
     tlp: TLP
     do_not_submit: bool
     external_llm_allowed: bool
+    logical_filename: str | None = None
+    source_collection_id: UUID | None = None
+    source_candidate_id: UUID | None = None
+    decoded_blob_id: UUID | None = None
+    title: str | None = None
+    publisher: str | None = None
+    published_at: date | None = None
+    final_url: str | None = None
+    declared_mime_type: str | None = None
+    detected_mime_type: str | None = None
+    encoded_sha256: str | None = None
+    decoded_sha256: str | None = None
+    encoded_size: int | None = None
+    decoded_size: int | None = None
     id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=utc_now)
 
@@ -59,6 +73,8 @@ class SourceDocument:
         _require_text(self.origin, "origin")
         _require_aware(self.acquired_at, "acquired_at")
         _require_aware(self.created_at, "created_at")
+        if self.logical_filename is not None:
+            _require_text(self.logical_filename, "logical_filename")
 
     def restrict_tlp(self, requested: TLP) -> None:
         ensure_tlp_not_downgraded(self.tlp, requested)

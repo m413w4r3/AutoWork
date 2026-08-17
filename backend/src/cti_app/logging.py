@@ -43,7 +43,23 @@ class JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
-        for field in ("http_method", "http_path", "http_status"):
+        for field in (
+            "http_method",
+            "http_path",
+            "http_status",
+            "event",
+            "job_id",
+            "subject_id",
+            "source_collection_id",
+            "source_candidate_id",
+            "requested_url",
+            "phase",
+            "state",
+            "duration_ms",
+            "size",
+            "error_code",
+            "summary",
+        ):
             if hasattr(record, field):
                 payload[field] = getattr(record, field)
         return json.dumps(payload, ensure_ascii=False)

@@ -424,7 +424,19 @@ def _detect_mime(body: bytes) -> DetectedMimeType:
         return DetectedMimeType.PDF
     if prefix.startswith((b"<!doctype html", b"<html")) or b"<html" in prefix:
         return DetectedMimeType.HTML
-    raise UnsupportedContentError("Only detected HTML and PDF content is supported")
+    try:
+        decoded = body.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise UnsupportedContentError("Detected content type is not supported") from exc
+    try:
+        parsed = json.loads(decoded)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        return DetectedMimeType.JSON
+    if "\x00" not in decoded:
+        return DetectedMimeType.TEXT
+    raise UnsupportedContentError("Detected content type is not supported")
 
 
 def _content_type(value: str | None) -> str | None:

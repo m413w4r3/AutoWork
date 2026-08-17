@@ -14,6 +14,7 @@ from cti_app.domain.discovery import (
 
 
 class CollectionState(StrEnum):
+    PENDING = "pending"
     QUEUED = "queued"
     FETCHING = "fetching"
     ARCHIVED = "archived"
@@ -37,6 +38,8 @@ class AttemptOutcome(StrEnum):
 class DetectedMimeType(StrEnum):
     HTML = "text/html"
     PDF = "application/pdf"
+    TEXT = "text/plain"
+    JSON = "application/json"
 
 
 class ClaimKind(StrEnum):
@@ -94,7 +97,7 @@ class SourceCollection:
     requested_url: str
     proposed_role: SourceRole
     id: UUID = field(default_factory=uuid4)
-    state: CollectionState = CollectionState.QUEUED
+    state: CollectionState = CollectionState.PENDING
     relationship_status: SourceRelationshipStatus = SourceRelationshipStatus.PROVISIONAL
     relationship_evidence: str = "model_proposal"
     source_document_id: UUID | None = None
@@ -136,6 +139,7 @@ class SourceCollection:
             if self.fetch_lease_expires_at and self.fetch_lease_expires_at > timestamp:
                 return False
         elif self.state not in {
+            CollectionState.PENDING,
             CollectionState.QUEUED,
             CollectionState.FAILED_RETRYABLE,
             CollectionState.UNAVAILABLE,
@@ -233,7 +237,7 @@ class SourceCollection:
         if self.source_document_id and self.decoded_blob_id:
             self.state = CollectionState.ARCHIVED
         elif self.state is not CollectionState.FETCHING:
-            self.state = CollectionState.QUEUED
+            self.state = CollectionState.PENDING
         self.error_reason = None
         self._clear_fetch_lease()
         self._touch()

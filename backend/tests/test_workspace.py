@@ -35,6 +35,7 @@ async def test_subject_workspace_materializes_logical_tree_without_using_origina
         tlp=TLP.AMBER,
         do_not_submit=False,
         external_llm_allowed=False,
+        logical_filename="2026-08-07_TLP AMBER_Rapport_Example.pdf",
     )
     sample = Sample(
         subject_id=subject.id,
@@ -61,7 +62,7 @@ async def test_subject_workspace_materializes_logical_tree_without_using_origina
     assert result.sample_count == 1
     for relative_directory in SUBJECT_DIRECTORIES:
         assert (result.path / relative_directory).is_dir()
-    source_path = result.path / "01_sources/original" / descriptor.sha256
+    source_path = result.path / "01_sources/original/2026-08-07_TLP AMBER_Rapport_Example.pdf"
     sample_path = result.path / "03_samples/original" / descriptor.sha256
     assert source_path.read_bytes() == b"#!/bin/sh\nexit 99\n"
     assert sample_path.read_bytes() == b"#!/bin/sh\nexit 99\n"
@@ -69,4 +70,6 @@ async def test_subject_workspace_materializes_logical_tree_without_using_origina
     manifest = json.loads((result.path / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["canonical"] is False
     assert manifest["samples"][0]["do_not_submit"] is True
-    assert manifest["sources"][0]["original_name"] == "report.pdf"
+    assert manifest["sources"][0]["logical_filename"] == (
+        "2026-08-07_TLP AMBER_Rapport_Example.pdf"
+    )

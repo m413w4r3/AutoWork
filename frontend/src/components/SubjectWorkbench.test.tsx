@@ -38,6 +38,13 @@ const workbench = {
         outcome: "succeeded",
         failure_reason: null,
       },
+      title: "Rapport ExampleRAT",
+      publisher: "Example Research",
+      published_at: "2026-08-10",
+      tlp: "AMBER",
+      logical_filename:
+        "2026-08-10_TLP AMBER_Rapport ExampleRAT_Example Research.html",
+      detected_mime_type: "text/html",
     },
   ],
   claims: [
@@ -87,7 +94,7 @@ describe("SubjectWorkbench", () => {
 
     expect(
       await screen.findByRole("heading", {
-        name: "https://research.example/report",
+        name: "Rapport ExampleRAT",
       }),
     ).toBeInTheDocument();
     expect(
@@ -103,6 +110,14 @@ describe("SubjectWorkbench", () => {
     expect(
       screen.getByText(/aucun JavaScript n’est exécuté/),
     ).toBeInTheDocument();
+    expect(screen.getByText("Archivée — prête pour l’analyse")).toBeVisible();
+    expect(screen.getByRole("link", { name: "Télécharger" })).toHaveAttribute(
+      "href",
+      expect.stringContaining("/download"),
+    );
+    expect(
+      screen.getByText("Détails techniques").parentElement,
+    ).not.toHaveAttribute("open");
   });
 
   it("présente les passages surlignés et les IOC originaux et normalisés", async () => {

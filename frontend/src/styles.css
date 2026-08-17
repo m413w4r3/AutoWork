@@ -886,6 +886,106 @@ h1 {
   flex-wrap: wrap;
 }
 
+.workflow-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin: 1.25rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workflow-steps li {
+  padding: 0.75rem 1rem;
+  border: 1px solid #cfdbd3;
+  border-radius: 0.5rem;
+  color: #5b6b62;
+}
+
+.workflow-steps li[aria-current="step"] {
+  border-color: #1f6042;
+  color: #17211d;
+  background: #f7faf7;
+  font-weight: 700;
+}
+
+.advanced-workbench {
+  margin: 1rem 0;
+}
+
+.advanced-workbench > summary,
+.technical-details > summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.source-summary {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.65rem 1.25rem;
+  margin: 1rem 0;
+}
+
+.source-summary h2 {
+  margin: 0;
+}
+
+.source-table {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.source-row {
+  padding: 1rem;
+  border: 1px solid #cfdbd3;
+  border-radius: 0.65rem;
+  background: #fff;
+}
+
+.source-row__main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 1rem;
+}
+
+.source-row h3,
+.source-row p {
+  margin-top: 0;
+}
+
+.source-row__actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.source-state {
+  max-width: 15rem;
+  color: #5b6b62;
+}
+
+.logical-filename {
+  margin: 0.75rem 0 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88rem;
+}
+
+.technical-details {
+  margin-top: 0.75rem;
+}
+
+@media (max-width: 760px) {
+  .workflow-steps {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .source-row__main {
+    grid-template-columns: 1fr;
+  }
+}
+
 .workbench-tabs button[aria-pressed="true"] {
   background: var(--color-primary, #243b53);
   color: white;

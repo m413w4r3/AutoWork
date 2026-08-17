@@ -34,8 +34,10 @@ Les octets des documents et échantillons ne sont jamais stockés dans PostgreSQ
 ## Collecte sûre et preuves
 
 La collecte ne concerne que les sources d'un `Subject` sélectionné et démarre exclusivement par
-`POST /api/subjects/{id}/collection`. Le job `source.collect` est idempotent et reprend les sources
-interrompues sans recréer les objets déjà terminés.
+`POST /api/subjects/{id}/collection`. Le job `source.collect` est idempotent, traite chaque
+publication séparément et s'arrête à l'état `archived`. **La collecte HTTP n'appelle aucun
+modèle** : parsing, Qwen, OpenAI, ChatGPT, claims, IOC et artefacts dérivés appartiennent à une
+future étape Analyse explicite.
 
 - `source_collections` est la projection mutable par source sélectionnée : état courant, bail de
   téléchargement, références brute/décodée, rôle proposé et niveau de preuve. Le rôle ne devient
@@ -46,8 +48,9 @@ interrompues sans recréer les objets déjà terminés.
   résultat et motif.
 - `collection_policy_snapshots` conserve la configuration canonique complète utilisée par chaque
   tentative, et pas seulement son hash.
-- `source_documents` conserve chaque observation d'URL et référence les octets HTTP encodés
-  immuables `source-raw`; `source-decoded` porte séparément le contenu après `Content-Encoding`.
+- `source_documents` conserve chaque observation d'URL, son nom logique et ses métadonnées, ainsi
+  que les références explicites vers les octets HTTP encodés immuables `source-raw` et le contenu
+  `source-decoded` après `Content-Encoding`.
   Deux gzip distincts peuvent donc partager le blob décodé sans partager le blob brut.
 - `derived_artifacts` référence séparément le texte `source-text`, sa version de parseur et les
   métadonnées de publication.
@@ -58,8 +61,8 @@ interrompues sans recréer les objets déjà terminés.
   les propositions valides du même segment.
 - `human_decisions` porte les validations, corrections et rejets sans modifier l'extraction initiale.
 
-La migration additive et réversible `0008_harden_collection_recovery` complète `0007` sans modifier
-les migrations antérieures.
+La migration additive et réversible `0015_collection_only_and_document_metadata` enrichit les
+documents sans supprimer les références historiques.
 
 ## Brèves et evidence packs
 
@@ -73,7 +76,8 @@ Le collecteur accepte uniquement HTTP(S), refuse credentials, localhost, metadat
 privées, loopback, link-local, multicast ou réservées IPv4/IPv6. Il contrôle deux réponses DNS puis
 se connecte à l'IP approuvée en conservant la validation TLS du nom d'hôte. Chaque redirection est
 revalidée. Le temps total, les octets réseau, les octets décompressés, le ratio de décompression et
-le nombre de redirections sont bornés. Le type est détecté depuis les octets (HTML/PDF MVP), sans
+le nombre de redirections sont bornés. Le type est détecté depuis les octets (HTML, PDF, texte et
+JSON), sans
 JavaScript, macro, script ni exécution du fichier.
 
 Les limites se règlent avec `COLLECTION_MAX_REDIRECTS`, `COLLECTION_TIMEOUT_SECONDS`,

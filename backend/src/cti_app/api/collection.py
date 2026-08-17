@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from typing import Literal
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
+from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.collection import (
@@ -14,6 +16,7 @@ from cti_app.application.collection import (
 )
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobService
+from cti_app.application.source_filenames import ascii_download_filename, validate_logical_filename
 from cti_app.domain.collection import (
     Claim,
     CollectionAttempt,
@@ -21,8 +24,9 @@ from cti_app.domain.collection import (
     ReviewStatus,
     SourceCollection,
 )
-from cti_app.domain.discovery import SourceRole
+from cti_app.domain.discovery import SourceCandidate, SourceRole
 from cti_app.domain.editorial import HumanDecision, HumanDecisionType
+from cti_app.domain.entities import SourceDocument
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api/subjects", tags=["subject-workbench"])
@@ -64,6 +68,12 @@ class SourceView(BaseModel):
     error_reason: str | None
     fetch_lease_expires_at: str | None
     latest_attempt: AttemptView | None
+    title: str
+    publisher: str
+    published_at: str | None
+    tlp: str | None
+    logical_filename: str | None
+    detected_mime_type: str | None
 
 
 class ClaimView(BaseModel):
@@ -210,7 +220,10 @@ async def get_workbench(subject_id: UUID, request: Request) -> WorkbenchView:
     source_views: list[SourceView] = []
     for source in sources:
         attempts = await service.attempts(source.id)
-        source_views.append(_source_view(source, attempts[-1] if attempts else None))
+        candidate, document = await service.source_context(source)
+        source_views.append(
+            _source_view(source, attempts[-1] if attempts else None, candidate, document)
+        )
     claim_views: list[ClaimView] = []
     text_cache: dict[UUID, str] = {}
     for claim in claims:
@@ -295,7 +308,35 @@ async def decide_relationship(
     except CollectionItemNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Source collection not found") from exc
     attempts = await service.attempts(source.id)
-    return _source_view(source, attempts[-1] if attempts else None)
+    candidate, document = await service.source_context(source)
+    return _source_view(source, attempts[-1] if attempts else None, candidate, document)
+
+
+@router.get("/{subject_id}/sources/{collection_id}/download")
+async def download_source(subject_id: UUID, collection_id: UUID, request: Request) -> Response:
+    service, _, _ = _runtime(request)
+    try:
+        document, content = await service.download_source(subject_id, collection_id)
+    except CollectionItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Source collection not found") from exc
+    except CollectionNotAllowedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    logical_filename = validate_logical_filename(
+        document.logical_filename or document.original_name
+    )
+    ascii_filename = ascii_download_filename(logical_filename).replace('"', "_")
+    disposition = (
+        f'attachment; filename="{ascii_filename}"; '
+        f"filename*=UTF-8''{quote(logical_filename, safe='')}"
+    )
+    return Response(
+        content,
+        media_type=document.detected_mime_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": disposition,
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def _runtime(request: Request) -> tuple[SubjectCollectionService, JobService, JobDispatcher]:
@@ -311,7 +352,12 @@ async def _actor_id(request: Request) -> str:
     return (await provider.current()).actor_id
 
 
-def _source_view(source: SourceCollection, attempt: CollectionAttempt | None) -> SourceView:
+def _source_view(
+    source: SourceCollection,
+    attempt: CollectionAttempt | None,
+    candidate: SourceCandidate | None,
+    document: SourceDocument | None,
+) -> SourceView:
     return SourceView(
         id=source.id,
         requested_url=source.requested_url,
@@ -326,6 +372,30 @@ def _source_view(source: SourceCollection, attempt: CollectionAttempt | None) ->
             source.fetch_lease_expires_at.isoformat() if source.fetch_lease_expires_at else None
         ),
         latest_attempt=_attempt_view(attempt) if attempt else None,
+        title=(
+            (candidate.title if candidate else None)
+            or (document.title if document else None)
+            or "titre-inconnu"
+        ),
+        publisher=(candidate.publisher if candidate else None)
+        or (document.publisher if document else None)
+        or "publisher-inconnu",
+        published_at=(
+            candidate.published_at.isoformat()
+            if candidate and candidate.published_at
+            else document.published_at.isoformat()
+            if document and document.published_at
+            else None
+        ),
+        tlp=(candidate.tlp.value if candidate else document.tlp.value if document else None),
+        logical_filename=document.logical_filename if document else None,
+        detected_mime_type=(
+            document.detected_mime_type
+            if document
+            else attempt.detected_content_type
+            if attempt
+            else None
+        ),
     )
 
 
