@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "15";
+const VERSION = "16";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -118,6 +118,13 @@ const HEARTBEAT_INTERVAL_MS = 5000;
 // Une réponse non vide et inchangée ne doit jamais rester "running"
 // pendant plusieurs minutes uniquement à cause d'un signal DOM périmé.
 const FINALIZATION_STALL_MS = 45000;
+
+// Garde-fou du cas symétrique : l'UI se prétend encore active (`finished=false`,
+// donc le garde-fou ci-dessus est désarmé) alors que la réponse n'a plus bougé
+// d'un caractère. On ne conclut pas « terminé » — un Stop réellement visible
+// peut signifier que ChatGPT travaille — mais on rend la main en `incomplete`
+// plutôt que de rester « running » indéfiniment.
+const ACTIVE_SIGNAL_STALL_MS = 120000;
 
 let currentJob = null;
 const claimedRequestIds = new Set();
@@ -327,6 +334,14 @@ function readAnswer(root, streaming) {
 function completionState(turn) {
   const scope =
     closestOf(turn, SELECTORS.turnContainer) || turn.parentElement || turn;
+  // Le Stop est un contrôle de la génération courante : il ne se cherche que
+  // dans le composer. Un bouton portant le même libellé ailleurs dans la page
+  // ne doit jamais maintenir ce tour en état « running ». Volontairement sans
+  // `composerRoot()`, dont le repli sur document.body rendrait le scope inutile :
+  // composer introuvable => pas de signal, plutôt qu'un signal de toute la page.
+  const composer = $(SELECTORS.composer);
+  const generationControls =
+    composer && (closestOf(composer, ["form"]) || composer.parentElement);
   const visible = (element) => {
     if (!element || element.getAttribute?.("aria-hidden") === "true")
       return false;
@@ -345,12 +360,17 @@ function completionState(turn) {
     return visible(element);
   };
   return globalThis.ChatGPTBridgeCompletion.completionState({
-    stopVisible: SELECTORS.stop.some((selector) =>
-      [...document.querySelectorAll(selector)].some(visible),
+    stopVisible: Boolean(
+      generationControls &&
+      SELECTORS.stop.some((selector) =>
+        [...generationControls.querySelectorAll(selector)].some(visible),
+      ),
     ),
+    // Le streaming se lit dans le tour surveillé : un indicateur laissé par un
+    // ancien tour ou par un widget latéral ne doit pas empêcher sa finalisation.
     streamingVisible: Boolean(
       [
-        ...document.querySelectorAll(
+        ...scope.querySelectorAll(
           ".streaming-animation, .result-streaming, [data-is-streaming='true']",
         ),
       ].some(visible),
@@ -1070,6 +1090,24 @@ async function streamAnswer(job, locator, before) {
         stable_for_ms: stableForMs,
         incomplete: true,
         incomplete_reason: "finalization_stalled",
+        turn_locator: turnLocator(turn),
+      };
+    }
+
+    if (
+      full.length > 0 &&
+      finished === false &&
+      stableForMs >= ACTIVE_SIGNAL_STALL_MS
+    ) {
+      return {
+        text: full,
+        visible_citations: snapshot?.visible_citations || [],
+        serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
+        completion_signal: completion.signal,
+        completion_confidence: completion.confidence,
+        stable_for_ms: stableForMs,
+        incomplete: true,
+        incomplete_reason: "active_signal_stalled",
         turn_locator: turnLocator(turn),
       };
     }

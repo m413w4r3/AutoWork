@@ -307,15 +307,25 @@ class JobService:
             await uow.commit()
             return job
 
-    async def recover_abandoned(self, heartbeat_timeout: timedelta) -> list[Job]:
+    async def recover_abandoned(
+        self,
+        heartbeat_timeout: timedelta,
+        *,
+        resume_current_attempt_kinds: frozenset[str] | None = None,
+    ) -> list[Job]:
         cutoff = datetime.now(UTC) - heartbeat_timeout
         async with self._uow_factory() as uow:
             abandoned = list(await uow.jobs.list_abandoned(cutoff))
             for job in abandoned:
                 previous_status = job.status
-                job.recover_abandoned(
-                    resume_current_attempt=self._registry.resumes_after_worker_loss(job.kind)
-                )
+                if resume_current_attempt_kinds is None:
+                    resume_current_attempt = self._registry.resumes_after_worker_loss(job.kind)
+                else:
+                    # Le processus de recovery n'instancie volontairement pas
+                    # les handlers métier juste pour lire leur politique de
+                    # reprise : il fournit la liste des kinds durables.
+                    resume_current_attempt = job.kind in resume_current_attempt_kinds
+                job.recover_abandoned(resume_current_attempt=resume_current_attempt)
                 await uow.jobs.save(job)
                 await _append_job_event(
                     uow, job, previous_status, "job.heartbeat_recovered", "system:recovery"

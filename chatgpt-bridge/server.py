@@ -1078,6 +1078,7 @@ async def run_generation(
                 if reason not in {
                     "no_final_answer",
                     "finalization_stalled",
+                    "active_signal_stalled",
                     "dom_unstable",
                 }:
                     reason = "no_final_answer"

@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application.discovery import DISCOVERY_JOB_KIND
 from cti_app.application.jobs import (
     DemoJobParameters,
     DuplicateJobError,
@@ -182,3 +183,80 @@ async def test_long_handler_renews_job_lease() -> None:
 
     assert completed.status is JobStatus.SUCCEEDED
     assert observed_renewal is True
+
+
+def _stale_discovery_job() -> Job:
+    return Job(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="edition",
+        aggregate_id=uuid4(),
+        idempotency_key=f"discovery-{uuid4()}",
+        correlation_id="test",
+        input_parameters={},
+        max_attempts=1,
+    )
+
+
+async def test_durable_kind_recovery_resumes_same_attempt_without_registry_lookup() -> None:
+    factory = InMemoryJobUnitOfWorkFactory()
+    # Le registry du process de recovery ne connaît pas les jobs métier.
+    service = JobService(factory, create_job_registry())
+    job = _stale_discovery_job()
+    job.start(datetime.now(UTC) - timedelta(minutes=10))
+    factory.state[job.id] = job
+
+    recovered = await service.recover_abandoned(
+        timedelta(seconds=120),
+        resume_current_attempt_kinds=frozenset({DISCOVERY_JOB_KIND}),
+    )
+
+    assert [item.id for item in recovered] == [job.id]
+    requeued = await service.get(job.id)
+    assert requeued.status is JobStatus.QUEUED
+    assert requeued.next_retry_at is not None
+    assert requeued.attempt == 0
+    assert requeued.error_code == "worker_interrupted"
+
+
+async def test_durable_kind_recovery_cancels_a_job_whose_worker_died() -> None:
+    factory = InMemoryJobUnitOfWorkFactory()
+    service = JobService(factory, create_job_registry())
+    job = _stale_discovery_job()
+    job.start(datetime.now(UTC) - timedelta(minutes=10))
+    job.request_cancellation()
+    factory.state[job.id] = job
+
+    await service.recover_abandoned(
+        timedelta(seconds=120),
+        resume_current_attempt_kinds=frozenset({DISCOVERY_JOB_KIND}),
+    )
+
+    cancelled = await service.get(job.id)
+    assert cancelled.status is JobStatus.CANCELLED
+    assert cancelled.user_message == "Tâche annulée"
+
+
+async def test_recovery_with_declared_kinds_never_queries_an_incomplete_registry() -> None:
+    factory = InMemoryJobUnitOfWorkFactory()
+    service = JobService(factory, create_job_registry())
+    unknown = Job(
+        kind="collection.unknown-to-this-registry",
+        aggregate_type="subject",
+        aggregate_id=uuid4(),
+        idempotency_key=f"unknown-{uuid4()}",
+        correlation_id="test",
+        input_parameters={},
+    )
+    unknown.start(datetime.now(UTC) - timedelta(minutes=10))
+    factory.state[unknown.id] = unknown
+
+    # Sans le paramètre, resumes_after_worker_loss lèverait UnknownJobKindError.
+    recovered = await service.recover_abandoned(
+        timedelta(seconds=120),
+        resume_current_attempt_kinds=frozenset({DISCOVERY_JOB_KIND}),
+    )
+
+    assert [item.id for item in recovered] == [unknown.id]
+    requeued = await service.get(unknown.id)
+    assert requeued.status is JobStatus.QUEUED
+    assert requeued.error_code == "heartbeat_expired"

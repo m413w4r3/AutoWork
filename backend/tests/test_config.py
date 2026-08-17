@@ -42,3 +42,17 @@ def test_discovery_bridge_poll_interval_is_configurable_and_bounded(
     monkeypatch.setenv("DISCOVERY_BRIDGE_POLL_INTERVAL_SECONDS", "11")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_job_actor_time_limit_outlives_the_dramatiq_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Le défaut Dramatiq de 600 s tuait le worker en pleine attente du bridge.
+    assert Settings(_env_file=None).job_actor_time_limit_seconds >= 1800.0
+
+    monkeypatch.setenv("JOB_ACTOR_TIME_LIMIT_SECONDS", "3600")
+    assert Settings(_env_file=None).job_actor_time_limit_seconds == 3600.0
+
+    monkeypatch.setenv("JOB_ACTOR_TIME_LIMIT_SECONDS", "600")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)

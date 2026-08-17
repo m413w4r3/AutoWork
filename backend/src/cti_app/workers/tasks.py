@@ -8,7 +8,7 @@ from minio import Minio
 
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
-from cti_app.application.discovery import DiscoveryService
+from cti_app.application.discovery import DISCOVERY_JOB_KIND, DiscoveryService
 from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.http_collection import (
     CollectionPolicy,
@@ -31,13 +31,21 @@ from cti_app.integrations.model_factory import (
 )
 from cti_app.workers.broker import broker as broker
 
+# Une recherche ChatGPT durable dépasse largement la limite Dramatiq par
+# défaut de 600 000 ms, qui tuait le worker en pleine attente du bridge.
+EXECUTE_JOB_TIME_LIMIT_MS = int(get_settings().job_actor_time_limit_seconds * 1000)
+
+# Kinds dont l'attente survit à la perte du worker. Le processus de recovery
+# les déclare explicitement pour ne pas construire tous les services métier.
+DURABLE_RESUME_JOB_KINDS = frozenset({DISCOVERY_JOB_KIND})
+
 
 @dramatiq.actor(max_retries=0)
 def worker_probe() -> None:
     """No-op actor proving worker wiring; it is not a CTI business task."""
 
 
-@dramatiq.actor(max_retries=0)
+@dramatiq.actor(max_retries=0, time_limit=EXECUTE_JOB_TIME_LIMIT_MS)
 def execute_job(job_id: str) -> None:
     """Execute one canonical job; application code owns retry decisions."""
     delay_ms = asyncio.run(_execute_job(UUID(job_id)))
@@ -130,7 +138,8 @@ async def _recover_abandoned_jobs() -> list[UUID]:
     try:
         service = JobService(uow_factory, create_job_registry())
         jobs = await service.recover_abandoned(
-            timedelta(seconds=settings.job_heartbeat_timeout_seconds)
+            timedelta(seconds=settings.job_heartbeat_timeout_seconds),
+            resume_current_attempt_kinds=DURABLE_RESUME_JOB_KINDS,
         )
         return [job.id for job in jobs if job.status is JobStatus.QUEUED]
     finally:
