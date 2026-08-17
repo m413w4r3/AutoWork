@@ -160,6 +160,14 @@ export interface DiscoveryRecoveryPreview {
   subjects: string[];
 }
 
+export interface DiscoveryImportConfirmResult {
+  batch_id: string;
+  reused: boolean;
+  source_mode: "manual_import";
+  subject_count: number;
+  publication_count: number;
+}
+
 export function launchDiscovery(
   editionId: string,
   complementaryAxis: string,
@@ -274,6 +282,50 @@ export function confirmManualDiscoveryRecovery(
         job_id: jobId,
         markdown,
         expected_sha256: expectedSha256,
+      }),
+    },
+  );
+}
+
+export function previewDiscoveryImport(
+  editionId: string,
+  markdown: string,
+  complementaryAxis: string = "manual-import",
+  sensitivity: string = "internal",
+): Promise<DiscoveryRecoveryPreview> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/import/preview`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        markdown,
+        complementary_axis: complementaryAxis,
+        sensitivity,
+        external_llm_allowed: true,
+      }),
+    },
+  );
+}
+
+export function confirmDiscoveryImport(
+  editionId: string,
+  markdown: string,
+  expectedSha256: string,
+  complementaryAxis: string = "manual-import",
+  sensitivity: string = "internal",
+): Promise<DiscoveryImportConfirmResult> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/import/confirm`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        markdown,
+        expected_sha256: expectedSha256,
+        complementary_axis: complementaryAxis,
+        sensitivity,
+        external_llm_allowed: true,
       }),
     },
   );

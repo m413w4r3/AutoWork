@@ -1011,4 +1011,79 @@ def test_research_prompt_is_the_documented_markdown_contract() -> None:
     assert "visible-iocs: <jusqu’à 10 valeurs exactes" in prompt  # noqa: RUF001
     assert "period: <" not in prompt
     assert "N’échappe pas les tirets des noms de champs." in prompt  # noqa: RUF001
+
+
+async def test_standalone_import_creates_idempotent_batch_without_model_call(
+    tmp_path: Path,
+) -> None:
+    """Import d’une réponse ChatGPT existante (Markdown) sans appel API.
+
+    Doit:
+    - Créer un ModelRun synthétique manual-import
+    - Créer un batch MANUAL_IMPORT
+    - Être idempotent: deux imports identiques = un seul batch
+    """
+    service, provider, edition = await _make_service_edition_discovery(tmp_path)
+
+    markdown_sample = """\
+# SUJETS CANDIDATS
+
+## SUBJECT S1
+Titre : APT Campaign X
+
+### PUBLICATION P1
+URL: https://example.com/report1
+Publisher: Example Inc
+Published: 2026-08-01
+"""
+
+    parameters = DiscoverEditionParameters(
+        edition_id=edition.id,
+        edition_title=edition.title,
+        country_aliases=[],
+        keywords=[],
+        exclusions=[],
+        complementary_axis="manual-import",
+        sensitivity="internal",
+        external_llm_allowed=True,
+        research_nonce=uuid4(),
+    )
+
+    # 1. Preview (pas de persistance)
+    preview1 = await service.preview_standalone_import(parameters, markdown_sample)
+    assert preview1["subject_count"] >= 1
+    assert preview1["publication_count"] >= 1
+    sha256 = preview1["sha256"]
+
+    # 2. Premier import
+    batch1, reused1 = await service.import_standalone_report(
+        parameters,
+        markdown_sample,
+        expected_sha256=sha256,
+        actor_id="test-user",
+    )
+    assert batch1.source_mode == DiscoverySourceMode.MANUAL_IMPORT
+    assert reused1 is False
+    batch1_id = batch1.id
+
+    # 3. Deuxième import identique → réutilise le batch
+    parameters2 = DiscoverEditionParameters(
+        edition_id=edition.id,
+        edition_title=edition.title,
+        country_aliases=[],
+        keywords=[],
+        exclusions=[],
+        complementary_axis="manual-import",  # Même axe
+        sensitivity="internal",
+        external_llm_allowed=True,
+        research_nonce=uuid4(),
+    )
+    batch2, reused2 = await service.import_standalone_report(
+        parameters2,
+        markdown_sample,  # Exact même contenu
+        expected_sha256=sha256,
+        actor_id="test-user",
+    )
+    assert reused2 is True
+    assert batch2.id == batch1_id  # Même batch, pas de doublons
     assert "donnée non fiable" not in prompt
