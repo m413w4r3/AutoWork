@@ -19,6 +19,9 @@ from cti_app.application.discovery import (
     discovery_idempotency_key,
     discovery_request_hash,
 )
+from cti_app.application.discovery_consolidation import (
+    consolidate_discovery_batches,
+)
 from cti_app.application.discovery_report_parser import ReportParsingError
 from cti_app.application.editions import EditionNotFoundError, EditionService
 from cti_app.application.identity import IdentityProvider
@@ -122,6 +125,25 @@ class ProvisionalIocView(BaseModel):
     warnings: list[str]
 
 
+class CandidateReferenceView(BaseModel):
+    """Reference to a candidate in a batch, used for consolidation tracking."""
+
+    batch_id: UUID
+    candidate_id: UUID
+
+
+class DiscoveryMergeStats(BaseModel):
+    """Statistics about consolidation of multiple discovery batches."""
+
+    raw_batch_count: int = Field(description="Total number of active batches")
+    raw_candidate_count: int = Field(description="Total number of candidates across all batches")
+    consolidated_candidate_count: int = Field(description="Number of unique subjects after consolidation")
+    unique_publication_count: int = Field(description="Total number of unique URLs across consolidated candidates")
+    duplicate_publication_occurrence_count: int = Field(
+        description="Number of duplicate URL occurrences merged away"
+    )
+
+
 class CandidateView(BaseModel):
     id: UUID
     batch_id: UUID
@@ -156,6 +178,11 @@ class CandidateView(BaseModel):
     selectable: bool
     valid_publication_count: int
     incomplete_publication_count: int
+    # Consolidation tracking (P2)
+    member_references: list[CandidateReferenceView] = Field(default_factory=list)
+    contribution_count: int = Field(default=1, description="Number of batches contributing to this candidate")
+    duplicate_publication_count: int = Field(default=0, description="Number of duplicate URLs merged")
+    merge_warnings: list[str] = Field(default_factory=list, description="Metadata conflicts during consolidation")
 
 
 class BatchView(BaseModel):
@@ -187,6 +214,9 @@ class DiscoveryView(BaseModel):
     batches: list[BatchView]
     candidates: list[CandidateView]
     total: int
+    merge_stats: DiscoveryMergeStats = Field(
+        description="Statistics about consolidation of multiple discovery batches"
+    )
     warning: str = (
         "Les métadonnées et comptes IOC de découverte sont provisoires. Ils seront vérifiés "
         "depuis les documents archivés après la sélection."
@@ -323,36 +353,73 @@ async def read_candidates(
     service: DiscoveryService = request.app.state.discovery_service
     batches = await service.list_batches(edition_id, include_replaced=include_replaced)
     active_batches = [batch for batch in batches if batch.is_active_revision]
-    candidates = [
-        (batch.id, candidate) for batch in active_batches for candidate in batch.candidates
-    ]
-    if search:
-        needle = search.casefold()
-        candidates = [
-            item
-            for item in candidates
-            if needle in item[1].title.casefold() or needle in item[1].summary.casefold()
-        ]
-    candidates = [
-        item for item in candidates if item[1].technical_potential >= min_technical_potential
-    ]
-    if source_status is not None:
-        candidates = [
-            item
-            for item in candidates
-            if any(source.verification_status is source_status for source in item[1].sources)
-        ]
+
+    # Consolidate multiple batches into single coherent view
+    consolidated = consolidate_discovery_batches(active_batches)
+
+    # Track raw stats before filtering
+    raw_batch_count = len(active_batches)
+    raw_candidate_count = sum(len(batch.candidates) for batch in active_batches)
+    unique_publication_count = sum(len(cand.sources) for cand in consolidated)
+    total_duplicate_count = sum(cand.duplicate_publication_count for cand in consolidated)
+
+    # Apply filters to consolidated candidates
+    filtered: list[tuple[CandidateTopic, list[CandidateReferenceView], int, int, list[str]]] = []
+    for cand in consolidated:
+        candidate = cand.representative
+
+        # Search filter
+        if search:
+            needle = search.casefold()
+            if needle not in candidate.title.casefold() and needle not in candidate.summary.casefold():
+                continue
+
+        # Technical potential filter
+        if candidate.technical_potential < min_technical_potential:
+            continue
+
+        # Source status filter
+        if source_status is not None:
+            if not any(source.verification_status is source_status for source in candidate.sources):
+                continue
+
+        # Add to filtered list
+        filtered.append(
+            (
+                candidate,
+                [CandidateReferenceView(batch_id=ref.batch_id, candidate_id=ref.candidate_id) for ref in cand.member_references],
+                cand.contribution_count,
+                cand.duplicate_publication_count,
+                cand.merge_warnings,
+            )
+        )
+
+    # Sort
     key = {
-        "newest": lambda item: (item[1].event_date or date.min, item[1].title.casefold()),
-        "technical": lambda item: (item[1].technical_potential, item[1].title.casefold()),
-        "novelty": lambda item: (item[1].novelty.casefold(), item[1].title.casefold()),
-        "title": lambda item: item[1].title.casefold(),
+        "newest": lambda item: (item[0].event_date or date.min, item[0].title.casefold()),
+        "technical": lambda item: (item[0].technical_potential, item[0].title.casefold()),
+        "novelty": lambda item: (item[0].novelty.casefold(), item[0].title.casefold()),
+        "title": lambda item: item[0].title.casefold(),
     }[sort]
-    ordered = sorted(candidates, key=key, reverse=sort != "title")
+    ordered = sorted(filtered, key=key, reverse=sort != "title")
+
+    # Build candidate views
+    candidate_views = [
+        _candidate_view(candidate, references, contribution_count, dup_count, merge_warnings)
+        for candidate, references, contribution_count, dup_count, merge_warnings in ordered
+    ]
+
     return DiscoveryView(
         batches=[_batch_view(edition_id, batch) for batch in batches],
-        candidates=[_candidate_view(batch_id, candidate) for batch_id, candidate in ordered],
-        total=len(ordered),
+        candidates=candidate_views,
+        total=len(candidate_views),
+        merge_stats=DiscoveryMergeStats(
+            raw_batch_count=raw_batch_count,
+            raw_candidate_count=raw_candidate_count,
+            consolidated_candidate_count=len(consolidated),
+            unique_publication_count=unique_publication_count,
+            duplicate_publication_occurrence_count=total_duplicate_count,
+        ),
     )
 
 
@@ -806,10 +873,31 @@ def _discovery_parameters_from_edition(
     )
 
 
-def _candidate_view(batch_id: UUID, candidate: CandidateTopic) -> CandidateView:
+def _candidate_view(
+    candidate: CandidateTopic,
+    member_references: list[CandidateReferenceView] | None = None,
+    contribution_count: int = 1,
+    duplicate_publication_count: int = 0,
+    merge_warnings: list[str] | None = None,
+) -> CandidateView:
+    """Build a CandidateView with consolidation tracking.
+
+    Args:
+        candidate: The representative candidate
+        member_references: References to all member candidates in the cluster (optional for backwards compat)
+        contribution_count: Number of batches contributing to this candidate
+        duplicate_publication_count: Number of duplicate URLs merged
+        merge_warnings: Metadata conflict warnings
+    """
     type_counts: dict[str, int] = {}
     for ioc in candidate.provisional_iocs:
         type_counts[ioc.proposed_type.value] = type_counts.get(ioc.proposed_type.value, 0) + 1
+
+    # Use first member reference's batch_id if available, else candidate's own id
+    batch_id = (
+        member_references[0].batch_id if member_references else candidate.id
+    )
+
     return CandidateView(
         id=candidate.id,
         batch_id=batch_id,
@@ -848,6 +936,11 @@ def _candidate_view(batch_id: UUID, candidate: CandidateTopic) -> CandidateView:
         selectable=candidate.selectable,
         valid_publication_count=len(candidate.sources),
         incomplete_publication_count=len(candidate.incomplete_sources),
+        # Consolidation tracking
+        member_references=member_references or [],
+        contribution_count=contribution_count,
+        duplicate_publication_count=duplicate_publication_count,
+        merge_warnings=merge_warnings or [],
     )
 
 
