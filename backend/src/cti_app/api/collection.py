@@ -16,6 +16,7 @@ from cti_app.application.collection import (
 )
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobService
+from cti_app.application.production_verification import project_review_status
 from cti_app.application.source_filenames import ascii_download_filename, validate_logical_filename
 from cti_app.domain.collection import (
     Claim,
@@ -458,11 +459,18 @@ def _indicator_view(indicator: Indicator, decisions: list[HumanDecision]) -> Ind
 
 
 def _review_projection(
-    decisions: list[HumanDecision], key: str, target_id: UUID, original: str, prefix: str
+    decisions: list[HumanDecision],
+    key: str,
+    target_id: UUID,
+    original: str,
+    prefix: str,
+    *,
+    machine_verified: bool = False,
 ) -> tuple[ReviewStatus, str]:
     relevant = [item for item in decisions if item.payload.get(key) == str(target_id)]
     if not relevant:
-        return ReviewStatus.EXTRACTED, original
+        # No human looked at it: machine verification is what we can honestly say.
+        return project_review_status(None, machine_verified=machine_verified), original
     latest = relevant[-1]
     action = latest.decision_type.value.removeprefix(prefix)
     status_value = ReviewStatus(action + "d" if action == "validate" else action + "ed")

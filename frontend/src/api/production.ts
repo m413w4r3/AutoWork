@@ -5,10 +5,18 @@ import { ApiError } from "./editions";
  */
 
 export interface StageStatus {
-  status: "pending" | "running" | "succeeded" | "needs_review" | "failed";
+  status:
+    | "pending"
+    | "running"
+    | "succeeded"
+    | "needs_review"
+    | "failed"
+    | "cancelled";
   version: number | null;
   error_code: string | null;
   error_message: string | null;
+  /** Only on the sources stage. */
+  archived_sources?: number;
 }
 
 export interface ProductionStatus {
@@ -25,7 +33,18 @@ export interface ProductionStatus {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  /** Parser recoveries worth showing, never blocking. */
+  warnings: string[];
   stages: Record<string, StageStatus>;
+}
+
+export interface BatchItemDetail {
+  position: number;
+  subject_id: string;
+  title: string;
+  run_id: string;
+  status: string;
+  current_stage: string;
 }
 
 export interface BatchStatus {
@@ -39,6 +58,8 @@ export interface BatchStatus {
   needs_review: number;
   failed: number;
   current_subject_index: number | null;
+  cancelled: number;
+  item_details: BatchItemDetail[];
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -50,6 +71,9 @@ export interface ArtifactResponse {
   version: number;
   status: "verified" | "stale" | "needs_review";
   metadata: Record<string, unknown>;
+  /** Reader-facing Markdown, when the stage produces one. */
+  rendered_content: string | null;
+  canonical_content: Record<string, unknown> | null;
 }
 
 /**

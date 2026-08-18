@@ -8,14 +8,26 @@ interface ProductionStageCardProps {
   status: string;
   stageNumber: number;
   isActive?: boolean;
+  /** Short count line, e.g. "5/5 archivées" or "12 IOC · 8 TTP". */
+  detail?: string;
 }
 
 const STAGE_NAMES: Record<string, string> = {
   sources: "Sources",
-  references: "References",
-  extraction: "Extraction",
-  synthesis: "Synthesis",
-  assembly: "Assembly",
+  references: "Références",
+  extraction: "Extraction CTI",
+  synthesis: "Synthèse",
+  assembly: "Brève",
+};
+
+const STATUS_LABELS: Record<string, string> = {
+  pending: "en attente",
+  running: "en cours",
+  succeeded: "terminée",
+  verified: "terminée",
+  needs_review: "à vérifier",
+  failed: "en échec",
+  cancelled: "annulée",
 };
 
 const STATUS_ICONS: Record<string, { icon: string; color: string }> = {
@@ -25,6 +37,7 @@ const STATUS_ICONS: Record<string, { icon: string; color: string }> = {
   verified: { icon: "✓", color: "text-green-500" },
   needs_review: { icon: "⚠", color: "text-yellow-500" },
   failed: { icon: "✗", color: "text-red-500" },
+  cancelled: { icon: "⊘", color: "text-gray-500" },
 };
 
 export function ProductionStageCard({
@@ -32,6 +45,7 @@ export function ProductionStageCard({
   status,
   stageNumber,
   isActive,
+  detail,
 }: ProductionStageCardProps) {
   const statusInfo = (STATUS_ICONS[status] || STATUS_ICONS["pending"]) as {
     icon: string;
@@ -61,9 +75,13 @@ export function ProductionStageCard({
       <div className={`text-2xl ${statusInfo.color}`}>{statusInfo.icon}</div>
 
       {/* Status Label */}
-      <p className="text-xs text-center text-gray-600 capitalize">
-        {status === "verified" ? "completed" : status}
+      <p className="text-xs text-center text-gray-600">
+        {STATUS_LABELS[status] ?? status}
       </p>
+
+      {detail ? (
+        <p className="text-xs text-center text-gray-500">{detail}</p>
+      ) : null}
 
       {/* Loading Indicator */}
       {status === "running" && (

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -86,7 +86,20 @@ class ProductionStatus(BaseModel):
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
+    # Parser recoveries worth showing to an analyst, never blocking.
+    warnings: list[str] = []
     stages: dict[str, StageStatus]
+
+
+class BatchItemDetail(BaseModel):
+    """One subject inside a batch, so the UI can show 1/23 with names."""
+
+    position: int
+    subject_id: str
+    title: str
+    run_id: str
+    status: str
+    current_stage: str
 
 
 class BatchStatus(BaseModel):
@@ -101,6 +114,8 @@ class BatchStatus(BaseModel):
     needs_review: int
     failed: int
     current_subject_index: int | None = None
+    cancelled: int = 0
+    item_details: list[BatchItemDetail] = []
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
@@ -123,6 +138,16 @@ def _eligible_brief_subject_ids(groups: Iterable[EditorialGroup]) -> list[UUID]:
         and group.status == EditorialGroupStatus.SELECTED
         and group.editorial_type == EditorialType.BRIEF
     ]
+
+
+def _collect_warnings(artifacts: Sequence[Any]) -> list[str]:
+    """Parser warnings recorded by each stage, in stage order."""
+    out: list[str] = []
+    for artifact in artifacts:
+        for warning in artifact.metadata.get("warnings", []):
+            if warning not in out:
+                out.append(str(warning))
+    return out
 
 
 def _run_view(
@@ -280,6 +305,7 @@ async def get_subject_production(
             created_at=run.created_at.isoformat(),
             started_at=run.started_at.isoformat() if run.started_at else None,
             finished_at=run.finished_at.isoformat() if run.finished_at else None,
+            warnings=_collect_warnings(artifacts),
             stages=stages,
         )
 
@@ -411,12 +437,23 @@ async def _artifact_view(
         if not artifact:
             raise HTTPException(status_code=404, detail=f"{stage} artifact not found")
 
+        store = getattr(request.app.state, "production_artifact_store", None)
+        rendered = None
+        canonical = None
+        if store is not None:
+            if artifact.rendered_blob_id is not None:
+                rendered = await store.read_text(artifact.rendered_blob_id)
+            if artifact.canonical_blob_id is not None:
+                canonical = await store.read_json(artifact.canonical_blob_id)
+
         return {
             "artifact_id": str(artifact.id),
             "stage": artifact.stage.value,
             "version": artifact.version,
             "status": artifact.status.value,
             "metadata": artifact.metadata,
+            "rendered_content": rendered,
+            "canonical_content": canonical,
         }
 
 
@@ -587,6 +624,9 @@ async def get_edition_brief_production(
         failed = 0
         current_index = None
 
+        cancelled = 0
+        details: list[BatchItemDetail] = []
+
         for i, item in enumerate(items):
             run = await uow.subject_production_runs.get(item.production_run_id)
             if not run:
@@ -598,8 +638,22 @@ async def get_edition_brief_production(
                 needs_review += 1
             elif run.status == SubjectProductionStatus.FAILED:
                 failed += 1
+            elif run.status == SubjectProductionStatus.CANCELLED:
+                cancelled += 1
             elif run.status == SubjectProductionStatus.RUNNING:
                 current_index = i
+
+            group = await uow.editorial_groups.get_by_subject(item.subject_id)
+            details.append(
+                BatchItemDetail(
+                    position=item.position,
+                    subject_id=str(item.subject_id),
+                    title=group.title if group else str(item.subject_id),
+                    run_id=str(run.id),
+                    status=run.status.value,
+                    current_stage=run.current_stage.value,
+                )
+            )
 
         return BatchStatus(
             batch_id=str(batch.id),
@@ -611,6 +665,8 @@ async def get_edition_brief_production(
             needs_review=needs_review,
             failed=failed,
             current_subject_index=current_index,
+            cancelled=cancelled,
+            item_details=details,
             created_at=batch.created_at.isoformat(),
             started_at=batch.started_at.isoformat() if batch.started_at else None,
             finished_at=batch.finished_at.isoformat() if batch.finished_at else None,

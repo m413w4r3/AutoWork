@@ -7,6 +7,7 @@ and only a genuinely empty result is unusable.
 
 from __future__ import annotations
 
+import pathlib
 from datetime import date
 
 import pytest
@@ -373,3 +374,47 @@ def test_empty_synthesis_is_rejected() -> None:
 
     assert not result.usable
     assert "empty_synthesis" in result.errors
+
+
+# --- Real ChatGPT output ---------------------------------------------------
+
+REAL_ANSWER = (
+    pathlib.Path(__file__).parent / "fixtures" / "real_chatgpt_references.md"
+).read_text()
+
+
+def test_real_chatgpt_answer_is_parsed() -> None:
+    """Regression guard against a genuine answer, quirks included.
+
+    A real answer writes URLs as `[https://x](https://x)`, appends citation
+    markers after values, and carries fields the report does not use. A naive
+    URL regex dropped every source here.
+    """
+    result = parse_reference_report(REAL_ANSWER, date(2026, 8, 1))
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    sources = result.value.sources
+    assert len(sources) == 3
+
+    first = sources[0]
+    assert first.canonical_url == (
+        "https://www.recordedfuture.com/research/nexus-tag182-disseminates-markirat"
+    )
+    assert first.publisher == "Recorded Future / Insikt Group"
+    assert first.published_at == date(2026, 7, 1)
+    assert first.role is SourceRole.PRIMARY
+    # The event keeps all three sources.
+    assert len(result.value.events[0].source_ids) == 3
+
+
+def test_explicit_unknown_date_is_not_reported_as_a_parse_failure() -> None:
+    """`published-at: unknown` is the model answering, not a broken format."""
+    text = REAL_ANSWER.replace("published-at: 2026-07-01", "published-at: unknown", 1)
+
+    result = parse_reference_report(text, date(2026, 8, 1))
+
+    assert result.usable
+    assert result.value is not None
+    assert result.value.sources[0].published_at is None
+    assert "source_date_unreadable" not in result.warnings

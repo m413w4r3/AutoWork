@@ -19,6 +19,17 @@ interface SubjectProductionProps {
   onClose?: () => void;
 }
 
+function stageDetail(
+  stage: string,
+  entry: StageStatus | undefined,
+): string | undefined {
+  if (!entry) return undefined;
+  if (stage === "sources" && entry.archived_sources !== undefined) {
+    return `${entry.archived_sources} archivée(s)`;
+  }
+  return undefined;
+}
+
 export function SubjectProduction({
   subjectId,
   onClose,
@@ -105,6 +116,9 @@ export function SubjectProduction({
     "synthesis",
     "assembly",
   ];
+  // Warnings are recoveries the parser made: worth showing, never blocking.
+  const warnings = status.warnings ?? [];
+
   // Tolerate a response without per-stage detail rather than crashing the page.
   const stages: Partial<Record<string, StageStatus>> = status.stages ?? {};
   const completedStages = stageList.filter(
@@ -163,9 +177,37 @@ export function SubjectProduction({
             status={stages[stage]?.status || "pending"}
             stageNumber={i + 1}
             isActive={status.current_stage === stage}
+            detail={stageDetail(stage, stages[stage])}
           />
         ))}
       </div>
+
+      {/* Deep links into what each stage actually produced */}
+      <nav
+        className="flex gap-3 flex-wrap text-sm"
+        aria-label="Détail des étapes"
+      >
+        <a href={`/subjects/${subjectId}#sources`}>Voir les sources</a>
+        <a href={`/subjects/${subjectId}/production/artifacts/references`}>
+          Voir les références
+        </a>
+        <a href={`/subjects/${subjectId}/production/artifacts/extraction`}>
+          Voir l’extraction
+        </a>
+        <a href={`/subjects/${subjectId}/production/artifacts/synthesis`}>
+          Voir la synthèse
+        </a>
+        {status.conversation_id ? (
+          <a href={`/subjects/${subjectId}#conversations`}>
+            Voir la conversation
+          </a>
+        ) : null}
+        {status.status === "ready" ? (
+          <a href={`/subjects/${subjectId}/production/artifacts/brief`}>
+            Aperçu
+          </a>
+        ) : null}
+      </nav>
 
       {/* Current Stage Details */}
       {stages[status.current_stage] && (
@@ -177,6 +219,19 @@ export function SubjectProduction({
             {stages[status.current_stage]?.error_message ||
               "Traitement en cours…"}
           </p>
+        </div>
+      )}
+
+      {warnings.length > 0 && (
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+          <h3 className="font-semibold text-amber-900">
+            Avertissements de lecture
+          </h3>
+          <ul className="text-sm text-amber-800 mt-2 list-disc pl-5">
+            {warnings.map((warning: string) => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
         </div>
       )}
 

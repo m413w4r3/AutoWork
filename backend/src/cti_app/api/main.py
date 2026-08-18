@@ -31,6 +31,7 @@ from cti_app.application.jobs import JobService, create_job_registry
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import (
@@ -125,6 +126,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model_service=model_conversation_service,
     )
 
+    production_diagnostics = ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root)
     production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
     production_chain = ProductionStageChain()
     registry = create_job_registry(
@@ -136,9 +138,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model_conversation_service=model_conversation_service,
         production_chain=production_chain,
         production_artifact_store=production_artifact_store,
+        production_diagnostics=production_diagnostics,
     )
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory
+    app.state.production_artifact_store = production_artifact_store
     job_service = JobService(uow_factory, registry)
     job_dispatcher = DramatiqJobDispatcher()
     # The registry must exist before the service that consumes it, so the

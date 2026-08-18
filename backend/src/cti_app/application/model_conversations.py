@@ -47,6 +47,15 @@ class ConversationBusyError(ModelConversationError):
     status_code = 409
 
 
+class ConversationTurnFailedError(ModelConversationError):
+    """A turn replayed by idempotency key had already ended badly."""
+
+    def __init__(self, message: str, *, code: str, status: ConversationTurnStatus) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
 class ConversationPolicyError(ModelConversationError):
     code = "conversation_policy_blocked"
     status_code = 422
@@ -200,7 +209,19 @@ class ModelConversationService:
                     raise ConversationPolicyError(
                         "La clé d'idempotence appartient à un autre message"
                     )
-                return duplicate
+                # The caller must be able to tell a completed turn from one that
+                # ended badly: returning a failed turn as if it succeeded would
+                # have the caller look for an output that will never exist.
+                if duplicate.status is ConversationTurnStatus.SUCCEEDED:
+                    return duplicate
+                if duplicate.status is ConversationTurnStatus.RUNNING:
+                    # Resume the existing turn rather than re-sending the prompt.
+                    return duplicate
+                raise ConversationTurnFailedError(
+                    duplicate.error_message or "Le tour précédent n'a pas abouti",
+                    code=duplicate.error_code or "conversation_turn_failed",
+                    status=duplicate.status,
+                )
 
         input_bytes = message.encode()
         input_blob = await self._catalog.ingest(

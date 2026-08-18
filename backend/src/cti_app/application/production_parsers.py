@@ -17,7 +17,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
-from cti_app.domain.discovery import SourceRole, canonicalize_http_url
+from cti_app.application.discovery_report_parser import extract_http_urls
+from cti_app.domain.discovery import SourceRole
 
 PARSER_VERSION = "production-markdown-v1"
 
@@ -187,7 +188,8 @@ _FENCE = re.compile(r"^\s*```[^\n]*\n(?P<body>.*?)\n\s*```\s*$", re.DOTALL)
 _HEADING = re.compile(r"^\s{0,3}(#{1,6})\s*(?P<text>.+?)\s*#*\s*$")
 _FIELD = re.compile(r"^\s{0,3}(?P<key>[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 _-]{0,40}?)\s*[:=]\s*(?P<value>.*)$")
 _BULLET = re.compile(r"^\s*[-*•]\s+(?P<text>.+?)\s*$")
-_URL = re.compile(r"https?://[^\s<>\"'\])}]+")
+# URL extraction is shared with the discovery parser: a real ChatGPT answer
+# writes `[https://x](https://x)`, which a naive regex turns into garbage.
 _LOCAL_ID = re.compile(r"\b([SR])\s*[-_]?\s*(\d{1,3})\b", re.IGNORECASE)
 _ID_TOKEN = re.compile(r"[SR]\d{1,3}", re.IGNORECASE)
 
@@ -256,6 +258,14 @@ def _fields(lines: list[str]) -> dict[str, str]:
         if current and stripped and not _HEADING.match(line):
             values[current] = f"{values[current]} {stripped}".strip()
     return values
+
+
+# Values the model uses to say "I could not establish this".
+_EXPLICIT_UNKNOWN = {"unknown", "inconnu", "inconnue", "n/a", "na", "none", "null", "-"}
+
+
+def _is_explicit_unknown(value: str) -> bool:
+    return value.strip().strip(".").lower() in _EXPLICIT_UNKNOWN
 
 
 def _parse_date(value: str) -> date | None:
@@ -367,22 +377,18 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
 
     for block in (b for b in blocks if b.kind == "source"):
         values = _fields(block.lines)
-        raw_url = values.get("url") or values.get("lien") or ""
-        if not raw_url:
-            found = _URL.search(block.raw())
-            if found:
-                raw_url = found.group(0)
+        field_value = values.get("url") or values.get("lien") or ""
+        urls = extract_http_urls(field_value)
+        if not urls:
+            # The model often puts the link in prose instead of the field.
+            urls = extract_http_urls(block.raw())
+            if urls:
                 result.warnings.append("source_url_recovered_from_text")
-        if not raw_url:
+        if not urls:
             result.dropped_blocks.append(block.raw())
             result.warnings.append("source_without_url_dropped")
             continue
-        try:
-            canonical = canonicalize_http_url(raw_url)
-        except ValueError:
-            result.dropped_blocks.append(block.raw())
-            result.warnings.append("source_with_invalid_url_dropped")
-            continue
+        raw_url, canonical = urls[0]
 
         auto_source += 1
         local_id = block.local_id
@@ -398,7 +404,7 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
 
         published_at = None
         raw_date = values.get("published-at") or values.get("date") or ""
-        if raw_date:
+        if raw_date and not _is_explicit_unknown(raw_date):
             published_at = _parse_date(raw_date)
             if published_at is None:
                 result.warnings.append("source_date_unreadable")
@@ -458,7 +464,7 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
 
         event_date = None
         raw_date = values.get("date") or ""
-        if raw_date:
+        if raw_date and not _is_explicit_unknown(raw_date):
             event_date = _parse_date(raw_date)
             if event_date is None:
                 result.warnings.append("event_date_unreadable")
@@ -635,12 +641,7 @@ def validate_synthesis(
         result.errors.append(f"unknown_source_marker:{','.join(unknown)}")
 
     corpus_urls = {source.canonical_url for source in reference_report.sources}
-    for match in _URL.finditer(body):
-        try:
-            canonical = canonicalize_http_url(match.group(0))
-        except ValueError:
-            result.errors.append("invalid_url_in_synthesis")
-            continue
+    for _raw, canonical in extract_http_urls(body):
         if canonical not in corpus_urls:
             result.errors.append(f"url_outside_corpus:{canonical}")
 

@@ -575,6 +575,7 @@ def create_job_registry(
     model_conversation_service: object | None = None,
     production_chain: object | None = None,
     production_artifact_store: object | None = None,
+    production_diagnostics: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
@@ -609,6 +610,7 @@ def create_job_registry(
     if uow_factory is not None:
         from cti_app.application.model_conversations import ModelConversationService
         from cti_app.application.production_artifact_store import ProductionArtifactStore
+        from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
         from cti_app.application.production_jobs import (
             ProductionStageChain,
             register_production_jobs,
@@ -626,6 +628,10 @@ def create_job_registry(
             production_artifact_store, ProductionArtifactStore
         ):
             raise TypeError("production_artifact_store must be a ProductionArtifactStore")
+        if production_diagnostics is not None and not isinstance(
+            production_diagnostics, ProductionDiagnosticsLog
+        ):
+            raise TypeError("production_diagnostics must be a ProductionDiagnosticsLog")
         register_production_jobs(
             registry,
             uow_factory,
@@ -633,6 +639,7 @@ def create_job_registry(
             model_service=model_conversation_service,
             collection_service=collection_service,
             artifact_store=production_artifact_store,
+            diagnostics=production_diagnostics,
         )
     return registry
 

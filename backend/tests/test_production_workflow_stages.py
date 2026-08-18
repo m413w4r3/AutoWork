@@ -7,14 +7,17 @@ one repair turn — never a second web search.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
 from cti_app.application.production_parsers import reference_report_from_json
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.collection import CollectionState
@@ -226,7 +229,9 @@ class _Uow:
         return None
 
 
-def _build(answers: list[str]) -> tuple[ProductionWorkflowOrchestrator, _Uow, _FakeConversations]:
+def _build(
+    answers: list[str], diagnostics: ProductionDiagnosticsLog | None = None
+) -> tuple[ProductionWorkflowOrchestrator, _Uow, _FakeConversations]:
     run = SubjectProductionRun(
         subject_id=uuid4(), edition_id=uuid4(), profile=ProductionProfile.BRIEF_AUTO
     )
@@ -239,6 +244,7 @@ def _build(answers: list[str]) -> tuple[ProductionWorkflowOrchestrator, _Uow, _F
         model_service=conversations,  # type: ignore[arg-type]
         collection_service=_CollectionService(uow.source_collections),  # type: ignore[arg-type]
         artifact_store=store,
+        diagnostics=diagnostics,
     )
     return orchestrator, uow, conversations
 
@@ -260,7 +266,8 @@ async def test_references_stage_stores_a_readable_report() -> None:
     # The canonical payload must be readable back, not just counted.
     assert artifact.canonical_blob_id is not None
     assert artifact.raw_blob_id is not None
-    payload = await orchestrator._artifact_store.read_json(artifact.canonical_blob_id)
+    store = cast(ProductionArtifactStore, orchestrator._artifact_store)
+    payload = await store.read_json(artifact.canonical_blob_id)
     assert len(reference_report_from_json(payload).sources) == 2
 
     # Q1 opens the conversation and asks fresh.
@@ -350,7 +357,7 @@ async def test_new_q1_sources_are_attached_and_collected() -> None:
     """Q1's publications must be integrated before the report is recorded."""
     orchestrator, uow, _ = _build([PERFECT_Q1])
     uow.run.current_stage = SubjectProductionStage.REFERENCES
-    service = orchestrator._collection_service
+    service = cast(_CollectionService, orchestrator._collection_service)
 
     result = await orchestrator.execute_stage(
         uow.run.id,
@@ -379,7 +386,8 @@ async def test_event_without_any_archived_source_sends_the_run_to_review() -> No
     async def add_nothing(subject_id: Any, sources: Any) -> list[Any]:
         return []
 
-    orchestrator._collection_service.add_supplemental_sources = add_nothing  # type: ignore[method-assign]
+    service = cast(_CollectionService, orchestrator._collection_service)
+    service.add_supplemental_sources = add_nothing  # type: ignore[method-assign]
 
     result = await orchestrator.execute_stage(
         uow.run.id, SubjectProductionStage.REFERENCES, correlation_id="c1"
@@ -417,3 +425,59 @@ async def test_source_forbidding_external_model_blocks_the_stage() -> None:
     assert result["error_code"] == "external_llm_blocked"
     # Nothing was ever sent to the model.
     assert conversations.calls == []
+
+
+async def test_diagnostics_trail_captures_the_whole_stage(tmp_path: Path) -> None:
+    """After a run, the trail must answer what was asked and what came back."""
+    log = ProductionDiagnosticsLog.from_env(tmp_path)
+    orchestrator, uow, _ = _build([PERFECT_Q1], diagnostics=log)
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+
+    await orchestrator.execute_stage(
+        uow.run.id,
+        SubjectProductionStage.REFERENCES,
+        context=_JobContext(),  # type: ignore[arg-type]
+        correlation_id="corr-42",
+    )
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    kinds = [event["event"] for event in events]
+    assert kinds == ["model.answer", "parse.result", "stage.outcome"]
+    assert all(event["correlation_id"] == "corr-42" for event in events)
+
+    answer_file = tmp_path / events[0]["payload_file"]
+    body = answer_file.read_text(encoding="utf-8")
+    assert "--- PROMPT ---" in body
+    assert "## SOURCE S1" in body
+
+    assert events[1]["usable"] is True
+    assert events[2]["status"] == "success"
+    assert events[2]["sources_count"] == 2
+
+
+async def test_diagnostics_trail_records_a_format_repair(tmp_path: Path) -> None:
+    """A repair must be visible as its own model exchange."""
+    log = ProductionDiagnosticsLog.from_env(tmp_path)
+    orchestrator, uow, _ = _build([BROKEN_Q1, PERFECT_Q1], diagnostics=log)
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+
+    await orchestrator.execute_stage(
+        uow.run.id,
+        SubjectProductionStage.REFERENCES,
+        context=_JobContext(),  # type: ignore[arg-type]
+        correlation_id="corr-43",
+    )
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    stages = [event.get("stage") for event in events]
+    assert "references-repair" in stages
+    # The failed first parse is on record, with the reason.
+    first_parse = next(e for e in events if e["event"] == "parse.result")
+    assert first_parse["usable"] is False
+    assert first_parse["errors"]

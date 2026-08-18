@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.production import router
+from cti_app.domain.discovery import SourceRelationshipStatus
 from cti_app.domain.editorial import (
     CandidateReference,
     EditorialGroup,
@@ -24,7 +25,6 @@ from cti_app.domain.editorial import (
     EditorialType,
     GroupingConfidence,
     GroupingOutcome,
-    SourceRelationshipStatus,
 )
 from cti_app.domain.production import (
     EditionProductionBatch,

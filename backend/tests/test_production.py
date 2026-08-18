@@ -21,7 +21,7 @@ from cti_app.domain.production import (
 class TestSubjectProductionRun:
     """Tests for SubjectProductionRun domain model."""
 
-    def test_create_run(self):
+    def test_create_run(self) -> None:
         """Test creating a new production run."""
         subject_id = uuid4()
         edition_id = uuid4()
@@ -33,11 +33,11 @@ class TestSubjectProductionRun:
         )
 
         assert run.status == SubjectProductionStatus.QUEUED
-        assert run.current_stage == SubjectProductionStage.SOURCES
+        assert run.current_stage is SubjectProductionStage.SOURCES
         assert run.run_number == 1
         assert run.conversation_id is None
 
-    def test_run_state_transitions(self):
+    def test_run_state_transitions(self) -> None:
         """Test valid run state transitions."""
         subject_id = uuid4()
         edition_id = uuid4()
@@ -53,22 +53,22 @@ class TestSubjectProductionRun:
 
         # Advance stages
         run.advance_stage()
-        assert run.current_stage == SubjectProductionStage.REFERENCES
+        assert run.current_stage is SubjectProductionStage.REFERENCES
 
         run.advance_stage()
-        assert run.current_stage == SubjectProductionStage.EXTRACTION
+        assert run.current_stage is SubjectProductionStage.EXTRACTION  # type: ignore[comparison-overlap]
 
         run.advance_stage()
-        assert run.current_stage == SubjectProductionStage.SYNTHESIS
+        assert run.current_stage is SubjectProductionStage.SYNTHESIS
 
         run.advance_stage()
-        assert run.current_stage == SubjectProductionStage.ASSEMBLY
+        assert run.current_stage is SubjectProductionStage.ASSEMBLY
 
         # Assembly -> READY
         run.mark_ready()
         assert run.status == SubjectProductionStatus.READY
 
-    def test_run_cannot_start_from_non_queued(self):
+    def test_run_cannot_start_from_non_queued(self) -> None:
         """Test that run cannot start from non-QUEUED status."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
@@ -80,7 +80,7 @@ class TestSubjectProductionRun:
         with pytest.raises(ValueError, match="Can only start from QUEUED"):
             run.start_running()
 
-    def test_run_mark_needs_review(self):
+    def test_run_mark_needs_review(self) -> None:
         """Test marking run as needing review."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
@@ -96,9 +96,10 @@ class TestSubjectProductionRun:
 
         assert run.status == SubjectProductionStatus.NEEDS_REVIEW
         assert run.error_code == "qa_failed"
+        assert run.error_message is not None
         assert "QA" in run.error_message
 
-    def test_run_mark_failed(self):
+    def test_run_mark_failed(self) -> None:
         """Test marking run as failed."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
@@ -119,7 +120,7 @@ class TestSubjectProductionRun:
 class TestProductionArtifact:
     """Tests for ProductionArtifact domain model."""
 
-    def test_create_artifact(self):
+    def test_create_artifact(self) -> None:
         """Test creating a production artifact."""
         run_id = uuid4()
         subject_id = uuid4()
@@ -137,7 +138,7 @@ class TestProductionArtifact:
         assert artifact.canonical_blob_id is None
         assert artifact.created_at
 
-    def test_artifact_input_hash_validation(self):
+    def test_artifact_input_hash_validation(self) -> None:
         """Test that artifact validates SHA-256 input hash."""
         run_id = uuid4()
         subject_id = uuid4()
@@ -175,7 +176,7 @@ class TestProductionArtifact:
 class TestEditionProductionBatch:
     """Tests for EditionProductionBatch domain model."""
 
-    def test_create_batch(self):
+    def test_create_batch(self) -> None:
         """Test creating a production batch."""
         edition_id = uuid4()
 
@@ -189,7 +190,7 @@ class TestEditionProductionBatch:
         assert batch.created_at
         assert batch.started_at is None
 
-    def test_batch_lifecycle(self):
+    def test_batch_lifecycle(self) -> None:
         """Test batch status transitions."""
         batch = EditionProductionBatch(
             edition_id=uuid4(),
@@ -205,7 +206,7 @@ class TestEditionProductionBatch:
         assert batch.status == "completed"
         assert batch.finished_at
 
-    def test_batch_finish_with_issues(self):
+    def test_batch_finish_with_issues(self) -> None:
         """Test marking batch as completed with issues."""
         batch = EditionProductionBatch(
             edition_id=uuid4(),
@@ -221,7 +222,7 @@ class TestEditionProductionBatch:
 class TestEditionProductionBatchItem:
     """Tests for EditionProductionBatchItem domain model."""
 
-    def test_create_batch_item(self):
+    def test_create_batch_item(self) -> None:
         """Test creating a batch item with ordering."""
         batch_id = uuid4()
         subject_id = uuid4()
@@ -237,7 +238,7 @@ class TestEditionProductionBatchItem:
         assert item.position == 1
         assert item.batch_id == batch_id
 
-    def test_batch_item_position_must_be_positive(self):
+    def test_batch_item_position_must_be_positive(self) -> None:
         """Test that batch item position must be >= 1."""
         with pytest.raises(ValueError, match="position must be >= 1"):
             EditionProductionBatchItem(
@@ -251,7 +252,7 @@ class TestEditionProductionBatchItem:
 class TestInputHashComputation:
     """Tests for deterministic input hash computation."""
 
-    def test_input_hash_deterministic(self):
+    def test_input_hash_deterministic(self) -> None:
         """Test that same input produces same hash."""
         data = {
             "subject_id": "test",
@@ -264,7 +265,7 @@ class TestInputHashComputation:
         assert hash1 == hash2
         assert len(hash1) == 64
 
-    def test_input_hash_different_for_different_data(self):
+    def test_input_hash_different_for_different_data(self) -> None:
         """Test that different data produces different hash."""
         data1 = {"version": "1.0.0"}
         data2 = {"version": "2.0.0"}
@@ -274,7 +275,7 @@ class TestInputHashComputation:
 
         assert hash1 != hash2
 
-    def test_input_hash_order_independent(self):
+    def test_input_hash_order_independent(self) -> None:
         """Test that key order doesn't affect hash."""
         data1 = {"a": 1, "b": 2}
         data2 = {"b": 2, "a": 1}
@@ -288,7 +289,7 @@ class TestInputHashComputation:
 class TestProductionWorkflow:
     """Integration tests for production workflow."""
 
-    def test_brief_auto_workflow_sequence(self):
+    def test_brief_auto_workflow_sequence(self) -> None:
         """Test the complete brief_auto workflow sequence."""
         subject_id = uuid4()
         edition_id = uuid4()
@@ -301,7 +302,7 @@ class TestProductionWorkflow:
         )
 
         # Stage sequence
-        assert run.current_stage == SubjectProductionStage.SOURCES
+        assert run.current_stage is SubjectProductionStage.SOURCES
 
         stages = [
             SubjectProductionStage.SOURCES,
@@ -316,9 +317,9 @@ class TestProductionWorkflow:
             run.advance_stage()
 
         # After advancing from ASSEMBLY, should still be ASSEMBLY (last stage)
-        assert run.current_stage == SubjectProductionStage.ASSEMBLY
+        assert run.current_stage is SubjectProductionStage.ASSEMBLY  # type: ignore[comparison-overlap]
 
-    def test_batch_sequential_execution(self):
+    def test_batch_sequential_execution(self) -> None:
         """Test that batch items are processed in order."""
         edition_id = uuid4()
         subject_ids = [uuid4() for _ in range(3)]

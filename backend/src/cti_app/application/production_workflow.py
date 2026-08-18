@@ -13,6 +13,7 @@ from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_context import build_subject_production_context
+from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
 from cti_app.application.production_parsers import (
     ParsedEvent,
     ParseResult,
@@ -21,6 +22,7 @@ from cti_app.application.production_parsers import (
     parse_technical_extraction,
     reference_report_from_json,
     reference_report_to_json,
+    technical_extraction_from_json,
     technical_extraction_to_json,
 )
 from cti_app.application.production_prompts import ProductionPromptTemplates
@@ -84,11 +86,13 @@ class ProductionWorkflowOrchestrator:
         model_service: ModelConversationService | None = None,
         collection_service: SubjectCollectionService | None = None,
         artifact_store: ProductionArtifactStore | None = None,
+        diagnostics: ProductionDiagnosticsLog | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._model_service = model_service
         self._collection_service = collection_service
         self._artifact_store = artifact_store
+        self._diagnostics = diagnostics or ProductionDiagnosticsLog(None)
         self._correlation_id = "-"
         self._references = ReferenceResearchService(uow_factory, artifact_store)
         self._extraction = ExtractionService(uow_factory, artifact_store)
@@ -136,6 +140,13 @@ class ProductionWorkflowOrchestrator:
             else:
                 raise ValueError(f"Unknown stage: {expected_stage.value}")
 
+            self._diagnostics.record_stage_outcome(
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage=expected_stage.value,
+                correlation_id=correlation_id,
+                result=result,
+            )
             return result
 
     async def _ask_with_format_repair(
@@ -166,10 +177,20 @@ class ProductionWorkflowOrchestrator:
             context_subject_id=run.subject_id,
         )
         raw = await self._turn_output_text(conversation_id, turn.id) or ""
+        self._diagnostics.record_model_answer(
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage,
+            correlation_id=self._correlation_id,
+            prompt=prompt,
+            answer=raw,
+            idempotency_key=f"{stage}-{run.id}-v1",
+        )
         if not raw:
             return None, "", turn.id
 
         result = parse(raw)
+        self._log_parse(run, stage, result)
         if result.usable:
             return result, raw, turn.id
 
@@ -186,10 +207,20 @@ class ProductionWorkflowOrchestrator:
             context_subject_id=run.subject_id,
         )
         repaired_raw = await self._turn_output_text(conversation_id, repair_turn.id) or ""
+        self._diagnostics.record_model_answer(
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage=f"{stage}-repair",
+            correlation_id=self._correlation_id,
+            prompt=repair_prompt,
+            answer=repaired_raw,
+            idempotency_key=f"{stage}-format-repair-{run.id}-v1",
+        )
         if not repaired_raw:
             return result, raw, turn.id
 
         repaired = parse(repaired_raw)
+        self._log_parse(run, f"{stage}-repair", repaired)
         repaired.repair_actions.append(f"{stage}_format_repair")
         repaired.warnings.extend(result.errors)
         return repaired, repaired_raw, repair_turn.id
@@ -268,6 +299,35 @@ class ProductionWorkflowOrchestrator:
             "archived_sources": len(archived_ids),
         }
 
+    async def _load_qa_inputs(
+        self,
+        references: Any,
+        extraction: Any,
+        synthesis: Any,
+        brief: Any,
+    ) -> dict[str, Any]:
+        """Read back what QA needs to judge the brief."""
+        if self._artifact_store is None:
+            return {}
+        store = self._artifact_store
+        loaded: dict[str, Any] = {}
+        try:
+            if references.canonical_blob_id is not None:
+                loaded["report"] = reference_report_from_json(
+                    await store.read_json(references.canonical_blob_id)
+                )
+            if extraction.canonical_blob_id is not None:
+                loaded["extraction"] = technical_extraction_from_json(
+                    await store.read_json(extraction.canonical_blob_id)
+                )
+            if synthesis.rendered_blob_id is not None:
+                loaded["synthesis_text"] = await store.read_text(synthesis.rendered_blob_id)
+            if brief.rendered_blob_id is not None:
+                loaded["brief_markdown"] = await store.read_text(brief.rendered_blob_id)
+        except Exception:
+            return loaded
+        return loaded
+
     async def _load_reference_report(self, artifact: Any) -> ReferenceReport | None:
         """Read back the canonical Q1 report stored with the artifact."""
         if self._artifact_store is None or artifact.canonical_blob_id is None:
@@ -277,6 +337,19 @@ class ProductionWorkflowOrchestrator:
             return reference_report_from_json(payload)
         except Exception:
             return None
+
+    def _log_parse(self, run: SubjectProductionRun, stage: str, result: ParseResult[Any]) -> None:
+        self._diagnostics.record_parse(
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage,
+            correlation_id=self._correlation_id,
+            usable=result.usable,
+            warnings=result.warnings,
+            errors=result.errors,
+            repair_actions=result.repair_actions,
+            dropped_blocks=result.dropped_blocks,
+        )
 
     async def _subject_context(self, uow: UnitOfWork, subject_id: UUID) -> tuple[str, str]:
         """Editorial title and context for a subject.
@@ -491,6 +564,7 @@ class ProductionWorkflowOrchestrator:
                 raw_result=raw,
                 canonical_json=reference_report_to_json(report),
                 conversation_turn_id=turn_id,
+                warnings=parsed.warnings,
             )
 
             return {
@@ -616,6 +690,7 @@ class ProductionWorkflowOrchestrator:
                 raw_result=raw,
                 canonical_json=technical_extraction_to_json(extraction),
                 conversation_turn_id=turn_id,
+                warnings=parsed.warnings,
             )
 
             return {
@@ -754,6 +829,11 @@ class ProductionWorkflowOrchestrator:
                 }
 
             subject_title, _ = await self._subject_context(uow, run.subject_id)
+            archived_urls = {
+                item.canonical_url
+                for item in await uow.source_collections.list_for_subject(run.subject_id)
+                if item.state.value in _ARCHIVED_STATES
+            }
             brief = await self._assembly.assemble_brief(
                 run_id=run.id,
                 subject_id=run.subject_id,
@@ -763,13 +843,17 @@ class ProductionWorkflowOrchestrator:
                 synthesis_artifact=synthesis,
             )
 
-            # Run QA
+            # QA reads the real payloads, not the counters.
+            qa_inputs = await self._load_qa_inputs(references, extraction, synthesis, brief)
             qa_result = await self._qa.run_qa(
                 run_id=run.id,
                 references_artifact=references,
                 extraction_artifact=extraction,
                 synthesis_artifact=synthesis,
                 brief_artifact=brief,
+                archived_urls=archived_urls,
+                research_date=run.research_date,
+                **qa_inputs,
             )
 
             if qa_result["passed"]:

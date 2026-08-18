@@ -204,8 +204,10 @@ services:
       QWEN_CHUNK_MAX_CHARS: ${QWEN_CHUNK_MAX_CHARS:-12000}
       QWEN_CHUNK_OVERLAP_CHARS: ${QWEN_CHUNK_OVERLAP_CHARS:-500}
       SUBJECT_WORKSPACE_ROOT: /work/subjects
+      DIAGNOSTICS_LOG_ROOT: ${DIAGNOSTICS_LOG_ROOT:-/var/diagnostics}
     volumes:
       - subject_workspaces:/work/subjects
+      - ./var/diagnostics:/var/diagnostics
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     extra_hosts:
@@ -259,6 +261,9 @@ services:
         "--skip-logging",
       ]
     environment: *backend-environment
+    volumes:
+      - subject_workspaces:/work/subjects
+      - ./var/diagnostics:/var/diagnostics
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

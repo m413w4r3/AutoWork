@@ -4,13 +4,26 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+import re
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
 
+from cti_app.application.discovery_report_parser import extract_http_urls
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_parsers import (
+    ReferenceReport,
+    TechnicalExtraction,
+    reference_report_from_json,
+    technical_extraction_from_json,
+)
 from cti_app.application.production_prompts import ProductionPromptTemplates
+from cti_app.application.production_rendering import (
+    build_reference_numbering,
+    collect_indicators,
+    render_brief,
+)
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -105,6 +118,7 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
         canonical_json: dict[str, Any],
         model_run_id: UUID | None = None,
         conversation_turn_id: UUID | None = None,
+        warnings: list[str] | None = None,
     ) -> ProductionArtifact:
         """Store references research result as artifact."""
         async with self._uow_factory() as uow:
@@ -131,6 +145,8 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
                 metadata={
                     "event_count": len(canonical_json.get("events", [])),
                     "source_count": len(canonical_json.get("sources", [])),
+                    "warnings": warnings or [],
+                    "parser_version": canonical_json.get("parser_version"),
                     "generated_at": datetime.now(UTC).isoformat(),
                 },
             )
@@ -195,6 +211,7 @@ class ExtractionService(_ArtifactPayloadMixin):
         canonical_json: dict[str, Any],
         model_run_id: UUID | None = None,
         conversation_turn_id: UUID | None = None,
+        warnings: list[str] | None = None,
     ) -> ProductionArtifact:
         """Store extraction result as artifact."""
         async with self._uow_factory() as uow:
@@ -226,6 +243,8 @@ class ExtractionService(_ArtifactPayloadMixin):
                 conversation_turn_id=conversation_turn_id,
                 metadata={
                     "element_counts": element_counts,
+                    "warnings": warnings or [],
+                    "parser_version": canonical_json.get("parser_version"),
                     "generated_at": datetime.now(UTC).isoformat(),
                 },
             )
@@ -353,12 +372,16 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
         extraction_artifact: ProductionArtifact,
         synthesis_artifact: ProductionArtifact,
     ) -> ProductionArtifact:
-        """Assemble brief from artifacts (deterministic).
+        """Render the final brief from the stored artifacts.
 
-        No LLM call - pure rendering.
+        Deterministic: no model call. Reads the real payloads rather than the
+        counters kept in `metadata`.
         """
+        report, extraction, synthesis_text = await self._load_inputs(
+            references_artifact, extraction_artifact, synthesis_artifact
+        )
+
         async with self._uow_factory() as uow:
-            # Compute input hash from all dependencies
             input_data = {
                 "references_id": str(references_artifact.id),
                 "references_hash": references_artifact.input_hash,
@@ -374,14 +397,22 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
             )
             version = (current.version + 1) if current else 1
 
-            # Brief content would be assembled here from artifacts
-            brief_markdown = self._render_brief(
-                subject_title,
-                references_artifact.metadata,
-                extraction_artifact.metadata,
-                synthesis_artifact.metadata,
+            numbering = build_reference_numbering(report, synthesis_text)
+            brief_markdown = render_brief(
+                subject_title=subject_title,
+                report=report,
+                extraction=extraction,
+                synthesis_text=synthesis_text,
+                numbering=numbering,
             )
 
+            raw_id, canonical_id, rendered_id = await self._store_payloads(
+                canonical={
+                    "title": subject_title,
+                    "numbering": {sid: number for sid, number in numbering.items()},
+                },
+                rendered=brief_markdown,
+            )
             artifact = ProductionArtifact(
                 production_run_id=run_id,
                 subject_id=subject_id,
@@ -389,8 +420,13 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
                 version=version,
                 input_hash=input_hash,
                 status=ProductionArtifactStatus.VERIFIED,
+                raw_blob_id=raw_id,
+                canonical_blob_id=canonical_id,
+                rendered_blob_id=rendered_id,
                 metadata={
                     "word_count": len(brief_markdown.split()),
+                    "reference_count": len(numbering),
+                    "indicator_count": len(collect_indicators(extraction)),
                     "generated_at": datetime.now(UTC).isoformat(),
                 },
             )
@@ -398,97 +434,39 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
             await uow.commit()
             return artifact
 
-    def _render_brief(
+    async def _load_inputs(
         self,
-        subject_title: str,
-        references_metadata: dict[str, Any],
-        extraction_metadata: dict[str, Any],
-        synthesis_metadata: dict[str, Any],
-    ) -> str:
-        """Render brief markdown from artifact metadata.
-
-        Assembles references, synthesis, and IOC from extracted artifacts.
-        """
-        # Parse synthesis markdown content if available
-        synthesis_content = synthesis_metadata.get("markdown_content", "")
-        if not synthesis_content:
-            synthesis_content = (
-                f"(Synthèse technique — {synthesis_metadata.get('word_count', 0)} mots)"
-            )
-
-        # Build references section
-        references_section = "## Références\n\n"
-        sources = references_metadata.get("sources", [])
-        if sources:
-            for i, source in enumerate(sources[:10], 1):
-                url = source.get("url", "")
-                title = source.get("title", "Source")
-                references_section += f"[{i}] {title}\n"
-                if url:
-                    references_section += f"    {url}\n"
-        else:
-            references_section += (
-                f"{references_metadata.get('source_count', 0)} publications identifiées\n"
-            )
-
-        # Build IOC section
-        ioc_section = "## Indicateurs de Compromission (IOC)\n\n"
-        indicators = extraction_metadata.get("indicators", {})
-        if indicators:
-            # Network indicators
-            if indicators.get("network_artifacts"):
-                ioc_section += "### Artefacts Réseau\n\n"
-                for artifact in indicators["network_artifacts"][:20]:
-                    ioc_section += f"- {artifact}\n"
-            # Malware hashes
-            if indicators.get("malware_hashes"):
-                ioc_section += "\n### Hachés de Malware\n\n"
-                for hash_val in indicators["malware_hashes"][:10]:
-                    ioc_section += f"- {hash_val}\n"
-            # CVEs
-            if indicators.get("cves"):
-                ioc_section += "\n### Vulnérabilités (CVE)\n\n"
-                for cve in indicators["cves"][:10]:
-                    ioc_section += f"- {cve}\n"
-        else:
-            network_artifacts = extraction_metadata.get("element_counts", {}).get(
-                "network_artifacts", 0
-            )
-            ioc_section += f"{network_artifacts} artefacts réseau identifiés\n"
-
-        # Build final brief
-        brief = f"""# {subject_title}
-
-## Contexte
-
-Analyse produite automatiquement basée sur les sources collectées et l'analyse technique.
-
-{references_section}
-
-## Synthèse Technique
-
-{synthesis_content}
-
-{ioc_section}
-
----
-
-*Brève générée automatiquement par le système de production CTI.*
-"""
-
-        return brief
+        references_artifact: ProductionArtifact,
+        extraction_artifact: ProductionArtifact,
+        synthesis_artifact: ProductionArtifact,
+    ) -> tuple[ReferenceReport, TechnicalExtraction, str]:
+        if self._artifact_store is None:
+            raise ValueError("Brief assembly requires an artifact store")
+        if references_artifact.canonical_blob_id is None:
+            raise ValueError("References artifact has no canonical payload")
+        if extraction_artifact.canonical_blob_id is None:
+            raise ValueError("Extraction artifact has no canonical payload")
+        if synthesis_artifact.rendered_blob_id is None:
+            raise ValueError("Synthesis artifact has no rendered payload")
+        report = reference_report_from_json(
+            await self._artifact_store.read_json(references_artifact.canonical_blob_id)
+        )
+        extraction = technical_extraction_from_json(
+            await self._artifact_store.read_json(extraction_artifact.canonical_blob_id)
+        )
+        synthesis_text = await self._artifact_store.read_text(synthesis_artifact.rendered_blob_id)
+        return report, extraction, synthesis_text
 
 
 class ProductionQAService:
-    """Automated QA checks for production."""
+    """Automated QA gate between assembly and READY.
 
-    def __init__(
-        self,
-        uow_factory: ProductionUnitOfWorkFactory,
-        artifact_store: ProductionArtifactStore | None = None,
-    ) -> None:
+    Every check answers one question: can a reader trust what this brief
+    asserts, given only the sources we actually hold?
+    """
+
+    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
-        self._artifact_store = artifact_store
 
     async def run_qa(
         self,
@@ -497,63 +475,126 @@ class ProductionQAService:
         extraction_artifact: ProductionArtifact | None,
         synthesis_artifact: ProductionArtifact | None,
         brief_artifact: ProductionArtifact | None,
+        *,
+        report: ReferenceReport | None = None,
+        extraction: TechnicalExtraction | None = None,
+        synthesis_text: str = "",
+        brief_markdown: str = "",
+        archived_urls: set[str] | None = None,
+        research_date: date | None = None,
     ) -> dict[str, Any]:
-        """Run QA checks on production artifacts.
-
-        Returns:
-            {
-                "passed": bool,
-                "checks": {check_name: bool},
-                "errors": [error messages],
-                "warnings": [warning messages],
-            }
-        """
-        checks = {}
-        errors = []
+        checks: dict[str, bool] = {}
+        errors: list[str] = []
         warnings: list[str] = []
+        archived = archived_urls or set()
 
-        # Check 1: References present
-        checks["references_present"] = references_artifact is not None
-        if not checks["references_present"]:
-            errors.append("References artifact missing")
+        def require(name: str, ok: bool, message: str) -> None:
+            checks[name] = ok
+            if not ok:
+                errors.append(message)
 
-        # Check 2: Extraction present
-        checks["extraction_present"] = extraction_artifact is not None
-        if not checks["extraction_present"]:
-            errors.append("Extraction artifact missing")
+        require("references_present", references_artifact is not None, "Références manquantes")
+        require("extraction_present", extraction_artifact is not None, "Extraction manquante")
+        require("synthesis_present", synthesis_artifact is not None, "Synthèse manquante")
+        require("brief_present", brief_artifact is not None, "Brève manquante")
 
-        # Check 3: Synthesis present
-        checks["synthesis_present"] = synthesis_artifact is not None
-        if not checks["synthesis_present"]:
-            errors.append("Synthesis artifact missing")
+        for label, artifact in (
+            ("references", references_artifact),
+            ("extraction", extraction_artifact),
+            ("synthesis", synthesis_artifact),
+            ("brief", brief_artifact),
+        ):
+            if artifact is not None:
+                require(
+                    f"no_stale_{label}",
+                    artifact.status != ProductionArtifactStatus.STALE,
+                    f"Artifact {label} périmé",
+                )
 
-        # Check 4: Brief present
-        checks["brief_present"] = brief_artifact is not None
-        if not checks["brief_present"]:
-            errors.append("Brief artifact missing")
-
-        # Check 5: No stale artifacts
-        if references_artifact:
-            checks["no_stale_references"] = (
-                references_artifact.status != ProductionArtifactStatus.STALE.value
+        known_sources: set[str] = set()
+        known_events: set[str] = set()
+        if report is not None:
+            known_sources = report.source_ids()
+            known_events = {event.local_id for event in report.events}
+            require("source_count", bool(report.sources), "Aucune source retenue")
+            require("event_count", bool(report.events), "Aucun événement retenu")
+            require(
+                "every_event_has_an_archived_source",
+                all(
+                    any(
+                        source.canonical_url in archived
+                        for source in report.sources
+                        if source.local_id in event.source_ids
+                    )
+                    for event in report.events
+                ),
+                "Un événement n'est adossé à aucune source archivée",
             )
-        if extraction_artifact:
-            checks["no_stale_extraction"] = (
-                extraction_artifact.status != ProductionArtifactStatus.STALE.value
+            require(
+                "at_least_one_archived_source",
+                any(source.canonical_url in archived for source in report.sources),
+                "Aucune source archivée",
             )
-        if synthesis_artifact:
-            checks["no_stale_synthesis"] = (
-                synthesis_artifact.status != ProductionArtifactStatus.STALE.value
-            )
-        if brief_artifact:
-            checks["no_stale_brief"] = brief_artifact.status != ProductionArtifactStatus.STALE.value
+            if research_date is not None:
+                require(
+                    "no_future_date",
+                    all(
+                        event.event_date is None or event.event_date <= research_date
+                        for event in report.events
+                    ),
+                    "Un événement porte une date postérieure à la recherche",
+                )
 
-        # Overall result
+        if extraction is not None:
+            require(
+                "no_unknown_reference_in_items",
+                all(
+                    set(item.reference_ids) <= known_events
+                    and set(item.source_ids) <= known_sources
+                    for item in extraction.supported_items()
+                ),
+                "Un élément d'extraction cite une référence inconnue",
+            )
+            if not extraction.supported_items():
+                warnings.append("Aucun élément d'extraction n'est étayé")
+
+        if synthesis_text:
+            markers = {
+                match.group(1).upper() for match in _SYNTHESIS_MARKER.finditer(synthesis_text)
+            }
+            require(
+                "no_unknown_marker_in_synthesis",
+                markers <= known_sources,
+                "La synthèse cite une source inconnue",
+            )
+            corpus_urls = {source.canonical_url for source in report.sources} if report else set()
+            require(
+                "no_url_outside_corpus",
+                all(
+                    canonical in corpus_urls
+                    for _raw, canonical in extract_http_urls(synthesis_text)
+                ),
+                "La synthèse cite une URL hors corpus",
+            )
+
+        if brief_markdown:
+            used = {int(match.group(1)) for match in _BRIEF_FOOTNOTE.finditer(brief_markdown)}
+            declared = {int(match.group(1)) for match in _BRIEF_DECLARED.finditer(brief_markdown)}
+            require(
+                "no_orphan_footnote",
+                used <= declared,
+                "La brève contient une note de bas de page orpheline",
+            )
+
         passed = all(checks.values()) and not errors
-
         return {
             "passed": passed,
             "checks": checks,
             "errors": errors,
             "warnings": warnings,
         }
+
+
+_SYNTHESIS_MARKER = re.compile(r"\[(S\d{1,3})\]", re.IGNORECASE)
+_BRIEF_FOOTNOTE = re.compile(r"(?<!^)\[(\d{1,3})\]", re.MULTILINE)
+_BRIEF_DECLARED = re.compile(r"^\[(\d{1,3})\]\s", re.MULTILINE)

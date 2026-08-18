@@ -16,6 +16,7 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.model_gateway import ModelGateway, ModelRouter
 from cti_app.domain.classification import TLP
+from cti_app.domain.editions import Edition
 from cti_app.domain.model_runs import ModelProvider, ModelRunStatus
 from cti_app.integrations.models import FakeModelAdapter, InMemoryModelOutputStore
 from cti_app.logging import CorrelationIdMiddleware
@@ -236,7 +237,9 @@ async def test_manual_recovery_previews_then_resumes_the_original_job() -> None:
     ).decode() == markdown
 
 
-async def _recovery_application() -> tuple[FastAPI, object, InMemoryJobUnitOfWorkFactory, object]:
+async def _recovery_application() -> tuple[
+    FastAPI, Edition, InMemoryJobUnitOfWorkFactory, DiscoveryService
+]:
     """Application minimale exposant découverte + jobs, ChatGPT en needs_review."""
     adapter = DeferredResearchAdapter(needs_review=True)
     model_uow = InMemoryModelRunUnitOfWorkFactory()

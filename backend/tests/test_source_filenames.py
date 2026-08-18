@@ -1,4 +1,5 @@
 from datetime import date
+from typing import Any
 
 import pytest
 
@@ -42,7 +43,7 @@ def test_analyst_filename_uses_business_metadata_and_unicode() -> None:
 
 
 def test_unknown_values_and_unsafe_characters_are_sanitized_deterministically() -> None:
-    arguments = {
+    arguments: dict[str, Any] = {
         "published_at": None,
         "tlp": TLP.RED,
         "title": '../Rapport\x00 / \\ : * ? " < > |',

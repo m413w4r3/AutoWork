@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from cti_app.application.discovery_consolidation import consolidate_discovery_batches
 from cti_app.application.discovery_identity import (
@@ -87,7 +87,7 @@ def _candidate(
     )
 
 
-def _batch(candidates: list[CandidateTopic], *, edition_id=None) -> DiscoveryBatch:
+def _batch(candidates: list[CandidateTopic], *, edition_id: UUID | None = None) -> DiscoveryBatch:
     return DiscoveryBatch(
         edition_id=edition_id or uuid4(),
         request_hash=REQUEST_HASH,

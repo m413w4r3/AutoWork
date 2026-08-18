@@ -21,6 +21,7 @@ from cti_app.application.jobs import JobExecutor, JobService, create_job_registr
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
@@ -122,6 +123,7 @@ async def _execute_job(job_id: UUID) -> int | None:
         )
         # Production stage jobs run here, so the worker needs the production
         # registrations and a bound chain to queue the following stage.
+        production_diagnostics = ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root)
         production_artifact_store = ProductionArtifactStore(
             BlobCatalogService(blob_store, uow_factory)
         )
@@ -135,6 +137,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             model_conversation_service=model_conversation_service,
             production_chain=production_chain,
             production_artifact_store=production_artifact_store,
+            production_diagnostics=production_diagnostics,
         )
         production_chain.bind(JobService(uow_factory, registry), DramatiqJobDispatcher())
         executor = JobExecutor(

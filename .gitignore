@@ -65,3 +65,17 @@ evidence_packs/
 chatgpt-bridge/.venv/
 chatgpt-bridge/__pycache__/
 chatgpt-bridge/out/
+
+
+# roo code
+
+!.roomodes
+!.rooignore
+!.roo/
+!.roo/**
+
+# Local diagnostic trail: raw model answers and parser decisions.
+# Never commit — it mirrors external model output verbatim.
+/var/
+chatGPT_Answers/
+

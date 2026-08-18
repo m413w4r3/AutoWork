@@ -13,6 +13,7 @@ import pytest
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
+    ProductionArtifactStage,
     ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
@@ -32,7 +33,7 @@ class TestSubjectProductionRunStates:
         )
 
         assert run.status == SubjectProductionStatus.QUEUED
-        assert run.current_stage == SubjectProductionStage.SOURCES
+        assert run.current_stage is SubjectProductionStage.SOURCES
         assert run.started_at is None
         assert run.finished_at is None
 
@@ -57,23 +58,23 @@ class TestSubjectProductionRunStates:
             profile=ProductionProfile.BRIEF_AUTO,
         )
 
-        assert run.current_stage == SubjectProductionStage.SOURCES
+        assert run.current_stage is SubjectProductionStage.SOURCES
 
         # SOURCES -> REFERENCES
         run.advance_stage(now=datetime.now(UTC))
-        assert run.current_stage == SubjectProductionStage.REFERENCES
+        assert run.current_stage is SubjectProductionStage.REFERENCES  # type: ignore[comparison-overlap]
 
         # REFERENCES -> EXTRACTION
         run.advance_stage(now=datetime.now(UTC))
-        assert run.current_stage == SubjectProductionStage.EXTRACTION
+        assert run.current_stage is SubjectProductionStage.EXTRACTION
 
         # EXTRACTION -> SYNTHESIS
         run.advance_stage(now=datetime.now(UTC))
-        assert run.current_stage == SubjectProductionStage.SYNTHESIS
+        assert run.current_stage is SubjectProductionStage.SYNTHESIS
 
         # SYNTHESIS -> ASSEMBLY
         run.advance_stage(now=datetime.now(UTC))
-        assert run.current_stage == SubjectProductionStage.ASSEMBLY
+        assert run.current_stage is SubjectProductionStage.ASSEMBLY
 
     def test_mark_ready_terminates_run(self) -> None:
         """Test mark_ready transitions to READY terminal state."""
@@ -106,6 +107,7 @@ class TestSubjectProductionRunStates:
 
         assert run.status == SubjectProductionStatus.NEEDS_REVIEW
         assert run.error_code == "qa_check_failed"
+        assert run.error_message is not None
         assert "QA validation failed" in run.error_message
         assert run.finished_at is not None
 
@@ -259,7 +261,7 @@ class TestProductionArtifactValidation:
             ProductionArtifact(
                 production_run_id=uuid4(),
                 subject_id=uuid4(),
-                stage="references",
+                stage=ProductionArtifactStage.REFERENCES,
                 version=0,  # Invalid
                 input_hash="a" * 64,
             )
@@ -272,7 +274,7 @@ class TestProductionArtifactValidation:
             ProductionArtifact(
                 production_run_id=uuid4(),
                 subject_id=uuid4(),
-                stage="references",
+                stage=ProductionArtifactStage.REFERENCES,
                 version=1,
                 input_hash="invalid",  # Too short and wrong format
             )
@@ -286,7 +288,7 @@ class TestProductionArtifactValidation:
         artifact = ProductionArtifact(
             production_run_id=uuid4(),
             subject_id=uuid4(),
-            stage="references",
+            stage=ProductionArtifactStage.REFERENCES,
             version=1,
             input_hash=valid_hash,
         )

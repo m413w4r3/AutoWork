@@ -508,7 +508,9 @@ async def test_tenable_resume_processes_all_seven_sources_with_exact_summary(
     )
     sources = await app.initialize(subject.id)
     await app.archive_one(sources[0].id, uuid4())
-    tenable_document = factory.documents[factory.collections[sources[0].id].source_document_id]
+    document_id = factory.collections[sources[0].id].source_document_id
+    assert document_id is not None
+    tenable_document = factory.documents[document_id]
     tenable_document.title = None
     tenable_document.logical_filename = tenable_document.original_name
     context_value = NoopContext(uuid4())
@@ -540,9 +542,9 @@ async def test_tenable_resume_processes_all_seven_sources_with_exact_summary(
         "failed_terminal": 0,
     }
     assert factory.collections[sources[0].id].attempt_count == 1
-    assert factory.documents[tenable_document.id].logical_filename.startswith(
-        "date-inconnue_TLP AMBER_Report 1_Research team"
-    )
+    logical_filename = factory.documents[tenable_document.id].logical_filename
+    assert logical_filename is not None
+    assert logical_filename.startswith("date-inconnue_TLP AMBER_Report 1_Research team")
 
 
 async def test_invalid_qwen_output_is_never_requested_during_collection(
@@ -622,7 +624,9 @@ async def test_size_limit_does_not_stop_next_source(tmp_path: Path) -> None:
 
 async def test_blob_store_failure_remains_systemic(tmp_path: Path) -> None:
     class FailingBlobStore(FilesystemBlobStore):
-        async def put(self, source: object, *, logical_bucket: str, mime_type: str) -> object:
+        async def put(  # type: ignore[override]
+            self, source: object, *, logical_bucket: str, mime_type: str
+        ) -> object:
             del source, logical_bucket, mime_type
             raise RuntimeError("blob store unavailable")
 

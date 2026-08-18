@@ -21,6 +21,23 @@ interface ProductionQueueProps {
   briefs?: ProductionQueueBrief[];
 }
 
+const ITEM_STATUS_LABELS: Record<string, string> = {
+  queued: "En attente",
+  running: "En cours",
+  ready: "Prête",
+  needs_review: "À vérifier",
+  failed: "En échec",
+  cancelled: "Annulée",
+};
+
+function itemStatusColor(status: string): string {
+  if (status === "ready") return "text-green-700";
+  if (status === "needs_review") return "text-yellow-700";
+  if (status === "failed") return "text-red-700";
+  if (status === "running") return "text-blue-700";
+  return "text-gray-500";
+}
+
 export function ProductionQueue({
   editionId,
   briefs = [],
@@ -180,7 +197,9 @@ export function ProductionQueue({
         </div>
         <div className="bg-red-50 p-3 rounded">
           <div className="text-2xl font-bold text-red-800">{batch.failed}</div>
-          <div className="text-xs text-gray-600">En échec</div>
+          <div className="text-xs text-gray-600">
+            En échec{batch.cancelled ? ` · ${batch.cancelled} annulée(s)` : ""}
+          </div>
         </div>
         <div className="bg-blue-50 p-3 rounded">
           <div className="text-2xl font-bold text-blue-800">
@@ -207,6 +226,27 @@ export function ProductionQueue({
           />
         </div>
       </div>
+
+      {/* Per-subject queue: which one is running, which are done */}
+      {batch.item_details.length > 0 && (
+        <ol className="space-y-1" aria-label="File de production">
+          {batch.item_details.map((item) => (
+            <li
+              key={item.run_id}
+              className="flex items-center gap-2 text-sm border-b py-1"
+            >
+              <span className="text-gray-500 tabular-nums">
+                {item.position}/{totalItems}
+              </span>
+              <span className="flex-1">{item.title}</span>
+              <span className={`text-xs ${itemStatusColor(item.status)}`}>
+                {ITEM_STATUS_LABELS[item.status] ?? item.status}
+                {item.status === "running" ? ` · ${item.current_stage}` : ""}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
 
       {/* Current Subject */}
       {batch.status === "running" && batch.current_subject_index !== null && (
