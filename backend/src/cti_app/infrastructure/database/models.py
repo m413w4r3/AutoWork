@@ -57,6 +57,7 @@ HUMAN_DECISION_VALUES_SQL = (
     "'source_relationship_validate', 'source_relationship_correct', "
     "'brief_changes_requested', 'brief_approve', 'brief_promote'"
 )
+SOURCE_ORIGIN_KIND_VALUES_SQL = "'discovery', 'reference_research', 'manual'"
 BRIEF_DRAFT_STATUS_VALUES_SQL = "'draft', 'changes_requested', 'approved', 'promoted'"
 CONVERSATION_TRANSPORT_VALUES_SQL = "'chatgpt_bridge', 'openai_responses', 'application_managed'"
 CONVERSATION_PURPOSE_VALUES_SQL = (
@@ -621,6 +622,13 @@ class SourceCollectionRow(Base):
         UniqueConstraint(
             "subject_id", "source_candidate_id", name="uq_source_collections_subject_candidate"
         ),
+        UniqueConstraint(
+            "subject_id", "canonical_url", name="uq_source_collections_subject_canonical_url"
+        ),
+        CheckConstraint(
+            f"origin_kind IN ({SOURCE_ORIGIN_KIND_VALUES_SQL})",
+            name="ck_source_collections_origin_kind",
+        ),
         CheckConstraint(
             f"state IN ({COLLECTION_STATE_VALUES_SQL})", name="ck_source_collections_state"
         ),
@@ -652,11 +660,20 @@ class SourceCollectionRow(Base):
     group_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("editorial_groups.id", ondelete="RESTRICT"), nullable=False
     )
-    batch_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("discovery_batches.id", ondelete="RESTRICT"), nullable=False
+    batch_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovery_batches.id", ondelete="RESTRICT")
     )
-    source_candidate_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    source_candidate_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    origin_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     requested_url: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text)
+    publisher: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[date | None] = mapped_column(Date)
+    source_tlp: Mapped[str] = mapped_column(String(32), nullable=False)
+    sensitivity: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_llm_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    do_not_submit: Mapped[bool] = mapped_column(Boolean, nullable=False)
     proposed_role: Mapped[str] = mapped_column(String(32), nullable=False)
     relationship_status: Mapped[str] = mapped_column(String(32), nullable=False)
     relationship_evidence: Mapped[str] = mapped_column(Text, nullable=False)
@@ -996,6 +1013,7 @@ class SubjectProductionRunRow(Base):
         Uuid(as_uuid=True), ForeignKey("model_conversations.id", ondelete="SET NULL")
     )
     run_number: Mapped[int] = mapped_column(nullable=False)
+    research_date: Mapped[date | None] = mapped_column(Date)
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(String(500))
     error_details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)

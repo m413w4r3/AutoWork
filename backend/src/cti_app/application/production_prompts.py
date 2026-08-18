@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 
 class ProductionPromptTemplates:
     """Versioned prompt templates for subject production."""
@@ -33,118 +35,98 @@ class ProductionPromptTemplates:
 5. Verify all dates are on or before the research date
 6. Use only publicly available information
 
-**Output Format**: Return ONLY a valid JSON object within a single markdown code block (```json ... ```). Do not include any text outside the code block.
+**Output format** — plain Markdown, no code fence, no JSON:
 
-Schema:
-{{
-  "subject": "Brief subject identifier",
-  "sources": [
-    {{
-      "id": "S1",
-      "url": "https://...",
-      "title": "Source title",
-      "publisher": "Organization name",
-      "published_at": "YYYY-MM-DD or null",
-      "role": "primary|independent|relay|aggregator|social|unknown"
-    }}
-  ],
-  "events": [
-    {{
-      "id": "R1",
-      "date": "YYYY-MM-DD or null",
-      "text": "Chronological event in French",
-      "source_ids": ["S1", "S2"]
-    }}
-  ],
-  "uncertainties": ["Any uncertainties about the research"]
-}}
+# REFERENCES
+
+## SOURCE S1
+
+title: <title>
+url: https://...
+publisher: <publisher>
+published-at: YYYY-MM-DD
+role: primary|independent|relay|aggregator|social|unknown
+
+## EVENT R1
+
+date: YYYY-MM-DD
+sources: S1, S2
+text: <one chronological event, in French>
+
+# UNCERTAINTIES
+- <uncertainty, or omit the section>
+
+Rules:
+- One `## SOURCE` block per publication, numbered S1, S2, ...
+- One `## EVENT` block per dated event, numbered R1, R2, ...
+- Every event must cite at least one source id you defined above.
+- Never cite a source id you did not define.
+- No date after the research date.
 """
 
-    TECHNICAL_EXTRACTION_V1 = """You are a CTI (Cyber Threat Intelligence) analysis assistant. Your task is to extract technical intelligence from the provided references.
+    TECHNICAL_EXTRACTION_V1 = """You are a CTI analysis assistant. Extract the technical intelligence contained in the references you produced in this conversation.
 
 **Subject**: {subject_title}
 
-**Reference Timeline**: (already provided in previous messages)
+**Rules**:
+1. Use ONLY the references and sources established earlier in this conversation.
+2. Never invent an indicator, a hash, a domain or a CVE.
+3. Every item must cite the events (R#) and/or sources (S#) that support it.
+4. Omit a category entirely, or write `none`, when the subject has nothing for it.
 
-**Extraction Guidelines**:
-1. Use ONLY information from the reference timeline
-2. DO NOT conduct new web research or add new publications
-3. For unsupported claims, include in "uncertainties" with explanation
-4. Extract maximum technical detail with source attribution
-5. Each element must be supported by at least one reference
+**Output format** — plain Markdown, no code fence, no JSON:
 
-**Expected CTI Categories**:
-- actors: Threat actors, groups, individuals
-- campaigns: Named operations and campaigns
-- victimology: Target sectors, countries, organizations
-- infection_chain: Attack progression steps
-- malware: Malware families and variants
-- tools: Attacker tools and utilities
-- ttps: Techniques (MITRE ATT&CK)
-- cves: CVEs exploited or discussed
-- protocols: Protocols used in attacks
-- network_artifacts: IPs, domains, URLs
-- infrastructure: C2 servers, hosting providers
-- files: File hashes, names, metadata
-- commands: Commands executed
-- persistence: Persistence mechanisms
-- detections: Detection signatures, indicators
-- other_technical: Other relevant technical details
-- uncertainties: Claims without sufficient support
+# EXTRACTION CTI
 
-**Output Format**: Return ONLY a valid JSON object within a single markdown code block.
+## ACTORS
+### ITEM A1
+value: <value>
+context: <short context, in French>
+references: R1
+sources: S1
 
-Schema:
-{{
-  "actors": [
-    {{
-      "value": "Actor name",
-      "context": "Brief description",
-      "reference_ids": ["R1"],
-      "source_ids": ["S1"]
-    }}
-  ],
-  "campaigns": [],
-  "victimology": [],
-  "infection_chain": [
-    {{
-      "order": 1,
-      "value": "Step description",
-      "context": "Details",
-      "reference_ids": ["R1"],
-      "source_ids": ["S1"]
-    }}
-  ],
-  "malware": [],
-  "tools": [],
-  "ttps": [
-    {{
-      "attack_id": "T1234 or null",
-      "value": "Technique name",
-      "context": "How used",
-      "reference_ids": ["R1"],
-      "source_ids": ["S1"]
-    }}
-  ],
-  "cves": [],
-  "protocols": [],
-  "network_artifacts": [
-    {{
-      "type": "ipv4|ipv6|domain|url|hash|email|hostname|port|uri",
-      "value": "The artifact",
-      "context": "What it is used for",
-      "reference_ids": ["R1"],
-      "source_ids": ["S1"]
-    }}
-  ],
-  "infrastructure": [],
-  "files": [],
-  "commands": [],
-  "persistence": [],
-  "detections": [],
-  "other_technical": [],
-  "uncertainties": ["Items not fully supported by references"]
-}}
+## TTP
+### ITEM T1
+value: <technique name>
+attack-id: T1566.001
+context: <context>
+references: R1
+sources: S1
+
+## NETWORK ARTIFACTS
+### ITEM N1
+type: domain|ip|url|hash|email
+value: <value>
+context: <context>
+references: R1
+sources: S1
+
+## PERSISTENCE
+none
+
+# UNCERTAINTIES
+- <uncertainty>
+
+Available categories: ACTORS, CAMPAIGNS, VICTIMOLOGY, INFECTION CHAIN, MALWARE,
+TOOLS, TTP, CVE, PROTOCOLS, NETWORK ARTIFACTS, INFRASTRUCTURE, FILES, COMMANDS,
+PERSISTENCE, DETECTIONS, OTHER TECHNICAL.
+"""
+
+    FORMAT_REPAIR_V1 = """Your previous answer could not be read by the automated parser.
+
+Problems found:
+{problems}
+
+Reformat your **previous answer** so it follows the requested structure exactly.
+
+Strict rules:
+- Do NOT search the web again.
+- Do NOT add, remove or change any fact, source, event or indicator.
+- Reproduce the same content, only fixing the structure.
+- Plain Markdown, no code fence, no JSON.
+
+Expected structure:
+{expected_structure}
 """
 
     TECHNICAL_SYNTHESIS_V1 = """You are a technical writer for threat intelligence reports. Your task is to synthesize research into a comprehensive technical briefing.
@@ -221,6 +203,40 @@ Le groupe Exemple réalise depuis 2020 des attaques ciblées contre le secteur f
         return cls.TECHNICAL_EXTRACTION_V1.format(
             subject_title=subject_title,
         )
+
+    _REFERENCES_STRUCTURE = """# REFERENCES
+
+## SOURCE S1
+
+title: <title>
+url: https://...
+publisher: <publisher>
+published-at: YYYY-MM-DD
+role: primary
+
+## EVENT R1
+
+date: YYYY-MM-DD
+sources: S1
+text: <event>"""
+
+    _EXTRACTION_STRUCTURE = """# EXTRACTION CTI
+
+## ACTORS
+### ITEM A1
+value: <value>
+context: <context>
+references: R1
+sources: S1"""
+
+    @classmethod
+    def get_format_repair_prompt(cls, *, stage: str, problems: Sequence[str]) -> str:
+        """Ask the model to restructure its previous answer, nothing else."""
+        structure = (
+            cls._REFERENCES_STRUCTURE if stage == "references" else cls._EXTRACTION_STRUCTURE
+        )
+        listed = "\n".join(f"- {problem}" for problem in problems) or "- structure illisible"
+        return cls.FORMAT_REPAIR_V1.format(problems=listed, expected_structure=structure)
 
     @classmethod
     def get_synthesis_prompt(

@@ -6,6 +6,7 @@ from uuid import UUID
 import dramatiq
 from minio import Minio
 
+from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.discovery import DISCOVERY_JOB_KIND, DiscoveryService
@@ -19,6 +20,7 @@ from cti_app.application.http_collection import (
 from cti_app.application.jobs import JobExecutor, JobService, create_job_registry
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
@@ -120,6 +122,9 @@ async def _execute_job(job_id: UUID) -> int | None:
         )
         # Production stage jobs run here, so the worker needs the production
         # registrations and a bound chain to queue the following stage.
+        production_artifact_store = ProductionArtifactStore(
+            BlobCatalogService(blob_store, uow_factory)
+        )
         production_chain = ProductionStageChain()
         registry = create_job_registry(
             model_gateway,
@@ -129,6 +134,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             uow_factory,
             model_conversation_service=model_conversation_service,
             production_chain=production_chain,
+            production_artifact_store=production_artifact_store,
         )
         production_chain.bind(JobService(uow_factory, registry), DramatiqJobDispatcher())
         executor = JobExecutor(

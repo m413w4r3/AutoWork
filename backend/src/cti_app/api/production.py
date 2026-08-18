@@ -13,6 +13,10 @@ from pydantic import BaseModel
 from cti_app.application.jobs import JobDispatcher, JobService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_jobs import ProductionStageParameters
+from cti_app.application.production_stage_status import (
+    build_stage_statuses,
+    completed_stage_count,
+)
 from cti_app.application.subject_production import (
     EditionProductionService,
     SubjectProductionService,
@@ -20,12 +24,16 @@ from cti_app.application.subject_production import (
 from cti_app.domain.editorial import EditorialGroup, EditorialGroupStatus, EditorialType
 from cti_app.domain.production import (
     ProductionProfile,
+    SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
 )
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api", tags=["production"])
+
+# Collection states that count as "available for analysis".
+_ARCHIVED_STATES = {"archived", "extracted", "completed"}
 
 
 # Request Models
@@ -117,6 +125,21 @@ def _eligible_brief_subject_ids(groups: Iterable[EditorialGroup]) -> list[UUID]:
     ]
 
 
+def _run_view(
+    run: SubjectProductionRun, edition_id: UUID, *, job_id: UUID | None
+) -> dict[str, Any]:
+    return {
+        "run_id": str(run.id),
+        "subject_id": str(run.subject_id),
+        "edition_id": str(edition_id),
+        "profile": run.profile.value,
+        "status": run.status.value,
+        "stage": run.current_stage.value,
+        "job_id": str(job_id) if job_id else None,
+        "created_at": run.created_at.isoformat(),
+    }
+
+
 # Subject Production Endpoints
 
 
@@ -169,16 +192,20 @@ async def start_subject_production(
     service = SubjectProductionService(uow_factory)
 
     try:
-        run = await service.create_run(
+        run, created = await service.create_run(
             subject_id=subject_id,
             edition_id=edition_id,
             profile=profile,
         )
 
-        # Start the run
-        await service.start_run(run.id)
+        if run.status is SubjectProductionStatus.RUNNING and not created:
+            # Already in flight: never start it again, never re-prompt.
+            return _run_view(run, edition_id, job_id=None)
 
-        # Dispatch the first job (SOURCES stage)
+        if created or run.status is SubjectProductionStatus.QUEUED:
+            await service.start_run(run.id)
+
+        # The idempotency key makes a concurrent duplicate POST reuse this job.
         parameters = ProductionStageParameters(
             run_id=run.id,
             expected_stage=SubjectProductionStage.SOURCES.value,
@@ -201,16 +228,7 @@ async def start_subject_production(
             detail=str(e),
         ) from e
 
-    return {
-        "run_id": str(run.id),
-        "subject_id": str(run.subject_id),
-        "edition_id": str(edition_id),
-        "profile": run.profile.value,
-        "status": run.status.value,
-        "stage": run.current_stage.value,
-        "job_id": str(job.id),
-        "created_at": run.created_at.isoformat(),
-    }
+    return _run_view(run, edition_id, job_id=job.id)
 
 
 @router.get("/subjects/{subject_id}/production")
@@ -236,26 +254,14 @@ async def get_subject_production(
 
         group = await uow.editorial_groups.get_by_subject(subject_id)
 
-        # Get all artifacts for this run
+        # Artifacts evidence the stages that produce one; SOURCES does not.
         artifacts = await uow.production_artifacts.list_for_run(run.id)
         artifacts_by_stage = {a.stage.value: a for a in artifacts}
+        collections = await uow.source_collections.list_for_subject(subject_id)
+        archived_sources = sum(1 for c in collections if c.state in _ARCHIVED_STATES)
 
-        # Build stage statuses
-        stages = {}
-        stage_list = [s.value for s in SubjectProductionStage]
-        for stage_name in stage_list:
-            artifact = artifacts_by_stage.get(stage_name)
-            stages[stage_name] = {
-                "status": artifact.status.value if artifact else "pending",
-                "version": artifact.version if artifact else None,
-                "error_code": None,
-                "error_message": None,
-            }
-
-        # Calculate progress
-        completed_stages = sum(
-            1 for s in stages.values() if s["status"] in ("verified", "succeeded")
-        )
+        stages = build_stage_statuses(run, artifacts_by_stage, archived_sources=archived_sources)
+        completed_stages = completed_stage_count(stages)
 
         return ProductionStatus(
             subject_id=str(run.subject_id),
@@ -268,7 +274,7 @@ async def get_subject_production(
             status=run.status.value,
             current_stage=run.current_stage.value,
             progress_current=completed_stages,
-            progress_total=len(stage_list),
+            progress_total=len(stages),
             conversation_id=str(run.conversation_id) if run.conversation_id else None,
             run_id=str(run.id),
             created_at=run.created_at.isoformat(),
@@ -510,29 +516,19 @@ async def start_edition_brief_production(
             subject_ids=subject_ids,
         )
 
-        async with uow_factory() as uow:
-            batch.start()
-            await uow.edition_production_batches.save(batch)
-            await uow.commit()
-
-        # Dispatch the first job for the first subject
-        first_subject_id = subject_ids[0]
-        subject_run = await service.create_batch_item_run(
-            batch_id=batch.id,
-            subject_id=first_subject_id,
-            position=0,
-        )
-
-        if subject_run:
+        # create_batch already created a run per subject and linked the batch
+        # items to them; start_next promotes the first one to RUNNING.
+        first_run = await service.start_next(batch.id)
+        if first_run is not None:
             parameters = ProductionStageParameters(
-                run_id=subject_run.id,
+                run_id=first_run.id,
                 expected_stage=SubjectProductionStage.SOURCES.value,
             )
             job = await jobs.submit(
                 kind="production.subject.sources",
                 aggregate_type="subject",
-                aggregate_id=first_subject_id,
-                idempotency_key=f"production-batch-{batch.id}-{first_subject_id}",
+                aggregate_id=first_run.subject_id,
+                idempotency_key=f"production-sources-{first_run.id}",
                 correlation_id=get_correlation_id(),
                 input_parameters=parameters.model_dump(mode="json"),
                 max_attempts=1,

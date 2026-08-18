@@ -59,6 +59,20 @@ class _Batches:
     async def save(self, batch: EditionProductionBatch) -> None:
         self.items[batch.id] = batch
 
+    async def get_active_for_edition(self, edition_id: UUID) -> EditionProductionBatch | None:
+        return next(
+            (
+                b
+                for b in self.items.values()
+                if b.edition_id == edition_id and b.status in ("queued", "running")
+            ),
+            None,
+        )
+
+    async def get_latest_for_edition(self, edition_id: UUID) -> EditionProductionBatch | None:
+        matches = [b for b in self.items.values() if b.edition_id == edition_id]
+        return matches[-1] if matches else None
+
 
 class _BatchItems:
     def __init__(self) -> None:
@@ -122,6 +136,9 @@ class _Context:
         self.job_id = uuid4()
         self.progress: list[tuple[int, int]] = []
 
+    async def correlation_id(self) -> str:
+        return "test-correlation"
+
     async def report_progress(self, current: int, total: int, message: str | None = None) -> None:
         self.progress.append((current, total))
 
@@ -141,6 +158,7 @@ class _Orchestrator:
         run_id: UUID,
         expected_stage: SubjectProductionStage,
         context: object | None = None,
+        correlation_id: str = "-",
     ) -> dict[str, Any]:
         self.calls.append(expected_stage)
         return self.result
@@ -308,3 +326,56 @@ async def test_failed_subject_does_not_block_the_batch(
     assert uow.subject_production_runs.items[first.id].status is SubjectProductionStatus.FAILED
     assert [job.kind for job in jobs.submitted] == [stage_job_kind(SubjectProductionStage.SOURCES)]
     assert uow.subject_production_runs.items[second.id].status is (SubjectProductionStatus.RUNNING)
+
+
+async def test_needs_review_is_a_business_outcome_not_a_crash(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A format problem must park the subject for review, not fail the job."""
+    registry, jobs, _ = _build(
+        uow,
+        monkeypatch,
+        {"stage": "references", "status": "needs_review", "error_code": "format_unusable"},
+    )
+    first = _run(uow, SubjectProductionStage.REFERENCES)
+    second = _batch_of(uow, first)
+
+    handler = registry.handler(stage_job_kind(SubjectProductionStage.REFERENCES))
+    await handler(
+        ProductionStageParameters(
+            run_id=first.id, expected_stage=SubjectProductionStage.REFERENCES.value
+        ),
+        _Context(),  # type: ignore[arg-type]
+    )
+
+    parked = uow.subject_production_runs.items[first.id]
+    assert parked.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert parked.error_code == "format_unusable"
+    # The queue keeps going.
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(SubjectProductionStage.SOURCES)]
+    assert uow.subject_production_runs.items[second.id].status is SubjectProductionStatus.RUNNING
+
+
+async def test_transient_error_stays_retryable_and_keeps_the_run_alive(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, jobs, _ = _build(
+        uow,
+        monkeypatch,
+        {"stage": "references", "status": "transient_error", "error_code": "bridge_timeout"},
+    )
+    run = _run(uow, SubjectProductionStage.REFERENCES)
+
+    handler = registry.handler(stage_job_kind(SubjectProductionStage.REFERENCES))
+    with pytest.raises(JobHandlerError) as excinfo:
+        await handler(
+            ProductionStageParameters(
+                run_id=run.id, expected_stage=SubjectProductionStage.REFERENCES.value
+            ),
+            _Context(),  # type: ignore[arg-type]
+        )
+
+    assert excinfo.value.transient is True
+    # The run must not be terminated: the job will be retried.
+    assert uow.subject_production_runs.items[run.id].status is SubjectProductionStatus.RUNNING
+    assert jobs.submitted == []

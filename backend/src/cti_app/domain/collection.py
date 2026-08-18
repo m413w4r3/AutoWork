@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
+from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     SourceRelationshipStatus,
     SourceRole,
+    canonicalize_http_url,
 )
 
 
@@ -65,8 +67,19 @@ class IndicatorKind(StrEnum):
     EMAIL = "email"
 
 
+class SourceOriginKind(StrEnum):
+    """How a source came to be attached to a subject."""
+
+    DISCOVERY = "discovery"
+    REFERENCE_RESEARCH = "reference_research"
+    MANUAL = "manual"
+
+
 class ReviewStatus(StrEnum):
     EXTRACTED = "extracted"
+    # Verified by the application itself (quote located in an archived source,
+    # deterministic indicator) — never a fabricated HumanDecision.
+    MACHINE_VERIFIED = "machine_verified"
     VALIDATED = "validated"
     CORRECTED = "corrected"
     REJECTED = "rejected"
@@ -92,10 +105,23 @@ class SourceCollection:
     subject_id: UUID
     edition_id: UUID
     group_id: UUID
-    batch_id: UUID
-    source_candidate_id: UUID
     requested_url: str
     proposed_role: SourceRole
+    # Derived from requested_url when not supplied; this is the key that
+    # makes a subject hold one collection per publication.
+    canonical_url: str = ""
+    origin_kind: SourceOriginKind = SourceOriginKind.DISCOVERY
+    # A reference-research source has no DiscoveryBatch candidate to read its
+    # metadata from, so the collection carries its own snapshot.
+    batch_id: UUID | None = None
+    source_candidate_id: UUID | None = None
+    title: str | None = None
+    publisher: str | None = None
+    published_at: date | None = None
+    source_tlp: TLP = TLP.CLEAR
+    sensitivity: str = "public"
+    external_llm_allowed: bool = True
+    do_not_submit: bool = False
     id: UUID = field(default_factory=uuid4)
     state: CollectionState = CollectionState.PENDING
     relationship_status: SourceRelationshipStatus = SourceRelationshipStatus.PROVISIONAL
@@ -116,6 +142,11 @@ class SourceCollection:
     def __post_init__(self) -> None:
         if not self.requested_url.strip():
             raise ValueError("A collection URL is required")
+        if not self.canonical_url:
+            try:
+                self.canonical_url = canonicalize_http_url(self.requested_url)
+            except ValueError:
+                self.canonical_url = self.requested_url.strip()
         if self.relationship_status is SourceRelationshipStatus.VERIFIED and not (
             self.relationship_evidence.startswith("human:")
             or self.relationship_evidence.startswith("deterministic:")

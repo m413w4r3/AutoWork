@@ -17,6 +17,7 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import EditionProductionService
 from cti_app.domain.production import (
@@ -105,11 +106,12 @@ def register_production_jobs(
     chain: ProductionStageChain | None = None,
     model_service: ModelConversationService | None = None,
     collection_service: SubjectCollectionService | None = None,
+    artifact_store: ProductionArtifactStore | None = None,
 ) -> None:
     """Register the five production stage jobs."""
     stage_chain = chain or ProductionStageChain()
 
-    async def advance_batch(run_id: UUID, subject_id: UUID, correlation_id: str) -> None:
+    async def advance_batch(run_id: UUID, correlation_id: str) -> None:
         """Start the next subject of the batch this run belongs to.
 
         A subject that ends in needs_review or failed must not block the queue,
@@ -122,19 +124,9 @@ def register_production_jobs(
                 return
             batch_id = item.batch_id
 
-        if not await batches.on_subject_terminal(batch_id, run_id):
-            # Batch is finished; nothing left to dispatch.
-            return
-
-        # on_subject_terminal moved the next queued subject to RUNNING.
-        async with uow_factory() as uow:
-            items = await uow.edition_production_batch_items.list_for_batch(batch_id)
-            started = None
-            for candidate in items:
-                run = await uow.subject_production_runs.get(candidate.production_run_id)
-                if run is not None and run.status is SubjectProductionStatus.RUNNING:
-                    started = run
-                    break
+        # The transaction is committed before dispatching, so the worker can
+        # never pick the job up before the run is visible as RUNNING.
+        started = await batches.on_subject_terminal(batch_id, run_id)
         if started is None:
             return
         await stage_chain.submit(
@@ -156,12 +148,15 @@ def register_production_jobs(
             uow_factory,
             model_service=model_service,
             collection_service=collection_service,
+            artifact_store=artifact_store,
         )
 
+        correlation_id = await context.correlation_id()
         result = await orchestrator.execute_stage(
             run_id=parameters.run_id,
             expected_stage=stage,
             context=context,
+            correlation_id=correlation_id,
         )
 
         stages = list(SubjectProductionStage)
@@ -180,22 +175,36 @@ def register_production_jobs(
                 public_message="Le run de production est introuvable.",
                 transient=False,
             )
-        correlation_id = str(run.id)
+        outcome = str(result.get("status", "success"))
+        error_code = str(result.get("error_code") or f"{stage.value}_error")
+        error_message = str(result.get("error", "unknown error"))
 
-        if result.get("status") == "error":
-            # Mark the run failed so the batch can move on, then surface the error.
-            async with uow_factory() as uow:
-                failing = await uow.subject_production_runs.get_for_update(parameters.run_id)
-                if failing is not None and failing.status not in _TERMINAL_STATUSES:
-                    failing.mark_failed(
-                        code=f"{stage.value}_error",
-                        message=str(result.get("error", "unknown error")),
-                    )
-                    await uow.subject_production_runs.save(failing)
-                    await uow.commit()
-            await advance_batch(parameters.run_id, run.subject_id, correlation_id)
+        # A transient failure must stay retryable and must NOT end the run:
+        # the batch keeps its slot and the job is retried.
+        if outcome == "transient_error":
             raise JobHandlerError(
-                code="production_stage_error",
+                code=error_code,
+                public_message=f"Erreur temporaire lors de l'étape {stage.value}",
+                transient=True,
+            )
+
+        # needs_review is a business outcome, not a crash: the subject stops
+        # here for a human, and the batch moves on.
+        if outcome in {"needs_review", "terminal_error", "error"}:
+            async with uow_factory() as uow:
+                ending = await uow.subject_production_runs.get_for_update(parameters.run_id)
+                if ending is not None and ending.status not in _TERMINAL_STATUSES:
+                    if outcome == "needs_review":
+                        ending.mark_needs_review(code=error_code, message=error_message)
+                    else:
+                        ending.mark_failed(code=error_code, message=error_message)
+                    await uow.subject_production_runs.save(ending)
+                    await uow.commit()
+            await advance_batch(parameters.run_id, correlation_id)
+            if outcome == "needs_review":
+                return f"production-stage://{parameters.run_id}/{stage.value}#needs_review"
+            raise JobHandlerError(
+                code=error_code,
                 public_message=f"Erreur lors de l'étape {stage.value}",
                 transient=False,
             )
@@ -203,7 +212,7 @@ def register_production_jobs(
         # Assembly is the last stage: it already marked the run ready or
         # needs_review, so the batch moves to the next subject.
         if stage is SubjectProductionStage.ASSEMBLY:
-            await advance_batch(parameters.run_id, run.subject_id, correlation_id)
+            await advance_batch(parameters.run_id, correlation_id)
             return f"production-stage://{parameters.run_id}/{stage.value}"
 
         # Otherwise advance the run and queue the next stage.

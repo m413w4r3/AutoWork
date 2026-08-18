@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from uuid import UUID
@@ -36,6 +37,7 @@ from cti_app.domain.collection import (
     CollectionState,
     Indicator,
     SourceCollection,
+    SourceOriginKind,
 )
 from cti_app.domain.discovery import SourceCandidate, SourceRole, canonicalize_http_url
 from cti_app.domain.editorial import EditorialGroupStatus, HumanDecision, HumanDecisionType
@@ -48,6 +50,17 @@ _COLLECTED_STATES = {
     CollectionState.EXTRACTED,
     CollectionState.COMPLETED,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class SupplementalSource:
+    """A publication proposed by reference research, not by discovery."""
+
+    url: str
+    title: str | None = None
+    publisher: str | None = None
+    published_at: date | None = None
+    role: SourceRole = SourceRole.UNKNOWN
 
 
 @dataclass(slots=True)
@@ -178,6 +191,49 @@ class SubjectCollectionService:
             await uow.commit()
         return await self.list_sources(subject_id)
 
+    async def add_supplemental_sources(
+        self,
+        subject_id: UUID,
+        sources: Sequence[SupplementalSource],
+    ) -> list[SourceCollection]:
+        """Attach sources found during reference research.
+
+        A URL already attached to the subject is reused as-is and never
+        re-downloaded; a genuinely new one is registered as REFERENCE_RESEARCH
+        so the normal collection pass picks it up.
+        """
+        async with self._uow_factory() as uow:
+            group = await uow.editorial_groups.get_by_subject(subject_id)
+            if group is None or group.status is not EditorialGroupStatus.SELECTED:
+                raise CollectionNotAllowedError(
+                    "Only sources attached to a selected subject can be collected"
+                )
+            added: list[SourceCollection] = []
+            for candidate in sources:
+                try:
+                    canonical = canonicalize_http_url(candidate.url)
+                except ValueError:
+                    continue
+                existing = await uow.source_collections.get_by_canonical_url(subject_id, canonical)
+                if existing is not None:
+                    continue
+                collection = SourceCollection(
+                    subject_id=subject_id,
+                    edition_id=group.edition_id,
+                    group_id=group.id,
+                    requested_url=canonical,
+                    canonical_url=canonical,
+                    origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
+                    proposed_role=candidate.role,
+                    title=candidate.title,
+                    publisher=candidate.publisher,
+                    published_at=candidate.published_at,
+                )
+                if await uow.source_collections.add_if_absent(collection):
+                    added.append(collection)
+            await uow.commit()
+        return added
+
     async def list_sources(self, subject_id: UUID) -> list[SourceCollection]:
         async with self._uow_factory() as uow:
             return list(await uow.source_collections.list_for_subject(subject_id))
@@ -211,8 +267,10 @@ class SubjectCollectionService:
         self, source: SourceCollection
     ) -> tuple[SourceCandidate | None, SourceDocument | None]:
         async with self._uow_factory() as uow:
-            batch = await uow.discovery_batches.get(source.batch_id)
-            candidate = batch.source(source.source_candidate_id) if batch else None
+            candidate = None
+            if source.batch_id is not None and source.source_candidate_id is not None:
+                batch = await uow.discovery_batches.get(source.batch_id)
+                candidate = batch.source(source.source_candidate_id) if batch else None
             document = (
                 await uow.source_documents.get(source.source_document_id)
                 if source.source_document_id
@@ -592,6 +650,8 @@ class SubjectCollectionService:
             return collection
 
     async def _candidate_for(self, collection: SourceCollection) -> SourceCandidate | None:
+        if collection.batch_id is None or collection.source_candidate_id is None:
+            return None
         async with self._uow_factory() as uow:
             batch = await uow.discovery_batches.get(collection.batch_id)
             return batch.source(collection.source_candidate_id) if batch else None
@@ -751,20 +811,31 @@ class SubjectCollectionService:
         async with self._uow_factory() as uow:
             collection = await _require_collection(uow, collection_id)
             subject = await uow.subjects.get(collection.subject_id)
-            batch = await uow.discovery_batches.get(collection.batch_id)
-            source = batch.source(collection.source_candidate_id) if batch else None
-            if subject is None or source is None:
+            source = None
+            if collection.batch_id is not None and collection.source_candidate_id is not None:
+                batch = await uow.discovery_batches.get(collection.batch_id)
+                source = batch.source(collection.source_candidate_id) if batch else None
+            if subject is None:
                 raise CollectionNotAllowedError("Collection source lost its canonical context")
             existing_names = {
                 item.logical_filename
                 for item in await uow.source_documents.list_for_subject(collection.subject_id)
                 if item.logical_filename
             }
+            # A reference-research source has no discovery candidate: the
+            # collection carries its own metadata snapshot instead.
+            meta_title = source.title if source else (collection.title or collection.requested_url)
+            meta_publisher = source.publisher if source else (collection.publisher or "")
+            meta_published_at = source.published_at if source else collection.published_at
+            meta_tlp = source.tlp if source else collection.source_tlp
+            meta_external_allowed = (
+                source.external_llm_allowed if source else collection.external_llm_allowed
+            )
             logical_filename = analyst_filename(
-                published_at=source.published_at,
-                tlp=source.tlp,
-                title=source.title,
-                publisher=source.publisher,
+                published_at=meta_published_at,
+                tlp=meta_tlp,
+                title=meta_title,
+                publisher=meta_publisher,
                 detected_mime_type=response.detected_content_type.value,
                 decoded_sha256=response.decoded_sha256,
                 existing_names=existing_names,
@@ -776,16 +847,16 @@ class SubjectCollectionService:
                 origin=response.requested_url,
                 acquired_at=response.acquired_at,
                 license_restriction=None,
-                tlp=source.tlp,
-                do_not_submit=False,
-                external_llm_allowed=source.external_llm_allowed,
+                tlp=meta_tlp,
+                do_not_submit=collection.do_not_submit,
+                external_llm_allowed=meta_external_allowed,
                 logical_filename=logical_filename,
                 source_collection_id=collection.id,
-                source_candidate_id=source.id,
+                source_candidate_id=source.id if source else None,
                 decoded_blob_id=decoded_blob.id,
-                title=source.title,
-                publisher=source.publisher,
-                published_at=source.published_at,
+                title=meta_title,
+                publisher=meta_publisher,
+                published_at=meta_published_at,
                 final_url=response.final_url,
                 declared_mime_type=response.declared_content_type,
                 detected_mime_type=response.detected_content_type.value,
@@ -960,7 +1031,15 @@ def _new_collection(
         batch_id=batch_id,
         source_candidate_id=source.id,
         requested_url=source.canonical_url,
+        canonical_url=source.canonical_url,
+        origin_kind=SourceOriginKind.DISCOVERY,
         proposed_role=source.role,
+        title=source.title,
+        publisher=source.publisher,
+        published_at=source.published_at,
+        source_tlp=source.tlp,
+        sensitivity=source.sensitivity,
+        external_llm_allowed=source.external_llm_allowed,
     )
 
 

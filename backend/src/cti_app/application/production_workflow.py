@@ -2,14 +2,27 @@
 
 from __future__ import annotations
 
-import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
+from cti_app.application.collection import SupplementalSource
 from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
+from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_context import build_subject_production_context
+from cti_app.application.production_parsers import (
+    ParsedEvent,
+    ParseResult,
+    ReferenceReport,
+    parse_reference_report,
+    parse_technical_extraction,
+    reference_report_from_json,
+    reference_report_to_json,
+    technical_extraction_to_json,
+)
 from cti_app.application.production_prompts import ProductionPromptTemplates
 from cti_app.application.production_stages import (
     BriefAssemblyService,
@@ -40,6 +53,28 @@ if TYPE_CHECKING:
 _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 
 
+# Bridge and network hiccups are worth retrying; anything else is a dead end
+# for this attempt and must not silently burn the subject.
+_TRANSIENT_CODES = {
+    "bridge_server_error",
+    "bridge_timeout",
+    "bridge_ui_timeout",
+    "conversation_busy",
+}
+
+
+def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
+    code = str(getattr(exc, "code", "") or "")
+    retryable = bool(getattr(exc, "retryable", False))
+    transient = retryable or code in _TRANSIENT_CODES
+    return {
+        "stage": stage,
+        "status": "transient_error" if transient else "terminal_error",
+        "error_code": code or f"{stage}_failed",
+        "error": str(exc),
+    }
+
+
 class ProductionWorkflowOrchestrator:
     """Orchestrates the complete brief_auto production workflow."""
 
@@ -48,14 +83,17 @@ class ProductionWorkflowOrchestrator:
         uow_factory: UnitOfWorkFactory,
         model_service: ModelConversationService | None = None,
         collection_service: SubjectCollectionService | None = None,
+        artifact_store: ProductionArtifactStore | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._model_service = model_service
         self._collection_service = collection_service
-        self._references = ReferenceResearchService(uow_factory)
-        self._extraction = ExtractionService(uow_factory)
-        self._synthesis = SynthesisService(uow_factory)
-        self._assembly = BriefAssemblyService(uow_factory)
+        self._artifact_store = artifact_store
+        self._correlation_id = "-"
+        self._references = ReferenceResearchService(uow_factory, artifact_store)
+        self._extraction = ExtractionService(uow_factory, artifact_store)
+        self._synthesis = SynthesisService(uow_factory, artifact_store)
+        self._assembly = BriefAssemblyService(uow_factory, artifact_store)
         self._qa = ProductionQAService(uow_factory)
 
     async def execute_stage(
@@ -63,11 +101,13 @@ class ProductionWorkflowOrchestrator:
         run_id: UUID,
         expected_stage: SubjectProductionStage,
         context: JobExecutionContext | None = None,
+        correlation_id: str = "-",
     ) -> dict[str, Any]:
         """Execute a single production stage.
 
         Idempotent: if stage is already complete, returns cached result.
         """
+        self._correlation_id = correlation_id
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:
@@ -86,7 +126,7 @@ class ProductionWorkflowOrchestrator:
             if expected_stage == SubjectProductionStage.SOURCES:
                 result = await self._execute_sources_stage(run, context)
             elif expected_stage == SubjectProductionStage.REFERENCES:
-                result = await self._execute_references_stage(run)
+                result = await self._execute_references_stage(run, context)
             elif expected_stage == SubjectProductionStage.EXTRACTION:
                 result = await self._execute_extraction_stage(run)
             elif expected_stage == SubjectProductionStage.SYNTHESIS:
@@ -97,6 +137,146 @@ class ProductionWorkflowOrchestrator:
                 raise ValueError(f"Unknown stage: {expected_stage.value}")
 
             return result
+
+    async def _ask_with_format_repair(
+        self,
+        *,
+        run: SubjectProductionRun,
+        conversation_id: UUID,
+        stage: str,
+        prompt: str,
+        mode: ConversationMode,
+        parse: Callable[[str], ParseResult[Any]],
+        external_llm_allowed: bool,
+    ) -> tuple[ParseResult[Any] | None, str, UUID | None]:
+        """Ask the model, and give it exactly one chance to fix its formatting.
+
+        The repair turn never researches again: it restates the same answer in
+        the expected structure. Returns the parse result, the raw text used, and
+        the turn id it came from.
+        """
+        assert self._model_service is not None
+        turn = await self._model_service.add_turn(
+            conversation_id=conversation_id,
+            message=prompt,
+            mode=mode,
+            external_llm_allowed=external_llm_allowed,
+            idempotency_key=f"{stage}-{run.id}-v1",
+            correlation_id=self._correlation_id,
+            context_subject_id=run.subject_id,
+        )
+        raw = await self._turn_output_text(conversation_id, turn.id) or ""
+        if not raw:
+            return None, "", turn.id
+
+        result = parse(raw)
+        if result.usable:
+            return result, raw, turn.id
+
+        repair_prompt = ProductionPromptTemplates.get_format_repair_prompt(
+            stage=stage, problems=result.errors
+        )
+        repair_turn = await self._model_service.add_turn(
+            conversation_id=conversation_id,
+            message=repair_prompt,
+            mode=ConversationMode.CONTINUE,
+            external_llm_allowed=external_llm_allowed,
+            idempotency_key=f"{stage}-format-repair-{run.id}-v1",
+            correlation_id=self._correlation_id,
+            context_subject_id=run.subject_id,
+        )
+        repaired_raw = await self._turn_output_text(conversation_id, repair_turn.id) or ""
+        if not repaired_raw:
+            return result, raw, turn.id
+
+        repaired = parse(repaired_raw)
+        repaired.repair_actions.append(f"{stage}_format_repair")
+        repaired.warnings.extend(result.errors)
+        return repaired, repaired_raw, repair_turn.id
+
+    async def _integrate_reference_sources(
+        self,
+        run: SubjectProductionRun,
+        report: ReferenceReport,
+        context: JobExecutionContext | None,
+    ) -> dict[str, Any]:
+        """Attach, collect and archive the publications Q1 proposed.
+
+        An event survives if at least one of its sources ended up archived; a
+        URL already attached to the subject is reused, never re-downloaded.
+        """
+        warnings: list[str] = []
+        new_sources = 0
+
+        if self._collection_service is not None:
+            supplemental = [
+                SupplementalSource(
+                    url=source.canonical_url,
+                    title=source.title or None,
+                    publisher=source.publisher,
+                    published_at=source.published_at,
+                    role=source.role,
+                )
+                for source in report.sources
+            ]
+            try:
+                added = await self._collection_service.add_supplemental_sources(
+                    run.subject_id, supplemental
+                )
+                new_sources = len(added)
+                if added and context is not None:
+                    await self._collection_service.collect_subject(
+                        run.subject_id, context.job_id, context
+                    )
+            except Exception as exc:
+                warnings.append(f"supplemental_collection_failed:{exc}")
+
+        archived_urls: set[str] = set()
+        async with self._uow_factory() as uow:
+            for item in await uow.source_collections.list_for_subject(run.subject_id):
+                if item.state.value in _ARCHIVED_STATES:
+                    archived_urls.add(item.canonical_url)
+
+        archived_ids = {
+            source.local_id for source in report.sources if source.canonical_url in archived_urls
+        }
+        kept_events = []
+        for event in report.events:
+            backed = tuple(sid for sid in event.source_ids if sid in archived_ids)
+            if not backed:
+                warnings.append(f"event_without_archived_source_dropped:{event.local_id}")
+                continue
+            kept_events.append(
+                ParsedEvent(
+                    local_id=event.local_id,
+                    event_date=event.event_date,
+                    source_ids=backed,
+                    text=event.text,
+                )
+            )
+
+        kept_sources = tuple(source for source in report.sources if source.local_id in archived_ids)
+        return {
+            "report": ReferenceReport(
+                sources=kept_sources,
+                events=tuple(kept_events),
+                uncertainties=report.uncertainties,
+            ),
+            "kept_events": kept_events,
+            "warnings": warnings,
+            "new_sources": new_sources,
+            "archived_sources": len(archived_ids),
+        }
+
+    async def _load_reference_report(self, artifact: Any) -> ReferenceReport | None:
+        """Read back the canonical Q1 report stored with the artifact."""
+        if self._artifact_store is None or artifact.canonical_blob_id is None:
+            return None
+        try:
+            payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
+            return reference_report_from_json(payload)
+        except Exception:
+            return None
 
     async def _subject_context(self, uow: UnitOfWork, subject_id: UUID) -> tuple[str, str]:
         """Editorial title and context for a subject.
@@ -187,7 +367,9 @@ class ProductionWorkflowOrchestrator:
             "archived": archived,
         }
 
-    async def _execute_references_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
+    async def _execute_references_stage(
+        self, run: SubjectProductionRun, context: JobExecutionContext | None = None
+    ) -> dict[str, Any]:
         """Execute references research stage.
 
         Calls LLM to conduct web research and build timeline.
@@ -200,13 +382,26 @@ class ProductionWorkflowOrchestrator:
             }
 
         async with self._uow_factory() as uow:
-            subject_title, subject_context = await self._subject_context(uow, run.subject_id)
+            research_date = run.research_date or datetime.now(UTC).date()
+            ctx = await build_subject_production_context(uow, run.subject_id, research_date)
+            subject_title = ctx.subject_title
+
+            # The diffusion policy, not a hardcoded flag, decides whether this
+            # subject may be sent to an external model.
+            if not ctx.external_llm_allowed:
+                return {
+                    "stage": "references",
+                    "status": "needs_review",
+                    "error_code": "external_llm_blocked",
+                    "error": "Diffusion policy forbids sending this subject to an external model",
+                }
 
             # Prepare input for hashing
             input_data = {
                 "subject_id": str(run.subject_id),
                 "title": subject_title,
-                "context": subject_context,
+                "context": ctx.subject_description,
+                "research_date": research_date.isoformat(),
                 "stage": "references",
             }
             input_hash = compute_input_hash(input_data)
@@ -230,65 +425,85 @@ class ProductionWorkflowOrchestrator:
                     await uow.subject_production_runs.save(persisted)
                     await uow.commit()
 
-            now = datetime.now(UTC)
-            existing_sources = await uow.source_collections.list_for_subject(run.subject_id)
-            existing_sources_text = "\n".join(
-                f"- {item.requested_url}" for item in existing_sources
-            )
             prompt = ProductionPromptTemplates.get_references_prompt(
                 subject_title=subject_title,
-                subject_description=subject_context,
-                actor_info="",
-                technical_summary="",
-                research_date=now.date().isoformat(),
-                period_start="",
-                period_end="",
-                existing_sources_text=existing_sources_text,
+                subject_description=ctx.subject_description,
+                actor_info=ctx.actor_info,
+                technical_summary=ctx.technical_summary,
+                research_date=research_date.isoformat(),
+                period_start=ctx.period_start,
+                period_end=ctx.period_end,
+                existing_sources_text=ctx.existing_sources_text,
             )
 
-            # Call LLM
             try:
-                turn = await self._model_service.add_turn(
+                parsed, raw, turn_id = await self._ask_with_format_repair(
+                    run=run,
                     conversation_id=run.conversation_id,
-                    message=prompt,
+                    stage="references",
+                    prompt=prompt,
                     mode=ConversationMode.FRESH,
-                    external_llm_allowed=True,
-                    idempotency_key=f"references-{run.id}",
-                    correlation_id=str(uuid4()),
-                    context_subject_id=run.subject_id,
+                    parse=lambda text: parse_reference_report(text, research_date),
+                    external_llm_allowed=ctx.external_llm_allowed,
                 )
-
-                output_text = await self._turn_output_text(run.conversation_id, turn.id)
-                if not output_text:
-                    return {
-                        "stage": "references",
-                        "status": "error",
-                        "error": "No response from model",
-                    }
-
-                response_data = json.loads(output_text)
-
-                artifact = await self._references.store_references_result(
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    input_hash=input_hash,
-                    raw_result=output_text,
-                    canonical_json=response_data,
-                    conversation_turn_id=turn.id,
-                )
-
-                return {
-                    "stage": "references",
-                    "status": "success",
-                    "artifact_id": str(artifact.id),
-                    "sources_count": len(response_data.get("sources", [])),
-                }
             except Exception as e:
+                return _transient_or_terminal("references", e)
+
+            if parsed is None:
                 return {
                     "stage": "references",
-                    "status": "error",
-                    "error": str(e),
+                    "status": "needs_review",
+                    "error_code": "no_model_response",
+                    "error": "No response from model",
                 }
+            if not parsed.usable:
+                # A format the parser cannot read is a review case, never a crash.
+                return {
+                    "stage": "references",
+                    "status": "needs_review",
+                    "error_code": "references_format_unusable",
+                    "error": "; ".join(parsed.errors),
+                    "warnings": parsed.warnings,
+                }
+
+            report = parsed.value
+            assert report is not None
+
+            # Order matters: the new publications must be attached, downloaded
+            # and archived before Q1 is recorded, so extraction only ever sees
+            # events backed by a source we actually hold.
+            integration = await self._integrate_reference_sources(run, report, context)
+            parsed.warnings.extend(integration["warnings"])
+            if not integration["kept_events"]:
+                return {
+                    "stage": "references",
+                    "status": "needs_review",
+                    "error_code": "no_event_with_archived_source",
+                    "error": "No chronological event is backed by an archived source",
+                    "warnings": parsed.warnings,
+                }
+            report = integration["report"]
+
+            artifact = await self._references.store_references_result(
+                run_id=run.id,
+                subject_id=run.subject_id,
+                input_hash=input_hash,
+                raw_result=raw,
+                canonical_json=reference_report_to_json(report),
+                conversation_turn_id=turn_id,
+            )
+
+            return {
+                "stage": "references",
+                "status": "success",
+                "artifact_id": str(artifact.id),
+                "sources_count": len(report.sources),
+                "events_count": len(report.events),
+                "new_sources": integration["new_sources"],
+                "archived_sources": integration["archived_sources"],
+                "warnings": parsed.warnings,
+                "repair_actions": parsed.repair_actions,
+            }
 
     async def _execute_extraction_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
         """Execute CTI extraction stage.
@@ -328,6 +543,26 @@ class ProductionWorkflowOrchestrator:
                     "error": "No conversation opened for this run",
                 }
 
+            research_date = run.research_date or datetime.now(UTC).date()
+            ctx = await build_subject_production_context(uow, run.subject_id, research_date)
+            policy_allows = ctx.external_llm_allowed
+            if not policy_allows:
+                return {
+                    "stage": "extraction",
+                    "status": "needs_review",
+                    "error_code": "external_llm_blocked",
+                    "error": "Diffusion policy forbids sending this subject to an external model",
+                }
+
+            report = await self._load_reference_report(references)
+            if report is None:
+                return {
+                    "stage": "extraction",
+                    "status": "terminal_error",
+                    "error_code": "references_payload_missing",
+                    "error": "Reference report content is not readable",
+                }
+
             # Check if we already have artifact with same hash
             existing = await uow.production_artifacts.get_current(run.id, "extraction")
             if existing and existing.input_hash == input_hash:
@@ -344,47 +579,54 @@ class ProductionWorkflowOrchestrator:
 
             # Call LLM (continue mode, same conversation)
             try:
-                turn = await self._model_service.add_turn(
+                parsed, raw, turn_id = await self._ask_with_format_repair(
+                    run=run,
                     conversation_id=conversation_id,
-                    message=prompt,
+                    stage="extraction",
+                    prompt=prompt,
                     mode=ConversationMode.CONTINUE,
-                    external_llm_allowed=True,
-                    idempotency_key=f"extraction-{run.id}",
-                    correlation_id=str(uuid4()),
-                    context_subject_id=run.subject_id,
+                    parse=lambda text: parse_technical_extraction(text, report),
+                    external_llm_allowed=policy_allows,
                 )
-
-                output_text = await self._turn_output_text(conversation_id, turn.id)
-                if not output_text:
-                    return {
-                        "stage": "extraction",
-                        "status": "error",
-                        "error": "No response from model",
-                    }
-
-                response_data = json.loads(output_text)
-
-                artifact = await self._extraction.store_extraction_result(
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    input_hash=input_hash,
-                    raw_result=output_text,
-                    canonical_json=response_data,
-                    conversation_turn_id=turn.id,
-                )
-
-                return {
-                    "stage": "extraction",
-                    "status": "success",
-                    "artifact_id": str(artifact.id),
-                    "indicators_count": len(response_data.get("indicators", [])),
-                }
             except Exception as e:
+                return _transient_or_terminal("extraction", e)
+
+            if parsed is None:
                 return {
                     "stage": "extraction",
-                    "status": "error",
-                    "error": str(e),
+                    "status": "needs_review",
+                    "error_code": "no_model_response",
+                    "error": "No response from model",
                 }
+            if not parsed.usable:
+                return {
+                    "stage": "extraction",
+                    "status": "needs_review",
+                    "error_code": "extraction_format_unusable",
+                    "error": "; ".join(parsed.errors),
+                    "warnings": parsed.warnings,
+                }
+
+            extraction = parsed.value
+            assert extraction is not None
+            artifact = await self._extraction.store_extraction_result(
+                run_id=run.id,
+                subject_id=run.subject_id,
+                input_hash=input_hash,
+                raw_result=raw,
+                canonical_json=technical_extraction_to_json(extraction),
+                conversation_turn_id=turn_id,
+            )
+
+            return {
+                "stage": "extraction",
+                "status": "success",
+                "artifact_id": str(artifact.id),
+                "items_count": len(extraction.items),
+                "supported_items": len(extraction.supported_items()),
+                "warnings": parsed.warnings,
+                "repair_actions": parsed.repair_actions,
+            }
 
     async def _execute_synthesis_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
         """Execute technical synthesis stage.
@@ -424,6 +666,19 @@ class ProductionWorkflowOrchestrator:
                     "error": "No conversation opened for this run",
                 }
 
+            synthesis_research_date = run.research_date or datetime.now(UTC).date()
+            synthesis_ctx = await build_subject_production_context(
+                uow, run.subject_id, synthesis_research_date
+            )
+            synthesis_policy_allows = synthesis_ctx.external_llm_allowed
+            if not synthesis_policy_allows:
+                return {
+                    "stage": "synthesis",
+                    "status": "needs_review",
+                    "error_code": "external_llm_blocked",
+                    "error": "Diffusion policy forbids sending this subject to an external model",
+                }
+
             # Check if we already have artifact with same hash
             existing = await uow.production_artifacts.get_current(run.id, "synthesis")
             if existing and existing.input_hash == input_hash:
@@ -444,9 +699,9 @@ class ProductionWorkflowOrchestrator:
                     conversation_id=conversation_id,
                     message=prompt,
                     mode=ConversationMode.CONTINUE,
-                    external_llm_allowed=True,
-                    idempotency_key=f"synthesis-{run.id}",
-                    correlation_id=str(uuid4()),
+                    external_llm_allowed=synthesis_policy_allows,
+                    idempotency_key=f"synthesis-{run.id}-v1",
+                    correlation_id=self._correlation_id,
                     context_subject_id=run.subject_id,
                 )
 

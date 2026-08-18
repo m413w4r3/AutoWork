@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
@@ -65,6 +65,9 @@ class SubjectProductionRun:
     current_stage: SubjectProductionStage = SubjectProductionStage.SOURCES
     conversation_id: UUID | None = None
     run_number: int = 1
+    # Frozen when the run starts: a retry after midnight must not shift the
+    # boundary used to reject impossible publication dates.
+    research_date: date | None = None
     error_code: str | None = None
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
@@ -85,6 +88,8 @@ class SubjectProductionRun:
             raise ValueError("Can only start from QUEUED status")
         self.status = SubjectProductionStatus.RUNNING
         self.started_at = now or datetime.now(UTC)
+        if self.research_date is None:
+            self.research_date = self.started_at.date()
         self.updated_at = self.started_at
         self.version += 1
 

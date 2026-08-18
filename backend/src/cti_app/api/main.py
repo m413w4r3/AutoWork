@@ -14,6 +14,7 @@ from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
 from cti_app.api.production import router as production_router
+from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.discovery import DiscoveryService
@@ -29,6 +30,7 @@ from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import JobService, create_job_registry
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import (
@@ -123,6 +125,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model_service=model_conversation_service,
     )
 
+    production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
     production_chain = ProductionStageChain()
     registry = create_job_registry(
         model_gateway,
@@ -132,6 +135,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory,
         model_conversation_service=model_conversation_service,
         production_chain=production_chain,
+        production_artifact_store=production_artifact_store,
     )
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory

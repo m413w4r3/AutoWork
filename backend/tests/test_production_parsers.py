@@ -1,0 +1,375 @@
+"""Tolerance tests for the production Markdown parsers.
+
+The model will not answer in exactly the requested shape. What matters is that
+a recoverable deviation costs a warning, an unreadable block is dropped alone,
+and only a genuinely empty result is unusable.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+
+import pytest
+
+from cti_app.application.production_parsers import (
+    ParsedEvent,
+    ParsedSource,
+    ReferenceReport,
+    parse_reference_report,
+    parse_technical_extraction,
+    validate_synthesis,
+)
+from cti_app.domain.discovery import SourceRole
+
+RESEARCH_DATE = date(2026, 8, 1)
+
+PERFECT_Q1 = """# REFERENCES
+
+## SOURCE S1
+
+title: Rapport ExampleRAT
+url: https://research.example/rapport
+publisher: Example Labs
+published-at: 2026-07-01
+role: primary
+
+## SOURCE S2
+
+title: Analyse complementaire
+url: https://other.example/analyse
+publisher: Other
+published-at: 2026-07-05
+role: independent
+
+## EVENT R1
+
+date: 2026-07-01
+sources: S1, S2
+text: Premiere observation de la campagne.
+
+# UNCERTAINTIES
+- Attribution non confirmee
+"""
+
+
+def _report() -> ReferenceReport:
+    result = parse_reference_report(PERFECT_Q1, RESEARCH_DATE)
+    assert result.usable
+    assert result.value is not None
+    return result.value
+
+
+def test_perfect_report_is_parsed() -> None:
+    report = _report()
+
+    assert [s.local_id for s in report.sources] == ["S1", "S2"]
+    assert report.sources[0].role is SourceRole.PRIMARY
+    assert report.sources[0].published_at == date(2026, 7, 1)
+    assert report.events[0].source_ids == ("S1", "S2")
+    assert report.uncertainties == ("Attribution non confirmee",)
+
+
+def test_outer_markdown_fence_is_stripped() -> None:
+    result = parse_reference_report(f"```markdown\n{PERFECT_Q1}\n```", RESEARCH_DATE)
+
+    assert result.usable
+
+
+def test_crlf_and_non_breaking_spaces_are_tolerated() -> None:
+    mangled = PERFECT_Q1.replace("\n", "\r\n").replace("title:", "title:\u00a0")
+
+    result = parse_reference_report(mangled, RESEARCH_DATE)
+
+    assert result.usable
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        PERFECT_Q1.replace("## SOURCE", "## publication").replace("## EVENT", "## Événement"),
+        PERFECT_Q1.replace(":", " =", 0).replace("url:", "url ="),
+        PERFECT_Q1.replace("published-at:", "published_at:"),
+        PERFECT_Q1.upper().replace("HTTPS://", "https://"),
+    ],
+)
+def test_heading_and_field_variants_are_tolerated(variant: str) -> None:
+    result = parse_reference_report(variant, RESEARCH_DATE)
+
+    assert result.usable, result.errors
+
+
+def test_multiline_field_is_joined() -> None:
+    text = PERFECT_Q1.replace(
+        "text: Premiere observation de la campagne.",
+        "text: Premiere observation\n  de la campagne sur plusieurs lignes.",
+    )
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert result.usable
+    assert result.value is not None
+    assert "plusieurs lignes" in result.value.events[0].text
+
+
+def test_missing_ids_are_generated() -> None:
+    text = PERFECT_Q1.replace("## SOURCE S1", "## SOURCE").replace("## EVENT R1", "## EVENT")
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert result.usable
+    assert "source_id_generated" in result.warnings
+    assert "event_id_generated" in result.warnings
+
+
+def test_duplicate_url_is_merged_and_events_remapped() -> None:
+    """The same publication announced twice must not become two sources."""
+    text = PERFECT_Q1.replace(
+        "url: https://other.example/analyse",
+        "url: https://research.example/rapport?utm_source=x",
+    )
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert result.usable
+    assert result.value is not None
+    assert len(result.value.sources) == 1
+    assert "duplicate_source_merged" in result.warnings
+    # The event cited S1 and S2; both now resolve to the single surviving source.
+    assert result.value.events[0].source_ids == ("S1",)
+
+
+def test_url_is_recovered_from_free_text() -> None:
+    text = PERFECT_Q1.replace(
+        "url: https://research.example/rapport",
+        "Disponible ici https://research.example/rapport",
+    )
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert result.usable
+    assert "source_url_recovered_from_text" in result.warnings
+
+
+def test_event_citing_only_unknown_sources_is_dropped() -> None:
+    text = PERFECT_Q1.replace("sources: S1, S2", "sources: S9")
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert not result.usable
+    assert "no_usable_event" in result.errors
+    assert "event_without_known_source_dropped" in result.warnings
+
+
+def test_event_keeps_its_known_sources_when_one_is_unknown() -> None:
+    text = PERFECT_Q1.replace("sources: S1, S2", "sources: S1, S9")
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert result.usable
+    assert result.value is not None
+    assert result.value.events[0].source_ids == ("S1",)
+    assert "event_unknown_source_removed" in result.warnings
+
+
+def test_future_event_date_is_rejected() -> None:
+    text = PERFECT_Q1.replace("date: 2026-07-01", "date: 2027-01-01")
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert not result.usable
+    assert "event_with_future_date_dropped" in result.warnings
+
+
+def test_one_broken_block_does_not_sink_the_others() -> None:
+    text = PERFECT_Q1.replace(
+        "## EVENT R1\n\ndate: 2026-07-01\nsources: S1, S2\n"
+        "text: Premiere observation de la campagne.",
+        "## EVENT R1\n\ndate: 2026-07-01\nsources: S1\ntext: Premiere observation.\n\n"
+        "## EVENT R2\n\nsources: S2\n",
+    )
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert result.usable
+    assert result.value is not None
+    assert [e.local_id for e in result.value.events] == ["R1"]
+    assert result.dropped_blocks
+
+
+def test_totally_unusable_answer_reports_errors() -> None:
+    result = parse_reference_report("Je ne peux pas répondre à cette demande.", RESEARCH_DATE)
+
+    assert not result.usable
+    assert result.errors
+
+
+def test_empty_answer_is_unusable() -> None:
+    result = parse_reference_report("   \n  ", RESEARCH_DATE)
+
+    assert not result.usable
+    assert "empty_response" in result.errors
+
+
+# --- Q2 --------------------------------------------------------------------
+
+PERFECT_Q2 = """# EXTRACTION CTI
+
+## ACTORS
+### ITEM A1
+value: TAG-182
+context: Acteur principal
+references: R1
+sources: S1
+
+## NETWORK ARTIFACTS
+### ITEM N1
+type: domain
+value: malicious.example.com
+context: C2
+references: R1
+sources: S2
+
+## TTP
+### ITEM T1
+value: Spearphishing Attachment
+attack-id: T1566.001
+context: Vecteur initial
+references: R1
+sources: S1
+
+## PERSISTENCE
+none
+
+# UNCERTAINTIES
+- Infrastructure partiellement identifiee
+"""
+
+
+def test_perfect_extraction_is_parsed() -> None:
+    result = parse_technical_extraction(PERFECT_Q2, _report())
+
+    assert result.usable
+    assert result.value is not None
+    categories = {item.category for item in result.value.items}
+    assert categories == {"actors", "network_artifacts", "ttps"}
+    assert result.value.items[1].artifact_type == "domain"
+    assert result.value.items[2].attack_id == "T1566.001"
+    assert result.value.uncertainties
+
+
+def test_french_category_aliases_are_accepted() -> None:
+    text = PERFECT_Q2.replace("## ACTORS", "## Acteurs").replace(
+        "## NETWORK ARTIFACTS", "## Artefacts réseau"
+    )
+
+    result = parse_technical_extraction(text, _report())
+
+    assert result.usable
+    assert result.value is not None
+    assert {"actors", "network_artifacts"} <= {i.category for i in result.value.items}
+
+
+def test_refs_alias_and_missing_ids_are_tolerated() -> None:
+    text = PERFECT_Q2.replace("references:", "refs:").replace("### ITEM A1", "### ITEM")
+
+    result = parse_technical_extraction(text, _report())
+
+    assert result.usable
+    assert "item_id_generated" in result.warnings
+
+
+def test_unknown_reference_is_stripped_and_item_becomes_unsupported() -> None:
+    text = PERFECT_Q2.replace("references: R1\nsources: S1", "references: R9\nsources: S9", 1)
+
+    result = parse_technical_extraction(text, _report())
+
+    assert result.usable
+    assert result.value is not None
+    actor = next(i for i in result.value.items if i.category == "actors")
+    assert actor.reference_ids == ()
+    assert actor.source_ids == ()
+    assert actor.supported is False
+    assert "item_unknown_reference_removed" in result.warnings
+    # The well-formed items are untouched.
+    assert all(i.supported for i in result.value.items if i.category != "actors")
+
+
+def test_item_without_value_is_dropped() -> None:
+    text = PERFECT_Q2.replace("value: TAG-182\n", "")
+
+    result = parse_technical_extraction(text, _report())
+
+    assert result.usable
+    assert "item_without_value_dropped" in result.warnings
+
+
+def test_extraction_without_any_item_is_unusable() -> None:
+    result = parse_technical_extraction("# EXTRACTION CTI\n\n## ACTORS\nnone\n", _report())
+
+    assert not result.usable
+    assert "no_usable_item" in result.errors
+
+
+# --- Q3 --------------------------------------------------------------------
+
+
+def _corpus() -> ReferenceReport:
+    return ReferenceReport(
+        sources=(
+            ParsedSource(
+                local_id="S1",
+                title="t",
+                url="https://research.example/rapport",
+                canonical_url="https://research.example/rapport",
+                publisher=None,
+                published_at=None,
+                role=SourceRole.PRIMARY,
+            ),
+        ),
+        events=(ParsedEvent(local_id="R1", event_date=None, source_ids=("S1",), text="x"),),
+    )
+
+
+def test_valid_synthesis_passes() -> None:
+    text = "Le groupe agit depuis 2020 [S1]. Le CVE-2026-1234 est exploité [S1]."
+
+    result = validate_synthesis(text, _corpus(), {"CVE-2026-1234"})
+
+    assert result.usable
+
+
+def test_unknown_source_marker_is_rejected() -> None:
+    result = validate_synthesis("Analyse [S9].", _corpus(), set())
+
+    assert not result.usable
+    assert any("unknown_source_marker" in e for e in result.errors)
+
+
+def test_url_outside_corpus_is_rejected() -> None:
+    result = validate_synthesis("Voir https://elsewhere.example/page [S1].", _corpus(), set())
+
+    assert not result.usable
+    assert any("url_outside_corpus" in e for e in result.errors)
+
+
+def test_indicator_absent_from_corpus_is_rejected() -> None:
+    result = validate_synthesis("Le hash " + "a" * 64 + " circule [S1].", _corpus(), set())
+
+    assert not result.usable
+    assert any("unknown_indicator" in e for e in result.errors)
+
+
+def test_version_numbers_are_not_mistaken_for_indicators() -> None:
+    """A naive IPv4 rule would bounce this perfectly good synthesis."""
+    result = validate_synthesis(
+        "La version 4.2.1.3 du greffon est affectée [S1].", _corpus(), set()
+    )
+
+    assert result.usable
+
+
+def test_empty_synthesis_is_rejected() -> None:
+    result = validate_synthesis("   ", _corpus(), set())
+
+    assert not result.usable
+    assert "empty_synthesis" in result.errors

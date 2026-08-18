@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_prompts import ProductionPromptTemplates
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -23,11 +24,35 @@ def compute_input_hash(input_data: dict[str, Any]) -> str:
     return hashlib.sha256(json_str.encode()).hexdigest()
 
 
-class ReferenceResearchService:
+class _ArtifactPayloadMixin:
+    """Stores stage payloads as blobs, when a store is configured."""
+
+    _artifact_store: ProductionArtifactStore | None
+
+    async def _store_payloads(
+        self,
+        *,
+        raw: str | None = None,
+        canonical: dict[str, Any] | None = None,
+        rendered: str | None = None,
+    ) -> tuple[UUID | None, UUID | None, UUID | None]:
+        if self._artifact_store is None:
+            return None, None, None
+        return await self._artifact_store.store_stage_payloads(
+            raw=raw, canonical=canonical, rendered=rendered
+        )
+
+
+class ReferenceResearchService(_ArtifactPayloadMixin):
     """Manages reference research stage."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        artifact_store: ProductionArtifactStore | None = None,
+    ) -> None:
         self._uow_factory = uow_factory
+        self._artifact_store = artifact_store
 
     async def prepare_references_stage(
         self,
@@ -89,6 +114,9 @@ class ReferenceResearchService:
             )
             version = (current.version + 1) if current else 1
 
+            raw_id, canonical_id, _ = await self._store_payloads(
+                raw=raw_result, canonical=canonical_json
+            )
             artifact = ProductionArtifact(
                 production_run_id=run_id,
                 subject_id=subject_id,
@@ -96,6 +124,8 @@ class ReferenceResearchService:
                 version=version,
                 input_hash=input_hash,
                 status=ProductionArtifactStatus.VERIFIED,
+                raw_blob_id=raw_id,
+                canonical_blob_id=canonical_id,
                 model_run_id=model_run_id,
                 conversation_turn_id=conversation_turn_id,
                 metadata={
@@ -115,11 +145,16 @@ class ReferenceResearchService:
             return artifact
 
 
-class ExtractionService:
+class ExtractionService(_ArtifactPayloadMixin):
     """Manages technical CTI extraction stage."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        artifact_store: ProductionArtifactStore | None = None,
+    ) -> None:
         self._uow_factory = uow_factory
+        self._artifact_store = artifact_store
 
     async def prepare_extraction_stage(
         self,
@@ -175,6 +210,9 @@ class ExtractionService:
                 if isinstance(items, list)
             }
 
+            raw_id, canonical_id, _ = await self._store_payloads(
+                raw=raw_result, canonical=canonical_json
+            )
             artifact = ProductionArtifact(
                 production_run_id=run_id,
                 subject_id=subject_id,
@@ -182,6 +220,8 @@ class ExtractionService:
                 version=version,
                 input_hash=input_hash,
                 status=ProductionArtifactStatus.VERIFIED,
+                raw_blob_id=raw_id,
+                canonical_blob_id=canonical_id,
                 model_run_id=model_run_id,
                 conversation_turn_id=conversation_turn_id,
                 metadata={
@@ -200,11 +240,16 @@ class ExtractionService:
             return artifact
 
 
-class SynthesisService:
+class SynthesisService(_ArtifactPayloadMixin):
     """Manages technical synthesis stage."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        artifact_store: ProductionArtifactStore | None = None,
+    ) -> None:
         self._uow_factory = uow_factory
+        self._artifact_store = artifact_store
 
     async def prepare_synthesis_stage(
         self,
@@ -257,6 +302,9 @@ class SynthesisService:
             word_count = len(markdown_content.split())
             reference_count = markdown_content.count("[S")
 
+            raw_id, _, rendered_id = await self._store_payloads(
+                raw=raw_result, rendered=markdown_content
+            )
             artifact = ProductionArtifact(
                 production_run_id=run_id,
                 subject_id=subject_id,
@@ -264,6 +312,8 @@ class SynthesisService:
                 version=version,
                 input_hash=input_hash,
                 status=ProductionArtifactStatus.VERIFIED,
+                raw_blob_id=raw_id,
+                rendered_blob_id=rendered_id,
                 model_run_id=model_run_id,
                 conversation_turn_id=conversation_turn_id,
                 metadata={
@@ -283,11 +333,16 @@ class SynthesisService:
             return artifact
 
 
-class BriefAssemblyService:
+class BriefAssemblyService(_ArtifactPayloadMixin):
     """Manages brief assembly stage (deterministic)."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        artifact_store: ProductionArtifactStore | None = None,
+    ) -> None:
         self._uow_factory = uow_factory
+        self._artifact_store = artifact_store
 
     async def assemble_brief(
         self,
@@ -427,8 +482,13 @@ Analyse produite automatiquement basée sur les sources collectées et l'analyse
 class ProductionQAService:
     """Automated QA checks for production."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        artifact_store: ProductionArtifactStore | None = None,
+    ) -> None:
         self._uow_factory = uow_factory
+        self._artifact_store = artifact_store
 
     async def run_qa(
         self,

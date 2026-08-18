@@ -28,6 +28,7 @@ from cti_app.domain.collection import (
     IndicatorKind,
     RejectedModelProposal,
     SourceCollection,
+    SourceOriginKind,
     SourceSpan,
 )
 from cti_app.domain.discovery import (
@@ -1074,7 +1075,7 @@ class SqlAlchemySourceCollectionRepository:
             .on_conflict_do_nothing(
                 index_elements=[
                     SourceCollectionRow.subject_id,
-                    SourceCollectionRow.source_candidate_id,
+                    SourceCollectionRow.canonical_url,
                 ]
             )
             .returning(SourceCollectionRow.id)
@@ -1090,6 +1091,17 @@ class SqlAlchemySourceCollectionRepository:
             select(SourceCollectionRow)
             .where(SourceCollectionRow.id == collection_id)
             .with_for_update()
+        )
+        return _source_collection_from_row(row) if row else None
+
+    async def get_by_canonical_url(
+        self, subject_id: UUID, canonical_url: str
+    ) -> SourceCollection | None:
+        row = await self._session.scalar(
+            select(SourceCollectionRow).where(
+                SourceCollectionRow.subject_id == subject_id,
+                SourceCollectionRow.canonical_url == canonical_url,
+            )
         )
         return _source_collection_from_row(row) if row else None
 
@@ -2157,7 +2169,16 @@ def _source_collection_values(collection: SourceCollection) -> dict[str, object]
         "group_id": collection.group_id,
         "batch_id": collection.batch_id,
         "source_candidate_id": collection.source_candidate_id,
+        "origin_kind": collection.origin_kind.value,
         "requested_url": collection.requested_url,
+        "canonical_url": collection.canonical_url,
+        "title": collection.title,
+        "publisher": collection.publisher,
+        "published_at": collection.published_at,
+        "source_tlp": collection.source_tlp.value,
+        "sensitivity": collection.sensitivity,
+        "external_llm_allowed": collection.external_llm_allowed,
+        "do_not_submit": collection.do_not_submit,
         "proposed_role": collection.proposed_role.value,
         "relationship_status": collection.relationship_status.value,
         "relationship_evidence": collection.relationship_evidence,
@@ -2185,7 +2206,16 @@ def _source_collection_from_row(row: SourceCollectionRow) -> SourceCollection:
         group_id=row.group_id,
         batch_id=row.batch_id,
         source_candidate_id=row.source_candidate_id,
+        origin_kind=SourceOriginKind(row.origin_kind),
         requested_url=row.requested_url,
+        canonical_url=row.canonical_url,
+        title=row.title,
+        publisher=row.publisher,
+        published_at=row.published_at,
+        source_tlp=TLP(row.source_tlp),
+        sensitivity=row.sensitivity,
+        external_llm_allowed=row.external_llm_allowed,
+        do_not_submit=row.do_not_submit,
         proposed_role=SourceRole(row.proposed_role),
         relationship_status=SourceRelationshipStatus(row.relationship_status),
         relationship_evidence=row.relationship_evidence,
@@ -2542,6 +2572,7 @@ class SqlAlchemySubjectProductionRunRepository:
             current_stage=run.current_stage.value,
             conversation_id=run.conversation_id,
             run_number=run.run_number,
+            research_date=run.research_date,
             error_code=run.error_code,
             error_message=run.error_message,
             error_details=run.error_details,
@@ -2575,6 +2606,7 @@ class SqlAlchemySubjectProductionRunRepository:
                 status=run.status.value,
                 current_stage=run.current_stage.value,
                 conversation_id=run.conversation_id,
+                research_date=run.research_date,
                 error_code=run.error_code,
                 error_message=run.error_message,
                 error_details=run.error_details,
@@ -2715,6 +2747,17 @@ class SqlAlchemyEditionProductionBatchRepository:
         row = result.scalar_one_or_none()
         return _edition_production_batch_from_row(row) if row else None
 
+    async def get_latest_for_edition(self, edition_id: UUID) -> EditionProductionBatch | None:
+        query = (
+            select(EditionProductionBatchRow)
+            .where(EditionProductionBatchRow.edition_id == edition_id)
+            .order_by(EditionProductionBatchRow.created_at.desc())
+            .limit(1)
+        )
+        result = await self._session.execute(query)
+        row = result.scalar_one_or_none()
+        return _edition_production_batch_from_row(row) if row else None
+
     async def save(self, batch: EditionProductionBatch) -> None:
         stmt = (
             update(EditionProductionBatchRow)
@@ -2794,6 +2837,7 @@ def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectPro
         current_stage=SubjectProductionStage(row.current_stage),
         conversation_id=row.conversation_id,
         run_number=row.run_number,
+        research_date=row.research_date,
         error_code=row.error_code,
         error_message=row.error_message,
         error_details=row.error_details,

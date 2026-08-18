@@ -125,6 +125,14 @@ class JobExecutionContext:
         self.job_id = job_id
         self._uow_factory = uow_factory
 
+    async def correlation_id(self) -> str:
+        """Correlation id of the running job, so chained work stays traceable."""
+        async with self._uow_factory() as uow:
+            job = await uow.jobs.get(self.job_id)
+            if job is None:
+                raise JobNotFoundError(str(self.job_id))
+            return job.correlation_id
+
     async def report_progress(self, current: int, total: int, message: str | None = None) -> None:
         async with self._uow_factory() as uow:
             job = await uow.jobs.get_for_update(self.job_id)
@@ -566,6 +574,7 @@ def create_job_registry(
     uow_factory: object | None = None,
     model_conversation_service: object | None = None,
     production_chain: object | None = None,
+    production_artifact_store: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
@@ -599,6 +608,7 @@ def create_job_registry(
         register_brief_jobs(registry, brief_service)
     if uow_factory is not None:
         from cti_app.application.model_conversations import ModelConversationService
+        from cti_app.application.production_artifact_store import ProductionArtifactStore
         from cti_app.application.production_jobs import (
             ProductionStageChain,
             register_production_jobs,
@@ -612,12 +622,17 @@ def create_job_registry(
             raise TypeError("model_conversation_service must be a ModelConversationService")
         if production_chain is not None and not isinstance(production_chain, ProductionStageChain):
             raise TypeError("production_chain must be a ProductionStageChain")
+        if production_artifact_store is not None and not isinstance(
+            production_artifact_store, ProductionArtifactStore
+        ):
+            raise TypeError("production_artifact_store must be a ProductionArtifactStore")
         register_production_jobs(
             registry,
             uow_factory,
             chain=production_chain,
             model_service=model_conversation_service,
             collection_service=collection_service,
+            artifact_store=production_artifact_store,
         )
     return registry
 

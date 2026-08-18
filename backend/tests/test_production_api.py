@@ -30,6 +30,7 @@ from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
     SubjectProductionRun,
+    SubjectProductionStatus,
 )
 
 
@@ -111,6 +112,10 @@ class _Batches:
 
     async def save(self, batch: EditionProductionBatch) -> None:
         self.items[batch.id] = batch
+
+    async def get_latest_for_edition(self, edition_id: UUID) -> EditionProductionBatch | None:
+        matches = [b for b in self.items.values() if b.edition_id == edition_id]
+        return matches[-1] if matches else None
 
     async def get_active_for_edition(self, edition_id: UUID) -> EditionProductionBatch | None:
         return next(
@@ -294,3 +299,50 @@ async def test_start_edition_briefs_rejects_unselected_subject(api: AsyncClient,
     )
 
     assert response.status_code == 409
+
+
+async def test_batch_creates_exactly_one_run_per_subject(api: AsyncClient, uow: _Uow) -> None:
+    """create_batch already builds every run; the endpoint must not add another."""
+    edition_id = uuid4()
+    subjects = [uuid4() for _ in range(3)]
+    for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
+        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+
+    response = await api.post(f"/api/editions/{edition_id}/production/briefs", json={})
+
+    assert response.status_code == 200, response.text
+    assert len(uow.subject_production_runs.items) == 3
+
+    # Every batch item must point at a run that actually exists.
+    linked = {item.production_run_id for item in uow.edition_production_batch_items.items}
+    assert linked == set(uow.subject_production_runs.items)
+
+    running = [
+        run
+        for run in uow.subject_production_runs.items.values()
+        if run.status is SubjectProductionStatus.RUNNING
+    ]
+    assert len(running) == 1
+
+
+async def test_second_start_while_running_does_not_reprompt(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    """A duplicate POST must not start the run again nor submit a second job."""
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+
+    first = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    assert first.status_code == 200, first.text
+
+    jobs = production_app.state.job_service
+    submitted_after_first = len(jobs.submitted)
+
+    second = await api.post(f"/api/subjects/{subject_id}/production", json={})
+
+    assert second.status_code == 200, second.text
+    assert second.json()["run_id"] == first.json()["run_id"]
+    assert second.json()["job_id"] is None
+    assert len(jobs.submitted) == submitted_after_first
+    assert len(uow.subject_production_runs.items) == 1

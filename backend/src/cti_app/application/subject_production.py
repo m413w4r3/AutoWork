@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.persistence import (
+    ProductionUnitOfWork,
+    ProductionUnitOfWorkFactory,
+)
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
@@ -26,10 +29,12 @@ class SubjectProductionService:
         subject_id: UUID,
         edition_id: UUID,
         profile: ProductionProfile,
-    ) -> SubjectProductionRun:
-        """Create a new production run for a subject.
+    ) -> tuple[SubjectProductionRun, bool]:
+        """Create a production run for a subject.
 
-        Idempotent: returns existing active run if one exists.
+        Returns the run and whether it was created by this call, so the caller
+        knows whether to start it and submit a job — two concurrent POSTs must
+        yield one logical run and one logical job.
         """
         async with self._uow_factory() as uow:
             # Check if active run already exists for this subject
@@ -38,8 +43,7 @@ class SubjectProductionService:
                 SubjectProductionStatus.QUEUED,
                 SubjectProductionStatus.RUNNING,
             ):
-                # Return existing active run instead of creating new one
-                return existing
+                return existing, False
 
             # Get next run number
             all_runs = await uow.subject_production_runs.list_for_edition(edition_id)
@@ -54,7 +58,7 @@ class SubjectProductionService:
             )
             await uow.subject_production_runs.add(run)
             await uow.commit()
-            return run
+            return run, True
 
     async def start_run(self, run_id: UUID) -> SubjectProductionRun:
         """Start a production run (move from QUEUED to RUNNING)."""
@@ -139,6 +143,14 @@ class SubjectProductionService:
             return run
 
 
+_TERMINAL_STATUSES = {
+    SubjectProductionStatus.READY,
+    SubjectProductionStatus.NEEDS_REVIEW,
+    SubjectProductionStatus.FAILED,
+    SubjectProductionStatus.CANCELLED,
+}
+
+
 class EditionProductionService:
     """Orchestrates batch production for an entire edition."""
 
@@ -198,117 +210,83 @@ class EditionProductionService:
             if batch:
                 return batch
 
-            # If not found, try to get active batch for edition
+            # Fall back to the edition's active batch, then its latest one so
+            # the status endpoint keeps working after completion.
             batch = await uow.edition_production_batches.get_active_for_edition(
                 batch_id_or_edition_id
             )
-            return batch
-
-    async def create_batch_item_run(
-        self,
-        batch_id: UUID,
-        subject_id: UUID,
-        position: int,
-    ) -> SubjectProductionRun | None:
-        """Create a production run for a subject in a batch.
-
-        Used to create runs for batch items that don't have runs yet.
-        """
-        async with self._uow_factory() as uow:
-            batch = await uow.edition_production_batches.get(batch_id)
-            if not batch:
-                return None
-
-            run = SubjectProductionRun(
-                subject_id=subject_id,
-                edition_id=batch.edition_id,
-                profile=batch.profile,
+            if batch:
+                return batch
+            return await uow.edition_production_batches.get_latest_for_edition(
+                batch_id_or_edition_id
             )
-            await uow.subject_production_runs.add(run)
+
+    async def _start_next_in_uow(
+        self, uow: ProductionUnitOfWork, batch: EditionProductionBatch
+    ) -> SubjectProductionRun | None:
+        """Move the first queued subject of a batch to RUNNING.
+
+        Runs inside the caller's transaction so the batch stays locked for the
+        whole decision; the caller commits and dispatches afterwards.
+        """
+        items = await uow.edition_production_batch_items.list_for_batch(batch.id)
+        for item in items:
+            run = await uow.subject_production_runs.get_for_update(item.production_run_id)
+            if run is None:
+                continue
+            if run.status is SubjectProductionStatus.RUNNING:
+                # Already in flight: never dispatch a second job for it.
+                return None
+            if run.status is SubjectProductionStatus.QUEUED:
+                run.start_running(now=datetime.now(UTC))
+                await uow.subject_production_runs.save(run)
+                if batch.status == "queued":
+                    batch.start(now=datetime.now(UTC))
+                    await uow.edition_production_batches.save(batch)
+                return run
+        return None
+
+    async def start_next(self, batch_id: UUID) -> SubjectProductionRun | None:
+        """Start the next subject of a batch, if any."""
+        async with self._uow_factory() as uow:
+            batch = await uow.edition_production_batches.get_for_update(batch_id)
+            if not batch:
+                raise ValueError(f"Batch {batch_id} not found")
+            run = await self._start_next_in_uow(uow, batch)
             await uow.commit()
             return run
 
-    async def start_next(self, batch_id: UUID) -> SubjectProductionRun | None:
-        """Start the next subject in a batch (dispatch first item not yet running)."""
-        async with self._uow_factory() as uow:
-            batch = await uow.edition_production_batches.get_for_update(batch_id)
-            if not batch:
-                raise ValueError(f"Batch {batch_id} not found")
+    async def on_subject_terminal(
+        self, batch_id: UUID, run_id: UUID
+    ) -> SubjectProductionRun | None:
+        """Hand the batch over after a subject reached a terminal state.
 
-            # Get all items in order
-            items = await uow.edition_production_batch_items.list_for_batch(batch_id)
-            if not items:
-                return None
-
-            # Find first item not in terminal state
-            for item in items:
-                run = await uow.subject_production_runs.get(item.production_run_id)
-                if not run:
-                    continue
-
-                # If queued, start it
-                if run.status == SubjectProductionStatus.QUEUED:
-                    run.start_running(now=datetime.now(UTC))
-                    await uow.subject_production_runs.save(run)
-
-                    if batch.status == "queued":
-                        batch.start(now=datetime.now(UTC))
-                        await uow.edition_production_batches.save(batch)
-
-                    await uow.commit()
-                    return run
-
-                # If running, it's already dispatched
-                if run.status == SubjectProductionStatus.RUNNING:
-                    return run
-
-            return None
-
-    async def on_subject_terminal(self, batch_id: UUID, run_id: UUID) -> bool:
-        """Handle subject reaching terminal state (READY/NEEDS_REVIEW/FAILED/CANCELLED).
-
-        Returns True if next item was started, False if batch is complete.
+        Returns the run that was started, or None when the batch is finished.
+        The caller dispatches the job outside this transaction.
         """
         async with self._uow_factory() as uow:
             batch = await uow.edition_production_batches.get_for_update(batch_id)
             if not batch:
                 raise ValueError(f"Batch {batch_id} not found")
 
-            # Try to start next subject
-            next_run = await self.start_next(batch_id)
+            started = await self._start_next_in_uow(uow, batch)
+            if started is not None:
+                await uow.commit()
+                return started
 
-            if not next_run:
-                # No more subjects to start - check if batch is done
-                items = await uow.edition_production_batch_items.list_for_batch(batch_id)
-                all_runs = [
-                    await uow.subject_production_runs.get(item.production_run_id) for item in items
-                ]
-
-                # Check if all are in terminal states
-                all_terminal = all(
-                    r
-                    and r.status
-                    in {
-                        SubjectProductionStatus.READY,
-                        SubjectProductionStatus.NEEDS_REVIEW,
-                        SubjectProductionStatus.FAILED,
-                        SubjectProductionStatus.CANCELLED,
-                    }
-                    for r in all_runs
+            items = await uow.edition_production_batch_items.list_for_batch(batch_id)
+            all_runs = [
+                await uow.subject_production_runs.get(item.production_run_id) for item in items
+            ]
+            all_terminal = all(
+                run is not None and run.status in _TERMINAL_STATUSES for run in all_runs
+            )
+            if all_terminal and batch.status in {"queued", "running"}:
+                has_non_ready = any(
+                    run is not None and run.status is not SubjectProductionStatus.READY
+                    for run in all_runs
                 )
-
-                if all_terminal:
-                    # Determine final batch status
-                    has_non_ready = any(
-                        r and r.status != SubjectProductionStatus.READY for r in all_runs
-                    )
-                    batch.finish(
-                        completed_with_issues=has_non_ready,
-                        now=datetime.now(UTC),
-                    )
-                    await uow.edition_production_batches.save(batch)
-                    await uow.commit()
-
-                return False
-
-            return True
+                batch.finish(completed_with_issues=has_non_ready, now=datetime.now(UTC))
+                await uow.edition_production_batches.save(batch)
+            await uow.commit()
+            return None
