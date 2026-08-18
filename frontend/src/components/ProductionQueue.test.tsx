@@ -13,13 +13,17 @@ const BRIEFS = [
   { subjectId: "s-3", title: "GigaWiper" },
 ];
 
-function renderQueue() {
+function renderQueue(selectedSubjects: string[] = []) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <ProductionQueue editionId={EDITION_ID} briefs={BRIEFS} />
+      <ProductionQueue
+        editionId={EDITION_ID}
+        briefs={BRIEFS}
+        selectedSubjects={selectedSubjects}
+      />
     </QueryClientProvider>,
   );
 }
@@ -41,7 +45,7 @@ describe("ProductionQueue", () => {
     ).toBeInTheDocument();
   });
 
-  it("n'envoie que les sujets cochés", async () => {
+  it("n'envoie que les sujets cochés dans le board", async () => {
     const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === "POST") {
         return Promise.resolve(Response.json({}, { status: 200 }));
@@ -50,11 +54,12 @@ describe("ProductionQueue", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     const user = userEvent.setup();
-    renderQueue();
+    renderQueue(["s-2"]);
 
-    await user.click(await screen.findByLabelText("Cavern Manticore"));
     await user.click(
-      screen.getByRole("button", { name: "Traiter les 1 sélectionnées" }),
+      await screen.findByRole("button", {
+        name: "Traiter les 1 sélectionnées",
+      }),
     );
 
     const post = fetchMock.mock.calls.find(

@@ -19,6 +19,15 @@ interface SubjectProductionProps {
   onClose?: () => void;
 }
 
+const STATUS_LABELS: Record<string, string> = {
+  queued: "en attente",
+  running: "en cours",
+  ready: "prête",
+  needs_review: "à vérifier",
+  failed: "en échec",
+  cancelled: "annulée",
+};
+
 function stageDetail(
   stage: string,
   entry: StageStatus | undefined,
@@ -76,30 +85,30 @@ export function SubjectProduction({
   });
 
   if (isLoading)
-    return <div className="p-4">Chargement de l’état de production…</div>;
+    return <p role="status">Chargement de l’état de production…</p>;
   if (error)
     return (
-      <div className="p-4 text-red-600" role="alert">
+      <p className="error-message" role="alert">
         L’état de production est inaccessible : {String(error)}
-      </div>
+      </p>
     );
 
   // No run yet: this is the entry point, not an error.
   if (!status) {
     return (
-      <section className="production-start space-y-3">
-        <h2 className="text-xl font-bold">Production de la brève</h2>
-        <p className="text-sm text-gray-600">
+      <section className="production-panel">
+        <h2>Production de la brève</h2>
+        <p>
           Les sources seront collectées, puis ChatGPT effectuera la recherche
           des références, l’extraction CTI et la synthèse.
         </p>
         {startMutation.error ? (
-          <p className="text-red-600 text-sm" role="alert">
+          <p className="error-message" role="alert">
             {String(startMutation.error)}
           </p>
         ) : null}
         <button
-          className="button px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+          className="button"
           disabled={startMutation.isPending}
           onClick={() => startMutation.mutate()}
         >
@@ -126,50 +135,26 @@ export function SubjectProduction({
   ).length;
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="border-b pb-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold">{status.title}</h1>
-            <p className="text-sm text-gray-600">
-              Type : {status.editorial_type}
-            </p>
-          </div>
-          <div className="text-right">
-            <div
-              className={`inline-block px-3 py-1 rounded text-sm font-semibold ${
-                status.status === "ready"
-                  ? "bg-green-100 text-green-800"
-                  : status.status === "needs_review"
-                    ? "bg-yellow-100 text-yellow-800"
-                    : status.status === "failed"
-                      ? "bg-red-100 text-red-800"
-                      : "bg-blue-100 text-blue-800"
-              }`}
-            >
-              {status.status.toUpperCase()}
-            </div>
-          </div>
+    <section className="production-panel">
+      <div className="production-panel__heading">
+        <div>
+          <p className="eyebrow">{status.editorial_type}</p>
+          <h2>{status.title}</h2>
         </div>
+        <span className={`badge production-status is-${status.status}`}>
+          {STATUS_LABELS[status.status] ?? status.status}
+        </span>
       </div>
 
-      {/* Progress Bar */}
-      <div className="space-y-2">
-        <div className="flex justify-between text-sm">
-          <span className="font-semibold">Progression</span>
-          <span>{completedStages} / 5 étapes</span>
-        </div>
-        <div className="w-full bg-gray-200 rounded-full h-2">
-          <div
-            className="bg-blue-600 h-2 rounded-full transition-all"
-            style={{ width: `${(completedStages / 5) * 100}%` }}
-          />
-        </div>
-      </div>
+      <p className="production-counters">
+        Progression : <strong>{completedStages}</strong> / {stageList.length}{" "}
+        étapes
+      </p>
+      <progress max={stageList.length} value={completedStages}>
+        {completedStages}/{stageList.length}
+      </progress>
 
-      {/* Stage Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+      <ol className="production-stage-list">
         {stageList.map((stage, i) => (
           <ProductionStageCard
             key={stage}
@@ -180,13 +165,9 @@ export function SubjectProduction({
             detail={stageDetail(stage, stages[stage])}
           />
         ))}
-      </div>
+      </ol>
 
-      {/* Deep links into what each stage actually produced */}
-      <nav
-        className="flex gap-3 flex-wrap text-sm"
-        aria-label="Détail des étapes"
-      >
+      <nav className="production-links" aria-label="Détail des étapes">
         <a href={`/subjects/${subjectId}#sources`}>Voir les sources</a>
         <a href={`/subjects/${subjectId}/production/artifacts/references`}>
           Voir les références
@@ -209,25 +190,10 @@ export function SubjectProduction({
         ) : null}
       </nav>
 
-      {/* Current Stage Details */}
-      {stages[status.current_stage] && (
-        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-          <h3 className="font-semibold text-blue-900">
-            En cours : {status.current_stage.toUpperCase()}
-          </h3>
-          <p className="text-sm text-blue-700 mt-2">
-            {stages[status.current_stage]?.error_message ||
-              "Traitement en cours…"}
-          </p>
-        </div>
-      )}
-
       {warnings.length > 0 && (
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
-          <h3 className="font-semibold text-amber-900">
-            Avertissements de lecture
-          </h3>
-          <ul className="text-sm text-amber-800 mt-2 list-disc pl-5">
+        <div className="verification-warning" role="note">
+          <strong>Avertissements de lecture</strong>
+          <ul>
             {warnings.map((warning: string) => (
               <li key={warning}>{warning}</li>
             ))}
@@ -235,36 +201,30 @@ export function SubjectProduction({
         </div>
       )}
 
-      {/* Error Display */}
-      {status.status === "needs_review" && (
-        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
-          <h3 className="font-semibold text-yellow-900">Revue nécessaire</h3>
-          <p className="text-sm text-yellow-700 mt-2">
-            Code : {stages[status.current_stage]?.error_code || "inconnu"}
-          </p>
-          <p className="text-sm text-yellow-700 mt-1">
-            {stages[status.current_stage]?.error_message}
-          </p>
-        </div>
+      {(status.status === "needs_review" || status.status === "failed") && (
+        <p className="error-message" role="alert">
+          {status.status === "needs_review" ? "Revue nécessaire" : "Échec"} —{" "}
+          {stages[status.current_stage]?.error_code ?? "inconnu"} :{" "}
+          {stages[status.current_stage]?.error_message ?? ""}
+        </p>
       )}
 
-      {/* Actions */}
-      <div className="flex gap-2 flex-wrap">
+      <div className="production-actions">
         {status.status === "ready" && (
           <>
             <button
+              className="button"
               onClick={() => retryReferencesMutation.mutate()}
               disabled={retryReferencesMutation.isPending}
-              className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
             >
               {retryReferencesMutation.isPending
                 ? "Relance…"
                 : "Relancer les références"}
             </button>
             <button
+              className="button button--secondary"
               onClick={() => retrySynthesisMutation.mutate()}
               disabled={retrySynthesisMutation.isPending}
-              className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
             >
               {retrySynthesisMutation.isPending
                 ? "Relance…"
@@ -275,26 +235,22 @@ export function SubjectProduction({
 
         {status.status === "running" && (
           <button
+            className="button button--danger"
             onClick={() => cancelMutation.mutate()}
             disabled={cancelMutation.isPending}
-            className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50"
           >
             {cancelMutation.isPending ? "Annulation…" : "Annuler"}
           </button>
         )}
 
         {onClose && (
-          <button
-            onClick={onClose}
-            className="px-4 py-2 bg-gray-300 text-gray-800 rounded hover:bg-gray-400 ml-auto"
-          >
+          <button className="button button--secondary" onClick={onClose}>
             Fermer
           </button>
         )}
       </div>
 
-      {/* Metadata */}
-      <div className="text-xs text-gray-500 border-t pt-4">
+      <div className="production-meta">
         <p>Identifiant du run : {status.run_id}</p>
         <p>Créé : {new Date(status.created_at).toLocaleString()}</p>
         {status.started_at && (
@@ -304,6 +260,6 @@ export function SubjectProduction({
           <p>Terminé : {new Date(status.finished_at).toLocaleString()}</p>
         )}
       </div>
-    </div>
+    </section>
   );
 }

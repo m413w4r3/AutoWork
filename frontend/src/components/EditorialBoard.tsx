@@ -39,6 +39,8 @@ type DecisionChoice = EditorialDecision | "undecided";
 export function EditorialBoard({ editionId }: { editionId: string }) {
   const queryClient = useQueryClient();
   const [checkedGroups, setCheckedGroups] = useState<string[]>([]);
+  // Subjects picked for production; the queue below acts on this list.
+  const [selectedSubjects, setSelectedSubjects] = useState<string[]>([]);
   const [drafts, setDrafts] = useState<Record<string, EditorialDecision>>({});
   const board = useQuery({
     queryKey: ["editorial-board", editionId],
@@ -55,6 +57,12 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
   });
 
   const draftEntries = useMemo(() => Object.entries(drafts), [drafts]);
+  const toggleSubject = (subjectId: string) =>
+    setSelectedSubjects((current) =>
+      current.includes(subjectId)
+        ? current.filter((id) => id !== subjectId)
+        : [...current, subjectId],
+    );
 
   if (board.isPending) return <p role="status">Regroupement des candidats…</p>;
   if (board.isError)
@@ -82,7 +90,12 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
   // Production queue for batch brief generation
   const productionQueue = (
     <div className="production-queue-section">
-      <ProductionQueue editionId={editionId} briefs={eligibleBriefs} />
+      <ProductionQueue
+        editionId={editionId}
+        briefs={eligibleBriefs}
+        selectedSubjects={selectedSubjects}
+        onProduced={() => setSelectedSubjects([])}
+      />
     </div>
   );
   const proposedIds = new Set(proposed.map((group) => group.id));
@@ -197,23 +210,35 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
             <p className="empty-state">Aucun sujet confirmé pour le moment.</p>
           ) : (
             <ul className="ready-subject-list">
-              {ready.map((group) => (
-                <li key={group.id}>
-                  <div>
-                    <strong>{group.title}</strong>
-                    <small>
-                      {group.editorial_type === "brief"
-                        ? "Brève"
-                        : "Article principal + pivots"}
-                    </small>
-                  </div>
-                  {group.subject_id ? (
-                    <a href={`/subjects/${group.subject_id}`}>
-                      Ouvrir le sujet
-                    </a>
-                  ) : null}
-                </li>
-              ))}
+              {ready.map((group) => {
+                const producible =
+                  group.editorial_type === "brief" && group.subject_id;
+                return (
+                  <li key={group.id}>
+                    {producible ? (
+                      <input
+                        type="checkbox"
+                        aria-label={group.title}
+                        checked={selectedSubjects.includes(group.subject_id!)}
+                        onChange={() => toggleSubject(group.subject_id!)}
+                      />
+                    ) : null}
+                    <div>
+                      <strong>{group.title}</strong>
+                      <small>
+                        {group.editorial_type === "brief"
+                          ? "Brève"
+                          : "Article principal + pivots"}
+                      </small>
+                    </div>
+                    {group.subject_id ? (
+                      <a href={`/subjects/${group.subject_id}`}>
+                        Ouvrir le sujet
+                      </a>
+                    ) : null}
+                  </li>
+                );
+              })}
             </ul>
           )}
         </section>

@@ -379,3 +379,37 @@ async def test_transient_error_stays_retryable_and_keeps_the_run_alive(
     # The run must not be terminated: the job will be retried.
     assert uow.subject_production_runs.items[run.id].status is SubjectProductionStatus.RUNNING
     assert jobs.submitted == []
+
+
+def test_stage_parameters_survive_the_json_round_trip() -> None:
+    """Parameters reach the worker as JSON: the UUID comes back as a string.
+
+    With strict validation this raised `Input should be an instance of UUID`
+    and every production job died before running.
+    """
+    run_id = uuid4()
+    encoded = ProductionStageParameters(
+        run_id=run_id, expected_stage=SubjectProductionStage.SOURCES.value
+    ).model_dump(mode="json")
+
+    assert isinstance(encoded["run_id"], str)
+
+    decoded = ProductionStageParameters.model_validate(encoded)
+
+    assert decoded.run_id == run_id
+    assert decoded.expected_stage == SubjectProductionStage.SOURCES.value
+
+
+def test_registry_validates_the_parameters_it_receives_from_the_queue() -> None:
+    """The registry is what re-parses them worker-side."""
+    registry = JobRegistry()
+    register_production_jobs(registry, lambda: None, chain=ProductionStageChain())  # type: ignore[arg-type]
+    run_id = uuid4()
+
+    validated = registry.validate(
+        stage_job_kind(SubjectProductionStage.SOURCES),
+        {"run_id": str(run_id), "expected_stage": "sources"},
+    )
+
+    assert isinstance(validated, ProductionStageParameters)
+    assert validated.run_id == run_id

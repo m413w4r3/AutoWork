@@ -1,0 +1,54 @@
+# Secrets
+.llm_keys
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python local/generated
+**/.venv/
+.ai-venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# JS local/generated
+node_modules/
+frontend/dist/
+coverage/
+frontend/test-results/
+frontend/playwright-report/
+
+# Runtime/generated data
+docs/references/
+data/
+work/
+output/
+outputs/
+artifacts/
+tmp/
+*.log
+
+# CTI sensitive / unsafe
+samples/
+quarantine/
+malware/
+evidence-packs/
+evidence_packs/
+
+# Archives / disk images
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.iso
+*.dmg
+
+# Bridge runtime
+chatgpt-bridge/.venv/
+chatgpt-bridge/__pycache__/
+chatgpt-bridge/out/

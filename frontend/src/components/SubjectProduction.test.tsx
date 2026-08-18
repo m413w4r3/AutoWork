@@ -124,7 +124,7 @@ describe("SubjectProduction", () => {
     expect(
       await screen.findByRole("heading", { name: "TAG-182 et MarkiRAT" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("5 archivée(s)")).toBeInTheDocument();
+    expect(screen.getByText(/5 archivée\(s\)/)).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: "Voir les références" }),
     ).toBeInTheDocument();

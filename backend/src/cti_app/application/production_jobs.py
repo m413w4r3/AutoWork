@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.jobs import (
@@ -36,7 +36,13 @@ _TERMINAL_STATUSES = {
 
 
 class ProductionStageParameters(JobParameters):
-    """Parameters for production stage jobs."""
+    """Parameters for production stage jobs.
+
+    Parameters round-trip through JSON on their way to the worker, so the UUID
+    comes back as a string: strict mode would reject it on the way in.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=False)
 
     run_id: UUID = Field(..., description="Production run ID")
     expected_stage: str = Field(..., description="Expected production stage")

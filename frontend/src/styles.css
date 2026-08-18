@@ -1137,3 +1137,156 @@ h1 {
     grid-template-columns: 1fr;
   }
 }
+
+/* Production ------------------------------------------------------------- */
+
+.production-panel {
+  display: grid;
+  gap: 1rem;
+  margin-bottom: 2rem;
+  padding: 1.5rem;
+  border: 1px solid #d4ded7;
+  border-radius: 1rem;
+  background: #fff;
+}
+
+.production-panel__heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.production-panel__heading h2 {
+  margin: 0;
+}
+
+.production-hint {
+  max-width: 32ch;
+  margin: 0;
+  color: #55665c;
+  font-size: 0.9rem;
+}
+
+.production-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+}
+
+.production-counters {
+  margin: 0;
+}
+
+.production-panel progress {
+  width: 100%;
+  height: 0.6rem;
+}
+
+.production-stage-list,
+.production-item-list {
+  display: grid;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.production-stage {
+  display: grid;
+  grid-template-columns: 1.5rem minmax(9rem, max-content) 1fr;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.65rem;
+}
+
+.production-stage.is-active {
+  border-color: #1f6042;
+  background: rgb(31 96 66 / 6%);
+}
+
+.production-stage__icon {
+  font-size: 1.1rem;
+  text-align: center;
+}
+
+.production-stage.is-succeeded .production-stage__icon,
+.production-stage.is-verified .production-stage__icon {
+  color: #1f6042;
+}
+
+.production-stage.is-needs_review .production-stage__icon {
+  color: #8a6116;
+}
+
+.production-stage.is-failed .production-stage__icon {
+  color: #92443b;
+}
+
+.production-stage__name {
+  font-weight: 700;
+}
+
+.production-stage__status {
+  color: #55665c;
+  font-size: 0.9rem;
+}
+
+.production-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  font-size: 0.9rem;
+}
+
+.production-item-list li {
+  display: grid;
+  grid-template-columns: 4rem 1fr max-content;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.65rem;
+}
+
+.production-item__position {
+  color: #55665c;
+  font-variant-numeric: tabular-nums;
+}
+
+.production-item__status {
+  font-size: 0.9rem;
+}
+
+.production-item__status.is-ready {
+  color: #1f6042;
+  font-weight: 700;
+}
+
+.production-item__status.is-needs_review {
+  color: #8a6116;
+}
+
+.production-item__status.is-failed {
+  color: #92443b;
+}
+
+.production-meta {
+  padding-top: 0.8rem;
+  border-top: 1px solid #d4ded7;
+  color: #55665c;
+  font-size: 0.8rem;
+}
+
+.production-meta p {
+  margin: 0.2rem 0;
+}
+
+.ready-subject-list li input[type="checkbox"] {
+  width: 1.15rem;
+  height: 1.15rem;
+  margin-right: 0.2rem;
+}
