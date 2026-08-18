@@ -566,6 +566,43 @@ class SqlAlchemyEditionRepository:
             *(row.structuring_model_run_id for row in batch_rows),
         }
 
+        # Production artifacts reference conversation turns and model runs, so
+        # they have to go before those are deleted below.
+        production_run_ids = list(
+            await self._session.scalars(
+                select(SubjectProductionRunRow.id).where(
+                    SubjectProductionRunRow.edition_id == edition_id
+                )
+            )
+        )
+        batch_ids = list(
+            await self._session.scalars(
+                select(EditionProductionBatchRow.id).where(
+                    EditionProductionBatchRow.edition_id == edition_id
+                )
+            )
+        )
+        if batch_ids:
+            await self._session.execute(
+                delete(EditionProductionBatchItemRow).where(
+                    EditionProductionBatchItemRow.batch_id.in_(batch_ids)
+                )
+            )
+        await self._session.execute(
+            delete(EditionProductionBatchRow).where(
+                EditionProductionBatchRow.edition_id == edition_id
+            )
+        )
+        if production_run_ids:
+            await self._session.execute(
+                delete(ProductionArtifactRow).where(
+                    ProductionArtifactRow.production_run_id.in_(production_run_ids)
+                )
+            )
+        await self._session.execute(
+            delete(SubjectProductionRunRow).where(SubjectProductionRunRow.edition_id == edition_id)
+        )
+
         # Break the two explicit parent/head cycles before deleting their children.
         if conversation_ids:
             await self._session.execute(

@@ -174,6 +174,29 @@ export async function getBriefArtifact(
   return request(`/api/subjects/${subjectId}/production/artifacts/brief`);
 }
 
+/**
+ * Save a draft version of the brief
+ */
+export async function saveBriefDraft(
+  subjectId: string,
+  content: string,
+): Promise<{ artifact_id: string; saved_at: string; draft_version: number }> {
+  return request(`/api/subjects/${subjectId}/production/brief/draft`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+}
+
+/**
+ * Get the current brief draft
+ */
+export async function getBriefDraft(
+  subjectId: string,
+): Promise<{ content: string; saved_at: string; draft_version: number } | null> {
+  return requestOrNull(`/api/subjects/${subjectId}/production/brief/draft`);
+}
+
 // Edition Production API
 
 /**

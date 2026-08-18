@@ -27,6 +27,8 @@ from cti_app.domain.production import (
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
+    ProductionArtifact,
+    ProductionArtifactStatus,
 )
 from cti_app.logging import get_correlation_id
 
@@ -479,6 +481,95 @@ async def get_synthesis_artifact(subject_id: UUID, request: Request) -> dict[str
 async def get_brief_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
     """Get the current brief artifact for a subject."""
     return await _artifact_view(request, subject_id, "brief")
+
+
+class SaveBriefDraftRequest(BaseModel):
+    """Request to save a brief draft."""
+
+    content: str
+
+
+@router.post("/subjects/{subject_id}/production/brief/draft")
+async def save_brief_draft(
+    subject_id: UUID,
+    request: Request,
+    body: SaveBriefDraftRequest,
+) -> dict[str, Any]:
+    """Save a draft version of the brief before final assembly.
+
+    The draft is stored as metadata in the brief artifact for later retrieval.
+    """
+    uow_factory, _, _ = _runtime(request)
+
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if not run:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No production run found for subject {subject_id}",
+            )
+
+        # Brief artifacts can be created/updated at any point after synthesis
+        artifact = await uow.production_artifacts.get_current(run.id, "brief")
+
+        if not artifact:
+            # Create a draft artifact if it doesn't exist yet
+            artifact = ProductionArtifact(
+                run_id=run.id,
+                stage="brief",
+                version=1,
+                status=ProductionArtifactStatus.NEEDS_REVIEW,
+                metadata={"draft_content": body.content, "saved_at": datetime.now(UTC).isoformat()},
+            )
+            await uow.production_artifacts.save(artifact)
+        else:
+            # Update existing artifact's metadata with draft content
+            artifact.metadata["draft_content"] = body.content
+            artifact.metadata["saved_at"] = datetime.now(UTC).isoformat()
+            artifact.metadata["draft_version"] = artifact.metadata.get("draft_version", 0) + 1
+            await uow.production_artifacts.save(artifact)
+
+        await uow.commit()
+
+        return {
+            "action": "save_brief_draft",
+            "artifact_id": str(artifact.id),
+            "run_id": str(run.id),
+            "saved_at": artifact.metadata.get("saved_at"),
+            "draft_version": artifact.metadata.get("draft_version", 1),
+        }
+
+
+@router.get("/subjects/{subject_id}/production/brief/draft")
+async def get_brief_draft(subject_id: UUID, request: Request) -> dict[str, Any]:
+    """Get the current draft version of the brief.
+
+    Returns the draft content stored in the brief artifact metadata.
+    """
+    uow_factory, _, _ = _runtime(request)
+
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if not run:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No production run found for subject {subject_id}",
+            )
+
+        artifact = await uow.production_artifacts.get_current(run.id, "brief")
+        if not artifact or "draft_content" not in artifact.metadata:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No brief draft found",
+            )
+
+        return {
+            "artifact_id": str(artifact.id),
+            "run_id": str(run.id),
+            "content": artifact.metadata.get("draft_content"),
+            "saved_at": artifact.metadata.get("saved_at"),
+            "draft_version": artifact.metadata.get("draft_version", 1),
+        }
 
 
 # Edition Production Endpoints

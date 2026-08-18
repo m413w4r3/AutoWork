@@ -152,4 +152,51 @@ describe("SubjectProduction", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("duplicate_source_merged")).toBeInTheDocument();
   });
+
+  it("permet de relancer après une annulation", async () => {
+    // A cancelled run used to leave the page with no way forward.
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          Response.json(runningStatus({ status: "cancelled" })),
+        ),
+    );
+
+    renderProduction();
+
+    expect(
+      await screen.findByRole("button", { name: "Relancer la production" }),
+    ).toBeInTheDocument();
+  });
+
+  it("permet de relancer après un échec, en rappelant la cause", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json(
+          runningStatus({
+            status: "failed",
+            stages: {
+              ...runningStatus().stages,
+              references: {
+                status: "failed",
+                version: null,
+                error_code: "bridge_timeout",
+                error_message: "timeout",
+              },
+            },
+          }),
+        ),
+      ),
+    );
+
+    renderProduction();
+
+    expect(
+      await screen.findByRole("button", { name: "Relancer la production" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/bridge_timeout/)).toBeInTheDocument();
+  });
 });

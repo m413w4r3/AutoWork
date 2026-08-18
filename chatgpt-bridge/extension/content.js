@@ -1305,7 +1305,11 @@ async function handlePrompt({
         conversation: conversation
           ? {
               id: conversation.id,
-              external_locator: externalLocator,
+              // Read again at completion: right after submission ChatGPT still
+              // exposes an optimistic `/c/WEB:<id>` URL, which it replaces with
+              // the canonical one once the turn is persisted. Storing the early
+              // value made every follow-up turn open a new tab and fail.
+              external_locator: verifiedLocator() || externalLocator,
               turn_id: externalTurnId || `bridge-${id}`,
               mode: conversation.mode,
               verified: true,

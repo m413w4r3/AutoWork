@@ -193,11 +193,13 @@ class _CollectionService:
 class _Runs:
     def __init__(self, run: SubjectProductionRun) -> None:
         self.run = run
+        self.locked = 0
 
     async def get(self, run_id: UUID) -> SubjectProductionRun:
         return self.run
 
     async def get_for_update(self, run_id: UUID) -> SubjectProductionRun:
+        self.locked += 1
         return self.run
 
     async def save(self, run: SubjectProductionRun) -> None:
@@ -481,3 +483,49 @@ async def test_diagnostics_trail_records_a_format_repair(tmp_path: Path) -> None
     first_parse = next(e for e in events if e["event"] == "parse.result")
     assert first_parse["usable"] is False
     assert first_parse["errors"]
+
+
+async def test_a_stage_never_holds_a_row_lock_across_the_model_call() -> None:
+    """A stage spans a full model round-trip.
+
+    Selecting the run `FOR UPDATE` for that whole time deadlocked the stage
+    against the unit of work it opens itself: the job hung in `running`, no
+    conversation turn was ever created, and the bridge was never called.
+    """
+    orchestrator, uow, _ = _build([PERFECT_Q1])
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+
+    await orchestrator.execute_stage(
+        uow.run.id,
+        SubjectProductionStage.REFERENCES,
+        context=_JobContext(),  # type: ignore[arg-type]
+        correlation_id="c1",
+    )
+
+    # Only the short conversation-id write may take the lock, never the stage.
+    assert uow.subject_production_runs.locked <= 1
+
+
+async def test_lost_conversation_parks_the_subject_instead_of_failing_it() -> None:
+    """A conversation whose locator went stale is an operational exception.
+
+    Retrying the same turn cannot help, but the subject is intact and the batch
+    must keep moving, so it is a review case rather than a failure.
+    """
+    orchestrator, uow, conversations = _build([PERFECT_Q1])
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+
+    class _Gone(Exception):
+        code = "conversation_unavailable"
+
+    async def explode(*args: Any, **kwargs: Any) -> Any:
+        raise _Gone("La conversation ChatGPT est inaccessible.")
+
+    conversations.add_turn = explode  # type: ignore[method-assign]
+
+    result = await orchestrator.execute_stage(
+        uow.run.id, SubjectProductionStage.REFERENCES, correlation_id="c1"
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "conversation_unavailable"

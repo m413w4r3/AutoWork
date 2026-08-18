@@ -185,7 +185,34 @@ class TechnicalExtraction:
 # --- Shared lexing ---------------------------------------------------------
 
 _FENCE = re.compile(r"^\s*```[^\n]*\n(?P<body>.*?)\n\s*```\s*$", re.DOTALL)
-_HEADING = re.compile(r"^\s{0,3}(#{1,6})\s*(?P<text>.+?)\s*#*\s*$")
+# The bridge serialises ChatGPT's rendered DOM, where headings have already
+# lost their `#` markers: `## SOURCE S1` reaches us as `SOURCE S1`. The hash
+# is therefore optional, and a heading is told apart from prose by the fact
+# that it carries no `key: value` pair and stays short.
+_HEADING = re.compile(r"^\s{0,3}(?P<hashes>#{0,6})\s*(?P<text>\S.*?)\s*#*\s*$")
+_MAX_HEADING_CHARS = 90
+
+# Structure names the model may emit as a bare line once the bridge has
+# stripped the `#` markers.
+_HEADING_WORDS = frozenset(
+    {
+        "references",
+        "reference",
+        "uncertainties",
+        "incertitudes",
+        "source",
+        "publication",
+        "event",
+        "evenement",
+        "extraction",
+        "extraction cti",
+        "item",
+        "element",
+        "entree",
+    }
+    # Q2 category headings arrive bare as well.
+    | set(_CATEGORY_ALIASES)
+)
 _FIELD = re.compile(r"^\s{0,3}(?P<key>[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 _-]{0,40}?)\s*[:=]\s*(?P<value>.*)$")
 _BULLET = re.compile(r"^\s*[-*•]\s+(?P<text>.+?)\s*$")
 # URL extraction is shared with the discovery parser: a real ChatGPT answer
@@ -244,6 +271,26 @@ class _Block:
         return "\n".join(self.lines).strip()
 
 
+def _heading_text(line: str) -> str | None:
+    """The heading carried by a line, with or without `#` markers.
+
+    Without a `#` the line has to name a structure we expect; anything else is
+    prose, and a continuation line must not be mistaken for a new block.
+    """
+    match = _HEADING.match(line)
+    if match is None:
+        return None
+    text = match.group("text")
+    if match.group("hashes"):
+        return text
+    if _FIELD.match(line) or _BULLET.match(line) or len(text) > _MAX_HEADING_CHARS:
+        return None
+    folded = _fold(text)
+    if any(folded == word or folded.startswith(f"{word} ") for word in _HEADING_WORDS):
+        return text
+    return None
+
+
 def _fields(lines: list[str]) -> dict[str, str]:
     """Read `key: value` pairs, letting a value continue on following lines."""
     values: dict[str, str] = {}
@@ -255,7 +302,7 @@ def _fields(lines: list[str]) -> dict[str, str]:
             values[current] = match.group("value").strip()
             continue
         stripped = line.strip()
-        if current and stripped and not _HEADING.match(line):
+        if current and stripped and _heading_text(line) is None:
             values[current] = f"{values[current]} {stripped}".strip()
     return values
 
@@ -289,13 +336,13 @@ def _split_blocks(text: str, block_keywords: dict[str, str]) -> tuple[list[_Bloc
     current: _Block | None = None
 
     for line in text.split("\n"):
-        heading = _HEADING.match(line)
-        if heading:
-            folded = _fold(heading.group("text"))
+        heading = _heading_text(line)
+        if heading is not None:
+            folded = _fold(heading)
             keyword = _match_keyword(folded, block_keywords)
             if keyword is not None:
                 local_id = None
-                token = _LOCAL_ID.search(heading.group("text"))
+                token = _LOCAL_ID.search(heading)
                 if token:
                     local_id = f"{token.group(1).upper()}{int(token.group(2))}"
                 current = _Block(kind=keyword, local_id=local_id)
@@ -322,9 +369,9 @@ def _collect_uncertainties(text: str) -> tuple[str, ...]:
     out: list[str] = []
     capturing = False
     for line in text.split("\n"):
-        heading = _HEADING.match(line)
-        if heading:
-            capturing = _fold(heading.group("text")).startswith(("uncertainties", "incertitudes"))
+        heading = _heading_text(line)
+        if heading is not None:
+            capturing = _fold(heading).startswith(("uncertainties", "incertitudes"))
             continue
         if capturing:
             bullet = _BULLET.match(line)
@@ -568,12 +615,12 @@ def parse_technical_extraction(
         current = None
 
     for line in body.split("\n"):
-        heading = _HEADING.match(line)
-        if heading:
-            folded = _fold(heading.group("text"))
+        heading = _heading_text(line)
+        if heading is not None:
+            folded = _fold(heading)
             if _match_keyword(folded, _Q2_ITEM_BLOCKS) is not None:
                 flush()
-                token = re.search(r"\b([A-Za-z]{1,3})\s*[-_]?\s*(\d{1,3})\b", heading.group("text"))
+                token = re.search(r"\b([A-Za-z]{1,3})\s*[-_]?\s*(\d{1,3})\b", heading)
                 local_id = f"{token.group(1).upper()}{int(token.group(2))}" if token else None
                 current = _Block(kind="item", local_id=local_id)
                 continue

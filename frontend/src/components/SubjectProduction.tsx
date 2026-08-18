@@ -13,6 +13,7 @@ import {
 } from "../api/production";
 import type { StageStatus } from "../api/production";
 import { ProductionStageCard } from "./ProductionStageCard";
+import { BriefDraftEditor } from "./BriefDraftEditor";
 
 interface SubjectProductionProps {
   subjectId: string;
@@ -93,11 +94,23 @@ export function SubjectProduction({
       </p>
     );
 
-  // No run yet: this is the entry point, not an error.
-  if (!status) {
+  // No run yet, or the last one ended without a brief: either way the only
+  // way forward is to (re)start production, so offer it.
+  const restartable =
+    !status || status.status === "cancelled" || status.status === "failed";
+  const previousError = status?.stages?.[status.current_stage]?.error_code;
+
+  if (restartable) {
     return (
       <section className="production-panel">
         <h2>Production de la brève</h2>
+        {status ? (
+          <p className="production-counters">
+            La production précédente s’est terminée en{" "}
+            <strong>{STATUS_LABELS[status.status] ?? status.status}</strong>
+            {previousError ? ` (${previousError})` : ""}.
+          </p>
+        ) : null}
         <p>
           Les sources seront collectées, puis ChatGPT effectuera la recherche
           des références, l’extraction CTI et la synthèse.
@@ -112,7 +125,11 @@ export function SubjectProduction({
           disabled={startMutation.isPending}
           onClick={() => startMutation.mutate()}
         >
-          {startMutation.isPending ? "Démarrage…" : "Produire cette brève"}
+          {startMutation.isPending
+            ? "Démarrage…"
+            : status
+              ? "Relancer la production"
+              : "Produire cette brève"}
         </button>
       </section>
     );
@@ -207,6 +224,14 @@ export function SubjectProduction({
           {stages[status.current_stage]?.error_code ?? "inconnu"} :{" "}
           {stages[status.current_stage]?.error_message ?? ""}
         </p>
+      )}
+
+      {status.status === "ready" && (
+        <BriefDraftEditor
+          subjectId={subjectId}
+          isAvailable={true}
+          onClose={undefined}
+        />
       )}
 
       <div className="production-actions">

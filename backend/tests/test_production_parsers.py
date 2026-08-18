@@ -418,3 +418,58 @@ def test_explicit_unknown_date_is_not_reported_as_a_parse_failure() -> None:
     assert result.value is not None
     assert result.value.sources[0].published_at is None
     assert "source_date_unreadable" not in result.warnings
+
+
+BRIDGE_ANSWER = (
+    pathlib.Path(__file__).parent / "fixtures" / "real_bridge_references.md"
+).read_text()
+
+
+def test_answer_delivered_by_the_bridge_is_parsed() -> None:
+    """The bridge serialises ChatGPT's rendered DOM, so `#` markers are gone.
+
+    This is a verbatim Q1 answer as it reached the application. Requiring `#`
+    made the parser find no block at all and report `no_source_or_event_block`
+    on a perfectly well-formed answer.
+    """
+    result = parse_reference_report(BRIDGE_ANSWER, date(2026, 8, 18))
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    report = result.value
+
+    assert [source.local_id for source in report.sources] == ["S1", "S2", "S3"]
+    assert report.sources[0].role is SourceRole.PRIMARY
+    assert report.sources[1].role is SourceRole.RELAY
+    # The tracking parameter the model appends is canonicalised away.
+    assert report.sources[0].canonical_url == (
+        "https://www.recordedfuture.com/research/nexus-tag182-disseminates-markirat"
+    )
+
+    assert len(report.events) == 6
+    assert report.events[0].event_date == date(2026, 3, 7)
+    # An event may rest on several sources.
+    assert report.events[4].source_ids == ("S1", "S2")
+    assert len(report.uncertainties) == 4
+
+    # Nothing was recovered or thrown away: the answer was simply readable.
+    assert result.warnings == []
+    assert result.dropped_blocks == []
+
+
+def test_prose_is_never_mistaken_for_a_bare_heading() -> None:
+    """Dropping the `#` requirement must not turn continuation lines into blocks."""
+    # Anchored on ASCII only: the fixture uses precomposed accents.
+    text = BRIDGE_ANSWER.replace(
+        "\ntext: ",
+        "\ntext: Une phrase courte\nqui continue ici\n",
+        1,
+    )
+
+    result = parse_reference_report(text, date(2026, 8, 18))
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert len(result.value.events) == 6
+    joined = " ".join(event.text for event in result.value.events)
+    assert "qui continue ici" in joined

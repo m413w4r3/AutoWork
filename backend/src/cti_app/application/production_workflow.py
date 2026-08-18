@@ -61,17 +61,33 @@ _TRANSIENT_CODES = {
     "bridge_server_error",
     "bridge_timeout",
     "bridge_ui_timeout",
+}
+
+# The conversation itself is the problem, not the pipeline: retrying the same
+# turn cannot help, but nothing is broken either.
+_REVIEW_CODES = {
+    "conversation_unavailable",
+    "conversation_locator_invalid",
+    "conversation_profile_mismatch",
     "conversation_busy",
+    "external_llm_blocked",
 }
 
 
 def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
     code = str(getattr(exc, "code", "") or "")
     retryable = bool(getattr(exc, "retryable", False))
-    transient = retryable or code in _TRANSIENT_CODES
+    if code in _REVIEW_CODES:
+        # The conversation is gone or busy: an operator has to look, but the
+        # subject is not corrupted and the batch must keep moving.
+        status = "needs_review"
+    elif retryable or code in _TRANSIENT_CODES:
+        status = "transient_error"
+    else:
+        status = "terminal_error"
     return {
         "stage": stage,
-        "status": "transient_error" if transient else "terminal_error",
+        "status": status,
         "error_code": code or f"{stage}_failed",
         "error": str(exc),
     }
@@ -112,42 +128,43 @@ class ProductionWorkflowOrchestrator:
         Idempotent: if stage is already complete, returns cached result.
         """
         self._correlation_id = correlation_id
+
+        # Read the run without locking it. A stage spans a full model
+        # round-trip; holding `FOR UPDATE` on the run for that long deadlocks
+        # the stage against itself as soon as it opens its own unit of work,
+        # and blocks the batch besides. State transitions take their own short
+        # lock, in the job handler.
         async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get_for_update(run_id)
-            if not run:
-                raise ValueError(f"Production run {run_id} not found")
+            run = await uow.subject_production_runs.get(run_id)
+        if not run:
+            raise ValueError(f"Production run {run_id} not found")
 
-            # Verify we're on expected stage
-            if run.current_stage != expected_stage:
-                raise ValueError(
-                    f"Run on stage {run.current_stage.value}, expected {expected_stage.value}"
-                )
-
-            # Check for cached result with same input_hash
-            # (would be implemented with actual artifact storage)
-
-            # Execute the stage based on type
-            if expected_stage == SubjectProductionStage.SOURCES:
-                result = await self._execute_sources_stage(run, context)
-            elif expected_stage == SubjectProductionStage.REFERENCES:
-                result = await self._execute_references_stage(run, context)
-            elif expected_stage == SubjectProductionStage.EXTRACTION:
-                result = await self._execute_extraction_stage(run)
-            elif expected_stage == SubjectProductionStage.SYNTHESIS:
-                result = await self._execute_synthesis_stage(run)
-            elif expected_stage == SubjectProductionStage.ASSEMBLY:
-                result = await self._execute_assembly_stage(run)
-            else:
-                raise ValueError(f"Unknown stage: {expected_stage.value}")
-
-            self._diagnostics.record_stage_outcome(
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage=expected_stage.value,
-                correlation_id=correlation_id,
-                result=result,
+        if run.current_stage != expected_stage:
+            raise ValueError(
+                f"Run on stage {run.current_stage.value}, expected {expected_stage.value}"
             )
-            return result
+
+        if expected_stage == SubjectProductionStage.SOURCES:
+            result = await self._execute_sources_stage(run, context)
+        elif expected_stage == SubjectProductionStage.REFERENCES:
+            result = await self._execute_references_stage(run, context)
+        elif expected_stage == SubjectProductionStage.EXTRACTION:
+            result = await self._execute_extraction_stage(run)
+        elif expected_stage == SubjectProductionStage.SYNTHESIS:
+            result = await self._execute_synthesis_stage(run)
+        elif expected_stage == SubjectProductionStage.ASSEMBLY:
+            result = await self._execute_assembly_stage(run)
+        else:
+            raise ValueError(f"Unknown stage: {expected_stage.value}")
+
+        self._diagnostics.record_stage_outcome(
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage=expected_stage.value,
+            correlation_id=correlation_id,
+            result=result,
+        )
+        return result
 
     async def _ask_with_format_repair(
         self,

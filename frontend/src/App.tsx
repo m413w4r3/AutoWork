@@ -31,6 +31,7 @@ import {
 import { JobStatusCard } from "./components/JobStatusCard";
 import { EditorialBoard } from "./components/EditorialBoard";
 import { SubjectWorkbench } from "./components/SubjectWorkbench";
+import { ProductionArtifactView } from "./components/ProductionArtifactView";
 import {
   cancelJob,
   terminalJobStatuses,
@@ -82,13 +83,22 @@ export function App() {
   const pathname = usePathname();
   const detail = pathname.match(/^\/editions\/([^/]+)$/);
   const subject = pathname.match(/^\/subjects\/([^/]+)$/);
+  const artifact = pathname.match(
+    /^\/subjects\/([^/]+)\/production\/artifacts\/(references|extraction|synthesis|brief)$/,
+  );
   return (
     <main>
       <header className="app-header">
         <Link to="/editions">CTI Bulletin</Link>
         <span>Utilisateur local : dev-analyst</span>
       </header>
-      {subject ? (
+      {artifact ? (
+        <ProductionArtifactView
+          subjectId={artifact[1]!}
+          stage={artifact[2] as "references" | "extraction" | "synthesis" | "brief"}
+          onClose={() => window.history.back()}
+        />
+      ) : subject ? (
         <SubjectWorkbench subjectId={subject[1]!} />
       ) : pathname === "/editions/new" ? (
         <EditionCreatePage />

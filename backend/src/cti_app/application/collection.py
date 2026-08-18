@@ -384,7 +384,14 @@ class SubjectCollectionService:
             )
             already_archived = source.state in _COLLECTED_STATES
             if already_archived:
-                await self._ensure_archived_document_metadata(source, candidate)
+                try:
+                    await self._ensure_archived_document_metadata(source, candidate)
+                except CollectionNotAllowedError as e:
+                    logger.warning(
+                        f"Could not ensure archived metadata for collection {source.id}: {e}. "
+                        f"Collection will be retained in its current state."
+                    )
+                    # Don't re-raise: allow the workflow to continue with the archived source
             if already_archived or source.state in {
                 CollectionState.UNAVAILABLE,
                 CollectionState.BLOCKED,
@@ -659,12 +666,21 @@ class SubjectCollectionService:
     async def _ensure_archived_document_metadata(
         self, collection: SourceCollection, candidate: SourceCandidate | None
     ) -> None:
-        if candidate is None or collection.source_document_id is None:
+        if collection.source_document_id is None:
             raise CollectionNotAllowedError("Archived source lost its canonical metadata")
+
         async with self._uow_factory() as uow:
             document = await uow.source_documents.get(collection.source_document_id)
             if document is None or collection.decoded_blob_id is None:
                 raise CollectionNotAllowedError("Archived source content is missing")
+
+            # If candidate is missing but document has metadata, reuse existing metadata
+            if candidate is None:
+                logger.warning(
+                    f"Source candidate missing for collection {collection.id}, "
+                    f"reusing existing document metadata"
+                )
+                return
             if document.title is not None and document.logical_filename is not None:
                 return
             attempts = await uow.collection_attempts.list_for_collection(collection.id)
