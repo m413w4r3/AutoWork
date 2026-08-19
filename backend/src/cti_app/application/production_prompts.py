@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+REFERENCES_PROMPT_VERSION = "2"
+EXTRACTION_PROMPT_VERSION = "2"
+SYNTHESIS_PROMPT_VERSION = "2"
+
 
 class ProductionPromptTemplates:
     """Versioned prompt templates for subject production."""
@@ -64,6 +68,14 @@ Rules:
 - No date after the research date.
 """
 
+    REFERENCES_RESEARCH_V2 = REFERENCES_RESEARCH_V1.replace(
+        "# REFERENCES",
+        "# REFERENCES\n\neditorial-title: <titre français au format [Acteur principal] Titre, ou [Brève] Titre>",
+    ).replace(
+        "- One `## SOURCE` block per publication",
+        "- Produce the editorial title during this references step.\n- One `## SOURCE` block per publication",
+    )
+
     TECHNICAL_EXTRACTION_V1 = """You are a CTI analysis assistant. Extract the technical intelligence contained in the references you produced in this conversation.
 
 **Subject**: {subject_title}
@@ -110,6 +122,55 @@ none
 Available categories: ACTORS, CAMPAIGNS, VICTIMOLOGY, INFECTION CHAIN, MALWARE,
 TOOLS, TTP, CVE, PROTOCOLS, NETWORK ARTIFACTS, INFRASTRUCTURE, FILES, COMMANDS,
 PERSISTENCE, DETECTIONS, OTHER TECHNICAL.
+"""
+
+    TECHNICAL_EXTRACTION_V2 = """You are a CTI analysis assistant. Extract structured technical intelligence from the corpus already established in this conversation.
+
+**Subject**: {subject_title}
+
+Use ONLY the existing corpus. Do not perform additional research. Never invent an IOC.
+For every item output: value, semantic-type, artifact-type, indicator-status,
+provenance, display-policy, context, references (R#), and sources (S#).
+
+Allowed semantic-type values: actor, campaign, malware, tool, product, technique,
+protocol, infrastructure, file, indicator, other.
+Common artifact-type values: ip, domain, url, hash, email, filepath, filename, cve.
+Allowed indicator-status values: confirmed_ioc, contextual, excluded.
+Allowed provenance values: source, derived, analyst.
+Allowed display-policy values: ioc_section, body_only, both, hidden.
+
+Strict qualification rules:
+- An IP address, domain, URL or hash is not automatically an IOC.
+- A sentinel or test value is EXCLUDED.
+- A legitimate product in an attack chain is CONTEXTUAL.
+- A CVE is CONTEXTUAL unless an explicit documented reason says otherwise.
+- Only an artifact published by a source as malicious infrastructure or artifact may be CONFIRMED_IOC.
+- A legitimate file used for side-loading is not an IOC.
+- Do not defang or refang: copy the value exactly as published.
+- Do not mix semantic-type (business nature) with artifact-type (technical shape).
+
+Output plain Markdown, without a code fence or JSON:
+
+# EXTRACTION CTI
+
+## ACTORS
+### ITEM A1
+value: <value>
+semantic-type: actor
+artifact-type: none
+indicator-status: contextual
+provenance: source
+display-policy: body_only
+context: <short French context>
+references: R1
+sources: S1
+
+# UNCERTAINTIES
+- <uncertainty, or omit the section>
+
+Available category headings: ACTORS, CAMPAIGNS, VICTIMOLOGY, INFECTION CHAIN,
+MALWARE, TOOLS, TTP, CVE, PROTOCOLS, NETWORK ARTIFACTS, INFRASTRUCTURE, FILES,
+COMMANDS, PERSISTENCE, DETECTIONS, OTHER TECHNICAL.
 """
 
     FORMAT_REPAIR_V1 = """Your previous answer could not be read by the automated parser.
@@ -170,6 +231,38 @@ Example of good synthesis:
 Le groupe Exemple réalise depuis 2020 des attaques ciblées contre le secteur financier [S1]. Les campagnes utilisent des emails de phishing contenant des pièces jointes malveillantes [S2]. La chaîne d'infection commence par un document Office piégé [S1], suivi du téléchargement du malware AwesomeMalware [S3] via C2 situé sur infrastructure Telia [S2]. Les IOC associés incluent l'adresse 192.0.2.1 [S1] et le domaine malicious.example.com [S3].
 """
 
+    TECHNICAL_SYNTHESIS_V2 = """You are a technical writer for threat intelligence reports. Write a sourced French technical synthesis for:
+
+**Subject**: {subject_title}
+
+Use only the reference timeline and technical extraction already present in this
+conversation. Do not research, add a source, an IOC or a factual assertion.
+Keep internal [S#] source markers on factual claims.
+
+Strict publication rules:
+- Produce no Markdown title or heading.
+- Produce no line named "Sources du corpus" and no final bibliography.
+- Produce no raw URL.
+- Do not enumerate IP addresses, domains, URLs or hashes.
+- Do not copy the IOC inventory; describe the functional role of indicators.
+- A precise IOC value may appear only when its display-policy is both.
+- Use no bold, backtick, code fence or italics; typography is applied downstream.
+- Keep paragraphs simple and omit empty or invented sections.
+
+Return only the synthesis prose with [S#] markers.
+"""
+
+    SYNTHESIS_REPAIR_V2 = """Your previous synthesis violates deterministic publication rules.
+
+Violations:
+{problems}
+
+Repair the previous answer once. Do not research, add, remove, or alter any fact.
+Keep valid [S#] citations. Remove headings, bibliography, raw URLs, "Sources du
+corpus", formatting marks and IOC inventories; replace inventories with a
+functional description. Return only French prose.
+"""
+
     @classmethod
     def get_references_prompt(
         cls,
@@ -183,7 +276,7 @@ Le groupe Exemple réalise depuis 2020 des attaques ciblées contre le secteur f
         existing_sources_text: str,
     ) -> str:
         """Generate references research prompt."""
-        return cls.REFERENCES_RESEARCH_V1.format(
+        return cls.REFERENCES_RESEARCH_V2.format(
             subject_title=subject_title,
             subject_description=subject_description,
             actor_info=actor_info,
@@ -200,7 +293,7 @@ Le groupe Exemple réalise depuis 2020 des attaques ciblées contre le secteur f
         subject_title: str,
     ) -> str:
         """Generate CTI extraction prompt."""
-        return cls.TECHNICAL_EXTRACTION_V1.format(
+        return cls.TECHNICAL_EXTRACTION_V2.format(
             subject_title=subject_title,
         )
 
@@ -232,10 +325,12 @@ sources: S1"""
     @classmethod
     def get_format_repair_prompt(cls, *, stage: str, problems: Sequence[str]) -> str:
         """Ask the model to restructure its previous answer, nothing else."""
+        listed = "\n".join(f"- {problem}" for problem in problems) or "- structure illisible"
+        if stage == "synthesis":
+            return cls.SYNTHESIS_REPAIR_V2.format(problems=listed)
         structure = (
             cls._REFERENCES_STRUCTURE if stage == "references" else cls._EXTRACTION_STRUCTURE
         )
-        listed = "\n".join(f"- {problem}" for problem in problems) or "- structure illisible"
         return cls.FORMAT_REPAIR_V1.format(problems=listed, expected_structure=structure)
 
     @classmethod
@@ -244,6 +339,6 @@ sources: S1"""
         subject_title: str,
     ) -> str:
         """Generate technical synthesis prompt."""
-        return cls.TECHNICAL_SYNTHESIS_V1.format(
+        return cls.TECHNICAL_SYNTHESIS_V2.format(
             subject_title=subject_title,
         )

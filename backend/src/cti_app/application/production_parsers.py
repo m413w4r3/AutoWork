@@ -15,12 +15,19 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from enum import StrEnum
 from typing import Any
 
 from cti_app.application.discovery_report_parser import extract_http_urls
+from cti_app.application.production_normalization import (
+    canonical_indicator_key,
+    display_indicator_value,
+    normalize_indicator_value,
+)
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.publication import ArtifactType
 
-PARSER_VERSION = "production-markdown-v1"
+PARSER_VERSION = "production-markdown-v2"
 
 # Whitespace a chat model routinely emits and that would break field parsing.
 _NBSP = "\u00a0"
@@ -41,6 +48,7 @@ class ParseResult[T]:
     errors: list[str] = field(default_factory=list)
     repair_actions: list[str] = field(default_factory=list)
     dropped_blocks: list[str] = field(default_factory=list)
+    violations: list[SynthesisViolation] = field(default_factory=list)
 
     @property
     def usable(self) -> bool:
@@ -74,6 +82,7 @@ class ReferenceReport:
     sources: tuple[ParsedSource, ...]
     events: tuple[ParsedEvent, ...]
     uncertainties: tuple[str, ...] = ()
+    editorial_title: str | None = None
 
     def source_ids(self) -> set[str]:
         return {source.local_id for source in self.sources}
@@ -160,17 +169,55 @@ _CATEGORY_ALIASES: dict[str, str] = {
 }
 
 
+class SemanticType(StrEnum):
+    ACTOR = "actor"
+    CAMPAIGN = "campaign"
+    MALWARE = "malware"
+    TOOL = "tool"
+    PRODUCT = "product"
+    TECHNIQUE = "technique"
+    PROTOCOL = "protocol"
+    INFRASTRUCTURE = "infrastructure"
+    FILE = "file"
+    INDICATOR = "indicator"
+    OTHER = "other"
+
+
+class IndicatorStatus(StrEnum):
+    CONFIRMED_IOC = "confirmed_ioc"
+    CONTEXTUAL = "contextual"
+    EXCLUDED = "excluded"
+
+
+class IndicatorProvenance(StrEnum):
+    SOURCE = "source"
+    DERIVED = "derived"
+    ANALYST = "analyst"
+
+
+class DisplayPolicy(StrEnum):
+    IOC_SECTION = "ioc_section"
+    BODY_ONLY = "body_only"
+    BOTH = "both"
+    HIDDEN = "hidden"
+
+
 @dataclass(frozen=True)
 class ExtractionItem:
     local_id: str
     category: str
     value: str
     context: str
-    artifact_type: str | None
+    artifact_type: ArtifactType | None
     attack_id: str | None
     reference_ids: tuple[str, ...]
     source_ids: tuple[str, ...]
     supported: bool
+    semantic_type: SemanticType = SemanticType.OTHER
+    indicator_status: IndicatorStatus = IndicatorStatus.CONTEXTUAL
+    provenance: IndicatorProvenance = IndicatorProvenance.SOURCE
+    display_policy: DisplayPolicy = DisplayPolicy.BODY_ONLY
+    normalized_value: str | None = None
 
 
 @dataclass(frozen=True)
@@ -323,6 +370,17 @@ def _parse_date(value: str) -> date | None:
         except ValueError:
             continue
     return None
+
+
+def _enum_value[T: StrEnum](
+    raw: str | None, enum_type: type[T], default: T | None
+) -> T | None:
+    if not raw:
+        return default
+    try:
+        return enum_type(_fold(raw).replace(" ", "_"))
+    except ValueError:
+        return default
 
 
 def _split_blocks(text: str, block_keywords: dict[str, str]) -> tuple[list[_Block], list[str]]:
@@ -540,6 +598,7 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
         sources=tuple(sources),
         events=tuple(events),
         uncertainties=_collect_uncertainties(body),
+        editorial_title=_editorial_title(body),
     )
     return result
 
@@ -547,6 +606,14 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
 # --- Q2 --------------------------------------------------------------------
 
 _Q2_ITEM_BLOCKS = {"item": "item", "element": "item", "entree": "item"}
+
+
+def _editorial_title(body: str) -> str | None:
+    for line in body.splitlines():
+        match = _FIELD.match(line)
+        if match and _normalize_key(match.group("key")) in {"editorial-title", "brief-title"}:
+            return match.group("value").strip() or None
+    return None
 
 
 def parse_technical_extraction(
@@ -599,17 +666,45 @@ def parse_technical_extraction(
         ):
             result.warnings.append("item_unknown_reference_removed")
 
+        artifact_raw = values.get("artifact-type") or values.get("artifacttype")
+        if artifact_raw is None:
+            # Read migration for persisted/model V1 payloads. Its presence does
+            # not promote the item to an IOC: the cautious V2 defaults remain.
+            artifact_raw = values.get("type")
+        artifact_type = _enum_value(artifact_raw, ArtifactType, None)
+        semantic_type = _enum_value(values.get("semantic-type"), SemanticType, SemanticType.OTHER)
+        indicator_status = _enum_value(
+            values.get("indicator-status"), IndicatorStatus, IndicatorStatus.CONTEXTUAL
+        )
+        provenance = _enum_value(
+            values.get("provenance"), IndicatorProvenance, IndicatorProvenance.SOURCE
+        )
+        display_policy = _enum_value(
+            values.get("display-policy"), DisplayPolicy, DisplayPolicy.BODY_ONLY
+        )
+        normalized_value = None
+        if artifact_type is not None:
+            try:
+                normalized_value = normalize_indicator_value(value, artifact_type)
+            except ValueError:
+                result.warnings.append("invalid_artifact_value")
+
         items.append(
             ExtractionItem(
                 local_id=local_id,
                 category=category,
                 value=value,
                 context=(values.get("context") or values.get("contexte") or "").strip(),
-                artifact_type=(values.get("type") or "").strip() or None,
+                artifact_type=artifact_type,
                 attack_id=(values.get("attack-id") or values.get("attackid") or "").strip() or None,
                 reference_ids=refs,
                 source_ids=srcs,
                 supported=bool(refs or srcs),
+                semantic_type=semantic_type or SemanticType.OTHER,
+                indicator_status=indicator_status or IndicatorStatus.CONTEXTUAL,
+                provenance=provenance or IndicatorProvenance.SOURCE,
+                display_policy=display_policy or DisplayPolicy.BODY_ONLY,
+                normalized_value=normalized_value,
             )
         )
         current = None
@@ -655,6 +750,13 @@ def parse_technical_extraction(
 
 # --- Q3 --------------------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class SynthesisViolation:
+    code: str
+    detail: str
+    span: tuple[int, int] | None = None
+
 # Only kinds with a low false-positive rate in French prose. Bare IPv4 is
 # deliberately excluded: version numbers such as "4.2.1.3" match it.
 _SYNTHESIS_IOC_PATTERNS = {
@@ -668,35 +770,107 @@ _SYNTHESIS_IOC_PATTERNS = {
 def validate_synthesis(
     text: str,
     reference_report: ReferenceReport,
-    known_indicators: set[str],
+    known_indicators: set[str] | TechnicalExtraction,
 ) -> ParseResult[str]:
-    """Check the Q3 synthesis against the corpus it was allowed to use.
-
-    The synthesis must not introduce a source, a URL or an indicator that the
-    references and extraction did not already establish.
-    """
+    """Validate the model prose before publication and expose repairable violations."""
     result: ParseResult[str] = ParseResult()
-    body = normalize_text(text)
+    body = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def reject(code: str, detail: str, span: tuple[int, int] | None = None) -> None:
+        violation = SynthesisViolation(code, detail, span)
+        result.violations.append(violation)
+        result.errors.append(code)
+
     if not body.strip():
-        result.errors.append("empty_synthesis")
+        reject("empty_synthesis", "The synthesis is empty")
         return result
 
     known_sources = reference_report.source_ids()
     cited = {t for t in _reference_tokens(body) if t.startswith("S")}
     unknown = sorted(cited - known_sources)
     if unknown:
-        result.errors.append(f"unknown_source_marker:{','.join(unknown)}")
+        reject("unknown_source_marker", ",".join(unknown))
 
-    corpus_urls = {source.canonical_url for source in reference_report.sources}
-    for _raw, canonical in extract_http_urls(body):
-        if canonical not in corpus_urls:
-            result.errors.append(f"url_outside_corpus:{canonical}")
-
-    normalized_known = {value.strip().lower() for value in known_indicators}
-    for pattern in _SYNTHESIS_IOC_PATTERNS.values():
+    checks = (
+        ("heading", re.compile(r"(?m)^\s{0,3}#{1,6}\s+.+"), "Markdown heading"),
+        ("code_fence", re.compile(r"```"), "Code fence"),
+        ("inline_code", re.compile(r"`"), "Inline code marker"),
+        (
+            "sources_corpus",
+            re.compile(r"sources\s+du\s+corpus", re.IGNORECASE),
+            "Sources du corpus line",
+        ),
+        (
+            "bibliography",
+            re.compile(r"(?m)^\s*\[\d+\]\s+(?:https?://|hxxps?://)"),
+            "Final bibliography entry",
+        ),
+        ("raw_url", re.compile(r"\b(?:https?|hxxps?)://\S+", re.IGNORECASE), "Raw URL"),
+        ("bold", re.compile(r"\*\*"), "Bold marker"),
+    )
+    for code, pattern, detail in checks:
         for match in pattern.finditer(body):
-            if match.group(0).strip().lower() not in normalized_known:
-                result.errors.append(f"unknown_indicator:{match.group(0)}")
+            reject(code, detail, match.span())
+            if code == "raw_url":
+                # Kept as a read-compatible diagnostic code for existing QA clients.
+                result.errors.append("url_outside_corpus")
+
+    if isinstance(known_indicators, TechnicalExtraction):
+        extraction = known_indicators
+        for item in extraction.items:
+            if (
+                item.indicator_status is not IndicatorStatus.CONFIRMED_IOC
+                or item.display_policy is DisplayPolicy.BOTH
+                or item.artifact_type is None
+            ):
+                continue
+            artifact_type = item.artifact_type
+            try:
+                variants = {
+                    canonical_indicator_key(item.value, artifact_type),
+                    display_indicator_value(item.value, artifact_type, defanged=True),
+                }
+            except ValueError:
+                continue
+            for variant in sorted(variants, key=len, reverse=True):
+                occurrence = re.search(re.escape(variant), body, re.IGNORECASE)
+                if occurrence:
+                    reject(
+                        "ioc_repeated_in_body",
+                        f"{artifact_type.value}:{variant}",
+                        occurrence.span(),
+                    )
+                    break
+
+        hash_count = sum(
+            len(pattern.findall(body))
+            for kind, pattern in _SYNTHESIS_IOC_PATTERNS.items()
+            if kind in {"sha256", "sha1", "md5"}
+        )
+        if hash_count >= 3:
+            reject("mass_hash_enumeration", f"{hash_count} hash values")
+        # Compare only against extraction values: dotted prose is never guessed as a domain.
+        repeated_network = 0
+        for item in extraction.items:
+            if item.artifact_type not in {ArtifactType.IP, ArtifactType.DOMAIN}:
+                continue
+            try:
+                variants = {
+                    canonical_indicator_key(item.value, item.artifact_type),
+                    display_indicator_value(item.value, item.artifact_type, defanged=True),
+                }
+            except ValueError:
+                continue
+            if any(re.search(re.escape(value), body, re.IGNORECASE) for value in variants):
+                repeated_network += 1
+        if repeated_network >= 3:
+            reject("mass_network_enumeration", f"{repeated_network} network values")
+    else:
+        normalized_known = {value.strip().lower() for value in known_indicators}
+        for pattern in _SYNTHESIS_IOC_PATTERNS.values():
+            for match in pattern.finditer(body):
+                if match.group(0).strip().lower() not in normalized_known:
+                    reject("unknown_indicator", match.group(0), match.span())
 
     if result.errors:
         return result
@@ -710,6 +884,8 @@ def validate_synthesis(
 def reference_report_to_json(report: ReferenceReport) -> dict[str, Any]:
     return {
         "parser_version": PARSER_VERSION,
+        "schema_version": "2",
+        "editorial_title": report.editorial_title,
         "sources": [
             {
                 "id": source.local_id,
@@ -761,19 +937,26 @@ def reference_report_from_json(payload: dict[str, Any]) -> ReferenceReport:
             for item in payload.get("events", [])
         ),
         uncertainties=tuple(payload.get("uncertainties", [])),
+        editorial_title=payload.get("editorial_title"),
     )
 
 
 def technical_extraction_to_json(extraction: TechnicalExtraction) -> dict[str, Any]:
     return {
         "parser_version": PARSER_VERSION,
+        "schema_version": "2",
         "items": [
             {
                 "id": item.local_id,
                 "category": item.category,
                 "value": item.value,
                 "context": item.context,
-                "type": item.artifact_type,
+                "artifact_type": item.artifact_type.value if item.artifact_type else None,
+                "semantic_type": item.semantic_type.value,
+                "indicator_status": item.indicator_status.value,
+                "provenance": item.provenance.value,
+                "display_policy": item.display_policy.value,
+                "normalized_value": item.normalized_value,
                 "attack_id": item.attack_id,
                 "reference_ids": list(item.reference_ids),
                 "source_ids": list(item.source_ids),
@@ -786,20 +969,46 @@ def technical_extraction_to_json(extraction: TechnicalExtraction) -> dict[str, A
 
 
 def technical_extraction_from_json(payload: dict[str, Any]) -> TechnicalExtraction:
-    return TechnicalExtraction(
-        items=tuple(
-            ExtractionItem(
-                local_id=item["id"],
-                category=item["category"],
-                value=item["value"],
-                context=item.get("context", ""),
-                artifact_type=item.get("type"),
-                attack_id=item.get("attack_id"),
-                reference_ids=tuple(item.get("reference_ids", [])),
-                source_ids=tuple(item.get("source_ids", [])),
-                supported=bool(item.get("supported", False)),
+    def read_item(item: dict[str, Any]) -> ExtractionItem:
+        artifact_type = _enum_value(
+            item.get("artifact_type") or item.get("type"), ArtifactType, None
+        )
+        normalized = item.get("normalized_value")
+        if normalized is None and artifact_type is not None:
+            try:
+                normalized = normalize_indicator_value(str(item["value"]), artifact_type)
+            except ValueError:
+                normalized = None
+        return ExtractionItem(
+            local_id=item["id"],
+            category=item["category"],
+            value=item["value"],
+            context=item.get("context", ""),
+            artifact_type=artifact_type,
+            attack_id=item.get("attack_id"),
+            reference_ids=tuple(item.get("reference_ids", [])),
+            source_ids=tuple(item.get("source_ids", [])),
+            supported=bool(item.get("supported", False)),
+            semantic_type=_enum_value(
+                item.get("semantic_type"), SemanticType, SemanticType.OTHER
             )
-            for item in payload.get("items", [])
-        ),
+            or SemanticType.OTHER,
+            indicator_status=_enum_value(
+                item.get("indicator_status"), IndicatorStatus, IndicatorStatus.CONTEXTUAL
+            )
+            or IndicatorStatus.CONTEXTUAL,
+            provenance=_enum_value(
+                item.get("provenance"), IndicatorProvenance, IndicatorProvenance.SOURCE
+            )
+            or IndicatorProvenance.SOURCE,
+            display_policy=_enum_value(
+                item.get("display_policy"), DisplayPolicy, DisplayPolicy.BODY_ONLY
+            )
+            or DisplayPolicy.BODY_ONLY,
+            normalized_value=normalized,
+        )
+
+    return TechnicalExtraction(
+        items=tuple(read_item(item) for item in payload.get("items", [])),
         uncertainties=tuple(payload.get("uncertainties", [])),
     )

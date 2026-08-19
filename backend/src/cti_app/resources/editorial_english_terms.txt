@@ -1,0 +1,12 @@
+# Versioned editorial lexicon; longest expressions win.
+command and control
+credential stuffing
+dead drop resolver
+side-loading
+loader
+payload
+wiper
+phishing
+backdoor
+dropper
+ransomware

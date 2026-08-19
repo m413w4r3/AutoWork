@@ -24,8 +24,14 @@ from cti_app.application.production_parsers import (
     reference_report_to_json,
     technical_extraction_from_json,
     technical_extraction_to_json,
+    validate_synthesis,
 )
-from cti_app.application.production_prompts import ProductionPromptTemplates
+from cti_app.application.production_prompts import (
+    EXTRACTION_PROMPT_VERSION,
+    REFERENCES_PROMPT_VERSION,
+    SYNTHESIS_PROMPT_VERSION,
+    ProductionPromptTemplates,
+)
 from cti_app.application.production_stages import (
     BriefAssemblyService,
     ExtractionService,
@@ -493,6 +499,7 @@ class ProductionWorkflowOrchestrator:
                 "context": ctx.subject_description,
                 "research_date": research_date.isoformat(),
                 "stage": "references",
+                "prompt_version": REFERENCES_PROMPT_VERSION,
             }
             input_hash = compute_input_hash(input_data)
 
@@ -623,6 +630,7 @@ class ProductionWorkflowOrchestrator:
                 "subject_id": str(run.subject_id),
                 "references_version": references.version,
                 "stage": "extraction",
+                "prompt_version": EXTRACTION_PROMPT_VERSION,
             }
             input_hash = compute_input_hash(input_data)
 
@@ -735,11 +743,18 @@ class ProductionWorkflowOrchestrator:
         async with self._uow_factory() as uow:
             # Get extraction artifact
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
+            references = await uow.production_artifacts.get_current(run.id, "references")
             if not extraction:
                 return {
                     "stage": "synthesis",
                     "status": "error",
                     "error": "Extraction artifact not found",
+                }
+            if references is None:
+                return {
+                    "stage": "synthesis",
+                    "status": "error",
+                    "error": "References artifact not found",
                 }
 
             # Prepare input for hashing
@@ -747,6 +762,7 @@ class ProductionWorkflowOrchestrator:
                 "subject_id": str(run.subject_id),
                 "extraction_version": extraction.version,
                 "stage": "synthesis",
+                "prompt_version": SYNTHESIS_PROMPT_VERSION,
             }
             input_hash = compute_input_hash(input_data)
 
@@ -785,24 +801,54 @@ class ProductionWorkflowOrchestrator:
                 subject_title=subject_title,
             )
 
-            # Call LLM (continue mode, same conversation)
-            try:
-                turn = await self._model_service.add_turn(
-                    conversation_id=conversation_id,
-                    message=prompt,
-                    mode=ConversationMode.CONTINUE,
-                    external_llm_allowed=synthesis_policy_allows,
-                    idempotency_key=f"synthesis-{run.id}-v1",
-                    correlation_id=self._correlation_id,
-                    context_subject_id=run.subject_id,
-                )
+            report = await self._load_reference_report(references)
+            if (
+                report is None
+                or self._artifact_store is None
+                or extraction.canonical_blob_id is None
+            ):
+                return {
+                    "stage": "synthesis",
+                    "status": "terminal_error",
+                    "error_code": "synthesis_inputs_missing",
+                    "error": "Reference or extraction payload is not readable",
+                }
+            extraction_payload = technical_extraction_from_json(
+                await self._artifact_store.read_json(extraction.canonical_blob_id)
+            )
 
-                output_text = await self._turn_output_text(conversation_id, turn.id)
-                if not output_text:
+            try:
+                parsed, output_text, turn_id = await self._ask_with_format_repair(
+                    run=run,
+                    conversation_id=conversation_id,
+                    stage="synthesis",
+                    prompt=prompt,
+                    mode=ConversationMode.CONTINUE,
+                    parse=lambda text: validate_synthesis(text, report, extraction_payload),
+                    external_llm_allowed=synthesis_policy_allows,
+                )
+                if parsed is None:
                     return {
                         "stage": "synthesis",
-                        "status": "error",
+                        "status": "needs_review",
+                        "error_code": "no_model_response",
                         "error": "No response from model",
+                    }
+                if not parsed.usable:
+                    return {
+                        "stage": "synthesis",
+                        "status": "needs_review",
+                        "error_code": "synthesis_validation_failed",
+                        "error": "; ".join(parsed.errors),
+                        "violations": [
+                            {
+                                "code": violation.code,
+                                "detail": violation.detail,
+                                "span": violation.span,
+                            }
+                            for violation in parsed.violations
+                        ],
+                        "repair_actions": parsed.repair_actions,
                     }
 
                 artifact = await self._synthesis.store_synthesis_result(
@@ -811,7 +857,7 @@ class ProductionWorkflowOrchestrator:
                     input_hash=input_hash,
                     raw_result=output_text,
                     markdown_content=output_text,
-                    conversation_turn_id=turn.id,
+                    conversation_turn_id=turn_id,
                 )
 
                 return {
@@ -819,13 +865,10 @@ class ProductionWorkflowOrchestrator:
                     "status": "success",
                     "artifact_id": str(artifact.id),
                     "word_count": len(output_text.split()),
+                    "repair_actions": parsed.repair_actions,
                 }
             except Exception as e:
-                return {
-                    "stage": "synthesis",
-                    "status": "error",
-                    "error": str(e),
-                }
+                return _transient_or_terminal("synthesis", e)
 
     async def _execute_assembly_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
         """Execute brief assembly stage (deterministic).

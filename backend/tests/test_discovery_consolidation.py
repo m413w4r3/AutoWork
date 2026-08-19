@@ -25,7 +25,8 @@ from cti_app.domain.discovery import (
     SourceRole,
     SourceVerificationStatus,
 )
-from conftest import wrap_candidates_in_contributions
+
+from .discovery_helpers import wrap_candidates_in_contributions
 
 REQUEST_HASH = "a" * 64
 

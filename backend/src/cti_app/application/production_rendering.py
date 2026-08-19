@@ -11,15 +11,16 @@ from __future__ import annotations
 import re
 
 from cti_app.application.production_parsers import (
+    DisplayPolicy,
     ExtractionItem,
+    IndicatorStatus,
     ReferenceReport,
     TechnicalExtraction,
 )
+from cti_app.application.production_normalization import canonical_indicator_key
+from cti_app.domain.publication import ArtifactType
 
 _MARKER = re.compile(r"\[(S\d{1,3})\]", re.IGNORECASE)
-
-# Categories rendered as indicators of compromise, in reading order.
-_IOC_CATEGORIES = ("network_artifacts", "files", "infrastructure", "cves")
 
 _CATEGORY_LABELS = {
     "actors": "Acteurs",
@@ -71,18 +72,30 @@ def apply_numbering(text: str, numbering: dict[str, int]) -> str:
 
 
 def collect_indicators(extraction: TechnicalExtraction) -> list[ExtractionItem]:
-    """Supported indicators, deduplicated by kind and normalised value."""
+    """Explicitly qualified IOC, deduplicated by type and canonical value."""
     seen: set[tuple[str, str]] = set()
     out: list[ExtractionItem] = []
-    for category in _IOC_CATEGORIES:
-        for item in extraction.supported_items():
-            if item.category != category:
-                continue
-            key = ((item.artifact_type or item.category).lower(), item.value.strip().lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(item)
+    for item in extraction.items:
+        if (
+            not item.supported
+            or item.indicator_status is not IndicatorStatus.CONFIRMED_IOC
+            or item.display_policy not in {DisplayPolicy.IOC_SECTION, DisplayPolicy.BOTH}
+            or item.artifact_type is None
+        ):
+            continue
+        artifact_type = (
+            item.artifact_type
+            if isinstance(item.artifact_type, ArtifactType)
+            else ArtifactType(item.artifact_type)
+        )
+        try:
+            key = (artifact_type.value, canonical_indicator_key(item.value, artifact_type))
+        except ValueError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
     return out
 
 
@@ -127,7 +140,11 @@ def render_brief(
         lines.append("## Indicateurs de compromission")
         lines.append("")
         for item in indicators:
-            kind = item.artifact_type or _CATEGORY_LABELS.get(item.category, item.category)
+            kind = (
+                item.artifact_type.value
+                if isinstance(item.artifact_type, ArtifactType)
+                else item.artifact_type
+            ) or _CATEGORY_LABELS.get(item.category, item.category)
             markers = "".join(f"[{numbering[sid]}]" for sid in item.source_ids if sid in numbering)
             lines.append(f"- `{item.value}` ({kind}) {markers}".rstrip())
         lines.append("")

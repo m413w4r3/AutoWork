@@ -10,6 +10,8 @@ import {
   getSynthesisArtifact,
   getBriefArtifact,
   type ArtifactResponse,
+  type BriefDocumentV1,
+  type RichSpan,
 } from "../api/production";
 
 interface ProductionArtifactViewProps {
@@ -48,6 +50,96 @@ function getArtifactFetcher(
   }
 }
 
+function isBriefDocument(value: unknown): value is BriefDocumentV1 {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "schema_version" in value &&
+    value.schema_version === "1" &&
+    "timeline" in value &&
+    Array.isArray(value.timeline)
+  );
+}
+
+function RichText({ spans }: { spans: RichSpan[] }) {
+  return spans.map((span, index) => {
+    if (span.kind === "citation") {
+      return (
+        <sup key={index} className="semantic-citation">
+          {span.source_ids.join(", ")}
+        </sup>
+      );
+    }
+    if (span.kind === "actor" || span.kind === "malware") {
+      return <strong key={index}>{span.text}</strong>;
+    }
+    if (span.kind === "emphasis") {
+      return <em key={index}>{span.text}</em>;
+    }
+    return (
+      <span key={index} className={`semantic-${span.kind}`}>
+        {span.text}
+      </span>
+    );
+  });
+}
+
+const IOC_LABELS: Record<string, string> = {
+  ip: "Adresses IP",
+  domain: "Noms de domaine",
+  url: "URL",
+  hash: "Fichiers",
+};
+
+function BriefPreview({ document }: { document: BriefDocumentV1 }) {
+  const visibleGroups = document.indicators.filter(
+    (group) => IOC_LABELS[group.artifact_type] && group.values.length > 0,
+  );
+  return (
+    <article className="brief-preview">
+      <h3>{document.title}</h3>
+      <div className="brief-preview__timeline">
+        {document.timeline.map((entry, index) => (
+          <p key={index}>
+            {entry.date && (
+              <strong className="semantic-date">
+                {new Intl.DateTimeFormat("fr-FR", { dateStyle: "long" }).format(
+                  new Date(`${entry.date}T00:00:00`),
+                )}
+                {" : "}
+              </strong>
+            )}
+            <RichText spans={entry.content} />
+          </p>
+        ))}
+      </div>
+      <h4>Synthèse</h4>
+      {document.synthesis.map((paragraph, index) => (
+        <p key={index}>
+          <RichText spans={paragraph} />
+        </p>
+      ))}
+      {visibleGroups.length > 0 && (
+        <section className="brief-preview__indicators">
+          <h4>IOC</h4>
+          {visibleGroups.map((group) => (
+            <div key={group.artifact_type}>
+              <h5>{IOC_LABELS[group.artifact_type]}</h5>
+              <ul>
+                {group.values.map((indicator) => (
+                  <li key={indicator.normalized_value}>
+                    <code>{indicator.normalized_value}</code>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </section>
+      )}
+    </article>
+  );
+}
+
 export function ProductionArtifactView({
   subjectId,
   stage,
@@ -55,7 +147,11 @@ export function ProductionArtifactView({
 }: ProductionArtifactViewProps) {
   const fetcher = getArtifactFetcher(stage);
 
-  const { data: artifact, isLoading, error } = useQuery({
+  const {
+    data: artifact,
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ["production-artifact", subjectId, stage],
     queryFn: () => fetcher(subjectId),
   });
@@ -117,7 +213,23 @@ export function ProductionArtifactView({
         </div>
       )}
 
-      {artifact.rendered_content && (
+      {stage === "brief" && isBriefDocument(artifact.canonical_content) && (
+        <BriefPreview document={artifact.canonical_content} />
+      )}
+
+      {stage === "brief" && artifact.rendered_content && (
+        <p>
+          <a
+            className="button button--secondary"
+            download="breve-pandoc.md"
+            href={`data:text/markdown;charset=utf-8,${encodeURIComponent(artifact.rendered_content)}`}
+          >
+            Télécharger le Markdown Pandoc
+          </a>
+        </p>
+      )}
+
+      {stage !== "brief" && artifact.rendered_content && (
         <div className="artifact-content">
           <div className="rendered-markdown">
             {/* Render as HTML/Markdown - would need a markdown parser */}
@@ -126,7 +238,7 @@ export function ProductionArtifactView({
         </div>
       )}
 
-      {artifact.canonical_content && (
+      {stage !== "brief" && artifact.canonical_content && (
         <div className="artifact-canonical">
           <details>
             <summary>Contenu canonique</summary>

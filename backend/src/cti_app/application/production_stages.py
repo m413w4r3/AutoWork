@@ -10,6 +10,7 @@ from typing import Any
 from uuid import UUID
 
 from cti_app.application.discovery_report_parser import extract_http_urls
+from cti_app.application.pandoc_rendering import PANDOC_RENDERER_VERSION, render_brief_pandoc
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_parsers import (
@@ -18,17 +19,21 @@ from cti_app.application.production_parsers import (
     reference_report_from_json,
     technical_extraction_from_json,
 )
-from cti_app.application.production_prompts import ProductionPromptTemplates
-from cti_app.application.production_rendering import (
-    build_reference_numbering,
-    collect_indicators,
-    render_brief,
+from cti_app.application.production_prompts import (
+    EXTRACTION_PROMPT_VERSION,
+    REFERENCES_PROMPT_VERSION,
+    SYNTHESIS_PROMPT_VERSION,
+    ProductionPromptTemplates,
 )
+from cti_app.application.production_rendering import collect_indicators
+from cti_app.application.publication_builder import build_brief_document
+from cti_app.application.semantic_annotation import SEMANTIC_ANNOTATOR_VERSION
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
+from cti_app.domain.publication import PUBLICATION_SCHEMA_VERSION
 
 
 def compute_input_hash(input_data: dict[str, Any]) -> str:
@@ -99,7 +104,7 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
             "subject_id": str(subject_id),
             "subject_title": subject_title,
             "research_date": research_date,
-            "template_version": "1.0.0",
+            "prompt_version": REFERENCES_PROMPT_VERSION,
         }
         input_hash = compute_input_hash(input_data)
 
@@ -192,7 +197,7 @@ class ExtractionService(_ArtifactPayloadMixin):
             "subject_id": str(subject_id),
             "references_artifact_id": str(references_artifact.id),
             "references_hash": references_artifact.input_hash,
-            "template_version": "1.0.0",
+            "prompt_version": EXTRACTION_PROMPT_VERSION,
         }
         input_hash = compute_input_hash(input_data)
 
@@ -290,7 +295,7 @@ class SynthesisService(_ArtifactPayloadMixin):
             "subject_id": str(subject_id),
             "extraction_artifact_id": str(extraction_artifact.id),
             "extraction_hash": extraction_artifact.input_hash,
-            "template_version": "1.0.0",
+            "prompt_version": SYNTHESIS_PROMPT_VERSION,
         }
         input_hash = compute_input_hash(input_data)
 
@@ -389,6 +394,9 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
                 "extraction_hash": extraction_artifact.input_hash,
                 "synthesis_id": str(synthesis_artifact.id),
                 "synthesis_hash": synthesis_artifact.input_hash,
+                "publication_schema_version": PUBLICATION_SCHEMA_VERSION,
+                "semantic_annotator_version": SEMANTIC_ANNOTATOR_VERSION,
+                "pandoc_renderer_version": PANDOC_RENDERER_VERSION,
             }
             input_hash = compute_input_hash(input_data)
 
@@ -397,20 +405,16 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
             )
             version = (current.version + 1) if current else 1
 
-            numbering = build_reference_numbering(report, synthesis_text)
-            brief_markdown = render_brief(
+            document = build_brief_document(
                 subject_title=subject_title,
                 report=report,
                 extraction=extraction,
                 synthesis_text=synthesis_text,
-                numbering=numbering,
             )
+            brief_markdown = render_brief_pandoc(document)
 
             raw_id, canonical_id, rendered_id = await self._store_payloads(
-                canonical={
-                    "title": subject_title,
-                    "numbering": {sid: number for sid, number in numbering.items()},
-                },
+                canonical=document.to_json(),
                 rendered=brief_markdown,
             )
             artifact = ProductionArtifact(
@@ -425,8 +429,11 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
                 rendered_blob_id=rendered_id,
                 metadata={
                     "word_count": len(brief_markdown.split()),
-                    "reference_count": len(numbering),
+                    "reference_count": len(document.sources),
                     "indicator_count": len(collect_indicators(extraction)),
+                    "publication_schema_version": PUBLICATION_SCHEMA_VERSION,
+                    "semantic_annotator_version": SEMANTIC_ANNOTATOR_VERSION,
+                    "pandoc_renderer_version": PANDOC_RENDERER_VERSION,
                     "generated_at": datetime.now(UTC).isoformat(),
                 },
             )

@@ -23,7 +23,7 @@ After Patch 1 implementation, all assertions should pass.
 from __future__ import annotations
 
 import itertools
-from datetime import UTC, date, datetime
+from datetime import date
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -36,9 +36,10 @@ from cti_app.domain.discovery import (
     CandidateTopic,
     ContributionStatus,
     DiscoveryBatch,
-    DiscoveryContribution,
     DiscoverySourceMode,
 )
+
+from .discovery_helpers import wrap_candidates_in_contributions
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "discovery_golden"
 EDITION_ID = UUID("12345678-1234-5678-1234-567812345678")
@@ -72,22 +73,13 @@ def golden_fixtures() -> dict[str, DiscoveryBatch]:
 
         # Construct a DiscoveryBatch from parsed candidates
         # Wrap candidates as contributions (all PENDING by default for new batches)
-        now = datetime.now(UTC)
-        contributions = [
-            DiscoveryContribution(
-                candidate=candidate,
-                status=ContributionStatus.PENDING,
-                created_at=now,
-            )
-            for candidate in parsed.candidates
-        ]
         batch = DiscoveryBatch(
             edition_id=EDITION_ID,
             request_hash=REQUEST_HASH,
             complementary_axis="initial",
             queries=(),
             citations=parsed.citations,
-            contributions=contributions,
+            contributions=wrap_candidates_in_contributions(parsed.candidates, ContributionStatus.PENDING),
             discovery_model_run_id=uuid4(),
             structuring_model_run_id=uuid4(),
             tlp=TLP.AMBER,

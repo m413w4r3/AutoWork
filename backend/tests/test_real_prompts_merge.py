@@ -18,7 +18,9 @@ from uuid import uuid4
 from cti_app.application.discovery_consolidation import consolidate_discovery_batches
 from cti_app.application.discovery_report_parser import parse_discovery_report
 from cti_app.domain.classification import TLP
-from cti_app.domain.discovery import DiscoveryBatch, DiscoverySourceMode
+from cti_app.domain.discovery import ContributionStatus, DiscoveryBatch, DiscoverySourceMode
+
+from .discovery_helpers import wrap_candidates_in_contributions
 
 
 REQUEST_HASH = hashlib.sha256(b"july_test_request").hexdigest()
@@ -77,13 +79,15 @@ def test_july_prompts_with_official_pipeline():
                 print(f"    ⚠️  {len(parsed.warnings)} warnings")
 
             # Créer un DiscoveryBatch
+            # Note: Using ACCEPTED status for batches created from parsed reports
+            # (in production, these would become PENDING for user review, then ACCEPTED)
             batch = DiscoveryBatch(
                 edition_id=edition_id,
                 request_hash=REQUEST_HASH,
                 complementary_axis=f"july_batch_{idx}_{md_file.stem}",
                 queries=(),
                 citations=parsed.citations,
-                candidates=parsed.candidates,
+                contributions=wrap_candidates_in_contributions(parsed.candidates, ContributionStatus.ACCEPTED),
                 discovery_model_run_id=uuid4(),
                 structuring_model_run_id=uuid4(),
                 tlp=TLP.AMBER,

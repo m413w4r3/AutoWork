@@ -20,7 +20,8 @@ from cti_app.domain.discovery import (
     Source,
     SourceRole,
 )
-from conftest import wrap_candidates_in_contributions
+
+from .discovery_helpers import wrap_candidates_in_contributions
 
 
 def _candidate(

@@ -71,9 +71,49 @@ export interface ArtifactResponse {
   version: number;
   status: "verified" | "stale" | "needs_review";
   metadata: Record<string, unknown>;
-  /** Reader-facing Markdown, when the stage produces one. */
+  /** Publication Markdown is downloadable, not the BRIEF preview source. */
   rendered_content: string | null;
-  canonical_content: Record<string, unknown> | null;
+  canonical_content: BriefDocumentV1 | Record<string, unknown> | null;
+}
+
+export type RichSpanKind =
+  | "text"
+  | "emphasis"
+  | "actor"
+  | "malware"
+  | "tool"
+  | "product"
+  | "technical"
+  | "ioc"
+  | "code"
+  | "citation";
+
+export interface RichSpan {
+  kind: RichSpanKind;
+  text: string;
+  source_ids: string[];
+}
+
+export interface BriefDocumentV1 {
+  schema_version: "1";
+  title: string;
+  timeline: Array<{
+    date: string | null;
+    content: RichSpan[];
+    source_ids: string[];
+  }>;
+  synthesis: RichSpan[][];
+  indicators: Array<{
+    artifact_type: string;
+    values: Array<{
+      value: string;
+      normalized_value: string;
+      artifact_type: string;
+      source_ids: string[];
+    }>;
+  }>;
+  sources: Array<{ source_id: string; canonical_url: string }>;
+  uncertainties: string[];
 }
 
 /**
@@ -191,9 +231,11 @@ export async function saveBriefDraft(
 /**
  * Get the current brief draft
  */
-export async function getBriefDraft(
-  subjectId: string,
-): Promise<{ content: string; saved_at: string; draft_version: number } | null> {
+export async function getBriefDraft(subjectId: string): Promise<{
+  content: string;
+  saved_at: string;
+  draft_version: number;
+} | null> {
   return requestOrNull(`/api/subjects/${subjectId}/production/brief/draft`);
 }
 

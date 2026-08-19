@@ -7,7 +7,9 @@ from typing import Any
 from uuid import uuid4
 
 from cti_app.application.production_parsers import (
+    DisplayPolicy,
     ExtractionItem,
+    IndicatorStatus,
     ParsedEvent,
     ParsedSource,
     ReferenceReport,
@@ -69,7 +71,13 @@ def _report() -> ReferenceReport:
     )
 
 
-def _item(category: str, value: str, artifact_type: str | None = None) -> ExtractionItem:
+def _item(
+    category: str,
+    value: str,
+    artifact_type: str | None = None,
+    *,
+    confirmed: bool = False,
+) -> ExtractionItem:
     return ExtractionItem(
         local_id=f"I-{value}",
         category=category,
@@ -80,14 +88,18 @@ def _item(category: str, value: str, artifact_type: str | None = None) -> Extrac
         reference_ids=("R1",),
         source_ids=("S1",),
         supported=True,
+        indicator_status=(
+            IndicatorStatus.CONFIRMED_IOC if confirmed else IndicatorStatus.CONTEXTUAL
+        ),
+        display_policy=DisplayPolicy.IOC_SECTION if confirmed else DisplayPolicy.BODY_ONLY,
     )
 
 
 def _extraction() -> TechnicalExtraction:
     return TechnicalExtraction(
         items=(
-            _item("network_artifacts", "malicious.example.com", "domain"),
-            _item("network_artifacts", "Malicious.Example.com", "domain"),
+            _item("network_artifacts", "malicious.example.com", "domain", confirmed=True),
+            _item("network_artifacts", "Malicious.Example.com", "domain", confirmed=True),
             _item("cves", "CVE-2026-1234"),
         )
     )
@@ -114,7 +126,6 @@ def test_indicators_are_deduplicated_by_kind_and_value() -> None:
 
     assert [item.value for item in indicators] == [
         "malicious.example.com",
-        "CVE-2026-1234",
     ]
 
 
