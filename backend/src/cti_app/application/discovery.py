@@ -45,7 +45,9 @@ from cti_app.application.persistence import DiscoveryUnitOfWorkFactory
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
+    ContributionStatus,
     DiscoveryBatch,
+    DiscoveryContribution,
     DiscoverySourceMode,
     SourceCandidate,
     SourceRole,
@@ -63,6 +65,23 @@ PROMPT_TEMPLATE_ID = "monthly-cti-discovery"
 PROMPT_TEMPLATE_VERSION = "4.1"
 COMPACT_CONTRACT_VERSION = "research-batch-compact-v1"
 logger = logging.getLogger(__name__)
+
+
+def _wrap_candidates_as_contributions(
+    candidates: list[CandidateTopic],
+    status: ContributionStatus = ContributionStatus.PENDING,
+) -> list[DiscoveryContribution]:
+    """Wrap candidate topics into contributions with temporal tracking."""
+    now = datetime.now(UTC)
+    return [
+        DiscoveryContribution(
+            candidate=candidate,
+            status=status,
+            created_at=now,
+            accepted_at=now if status == ContributionStatus.ACCEPTED else None,
+        )
+        for candidate in candidates
+    ]
 
 
 class ResearchCitation(BaseModel):
@@ -1794,7 +1813,7 @@ def _to_domain_batch(
         complementary_axis=parameters.complementary_axis,
         queries=tuple(result.queries),
         citations=tuple(citation.model_dump() for citation in result.citations),
-        candidates=candidates,
+        contributions=_wrap_candidates_as_contributions(candidates, ContributionStatus.PENDING),
         discovery_model_run_id=research_run_id,
         structuring_model_run_id=structuring_run_id,
         tlp=parameters.tlp,
@@ -1826,7 +1845,7 @@ def _parsed_to_domain_batch(
         complementary_axis=parameters.complementary_axis,
         queries=(),
         citations=result.citations,
-        candidates=result.candidates,
+        contributions=_wrap_candidates_as_contributions(result.candidates, ContributionStatus.PENDING),
         discovery_model_run_id=research_run_id,
         # The historical column remains non-null for backwards compatibility. Reusing
         # the research run ID explicitly means that no structuring ModelRun was created.

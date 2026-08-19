@@ -12,6 +12,12 @@ from uuid import UUID, uuid4
 from cti_app.domain.classification import TLP
 
 
+class ContributionStatus(StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
 class SourceRole(StrEnum):
     PRIMARY = "primary"
     INDEPENDENT = "independent"
@@ -230,13 +236,27 @@ class CandidateTopic:
 
 
 @dataclass(slots=True)
+class DiscoveryContribution:
+    """One CandidateTopic with contribution metadata for temporal tracking."""
+    candidate: CandidateTopic
+    status: ContributionStatus
+    created_at: datetime
+    accepted_at: datetime | None = None
+    human_note: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status == ContributionStatus.ACCEPTED and self.accepted_at is None:
+            self.accepted_at = datetime.now(UTC)
+
+
+@dataclass(slots=True)
 class DiscoveryBatch:
     edition_id: UUID
     request_hash: str
     complementary_axis: str
     queries: tuple[str, ...]
     citations: tuple[dict[str, str | None], ...]
-    candidates: list[CandidateTopic]
+    contributions: list[DiscoveryContribution]
     discovery_model_run_id: UUID
     structuring_model_run_id: UUID
     tlp: TLP
@@ -274,25 +294,44 @@ class DiscoveryBatch:
                 self.source_coverage_incomplete_reason
                 or "Le bridge expose uniquement les citations visibles de ChatGPT."
             )
-            for candidate in self.candidates:
-                for source in candidate.sources:
+            for contribution in self.contributions:
+                for source in contribution.candidate.sources:
                     source.relationship_status = SourceRelationshipStatus.PROVISIONAL
         if not self.source_coverage_complete and not self.source_coverage_incomplete_reason:
             raise ValueError("Incomplete source coverage requires a reason")
-        self.candidates = deduplicate_topics(self.candidates)
+        # Deduplicate candidate topics
+        candidates = [c.candidate for c in self.contributions]
+        deduplicated = deduplicate_topics(candidates)
+        # Update contributions with deduplicated candidates
+        candidate_map = {c.id: c for c in deduplicated}
+        for contribution in self.contributions:
+            if contribution.candidate.id in candidate_map:
+                contribution.candidate = candidate_map[contribution.candidate.id]
         if self.parsing_revision < 1:
             raise ValueError("Parsing revision must be positive")
+
+    @property
+    def candidates(self) -> list[CandidateTopic]:
+        """Return only ACCEPTED contributions (for backward compat)."""
+        return [c.candidate for c in self.contributions if c.status == ContributionStatus.ACCEPTED]
 
     @property
     def is_active_revision(self) -> bool:
         return self.replaced_by_batch_id is None
 
+    @property
+    def history_hash(self) -> str:
+        """Hash of accepted contributions for idempotency checking."""
+        accepted = [c.candidate.id for c in self.contributions if c.status == ContributionStatus.ACCEPTED]
+        content = "|".join(str(cid) for cid in sorted(accepted))
+        return hashlib.sha256(content.encode()).hexdigest()
+
     def source(self, source_id: UUID) -> SourceCandidate | None:
         return next(
             (
                 source
-                for candidate in self.candidates
-                for source in candidate.sources
+                for contribution in self.contributions
+                for source in contribution.candidate.sources
                 if source.id == source_id
             ),
             None,

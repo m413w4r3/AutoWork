@@ -17,7 +17,6 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.discovery_identity import (
-    TopicMatchDecision,
     build_discovery_identity_index,
     explicit_entity_tokens,
     normalize,
@@ -633,10 +632,8 @@ def _best_group_match(
 ) -> _GroupMatch | None:
     """Find the best matching editorial group for a new candidate.
 
-    Uses the tri-state TopicMatchDecision engine from discovery_identity to
-    determine SAME/AMBIGUOUS/DISTINCT. Maintains numeric scores (0.0-1.0) for
-    EditorialScore/board display, but the attachment decision is driven by
-    TopicMatchDecision, not the numeric score alone.
+    Computes numeric similarity scores (0.0-1.0) for ranking and display.
+    The attachment decision is driven by score thresholds defined in synchronize().
     """
     from cti_app.application.discovery_identity import match_topics
 
@@ -667,21 +664,14 @@ def _best_group_match(
         }
         archived_for_group = archived_urls.get(group.id, set())
 
-        # If this candidate URL was already archived for this group, it's a strong anchor
-        if candidate_urls & archived_for_group:
-            # Treat as high-confidence match (score 0.9)
-            # This represents the "URL already collected" heuristic from before
-            matches.append(
-                _GroupMatch(
-                    group,
-                    0.9,
-                    "URL canonique déjà archivée pour ce groupe",
-                )
-            )
-            continue
-
         # Standard similarity check
-        score, reasons, decision = _similarity(candidate, other)
+        score, reasons = _similarity(candidate, other)
+
+        # Note archived URL evidence for ranking, but do NOT boost score
+        # Per requirement C2: archived URL alone cannot produce structural SAME
+        if candidate_urls & archived_for_group:
+            reasons.append("URL canonique déjà archivée pour ce groupe")
+
         matches.append(_GroupMatch(group, score, ", ".join(reasons)))
 
     return max(matches, key=lambda item: item.score, default=None)
@@ -705,13 +695,10 @@ def _representative(
 
 def _similarity(
     left: CandidateTopic, right: CandidateTopic
-) -> tuple[float, list[str], TopicMatchDecision]:
+) -> tuple[float, list[str]]:
     """Compute editorial similarity score (weak/medium signals).
 
-    Returns: (score, reasons, decision) where decision is inferred from score bands:
-    - score >= 0.85 -> SAME (high confidence)
-    - 0.45 <= score < 0.85 -> AMBIGUOUS
-    - score < 0.45 -> DISTINCT
+    Returns: (score, reasons) where score is normalized to [0.0, 1.0].
 
     Note: This is the editorial scoring layer only. It does NOT replace the
     authoritative hard-identity matching from discovery_identity.match_topics().
@@ -755,15 +742,7 @@ def _similarity(
 
     final_score = min(score, 1.0)
 
-    # Convert score to decision band
-    if final_score >= 0.85:
-        decision = TopicMatchDecision.SAME
-    elif final_score >= 0.45:
-        decision = TopicMatchDecision.AMBIGUOUS
-    else:
-        decision = TopicMatchDecision.DISTINCT
-
-    return final_score, reasons or ["rapprochement faible sans preuve d'identité"], decision
+    return final_score, reasons or ["rapprochement faible sans preuve d'identité"]
 
 
 def _editorial_score(candidate: CandidateTopic) -> EditorialScore:

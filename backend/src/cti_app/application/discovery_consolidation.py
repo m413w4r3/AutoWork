@@ -98,6 +98,12 @@ def consolidate_discovery_batches(
         for candidate in batch.candidates:
             all_occurrences.append(CandidateOccurrence(batch_id=batch.id, candidate_id=candidate.id))
 
+    # Sort for determinism - CRITICAL for order-independence
+    def stable_key(occ: CandidateOccurrence) -> tuple[str, str]:
+        return (str(occ.batch_id), str(occ.candidate_id))
+
+    all_occurrences = sorted(all_occurrences, key=stable_key)
+
     # === Step 1: Compute full pairwise match matrix (order-independent) ===
     pairwise_matrix: dict[tuple[CandidateOccurrence, CandidateOccurrence], TopicMatchDecision] = {}
     for i, occ1 in enumerate(all_occurrences):
@@ -118,7 +124,8 @@ def consolidate_discovery_batches(
     assigned: set[CandidateOccurrence] = set()
     clusters: list[set[CandidateOccurrence]] = []
 
-    for occ in all_occurrences:
+    # Iterate in deterministic order
+    for occ in all_occurrences:  # Already sorted above
         if occ in assigned:
             continue
 
@@ -136,10 +143,11 @@ def consolidate_discovery_batches(
         }
 
         # Grow the clique greedily, but only if the new member is SAME with ALL current members
-        for candidate_member in same_with_occ:
+        # Sort for deterministic iteration order
+        for candidate_member in sorted(same_with_occ, key=stable_key):
             is_compatible = all(
                 pairwise_matrix.get((candidate_member, existing)) is TopicMatchDecision.SAME
-                for existing in clique
+                for existing in sorted(clique, key=stable_key)  # Sort clique too (it's a set)
                 if existing != candidate_member
             )
             if is_compatible:
@@ -151,19 +159,22 @@ def consolidate_discovery_batches(
     # === Step 3: Detect bridges (occurrences matching multiple non-mutual clusters) ===
     # For each unassigned AMBIGUOUS bridge, mark it with the clusters it connects
     bridges: dict[CandidateOccurrence, tuple[UUID, ...]] = {}
+    # Iterate in deterministic order (already sorted above)
     for occ in all_occurrences:
         if occ in assigned:
             continue
         # occ is a singleton; find which clusters it's SAME with
         matched_cluster_ids = set()
         for cluster_idx, cluster in enumerate(clusters):
-            for cluster_member in cluster:
+            # Sort cluster members for deterministic iteration
+            for cluster_member in sorted(cluster, key=stable_key):
                 if pairwise_matrix.get((occ, cluster_member)) is TopicMatchDecision.SAME:
                     matched_cluster_ids.add(cluster_idx)
                     break
         if matched_cluster_ids:
             # This occurrence bridges multiple clusters -> flagged as ambiguous
-            bridges[occ] = tuple(matched_cluster_ids)
+            # Sort for deterministic ordering
+            bridges[occ] = tuple(sorted(matched_cluster_ids))
         # Mark as assigned (singleton)
         assigned.add(occ)
 

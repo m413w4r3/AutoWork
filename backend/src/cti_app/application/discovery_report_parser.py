@@ -23,7 +23,7 @@ from cti_app.domain.discovery import (
     canonicalize_http_url,
 )
 
-PARSER_VERSION = "chatgpt-markdown-v2"
+PARSER_VERSION = "chatgpt-markdown-v3-structured"
 _SUBJECT = re.compile(r"^\s*(?:##\s+)?SUBJECT\b\s*[:#-]?\s*(.*?)\s*$", re.IGNORECASE)
 _PUBLICATION = re.compile(r"^\s*(?:###\s+)?PUBLICATION\b\s*[:#-]?\s*(.*?)\s*$", re.IGNORECASE)
 _HEADING = re.compile(r"^\s*(#{1,6})\s+(.+?)\s*$")
@@ -48,6 +48,11 @@ _KNOWN_TOPIC_FIELDS = {
     "technical_potential_reason",
     "artifacts",
     "uncertainties",
+    # NEW — Patch 2: structured entity fields
+    "actors",
+    "campaigns",
+    "malware",
+    "subject_scope",
 }
 _KNOWN_PUBLICATION_FIELDS = {
     "title",
@@ -345,7 +350,7 @@ def _parse_legacy(
                 technical_potential_reason="Non extractible de manière fiable.",
                 uncertainties=("Métadonnées historiques à vérifier.",),
                 relevance_reasons=("Publication explicitement présente dans le rapport archivé.",),
-                actors=(),
+                actors=(),  # Legacy format has no structured actors
                 campaigns=(),
                 malware=(),
                 cves=(),
@@ -363,6 +368,38 @@ def _parse_legacy(
             )
         )
     return candidates, warnings
+
+
+def _detect_structured_format(lines: list[str]) -> bool:
+    """Detect if content uses new structured format (actors:, campaigns:, malware:)."""
+    content = "\n".join(lines)
+    return bool(
+        re.search(r"^\s*(?:actors|campaigns|malware|subject_scope)\s*:", content, re.MULTILINE | re.IGNORECASE)
+    )
+
+
+def _extract_structured_list(value: str) -> tuple[str, ...]:
+    """Extract items from a structured list field (YAML-like format).
+
+    Handles:
+    - bullet lists: "- item1\\n- item2"
+    - comma/semicolon separated: "item1, item2; item3"
+    - multiline YAML
+    """
+    if not value:
+        return ()
+    items: list[str] = []
+    for line in value.splitlines():
+        # Remove bullet points and leading whitespace
+        cleaned = re.sub(r"^\s*[-*]\s+", "", line).strip()
+        if cleaned:
+            # Split by common separators
+            parts = re.split(r"[,;|]", cleaned)
+            for part in parts:
+                part = part.strip()
+                if part and _normalize_enum(part) not in {"none", "unknown"}:
+                    items.append(part)
+    return tuple(dict.fromkeys(items))  # Deduplicate while preserving order
 
 
 def _parse_fields(lines: list[str]) -> tuple[dict[str, str], list[str]]:
@@ -419,6 +456,16 @@ def _candidate(
         if value in _ARTIFACTS
     ) or ("unknown",)
     uncertainties = tuple(_split_list(fields.get("uncertainties", "")))
+
+    # NEW — Patch 2: Extract structured entities if present
+    actors = _extract_structured_list(fields.get("actors", ""))
+    campaigns = _extract_structured_list(fields.get("campaigns", ""))
+    malware = _extract_structured_list(fields.get("malware", ""))
+
+    # Fallback: if no structured actors, use actor_or_campaign
+    if not actors and actor.casefold() != "unknown":
+        actors = (actor,)
+
     return CandidateTopic(
         id=uuid5(NAMESPACE_URL, f"{report_sha}:{local_ref}"),
         local_ref=local_ref,
@@ -431,9 +478,9 @@ def _candidate(
         ),
         uncertainties=uncertainties,
         relevance_reasons=("Sujet proposé dans le rapport ChatGPT archivé.",),
-        actors=() if actor.casefold() == "unknown" else (actor,),
-        campaigns=(),
-        malware=(),
+        actors=actors,
+        campaigns=campaigns,
+        malware=malware,
         cves=(),
         victims=(),
         sectors=(),

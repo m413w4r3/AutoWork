@@ -33,8 +33,10 @@ from cti_app.domain.collection import (
 )
 from cti_app.domain.discovery import (
     CandidateTopic,
+    ContributionStatus,
     DiscoveryBatch,
     DiscoveryBatchStatus,
+    DiscoveryContribution,
     DiscoveryIocStatus,
     DiscoveryIocType,
     DiscoverySourceMode,
@@ -1807,6 +1809,16 @@ def _discovery_batch_values(batch: DiscoveryBatch) -> dict[str, object]:
             "queries": list(batch.queries),
             "citations": list(batch.citations),
             "candidates": [_candidate_payload(candidate) for candidate in batch.candidates],
+            "contributions_meta": [
+                {
+                    "candidate_id": str(contrib.candidate.id),
+                    "status": contrib.status.value,
+                    "created_at": contrib.created_at.isoformat(),
+                    "accepted_at": contrib.accepted_at.isoformat() if contrib.accepted_at else None,
+                    "human_note": contrib.human_note,
+                }
+                for contrib in batch.contributions
+            ],
         },
         "created_at": batch.created_at,
         "updated_at": batch.updated_at,
@@ -1924,6 +1936,42 @@ def _provisional_ioc_payload(ioc: ProvisionalDiscoveryIoc) -> dict[str, object]:
 
 def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
     payload = row.payload
+    # Load candidates from payload
+    candidates = [_candidate_from_payload(item) for item in payload.get("candidates", [])]
+
+    # Load contribution metadata if available (new format)
+    contributions_meta = payload.get("contributions_meta", [])
+    contrib_map = {UUID(m["candidate_id"]): m for m in contributions_meta if "candidate_id" in m}
+
+    # Reconstruct contributions
+    contributions = []
+    for candidate in candidates:
+        meta = contrib_map.get(candidate.id)
+        if meta:
+            # New format: use metadata from storage
+            contributions.append(
+                DiscoveryContribution(
+                    candidate=candidate,
+                    status=ContributionStatus(meta["status"]),
+                    created_at=datetime.fromisoformat(meta["created_at"]),
+                    accepted_at=(
+                        datetime.fromisoformat(meta["accepted_at"])
+                        if meta.get("accepted_at")
+                        else None
+                    ),
+                    human_note=meta.get("human_note", ""),
+                )
+            )
+        else:
+            # Legacy format: all candidates marked as ACCEPTED
+            contributions.append(
+                DiscoveryContribution(
+                    candidate=candidate,
+                    status=ContributionStatus.ACCEPTED,
+                    created_at=row.created_at,
+                    accepted_at=row.created_at,
+                )
+            )
     return DiscoveryBatch(
         id=row.id,
         edition_id=row.edition_id,
@@ -1937,7 +1985,7 @@ def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
         external_llm_allowed=row.external_llm_allowed,
         queries=tuple(payload.get("queries", [])),
         citations=tuple(payload.get("citations", [])),
-        candidates=[_candidate_from_payload(item) for item in payload.get("candidates", [])],
+        contributions=contributions,
         report_sha256=(str(payload["report_sha256"]) if payload.get("report_sha256") else None),
         parser_version=str(payload.get("parser_version", "legacy-model-structured")),
         parsing_status=str(payload.get("parsing_status", "completed")),

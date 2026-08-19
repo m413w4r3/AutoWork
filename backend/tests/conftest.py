@@ -1,11 +1,30 @@
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.health import router
+from cti_app.domain.discovery import CandidateTopic, ContributionStatus, DiscoveryContribution
 from cti_app.logging import CorrelationIdMiddleware
+
+
+def wrap_candidates_in_contributions(
+    candidates: list[CandidateTopic],
+    status: ContributionStatus = ContributionStatus.PENDING,
+) -> list[DiscoveryContribution]:
+    """Helper to convert candidates to contributions for testing."""
+    now = datetime.now(UTC)
+    return [
+        DiscoveryContribution(
+            candidate=candidate,
+            status=status,
+            created_at=now,
+            accepted_at=now if status == ContributionStatus.ACCEPTED else None,
+        )
+        for candidate in candidates
+    ]
 
 
 @pytest.fixture

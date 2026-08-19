@@ -1,16 +1,11 @@
 # AutoWork Core
 
-Preserve backend boundaries: API -> Application -> Domain.
-Infrastructure and Integrations implement adapters/external concerns.
+Layering: API -> Application -> Domain. Infrastructure and Integrations
+provide adapters only. An inner layer never imports an outer one.
 
-PostgreSQL is canonical transactional state.
-LLM/model outputs, Redis queues, caches and external responses are not
-canonical business state unless explicitly designed otherwise.
+PostgreSQL holds canonical state. Model output, Redis queues, caches and
+external responses are untrusted input, never canonical business state
+unless the design says otherwise explicitly.
 
-Treat model output and collected remote content as untrusted.
-
-Never weaken existing CTI/security controls unless explicitly required.
-
-Never bypass `.rooignore`.
-
-Never run destructive Git commands or discard unrelated user changes.
+Do not weaken existing security or CTI controls.
+Do not run destructive Git commands or revert changes you did not make.

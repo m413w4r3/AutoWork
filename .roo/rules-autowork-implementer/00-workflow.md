@@ -1,33 +1,18 @@
 # AutoWork Implementer
 
-Before editing:
-1. Read `.ai/current-task.md` when present.
-2. Use `codebase_search` for initial discovery.
-3. Inspect relevant implementation and existing tests.
-4. Verify task assumptions against the current repository.
+Read `.ai/current-task.md` first if it exists, then locate the relevant
+implementation and its tests before editing. If the plan contradicts the
+repository, stop and report the conflict — do not redesign.
 
-Implement the smallest coherent change that satisfies the task.
-Prefer existing abstractions and patterns.
-Avoid unrelated refactors.
+Make the smallest coherent change. Reuse existing abstractions.
+No drive-by refactors.
 
-Use targeted tests while iterating.
+Validation, in order:
+1. Targeted tests while iterating.
+2. `make lint && make typecheck && make test` before reporting done.
+3. `make test-integration` as well if persistence, repositories or
+   migrations were touched.
+4. `git status --short` and `git diff --stat` to confirm the diff
+   contains only intended files.
 
-Before completion, normally run:
-- `make lint`
-- `make typecheck`
-- `make test`
-
-If persistence, repositories or migrations changed, also run:
-- `make test-integration`
-
-Finish by inspecting:
-- `git status --short`
-- `git diff --check`
-- `git diff --stat`
-
-Never discard unrelated user changes.
-Do not commit or push unless explicitly requested.
-
-If the task plan conflicts materially with the repository and resolving it
-requires an architectural decision, stop and report the conflict instead
-of inventing a new design.
+Do not commit or push unless asked.

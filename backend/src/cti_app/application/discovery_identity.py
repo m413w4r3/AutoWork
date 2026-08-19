@@ -95,18 +95,20 @@ def has_other_strong_signal(left: CandidateTopic, right: CandidateTopic) -> bool
         (left.campaigns, right.campaigns),
         (left.malware, right.malware),
     ):
-        left_tokens = {token for item in left_values for token in explicit_entity_tokens(item)}
-        right_tokens = {token for item in right_values for token in explicit_entity_tokens(item)}
+        left_tokens = frozenset(token for item in left_values for token in explicit_entity_tokens(item))
+        right_tokens = frozenset(token for item in right_values for token in explicit_entity_tokens(item))
         if left_tokens & right_tokens:
             return True
     return False
 
 
-def shared_strong_urls(left: CandidateTopic, right: CandidateTopic) -> set[str]:
+def shared_strong_urls(left: CandidateTopic, right: CandidateTopic) -> frozenset[str]:
     """URL canoniques PRIMARY/INDEPENDENT communes aux deux candidats."""
-    return {
+    return frozenset(
         source.canonical_url for source in left.sources if source.role in STRONG_SOURCE_ROLES
-    } & {source.canonical_url for source in right.sources if source.role in STRONG_SOURCE_ROLES}
+    ) & frozenset(
+        source.canonical_url for source in right.sources if source.role in STRONG_SOURCE_ROLES
+    )
 
 
 def candidates_match_strongly(left: CandidateTopic, right: CandidateTopic) -> bool:
@@ -172,7 +174,7 @@ def build_discovery_identity_index(batches: Sequence[DiscoveryBatch]) -> Discove
     )
 
 
-def _extract_incident_identifiers(text: str) -> set[str]:
+def _extract_incident_identifiers(text: str) -> frozenset[str]:
     """Extract narrow-form incident/advisory/campaign identifiers.
 
     Matches patterns like:
@@ -184,10 +186,10 @@ def _extract_incident_identifiers(text: str) -> set[str]:
     campaign/incident fields in the parser.
 
     Returns:
-        Set of normalized incident ID tokens, or empty set if none found.
+        Frozenset of normalized incident ID tokens, or empty frozenset if none found.
     """
     if not text:
-        return set()
+        return frozenset()
     # Narrow regex: advisory IDs, threat classifications, and explicit campaign/operation names
     patterns = [
         r"\bAA\d{2}-\d{3}A?\b",  # Advisory format: AA26-097A
@@ -201,7 +203,7 @@ def _extract_incident_identifiers(text: str) -> set[str]:
             # For group-capturing patterns, use group(1) if exists, else group(0)
             token = match.group(1) if match.lastindex else match.group(0)
             matches.add(normalize(token))
-    return matches
+    return frozenset(matches)
 
 
 def match_topics(
@@ -230,13 +232,13 @@ def match_topics(
     blockers_list = []
 
     # === Hard identity keys: explicit IDs ===
-    left_incident_ids = _extract_incident_identifiers(left.title)
+    left_incident_ids = frozenset(_extract_incident_identifiers(left.title))
     if left.actor_or_campaign:
-        left_incident_ids.update(_extract_incident_identifiers(left.actor_or_campaign))
+        left_incident_ids = left_incident_ids | frozenset(_extract_incident_identifiers(left.actor_or_campaign))
 
-    right_incident_ids = _extract_incident_identifiers(right.title)
+    right_incident_ids = frozenset(_extract_incident_identifiers(right.title))
     if right.actor_or_campaign:
-        right_incident_ids.update(_extract_incident_identifiers(right.actor_or_campaign))
+        right_incident_ids = right_incident_ids | frozenset(_extract_incident_identifiers(right.actor_or_campaign))
 
     if left_incident_ids & right_incident_ids:
         return TopicMatchResult(
@@ -246,8 +248,8 @@ def match_topics(
         )
 
     # Check explicit campaign/malware fields (currently always empty pre-Patch-2, included for forward compat)
-    left_campaign_tokens = {token for item in left.campaigns for token in explicit_entity_tokens(item)}
-    right_campaign_tokens = {token for item in right.campaigns for token in explicit_entity_tokens(item)}
+    left_campaign_tokens = frozenset(token for item in left.campaigns for token in explicit_entity_tokens(item))
+    right_campaign_tokens = frozenset(token for item in right.campaigns for token in explicit_entity_tokens(item))
     if left_campaign_tokens & right_campaign_tokens:
         return TopicMatchResult(
             decision=TopicMatchDecision.SAME,
@@ -272,18 +274,18 @@ def match_topics(
         elif title_sim >= 0.6:
             weak_reasons.append(f"close title similarity ({title_sim:.2f})")
 
-        if set(left.actors) & set(right.actors):
+        if frozenset(left.actors) & frozenset(right.actors):
             weak_reasons.append("shared actor (not a corroborator)")
 
         # Check shared IOCs
-        left_iocs = {normalize(ioc) for ioc in left.iocs}
-        right_iocs = {normalize(ioc) for ioc in right.iocs}
+        left_iocs = frozenset(normalize(ioc) for ioc in left.iocs)
+        right_iocs = frozenset(normalize(ioc) for ioc in right.iocs)
         if left_iocs & right_iocs:
             weak_reasons.append("shared IOC")
 
         # Check shared CVEs
-        left_cves = {normalize(cve) for cve in left.cves}
-        right_cves = {normalize(cve) for cve in right.cves}
+        left_cves = frozenset(normalize(cve) for cve in left.cves)
+        right_cves = frozenset(normalize(cve) for cve in right.cves)
         if left_cves & right_cves:
             weak_reasons.append("shared CVE")
 
@@ -312,8 +314,8 @@ def match_topics(
         )
 
     # Corroborator 2: shared malware/campaign token (narrow check, not bare actor)
-    left_malware_tokens = {token for item in left.malware for token in explicit_entity_tokens(item)}
-    right_malware_tokens = {token for item in right.malware for token in explicit_entity_tokens(item)}
+    left_malware_tokens = frozenset(token for item in left.malware for token in explicit_entity_tokens(item))
+    right_malware_tokens = frozenset(token for item in right.malware for token in explicit_entity_tokens(item))
     if left_malware_tokens & right_malware_tokens:
         reasons_list.append("anchor URL")
         reasons_list.append("shared specific malware identifier")
