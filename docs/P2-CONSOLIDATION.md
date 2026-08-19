@@ -40,10 +40,29 @@ Classes:
 Fonction principale:
 - `consolidate_discovery_batches()` → fusionne intelligent sans LLM
 
-Algorithme (conservatif):
-1. **Exact match** → même `title_fingerprint`
-2. **Strong signal** → titre similaire (>70%) OU entités communes OU campagne/malware commune
-3. **Sinon** → conserver séparé
+Algorithme (Patch 1 — Tri-state matcher + clique-only clustering):
+1. **Hard identity keys** (décision `SAME`):
+   - Identifiant explicite d'incident/advisory partagé (e.g. `AA26-097A`)
+   - Identifiant de campagne/malware explicite partagé
+   - URL PRIMARY/INDEPENDENT non-contextuelle + titre similaire (≥0.75)
+   - URL PRIMARY/INDEPENDENT non-contextuelle + ID explicite partagé
+2. **Weak signals** (décision `AMBIGUOUS` → révision humaine ou LLM assistant):
+   - Titre proche (0.6–0.75 similarité)
+   - Domaine commun
+   - Entités communes (acteurs, campagnes, malware)
+   - IOC commun
+   - Dates proches
+3. **Pas d'auto-merge sur** :
+   - Titre seul (exact ou similaire)
+   - Acteur seul (jamais corroborateur)
+   - Pays/secteur seul
+   - Publisher/domaine seul
+   - URL contextuelle (observée sous plusieurs SUBJECTs dans le même batch)
+
+Clustering: complet-link (clique-only) — un candidat ne rejoint un cluster que si `SAME`
+avec **tous** les membres existants. Aucune transitivité (A~B, B~C n'entraîne pas A~C).
+Détection de bridges : candidats matchant 2+ clusters non-mutuels → singleton flaggé
+`ambiguous_with` pour révision humaine.
 
 Déduplication:
 - `_merge_sources_in_cluster()` → canonical_url dedupe, enrichit métadonnées

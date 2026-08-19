@@ -8,19 +8,32 @@ archivé, domaine, proximité de date, titre normalisé, entités CTI déjà dé
 connus. Elle compare le batch courant, les groupes de l'édition — y compris déjà sélectionnés
 — et les groupes sélectionnés des éditions antérieures du même pays.
 
-Une correspondance avec un groupe proposé du batch peut enrichir ce groupe. Une
-correspondance avec un groupe déjà sélectionné n'est jamais absorbée automatiquement : elle
-reste visible comme doublon ou ambiguïté. Une correspondance historique forte et non
+Une correspondance déterministe forte (hard identity evidence : URL anchor + corroborator,
+ou identifiant explicite de campagne/incident) enrichit un groupe — qu'il soit PROPOSED ou
+SELECTED. Un groupe SELECTED conserve son `subject_id` lors de cet enrichissement,
+et ses `needs_source_expansion`/`needs_source_verification` sont marqués pour déclencher
+la collecte des nouvelles URL.
+
+Une correspondance ambiguë (weak signals, score 0.45–0.85) est présentée en tant que
+`AMBIGUOUS_REVIEW` : aucun auto-merge structurel, même si le LLM recommande une fusion
+(voir ci-dessous, "Deuxième passe"). Une correspondance historique forte et non
 identique est présentée comme `update_previous_subject`, avec un lien vers le groupe
 antérieur.
 
 La seconde passe s'exécute dans le job de découverte et appelle uniquement le port
-`StructuredExtractionModel`, seulement pour
-les scores déterministes ambigus. Son schéma fermé peut proposer merge, séparation, mise à
-jour ou reprise non indépendante. Sa justification reste une confiance de regroupement : ce
-n'est ni un fait probant, ni un niveau d'attribution. Un résultat ambigu ou indisponible reste
-présenté à l'analyste. La lecture du board reste déterministe et ne déclenche donc aucun appel
-modèle lent dans la requête HTTP.
+`StructuredExtractionModel`, seulement pour les scores déterministes ambigus (0.45–0.85).
+Son schéma fermé peut proposer merge, séparation, mise à jour ou reprise non indépendante.
+
+**Patch 1 (Consolidation d'identité)**: Le LLM n'a plus d'autorité de fusion structurelle.
+Même si le LLM recommande "merge", l'outcome reste `AMBIGUOUS_REVIEW` avec la suggestion du
+modèle flaggée pour révision humaine. Seule une action `HumanDecisionType.MERGE` appliquée
+par l'analyste peut causer une fusion structurelle; les correspondances déterministes fortes
+(hard identity evidence) s'enrichissent automatiquement sans intervention humaine.
+
+La justification du LLM reste une confiance de regroupement : ce n'est ni un fait probant,
+ni un niveau d'attribution. Un résultat ambigu ou indisponible reste présenté à l'analyste.
+La lecture du board reste déterministe et ne déclenche donc aucun appel modèle lent dans la
+requête HTTP.
 
 ## Couverture des sources du bridge
 

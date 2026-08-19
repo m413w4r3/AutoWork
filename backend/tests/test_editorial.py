@@ -132,16 +132,17 @@ class RecordingMaterializer:
 class RecordingStructuredModel:
     def __init__(self) -> None:
         self.calls: list[object] = []
+        # Allow tests to override the return value
+        self.return_result: AmbiguousGroupingResult | None = None
 
     async def extract(self, request: object, output_schema: object) -> object:
         self.calls.append(request)
-        return SimpleNamespace(
-            structured_output=AmbiguousGroupingResult(
-                decision="separate",
-                confidence=GroupingConfidence.LOW,
-                justification="Similarité insuffisante après comparaison structurée.",
-            )
+        result = self.return_result or AmbiguousGroupingResult(
+            decision="separate",
+            confidence=GroupingConfidence.LOW,
+            justification="Similarité insuffisante après comparaison structurée.",
         )
+        return SimpleNamespace(structured_output=result)
 
 
 async def test_same_batch_candidates_never_merge_on_same_canonical_url() -> None:
@@ -640,3 +641,106 @@ async def test_bulk_decisions_are_atomic_on_version_conflict() -> None:
     assert uow.subjects == {}
     assert uow.decisions == []
     assert materializer.subjects == []
+
+
+async def test_ambiguous_llm_unavailable_never_merges() -> None:
+    """Patch 1: LLM merge authority removed.
+
+    When _structured_model is None (LLM unavailable), the outcome must stay
+    AMBIGUOUS_REVIEW, and the candidate must NOT be added to any group
+    (assert group membership unchanged).
+    """
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+
+    # Batch 1: Create an initial group
+    batch1 = _batch(
+        edition.id,
+        [_candidate("Campaign alpha", "https://alpha.example/report")],
+    )
+    uow.batches[batch1.id] = batch1
+    service = EditorialGroupingService(uow, None)  # No structured model
+    groups = await service.synchronize(edition.id)
+    assert len(groups) == 1
+    original_group = groups[0]
+    original_refs = original_group.candidate_references
+
+    # Batch 2: Complementary batch with a similar but not identical candidate
+    # (score should be 0.5-0.8 range -> AMBIGUOUS without LLM)
+    batch2 = _batch(
+        edition.id,
+        [_candidate("Campaign similar", "https://similar.example/report")],  # Close title but different URL
+    )
+    uow.batches[batch2.id] = batch2
+
+    # Synchronize without LLM (model=None)
+    groups = await service.synchronize(edition.id)
+
+    # Verify original group was NOT modified
+    persisted_original = uow.groups[original_group.id]
+    assert persisted_original.candidate_references == original_refs, (
+        "When LLM is unavailable, AMBIGUOUS candidates must not be auto-merged"
+    )
+
+    # Verify a new group was created for the ambiguous candidate
+    assert len(uow.groups) >= 2, "Ambiguous candidate without LLM must create new group"
+
+
+async def test_ambiguous_llm_merge_verdict_does_not_structurally_merge() -> None:
+    """Patch 1: LLM suggests merge, but structural merge is NOT applied.
+
+    Even when the LLM returns decision='merge', the candidate must NOT be
+    added to the existing group. Instead, outcome becomes AMBIGUOUS_REVIEW
+    with the LLM's suggestion flagged for human decision.
+    """
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+
+    # Batch 1: Create an initial group
+    batch1 = _batch(
+        edition.id,
+        [_candidate("Campaign alpha", "https://alpha.example/report")],
+    )
+    uow.batches[batch1.id] = batch1
+    service = EditorialGroupingService(uow, None)
+    groups = await service.synchronize(edition.id)
+    original_group = groups[0]
+    original_refs = original_group.candidate_references
+
+    # Batch 2: Ambiguous-score candidate that triggers LLM
+    batch2 = _batch(
+        edition.id,
+        [_candidate("Campaign similar", "https://similar.example/report")],
+    )
+    uow.batches[batch2.id] = batch2
+
+    # Synchronize WITH a stub LLM that returns decision='merge'
+    llm_stub = RecordingStructuredModel()
+    # Override the recorded result to return 'merge'
+    llm_stub.return_result = AmbiguousGroupingResult(
+        decision="merge",
+        confidence="high",
+        justification="LLM thinks these should merge",
+    )
+    service = EditorialGroupingService(uow, llm_stub)
+    groups = await service.synchronize(edition.id)
+
+    # Verify original group was NOT modified (no structural merge applied)
+    persisted_original = uow.groups[original_group.id]
+    assert persisted_original.candidate_references == original_refs, (
+        "LLM merge verdict must NOT cause structural merge in Patch 1"
+    )
+
+    # Verify a new AMBIGUOUS_REVIEW group was created instead
+    from cti_app.domain.editorial import GroupingOutcome
+
+    ambiguous_groups = [g for g in uow.groups.values() if g.outcome is GroupingOutcome.AMBIGUOUS_REVIEW]
+    assert len(ambiguous_groups) >= 1, "LLM merge suggestion must create AMBIGUOUS_REVIEW group"
+
+    # The AMBIGUOUS_REVIEW group should reference the original group as potential match
+    ambiguous_group = ambiguous_groups[0]
+    assert ambiguous_group.potential_historical_group_id == original_group.id, (
+        "AMBIGUOUS_REVIEW must preserve the suggested group reference"
+    )

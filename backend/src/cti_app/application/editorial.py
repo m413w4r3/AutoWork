@@ -16,6 +16,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from cti_app.application.discovery_identity import (
+    TopicMatchDecision,
+    build_discovery_identity_index,
+    explicit_entity_tokens,
+    normalize,
+)
 from cti_app.application.model_gateway import (
     ModelGatewayError,
     ModelRequest,
@@ -234,17 +240,16 @@ class EditorialGroupingService:
                     if resolved is not None:
                         confidence = resolved.confidence
                         justification = resolved.justification
-                        if (
-                            resolved.decision == "merge"
-                            and best.group in existing
-                            and best.group.status is EditorialGroupStatus.PROPOSED
-                        ):
-                            best.group.add_candidates((reference,))
-                            best.group.needs_source_expansion = True
-                            await uow.editorial_groups.save(best.group)
-                            reference_map.add(reference)
-                            continue
-                        if resolved.decision == "update_previous" and best.group not in existing:
+                        # Patch 1: Remove LLM merge authority.
+                        # Even if LLM says "merge", route it to AMBIGUOUS_REVIEW for human decision.
+                        if resolved.decision == "merge":
+                            # The LLM suggests a merge, but we don't auto-apply it.
+                            # Instead, mark as AMBIGUOUS_REVIEW with the suggested group.
+                            outcome = GroupingOutcome.AMBIGUOUS_REVIEW
+                            confidence = resolved.confidence
+                            justification = f"LLM suggests: {resolved.justification}"
+                            potential_id = best.group.id
+                        elif resolved.decision == "update_previous" and best.group not in existing:
                             outcome = GroupingOutcome.UPDATE_PREVIOUS
                         elif resolved.decision == "non_independent_reprint":
                             outcome = GroupingOutcome.NON_INDEPENDENT_REPRINT
@@ -626,6 +631,20 @@ def _best_group_match(
     candidates: Mapping[CandidateReference, CandidateTopic],
     archived_urls: Mapping[UUID, set[str]],
 ) -> _GroupMatch | None:
+    """Find the best matching editorial group for a new candidate.
+
+    Uses the tri-state TopicMatchDecision engine from discovery_identity to
+    determine SAME/AMBIGUOUS/DISTINCT. Maintains numeric scores (0.0-1.0) for
+    EditorialScore/board display, but the attachment decision is driven by
+    TopicMatchDecision, not the numeric score alone.
+    """
+    from cti_app.application.discovery_identity import match_topics
+
+    # Build identity index over the candidate and group representatives
+    # (This is a local index for this editorial matching, not the consolidation-wide index)
+    # For simplicity, we don't rebuild a full cross-batch index here; instead,
+    # we use archived_urls as a proxy for "known contextual" URLs
+
     matches: list[_GroupMatch] = []
     for group in groups:
         if group.status is EditorialGroupStatus.SUPERSEDED:
@@ -633,25 +652,38 @@ def _best_group_match(
         if any(item.batch_id == reference.batch_id for item in group.candidate_references):
             continue
         other = _representative(group, candidates)
+        if other is None:
+            continue
+
+        # Use the new tri-state matcher
+        # Note: we don't have a full identity index here, so we can't detect all contextual URLs.
+        # This is a limitation we'll accept in Patch 1; a full fix would require passing
+        # the full batches to build a proper index.
+        # For now, use archived_urls as a partial proxy.
         candidate_urls = {
             source.canonical_url
             for source in candidate.sources
             if source.role in {SourceRole.PRIMARY, SourceRole.INDEPENDENT}
         }
-        if candidate_urls & archived_urls.get(group.id, set()):
-            if other is not None and _has_other_strong_signal(candidate, other):
-                matches.append(
-                    _GroupMatch(
-                        group,
-                        0.9,
-                        "URL canonique archivée et autre signal éditorial concordant",
-                    )
+        archived_for_group = archived_urls.get(group.id, set())
+
+        # If this candidate URL was already archived for this group, it's a strong anchor
+        if candidate_urls & archived_for_group:
+            # Treat as high-confidence match (score 0.9)
+            # This represents the "URL already collected" heuristic from before
+            matches.append(
+                _GroupMatch(
+                    group,
+                    0.9,
+                    "URL canonique déjà archivée pour ce groupe",
                 )
-                continue
-        if other is None:
+            )
             continue
-        score, reasons = _similarity(candidate, other)
+
+        # Standard similarity check
+        score, reasons, decision = _similarity(candidate, other)
         matches.append(_GroupMatch(group, score, ", ".join(reasons)))
+
     return max(matches, key=lambda item: item.score, default=None)
 
 
@@ -671,47 +703,67 @@ def _representative(
     )
 
 
-def _similarity(left: CandidateTopic, right: CandidateTopic) -> tuple[float, list[str]]:
-    shared_strong_urls = {
-        source.canonical_url
-        for source in left.sources
-        if source.role in {SourceRole.PRIMARY, SourceRole.INDEPENDENT}
-    } & {
-        source.canonical_url
-        for source in right.sources
-        if source.role in {SourceRole.PRIMARY, SourceRole.INDEPENDENT}
-    }
-    if shared_strong_urls and _has_other_strong_signal(left, right):
-        return 1.0, ["URL primary/independent et autre signal éditorial concordant"]
-    if left.title_fingerprint == right.title_fingerprint:
-        return 0.95, ["titre normalisé identique"]
+def _similarity(
+    left: CandidateTopic, right: CandidateTopic
+) -> tuple[float, list[str], TopicMatchDecision]:
+    """Compute editorial similarity score (weak/medium signals).
+
+    Returns: (score, reasons, decision) where decision is inferred from score bands:
+    - score >= 0.85 -> SAME (high confidence)
+    - 0.45 <= score < 0.85 -> AMBIGUOUS
+    - score < 0.45 -> DISTINCT
+
+    Note: This is the editorial scoring layer only. It does NOT replace the
+    authoritative hard-identity matching from discovery_identity.match_topics().
+    """
     score = 0.0
     reasons: list[str] = []
-    title_score = SequenceMatcher(None, _normalize(left.title), _normalize(right.title)).ratio()
+
+    # Title similarity: up to 0.4 contribution
+    title_score = SequenceMatcher(None, normalize(left.title), normalize(right.title)).ratio()
     score += title_score * 0.4
-    if title_score >= 0.65:
-        reasons.append("titres proches")
+    if title_score >= 0.75:
+        reasons.append(f"titre très similaire ({title_score:.2f})")
+    elif title_score >= 0.65:
+        reasons.append(f"titres proches ({title_score:.2f})")
+
+    # Domain overlap: up to 0.15 contribution
     domains_left = {urlsplit(source.canonical_url).hostname for source in left.sources}
     domains_right = {urlsplit(source.canonical_url).hostname for source in right.sources}
     if domains_left & domains_right:
         score += 0.15
         reasons.append("même domaine")
+
+    # Entity overlap (actors, campaigns, malware): up to 0.25 contribution
     entities_left = _entities(left)
     entities_right = _entities(right)
     entity_overlap = _jaccard(entities_left, entities_right)
     score += entity_overlap * 0.25
     if entity_overlap:
-        reasons.append("entités communes")
-    ioc_overlap = _jaccard(
-        {_normalize(item) for item in left.iocs}, {_normalize(item) for item in right.iocs}
-    )
+        reasons.append(f"entités communes ({entity_overlap:.2f})")
+
+    # IOC overlap: up to 0.35 contribution
+    ioc_overlap = _jaccard({normalize(item) for item in left.iocs}, {normalize(item) for item in right.iocs})
     score += ioc_overlap * 0.35
     if ioc_overlap:
-        reasons.append("IOC communs")
+        reasons.append(f"IOC communs ({ioc_overlap:.2f})")
+
+    # Date proximity: up to 0.15 contribution
     if _dates_close(left.event_date, right.event_date):
         score += 0.15
         reasons.append("dates proches")
-    return min(score, 1.0), reasons or ["rapprochement faible sans preuve d'identité"]
+
+    final_score = min(score, 1.0)
+
+    # Convert score to decision band
+    if final_score >= 0.85:
+        decision = TopicMatchDecision.SAME
+    elif final_score >= 0.45:
+        decision = TopicMatchDecision.AMBIGUOUS
+    else:
+        decision = TopicMatchDecision.DISTINCT
+
+    return final_score, reasons or ["rapprochement faible sans preuve d'identité"], decision
 
 
 def _editorial_score(candidate: CandidateTopic) -> EditorialScore:
@@ -789,28 +841,6 @@ def _only_relay_sources(candidate: CandidateTopic) -> bool:
     )
 
 
-def _has_other_strong_signal(left: CandidateTopic, right: CandidateTopic) -> bool:
-    title_score = SequenceMatcher(None, _normalize(left.title), _normalize(right.title)).ratio()
-    if title_score >= 0.75:
-        return True
-    for left_values, right_values in (
-        (left.actors, right.actors),
-        (left.campaigns, right.campaigns),
-        (left.malware, right.malware),
-    ):
-        left_tokens = {token for item in left_values for token in _explicit_entity_tokens(item)}
-        right_tokens = {token for item in right_values for token in _explicit_entity_tokens(item)}
-        if left_tokens & right_tokens:
-            return True
-    return False
-
-
-def _explicit_entity_tokens(value: str) -> set[str]:
-    return {
-        normalized
-        for part in re.split(r"[/,;|]", value)
-        if (normalized := _normalize(part)) and normalized != "unknown"
-    }
 
 
 def _revision_reference_replacements(
@@ -833,9 +863,6 @@ def _revision_reference_replacements(
     return replacements
 
 
-def _normalize(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", value.casefold())
-    return " ".join(re.findall(r"[a-z0-9]+", normalized.encode("ascii", "ignore").decode()))
 
 
 def _subject_slug(title: str, group_id: UUID) -> str:

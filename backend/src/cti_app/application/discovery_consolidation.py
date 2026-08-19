@@ -17,8 +17,10 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from cti_app.application.discovery_identity import (
-    candidates_match_strongly,
+    TopicMatchDecision,
+    build_discovery_identity_index,
     canonical_source_key,
+    match_topics,
 )
 from cti_app.domain.discovery import (
     CandidateTopic,
@@ -57,6 +59,7 @@ class ConsolidatedCandidate:
     sources: list[SourceCandidate]
     duplicate_publication_count: int
     merge_warnings: tuple[str, ...]
+    ambiguous_with: tuple[UUID, ...] = ()  # Refs to other clusters/occurrences this bridges
 
     @property
     def contribution_count(self) -> int:
@@ -68,8 +71,11 @@ def consolidate_discovery_batches(
 ) -> list[ConsolidatedCandidate]:
     """Consolide plusieurs batches de découverte en une vue unique.
 
+    Algorithme : pairwise matrix + clique-only clustering (complet-link).
+    Aucune transitivité, pas d'auto-merge sur titre seul, pas d'acteur comme signal fort.
+
     Args:
-        batches: batches actifs d'une édition, dans l'ordre chronologique.
+        batches: batches actifs d'une édition.
 
     Returns:
         Les sujets consolidés, publications dédupliquées et métadonnées fusionnées.
@@ -77,39 +83,98 @@ def consolidate_discovery_batches(
     if not batches:
         return []
 
+    # Build identity index once
+    identity_index = build_discovery_identity_index(batches)
+
     # Index (batch_id, candidate_id) -> candidat, et rang chronologique du batch.
     candidates_by_batch: dict[UUID, dict[UUID, CandidateTopic]] = {
         batch.id: {candidate.id: candidate for candidate in batch.candidates} for batch in batches
     }
     batch_order: dict[UUID, int] = {batch.id: index for index, batch in enumerate(batches)}
 
-    # Chaque cluster est identifié par l'occurrence qui l'a ouvert.
-    clusters: dict[CandidateOccurrence, list[CandidateOccurrence]] = {}
-
+    # Collect all occurrences
+    all_occurrences: list[CandidateOccurrence] = []
     for batch in batches:
         for candidate in batch.candidates:
-            occurrence = CandidateOccurrence(batch_id=batch.id, candidate_id=candidate.id)
+            all_occurrences.append(CandidateOccurrence(batch_id=batch.id, candidate_id=candidate.id))
 
-            matched_key: CandidateOccurrence | None = None
-            for key, members in clusters.items():
-                # Comparer à tous les membres déjà rattachés : le rapprochement
-                # peut porter sur une occurrence enrichie plutôt que sur celle
-                # qui a ouvert le cluster.
-                for member in members:
-                    other = candidates_by_batch[member.batch_id].get(member.candidate_id)
-                    if other is not None and candidates_match_strongly(candidate, other):
-                        matched_key = key
-                        break
-                if matched_key is not None:
+    # === Step 1: Compute full pairwise match matrix (order-independent) ===
+    pairwise_matrix: dict[tuple[CandidateOccurrence, CandidateOccurrence], TopicMatchDecision] = {}
+    for i, occ1 in enumerate(all_occurrences):
+        candidate1 = candidates_by_batch[occ1.batch_id].get(occ1.candidate_id)
+        if candidate1 is None:
+            continue
+        for occ2 in all_occurrences[i + 1 :]:
+            candidate2 = candidates_by_batch[occ2.batch_id].get(occ2.candidate_id)
+            if candidate2 is None:
+                continue
+            result = match_topics(candidate1, candidate2, identity_index)
+            # Store bidirectionally
+            pairwise_matrix[(occ1, occ2)] = result.decision
+            pairwise_matrix[(occ2, occ1)] = result.decision
+
+    # === Step 2: Build cliques (complete-link: every pair must be SAME) ===
+    # Track which occurrences have been assigned
+    assigned: set[CandidateOccurrence] = set()
+    clusters: list[set[CandidateOccurrence]] = []
+
+    for occ in all_occurrences:
+        if occ in assigned:
+            continue
+
+        # Try to grow a clique starting from this occurrence
+        clique: set[CandidateOccurrence] = {occ}
+        assigned.add(occ)
+
+        # Find all other occurrences that are SAME with occ
+        same_with_occ = {
+            other
+            for other in all_occurrences
+            if other != occ
+            and other not in assigned
+            and pairwise_matrix.get((occ, other)) is TopicMatchDecision.SAME
+        }
+
+        # Grow the clique greedily, but only if the new member is SAME with ALL current members
+        for candidate_member in same_with_occ:
+            is_compatible = all(
+                pairwise_matrix.get((candidate_member, existing)) is TopicMatchDecision.SAME
+                for existing in clique
+                if existing != candidate_member
+            )
+            if is_compatible:
+                clique.add(candidate_member)
+                assigned.add(candidate_member)
+
+        clusters.append(clique)
+
+    # === Step 3: Detect bridges (occurrences matching multiple non-mutual clusters) ===
+    # For each unassigned AMBIGUOUS bridge, mark it with the clusters it connects
+    bridges: dict[CandidateOccurrence, tuple[UUID, ...]] = {}
+    for occ in all_occurrences:
+        if occ in assigned:
+            continue
+        # occ is a singleton; find which clusters it's SAME with
+        matched_cluster_ids = set()
+        for cluster_idx, cluster in enumerate(clusters):
+            for cluster_member in cluster:
+                if pairwise_matrix.get((occ, cluster_member)) is TopicMatchDecision.SAME:
+                    matched_cluster_ids.add(cluster_idx)
                     break
+        if matched_cluster_ids:
+            # This occurrence bridges multiple clusters -> flagged as ambiguous
+            bridges[occ] = tuple(matched_cluster_ids)
+        # Mark as assigned (singleton)
+        assigned.add(occ)
 
-            if matched_key is not None:
-                clusters[matched_key].append(occurrence)
-            else:
-                clusters[occurrence] = [occurrence]
-
+    # === Step 4: Build consolidated candidates ===
     consolidated: list[ConsolidatedCandidate] = []
-    for occurrences in clusters.values():
+    for cluster in clusters:
+        occurrences = sorted(
+            cluster,
+            key=lambda occ: (batch_order[occ.batch_id], str(occ.candidate_id)),
+        )
+
         cluster_candidates: list[CandidateTopic] = []
         for occurrence in occurrences:
             member_candidate = candidates_by_batch[occurrence.batch_id].get(occurrence.candidate_id)
@@ -132,15 +197,37 @@ def consolidate_discovery_batches(
         consolidated.append(
             ConsolidatedCandidate(
                 representative=merged_candidate,
-                member_references=tuple(
-                    sorted(
-                        occurrences,
-                        key=lambda occ: (batch_order[occ.batch_id], str(occ.candidate_id)),
-                    )
-                ),
+                member_references=tuple(occurrences),
                 sources=merged_sources,
                 duplicate_publication_count=duplicate_count,
                 merge_warnings=tuple(merge_warnings),
+                ambiguous_with=(),  # Non-bridge
+            )
+        )
+
+    # Add singleton bridges as separate consolidated candidates
+    for bridge_occ in all_occurrences:
+        if bridge_occ not in bridges:
+            continue
+        bridge_candidate = candidates_by_batch[bridge_occ.batch_id].get(bridge_occ.candidate_id)
+        if bridge_candidate is None:
+            continue
+
+        merged_sources, duplicate_count, merge_warnings = _merge_sources_in_cluster(
+            [bridge_candidate]
+        )
+        merged_candidate = _merge_candidate_metadata(
+            bridge_candidate, [bridge_candidate], merged_sources
+        )
+
+        consolidated.append(
+            ConsolidatedCandidate(
+                representative=merged_candidate,
+                member_references=(bridge_occ,),
+                sources=merged_sources,
+                duplicate_publication_count=duplicate_count,
+                merge_warnings=tuple(merge_warnings),
+                ambiguous_with=bridges[bridge_occ],  # Flag the bridges
             )
         )
 
