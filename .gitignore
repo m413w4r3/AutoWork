@@ -74,6 +74,9 @@ chatgpt-bridge/out/
 .roo/
 .roo/**
 
+!.codex
+!.agents
+
 # Local diagnostic trail: raw model answers and parser decisions.
 # Never commit — it mirrors external model output verbatim.
 /var/
