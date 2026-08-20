@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 
+from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
     DisplayPolicy,
     ExtractionItem,
@@ -17,7 +18,6 @@ from cti_app.application.production_parsers import (
     ReferenceReport,
     TechnicalExtraction,
 )
-from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.domain.publication import ArtifactType
 
 _MARKER = re.compile(r"\[(S\d{1,3})\]", re.IGNORECASE)

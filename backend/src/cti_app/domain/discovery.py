@@ -238,6 +238,7 @@ class CandidateTopic:
 @dataclass(slots=True)
 class DiscoveryContribution:
     """One CandidateTopic with contribution metadata for temporal tracking."""
+
     candidate: CandidateTopic
     status: ContributionStatus
     created_at: datetime
@@ -256,12 +257,13 @@ class DiscoveryBatch:
     complementary_axis: str
     queries: tuple[str, ...]
     citations: tuple[dict[str, str | None], ...]
-    contributions: list[DiscoveryContribution]
     discovery_model_run_id: UUID
     structuring_model_run_id: UUID
     tlp: TLP
     sensitivity: str
     external_llm_allowed: bool
+    contributions: list[DiscoveryContribution] = field(default_factory=list)
+    candidates: list[CandidateTopic] = field(default_factory=list)
     report_sha256: str | None = None
     parser_version: str = "legacy-model-structured"
     parsing_status: str = "completed"
@@ -299,21 +301,29 @@ class DiscoveryBatch:
                     source.relationship_status = SourceRelationshipStatus.PROVISIONAL
         if not self.source_coverage_complete and not self.source_coverage_incomplete_reason:
             raise ValueError("Incomplete source coverage requires a reason")
-        # Deduplicate candidate topics
-        candidates = [c.candidate for c in self.contributions]
+        if self.candidates and not self.contributions:
+            self.contributions = [
+                DiscoveryContribution(
+                    candidate=candidate,
+                    status=ContributionStatus.ACCEPTED,
+                    created_at=self.created_at,
+                    accepted_at=self.created_at,
+                )
+                for candidate in self.candidates
+            ]
+        # `candidates` is the immutable raw-batch projection. Acceptance is a
+        # separate contribution attribute and must not make parsed subjects
+        # disappear from discovery reads.
+        candidates = [contribution.candidate for contribution in self.contributions]
         deduplicated = deduplicate_topics(candidates)
         # Update contributions with deduplicated candidates
         candidate_map = {c.id: c for c in deduplicated}
         for contribution in self.contributions:
             if contribution.candidate.id in candidate_map:
                 contribution.candidate = candidate_map[contribution.candidate.id]
+        self.candidates = deduplicated
         if self.parsing_revision < 1:
             raise ValueError("Parsing revision must be positive")
-
-    @property
-    def candidates(self) -> list[CandidateTopic]:
-        """Return only ACCEPTED contributions (for backward compat)."""
-        return [c.candidate for c in self.contributions if c.status == ContributionStatus.ACCEPTED]
 
     @property
     def is_active_revision(self) -> bool:
@@ -322,7 +332,9 @@ class DiscoveryBatch:
     @property
     def history_hash(self) -> str:
         """Hash of accepted contributions for idempotency checking."""
-        accepted = [c.candidate.id for c in self.contributions if c.status == ContributionStatus.ACCEPTED]
+        accepted = [
+            c.candidate.id for c in self.contributions if c.status == ContributionStatus.ACCEPTED
+        ]
         content = "|".join(str(cid) for cid in sorted(accepted))
         return hashlib.sha256(content.encode()).hexdigest()
 

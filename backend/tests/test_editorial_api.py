@@ -1,27 +1,33 @@
+from uuid import uuid4
+
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.editorial import router
 from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.identity import LocalIdentityProvider
+from cti_app.domain.discovery_cumulative import DiscoveryMemberReference
 from cti_app.logging import CorrelationIdMiddleware
 from tests.editorial_support import InMemoryEditorialUnitOfWorkFactory
-from tests.test_editorial import _batch, _candidate, _edition
+from tests.test_editorial import _candidate, _edition, _snapshot
 
 
 async def test_editorial_api_group_select_and_decision_audit() -> None:
     uow = InMemoryEditorialUnitOfWorkFactory()
     edition = _edition()
-    batch = _batch(
+    candidates = [
+        _candidate("Campagne A", "https://a.example/report"),
+        _candidate("Campagne B", "https://b.example/report"),
+    ]
+    uow.editions[edition.id] = edition
+    uow.snapshots[edition.id] = _snapshot(
         edition.id,
         [
-            _candidate("Campagne A", "https://a.example/report"),
-            _candidate("Campagne B", "https://b.example/report"),
+            (uuid4(), candidate, (DiscoveryMemberReference(uuid4(), candidate.id),))
+            for candidate in candidates
         ],
     )
-    uow.editions[edition.id] = edition
-    uow.batches[batch.id] = batch
-    service = EditorialGroupingService(uow, None)
+    service = EditorialGroupingService(uow)
     await service.synchronize(edition.id)
     application = FastAPI()
     application.add_middleware(CorrelationIdMiddleware)
@@ -54,16 +60,19 @@ async def test_editorial_api_group_select_and_decision_audit() -> None:
 async def test_editorial_api_applies_versioned_decisions_in_one_request() -> None:
     uow = InMemoryEditorialUnitOfWorkFactory()
     edition = _edition()
-    batch = _batch(
+    candidates = [
+        _candidate("Campagne A", "https://a.example/report"),
+        _candidate("Campagne B", "https://b.example/report"),
+    ]
+    uow.editions[edition.id] = edition
+    uow.snapshots[edition.id] = _snapshot(
         edition.id,
         [
-            _candidate("Campagne A", "https://a.example/report"),
-            _candidate("Campagne B", "https://b.example/report"),
+            (uuid4(), candidate, (DiscoveryMemberReference(uuid4(), candidate.id),))
+            for candidate in candidates
         ],
     )
-    uow.editions[edition.id] = edition
-    uow.batches[batch.id] = batch
-    service = EditorialGroupingService(uow, None)
+    service = EditorialGroupingService(uow)
     await service.synchronize(edition.id)
     application = FastAPI()
     application.add_middleware(CorrelationIdMiddleware)

@@ -165,11 +165,9 @@ déterministe proposé. Elles sont dédupliquées par valeur normalisée dans un
 jamais validées, ajoutées à un Evidence Pack, utilisées pour une chasse ou exportées dans un
 livrable final pendant la découverte.
 
-Le parseur de compatibilité reconnaît les anciennes sections de niveau 2, les mentions de
-publication dans la fenêtre et les zones `axe complémentaire`, `hors fenêtre`, `contexte` ou
-`contrôle a posteriori`. Les sections hors fenêtre restent visibles comme contexte non
-sélectionnable. Le rapport Iran archivé retrouve ainsi CYFIRMA et NCC Group sans nouvelle
-recherche.
+Le parseur accepte exclusivement le contrat courant `SUBJECT` / `PUBLICATION`. Un rapport
+d'un ancien format est rejeté avec `report_schema_unsupported` et reste disponible dans
+l'archive brute pour diagnostic.
 
 Le batch conserve le ModelRun ChatGPT, le SHA-256 du rapport, la version du parseur, son statut
 et ses avertissements. Le champ historique `structuring_model_run_id` référence le même

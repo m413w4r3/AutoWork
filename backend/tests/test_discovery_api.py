@@ -1,4 +1,5 @@
-from datetime import date
+from datetime import UTC, date, datetime
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -16,6 +17,12 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.model_gateway import ModelGateway, ModelRouter
 from cti_app.domain.classification import TLP
+from cti_app.domain.discovery_cumulative import (
+    DiscoveryMemberReference,
+    DiscoveryPlannerKind,
+    DiscoverySnapshot,
+    DiscoverySubject,
+)
 from cti_app.domain.editions import Edition
 from cti_app.domain.model_runs import ModelProvider, ModelRunStatus
 from cti_app.integrations.models import FakeModelAdapter, InMemoryModelOutputStore
@@ -25,6 +32,40 @@ from tests.edition_support import InMemoryEditionUnitOfWorkFactory
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
 from tests.test_discovery import DeferredResearchAdapter, research_markdown_fixture
+
+
+class SnapshotProjectionForApiTests:
+    def __init__(self, discovery: DiscoveryService) -> None:
+        self._discovery = discovery
+
+    async def active_snapshot(self, edition_id: UUID) -> DiscoverySnapshot | None:
+        batches = await self._discovery.list_batches(edition_id)
+        subjects = {
+            candidate.id: DiscoverySubject(
+                subject_id=candidate.id,
+                candidate=candidate,
+                member_references=(DiscoveryMemberReference(batch.id, candidate.id),),
+                created_at=batch.created_at,
+            )
+            for batch in batches
+            if batch.is_active_revision
+            for candidate in batch.candidates
+        }
+        if not subjects:
+            return None
+        return DiscoverySnapshot(
+            id=uuid4(),
+            edition_id=edition_id,
+            version=1,
+            parent_snapshot_id=None,
+            intake_id=uuid4(),
+            merge_run_id=uuid4(),
+            planner_kind=DiscoveryPlannerKind.HEURISTIC,
+            subjects=tuple(subjects.values()),
+            snapshot_hash="a" * 64,
+            is_active=True,
+            created_at=datetime.now(UTC),
+        )
 
 
 async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
@@ -66,6 +107,7 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
     application.include_router(jobs_router)
     application.state.edition_service = edition_service
     application.state.discovery_service = discovery
+    application.state.cumulative_discovery_service = SnapshotProjectionForApiTests(discovery)
     application.state.job_service = JobService(job_uow, registry)
     application.state.job_dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     application.state.identity_provider = LocalIdentityProvider()
@@ -188,6 +230,7 @@ async def test_manual_recovery_previews_then_resumes_the_original_job() -> None:
     application.include_router(jobs_router)
     application.state.edition_service = edition_service
     application.state.discovery_service = discovery
+    application.state.cumulative_discovery_service = SnapshotProjectionForApiTests(discovery)
     application.state.job_service = JobService(job_uow, registry)
     application.state.job_dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     application.state.identity_provider = LocalIdentityProvider()
@@ -277,6 +320,7 @@ async def _recovery_application() -> tuple[
     application.include_router(jobs_router)
     application.state.edition_service = edition_service
     application.state.discovery_service = discovery
+    application.state.cumulative_discovery_service = SnapshotProjectionForApiTests(discovery)
     application.state.job_service = JobService(job_uow, registry)
     application.state.job_dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     application.state.identity_provider = LocalIdentityProvider()

@@ -1,32 +1,13 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import re
-import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
-from difflib import SequenceMatcher
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
-
-from cti_app.application.discovery_identity import (
-    build_discovery_identity_index,
-    explicit_entity_tokens,
-    normalize,
-)
-from cti_app.application.model_gateway import (
-    ModelGatewayError,
-    ModelRequest,
-    ModelRoutingHint,
-    StructuredExtractionModel,
-)
+from cti_app.application.discovery_identity import normalize
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.discovery import (
@@ -34,7 +15,6 @@ from cti_app.domain.discovery import (
     DiscoveryBatch,
     SourceRelationshipStatus,
     SourceRole,
-    canonicalize_http_url,
 )
 from cti_app.domain.editorial import (
     CandidateReference,
@@ -71,14 +51,6 @@ class EditorialDecisionCommand:
     decision: EditorialDecisionValue
 
 
-class AmbiguousGroupingResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    decision: str = Field(pattern="^(merge|separate|update_previous|non_independent_reprint)$")
-    confidence: GroupingConfidence
-    justification: str = Field(min_length=1, max_length=1_000)
-
-
 class WorkspaceMaterializer(Protocol):
     async def materialize(
         self,
@@ -107,174 +79,62 @@ class EditorialGroupingService:
     def __init__(
         self,
         uow_factory: UnitOfWorkFactory,
-        structured_model: StructuredExtractionModel | None,
         *,
         materializer: WorkspaceMaterializer | None = None,
         workspace_root: Path = Path("work/subjects"),
     ) -> None:
         self._uow_factory = uow_factory
-        self._structured_model = structured_model
         self._materializer = materializer
         self._workspace_root = workspace_root
 
-    async def synchronize(
-        self, edition_id: UUID, *, resolve_ambiguous: bool = True
-    ) -> list[EditorialGroup]:
+    async def synchronize(self, edition_id: UUID) -> list[EditorialGroup]:
         async with self._uow_factory() as uow:
-            all_batches = list(await uow.discovery_batches.list_for_edition(edition_id))
-            batches = [batch for batch in all_batches if batch.is_active_revision]
             existing = list(await uow.editorial_groups.list_for_edition(edition_id))
-            historical = list(await uow.editorial_groups.list_historical(edition_id))
-            archived_urls: dict[UUID, set[str]] = {}
-            for group in [*existing, *historical]:
-                if group.subject_id is None:
-                    continue
-                documents = await uow.source_documents.list_for_subject(group.subject_id)
-                for document in documents:
-                    try:
-                        archived_urls.setdefault(group.id, set()).add(
-                            canonicalize_http_url(document.origin)
-                        )
-                    except ValueError:
-                        continue
-            replacements = _revision_reference_replacements(all_batches)
-            for group in existing:
-                before = group.candidate_references
-                group.replace_candidate_references(replacements)
-                if group.candidate_references != before:
-                    await uow.editorial_groups.save(group)
-            candidate_map = _candidate_map(batches)
-            reference_map = {
-                reference for group in existing for reference in group.candidate_references
+            snapshot = await uow.discovery_snapshots.get_active(edition_id)
+            if snapshot is None:
+                return existing
+            by_subject = {
+                group.discovery_subject_id: group
+                for group in existing
+                if group.discovery_subject_id is not None
             }
-            comparison_candidates = dict(candidate_map)
-            for group in historical:
-                for reference in group.candidate_references:
-                    if reference in comparison_candidates:
-                        continue
-                    batch = await uow.discovery_batches.get(reference.batch_id)
-                    if batch is not None:
-                        candidate = next(
-                            (
-                                item
-                                for item in batch.candidates
-                                if item.id == reference.candidate_id
-                            ),
-                            None,
-                        )
-                        if candidate is not None:
-                            comparison_candidates[reference] = candidate
-
-            for reference, candidate in candidate_map.items():
-                if reference in reference_map:
-                    continue
-                current_match = _best_group_match(
-                    reference, candidate, existing, comparison_candidates, archived_urls
+            for subject in snapshot.subjects:
+                references = tuple(
+                    CandidateReference(item.batch_id, item.candidate_id)
+                    for item in subject.member_references
                 )
-                historical_match = _best_group_match(
-                    reference, candidate, historical, comparison_candidates, archived_urls
-                )
-                best = _prefer_match(current_match, historical_match)
-                # Enrichir en place les groupes PROPOSED et SELECTED (§27.1).
-                if (
-                    best is not None
-                    and best.score >= 0.85
-                    and best.group in existing
-                    and best.group.status
-                    in (EditorialGroupStatus.PROPOSED, EditorialGroupStatus.SELECTED)
-                ):
-                    best.group.add_candidates((reference,))
-                    best.group.needs_source_expansion = True
-                    best.group.needs_source_verification = True
-                    await uow.editorial_groups.save(best.group)
-                    reference_map.add(reference)
-                    continue
-
-                if best is not None and best.score >= 0.85:
-                    same_publication = "URL canonique" in best.justification
-                    if best.group in existing:
-                        outcome = (
-                            GroupingOutcome.DUPLICATE_PUBLICATION
-                            if same_publication
-                            else GroupingOutcome.AMBIGUOUS_REVIEW
-                        )
-                    else:
-                        outcome = (
-                            GroupingOutcome.DUPLICATE_PUBLICATION
-                            if same_publication
-                            else GroupingOutcome.UPDATE_PREVIOUS
-                        )
-                    group = EditorialGroup(
-                        edition_id=edition_id,
-                        title=candidate.title,
-                        candidate_references=(reference,),
-                        outcome=outcome,
-                        score=_editorial_score(candidate),
-                        source_relationship_status=SourceRelationshipStatus.PROVISIONAL,
-                        needs_source_verification=True,
-                        needs_source_expansion=True,
-                        grouping_confidence=GroupingConfidence.HIGH,
-                        grouping_justification=best.justification,
-                        potential_historical_group_id=best.group.id,
+                group = by_subject.get(subject.subject_id)
+                if group is not None:
+                    additions = tuple(
+                        reference
+                        for reference in references
+                        if reference not in group.candidate_references
                     )
-                    await uow.editorial_groups.add(group)
-                    existing.append(group)
-                    reference_map.add(reference)
+                    if additions and group.status in {
+                        EditorialGroupStatus.PROPOSED,
+                        EditorialGroupStatus.SELECTED,
+                    }:
+                        group.add_candidates(additions)
+                        group.needs_source_expansion = True
+                        group.needs_source_verification = True
+                        await uow.editorial_groups.save(group)
                     continue
-
-                outcome = GroupingOutcome.NEW_SUBJECT
-                confidence = GroupingConfidence.HIGH
-                justification = "Aucun rapprochement déterministe suffisamment fort."
-                potential_id = None
-                if best is not None and best.score >= 0.45:
-                    outcome = GroupingOutcome.AMBIGUOUS_REVIEW
-                    confidence = GroupingConfidence.MEDIUM
-                    justification = best.justification
-                    potential_id = best.group.id
-                    resolved = (
-                        await self._resolve_ambiguous(candidate, best, comparison_candidates)
-                        if resolve_ambiguous
-                        else None
-                    )
-                    if resolved is not None:
-                        confidence = resolved.confidence
-                        justification = resolved.justification
-                        # Patch 1: Remove LLM merge authority.
-                        # Even if LLM says "merge", route it to AMBIGUOUS_REVIEW for human decision.
-                        if resolved.decision == "merge":
-                            # The LLM suggests a merge, but we don't auto-apply it.
-                            # Instead, mark as AMBIGUOUS_REVIEW with the suggested group.
-                            outcome = GroupingOutcome.AMBIGUOUS_REVIEW
-                            confidence = resolved.confidence
-                            justification = f"LLM suggests: {resolved.justification}"
-                            potential_id = best.group.id
-                        elif resolved.decision == "update_previous" and best.group not in existing:
-                            outcome = GroupingOutcome.UPDATE_PREVIOUS
-                        elif resolved.decision == "non_independent_reprint":
-                            outcome = GroupingOutcome.NON_INDEPENDENT_REPRINT
-                        elif resolved.decision == "separate":
-                            outcome = GroupingOutcome.NEW_SUBJECT
-                elif _only_relay_sources(candidate):
-                    outcome = GroupingOutcome.NON_INDEPENDENT_REPRINT
-                    confidence = GroupingConfidence.HIGH
-                    justification = "Toutes les sources visibles sont des reprises ou agrégateurs."
-
+                candidate = subject.candidate
                 group = EditorialGroup(
                     edition_id=edition_id,
                     title=candidate.title,
-                    candidate_references=(reference,),
-                    outcome=outcome,
+                    candidate_references=references,
+                    outcome=GroupingOutcome.NEW_SUBJECT,
                     score=_editorial_score(candidate),
                     source_relationship_status=SourceRelationshipStatus.PROVISIONAL,
                     needs_source_verification=True,
                     needs_source_expansion=True,
-                    grouping_confidence=confidence,
-                    grouping_justification=justification,
-                    potential_historical_group_id=potential_id,
+                    grouping_confidence=GroupingConfidence.HIGH,
+                    grouping_justification="Identité issue du snapshot cumulatif actif.",
+                    discovery_subject_id=subject.subject_id,
                 )
                 await uow.editorial_groups.add(group)
                 existing.append(group)
-                reference_map.add(reference)
             await uow.commit()
             return existing
 
@@ -561,58 +421,6 @@ class EditorialGroupingService:
         async with self._uow_factory() as uow:
             return list(await uow.human_decisions.list_for_edition(edition_id))
 
-    async def _resolve_ambiguous(
-        self,
-        candidate: CandidateTopic,
-        match: _GroupMatch,
-        candidates: Mapping[CandidateReference, CandidateTopic],
-    ) -> AmbiguousGroupingResult | None:
-        if self._structured_model is None:
-            return None
-        other = _representative(match.group, candidates)
-        if other is None:
-            return None
-        payload = {
-            "candidate": _comparison_payload(candidate),
-            "possible_match": _comparison_payload(other),
-            "deterministic_similarity": round(match.score, 3),
-        }
-        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        try:
-            execution = await self._structured_model.extract(
-                ModelRequest(
-                    text=(
-                        "Compare uniquement l'identité éditoriale de ces publications. Décide si "
-                        "elles décrivent le même sujet, une mise à jour, une reprise non "
-                        "indépendante ou deux sujets distincts. Ne produis aucune attribution et "
-                        "n'invente aucun fait.\n" + raw
-                    ),
-                    prompt_template_id="ambiguous-editorial-grouping",
-                    prompt_template_version="1.0",
-                    evidence_pack_hash=hashlib.sha256(raw.encode()).hexdigest(),
-                    external_llm_allowed=(
-                        candidate.external_llm_allowed and other.external_llm_allowed
-                    ),
-                    routing_hint=ModelRoutingHint.AMBIGUOUS_CLUSTERING,
-                    sensitivity=candidate.sensitivity,
-                ),
-                AmbiguousGroupingResult,
-            )
-        except ModelGatewayError:
-            return None
-        return (
-            execution.structured_output
-            if isinstance(execution.structured_output, AmbiguousGroupingResult)
-            else None
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class _GroupMatch:
-    group: EditorialGroup
-    score: float
-    justification: str
-
 
 def _candidate_map(batches: Sequence[DiscoveryBatch]) -> dict[CandidateReference, CandidateTopic]:
     return {
@@ -623,134 +431,12 @@ def _candidate_map(batches: Sequence[DiscoveryBatch]) -> dict[CandidateReference
     }
 
 
-def _best_group_match(
-    reference: CandidateReference,
-    candidate: CandidateTopic,
-    groups: Sequence[EditorialGroup],
-    candidates: Mapping[CandidateReference, CandidateTopic],
-    archived_urls: Mapping[UUID, set[str]],
-) -> _GroupMatch | None:
-    """Find the best matching editorial group for a new candidate.
-
-    Computes numeric similarity scores (0.0-1.0) for ranking and display.
-    The attachment decision is driven by score thresholds defined in synchronize().
-    """
-    from cti_app.application.discovery_identity import match_topics
-
-    # Build identity index over the candidate and group representatives
-    # (This is a local index for this editorial matching, not the consolidation-wide index)
-    # For simplicity, we don't rebuild a full cross-batch index here; instead,
-    # we use archived_urls as a proxy for "known contextual" URLs
-
-    matches: list[_GroupMatch] = []
-    for group in groups:
-        if group.status is EditorialGroupStatus.SUPERSEDED:
-            continue
-        if any(item.batch_id == reference.batch_id for item in group.candidate_references):
-            continue
-        other = _representative(group, candidates)
-        if other is None:
-            continue
-
-        # Use the new tri-state matcher
-        # Note: we don't have a full identity index here, so we can't detect all contextual URLs.
-        # This is a limitation we'll accept in Patch 1; a full fix would require passing
-        # the full batches to build a proper index.
-        # For now, use archived_urls as a partial proxy.
-        candidate_urls = {
-            source.canonical_url
-            for source in candidate.sources
-            if source.role in {SourceRole.PRIMARY, SourceRole.INDEPENDENT}
-        }
-        archived_for_group = archived_urls.get(group.id, set())
-
-        # Standard similarity check
-        score, reasons = _similarity(candidate, other)
-
-        # Note archived URL evidence for ranking, but do NOT boost score
-        # Per requirement C2: archived URL alone cannot produce structural SAME
-        if candidate_urls & archived_for_group:
-            reasons.append("URL canonique déjà archivée pour ce groupe")
-
-        matches.append(_GroupMatch(group, score, ", ".join(reasons)))
-
-    return max(matches, key=lambda item: item.score, default=None)
-
-
-def _prefer_match(left: _GroupMatch | None, right: _GroupMatch | None) -> _GroupMatch | None:
-    if left is None:
-        return right
-    if right is None:
-        return left
-    return left if left.score >= right.score else right
-
-
-def _representative(
-    group: EditorialGroup, candidates: Mapping[CandidateReference, CandidateTopic]
-) -> CandidateTopic | None:
-    return next(
-        (candidates[item] for item in group.candidate_references if item in candidates), None
-    )
-
-
-def _similarity(
-    left: CandidateTopic, right: CandidateTopic
-) -> tuple[float, list[str]]:
-    """Compute editorial similarity score (weak/medium signals).
-
-    Returns: (score, reasons) where score is normalized to [0.0, 1.0].
-
-    Note: This is the editorial scoring layer only. It does NOT replace the
-    authoritative hard-identity matching from discovery_identity.match_topics().
-    """
-    score = 0.0
-    reasons: list[str] = []
-
-    # Title similarity: up to 0.4 contribution
-    title_score = SequenceMatcher(None, normalize(left.title), normalize(right.title)).ratio()
-    score += title_score * 0.4
-    if title_score >= 0.75:
-        reasons.append(f"titre très similaire ({title_score:.2f})")
-    elif title_score >= 0.65:
-        reasons.append(f"titres proches ({title_score:.2f})")
-
-    # Domain overlap: up to 0.15 contribution
-    domains_left = {urlsplit(source.canonical_url).hostname for source in left.sources}
-    domains_right = {urlsplit(source.canonical_url).hostname for source in right.sources}
-    if domains_left & domains_right:
-        score += 0.15
-        reasons.append("même domaine")
-
-    # Entity overlap (actors, campaigns, malware): up to 0.25 contribution
-    entities_left = _entities(left)
-    entities_right = _entities(right)
-    entity_overlap = _jaccard(entities_left, entities_right)
-    score += entity_overlap * 0.25
-    if entity_overlap:
-        reasons.append(f"entités communes ({entity_overlap:.2f})")
-
-    # IOC overlap: up to 0.35 contribution
-    ioc_overlap = _jaccard({normalize(item) for item in left.iocs}, {normalize(item) for item in right.iocs})
-    score += ioc_overlap * 0.35
-    if ioc_overlap:
-        reasons.append(f"IOC communs ({ioc_overlap:.2f})")
-
-    # Date proximity: up to 0.15 contribution
-    if _dates_close(left.event_date, right.event_date):
-        score += 0.15
-        reasons.append("dates proches")
-
-    final_score = min(score, 1.0)
-
-    return final_score, reasons or ["rapprochement faible sans preuve d'identité"]
-
-
 def _editorial_score(candidate: CandidateTopic) -> EditorialScore:
     impact = min(
         4, max(1, len(candidate.countries) + len(candidate.sectors) + len(candidate.victims))
     )
     novelty = (
-        4 if any(word in _normalize(candidate.novelty) for word in ("nouveau", "inedit")) else 2
+        4 if any(word in normalize(candidate.novelty) for word in ("nouveau", "inedit")) else 2
     )
     technical = candidate.technical_potential
     hunting = min(4, len(candidate.likely_artifacts) + len(candidate.iocs) + bool(candidate.cves))
@@ -782,68 +468,6 @@ def _editorial_score(candidate: CandidateTopic) -> EditorialScore:
     )
 
 
-def _comparison_payload(candidate: CandidateTopic) -> dict[str, object]:
-    return {
-        "title": candidate.title,
-        "event_date": candidate.event_date.isoformat() if candidate.event_date else None,
-        "urls": [source.canonical_url for source in candidate.sources],
-        "publishers": [source.publisher for source in candidate.sources],
-        "actors_as_reported": list(candidate.actors),
-        "campaigns": list(candidate.campaigns),
-        "malware": list(candidate.malware),
-        "cves": list(candidate.cves),
-        "iocs": list(candidate.iocs),
-    }
-
-
-def _entities(candidate: CandidateTopic) -> set[str]:
-    return {
-        _normalize(value)
-        for values in (candidate.actors, candidate.campaigns, candidate.malware, candidate.cves)
-        for value in values
-        if value.strip()
-    }
-
-
-def _jaccard(left: set[str], right: set[str]) -> float:
-    return len(left & right) / len(left | right) if left and right else 0.0
-
-
-def _dates_close(left: date | None, right: date | None) -> bool:
-    return left is not None and right is not None and abs((left - right).days) <= 7
-
-
-def _only_relay_sources(candidate: CandidateTopic) -> bool:
-    return bool(candidate.sources) and all(
-        source.role in {SourceRole.RELAY, SourceRole.AGGREGATOR, SourceRole.SOCIAL}
-        for source in candidate.sources
-    )
-
-
-
-
-def _revision_reference_replacements(
-    batches: Sequence[DiscoveryBatch],
-) -> dict[CandidateReference, CandidateReference]:
-    active_by_run = {
-        batch.discovery_model_run_id: batch for batch in batches if batch.is_active_revision
-    }
-    replacements: dict[CandidateReference, CandidateReference] = {}
-    for batch in batches:
-        active = active_by_run.get(batch.discovery_model_run_id)
-        if active is None or active.id == batch.id:
-            continue
-        active_ids = {candidate.id for candidate in active.candidates}
-        for candidate in batch.candidates:
-            if candidate.id in active_ids:
-                replacements[CandidateReference(batch.id, candidate.id)] = CandidateReference(
-                    active.id, candidate.id
-                )
-    return replacements
-
-
-
-
 def _subject_slug(title: str, group_id: UUID) -> str:
-    base = "-".join(_normalize(title).split())[:100].strip("-") or "subject"
+    base = "-".join(normalize(title).split())[:100].strip("-") or "subject"
     return f"{base}-{group_id.hex[:8]}"

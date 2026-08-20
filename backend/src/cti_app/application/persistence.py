@@ -16,11 +16,20 @@ from cti_app.domain.collection import (
     SourceCollection,
 )
 from cti_app.domain.discovery import DiscoveryBatch
+from cti_app.domain.discovery_cumulative import (
+    DiscoveryIntake,
+    DiscoveryMergeRun,
+    DiscoverySnapshot,
+    DiscoverySubjectIdentity,
+    SubjectContribution,
+    SubjectMergeEvent,
+)
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import EditorialGroup, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics
 from cti_app.domain.model_conversations import (
+    ConversationLifecycle,
     ConversationPurpose,
     ConversationStatus,
     ModelConversation,
@@ -184,6 +193,20 @@ class ModelConversationTurnRepository(Protocol):
     async def save(self, turn: ModelConversationTurn) -> None: ...
 
 
+class ConversationLifecycleRepository(Protocol):
+    async def add(self, lifecycle: ConversationLifecycle) -> None: ...
+
+    async def get(self, lifecycle_id: UUID) -> ConversationLifecycle | None: ...
+
+    async def get_by_conversation_id(self, conversation_id: UUID) -> ConversationLifecycle | None: ...
+
+    async def save(self, lifecycle: ConversationLifecycle) -> None: ...
+
+    async def list_delete_pending(self) -> Sequence[ConversationLifecycle]: ...
+
+    async def list_cleanup_failed(self) -> Sequence[ConversationLifecycle]: ...
+
+
 class DiscoveryBatchRepository(Protocol):
     async def add_if_absent(self, batch: DiscoveryBatch) -> bool: ...
 
@@ -196,6 +219,70 @@ class DiscoveryBatchRepository(Protocol):
     async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoveryBatch]: ...
 
     async def save(self, batch: DiscoveryBatch) -> None: ...
+
+
+class DiscoveryIntakeRepository(Protocol):
+    async def add_if_absent(self, intake: DiscoveryIntake) -> bool: ...
+
+    async def get(self, intake_id: UUID) -> DiscoveryIntake | None: ...
+
+    async def get_by_batch(self, batch_id: UUID) -> DiscoveryIntake | None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoveryIntake]: ...
+
+    async def next_sequence(self, edition_id: UUID) -> int: ...
+
+
+class DiscoverySubjectIdentityRepository(Protocol):
+    async def add_many_if_absent(self, identities: Sequence[DiscoverySubjectIdentity]) -> None: ...
+
+    async def get(self, subject_id: UUID) -> DiscoverySubjectIdentity | None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoverySubjectIdentity]: ...
+
+    async def resolve_canonical_subject(self, subject_id: UUID) -> UUID: ...
+
+    async def contribution_closure(self, subject_id: UUID) -> Sequence[SubjectContribution]: ...
+
+
+class SubjectMergeEventRepository(Protocol):
+    async def append_many(self, events: Sequence[SubjectMergeEvent]) -> None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectMergeEvent]: ...
+
+
+class DiscoverySnapshotRepository(Protocol):
+    async def append(self, snapshot: DiscoverySnapshot) -> None: ...
+
+    async def get(self, snapshot_id: UUID) -> DiscoverySnapshot | None: ...
+
+    async def get_for_intake(self, intake_id: UUID) -> DiscoverySnapshot | None: ...
+
+    async def get_active(self, edition_id: UUID) -> DiscoverySnapshot | None: ...
+
+    async def get_active_for_update(self, edition_id: UUID) -> DiscoverySnapshot | None: ...
+
+    async def deactivate(self, snapshot_id: UUID) -> None: ...
+
+
+class DiscoveryMergeRunRepository(Protocol):
+    async def add_if_absent(self, run: DiscoveryMergeRun) -> bool: ...
+
+    async def get(self, run_id: UUID) -> DiscoveryMergeRun | None: ...
+
+    async def get_by_input_hash(self, merge_input_hash: str) -> DiscoveryMergeRun | None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoveryMergeRun]: ...
+
+
+class SubjectContributionRepository(Protocol):
+    async def append_many(self, contributions: Sequence[SubjectContribution]) -> None: ...
+
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[SubjectContribution]: ...
+
+    async def list_recent_subject_ids(
+        self, edition_id: UUID, *, minimum_snapshot_version: int
+    ) -> Sequence[UUID]: ...
 
 
 class EditorialGroupRepository(Protocol):
@@ -317,6 +404,12 @@ class UnitOfWork(Protocol):
     model_conversations: ModelConversationRepository
     model_conversation_turns: ModelConversationTurnRepository
     discovery_batches: DiscoveryBatchRepository
+    discovery_intakes: DiscoveryIntakeRepository
+    discovery_subject_identities: DiscoverySubjectIdentityRepository
+    subject_merge_events: SubjectMergeEventRepository
+    discovery_snapshots: DiscoverySnapshotRepository
+    discovery_merge_runs: DiscoveryMergeRunRepository
+    subject_contributions: SubjectContributionRepository
     editorial_groups: EditorialGroupRepository
     human_decisions: HumanDecisionRepository
     source_collections: SourceCollectionRepository

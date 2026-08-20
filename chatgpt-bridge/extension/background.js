@@ -149,6 +149,8 @@ async function connect() {
       handleConversationArchive(msg);
     } else if (msg.type === "recovery_capture") {
       handleRecoveryCapture(msg);
+    } else if (msg.type === "cleanup_conversation") {
+      handleCleanupConversation(msg);
     } else if (msg.type === "abort") {
       const tabId = inflight.get(msg.id);
       inflight.delete(msg.id);
@@ -186,6 +188,56 @@ async function handleRecoveryCapture(msg) {
       type: "recovery_preview",
       id: msg.id,
       error: err.message,
+    });
+  }
+}
+
+/**
+ * Automatisation UI : suppression d'une conversation via l'extension.
+ *
+ * Flux :
+ * 1. Résoudre le tab via le locator de la conversation
+ * 2. Envoyer la requête de cleanup au content script
+ * 3. Relayer la réponse au serveur
+ */
+async function handleCleanupConversation(msg) {
+  let tab;
+  try {
+    // Résoudre le tab correspondant au locator de la conversation
+    tab = await resolveConversationTab({
+      mode: "continue",
+      id: msg.conversation_id,
+      external_locator: msg.external_locator,
+    });
+
+    // Envoyer la requête au content script
+    const result = await sendToTab(tab.id, {
+      type: "delete_conversation",
+      id: msg.id,
+      conversation_id: msg.conversation_id,
+      external_locator: msg.external_locator,
+      timeout: msg.timeout || 30000,
+    });
+
+    // Relayer le résultat au serveur
+    send({
+      type: "cleanup_conversation",
+      id: msg.id,
+      success: result.success || false,
+      verified_deleted: result.verified_deleted || false,
+      error_code: result.error_code || null,
+      error_message: result.error_message || null,
+      steps_completed: result.steps_completed || [],
+    });
+  } catch (err) {
+    send({
+      type: "cleanup_conversation",
+      id: msg.id,
+      success: false,
+      verified_deleted: false,
+      error_code: "extension_error",
+      error_message: err.message,
+      steps_completed: [],
     });
   }
 }

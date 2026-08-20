@@ -11,6 +11,10 @@ from cti_app.application.persistence import (
     CollectionPolicySnapshotRepository,
     DerivedArtifactRepository,
     DiscoveryBatchRepository,
+    DiscoveryIntakeRepository,
+    DiscoveryMergeRunRepository,
+    DiscoverySnapshotRepository,
+    DiscoverySubjectIdentityRepository,
     EditionAuditRepository,
     EditionProductionBatchItemRepository,
     EditionProductionBatchRepository,
@@ -20,6 +24,7 @@ from cti_app.application.persistence import (
     IndicatorRepository,
     JobEventRepository,
     JobRepository,
+    ConversationLifecycleRepository,
     ModelConversationRepository,
     ModelConversationTurnRepository,
     ModelOutputRejectionRepository,
@@ -30,6 +35,8 @@ from cti_app.application.persistence import (
     SampleRepository,
     SourceCollectionRepository,
     SourceDocumentRepository,
+    SubjectContributionRepository,
+    SubjectMergeEventRepository,
     SubjectProductionRunRepository,
     SubjectRepository,
 )
@@ -42,6 +49,10 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyCollectionPolicySnapshotRepository,
     SqlAlchemyDerivedArtifactRepository,
     SqlAlchemyDiscoveryBatchRepository,
+    SqlAlchemyDiscoveryIntakeRepository,
+    SqlAlchemyDiscoveryMergeRunRepository,
+    SqlAlchemyDiscoverySnapshotRepository,
+    SqlAlchemyDiscoverySubjectIdentityRepository,
     SqlAlchemyEditionAuditRepository,
     SqlAlchemyEditionProductionBatchItemRepository,
     SqlAlchemyEditionProductionBatchRepository,
@@ -51,6 +62,7 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyIndicatorRepository,
     SqlAlchemyJobEventRepository,
     SqlAlchemyJobRepository,
+    SqlAlchemyConversationLifecycleRepository,
     SqlAlchemyModelConversationRepository,
     SqlAlchemyModelConversationTurnRepository,
     SqlAlchemyModelOutputRejectionRepository,
@@ -61,6 +73,8 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemySampleRepository,
     SqlAlchemySourceCollectionRepository,
     SqlAlchemySourceDocumentRepository,
+    SqlAlchemySubjectContributionRepository,
+    SqlAlchemySubjectMergeEventRepository,
     SqlAlchemySubjectProductionRunRepository,
     SqlAlchemySubjectRepository,
 )
@@ -80,7 +94,14 @@ class SqlAlchemyUnitOfWork:
     model_output_rejections: ModelOutputRejectionRepository
     model_conversations: ModelConversationRepository
     model_conversation_turns: ModelConversationTurnRepository
+    conversation_lifecycles: ConversationLifecycleRepository
     discovery_batches: DiscoveryBatchRepository
+    discovery_intakes: DiscoveryIntakeRepository
+    discovery_subject_identities: DiscoverySubjectIdentityRepository
+    subject_merge_events: SubjectMergeEventRepository
+    discovery_snapshots: DiscoverySnapshotRepository
+    discovery_merge_runs: DiscoveryMergeRunRepository
+    subject_contributions: SubjectContributionRepository
     editorial_groups: EditorialGroupRepository
     human_decisions: HumanDecisionRepository
     source_collections: SourceCollectionRepository
@@ -117,7 +138,16 @@ class SqlAlchemyUnitOfWork:
         self.model_output_rejections = SqlAlchemyModelOutputRejectionRepository(self._session)
         self.model_conversations = SqlAlchemyModelConversationRepository(self._session)
         self.model_conversation_turns = SqlAlchemyModelConversationTurnRepository(self._session)
+        self.conversation_lifecycles = SqlAlchemyConversationLifecycleRepository(self._session)
         self.discovery_batches = SqlAlchemyDiscoveryBatchRepository(self._session)
+        self.discovery_intakes = SqlAlchemyDiscoveryIntakeRepository(self._session)
+        self.discovery_subject_identities = SqlAlchemyDiscoverySubjectIdentityRepository(
+            self._session
+        )
+        self.subject_merge_events = SqlAlchemySubjectMergeEventRepository(self._session)
+        self.discovery_snapshots = SqlAlchemyDiscoverySnapshotRepository(self._session)
+        self.discovery_merge_runs = SqlAlchemyDiscoveryMergeRunRepository(self._session)
+        self.subject_contributions = SqlAlchemySubjectContributionRepository(self._session)
         self.editorial_groups = SqlAlchemyEditorialGroupRepository(self._session)
         self.human_decisions = SqlAlchemyHumanDecisionRepository(self._session)
         self.source_collections = SqlAlchemySourceCollectionRepository(self._session)

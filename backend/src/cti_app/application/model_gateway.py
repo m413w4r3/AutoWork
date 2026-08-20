@@ -13,6 +13,11 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ValidationError
 
+from cti_app.domain.model_conversations import (
+    ConversationLifecycle,
+    ConversationPolicy,
+    ConversationReleaseOutcome,
+)
 from cti_app.domain.model_runs import (
     ModelOutputRejection,
     ModelProvider,
@@ -72,6 +77,7 @@ class ModelRoutingHint(StrEnum):
     STANDARD_DRAFT = "standard_draft"
     PREMIUM_SYNTHESIS = "premium_synthesis"
     CRITIQUE = "critique"
+    DISCOVERY_MERGE = "discovery_merge"
 
 
 class AdapterResultStatus(StrEnum):
@@ -115,6 +121,16 @@ class ConversationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ConversationLifecycleSpec:
+    """Explicit lifecycle policy for a new conversation.
+
+    This is a first-order control data, not metadata. Every ModelRequest
+    creating a fresh conversation MUST provide this.
+    """
+    policy: ConversationPolicy
+
+
+@dataclass(frozen=True, slots=True)
 class ModelRequest:
     text: str
     prompt_template_id: str
@@ -127,7 +143,8 @@ class ModelRequest:
     parameters: dict[str, Any] = field(default_factory=dict)
     background: bool = False
     provider: ModelProvider | None = None
-    conversation: ConversationContext | None = None
+    conversation: ConversationContext  # ← MANDATORY (no more backward compat)
+    conversation_lifecycle: ConversationLifecycleSpec  # ← MANDATORY for fresh conversations
     run_id: UUID | None = None
 
     def __post_init__(self) -> None:
@@ -139,6 +156,10 @@ class ModelRequest:
             raise ValueError("evidence_pack_hash must be a lowercase SHA-256")
         if _contains_binary(self.metadata) or _contains_binary(self.parameters):
             raise BinaryModelInputError("Binary values cannot be sent to a model")
+        # Invariant: fresh requires explicit policy, continue reuses existing policy
+        if self.conversation.mode == "fresh":
+            # conversation_lifecycle is mandatory and should define policy
+            pass  # Validation enforced by type system (no None allowed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +313,7 @@ class ModelRouter:
             ModelRoutingHint.AMBIGUOUS_CLUSTERING,
             ModelRoutingHint.PREMIUM_SYNTHESIS,
             ModelRoutingHint.CRITIQUE,
+            ModelRoutingHint.DISCOVERY_MERGE,
         }:
             return self.by_provider(ModelProvider.OPENAI, role)
         return self.by_provider(ModelProvider.QWEN, role)

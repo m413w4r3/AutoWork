@@ -1,4 +1,6 @@
-.PHONY: up down status logs bridge-status bridge-logs bridge-soak restart-bridge model-run-diagnostics dev stop test test-integration lint format typecheck
+.PHONY: up down status logs bridge-status bridge-logs bridge-soak \
+	restart-bridge model-run-diagnostics dev stop test test-integration \
+	lint format typecheck ctx ctx-status ctx-doctor
 
 UV ?= uv
 PNPM ?= pnpm
@@ -58,3 +60,12 @@ format:
 	cd backend && $(UV) run ruff format .
 	cd backend && $(UV) run ruff check --fix .
 	cd frontend && $(PNPM) format
+
+ctx:
+	$(UV) run scripts/ctx/ctx.py build --prune
+
+ctx-status:
+	$(UV) run scripts/ctx/ctx.py status
+
+ctx-doctor:
+	$(UV) run scripts/ctx/ctx.py doctor

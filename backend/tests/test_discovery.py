@@ -36,6 +36,7 @@ from cti_app.application.model_gateway import (
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
+    DiscoveryBatch,
     DiscoverySourceMode,
     SourceRelationshipStatus,
     SourceRole,
@@ -386,15 +387,18 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
     grouped_editions: list[UUID] = []
 
-    async def group_after_discovery(edition_id: UUID) -> None:
-        grouped_editions.append(edition_id)
+    async def reconcile_after_batch(
+        batch: DiscoveryBatch, input_mode: object, actor_id: str
+    ) -> None:
+        del input_mode, actor_id
+        grouped_editions.append(batch.edition_id)
 
     discovery = DiscoveryService(
         discovery_uow,
         gateway,
         gateway,
         bridge_capabilities_provider=FakeBridgeCapabilities(),
-        after_discovery=group_after_discovery,
+        after_persisted_batch=reconcile_after_batch,
     )
     job_uow = InMemoryJobUnitOfWorkFactory()
     registry = create_job_registry(gateway, discovery)
@@ -924,7 +928,7 @@ async def test_totally_invalid_output_is_archived_before_safe_failure(
 
     failed = await jobs.get(job.id)
     assert failed.status is JobStatus.FAILED
-    assert failed.error_code == "report_parsing_failed"
+    assert failed.error_code == "report_schema_unsupported"
     assert failed.error_details is not None
     assert failed.error_details["phase"] == "local_parsing"
     research_run = next(iter(model_uow.state.values()))
@@ -1029,15 +1033,18 @@ def _import_service() -> tuple[DiscoveryService, InMemoryDiscoveryUnitOfWorkFact
     discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
     grouped: list[UUID] = []
 
-    async def after_discovery(edition_id: UUID) -> None:
-        grouped.append(edition_id)
+    async def after_persisted_batch(
+        batch: DiscoveryBatch, input_mode: object, actor_id: str
+    ) -> None:
+        del input_mode, actor_id
+        grouped.append(batch.edition_id)
 
     service = DiscoveryService(
         discovery_uow,
         gateway,
         gateway,
         bridge_capabilities_provider=FakeBridgeCapabilities(),
-        after_discovery=after_discovery,
+        after_persisted_batch=after_persisted_batch,
     )
     return service, discovery_uow, grouped
 

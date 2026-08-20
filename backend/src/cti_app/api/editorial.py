@@ -185,7 +185,7 @@ async def read_board(edition_id: UUID, request: Request) -> EditorialBoardView:
 @router.post("/refresh", response_model=EditorialBoardView)
 async def refresh_board(edition_id: UUID, request: Request) -> EditorialBoardView:
     try:
-        await _service(request).synchronize(edition_id, resolve_ambiguous=False)
+        await _service(request).synchronize(edition_id)
         return _board_view(await _service(request).board(edition_id))
     except Exception as exc:
         _raise_api_error(exc)

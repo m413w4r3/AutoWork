@@ -40,6 +40,48 @@ class ConversationMode(StrEnum):
     FORK = "fork"
 
 
+class ConversationPolicy(StrEnum):
+    """Lifecycle policy for a conversation after successful completion.
+
+    This is a first-order control data, not metadata. Every new conversation
+    must define its policy explicitly.
+    """
+    KEEP = "keep"
+    DELETE_ON_SUCCESS = "delete_on_success"
+
+
+class ConversationReleaseOutcome(StrEnum):
+    """Outcome of an explicit conversation release by the client.
+
+    Only SUCCESS may trigger automatic cleanup according to policy.
+    All other outcomes preserve the conversation for potential recovery.
+    """
+    SUCCESS = "success"
+    FAILURE = "failure"
+    NEEDS_REVIEW = "needs_review"
+    CANCELLED = "cancelled"
+
+
+class ConversationLifecycleStatus(StrEnum):
+    """State machine for conversation lifecycle.
+
+    ACTIVE: conversation is available for normal use
+    RELEASED: client has called release() with an outcome
+    DELETE_PENDING: outcome was SUCCESS and policy was DELETE_ON_SUCCESS
+    DELETING: cleanup is in progress
+    DELETED: conversation has been removed from ChatGPT
+    CLEANUP_FAILED: cleanup attempted but failed (retryable)
+    RETAINED: conversation is permanently retained (KEEP policy or non-SUCCESS outcome)
+    """
+    ACTIVE = "active"
+    RELEASED = "released"
+    DELETE_PENDING = "delete_pending"
+    DELETING = "deleting"
+    DELETED = "deleted"
+    CLEANUP_FAILED = "cleanup_failed"
+    RETAINED = "retained"
+
+
 class ConversationTurnStatus(StrEnum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
@@ -200,3 +242,111 @@ class ModelConversationTurn:
         self.error_message = " ".join(message.replace("\x00", "").split())[:500]
         self.error_details = details
         self.finished_at = now or datetime.now(UTC)
+
+
+@dataclass(slots=True, kw_only=True)
+class ConversationLifecycle:
+    """Lifecycle policy and status of a conversation.
+
+    This is a separate concern from ConversationContext (usage: fresh/continue).
+    The policy is immutable once set at fresh time.
+    """
+    policy: ConversationPolicy
+    status: ConversationLifecycleStatus = ConversationLifecycleStatus.ACTIVE
+    released_at: datetime | None = None
+    release_outcome: ConversationReleaseOutcome | None = None
+    deleted_at: datetime | None = None
+    cleanup_attempt_count: int = 0
+    last_cleanup_attempt_at: datetime | None = None
+    last_cleanup_error_code: str | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.status != ConversationLifecycleStatus.ACTIVE and self.release_outcome is None:
+            raise ValueError("Non-ACTIVE status requires a release_outcome")
+        if self.status == ConversationLifecycleStatus.ACTIVE and self.release_outcome is not None:
+            raise ValueError("ACTIVE status must have no release_outcome")
+
+    def release(
+        self,
+        *,
+        outcome: ConversationReleaseOutcome,
+        now: datetime | None = None,
+    ) -> None:
+        """Release the conversation with an explicit outcome.
+
+        The decision to release belongs to the workflow client, not the bridge.
+        Only SUCCESS may trigger automatic cleanup according to policy.
+        """
+        if self.status != ConversationLifecycleStatus.ACTIVE:
+            # Idempotence: releasing again is a no-op
+            return
+
+        timestamp = now or datetime.now(UTC)
+        self.release_outcome = outcome
+        self.released_at = timestamp
+        self.updated_at = timestamp
+        self.version += 1
+
+        # State machine transition based on outcome and policy
+        if outcome == ConversationReleaseOutcome.SUCCESS:
+            if self.policy == ConversationPolicy.DELETE_ON_SUCCESS:
+                self.status = ConversationLifecycleStatus.DELETE_PENDING
+            else:  # KEEP
+                self.status = ConversationLifecycleStatus.RETAINED
+        else:
+            # FAILURE, NEEDS_REVIEW, CANCELLED all preserve the conversation
+            self.status = ConversationLifecycleStatus.RETAINED
+
+    def start_cleanup(self, *, now: datetime | None = None) -> None:
+        """Transition to DELETING state (cleanup in progress)."""
+        if self.status != ConversationLifecycleStatus.DELETE_PENDING:
+            raise ValueError(
+                f"Cannot start cleanup from status {self.status.value}"
+            )
+        timestamp = now or datetime.now(UTC)
+        self.status = ConversationLifecycleStatus.DELETING
+        self.updated_at = timestamp
+        self.version += 1
+
+    def mark_cleanup_failed(
+        self,
+        *,
+        error_code: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Mark cleanup attempt as failed (retryable)."""
+        if self.status not in {
+            ConversationLifecycleStatus.DELETE_PENDING,
+            ConversationLifecycleStatus.DELETING,
+        }:
+            # Idempotence: ignore if not in cleanup states
+            return
+
+        timestamp = now or datetime.now(UTC)
+        self.status = ConversationLifecycleStatus.CLEANUP_FAILED
+        self.cleanup_attempt_count += 1
+        self.last_cleanup_attempt_at = timestamp
+        self.last_cleanup_error_code = error_code[:64]
+        self.updated_at = timestamp
+        self.version += 1
+
+    def mark_deleted(self, *, now: datetime | None = None) -> None:
+        """Mark as deleted after successful cleanup."""
+        if self.status not in {
+            ConversationLifecycleStatus.DELETE_PENDING,
+            ConversationLifecycleStatus.DELETING,
+        }:
+            # Idempotence: ignore if not in cleanup states
+            return
+
+        timestamp = now or datetime.now(UTC)
+        self.status = ConversationLifecycleStatus.DELETED
+        self.deleted_at = timestamp
+        self.cleanup_attempt_count += 1
+        self.last_cleanup_attempt_at = timestamp
+        self.updated_at = timestamp
+        self.version += 1

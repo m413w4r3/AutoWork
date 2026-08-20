@@ -32,6 +32,16 @@ def parse(report: str, citations: object = None) -> ParsedDiscoveryReport:
     )
 
 
+@pytest.mark.parametrize("fixture_name", ["run_1.md", "run_2.md", "run_3.md", "run_4.md"])
+def test_real_july_research_fixtures_remain_parseable(fixture_name: str) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "discovery" / "july" / fixture_name
+
+    result = parse(fixture.read_text())
+
+    assert result.candidates
+    assert all(candidate.sources for candidate in result.candidates)
+
+
 def test_current_format_is_tolerant_partial_and_preserves_urls() -> None:
     result = parse(
         """# SUJETS CANDIDATS
@@ -120,20 +130,12 @@ def test_url_forms_tracking_invalid_and_duplicates() -> None:
     ]
 
 
-def test_legacy_iran_report_keeps_context_without_selecting_it() -> None:
+def test_legacy_report_schema_is_rejected_explicitly() -> None:
     report = (Path(__file__).parent / "fixtures/iran_archived_discovery.md").read_text()
-    result = parse(report)
+    with pytest.raises(ReportParsingError) as error:
+        parse(report)
 
-    assert [candidate.title for candidate in result.candidates[:2]] == [
-        "CYFIRMA — APT Quarterly Report: Apr to Jun 2026",
-        "NCC Group — Monthly Threat Pulse – Review of May 2026",  # noqa: RUF001
-    ]
-    assert all(candidate.selectable for candidate in result.candidates[:2])
-    context = result.candidates[2:]
-    assert context
-    assert all(candidate.context_only and not candidate.selectable for candidate in context)
-    urls = [source.canonical_url for candidate in result.candidates for source in candidate.sources]
-    assert urls.count("https://example.org/archive/iranian-campaign") == 1
+    assert error.value.code == "report_schema_unsupported"
 
 
 def test_visible_citations_not_in_blocks_never_become_a_topic() -> None:

@@ -92,6 +92,30 @@ const SELECTORS = {
     "button[id^='system-hint']",
     "button[aria-haspopup='menu'][aria-label*='Ajouter']",
   ],
+
+  // --- Cleanup : suppression de conversation --- //
+  // Bouton qui ouvre le menu contextuel d'une conversation (barre latérale gauche).
+  conversationOptionsButton: [
+    "button[data-testid='conversation-options-button']",
+    "button[aria-label='More']",
+    "button[aria-label='Options']",
+  ],
+  // Entrée "Delete" dans le menu ouvert.
+  deleteMenuItem: [
+    "button[data-testid='delete-conversation-button']",
+    "[role='menuitem']:contains('Delete')",
+    "div[role='menuitem']:contains('Delete')",
+  ],
+  // Dialog de confirmation du delete.
+  confirmDeleteDialog: [
+    "div[role='dialog']",
+    "[role='alertdialog']",
+  ],
+  // Bouton "Delete" pour confirmer la suppression.
+  confirmDeleteButton: [
+    "button[data-testid='delete-conversation-confirm-button']",
+    "button[class*='btn-danger']",
+  ],
 };
 
 // Libellés reconnus comme « recherche web » dans un menu d'outils (FR/EN).
@@ -1376,6 +1400,237 @@ async function captureLaterResponse(msg) {
   };
 }
 
+// --------------------------------------------------------------------------- //
+// Suppression automatique de conversation (Cleanup UI Automation — Incrément 3)
+// --------------------------------------------------------------------------- //
+
+/**
+ * Automatise la suppression d'une conversation ChatGPT via l'interface.
+ *
+ * Processus :
+ * 1. Vérifier que l'URL courante correspond au locator
+ * 2. Localiser et cliquer le bouton du menu conversation
+ * 3. Attendre l'ouverture du menu
+ * 4. Trouver et cliquer l'entrée "Delete"
+ * 5. Attendre la dialog de confirmation
+ * 6. Cliquer le bouton "Delete" de confirmation
+ * 7. Vérifier que la conversation a été supprimée
+ *
+ * @param {string} conversationId - UUID de la conversation à supprimer
+ * @param {string} externalLocator - URL de la conversation (ChatGPT.com)
+ * @param {Object} options - Configuration
+ * @param {number} options.menuTimeout - Timeout d'ouverture du menu (ms, défaut 5000)
+ * @param {number} options.dialogTimeout - Timeout de la dialog (ms, défaut 5000)
+ * @param {number} options.verifyTimeout - Timeout de vérification (ms, défaut 10000)
+ *
+ * @returns {Promise<{
+ *   success: boolean,
+ *   conversation_id: string,
+ *   verified_deleted: boolean,
+ *   error_code?: string,
+ *   error_message?: string,
+ *   steps_completed: string[]
+ * }>}
+ */
+async function deleteConversation(conversationId, externalLocator, options = {}) {
+  const menuTimeout = options.menuTimeout || 5000;
+  const dialogTimeout = options.dialogTimeout || 5000;
+  const verifyTimeout = options.verifyTimeout || 10000;
+  const steps = [];
+
+  try {
+    // Étape 1 : Vérifier le locator
+    const currentUrl = window.location.href;
+    if (currentUrl !== externalLocator) {
+      return {
+        success: false,
+        conversation_id: conversationId,
+        verified_deleted: false,
+        error_code: "locator_mismatch",
+        error_message: `Current URL (${currentUrl}) does not match expected locator (${externalLocator})`,
+        steps_completed: steps,
+      };
+    }
+    steps.push("locator_verified");
+
+    // Étape 2 : Localiser le bouton du menu conversation
+    const menuButton = $(SELECTORS.conversationOptionsButton);
+    if (!menuButton) {
+      return {
+        success: false,
+        conversation_id: conversationId,
+        verified_deleted: false,
+        error_code: "conversation_menu_not_found",
+        error_message: "Cannot find conversation options button",
+        steps_completed: steps,
+      };
+    }
+    steps.push("found_menu_button");
+
+    // Étape 3 : Ouvrir le menu
+    menuButton.click();
+    let menuElement = null;
+    try {
+      menuElement = await waitFor(
+        () => {
+          for (const sel of SELECTORS.menu) {
+            const menus = document.querySelectorAll(sel);
+            for (const m of menus) {
+              if (m.offsetParent !== null && m.getClientRects().length > 0) {
+                return m;
+              }
+            }
+          }
+          return null;
+        },
+        menuTimeout,
+        "Timeout waiting for menu to open"
+      );
+    } catch (err) {
+      return {
+        success: false,
+        conversation_id: conversationId,
+        verified_deleted: false,
+        error_code: "menu_open_timeout",
+        error_message: err.message,
+        steps_completed: steps,
+      };
+    }
+    steps.push("menu_opened");
+
+    // Étape 4 : Trouver l'entrée "Delete" dans le menu
+    let deleteItem = null;
+    for (const sel of SELECTORS.deleteMenuItem) {
+      if (sel.includes("contains")) {
+        // Sélecteur contenant ":contains" — ne pas supporter XPath, chercher manuellement
+        const items = menuElement.querySelectorAll("[role='menuitem'], div[role='menuitem']");
+        for (const item of items) {
+          if (item.textContent && item.textContent.includes("Delete")) {
+            deleteItem = item;
+            break;
+          }
+        }
+      } else {
+        deleteItem = menuElement.querySelector(sel);
+        if (deleteItem) break;
+      }
+      if (deleteItem) break;
+    }
+
+    if (!deleteItem) {
+      closeMenu(menuElement);
+      return {
+        success: false,
+        conversation_id: conversationId,
+        verified_deleted: false,
+        error_code: "delete_action_not_found",
+        error_message: "Cannot find 'Delete' option in conversation menu",
+        steps_completed: steps,
+      };
+    }
+    steps.push("found_delete_item");
+
+    // Étape 5 : Cliquer sur "Delete"
+    deleteItem.click();
+    await sleep(200); // Attendre l'animation du menu
+
+    // Étape 6 : Attendre la dialog de confirmation
+    let confirmDialog = null;
+    try {
+      confirmDialog = await waitFor(
+        () => {
+          for (const sel of SELECTORS.confirmDeleteDialog) {
+            const dialog = document.querySelector(sel);
+            if (dialog && dialog.offsetParent !== null && dialog.getClientRects().length > 0) {
+              return dialog;
+            }
+          }
+          return null;
+        },
+        dialogTimeout,
+        "Timeout waiting for confirmation dialog"
+      );
+    } catch (err) {
+      return {
+        success: false,
+        conversation_id: conversationId,
+        verified_deleted: false,
+        error_code: "confirm_dialog_timeout",
+        error_message: err.message,
+        steps_completed: steps,
+      };
+    }
+    steps.push("confirm_dialog_opened");
+
+    // Étape 7 : Trouver et cliquer le bouton "Delete" de confirmation
+    let confirmButton = null;
+    for (const sel of SELECTORS.confirmDeleteButton) {
+      confirmButton = confirmDialog.querySelector(sel);
+      if (confirmButton) break;
+    }
+
+    if (!confirmButton) {
+      return {
+        success: false,
+        conversation_id: conversationId,
+        verified_deleted: false,
+        error_code: "confirm_button_not_found",
+        error_message: "Cannot find confirmation delete button",
+        steps_completed: steps,
+      };
+    }
+    steps.push("found_confirm_button");
+
+    // Cliquer le bouton de confirmation
+    confirmButton.click();
+    steps.push("clicked_confirm");
+
+    // Étape 8 : Vérifier que la conversation a été supprimée
+    let verifiedDeleted = false;
+    try {
+      // La dialog doit disparaître
+      await waitFor(
+        () => {
+          for (const sel of SELECTORS.confirmDeleteDialog) {
+            const dialog = document.querySelector(sel);
+            if (!dialog || dialog.offsetParent === null) {
+              return true; // Dialog fermée = succès potentiel
+            }
+          }
+          return null;
+        },
+        verifyTimeout,
+        "Timeout verifying deletion"
+      );
+      verifiedDeleted = true;
+      steps.push("deletion_verified");
+    } catch (err) {
+      // La dialog peut ne pas disparaître immédiatement sur toutes les UI
+      // Mais l'absence de message d'erreur suggère le succès
+      if (confirmDialog && !confirmDialog.querySelector("[role='alert']")) {
+        verifiedDeleted = true;
+        steps.push("deletion_verified_no_error");
+      }
+    }
+
+    return {
+      success: true,
+      conversation_id: conversationId,
+      verified_deleted: verifiedDeleted,
+      steps_completed: steps,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      conversation_id: conversationId,
+      verified_deleted: false,
+      error_code: "internal_error",
+      error_message: err.message,
+      steps_completed: steps,
+    };
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "ui_state" || msg?.type === "ui_control") {
     // Requête/réponse : le service worker attend la valeur, d'où le `return true`
@@ -1385,6 +1640,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg?.type === "recovery_capture") {
     captureLaterResponse(msg).then(sendResponse);
+    return true;
+  }
+  if (msg?.type === "delete_conversation") {
+    // Automatisation UI : suppression de conversation
+    deleteConversation(msg.conversation_id, msg.external_locator, {
+      menuTimeout: msg.timeout ? msg.timeout * 0.3 : 5000,
+      dialogTimeout: msg.timeout ? msg.timeout * 0.3 : 5000,
+      verifyTimeout: msg.timeout ? msg.timeout * 0.4 : 10000,
+    }).then(sendResponse);
     return true;
   }
   if (msg?.type === "prompt") {

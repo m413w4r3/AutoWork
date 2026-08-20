@@ -1,6 +1,5 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
-from functools import partial
 from uuid import UUID
 
 import dramatiq
@@ -10,6 +9,12 @@ from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.discovery import DISCOVERY_JOB_KIND, DiscoveryService
+from cti_app.application.discovery_cumulative import (
+    RECONCILE_DISCOVERY_JOB_KIND,
+    ChatGptMergePlanner,
+    CumulativeDiscoveryService,
+    ReconcileDiscoveryParameters,
+)
 from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.http_collection import (
     CollectionPolicy,
@@ -17,7 +22,12 @@ from cti_app.application.http_collection import (
     SystemDnsResolver,
     parse_domain_policy,
 )
-from cti_app.application.jobs import JobExecutor, JobService, create_job_registry
+from cti_app.application.jobs import (
+    DuplicateJobError,
+    JobExecutor,
+    JobService,
+    create_job_registry,
+)
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -35,6 +45,7 @@ from cti_app.integrations.model_factory import (
     create_bridge_capabilities_provider,
     create_model_gateway,
 )
+from cti_app.logging import get_correlation_id
 from cti_app.workers.broker import broker as broker
 
 # Une recherche ChatGPT durable dépasse largement la limite Dramatiq par
@@ -76,13 +87,58 @@ async def _execute_job(job_id: UUID) -> int | None:
 
     try:
         model_gateway = create_model_gateway(settings, uow_factory)
-        editorial_service = EditorialGroupingService(uow_factory, model_gateway)
+        editorial_service = EditorialGroupingService(uow_factory)
+        cumulative_discovery_service = CumulativeDiscoveryService(
+            uow_factory,
+            planner=ChatGptMergePlanner(model_gateway),
+            after_activation=editorial_service.synchronize,
+        )
+        job_service: JobService
+        job_dispatcher = DramatiqJobDispatcher()
+
+        async def enqueue_discovery_reconciliation(
+            batch: object, input_mode: object, actor_id: str
+        ) -> object:
+            from cti_app.domain.discovery import DiscoveryBatch
+            from cti_app.domain.discovery_cumulative import DiscoveryInputMode
+
+            if not isinstance(batch, DiscoveryBatch) or not isinstance(
+                input_mode, DiscoveryInputMode
+            ):
+                raise TypeError("Invalid discovery reconciliation request")
+            intake, _ = await cumulative_discovery_service.ingest_batch(
+                batch, input_mode=input_mode, actor_id=actor_id
+            )
+            parent = await cumulative_discovery_service.active_snapshot(batch.edition_id)
+            parameters = ReconcileDiscoveryParameters(
+                intake_id=intake.id,
+                edition_id=batch.edition_id,
+                expected_parent_snapshot_id=parent.id if parent else None,
+                actor_id=actor_id,
+            )
+            try:
+                child = await job_service.submit(
+                    kind=RECONCILE_DISCOVERY_JOB_KIND,
+                    aggregate_type="edition",
+                    aggregate_id=batch.edition_id,
+                    idempotency_key=f"reconcile-discovery:{intake.id}",
+                    correlation_id=get_correlation_id(),
+                    input_parameters=parameters.model_dump(mode="json"),
+                    max_attempts=3,
+                    actor_id=actor_id,
+                )
+                await job_dispatcher.dispatch(child.id)
+                return child
+            except DuplicateJobError as exc:
+                return await job_service.get(exc.existing_job_id)
+
         discovery_service = DiscoveryService(
             uow_factory,
             model_gateway,
             model_gateway,
             bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
-            after_discovery=partial(editorial_service.synchronize, resolve_ambiguous=False),
+            after_persisted_batch=enqueue_discovery_reconciliation,
+            allow_chatgpt_structuring_fallback=settings.discovery_chatgpt_structuring_fallback,
             background_poll_interval_seconds=settings.discovery_bridge_poll_interval_seconds,
         )
         blob_store = MinioBlobStore(
@@ -138,8 +194,10 @@ async def _execute_job(job_id: UUID) -> int | None:
             production_chain=production_chain,
             production_artifact_store=production_artifact_store,
             production_diagnostics=production_diagnostics,
+            cumulative_discovery_service=cumulative_discovery_service,
         )
-        production_chain.bind(JobService(uow_factory, registry), DramatiqJobDispatcher())
+        job_service = JobService(uow_factory, registry)
+        production_chain.bind(job_service, job_dispatcher)
         executor = JobExecutor(
             uow_factory,
             registry,

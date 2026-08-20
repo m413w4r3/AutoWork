@@ -186,6 +186,33 @@ class RunControls(BaseModel):
         return {k: v for k, v in self.model_dump().items() if v is not None}
 
 
+class ConversationReleaseRequest(BaseModel):
+    """Explicit release of a conversation with an outcome.
+
+    Only the client decides when a conversation is no longer needed,
+    and the outcome of that release.
+    """
+
+    outcome: str = Field(..., pattern="^(success|failure|needs_review|cancelled)$")
+
+
+class ConversationLifecycleResponse(BaseModel):
+    """Current lifecycle status of a conversation."""
+
+    conversation_id: str
+    policy: str
+    status: str
+    release_outcome: Optional[str] = None
+    created_at: float
+    updated_at: float
+    released_at: Optional[float] = None
+    deleted_at: Optional[float] = None
+    cleanup_attempt_count: int
+    last_cleanup_attempt_at: Optional[float] = None
+    last_cleanup_error_code: Optional[str] = None
+    version: int
+
+
 class ControlOutcome(BaseModel):
     """Résultat d'un contrôle, tel que le content script l'a *relu* dans le DOM."""
 
@@ -327,6 +354,32 @@ class RunRegistry:
             if "preview_json" not in columns:
                 db.execute("ALTER TABLE bridge_runs ADD COLUMN preview_json TEXT")
 
+            # Table for tracking conversation lifecycle and cleanup
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bridge_conversations (
+                    id TEXT PRIMARY KEY,
+                    external_locator TEXT,
+                    policy TEXT NOT NULL CHECK(policy IN ('keep', 'delete_on_success')),
+                    status TEXT NOT NULL CHECK(status IN (
+                        'active', 'released', 'delete_pending', 'deleting',
+                        'deleted', 'cleanup_failed', 'retained'
+                    )),
+                    release_outcome TEXT CHECK(release_outcome IN (
+                        'success', 'failure', 'needs_review', 'cancelled', NULL
+                    )),
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    released_at REAL,
+                    deleted_at REAL,
+                    cleanup_attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_cleanup_attempt_at REAL,
+                    last_cleanup_error_code TEXT,
+                    version INTEGER NOT NULL DEFAULT 1
+                )
+                """
+            )
+
     def recover_interrupted(self) -> None:
         # Après un arrêt, il est impossible de prouver si le clic UI a eu lieu.
         # Ne jamais resoumettre est la seule reprise sûre. Cette transition se
@@ -446,10 +499,380 @@ class RunRegistry:
             logger.exception("bridge_registry_unavailable")
             return False
 
+    def create_conversation(
+        self,
+        conversation_id: str,
+        external_locator: Optional[str],
+        policy: str,
+    ) -> None:
+        """Register a new conversation with its lifecycle policy."""
+        now = time.time()
+        with self._lock, self._connect() as db:
+            db.execute(
+                """
+                INSERT INTO bridge_conversations
+                (id, external_locator, policy, status, created_at, updated_at, version)
+                VALUES (?, ?, ?, 'active', ?, ?, 1)
+                """,
+                (conversation_id, external_locator, policy, now, now),
+            )
+
+    def release_conversation(self, conversation_id: str, outcome: str) -> dict[str, Any]:
+        """Release a conversation with an explicit outcome.
+
+        Returns the updated lifecycle state.
+        Only SUCCESS may trigger cleanup based on policy.
+        """
+        now = time.time()
+        with self._lock, self._connect() as db:
+            # Get current state
+            row = db.execute(
+                "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Conversation {conversation_id} not found")
+
+            current = dict(row)
+
+            # Idempotence: if already released, return current state
+            if current["status"] != "active":
+                return current
+
+            # Determine next state based on outcome and policy
+            if outcome == "success":
+                next_status = (
+                    "delete_pending" if current["policy"] == "delete_on_success" else "retained"
+                )
+            else:
+                # FAILURE, NEEDS_REVIEW, CANCELLED all preserve conversation
+                next_status = "retained"
+
+            # Update state
+            db.execute(
+                """
+                UPDATE bridge_conversations
+                SET status=?, release_outcome=?, released_at=?, updated_at=?, version=version+1
+                WHERE id=?
+                """,
+                (next_status, outcome, now, now, conversation_id),
+            )
+
+            # Return updated state
+            result = db.execute(
+                "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            return dict(result)
+
+    def get_conversation_lifecycle(self, conversation_id: str) -> dict[str, Any] | None:
+        """Retrieve the current lifecycle state of a conversation."""
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def start_cleanup(self, conversation_id: str) -> dict[str, Any]:
+        """Transition a DELETE_PENDING or CLEANUP_FAILED conversation to DELETING state.
+
+        Allows starting cleanup from DELETE_PENDING (initial attempt) or
+        CLEANUP_FAILED (retry). Idempotent on DELETING/DELETED.
+        Returns the updated conversation state.
+        """
+        now = time.time()
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            if not row:
+                raise ValueError(f"Conversation not found: {conversation_id}")
+
+            conversation = dict(row)
+            current_status = conversation["status"]
+
+            # Transition from DELETE_PENDING or CLEANUP_FAILED
+            if current_status in ("delete_pending", "cleanup_failed"):
+                db.execute(
+                    """
+                    UPDATE bridge_conversations
+                    SET status=?, updated_at=?, version=version+1
+                    WHERE id=?
+                    """,
+                    ("deleting", now, conversation_id),
+                )
+            elif current_status not in ("deleting", "deleted"):
+                raise ValueError(
+                    f"Cannot start cleanup from status {current_status}"
+                )
+
+            # Return updated state
+            result = db.execute(
+                "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            return dict(result)
+
+    def mark_conversation_deleted(self, conversation_id: str) -> dict[str, Any]:
+        """Mark a conversation as successfully deleted.
+
+        Transitions from DELETING to DELETED. Idempotent on DELETED.
+        """
+        now = time.time()
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            if not row:
+                raise ValueError(f"Conversation not found: {conversation_id}")
+
+            conversation = dict(row)
+            current_status = conversation["status"]
+
+            # Only transition from DELETING; idempotent for DELETED
+            if current_status == "deleting":
+                db.execute(
+                    """
+                    UPDATE bridge_conversations
+                    SET status=?, deleted_at=?, cleanup_attempt_count=cleanup_attempt_count+1,
+                        last_cleanup_attempt_at=?, updated_at=?, version=version+1
+                    WHERE id=?
+                    """,
+                    ("deleted", now, now, now, conversation_id),
+                )
+            elif current_status == "deleted":
+                # Idempotent: already deleted, no-op
+                pass
+            else:
+                # Cannot mark deleted from other states
+                raise ValueError(
+                    f"Cannot mark deleted from status {current_status}"
+                )
+
+            # Return updated state
+            result = db.execute(
+                "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            return dict(result)
+
+    def mark_cleanup_failed(
+        self,
+        conversation_id: str,
+        error_code: str,
+        error_message: str | None = None,
+    ) -> dict[str, Any]:
+        """Mark cleanup attempt as failed (retryable).
+
+        Transitions from DELETE_PENDING or DELETING to CLEANUP_FAILED.
+        Idempotent: calling again increments attempt count.
+        """
+        now = time.time()
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            if not row:
+                raise ValueError(f"Conversation not found: {conversation_id}")
+
+            conversation = dict(row)
+            current_status = conversation["status"]
+
+            # Transition from cleanup states or ignore if already in cleanup_failed
+            if current_status in ("delete_pending", "deleting", "cleanup_failed"):
+                db.execute(
+                    """
+                    UPDATE bridge_conversations
+                    SET status=?, cleanup_attempt_count=cleanup_attempt_count+1,
+                        last_cleanup_attempt_at=?, last_cleanup_error_code=?, updated_at=?, version=version+1
+                    WHERE id=?
+                    """,
+                    ("cleanup_failed", now, error_code[:64], now, conversation_id),
+                )
+            else:
+                raise ValueError(
+                    f"Cannot mark cleanup failed from status {current_status}"
+                )
+
+            # Return updated state
+            result = db.execute(
+                "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+            return dict(result)
+
+    def get_all_delete_pending(self) -> list[str]:
+        """Récupère tous les IDs de conversations en DELETE_PENDING."""
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                "SELECT id FROM bridge_conversations WHERE status=?", ("delete_pending",)
+            ).fetchall()
+            return [row[0] for row in rows]
+
+    def get_all_cleanup_failed(self) -> list[str]:
+        """Récupère tous les IDs de conversations en CLEANUP_FAILED."""
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                "SELECT id FROM bridge_conversations WHERE status=?", ("cleanup_failed",)
+            ).fetchall()
+            return [row[0] for row in rows]
+
     def checkpoint_and_close(self) -> None:
         """Force le checkpoint WAL ; les connexions sont déjà ouvertes à l'appel."""
         with self._lock, self._connect() as db:
             db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+
+
+# --------------------------------------------------------------------------- #
+# Cleanup Automation — Incrément 3
+# --------------------------------------------------------------------------- #
+
+class CleanupWorker:
+    """Traite les conversations DELETE_PENDING en supprimant via l'UI."""
+
+    def __init__(self, registry: RunRegistry, bridge: "Bridge"):
+        self.registry = registry
+        self.bridge = bridge
+        self.logger = logging.getLogger("cleanup_worker")
+
+    async def process_cleanup_task(self, conversation_id: str) -> bool:
+        """
+        Exécute le cleanup d'une conversation:
+        1. Récupère l'état de la conversation
+        2. Valide le status (DELETE_PENDING)
+        3. Marque comme DELETING
+        4. Envoie une requête à l'extension
+        5. Attend la réponse
+        6. Marque comme DELETED ou CLEANUP_FAILED
+
+        @param conversation_id: UUID de la conversation
+        @return: True si succès, False sinon
+        """
+        try:
+            # 1. Charger la conversation
+            conv = self.registry.get_conversation_lifecycle(conversation_id)
+            if not conv:
+                self.logger.warning(f"Conversation {conversation_id} not found")
+                return False
+
+            if conv["status"] != "delete_pending":
+                self.logger.warning(
+                    f"Conversation {conversation_id} not in DELETE_PENDING, status={conv['status']}"
+                )
+                return False
+
+            # 2. Vérifier le locator
+            if not conv.get("external_locator"):
+                self.logger.warning(f"Conversation {conversation_id} missing external_locator")
+                self.registry.mark_cleanup_failed(
+                    conversation_id, "locator_invalid", "Missing external_locator"
+                )
+                return False
+
+            # 3. Marquer comme DELETING
+            self.registry.start_cleanup(conversation_id)
+
+            # 4. Envoyer au worker
+            result = await self._send_cleanup_request(
+                conversation_id=conversation_id,
+                external_locator=conv["external_locator"],
+                timeout=30,
+            )
+
+            # 5. Traiter le résultat
+            if result["success"] and result.get("verified_deleted"):
+                self.registry.mark_conversation_deleted(conversation_id)
+                self.logger.info(
+                    f"Conversation {conversation_id} deleted successfully. "
+                    f"Steps: {result.get('steps_completed', [])}"
+                )
+                return True
+            else:
+                error_code = result.get("error_code", "unknown")
+                error_msg = result.get("error_message", "No error message")
+                self.registry.mark_cleanup_failed(
+                    conversation_id,
+                    error_code,
+                    error_msg,
+                )
+                self.logger.warning(
+                    f"Cleanup failed for {conversation_id}: {error_code} - {error_msg}"
+                )
+                return False
+        except Exception as e:
+            self.logger.error(f"Cleanup error for {conversation_id}: {e}", exc_info=True)
+            try:
+                self.registry.mark_cleanup_failed(
+                    conversation_id,
+                    "internal_error",
+                    str(e),
+                )
+            except Exception as e2:
+                self.logger.error(f"Failed to mark cleanup failed: {e2}")
+            return False
+
+    async def _send_cleanup_request(
+        self, conversation_id: str, external_locator: str, timeout: int
+    ) -> dict:
+        """Envoie la requête de cleanup à l'extension via WebSocket."""
+        message = {
+            "type": "cleanup_conversation",
+            "id": str(uuid.uuid4()),
+            "conversation_id": conversation_id,
+            "external_locator": external_locator,
+            "timeout": timeout,
+        }
+
+        # Utiliser le mécanisme d'aller-retour du bridge
+        try:
+            response = await self.bridge.request(message, timeout=timeout + 10)
+            return response
+        except asyncio.TimeoutError:
+            self.logger.warning(f"Cleanup timeout for {conversation_id}")
+            return {"success": False, "error_code": "timeout", "verified_deleted": False}
+        except RuntimeError as e:
+            if "non connectée" in str(e):
+                self.logger.warning(f"Extension not connected during cleanup: {conversation_id}")
+                return {"success": False, "error_code": "extension_disconnected", "verified_deleted": False}
+            raise
+        except Exception as e:
+            self.logger.error(f"Error during cleanup request: {e}")
+            return {
+                "success": False,
+                "error_code": "internal_error",
+                "error_message": str(e),
+                "verified_deleted": False,
+            }
+
+
+class ConversationSweeper:
+    """Reprend les cleanups après un restart."""
+
+    def __init__(self, registry: RunRegistry, worker: CleanupWorker):
+        self.registry = registry
+        self.worker = worker
+        self.logger = logging.getLogger("conversation_sweeper")
+
+    async def sweep(self):
+        """Trouve et traite DELETE_PENDING après restart."""
+        pending = self.registry.get_all_delete_pending()
+        self.logger.info(f"Sweeping {len(pending)} DELETE_PENDING conversations")
+
+        for conv_id in pending:
+            try:
+                await self.worker.process_cleanup_task(conv_id)
+            except Exception as e:
+                self.logger.error(f"Sweep error for {conv_id}: {e}", exc_info=True)
+            await asyncio.sleep(0.5)  # Petit délai entre les tentatives
+
+    async def retry_failed(self):
+        """Retry les CLEANUP_FAILED."""
+        failed = self.registry.get_all_cleanup_failed()
+        self.logger.info(f"Retrying {len(failed)} CLEANUP_FAILED conversations")
+
+        for conv_id in failed:
+            try:
+                conv = self.registry.get_conversation_lifecycle(conv_id)
+                if conv and conv.get("cleanup_attempt_count", 0) < 3:
+                    await self.worker.process_cleanup_task(conv_id)
+            except Exception as e:
+                self.logger.error(f"Retry error for {conv_id}: {e}", exc_info=True)
+            await asyncio.sleep(0.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -600,6 +1023,8 @@ bridge_metrics: Dict[str, int] = {
 background_responses: Dict[str, dict] = {}
 background_tasks: Dict[str, asyncio.Task] = {}
 accepting_runs = True
+cleanup_worker: Optional[CleanupWorker] = None
+conversation_sweeper: Optional[ConversationSweeper] = None
 
 
 def _consume_task_exception(task: asyncio.Task) -> None:
@@ -683,17 +1108,31 @@ async def shutdown_bridge(grace_seconds: float = SHUTDOWN_GRACE_SECONDS) -> None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global accepting_runs
+    global accepting_runs, cleanup_worker, conversation_sweeper
     accepting_runs = True
     bridge.closing = False
     task = asyncio.create_task(keepalive_loop())
     run_registry.recover_interrupted()
     run_registry.cleanup()
+
+    # Initialiser le cleanup worker et le sweeper
+    cleanup_worker = CleanupWorker(run_registry, bridge)
+    conversation_sweeper = ConversationSweeper(run_registry, cleanup_worker)
+
+    # Lancer le sweep initial (reprendre après restart)
+    try:
+        await conversation_sweeper.sweep()
+    except Exception as e:
+        logger.error(f"Initial cleanup sweep failed: {e}", exc_info=True)
+
+    # Lancer la tâche de retry périodique
+    sweep_task = asyncio.create_task(_periodic_cleanup_retry(conversation_sweeper))
+
     configuration = _configuration_state()
     registry_state = "accessible" if run_registry.accessible() else "unavailable"
     logger.info(
         "bridge_started host=%s port=%s http_auth=%s websocket_token=%s "
-        "sqlite_registry=%s extension=disconnected",
+        "sqlite_registry=%s extension=disconnected cleanup_worker=active",
         HOST,
         PORT,
         configuration["http_auth"],
@@ -704,8 +1143,21 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        sweep_task.cancel()
+        await asyncio.gather(task, sweep_task, return_exceptions=True)
         await shutdown_bridge()
+
+
+async def _periodic_cleanup_retry(sweeper: ConversationSweeper):
+    """Retry périodique des CLEANUP_FAILED."""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Chaque 5 minutes
+            await sweeper.retry_failed()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Periodic cleanup retry error: {e}", exc_info=True)
 
 
 app = FastAPI(title="ChatGPT Mini-Bridge", version="1.0.0", lifespan=lifespan)
@@ -1897,6 +2349,191 @@ async def archive_bridge_conversation(conversation_id: uuid.UUID):
         {"type": "conversation_archive", "conversation_id": str(conversation_id)}
     )
     return {"archived": packet.get("ok") is True, "conversation_id": str(conversation_id)}
+
+
+@app.post(
+    "/v1/conversations/{conversation_id}/release",
+    dependencies=[Depends(require_key)],
+)
+async def release_conversation(
+    conversation_id: str,
+    req: ConversationReleaseRequest,
+) -> ConversationLifecycleResponse:
+    """Release a conversation with an explicit outcome.
+
+    Only the application client can decide when a conversation is no longer needed
+    and what the outcome of that release is. The bridge applies the lifecycle policy
+    only after this explicit signal.
+
+    Outcome can be: success, failure, needs_review, or cancelled.
+    Only 'success' may trigger automatic cleanup based on the conversation's policy.
+    """
+    try:
+        result = run_registry.release_conversation(conversation_id, req.outcome)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    return ConversationLifecycleResponse(
+        conversation_id=result["id"],
+        policy=result["policy"],
+        status=result["status"],
+        release_outcome=result["release_outcome"],
+        created_at=result["created_at"],
+        updated_at=result["updated_at"],
+        released_at=result["released_at"],
+        deleted_at=result["deleted_at"],
+        cleanup_attempt_count=result["cleanup_attempt_count"],
+        last_cleanup_attempt_at=result["last_cleanup_attempt_at"],
+        last_cleanup_error_code=result["last_cleanup_error_code"],
+        version=result["version"],
+    )
+
+
+@app.get(
+    "/v1/conversations/{conversation_id}/lifecycle",
+    dependencies=[Depends(require_key)],
+)
+async def get_conversation_lifecycle(
+    conversation_id: str,
+) -> ConversationLifecycleResponse:
+    """Retrieve the current lifecycle status of a conversation.
+
+    This allows clients to query the current state, released_at timestamp,
+    release outcome, cleanup status, and retry information.
+    """
+    result = run_registry.get_conversation_lifecycle(conversation_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    return ConversationLifecycleResponse(
+        conversation_id=result["id"],
+        policy=result["policy"],
+        status=result["status"],
+        release_outcome=result["release_outcome"],
+        created_at=result["created_at"],
+        updated_at=result["updated_at"],
+        released_at=result["released_at"],
+        deleted_at=result["deleted_at"],
+        cleanup_attempt_count=result["cleanup_attempt_count"],
+        last_cleanup_attempt_at=result["last_cleanup_attempt_at"],
+        last_cleanup_error_code=result["last_cleanup_error_code"],
+        version=result["version"],
+    )
+
+
+class CleanupStartRequest(BaseModel):
+    """Request to start cleanup of a DELETE_PENDING conversation."""
+    pass
+
+
+class CleanupStartResponse(BaseModel):
+    """Response after initiating cleanup."""
+    conversation_id: str
+    status: str  # Should be DELETING if cleanup started
+    cleanup_attempt_count: int
+
+
+@app.post(
+    "/v1/conversations/{conversation_id}/cleanup/start",
+    dependencies=[Depends(require_key)],
+)
+async def start_conversation_cleanup(
+    conversation_id: str,
+) -> CleanupStartResponse:
+    """Initiate cleanup of a DELETE_PENDING conversation.
+
+    This transitions the conversation from DELETE_PENDING to DELETING state
+    and triggers the extension to open and delete the conversation via UI.
+
+    Idempotent: calling again on DELETING or DELETED returns current state.
+    """
+    try:
+        result = run_registry.start_cleanup(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    return CleanupStartResponse(
+        conversation_id=result["id"],
+        status=result["status"],
+        cleanup_attempt_count=result["cleanup_attempt_count"],
+    )
+
+
+@app.post(
+    "/v1/conversations/{conversation_id}/cleanup/complete",
+    dependencies=[Depends(require_key)],
+)
+async def mark_conversation_deleted(
+    conversation_id: str,
+) -> ConversationLifecycleResponse:
+    """Mark a conversation as successfully deleted.
+
+    Called by the extension after successfully deleting via UI.
+    Idempotent: calling on already-DELETED returns current state.
+    """
+    try:
+        result = run_registry.mark_conversation_deleted(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    return ConversationLifecycleResponse(
+        conversation_id=result["id"],
+        policy=result["policy"],
+        status=result["status"],
+        release_outcome=result["release_outcome"],
+        created_at=result["created_at"],
+        updated_at=result["updated_at"],
+        released_at=result["released_at"],
+        deleted_at=result["deleted_at"],
+        cleanup_attempt_count=result["cleanup_attempt_count"],
+        last_cleanup_attempt_at=result["last_cleanup_attempt_at"],
+        last_cleanup_error_code=result["last_cleanup_error_code"],
+        version=result["version"],
+    )
+
+
+class CleanupFailureRequest(BaseModel):
+    """Report cleanup failure for retry handling."""
+    error_code: str = Field(..., pattern="^[a-z_]+$", max_length=64)
+    error_message: Optional[str] = None
+
+
+@app.post(
+    "/v1/conversations/{conversation_id}/cleanup/fail",
+    dependencies=[Depends(require_key)],
+)
+async def mark_conversation_cleanup_failed(
+    conversation_id: str,
+    req: CleanupFailureRequest,
+) -> ConversationLifecycleResponse:
+    """Report cleanup failure and mark conversation CLEANUP_FAILED for retry.
+
+    The cleanup sweeper will retry up to 3 times with exponential backoff.
+    Idempotent: calling again increments attempt count.
+    """
+    try:
+        result = run_registry.mark_cleanup_failed(
+            conversation_id,
+            error_code=req.error_code,
+            error_message=req.error_message,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    return ConversationLifecycleResponse(
+        conversation_id=result["id"],
+        policy=result["policy"],
+        status=result["status"],
+        release_outcome=result["release_outcome"],
+        created_at=result["created_at"],
+        updated_at=result["updated_at"],
+        released_at=result["released_at"],
+        deleted_at=result["deleted_at"],
+        cleanup_attempt_count=result["cleanup_attempt_count"],
+        last_cleanup_attempt_at=result["last_cleanup_attempt_at"],
+        last_cleanup_error_code=result["last_cleanup_error_code"],
+        version=result["version"],
+    )
 
 
 @app.get("/v1/bridge/runs/{response_id}", dependencies=[Depends(require_key)])

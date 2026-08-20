@@ -576,6 +576,7 @@ def create_job_registry(
     production_chain: object | None = None,
     production_artifact_store: object | None = None,
     production_diagnostics: object | None = None,
+    cumulative_discovery_service: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
@@ -592,6 +593,15 @@ def create_job_registry(
         if not isinstance(discovery_service, DiscoveryService):
             raise TypeError("discovery_service must be a DiscoveryService")
         register_discovery_jobs(registry, discovery_service)
+    if cumulative_discovery_service is not None:
+        from cti_app.application.discovery_cumulative import (
+            CumulativeDiscoveryService,
+            register_cumulative_discovery_jobs,
+        )
+
+        if not isinstance(cumulative_discovery_service, CumulativeDiscoveryService):
+            raise TypeError("cumulative_discovery_service must be a CumulativeDiscoveryService")
+        register_cumulative_discovery_jobs(registry, cumulative_discovery_service)
     if collection_service is not None:
         from cti_app.application.collection import (
             SubjectCollectionService,

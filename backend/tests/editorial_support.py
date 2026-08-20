@@ -7,6 +7,7 @@ from uuid import UUID
 
 from cti_app.application.persistence import UnitOfWork
 from cti_app.domain.discovery import DiscoveryBatch
+from cti_app.domain.discovery_cumulative import DiscoverySnapshot
 from cti_app.domain.editions import Edition
 from cti_app.domain.editorial import EditorialGroup, HumanDecision
 from cti_app.domain.entities import Subject
@@ -93,10 +94,20 @@ class EmptySourceDocumentRepository:
         return []
 
 
+class InMemoryDiscoverySnapshotRepository:
+    def __init__(self, snapshots: dict[UUID, DiscoverySnapshot]) -> None:
+        self._snapshots = snapshots
+
+    async def get_active(self, edition_id: UUID) -> DiscoverySnapshot | None:
+        value = self._snapshots.get(edition_id)
+        return deepcopy(value) if value else None
+
+
 class InMemoryEditorialUnitOfWork:
     def __init__(self, factory: InMemoryEditorialUnitOfWorkFactory) -> None:
         self.editions = InMemoryEditionRepository(factory.editions)
         self.discovery_batches = InMemoryDiscoveryBatchRepository(factory.batches)
+        self.discovery_snapshots = InMemoryDiscoverySnapshotRepository(factory.snapshots)
         self.editorial_groups = InMemoryEditorialGroupRepository(factory.groups, factory.editions)
         self.human_decisions = InMemoryHumanDecisionRepository(factory.decisions)
         self.subjects = InMemorySubjectRepository(factory.subjects)
@@ -127,6 +138,7 @@ class InMemoryEditorialUnitOfWorkFactory:
         self.groups: dict[UUID, EditorialGroup] = {}
         self.decisions: list[HumanDecision] = []
         self.subjects: dict[UUID, Subject] = {}
+        self.snapshots: dict[UUID, DiscoverySnapshot] = {}
 
     def __call__(self) -> UnitOfWork:
         return cast(UnitOfWork, InMemoryEditorialUnitOfWork(self))

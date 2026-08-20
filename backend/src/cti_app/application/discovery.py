@@ -29,6 +29,7 @@ from cti_app.application.jobs import (
 from cti_app.application.model_gateway import (
     BackgroundResponsePendingError,
     ConversationContext,
+    ConversationLifecycleSpec,
     ModelExecution,
     ModelGatewayError,
     ModelRequest,
@@ -54,13 +55,17 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
     canonicalize_http_url,
 )
+from cti_app.domain.model_conversations import (
+    ConversationPolicy,
+    ConversationReleaseOutcome,
+)
+from cti_app.domain.discovery_cumulative import DiscoveryInputMode
 from cti_app.domain.model_runs import ModelProvider, ModelRun, ModelRunStatus
 from cti_app.logging import get_correlation_id
 
 DISCOVERY_JOB_KIND = "discover_edition"
 REPROCESS_DISCOVERY_REPORT_JOB_KIND = "reprocess_discovery_report"
 # Compatibility import for callers compiled against the previous name.
-RETRY_STRUCTURING_JOB_KIND = REPROCESS_DISCOVERY_REPORT_JOB_KIND
 PROMPT_TEMPLATE_ID = "monthly-cti-discovery"
 PROMPT_TEMPLATE_VERSION = "4.1"
 COMPACT_CONTRACT_VERSION = "research-batch-compact-v1"
@@ -310,7 +315,10 @@ class DiscoveryService:
         *,
         bridge_capabilities: Mapping[str, object] | None = None,
         bridge_capabilities_provider: BridgeCapabilitiesProvider | None = None,
-        after_discovery: Callable[[UUID], Awaitable[object]] | None = None,
+        after_persisted_batch: Callable[
+            [DiscoveryBatch, DiscoveryInputMode, str], Awaitable[object]
+        ]
+        | None = None,
         allow_chatgpt_structuring_fallback: bool = False,
         background_poll_interval_seconds: float = 5.0,
         background_waiter: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -321,7 +329,7 @@ class DiscoveryService:
         # calls its structured-extraction method.
         self._structured_model = structured_model
         self._bridge_capabilities_provider = bridge_capabilities_provider
-        self._after_discovery = after_discovery
+        self._after_persisted_batch = after_persisted_batch
         self._allow_chatgpt_structuring_fallback = allow_chatgpt_structuring_fallback
         self._background_poll_interval_seconds = background_poll_interval_seconds
         self._background_waiter = background_waiter
@@ -368,6 +376,16 @@ class DiscoveryService:
         bridge_capabilities = await self._capabilities_snapshot()
         research_run_id = uuid5(NAMESPACE_URL, f"cti-discovery-model-run:{request_hash}")
         fresh_conversation_id = uuid5(NAMESPACE_URL, f"cti-discovery-conversation:{request_hash}")
+
+        # Create and persist the conversation lifecycle (DELETE_ON_SUCCESS policy)
+        conversation_lifecycle = ConversationLifecycle(
+            id=fresh_conversation_id,
+            policy=ConversationPolicy.DELETE_ON_SUCCESS,
+        )
+        async with self._uow_factory() as uow:
+            await uow.conversation_lifecycles.add(conversation_lifecycle)
+            await uow.commit()
+
         research_request = ModelRequest(
             text=_research_prompt(parameters),
             prompt_template_id=PROMPT_TEMPLATE_ID,
@@ -386,6 +404,9 @@ class DiscoveryService:
             parameters={"reasoning": {"effort": "high"}},
             background=True,
             conversation=ConversationContext(mode="fresh", id=fresh_conversation_id),
+            conversation_lifecycle=ConversationLifecycleSpec(
+                policy=ConversationPolicy.DELETE_ON_SUCCESS,
+            ),
             run_id=research_run_id,
         )
         await context.report_progress(2, 4, "ChatGPT recherche et analyse les sources")
@@ -426,8 +447,19 @@ class DiscoveryService:
                     raise RuntimeError("Discovery conflict without canonical batch")
                 batch = existing
             await uow.commit()
-        if self._after_discovery is not None:
-            await self._after_discovery(parameters.edition_id)
+
+        # Release the conversation lifecycle with SUCCESS after batch commit
+        async with self._uow_factory() as uow:
+            lifecycle = await uow.conversation_lifecycles.get(fresh_conversation_id)
+            if lifecycle is not None:
+                lifecycle.release(outcome=ConversationReleaseOutcome.SUCCESS)
+                await uow.conversation_lifecycles.save(lifecycle)
+                await uow.commit()
+
+        if self._after_persisted_batch is not None:
+            await self._after_persisted_batch(
+                batch, DiscoveryInputMode.BRIDGE_RESEARCH, "system:discovery"
+            )
         await context.report_progress(4, 4, "Candidats proposés — vérification humaine requise")
         return batch
 
@@ -733,7 +765,7 @@ class DiscoveryService:
         5. Parser le rapport
         6. Enregistrer les diagnostics parser
         7. Transformer en DiscoveryBatch
-        8. Appeler _after_discovery()
+        8. Déclencher la réconciliation cumulative.
         9. Retourner (batch, reused=False)
         """
         if self._output_archive is None:
@@ -817,8 +849,8 @@ class DiscoveryService:
             await uow.commit()
 
         # 8. Regrouper éditorialement la nouvelle contribution.
-        if self._after_discovery is not None:
-            await self._after_discovery(parameters.edition_id)
+        if self._after_persisted_batch is not None:
+            await self._after_persisted_batch(batch, DiscoveryInputMode.MANUAL_IMPORT, actor_id)
 
         return batch, False
 
@@ -1194,8 +1226,8 @@ class DiscoveryService:
             if active is not None:
                 await uow.discovery_batches.save(active)
             await uow.commit()
-        if self._after_discovery is not None:
-            await self._after_discovery(parameters.edition_id)
+        if self._after_persisted_batch is not None:
+            await self._after_persisted_batch(batch, DiscoveryInputMode.RECOVERY, "system:recovery")
         return batch
 
     async def read_archived_report(self, edition_id: UUID, research_run_id: UUID) -> str:
@@ -1384,7 +1416,11 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
             ) from exc
         return f"discovery-batch://{batch.id}"
 
-    registry.register(RETRY_STRUCTURING_JOB_KIND, RetryStructuringParameters, retry_handler)
+    registry.register(
+        REPROCESS_DISCOVERY_REPORT_JOB_KIND,
+        RetryStructuringParameters,
+        retry_handler,
+    )
 
 
 def discovery_request_hash(parameters: DiscoverEditionParameters) -> str:
@@ -1813,7 +1849,7 @@ def _to_domain_batch(
         complementary_axis=parameters.complementary_axis,
         queries=tuple(result.queries),
         citations=tuple(citation.model_dump() for citation in result.citations),
-        contributions=_wrap_candidates_as_contributions(candidates, ContributionStatus.PENDING),
+        contributions=_wrap_candidates_as_contributions(candidates, ContributionStatus.ACCEPTED),
         discovery_model_run_id=research_run_id,
         structuring_model_run_id=structuring_run_id,
         tlp=parameters.tlp,
@@ -1845,7 +1881,9 @@ def _parsed_to_domain_batch(
         complementary_axis=parameters.complementary_axis,
         queries=(),
         citations=result.citations,
-        contributions=_wrap_candidates_as_contributions(result.candidates, ContributionStatus.PENDING),
+        contributions=_wrap_candidates_as_contributions(
+            result.candidates, ContributionStatus.ACCEPTED
+        ),
         discovery_model_run_id=research_run_id,
         # The historical column remains non-null for backwards compatibility. Reusing
         # the research run ID explicitly means that no structuring ModelRun was created.

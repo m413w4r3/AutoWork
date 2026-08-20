@@ -69,10 +69,10 @@ chatgpt-bridge/out/
 
 # roo code
 
-!.roomodes
-!.rooignore
-!.roo/
-!.roo/**
+.roomodes
+.rooignore
+.roo/
+.roo/**
 
 # Local diagnostic trail: raw model answers and parser decisions.
 # Never commit — it mirrors external model output verbatim.

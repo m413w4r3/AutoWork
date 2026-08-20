@@ -29,6 +29,8 @@ from cti_app.domain.editorial import (
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
+    ProductionArtifact,
+    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStatus,
 )
@@ -140,11 +142,22 @@ class _BatchItems:
 
 
 class _Artifacts:
-    async def list_for_run(self, run_id: UUID) -> Sequence[Any]:
-        return []
+    def __init__(self) -> None:
+        self.items: list[ProductionArtifact] = []
 
-    async def get_current(self, run_id: UUID, stage: str) -> Any:
-        return None
+    async def append(self, artifact: ProductionArtifact) -> None:
+        self.items.append(artifact)
+
+    async def list_for_run(self, run_id: UUID) -> Sequence[Any]:
+        return [artifact for artifact in self.items if artifact.production_run_id == run_id]
+
+    async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        matches = [
+            artifact
+            for artifact in self.items
+            if artifact.production_run_id == run_id and artifact.stage.value == stage
+        ]
+        return max(matches, key=lambda artifact: artifact.version) if matches else None
 
 
 class _Uow:
@@ -346,3 +359,30 @@ async def test_second_start_while_running_does_not_reprompt(
     assert second.json()["job_id"] is None
     assert len(jobs.submitted) == submitted_after_first
     assert len(uow.subject_production_runs.items) == 1
+
+
+async def test_save_brief_draft_appends_artifact_versions(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    run = SubjectProductionRun(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        profile=ProductionProfile.BRIEF_AUTO,
+    )
+    await uow.subject_production_runs.add(run)
+
+    first = await api.post(
+        f"/api/subjects/{subject_id}/production/brief/draft",
+        json={"content": "première version"},
+    )
+    second = await api.post(
+        f"/api/subjects/{subject_id}/production/brief/draft",
+        json={"content": "seconde version"},
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert [artifact.version for artifact in uow.production_artifacts.items] == [1, 2]
+    assert second.json()["draft_version"] == 2

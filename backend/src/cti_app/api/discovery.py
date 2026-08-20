@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Annotated, Literal, NoReturn
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -12,7 +14,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from cti_app.application.discovery import (
     DISCOVERY_JOB_KIND,
     REPROCESS_DISCOVERY_REPORT_JOB_KIND,
-    RETRY_STRUCTURING_JOB_KIND,
     DiscoverEditionParameters,
     DiscoveryService,
     RetryStructuringParameters,
@@ -20,8 +21,10 @@ from cti_app.application.discovery import (
     discovery_idempotency_key,
     discovery_request_hash,
 )
-from cti_app.application.discovery_consolidation import (
-    consolidate_discovery_batches,
+from cti_app.application.discovery_cumulative import (
+    CumulativeDiscoveryService,
+    DiscoveryMergeNeedsReview,
+    HumanMergeDecision,
 )
 from cti_app.application.discovery_report_parser import ReportParsingError
 from cti_app.application.editions import EditionNotFoundError, EditionService
@@ -47,11 +50,15 @@ from cti_app.domain.discovery import (
     SourceRole,
     SourceVerificationStatus,
 )
+from cti_app.domain.discovery_cumulative import DiscoveryMemberReference, DiscoveryMergeRun
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.jobs import Job, JobStatus
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api/editions/{edition_id}/discovery", tags=["discovery"])
+merge_runs_router = APIRouter(
+    prefix="/api/editions/{edition_id}/merge-runs", tags=["discovery-merge-review"]
+)
 
 
 class DiscoveryLaunch(BaseModel):
@@ -133,6 +140,19 @@ class CandidateReferenceView(BaseModel):
     candidate_id: UUID
 
 
+@dataclass(frozen=True, slots=True)
+class SnapshotCandidateProjection:
+    representative: CandidateTopic
+    member_references: tuple[DiscoveryMemberReference, ...]
+    sources: list[SourceCandidate]
+    duplicate_publication_count: int = 0
+    merge_warnings: tuple[str, ...] = ()
+
+    @property
+    def contribution_count(self) -> int:
+        return len(self.member_references)
+
+
 class DiscoveryMergeStats(BaseModel):
     """Statistics about consolidation of multiple discovery batches."""
 
@@ -183,7 +203,7 @@ class CandidateView(BaseModel):
     selectable: bool
     valid_publication_count: int
     incomplete_publication_count: int
-    # Consolidation tracking (P2)
+    # Provenance du sujet cumulatif.
     member_references: list[CandidateReferenceView] = Field(default_factory=list)
     contribution_count: int = Field(
         default=1, description="Number of batches contributing to this candidate"
@@ -225,6 +245,7 @@ class DiscoveryView(BaseModel):
     batches: list[BatchView]
     candidates: list[CandidateView]
     total: int
+    snapshot_version: int | None = None
     merge_stats: DiscoveryMergeStats = Field(
         description="Statistics about consolidation of multiple discovery batches"
     )
@@ -299,6 +320,99 @@ class DiscoveryImportConfirmView(BaseModel):
     publication_count: int
 
 
+class MergeRunView(BaseModel):
+    id: UUID
+    edition_id: UUID
+    parent_snapshot_id: UUID | None
+    intake_id: UUID
+    planner_kind: str
+    validation_status: str
+    review_reasons: list[str]
+    warnings: list[str]
+    plan: dict[str, object] | None
+    projected_diff: list[dict[str, object]]
+    supersedes_merge_run_id: UUID | None
+    created_at: datetime
+
+
+class MergeGroupDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    group_index: int = Field(ge=0)
+    action: Literal["accept", "create_new", "attach_to", "merge_existing", "defer"]
+    target_subject_handle: str | None = Field(default=None, pattern=r"^X[1-9][0-9]*$")
+
+
+class MergeRunResolutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    group_decisions: list[MergeGroupDecisionRequest] = Field(min_length=1)
+
+
+class MergeRunResolutionView(BaseModel):
+    snapshot_id: UUID
+    snapshot_version: int
+
+
+@merge_runs_router.get("", response_model=list[MergeRunView])
+async def list_merge_runs(edition_id: UUID, request: Request) -> list[MergeRunView]:
+    service: CumulativeDiscoveryService = request.app.state.cumulative_discovery_service
+    return [_merge_run_view(run) for run in await service.list_merge_runs(edition_id)]
+
+
+@merge_runs_router.get("/{run_id}", response_model=MergeRunView)
+async def read_merge_run(edition_id: UUID, run_id: UUID, request: Request) -> MergeRunView:
+    service: CumulativeDiscoveryService = request.app.state.cumulative_discovery_service
+    try:
+        return _merge_run_view(await service.get_merge_run(edition_id, run_id))
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": "merge_run_not_found", "message": str(exc)}
+        ) from exc
+
+
+@merge_runs_router.post("/{run_id}/resolve", response_model=MergeRunResolutionView)
+async def resolve_merge_run(
+    edition_id: UUID,
+    run_id: UUID,
+    payload: MergeRunResolutionRequest,
+    request: Request,
+) -> MergeRunResolutionView:
+    service: CumulativeDiscoveryService = request.app.state.cumulative_discovery_service
+    identity: IdentityProvider = request.app.state.identity_provider
+    try:
+        actor = await identity.current()
+        snapshot = await service.resolve_merge_run(
+            edition_id,
+            run_id,
+            [
+                HumanMergeDecision(
+                    group_index=item.group_index,
+                    action=item.action,
+                    target_subject_handle=item.target_subject_handle,
+                )
+                for item in payload.group_decisions
+            ],
+            actor_id=actor.actor_id,
+        )
+        return MergeRunResolutionView(snapshot_id=snapshot.id, snapshot_version=snapshot.version)
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": "merge_run_not_found", "message": str(exc)}
+        ) from exc
+    except DiscoveryMergeNeedsReview as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "merge_still_needs_review",
+                "merge_run_id": str(exc.run_id),
+                "reasons": list(exc.reasons),
+            },
+        ) from exc
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
 @router.post("", response_model=DiscoveryLaunchView, status_code=status.HTTP_202_ACCEPTED)
 async def launch_discovery(
     edition_id: UUID, payload: DiscoveryLaunch, request: Request
@@ -365,8 +479,26 @@ async def read_candidates(
     batches = await service.list_batches(edition_id, include_replaced=include_replaced)
     active_batches = [batch for batch in batches if batch.is_active_revision]
 
-    # Consolidate multiple batches into single coherent view
-    consolidated = consolidate_discovery_batches(active_batches)
+    cumulative: CumulativeDiscoveryService | None = getattr(
+        request.app.state, "cumulative_discovery_service", None
+    )
+    snapshot = await cumulative.active_snapshot(edition_id) if cumulative is not None else None
+    if snapshot is not None:
+        # Nominal path: this is a read-only projection of the already materialized
+        # cumulative state. No consolidation or merge occurs in this GET.
+        consolidated = []
+        for subject in snapshot.subjects:
+            candidate = deepcopy(subject.candidate)
+            candidate.id = subject.subject_id
+            consolidated.append(
+                SnapshotCandidateProjection(
+                    representative=candidate,
+                    member_references=subject.member_references,
+                    sources=candidate.sources,
+                )
+            )
+    else:
+        consolidated = []
 
     # Track raw stats before filtering
     raw_batch_count = len(active_batches)
@@ -432,6 +564,7 @@ async def read_candidates(
         batches=[_batch_view(edition_id, batch) for batch in batches],
         candidates=candidate_views,
         total=len(candidate_views),
+        snapshot_version=snapshot.version if snapshot else None,
         merge_stats=DiscoveryMergeStats(
             raw_batch_count=raw_batch_count,
             raw_candidate_count=raw_candidate_count,
@@ -675,12 +808,6 @@ async def confirm_discovery_import(
     response_model=DiscoveryLaunchView,
     status_code=status.HTTP_202_ACCEPTED,
 )
-@router.post(
-    "/structuring/retry",
-    response_model=DiscoveryLaunchView,
-    status_code=status.HTTP_202_ACCEPTED,
-    include_in_schema=False,
-)
 async def retry_structuring(
     edition_id: UUID, payload: StructuringRetryLaunch, request: Request
 ) -> DiscoveryLaunchView:
@@ -716,7 +843,7 @@ async def retry_structuring(
         )
         identity = await provider.current()
         job = await jobs.submit(
-            kind=RETRY_STRUCTURING_JOB_KIND,
+            kind=REPROCESS_DISCOVERY_REPORT_JOB_KIND,
             aggregate_type="edition",
             aggregate_id=edition.id,
             idempotency_key=(
@@ -984,6 +1111,39 @@ def _provisional_ioc_view(ioc: ProvisionalDiscoveryIoc) -> ProvisionalIocView:
             dict.fromkeys(relation.publication_ref for relation in ioc.publication_relations)
         ),
         warnings=list(ioc.warnings),
+    )
+
+
+def _merge_run_view(run: DiscoveryMergeRun) -> MergeRunView:
+    groups = []
+    if isinstance(run.plan_payload, dict):
+        raw_groups = run.plan_payload.get("groups")
+        if isinstance(raw_groups, list):
+            for index, group in enumerate(raw_groups):
+                if not isinstance(group, dict):
+                    continue
+                groups.append(
+                    {
+                        "group_index": index,
+                        "existing_subject_handles": group.get("existing_subject_handles", []),
+                        "incoming_candidate_handles": group.get("incoming_candidate_handles", []),
+                        "disposition": group.get("disposition"),
+                        "flags": group.get("flags", []),
+                    }
+                )
+    return MergeRunView(
+        id=run.id,
+        edition_id=run.edition_id,
+        parent_snapshot_id=run.parent_snapshot_id,
+        intake_id=run.intake_id,
+        planner_kind=run.planner_kind.value,
+        validation_status=run.validation_status.value,
+        review_reasons=list(run.review_reasons),
+        warnings=list(run.warnings),
+        plan=run.plan_payload,
+        projected_diff=groups,
+        supersedes_merge_run_id=run.supersedes_merge_run_id,
+        created_at=run.created_at,
     )
 
 

@@ -208,9 +208,16 @@ def test_router_prefers_qwen_for_bulk_and_openai_for_premium_drafting() -> None:
         external_llm_allowed=True,
         routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS,
     )
+    discovery_merge = request(
+        external_llm_allowed=True,
+        routing_hint=ModelRoutingHint.DISCOVERY_MERGE,
+    )
 
     assert router.select(bulk, ModelRole.STRUCTURED_EXTRACTION).provider is ModelProvider.QWEN
     assert router.select(premium, ModelRole.DRAFTING).provider is ModelProvider.OPENAI
+    assert (
+        router.select(discovery_merge, ModelRole.DRAFTING).provider is ModelProvider.OPENAI
+    )
 
 
 def test_binary_values_are_rejected_by_typed_request() -> None:

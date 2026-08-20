@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any
 from uuid import UUID
 
@@ -23,12 +24,13 @@ from cti_app.application.subject_production import (
 )
 from cti_app.domain.editorial import EditorialGroup, EditorialGroupStatus, EditorialType
 from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
-    ProductionArtifact,
-    ProductionArtifactStatus,
 )
 from cti_app.logging import get_correlation_id
 
@@ -308,7 +310,7 @@ async def get_subject_production(
             started_at=run.started_at.isoformat() if run.started_at else None,
             finished_at=run.finished_at.isoformat() if run.finished_at else None,
             warnings=_collect_warnings(artifacts),
-            stages=stages,
+            stages={name: StageStatus(**stage) for name, stage in stages.items()},
         )
 
 
@@ -509,25 +511,24 @@ async def save_brief_draft(
                 detail=f"No production run found for subject {subject_id}",
             )
 
-        # Brief artifacts can be created/updated at any point after synthesis
-        artifact = await uow.production_artifacts.get_current(run.id, "brief")
-
-        if not artifact:
-            # Create a draft artifact if it doesn't exist yet
-            artifact = ProductionArtifact(
-                run_id=run.id,
-                stage="brief",
-                version=1,
-                status=ProductionArtifactStatus.NEEDS_REVIEW,
-                metadata={"draft_content": body.content, "saved_at": datetime.now(UTC).isoformat()},
-            )
-            await uow.production_artifacts.save(artifact)
-        else:
-            # Update existing artifact's metadata with draft content
-            artifact.metadata["draft_content"] = body.content
-            artifact.metadata["saved_at"] = datetime.now(UTC).isoformat()
-            artifact.metadata["draft_version"] = artifact.metadata.get("draft_version", 0) + 1
-            await uow.production_artifacts.save(artifact)
+        # Artifacts are append-only: each saved draft creates a new version.
+        current = await uow.production_artifacts.get_current(run.id, "brief")
+        saved_at = datetime.now(UTC).isoformat()
+        draft_version = int(current.metadata.get("draft_version", 0)) + 1 if current else 1
+        artifact = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=subject_id,
+            stage=ProductionArtifactStage.BRIEF,
+            version=current.version + 1 if current else 1,
+            input_hash=sha256(body.content.encode("utf-8")).hexdigest(),
+            status=ProductionArtifactStatus.NEEDS_REVIEW,
+            metadata={
+                "draft_content": body.content,
+                "saved_at": saved_at,
+                "draft_version": draft_version,
+            },
+        )
+        await uow.production_artifacts.append(artifact)
 
         await uow.commit()
 

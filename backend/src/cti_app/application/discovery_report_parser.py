@@ -26,7 +26,6 @@ from cti_app.domain.discovery import (
 PARSER_VERSION = "chatgpt-markdown-v3-structured"
 _SUBJECT = re.compile(r"^\s*(?:##\s+)?SUBJECT\b\s*[:#-]?\s*(.*?)\s*$", re.IGNORECASE)
 _PUBLICATION = re.compile(r"^\s*(?:###\s+)?PUBLICATION\b\s*[:#-]?\s*(.*?)\s*$", re.IGNORECASE)
-_HEADING = re.compile(r"^\s*(#{1,6})\s+(.+?)\s*$")
 _FIELD = re.compile(
     r"^\s*(?:[-*]\s*)?(?:\*\*)?([\wÀ-ÿ\\][\wÀ-ÿ\\ ./'-]*?)(?:\*\*)?"
     r"\s*[:\N{FULLWIDTH COLON}]\s*(.*)$"
@@ -34,12 +33,6 @@ _FIELD = re.compile(
 _MARKDOWN_URL = re.compile(r"\[[^\]]*\]\(\s*(https?://[^\s)>]+)\s*\)", re.IGNORECASE)
 _ANGLE_URL = re.compile(r"<\s*(https?://[^>\s]+)\s*>", re.IGNORECASE)
 _NAKED_URL = re.compile(r"https?://[^\s<>\]\[\"']+", re.IGNORECASE)
-_CONTEXT_MARKERS = (
-    "axe complementaire",
-    "hors fenetre",
-    "contexte",
-    "controle a posteriori",
-)
 _KNOWN_TOPIC_FIELDS = {
     "title",
     "presentation",
@@ -118,22 +111,18 @@ def parse_discovery_report(
         )
     report_sha = hashlib.sha256(report.encode()).hexdigest()
     citation_values = _normalize_citations(visible_citations)
-    if any(_SUBJECT.match(line) for line in report.splitlines()):
-        candidates, warnings = _parse_current(
-            report,
-            report_sha=report_sha,
-            tlp=tlp,
-            sensitivity=sensitivity,
-            external_llm_allowed=external_llm_allowed,
+    if not any(_SUBJECT.match(line) for line in report.splitlines()):
+        raise ReportParsingError(
+            "report_schema_unsupported",
+            "Le rapport ne respecte pas le schéma SUBJECT/PUBLICATION courant.",
         )
-    else:
-        candidates, warnings = _parse_legacy(
-            report,
-            report_sha=report_sha,
-            tlp=tlp,
-            sensitivity=sensitivity,
-            external_llm_allowed=external_llm_allowed,
-        )
+    candidates, warnings = _parse_current(
+        report,
+        report_sha=report_sha,
+        tlp=tlp,
+        sensitivity=sensitivity,
+        external_llm_allowed=external_llm_allowed,
+    )
     candidates = _best_candidate_revision_by_subject(candidates)
     _apply_period_relations(candidates, period_start, period_end)
     attached = {source.canonical_url for candidate in candidates for source in candidate.sources}
@@ -270,112 +259,6 @@ def _parse_current(
         candidates.append(candidate)
         warnings.extend(topic_warnings)
     return candidates, warnings
-
-
-def _parse_legacy(
-    report: str,
-    *,
-    report_sha: str,
-    tlp: TLP,
-    sensitivity: str,
-    external_llm_allowed: bool,
-) -> tuple[list[CandidateTopic], list[str]]:
-    lines = report.splitlines()
-    headings = [
-        (index, len(match.group(1)), match.group(2).strip())
-        for index, line in enumerate(lines)
-        if (match := _HEADING.match(line))
-    ]
-    candidates: list[CandidateTopic] = []
-    warnings = [
-        "format historique: présentation et potentiel technique peuvent être incomplets; "
-        "consulter le rapport original."
-    ]
-    context = False
-    ordinal = 0
-    for position, (start, level, heading) in enumerate(headings):
-        normalized_heading = _normalize_text(heading)
-        if any(marker in normalized_heading for marker in _CONTEXT_MARKERS):
-            context = True
-            continue
-        if level != 2:
-            continue
-        end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
-        block = "\n".join(lines[start:end]).strip()
-        urls = extract_http_urls(block)
-        if not urls:
-            continue
-        ordinal += 1
-        in_period = bool(
-            re.search(
-                r"publication\s*:.*(?:dans la (?:fen[eê]tre|p[eé]riode)|in[ -]period)",
-                block,
-                re.IGNORECASE,
-            )
-        )
-        context_only = context or not in_period
-        local_ref = f"legacy-{ordinal}"
-        title = re.sub(r"[*_`]", "", heading).strip()
-        publisher = title.split("—", 1)[0].split("-", 1)[0].strip() or "unknown"
-        sources = [
-            SourceCandidate(
-                id=uuid5(NAMESPACE_URL, f"{report_sha}:{canonical}"),
-                url=canonical,
-                raw_url=raw,
-                title=title,
-                publisher=publisher,
-                role=SourceRole.UNKNOWN,
-                published_at=_first_explicit_date(block),
-                period_relation=(
-                    PeriodRelation.IN_PERIOD if in_period else PeriodRelation.OUTSIDE_PERIOD
-                ),
-                citation=block,
-                local_ref=f"P{url_index}",
-                parsing_warnings=("Métadonnées extraites depuis un rapport historique.",),
-                markdown_block=block,
-                tlp=tlp,
-                sensitivity=sensitivity,
-                external_llm_allowed=external_llm_allowed,
-            )
-            for url_index, (raw, canonical) in enumerate(urls, 1)
-        ]
-        candidates.append(
-            CandidateTopic(
-                id=uuid5(NAMESPACE_URL, f"{report_sha}:{local_ref}"),
-                local_ref=local_ref,
-                title=title,
-                summary="Présentation non disponible dans ce rapport historique.",
-                novelty="Non précisée dans le rapport historique.",
-                technical_potential=0,
-                technical_potential_reason="Non extractible de manière fiable.",
-                uncertainties=("Métadonnées historiques à vérifier.",),
-                relevance_reasons=("Publication explicitement présente dans le rapport archivé.",),
-                actors=(),  # Legacy format has no structured actors
-                campaigns=(),
-                malware=(),
-                cves=(),
-                victims=(),
-                sectors=(),
-                countries=(),
-                likely_artifacts=("unknown",),
-                sources=sources,
-                tlp=tlp,
-                sensitivity=sensitivity,
-                external_llm_allowed=external_llm_allowed,
-                parsing_warnings=(warnings[0],),
-                markdown_block=block,
-                context_only=context_only,
-            )
-        )
-    return candidates, warnings
-
-
-def _detect_structured_format(lines: list[str]) -> bool:
-    """Detect if content uses new structured format (actors:, campaigns:, malware:)."""
-    content = "\n".join(lines)
-    return bool(
-        re.search(r"^\s*(?:actors|campaigns|malware|subject_scope)\s*:", content, re.MULTILINE | re.IGNORECASE)
-    )
 
 
 def _extract_structured_list(value: str) -> tuple[str, ...]:
@@ -840,11 +723,6 @@ def _explicit_date(value: str | None) -> date | None:
         return date.fromisoformat(value.strip())
     except ValueError:
         return None
-
-
-def _first_explicit_date(value: str) -> date | None:
-    match = re.search(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)", value)
-    return _explicit_date(match.group(1)) if match else None
 
 
 def _enum_or_default(enum_type: Any, value: str | None, default: Any) -> Any:
