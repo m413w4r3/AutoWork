@@ -46,7 +46,6 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyClaimRepository,
     SqlAlchemyCollectionAttemptRepository,
     SqlAlchemyCollectionPolicySnapshotRepository,
-    SqlAlchemyConversationLifecycleRepository,
     SqlAlchemyDerivedArtifactRepository,
     SqlAlchemyDiscoveryBatchRepository,
     SqlAlchemyDiscoveryIntakeRepository,
@@ -60,8 +59,6 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyEditorialGroupRepository,
     SqlAlchemyHumanDecisionRepository,
     SqlAlchemyIndicatorRepository,
-    SqlAlchemyModelConversationRepository,
-    SqlAlchemyModelConversationTurnRepository,
     SqlAlchemyProductionArtifactRepository,
     SqlAlchemyRejectedModelProposalRepository,
     SqlAlchemySourceCollectionRepository,
@@ -79,6 +76,11 @@ from cti_app.infrastructure.database.repositories.core import (
 from cti_app.infrastructure.database.repositories.jobs import (
     SqlAlchemyJobEventRepository,
     SqlAlchemyJobRepository,
+)
+from cti_app.infrastructure.database.repositories.model_conversations import (
+    SqlAlchemyConversationLifecycleRepository,
+    SqlAlchemyModelConversationRepository,
+    SqlAlchemyModelConversationTurnRepository,
 )
 from cti_app.infrastructure.database.repositories.model_runs import (
     SqlAlchemyModelOutputRejectionRepository,
