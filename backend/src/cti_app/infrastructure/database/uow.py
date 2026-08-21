@@ -62,8 +62,6 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyIndicatorRepository,
     SqlAlchemyModelConversationRepository,
     SqlAlchemyModelConversationTurnRepository,
-    SqlAlchemyModelOutputRejectionRepository,
-    SqlAlchemyModelRunRepository,
     SqlAlchemyProductionArtifactRepository,
     SqlAlchemyRejectedModelProposalRepository,
     SqlAlchemySourceCollectionRepository,
@@ -81,6 +79,10 @@ from cti_app.infrastructure.database.repositories.core import (
 from cti_app.infrastructure.database.repositories.jobs import (
     SqlAlchemyJobEventRepository,
     SqlAlchemyJobRepository,
+)
+from cti_app.infrastructure.database.repositories.model_runs import (
+    SqlAlchemyModelOutputRejectionRepository,
+    SqlAlchemyModelRunRepository,
 )
 
 
