@@ -10,6 +10,7 @@ from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.model_gateway import (
     ConversationContext,
+    ConversationLifecycleSpec,
     ModelGateway,
     ModelRequest,
     ModelRoutingHint,
@@ -18,6 +19,7 @@ from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.model_conversations import (
     ConversationMode,
+    ConversationPolicy,
     ConversationPurpose,
     ConversationStatus,
     ConversationTransport,
@@ -270,6 +272,14 @@ class ModelConversationService:
                 requested_model=conversation.requested_model,
                 external_id=conversation.external_id,
             )
+            # Provide explicit lifecycle policy for fresh conversations to avoid leaking
+            # them on the ChatGPT side. Subject production conversations are multi-turn
+            # and must be preserved for extraction and synthesis phases.
+            conversation_lifecycle = (
+                ConversationLifecycleSpec(policy=ConversationPolicy.KEEP)
+                if mode is ConversationMode.FRESH
+                else None
+            )
             request = ModelRequest(
                 text=message,
                 prompt_template_id=CONVERSATION_PROMPT_ID,
@@ -281,6 +291,7 @@ class ModelConversationService:
                 metadata={"conversation_output": True, "primary_evidence": False},
                 provider=conversation.provider,
                 conversation=context,
+                conversation_lifecycle=conversation_lifecycle,
                 run_id=run_id,
             )
             run = self._gateway.build_run(request, _role(conversation.purpose))

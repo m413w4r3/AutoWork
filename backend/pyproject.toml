@@ -38,6 +38,7 @@ packages = ["src/cti_app"]
 addopts = "-ra --strict-config --strict-markers"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["src"]
 markers = ["integration: requires a temporary PostgreSQL database"]
 
 [tool.ruff]

@@ -4,12 +4,14 @@ import pytest
 
 from cti_app.application.model_gateway import (
     ConversationContext,
+    ConversationLifecycleSpec,
     ModelRequest,
     ModelRoutingHint,
     sanitize_model_request,
 )
 from cti_app.domain.model_conversations import (
     ConversationMode,
+    ConversationPolicy,
     ConversationPurpose,
     ConversationStatus,
     ConversationTransport,
@@ -79,3 +81,70 @@ def test_only_analyst_assistance_and_pivot_research_can_continue() -> None:
     )
     with pytest.raises(ValueError, match="requires fresh"):
         discovery.start_turn(mode=ConversationMode.CONTINUE)
+
+
+# Test A: Regression for conversation_lifecycle contract in ModelRequest
+def test_model_request_lifecycle_contract() -> None:
+    """Test that ModelRequest enforces lifecycle policy for fresh conversations.
+
+    This test protects against regression where fresh conversations without an
+    explicit lifecycle policy would raise ValueError.
+    """
+    conversation_id = uuid4()
+
+    # Stateless request without conversation should be valid
+    request = ModelRequest(
+        text="Extract data",
+        prompt_template_id="test",
+        prompt_template_version="1",
+        evidence_pack_hash="a" * 64,
+        external_llm_allowed=True,
+        routing_hint=ModelRoutingHint.WEB_RESEARCH,
+    )
+    assert request.conversation is None
+    assert request.conversation_lifecycle is None
+
+    # Fresh conversation WITHOUT lifecycle should raise ValueError
+    fresh_context = ConversationContext(mode="fresh", id=conversation_id)
+    with pytest.raises(ValueError, match="A fresh conversation requires an explicit"):
+        ModelRequest(
+            text="Analyze data",
+            prompt_template_id="test",
+            prompt_template_version="1",
+            evidence_pack_hash="a" * 64,
+            external_llm_allowed=True,
+            routing_hint=ModelRoutingHint.WEB_RESEARCH,
+            conversation=fresh_context,
+        )
+
+    # Fresh conversation WITH lifecycle should be valid
+    fresh_with_lifecycle = ModelRequest(
+        text="Analyze data",
+        prompt_template_id="test",
+        prompt_template_version="1",
+        evidence_pack_hash="a" * 64,
+        external_llm_allowed=True,
+        routing_hint=ModelRoutingHint.WEB_RESEARCH,
+        conversation=fresh_context,
+        conversation_lifecycle=ConversationLifecycleSpec(policy=ConversationPolicy.KEEP),
+    )
+    assert fresh_with_lifecycle.conversation == fresh_context
+    assert fresh_with_lifecycle.conversation_lifecycle is not None
+
+    # Continue conversation WITHOUT new lifecycle should be valid (reuses existing)
+    continue_context = ConversationContext(
+        mode="continue",
+        id=conversation_id,
+        external_locator="https://chatgpt.com/opaque/a",
+    )
+    continue_request = ModelRequest(
+        text="Continue analysis",
+        prompt_template_id="test",
+        prompt_template_version="1",
+        evidence_pack_hash="a" * 64,
+        external_llm_allowed=True,
+        routing_hint=ModelRoutingHint.WEB_RESEARCH,
+        conversation=continue_context,
+    )
+    assert continue_request.conversation == continue_context
+    assert continue_request.conversation_lifecycle is None

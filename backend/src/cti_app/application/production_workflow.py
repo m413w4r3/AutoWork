@@ -172,6 +172,24 @@ class ProductionWorkflowOrchestrator:
         )
         return result
 
+    def _handle_stage_exception(
+        self, run: SubjectProductionRun, stage: str, exc: Exception
+    ) -> dict[str, Any]:
+        """Record exception traceback in diagnostics and return error result.
+
+        Ensures the original exception's full traceback is preserved for debugging
+        while still returning a safe error result to the stage caller.
+        """
+        self._diagnostics.record_failure(
+            event="stage.exception",
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage,
+            correlation_id=self._correlation_id,
+            error=exc,
+        )
+        return _transient_or_terminal(stage, exc)
+
     async def _ask_with_format_repair(
         self,
         *,
@@ -544,7 +562,7 @@ class ProductionWorkflowOrchestrator:
                     external_llm_allowed=ctx.external_llm_allowed,
                 )
             except Exception as e:
-                return _transient_or_terminal("references", e)
+                return self._handle_stage_exception(run, "references", e)
 
             if parsed is None:
                 return {
@@ -688,7 +706,7 @@ class ProductionWorkflowOrchestrator:
                     external_llm_allowed=policy_allows,
                 )
             except Exception as e:
-                return _transient_or_terminal("extraction", e)
+                return self._handle_stage_exception(run, "extraction", e)
 
             if parsed is None:
                 return {
@@ -868,7 +886,7 @@ class ProductionWorkflowOrchestrator:
                     "repair_actions": parsed.repair_actions,
                 }
             except Exception as e:
-                return _transient_or_terminal("synthesis", e)
+                return self._handle_stage_exception(run, "synthesis", e)
 
     async def _execute_assembly_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
         """Execute brief assembly stage (deterministic).
