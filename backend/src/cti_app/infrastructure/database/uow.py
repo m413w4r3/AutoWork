@@ -49,8 +49,6 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyDerivedArtifactRepository,
     SqlAlchemyEditionProductionBatchItemRepository,
     SqlAlchemyEditionProductionBatchRepository,
-    SqlAlchemyEditorialGroupRepository,
-    SqlAlchemyHumanDecisionRepository,
     SqlAlchemyIndicatorRepository,
     SqlAlchemyProductionArtifactRepository,
     SqlAlchemyRejectedModelProposalRepository,
@@ -78,6 +76,10 @@ from cti_app.infrastructure.database.repositories.discovery_cumulative import (
 from cti_app.infrastructure.database.repositories.editions import (
     SqlAlchemyEditionAuditRepository,
     SqlAlchemyEditionRepository,
+)
+from cti_app.infrastructure.database.repositories.editorial import (
+    SqlAlchemyEditorialGroupRepository,
+    SqlAlchemyHumanDecisionRepository,
 )
 from cti_app.infrastructure.database.repositories.jobs import (
     SqlAlchemyJobEventRepository,
