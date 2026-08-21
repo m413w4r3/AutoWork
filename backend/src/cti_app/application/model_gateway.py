@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ValidationError
 
-from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
+from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.domain.model_conversations import (
     ConversationPolicy,
 )

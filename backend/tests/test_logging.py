@@ -5,7 +5,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 
-from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
+from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.logging import CorrelationIdMiddleware, JsonFormatter
 
 

@@ -18,7 +18,7 @@ from cti_app.application.jobs import (
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
+from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import EditionProductionService
 from cti_app.domain.production import (

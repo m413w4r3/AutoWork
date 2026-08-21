@@ -12,7 +12,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.persistence import JobUnitOfWork, JobUnitOfWorkFactory
-from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
+from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics, JobStatus
 from cti_app.logging import reset_correlation_id, set_correlation_id
 
@@ -659,7 +659,7 @@ def create_job_registry(
     if uow_factory is not None:
         from cti_app.application.model_conversations import ModelConversationService
         from cti_app.application.production_artifact_store import ProductionArtifactStore
-        from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
+        from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
         from cti_app.application.production_jobs import (
             ProductionStageChain,
             register_production_jobs,

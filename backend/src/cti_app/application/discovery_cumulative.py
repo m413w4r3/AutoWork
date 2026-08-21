@@ -31,7 +31,7 @@ from cti_app.application.model_gateway import (
     ModelRoutingHint,
 )
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
+from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,

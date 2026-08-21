@@ -777,7 +777,7 @@ def write_index(chunks: list[Chunk], model: str, signature: str, cache: dict[str
     )
 
 
-def do_build(model: str, *, full: bool = False, prune: bool = True, quiet: bool = False) -> dict[str, object]:
+def do_build(model: str, *, full: bool = False, quiet: bool = False) -> dict[str, object]:
     with build_lock():
         chunks, texts, signature, _ = build_chunks()
         cache = {} if full else load_cache(model)
@@ -796,9 +796,9 @@ def do_build(model: str, *, full: bool = False, prune: bool = True, quiet: bool 
             for key, vector in zip(missing, vectors, strict=True):
                 cache[key] = vector
 
-        if prune:
-            wanted = set(texts)
-            cache = {key: vector for key, vector in cache.items() if key in wanted}
+        # Prune orphaned vectors: keep only embeddings for current texts
+        wanted = set(texts)
+        cache = {key: vector for key, vector in cache.items() if key in wanted}
 
         save_cache(model, cache)
         write_index(chunks, model, signature, cache)
@@ -1046,7 +1046,7 @@ def rank_chunks(
 
 def cmd_build(args: argparse.Namespace) -> int:
     try:
-        do_build(args.model, full=args.full, prune=not args.no_prune, quiet=args.quiet)
+        do_build(args.model, full=args.full, quiet=args.quiet)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -1064,7 +1064,7 @@ def maybe_refresh(args: argparse.Namespace) -> None:
     except RuntimeError:
         stale = True
     if stale:
-        do_build(args.model, full=False, prune=True, quiet=True)
+        do_build(args.model, full=False, quiet=True)
 
 
 def cmd_query(args: argparse.Namespace) -> int:
@@ -1227,12 +1227,6 @@ def main() -> int:
 
     build = sub.add_parser("build", help="Construit / met à jour l'index.")
     build.add_argument("--full", action="store_true", help="Ignore le cache du modèle.")
-    build.add_argument(
-        "--prune",
-        action="store_true",
-        help=argparse.SUPPRESS,  # compatibilité avec le Makefile / hooks v1
-    )
-    build.add_argument("--no-prune", action="store_true", help="Conserve les vecteurs orphelins.")
     build.add_argument("--quiet", action="store_true", help="N'écrit rien si tout va bien.")
     build.set_defaults(func=cmd_build)
 

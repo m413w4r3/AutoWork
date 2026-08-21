@@ -3,7 +3,7 @@ from minio import Minio
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.model_gateway import ModelGateway, ModelRouter
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
+from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.config import Settings
 from cti_app.domain.model_runs import ModelProvider
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore

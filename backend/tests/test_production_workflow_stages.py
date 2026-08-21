@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
+from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.application.production_parsers import reference_report_from_json
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.collection import CollectionState

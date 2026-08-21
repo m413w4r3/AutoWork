@@ -13,7 +13,7 @@ from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_context import build_subject_production_context
-from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
+from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.application.production_parsers import (
     ParsedEvent,
     ParseResult,

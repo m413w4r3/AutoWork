@@ -19,7 +19,7 @@ from cti_app.application.jobs import (
     SynchronousJobDispatcher,
     create_job_registry,
 )
-from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
+from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.domain.jobs import Job, JobStatus
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 

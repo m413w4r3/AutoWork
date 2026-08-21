@@ -11,9 +11,9 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
-from cti_app.application.production_diagnostics import (
+from cti_app.application.diagnostics import (
     MAX_PAYLOAD_BYTES,
-    ProductionDiagnosticsLog,
+    DiagnosticsLog as ProductionDiagnosticsLog,
 )
 
 
