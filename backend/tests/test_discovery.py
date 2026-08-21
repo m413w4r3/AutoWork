@@ -5,17 +5,12 @@ from datetime import UTC, date, datetime, timedelta
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from cti_app.application.discovery import (
     DISCOVERY_JOB_KIND,
-    ArtifactAvailability,
     DiscoverEditionParameters,
     DiscoveryService,
-    ResearchBatch,
-    ResearchCitation,
-    ResearchSource,
-    ResearchTopic,
     _research_prompt,
     discovery_idempotency_key,
     discovery_request_hash,
@@ -215,85 +210,6 @@ def persisted_research_run(
     return run
 
 
-def research_fixture() -> ResearchBatch:
-    artifacts = ArtifactAvailability(
-        ioc="yes", samples="probable", configurations="yes", pcap="unknown", rules="yes"
-    )
-    primary = ResearchSource(
-        url="https://vendor.example/reports/muddywater?utm_source=feed",
-        title="MuddyWater technical report",
-        publisher="Vendor Research",
-        published_at=date(2026, 7, 10),
-        event_date=date(2026, 7, 2),
-        source_role=SourceRole.PRIMARY,
-        citation="Rapport original cité par la recherche.",
-    )
-    relay = ResearchSource(
-        url="https://relay.example/news/muddywater",
-        title="A new MuddyWater campaign",
-        publisher="Security News",
-        published_at=date(2026, 7, 11),
-        event_date=date(2026, 7, 2),
-        source_role=SourceRole.RELAY,
-        citation="Reprise du rapport original.",
-    )
-    duplicate_primary = ResearchSource(
-        url="https://vendor.example/reports/muddywater",
-        title="MuddyWater technical report (mirror title)",
-        publisher="Vendor Research",
-        published_at=date(2026, 7, 10),
-        event_date=date(2026, 7, 2),
-        source_role=SourceRole.PRIMARY,
-        citation="Même URL sans paramètre de suivi.",
-    )
-    independent = ResearchSource(
-        url="https://cert.example/advisories/42",
-        title="CERT advisory on the campaign",
-        publisher="National CERT",
-        published_at=date(2026, 7, 12),
-        event_date=date(2026, 7, 3),
-        source_role=SourceRole.INDEPENDENT,
-        citation="Observation indépendante.",
-    )
-
-    def topic(sources: list[ResearchSource], uncertainties: list[str]) -> ResearchTopic:
-        return ResearchTopic(
-            provisional_title="MuddyWater déploie une nouvelle chaîne d'infection",
-            summary=(
-                "Une campagne visant plusieurs secteurs iraniens expose une chaîne technique."
-            ),
-            novelty="Nouvelle configuration et nouvelles TTP documentées.",
-            technical_potential=4,
-            event_date=date(2026, 7, 2),
-            actors=["MuddyWater"],
-            campaigns=["Example campaign"],
-            malware=["ExampleRAT"],
-            cves=["CVE-2026-0001"],
-            victims=["organisations publiques"],
-            sectors=["gouvernement"],
-            countries=["Iran"],
-            artifact_availability=artifacts,
-            reasons_for_relevance=["Rapport technique original"],
-            uncertainties=uncertainties,
-            sources=sources,
-        )
-
-    return ResearchBatch(
-        queries=["Iran APT July 2026 technical report"],
-        citations=[
-            ResearchCitation(
-                label="Vendor report",
-                url="https://vendor.example/reports/muddywater",
-                excerpt="Technical report with indicators.",
-            )
-        ],
-        topics=[
-            topic([primary, relay], ["Attribution reprise de la source, non vérifiée."]),
-            topic([duplicate_primary, independent], ["Victimologie encore incomplète."]),
-        ],
-    )
-
-
 def research_markdown_fixture() -> str:
     return """# SUJETS CANDIDATS
 
@@ -396,7 +312,7 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     discovery = DiscoveryService(
         discovery_uow,
         gateway,
-        gateway,
+        archive=gateway,
         bridge_capabilities_provider=FakeBridgeCapabilities(),
         after_persisted_batch=reconcile_after_batch,
     )
@@ -506,7 +422,7 @@ async def test_discovery_renews_job_heartbeat_while_bridge_remains_running() -> 
     discovery = DiscoveryService(
         discovery_uow,
         gateway,
-        gateway,
+        archive=gateway,
         background_poll_interval_seconds=5,
         background_waiter=poll_cycle,
     )
@@ -548,7 +464,7 @@ async def test_worker_restart_resumes_waiting_model_run_by_get_without_second_po
     discovery = DiscoveryService(
         InMemoryDiscoveryUnitOfWorkFactory(),
         gateway,
-        gateway,
+        archive=gateway,
         background_waiter=lambda _: _completed_wait(),
     )
     job_uow = InMemoryJobUnitOfWorkFactory()
@@ -602,7 +518,7 @@ async def test_completed_model_run_is_reparsed_after_resume_without_bridge_call(
         output_reference=reference,
     )
     model_uow.state[completed_run.id] = completed_run
-    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway)
     job_uow = InMemoryJobUnitOfWorkFactory()
     registry = create_job_registry(gateway, discovery)
     jobs = JobService(job_uow, registry)
@@ -630,7 +546,7 @@ async def test_incomplete_model_run_waits_for_human_without_automatic_relaunch()
     gateway, model_uow, _ = gateway_for_adapter(adapter)
     waiting = persisted_research_run(params, status=ModelRunStatus.WAITING_BACKGROUND)
     model_uow.state[waiting.id] = waiting
-    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway)
     job_uow = InMemoryJobUnitOfWorkFactory()
     registry = create_job_registry(gateway, discovery)
     jobs = JobService(job_uow, registry)
@@ -670,7 +586,7 @@ async def test_manual_recovery_archives_exact_report_and_resumes_original_job() 
     waiting = persisted_research_run(params, status=ModelRunStatus.WAITING_BACKGROUND)
     model_uow.state[waiting.id] = waiting
     discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
-    discovery = DiscoveryService(discovery_uow, gateway, gateway)
+    discovery = DiscoveryService(discovery_uow, gateway, archive=gateway)
     job_uow = InMemoryJobUnitOfWorkFactory()
     registry = create_job_registry(gateway, discovery)
     jobs = JobService(job_uow, registry)
@@ -731,7 +647,7 @@ async def test_controlled_completion_is_idempotent_and_keeps_exact_conversation(
         },
     )
     model_uow.state[parent.id] = parent
-    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway)
 
     first = await discovery.start_completion_recovery(params, parent.id)
     second = await discovery.start_completion_recovery(params, parent.id)
@@ -768,7 +684,7 @@ async def test_terminal_bridge_error_fails_discovery_without_parsing() -> None:
     gateway, model_uow, _ = gateway_for_adapter(adapter)
     waiting = persisted_research_run(params, status=ModelRunStatus.WAITING_BACKGROUND)
     model_uow.state[waiting.id] = waiting
-    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway)
     job_uow = InMemoryJobUnitOfWorkFactory()
     registry = create_job_registry(gateway, discovery)
     jobs = JobService(job_uow, registry)
@@ -809,7 +725,7 @@ async def test_human_cancellation_stops_background_polling_without_resubmission(
     discovery = DiscoveryService(
         InMemoryDiscoveryUnitOfWorkFactory(),
         gateway,
-        gateway,
+        archive=gateway,
         background_waiter=cancel_during_wait,
     )
     registry = create_job_registry(gateway, discovery)
@@ -860,7 +776,7 @@ url: ftp://invalid.example/report
         model_uow,
         output_store,
     )
-    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway)
     job_uow = InMemoryJobUnitOfWorkFactory()
     registry = create_job_registry(gateway, discovery)
     jobs = JobService(job_uow, registry)
@@ -908,7 +824,7 @@ async def test_totally_invalid_output_is_archived_before_safe_failure(
         model_uow,
         output_store,
     )
-    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway)
     job_uow = InMemoryJobUnitOfWorkFactory()
     registry = create_job_registry(gateway, discovery)
     jobs = JobService(job_uow, registry)
@@ -951,7 +867,7 @@ async def test_transient_job_error_never_creates_a_second_research() -> None:
         model_uow,
         InMemoryModelOutputStore(),
     )
-    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway)
     job_uow = InMemoryJobUnitOfWorkFactory()
     registry = create_job_registry(gateway, discovery)
     jobs = JobService(job_uow, registry)
@@ -975,13 +891,6 @@ async def test_transient_job_error_never_creates_a_second_research() -> None:
     assert failed.attempt == failed.max_attempts == 1
     assert len(fake.calls) == 1
     assert len(model_uow.state) == 1
-
-
-def test_research_batch_rejects_non_http_urls() -> None:
-    payload = research_fixture().model_dump()
-    payload["topics"][0]["sources"][0]["url"] = "file:///etc/passwd"
-    with pytest.raises(ValidationError):
-        ResearchBatch.model_validate(payload)
 
 
 def test_research_prompt_is_the_documented_markdown_contract() -> None:
@@ -1042,7 +951,7 @@ def _import_service() -> tuple[DiscoveryService, InMemoryDiscoveryUnitOfWorkFact
     service = DiscoveryService(
         discovery_uow,
         gateway,
-        gateway,
+        archive=gateway,
         bridge_capabilities_provider=FakeBridgeCapabilities(),
         after_persisted_batch=after_persisted_batch,
     )
@@ -1130,7 +1039,7 @@ async def test_standalone_import_returns_reconciliation_job_id() -> None:
     service = DiscoveryService(
         discovery_uow,
         gateway,
-        gateway,
+        archive=gateway,
         bridge_capabilities_provider=FakeBridgeCapabilities(),
         after_persisted_batch=after_persisted_batch,
     )

@@ -140,10 +140,9 @@ async def _execute_job(job_id: UUID) -> int | None:
         discovery_service = DiscoveryService(
             uow_factory,
             model_gateway,
-            model_gateway,
+            archive=model_gateway,
             bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
             after_persisted_batch=enqueue_discovery_reconciliation,
-            allow_chatgpt_structuring_fallback=settings.discovery_chatgpt_structuring_fallback,
             background_poll_interval_seconds=settings.discovery_bridge_poll_interval_seconds,
         )
         blob_store = MinioBlobStore(

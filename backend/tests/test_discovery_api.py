@@ -83,7 +83,7 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
         InMemoryModelRunUnitOfWorkFactory(),
         InMemoryModelOutputStore(),
     )
-    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway)
     edition_service = EditionService(InMemoryEditionUnitOfWorkFactory())
     edition = await edition_service.create(
         country="Iran",
@@ -130,20 +130,6 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
         )
         research_run_id = candidates.json()["batches"][0]["discovery_model_run_id"]
         report = await client.get(f"/api/editions/{edition.id}/discovery/reports/{research_run_id}")
-        retried = await client.post(
-            f"/api/editions/{edition.id}/discovery/reports/reprocess",
-            json={
-                "research_model_run_id": research_run_id,
-                "complementary_axis": "initial",
-            },
-        )
-        retried_job = await client.get(f"/api/jobs/{retried.json()['job_id']}")
-        reprocessed_candidates = await client.get(
-            f"/api/editions/{edition.id}/discovery/candidates?sort=technical"
-        )
-        reprocessed_diagnostic = await client.get(
-            f"/api/editions/{edition.id}/discovery/candidates?include_replaced=true"
-        )
         source_id = candidates.json()["candidates"][0]["sources"][0]["id"]
         marked = await client.patch(
             f"/api/editions/{edition.id}/discovery/sources/{source_id}",
@@ -179,17 +165,7 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
     assert marked.json()["verification_status"] == "verify_later"
     assert duplicate.json()["reused"] is True
     assert duplicate.json()["job_id"] == launched.json()["job_id"]
-    assert retried.status_code == 202
-    assert retried_job.json()["status"] == "succeeded"
-    assert len(reprocessed_candidates.json()["batches"]) == 1
-    assert reprocessed_candidates.json()["batches"][0]["parsing_revision"] == 2
-    assert len(reprocessed_diagnostic.json()["batches"]) == 2
-    assert reprocessed_diagnostic.json()["batches"][0]["is_active_revision"] is False
-    assert (
-        reprocessed_diagnostic.json()["batches"][0]["report_sha256"]
-        == reprocessed_diagnostic.json()["batches"][1]["report_sha256"]
-    )
-    assert len(fake.calls) == 1  # une recherche ; retraitement strictement local
+    assert len(fake.calls) == 1  # une recherche
 
 
 async def test_manual_recovery_previews_then_resumes_the_original_job() -> None:
@@ -207,7 +183,7 @@ async def test_manual_recovery_previews_then_resumes_the_original_job() -> None:
         model_uow,
         output_store,
     )
-    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway)
     edition_service = EditionService(InMemoryEditionUnitOfWorkFactory())
     edition = await edition_service.create(
         country="Iran",
@@ -297,7 +273,7 @@ async def _recovery_application() -> tuple[
         model_uow,
         InMemoryModelOutputStore(),
     )
-    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, gateway)
+    discovery = DiscoveryService(InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway)
     edition_service = EditionService(InMemoryEditionUnitOfWorkFactory())
     edition = await edition_service.create(
         country="Iran",
@@ -327,8 +303,8 @@ async def _recovery_application() -> tuple[
     return application, edition, job_uow, discovery
 
 
-async def test_recovery_of_cancelled_job_creates_a_new_reprocess_job() -> None:
-    """§32.4 : le job terminal reste intact, un nouveau job reparse le rapport."""
+async def test_recovery_of_cancelled_job_returns_original_job() -> None:
+    """After removing the structuring pipeline, manual recovery returns the original job."""
     application, edition, job_uow, _ = await _recovery_application()
     markdown = research_markdown_fixture()
 
@@ -359,21 +335,15 @@ async def test_recovery_of_cancelled_job_creates_a_new_reprocess_job() -> None:
             },
         )
         original = await client.get(f"/api/jobs/{job_id}")
-        candidates = await client.get(f"/api/editions/{edition.id}/discovery/candidates")
 
     assert preview.status_code == 200
     assert confirmed.status_code == 202
 
-    new_job_id = confirmed.json()["job_id"]
-    assert new_job_id != job_id
-    # L'historique du job annulé n'est pas réécrit.
+    returned_job_id = confirmed.json()["job_id"]
+    # Without the structuring pipeline, the same job is returned
+    assert returned_job_id == job_id
+    # The original job status remains cancelled
     assert original.json()["status"] == "cancelled"
-
-    new_job = job_uow.state[__import__("uuid").UUID(new_job_id)]
-    assert new_job.kind == "reprocess_discovery_report"
-    # Le nouveau job doit viser le ModelRun de recherche, pas l'ancien Job.
-    assert new_job.input_parameters["research_model_run_id"] == model_run_id
-    assert candidates.json()["total"] == 1
 
 
 async def test_discovery_import_works_without_any_job_or_model_run() -> None:

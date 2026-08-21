@@ -1,15 +1,113 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from typing import Any
 
-from cti_app.application.discovery import _validate_partially
 from cti_app.application.model_output_normalization import normalize_discovery_output
-from tests.test_discovery import research_fixture
 
 
 def _raw_payload() -> dict[str, Any]:
-    return research_fixture().model_dump(mode="json")
+    return {
+        "queries": ["Iran APT July 2026 technical report"],
+        "citations": [
+            {
+                "label": "Vendor report",
+                "url": "https://vendor.example/reports/muddywater",
+                "excerpt": "Technical report with indicators.",
+            }
+        ],
+        "topics": [
+            {
+                "provisional_title": "MuddyWater déploie une nouvelle chaîne d'infection",
+                "summary": "Une campagne visant plusieurs secteurs iraniens expose une chaîne technique.",
+                "novelty": "Nouvelle configuration et nouvelles TTP documentées.",
+                "technical_potential": 4,
+                "event_date": "2026-07-02",
+                "actors": ["MuddyWater"],
+                "campaigns": ["Example campaign"],
+                "malware": ["ExampleRAT"],
+                "cves": ["CVE-2026-0001"],
+                "victims": ["organisations publiques"],
+                "sectors": ["gouvernement"],
+                "countries": ["Iran"],
+                "iocs": [],
+                "artifact_availability": {
+                    "ioc": "yes",
+                    "samples": "probable",
+                    "configurations": "yes",
+                    "pcap": "unknown",
+                    "rules": "yes",
+                },
+                "uncertainties": ["Attribution reprise de la source, non vérifiée."],
+                "reasons_for_relevance": ["Rapport technique original"],
+                "sources": [
+                    {
+                        "url": "https://vendor.example/reports/muddywater?utm_source=feed",
+                        "title": "MuddyWater technical report",
+                        "publisher": "Vendor Research",
+                        "published_at": "2026-07-10",
+                        "event_date": "2026-07-02",
+                        "source_role": "primary",
+                        "citation": "Rapport original cité par la recherche.",
+                    },
+                    {
+                        "url": "https://relay.example/news/muddywater",
+                        "title": "A new MuddyWater campaign",
+                        "publisher": "Security News",
+                        "published_at": "2026-07-11",
+                        "event_date": "2026-07-02",
+                        "source_role": "relay",
+                        "citation": "Reprise du rapport original.",
+                    },
+                ],
+            },
+            {
+                "provisional_title": "MuddyWater déploie une nouvelle chaîne d'infection",
+                "summary": "Une campagne visant plusieurs secteurs iraniens expose une chaîne technique.",
+                "novelty": "Nouvelle configuration et nouvelles TTP documentées.",
+                "technical_potential": 4,
+                "event_date": "2026-07-02",
+                "actors": ["MuddyWater"],
+                "campaigns": ["Example campaign"],
+                "malware": ["ExampleRAT"],
+                "cves": ["CVE-2026-0001"],
+                "victims": ["organisations publiques"],
+                "sectors": ["gouvernement"],
+                "countries": ["Iran"],
+                "iocs": [],
+                "artifact_availability": {
+                    "ioc": "yes",
+                    "samples": "probable",
+                    "configurations": "yes",
+                    "pcap": "unknown",
+                    "rules": "yes",
+                },
+                "uncertainties": ["Victimologie encore incomplète."],
+                "reasons_for_relevance": ["Rapport technique original"],
+                "sources": [
+                    {
+                        "url": "https://vendor.example/reports/muddywater",
+                        "title": "MuddyWater technical report (mirror title)",
+                        "publisher": "Vendor Research",
+                        "published_at": "2026-07-10",
+                        "event_date": "2026-07-02",
+                        "source_role": "primary",
+                        "citation": "Même URL sans paramètre de suivi.",
+                    },
+                    {
+                        "url": "https://cert.example/advisories/42",
+                        "title": "CERT advisory on the campaign",
+                        "publisher": "National CERT",
+                        "published_at": "2026-07-12",
+                        "event_date": "2026-07-03",
+                        "source_role": "independent",
+                        "citation": "Observation indépendante.",
+                    },
+                ],
+            },
+        ],
+    }
 
 
 def test_normalizes_fence_escaped_key_markdown_url_and_empty_query() -> None:
@@ -42,29 +140,6 @@ def test_extracts_one_json_object_surrounded_by_markdown() -> None:
     normalized = normalize_discovery_output(raw)
     assert "extract_unique_json_object" in normalized.transformations
     assert len(normalized.value["topics"]) == 2
-
-
-def test_invalid_secondary_source_does_not_remove_valid_topic() -> None:
-    payload = _raw_payload()
-    topic = payload["topics"][0]
-    topic["sources"].append(
-        {
-            "url": "[ambigu](https://one.example) ou https://two.example",
-            "title": "Source ambiguë",
-            "publisher": "Unknown",
-            "published_at": None,
-            "event_date": None,
-            "source_role": "independent",
-            "citation": None,
-        }
-    )
-
-    normalized = normalize_discovery_output(json.dumps(payload, ensure_ascii=False))
-    result, rejected = _validate_partially(normalized.value)
-
-    assert result.topics
-    assert all(source.url.startswith("https://") for source in result.topics[0].sources)
-    assert any(item["path"][-2:] == ["2", "url"] for item in rejected)
 
 
 def test_canonical_url_deduplication_is_deterministic() -> None:

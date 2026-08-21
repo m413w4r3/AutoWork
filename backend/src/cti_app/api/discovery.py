@@ -13,10 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.discovery import (
     DISCOVERY_JOB_KIND,
-    REPROCESS_DISCOVERY_REPORT_JOB_KIND,
     DiscoverEditionParameters,
     DiscoveryService,
-    RetryStructuringParameters,
     SourceCandidateNotFoundError,
     discovery_idempotency_key,
     discovery_request_hash,
@@ -82,10 +80,6 @@ class DiscoveryLaunchView(BaseModel):
     job_id: UUID
     status: str
     reused: bool
-
-
-class StructuringRetryLaunch(DiscoveryLaunch):
-    research_model_run_id: UUID
 
 
 class SourceView(BaseModel):
@@ -859,63 +853,6 @@ async def confirm_discovery_import(
         _raise_api_error(exc)
 
 
-@router.post(
-    "/reports/reprocess",
-    response_model=DiscoveryLaunchView,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def retry_structuring(
-    edition_id: UUID, payload: StructuringRetryLaunch, request: Request
-) -> DiscoveryLaunchView:
-    editions: EditionService = request.app.state.edition_service
-    jobs: JobService = request.app.state.job_service
-    dispatcher: JobDispatcher = request.app.state.job_dispatcher
-    provider: IdentityProvider = request.app.state.identity_provider
-    try:
-        edition = await editions.get(edition_id)
-        aliases = list(
-            dict.fromkeys([edition.country, edition.country_code, *payload.country_aliases])
-        )
-        discovery = DiscoverEditionParameters(
-            edition_id=edition.id,
-            country=edition.country,
-            country_aliases=aliases,
-            period_start=edition.period_start,
-            period_end=edition.period_end,
-            languages=list(edition.languages),
-            source_profile=edition.source_profile,
-            keywords=payload.keywords,
-            exclusions=payload.exclusions,
-            complementary_axis=payload.complementary_axis,
-            tlp=edition.tlp,
-            sensitivity=payload.sensitivity,
-            external_llm_allowed=payload.external_llm_allowed,
-        )
-        nonce = uuid4()
-        parameters = RetryStructuringParameters(
-            discovery=discovery,
-            research_model_run_id=payload.research_model_run_id,
-            retry_nonce=nonce,
-        )
-        identity = await provider.current()
-        job = await jobs.submit(
-            kind=REPROCESS_DISCOVERY_REPORT_JOB_KIND,
-            aggregate_type="edition",
-            aggregate_id=edition.id,
-            idempotency_key=(
-                f"retry-discovery-structuring:{edition.id}:{payload.research_model_run_id}:{nonce}"
-            ),
-            correlation_id=get_correlation_id(),
-            input_parameters=parameters.model_dump(mode="json"),
-            max_attempts=1,
-            actor_id=identity.actor_id,
-        )
-        await dispatcher.dispatch(job.id)
-        return DiscoveryLaunchView(job_id=job.id, status=job.status.value, reused=False)
-    except Exception as exc:
-        _raise_api_error(exc)
-
-
 @router.patch("/sources/{source_id}", response_model=SourceView)
 async def mark_source(
     edition_id: UUID, source_id: UUID, payload: SourceStatusUpdate, request: Request
@@ -1013,8 +950,6 @@ async def _continue_after_recovery(
 
     Règles :
     - WAITING_HUMAN : reprendre le job existant ;
-    - FAILED/CANCELLED : créer un NOUVEAU job local reprocess_discovery_report,
-      l'ancien job terminal restant inchangé dans l'historique ;
     - autre statut : retourner le job tel quel.
     """
     jobs: JobService = request.app.state.job_service
@@ -1024,29 +959,6 @@ async def _continue_after_recovery(
         resumed = await jobs.resume_waiting_human(job.id, actor_id=actor_id)
         await dispatcher.dispatch(resumed.id)
         return resumed
-
-    if job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
-        parameters = DiscoverEditionParameters.model_validate(job.input_parameters)
-        nonce = uuid4()
-        # Le reparse relit le ModelRun de recherche archivé, jamais le Job :
-        # passer job.id ici rendrait le nouveau job systématiquement en échec.
-        retry_parameters = RetryStructuringParameters(
-            discovery=parameters,
-            research_model_run_id=research_model_run_id,
-            retry_nonce=nonce,
-        )
-        new_job = await jobs.submit(
-            kind=REPROCESS_DISCOVERY_REPORT_JOB_KIND,
-            aggregate_type="edition",
-            aggregate_id=job.aggregate_id,
-            idempotency_key=(f"recovery-reprocess:{job.id}:{research_model_run_id}:{nonce}"),
-            correlation_id=get_correlation_id(),
-            input_parameters=retry_parameters.model_dump(mode="json"),
-            max_attempts=1,
-            actor_id=actor_id,
-        )
-        await dispatcher.dispatch(new_job.id)
-        return new_job
 
     return job
 

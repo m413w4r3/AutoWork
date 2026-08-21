@@ -99,7 +99,7 @@ async def test_postgres_job_lease_survives_long_background_bridge_run(
         discovery = DiscoveryService(
             discovery_uow,
             gateway,
-            gateway,
+            archive=gateway,
             background_poll_interval_seconds=5,
             background_waiter=poll_cycle,
         )

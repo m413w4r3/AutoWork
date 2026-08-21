@@ -158,7 +158,6 @@ def find_root() -> Path:
 
 ROOT = find_root()
 STORE = ROOT / "var" / "ctx"
-KEYS_FILE = ROOT / ".llms_key"  # compatibilité ; préférer les variables d'environnement.
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -204,31 +203,13 @@ def build_lock() -> Iterator[None]:
 # --------------------------------------------------------------------------- credentials
 
 
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        os.environ.setdefault(key, value)
-
-
 def make_client() -> OpenAI:
-    # Le fichier local n'est qu'une compatibilité avec le script v1.
-    # BASE_URL / EMBEDDING_API_KEY dans l'environnement sont préférables.
-    load_env_file(KEYS_FILE)
     base_url = os.getenv("BASE_URL", "").strip()
     api_key = os.getenv("EMBEDDING_API_KEY", "").strip()
     if not base_url or not api_key:
         raise RuntimeError(
-            "BASE_URL / EMBEDDING_API_KEY manquants "
-            f"(environnement ou {KEYS_FILE})."
+            "BASE_URL and EMBEDDING_API_KEY environment variables are required. "
+            "Please set them before running this command."
         )
     return OpenAI(
         api_key=api_key,

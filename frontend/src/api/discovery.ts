@@ -211,7 +211,7 @@ export function launchDiscovery(
   });
 }
 
-export function retryDiscoveryStructuring(
+export function reprocessReport(
   editionId: string,
   researchModelRunId: string,
   complementaryAxis: string,

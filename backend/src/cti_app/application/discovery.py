@@ -7,12 +7,12 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any, Literal, NoReturn, Protocol, cast
+from typing import Any, Literal, NoReturn, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cti_app.application.discovery_report_parser import (
     PARSER_VERSION,
@@ -35,12 +35,6 @@ from cti_app.application.model_gateway import (
     ModelRequest,
     ModelRoutingHint,
     ResearchModel,
-    StructuredExtractionModel,
-)
-from cti_app.application.model_output_normalization import (
-    JsonEnvelopeError,
-    NormalizedModelOutput,
-    normalize_discovery_output,
 )
 from cti_app.application.persistence import DiscoveryUnitOfWorkFactory
 from cti_app.domain.classification import TLP
@@ -65,11 +59,9 @@ from cti_app.domain.model_runs import ModelProvider, ModelRun, ModelRunStatus
 from cti_app.logging import get_correlation_id
 
 DISCOVERY_JOB_KIND = "discover_edition"
-REPROCESS_DISCOVERY_REPORT_JOB_KIND = "reprocess_discovery_report"
 # Compatibility import for callers compiled against the previous name.
 PROMPT_TEMPLATE_ID = "monthly-cti-discovery"
 PROMPT_TEMPLATE_VERSION = "4.1"
-COMPACT_CONTRACT_VERSION = "research-batch-compact-v1"
 logger = logging.getLogger(__name__)
 
 
@@ -88,80 +80,6 @@ def _wrap_candidates_as_contributions(
         )
         for candidate in candidates
     ]
-
-
-class ResearchCitation(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    label: str = Field(min_length=1, max_length=500)
-    url: str = Field(min_length=1, max_length=2048)
-    excerpt: str | None = Field(default=None, max_length=2_000)
-
-    @field_validator("url")
-    @classmethod
-    def validate_http_url(cls, value: str) -> str:
-        canonicalize_http_url(value)
-        return value
-
-
-class ResearchSource(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    url: str = Field(min_length=1, max_length=2048)
-    title: str = Field(min_length=1, max_length=1_000)
-    publisher: str = Field(min_length=1, max_length=500)
-    published_at: date | None
-    event_date: date | None
-    source_role: SourceRole
-    citation: str | None = Field(default=None, max_length=2_000)
-
-    @field_validator("url")
-    @classmethod
-    def validate_http_url(cls, value: str) -> str:
-        canonicalize_http_url(value)
-        return value
-
-
-class ArtifactAvailability(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    ioc: Literal["yes", "no", "probable", "unknown"]
-    samples: Literal["yes", "no", "probable", "unknown"]
-    configurations: Literal["yes", "no", "probable", "unknown"]
-    pcap: Literal["yes", "no", "probable", "unknown"]
-    rules: Literal["yes", "no", "probable", "unknown"]
-
-
-class ResearchTopic(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    provisional_title: str = Field(min_length=1, max_length=1_000)
-    summary: str = Field(min_length=1, max_length=8_000)
-    novelty: str = Field(min_length=1, max_length=2_000)
-    technical_potential: int = Field(ge=0, le=4)
-    event_date: date | None
-    actors: list[str] = Field(max_length=100)
-    campaigns: list[str] = Field(max_length=100)
-    malware: list[str] = Field(max_length=100)
-    cves: list[str] = Field(max_length=100)
-    victims: list[str] = Field(max_length=100)
-    sectors: list[str] = Field(max_length=100)
-    countries: list[str] = Field(max_length=100)
-    iocs: list[str] = Field(default_factory=list, max_length=500)
-    artifact_availability: ArtifactAvailability
-    uncertainties: list[str] = Field(max_length=100)
-    reasons_for_relevance: list[str] = Field(max_length=100)
-    sources: list[ResearchSource] = Field(min_length=1, max_length=100)
-
-
-class ResearchBatch(BaseModel):
-    """Strict, provider-facing output. It remains a proposal, never evidence."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    queries: list[str] = Field(max_length=50)
-    citations: list[ResearchCitation] = Field(max_length=500)
-    topics: list[ResearchTopic] = Field(max_length=200)
 
 
 class DiscoverEditionParameters(JobParameters):
@@ -195,17 +113,6 @@ class DiscoverEditionParameters(JobParameters):
     @classmethod
     def parse_tlp(cls, value: object) -> object:
         return TLP(value) if isinstance(value, str) else value
-
-
-class RetryStructuringParameters(JobParameters):
-    discovery: DiscoverEditionParameters
-    research_model_run_id: UUID
-    retry_nonce: UUID
-
-    @field_validator("research_model_run_id", "retry_nonce", mode="before")
-    @classmethod
-    def parse_uuid(cls, value: object) -> object:
-        return UUID(value) if isinstance(value, str) else value
 
 
 class SourceCandidateNotFoundError(LookupError):
@@ -265,54 +172,12 @@ class ModelOutputArchive(Protocol):
     ) -> ModelRun: ...
 
 
-class DiscoveryStructuringError(ModelGatewayError):
-    code = "discovery_structuring_invalid"
-    phase = "pydantic_validation"
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        run_id: UUID | None,
-        valid_count: int,
-        rejected_count: int,
-        diagnostic_available: bool,
-        parser_stage: str,
-        research_model_run_id: UUID | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.run_id = run_id
-        self.valid_count = valid_count
-        self.rejected_count = rejected_count
-        self.diagnostic_available = diagnostic_available
-        self.phase = parser_stage
-        self.research_model_run_id = research_model_run_id
-
-
-class DiscoveryStructuredModelUnavailable(ModelGatewayError):
-    code = "structured_model_unavailable"
-    retryable = False
-    phase = "structuring"
-
-    def __init__(self, research_model_run_id: UUID) -> None:
-        super().__init__("Le modèle local de structuration est indisponible.")
-        self.research_model_run_id = research_model_run_id
-
-
-@dataclass(frozen=True, slots=True)
-class StructuringResult:
-    batch: ResearchBatch
-    normalized: NormalizedModelOutput | None
-    rejected: tuple[dict[str, Any], ...]
-    run_id: UUID
-
-
 class DiscoveryService:
     def __init__(
         self,
         uow_factory: DiscoveryUnitOfWorkFactory,
         research_model: ResearchModel,
-        structured_model: StructuredExtractionModel,
+        archive: ModelOutputArchive | None,
         *,
         bridge_capabilities: Mapping[str, object] | None = None,
         bridge_capabilities_provider: BridgeCapabilitiesProvider | None = None,
@@ -320,36 +185,16 @@ class DiscoveryService:
             [DiscoveryBatch, DiscoveryInputMode, str], Awaitable[object]
         ]
         | None = None,
-        allow_chatgpt_structuring_fallback: bool = False,
         background_poll_interval_seconds: float = 5.0,
         background_waiter: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._uow_factory = uow_factory
         self._research_model = research_model
-        # Kept as an archive provider for historical ModelRun outputs. Discovery never
-        # calls its structured-extraction method.
-        self._structured_model = structured_model
+        self._output_archive = archive
         self._bridge_capabilities_provider = bridge_capabilities_provider
         self._after_persisted_batch = after_persisted_batch
-        self._allow_chatgpt_structuring_fallback = allow_chatgpt_structuring_fallback
         self._background_poll_interval_seconds = background_poll_interval_seconds
         self._background_waiter = background_waiter
-        self._output_archive = (
-            cast(ModelOutputArchive, structured_model)
-            if all(
-                callable(getattr(structured_model, name, None))
-                for name in (
-                    "get_run",
-                    "read_output",
-                    "archive_output",
-                    "resume",
-                    "adopt_recovery_output",
-                    "link_recovery_child",
-                    "record_output_diagnostics",
-                )
-            )
-            else None
-        )
         self._bridge_capabilities = dict(
             bridge_capabilities
             or {
@@ -999,252 +844,6 @@ class DiscoveryService:
             output_text=text,
             metadata={"visible_citations": list(run.visible_citations)},
         )
-
-    async def _structure(
-        self,
-        parameters: DiscoverEditionParameters,
-        research_text: str,
-        visible_citations: object,
-        research_run_id: UUID,
-        research_hash: str,
-        *,
-        repair_of: NormalizedModelOutput | None = None,
-        validation_errors: tuple[dict[str, Any], ...] = (),
-        fallback_conversation: ConversationContext | None = None,
-    ) -> StructuringResult:
-        citations = visible_citations if isinstance(visible_citations, list) else []
-        prompt = (
-            _repair_prompt(repair_of, validation_errors)
-            if repair_of is not None
-            else _structuring_prompt(
-                research_text,
-                citations,
-                parameters,
-                research_run_id,
-                research_hash,
-            )
-        )
-        request = ModelRequest(
-            text=prompt,
-            prompt_template_id=f"{PROMPT_TEMPLATE_ID}-structure",
-            prompt_template_version=PROMPT_TEMPLATE_VERSION,
-            evidence_pack_hash=research_hash,
-            external_llm_allowed=parameters.external_llm_allowed,
-            routing_hint=ModelRoutingHint.BULK_EXTRACTION,
-            provider=ModelProvider.QWEN,
-            sensitivity=parameters.sensitivity,
-            metadata={
-                "research_model_run_id": str(research_run_id),
-                "compact_contract": _compact_contract(),
-                "compact_contract_version": COMPACT_CONTRACT_VERSION,
-                "defer_validation": True,
-                "repair": repair_of is not None,
-            },
-        )
-        try:
-            execution = await self._structured_model.extract(request, ResearchBatch)
-        except ModelGatewayError as exc:
-            if not self._allow_chatgpt_structuring_fallback:
-                if getattr(exc, "code", None) == "structured_model_unavailable":
-                    raise DiscoveryStructuredModelUnavailable(research_run_id) from exc
-                raise
-            if fallback_conversation is None:
-                raise DiscoveryStructuredModelUnavailable(research_run_id) from exc
-            fallback = replace(
-                request,
-                text=_fallback_continuation_prompt(parameters, research_run_id, research_hash),
-                provider=ModelProvider.OPENAI,
-                conversation=fallback_conversation,
-                metadata={
-                    **request.metadata,
-                    "ephemeral_batch_conversation": True,
-                    "research_output_reused_from_conversation": True,
-                },
-            )
-            execution = await self._structured_model.extract(fallback, ResearchBatch)
-        if isinstance(execution.structured_output, ResearchBatch):
-            return StructuringResult(execution.structured_output, None, (), execution.run.id)
-        raw = execution.output_text
-        if raw is None:
-            raise DiscoveryStructuringError(
-                "La structuration n'a produit aucun objet exploitable.",
-                run_id=execution.run.id,
-                valid_count=0,
-                rejected_count=1,
-                diagnostic_available=bool(execution.run.output_references),
-                parser_stage="empty_output",
-                research_model_run_id=research_run_id,
-            )
-        try:
-            normalized = normalize_discovery_output(raw)
-        except JsonEnvelopeError as exc:
-            if self._output_archive is not None:
-                await self._output_archive.record_output_diagnostics(
-                    execution.run.id,
-                    normalized_reference=None,
-                    normalized_sha256=None,
-                    parser_stage="json_parse",
-                    normalization_version=None,
-                    transformations=(),
-                    validation_errors=(),
-                    json_error_line=exc.line,
-                    json_error_column=exc.column,
-                )
-            self._log_parse_failure(execution, raw, "json_parse", 0, 1)
-            raise DiscoveryStructuringError(
-                "La sortie de structuration ne contient pas un JSON valide.",
-                run_id=execution.run.id,
-                valid_count=0,
-                rejected_count=1,
-                diagnostic_available=bool(execution.run.output_references),
-                parser_stage="json_parse",
-                research_model_run_id=research_run_id,
-            ) from exc
-        result, rejected = _validate_partially(normalized.value)
-        normalized_reference = None
-        if self._output_archive is not None and normalized.normalized_text != raw:
-            normalized_reference = await self._output_archive.archive_output(
-                normalized.normalized_text.encode(), mime_type="application/json"
-            )
-        if self._output_archive is not None:
-            await self._output_archive.record_output_diagnostics(
-                execution.run.id,
-                normalized_reference=normalized_reference,
-                normalized_sha256=normalized.normalized_sha256,
-                parser_stage="completed" if result.topics else "pydantic_validation",
-                normalization_version=normalized.version,
-                transformations=normalized.transformations,
-                validation_errors=rejected,
-            )
-        if rejected and repair_of is None:
-            try:
-                repaired = await self._structure(
-                    parameters,
-                    research_text,
-                    citations,
-                    research_run_id,
-                    research_hash,
-                    repair_of=normalized,
-                    validation_errors=rejected,
-                    fallback_conversation=fallback_conversation,
-                )
-                if repaired.batch.topics:
-                    return repaired
-            except ModelGatewayError:
-                if not result.topics:
-                    raise
-                logger.warning(
-                    "discovery_repair_failed research_model_run_id=%s correlation_id=%s "
-                    "phase=repair valid=%s rejected=%s",
-                    research_run_id,
-                    get_correlation_id(),
-                    len(result.topics),
-                    len(rejected),
-                )
-        if not result.topics:
-            self._log_parse_failure(execution, raw, "pydantic_validation", 0, len(rejected))
-            raise DiscoveryStructuringError(
-                "Aucun topic valide n'a été produit par la structuration.",
-                run_id=execution.run.id,
-                valid_count=0,
-                rejected_count=len(rejected),
-                diagnostic_available=bool(execution.run.output_references),
-                parser_stage="pydantic_validation",
-                research_model_run_id=research_run_id,
-            )
-        logger.info(
-            "discovery_structuring_parsed model_run_id=%s correlation_id=%s raw_sha=%s "
-            "normalized_sha=%s raw_chars=%s valid=%s rejected=%s phase=completed",
-            execution.run.id,
-            get_correlation_id(),
-            normalized.raw_sha256[:12],
-            normalized.normalized_sha256[:12],
-            len(raw),
-            len(result.topics),
-            len(rejected),
-        )
-        return StructuringResult(result, normalized, rejected, execution.run.id)
-
-    @staticmethod
-    def _log_parse_failure(
-        execution: ModelExecution, raw: str, phase: str, valid: int, rejected: int
-    ) -> None:
-        logger.warning(
-            "discovery_structuring_failed model_run_id=%s correlation_id=%s raw_sha=%s "
-            "raw_chars=%s phase=%s valid=%s rejected=%s diagnostic=true",
-            execution.run.id,
-            get_correlation_id(),
-            hashlib.sha256(raw.encode()).hexdigest()[:12],
-            len(raw),
-            phase,
-            valid,
-            rejected,
-        )
-
-    async def retry_structuring(
-        self,
-        parameters: DiscoverEditionParameters,
-        research_run_id: UUID,
-        retry_nonce: UUID,
-        context: JobExecutionContext,
-    ) -> DiscoveryBatch:
-        if self._output_archive is None:
-            raise ModelGatewayError("Model output archive is unavailable")
-        run = await self._output_archive.get_run(research_run_id)
-        if run is None or not run.output_references:
-            raise ModelGatewayError("Archived research ModelRun is unavailable")
-        research_text = (
-            await self._output_archive.read_output(
-                run.raw_output_reference or run.output_references[-1],
-                max_bytes=10_000_000,
-            )
-        ).decode()
-        await context.report_progress(1, 2, "Le rapport ChatGPT archivé est réutilisé")
-        parsed = parse_discovery_report(
-            research_text,
-            visible_citations=list(run.visible_citations),
-            period_start=parameters.period_start,
-            period_end=parameters.period_end,
-            tlp=parameters.tlp,
-            sensitivity=parameters.sensitivity,
-            external_llm_allowed=parameters.external_llm_allowed,
-            research_model_run_id=research_run_id,
-        )
-        await self._record_parser_diagnostics(research_run_id, parsed)
-        await context.report_progress(2, 2, "Analyse locale terminée sans appel au bridge")
-        reparse_hash = hashlib.sha256(
-            f"reparse:{discovery_request_hash(parameters)}:{research_run_id}:{retry_nonce}".encode()
-        ).hexdigest()
-        batch = _parsed_to_domain_batch(
-            parameters,
-            reparse_hash,
-            parsed,
-            research_run_id,
-            await self._capabilities_snapshot(),
-        )
-        async with self._uow_factory() as uow:
-            revisions = [
-                item
-                for item in await uow.discovery_batches.list_for_edition(parameters.edition_id)
-                if item.discovery_model_run_id == research_run_id
-            ]
-            active = next((item for item in reversed(revisions) if item.is_active_revision), None)
-            batch.parsing_revision = (
-                max((item.parsing_revision for item in revisions), default=0) + 1
-            )
-            if active is not None:
-                batch.supersedes_batch_id = active.id
-                active.replaced_by_batch_id = batch.id
-            inserted = await uow.discovery_batches.add_if_absent(batch)
-            if not inserted:
-                raise ModelGatewayError("A parsing revision already exists for this request")
-            if active is not None:
-                await uow.discovery_batches.save(active)
-            await uow.commit()
-        if self._after_persisted_batch is not None:
-            await self._after_persisted_batch(batch, DiscoveryInputMode.RECOVERY, "system:recovery")
-        return batch
-
     async def read_archived_report(self, edition_id: UUID, research_run_id: UUID) -> str:
         if self._output_archive is None:
             raise ReportParsingError("report_unavailable", "Archive de rapports indisponible.")
@@ -1348,34 +947,7 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
             batch = await service.discover_edition(parameters, context)
         except (ModelGatewayError, ReportParsingError) as exc:
             details = None
-            if isinstance(exc, DiscoveryStructuringError):
-                details = {
-                    "phase": exc.phase,
-                    "validation_kind": (
-                        "json_invalid" if exc.phase == "json_parse" else "pydantic_validation"
-                    ),
-                    "valid_count": exc.valid_count,
-                    "rejected_count": exc.rejected_count,
-                    "model_run_id": str(exc.run_id) if exc.run_id else None,
-                    "research_model_run_id": (
-                        str(exc.research_model_run_id) if exc.research_model_run_id else None
-                    ),
-                    "correlation_id": get_correlation_id(),
-                    "diagnostic_available": exc.diagnostic_available,
-                    "can_retry_structuring": exc.research_model_run_id is not None,
-                }
-            elif isinstance(exc, DiscoveryStructuredModelUnavailable):
-                details = {
-                    "phase": exc.phase,
-                    "validation_kind": "model_unavailable",
-                    "valid_count": 0,
-                    "rejected_count": 0,
-                    "research_model_run_id": str(exc.research_model_run_id),
-                    "correlation_id": get_correlation_id(),
-                    "diagnostic_available": True,
-                    "can_retry_structuring": True,
-                }
-            elif isinstance(exc, ReportParsingError):
+            if isinstance(exc, ReportParsingError):
                 details = {
                     "phase": "local_parsing",
                     "research_model_run_id": (
@@ -1385,7 +957,10 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
                     ),
                     "correlation_id": get_correlation_id(),
                     "diagnostic_available": exc.research_model_run_id is not None,
-                    "can_retry_structuring": exc.research_model_run_id is not None,
+                }
+            else:
+                details = {
+                    "correlation_id": get_correlation_id(),
                 }
             error_code = str(getattr(exc, "code", "research_failed"))
             if error_code == "bridge_unreachable":
@@ -1403,38 +978,6 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
         DiscoverEditionParameters,
         handler,
         resume_after_worker_loss=True,
-    )
-
-    async def retry_handler(parameters: JobParameters, context: JobExecutionContext) -> str:
-        if not isinstance(parameters, RetryStructuringParameters):
-            raise TypeError("Invalid discovery structuring retry parameters")
-        try:
-            batch = await service.retry_structuring(
-                parameters.discovery,
-                parameters.research_model_run_id,
-                parameters.retry_nonce,
-                context,
-            )
-        except (ModelGatewayError, ReportParsingError) as exc:
-            details = {
-                "phase": str(getattr(exc, "phase", "structuring")),
-                "research_model_run_id": str(parameters.research_model_run_id),
-                "correlation_id": get_correlation_id(),
-                "diagnostic_available": True,
-                "can_retry_structuring": True,
-            }
-            raise JobHandlerError(
-                str(getattr(exc, "code", "discovery_model_failed")),
-                str(exc),
-                transient=False,
-                details=details,
-            ) from exc
-        return f"discovery-batch://{batch.id}"
-
-    registry.register(
-        REPROCESS_DISCOVERY_REPORT_JOB_KIND,
-        RetryStructuringParameters,
-        retry_handler,
     )
 
 
@@ -1600,286 +1143,6 @@ def _has_recovery_provenance(run: ModelRun, provenance: str) -> bool:
         and isinstance(recovery, dict)
         and recovery.get("provenance") == provenance
     )
-
-
-def _structuring_prompt(
-    raw: str,
-    visible_citations: list[object],
-    parameters: DiscoverEditionParameters,
-    research_run_id: UUID,
-    research_hash: str,
-) -> str:
-    original = {
-        "edition_id": str(parameters.edition_id),
-        "country": parameters.country,
-        "period_start": parameters.period_start.isoformat(),
-        "period_end": parameters.period_end.isoformat(),
-        "languages": parameters.languages,
-        "source_profile_id": parameters.source_profile,
-        "complementary_axis": parameters.complementary_axis,
-    }
-    return (
-        "Structure localement le compte rendu en respectant le contrat compact fourni par le "
-        "système. N'ajoute aucune source, aucun IOC et aucune attribution. Distingue les sources "
-        "primary/independent des relay/aggregator et conserve les incertitudes.\n\n"
-        f"ModelRun de recherche : {research_run_id}\n"
-        f"SHA-256 recherche : {research_hash}\n"
-        f"Paramètres originaux : {json.dumps(original, ensure_ascii=False, sort_keys=True)}\n"
-        f"Citations visibles séparées : {json.dumps(visible_citations, ensure_ascii=False)}\n\n"
-        "Compte rendu Markdown nettoyé :\n" + raw
-    )
-
-
-def _compact_contract() -> dict[str, object]:
-    return {
-        "version": COMPACT_CONTRACT_VERSION,
-        "required": ["queries", "citations", "topics"],
-        "types": {
-            "queries": "array<string,0..50>",
-            "citations": "array<{label:string,url:https-url,excerpt:string|null},0..500>",
-            "topics": "array<topic,0..200>",
-            "topic": {
-                "required": [
-                    "provisional_title",
-                    "summary",
-                    "novelty",
-                    "technical_potential",
-                    "event_date",
-                    "actors",
-                    "campaigns",
-                    "malware",
-                    "cves",
-                    "victims",
-                    "sectors",
-                    "countries",
-                    "iocs",
-                    "artifact_availability",
-                    "uncertainties",
-                    "reasons_for_relevance",
-                    "sources",
-                ],
-                "technical_potential": "integer 0..4",
-                "event_date": "YYYY-MM-DD|null",
-                "sources": "array<source,1..100>",
-            },
-            "source": {
-                "required": [
-                    "url",
-                    "title",
-                    "publisher",
-                    "published_at",
-                    "event_date",
-                    "source_role",
-                    "citation",
-                ],
-                "source_role": [
-                    "primary",
-                    "independent",
-                    "relay",
-                    "aggregator",
-                    "social",
-                    "unknown",
-                ],
-            },
-            "artifact_availability_values": ["yes", "no", "probable", "unknown"],
-        },
-        "minimal_example": {
-            "queries": [],
-            "citations": [],
-            "topics": [],
-        },
-    }
-
-
-def _repair_prompt(previous: NormalizedModelOutput, errors: tuple[dict[str, Any], ...]) -> str:
-    return (
-        "Répare une seule fois le JSON ci-dessous en corrigeant uniquement les erreurs listées. "
-        "Il est interdit d'ajouter une source, un IOC ou une attribution. Supprime une valeur "
-        "irrécupérable plutôt que de l'inventer.\n\n"
-        f"Erreurs structurées : {json.dumps(errors, ensure_ascii=False, sort_keys=True)}\n"
-        f"JSON précédent : {previous.normalized_text}"
-    )
-
-
-def _fallback_continuation_prompt(
-    parameters: DiscoverEditionParameters, research_run_id: UUID, research_hash: str
-) -> str:
-    return (
-        "Continue dans cette conversation et structure le résultat de recherche du tour précédent "
-        "selon le contrat compact. Ne recopie pas la recherche et n'ajoute aucune source, aucun "
-        "IOC ou attribution. Retourne uniquement l'objet JSON. "
-        f"Édition={parameters.edition_id}, ModelRun={research_run_id}, SHA-256={research_hash}."
-    )
-
-
-def _validate_partially(value: dict[str, Any]) -> tuple[ResearchBatch, tuple[dict[str, Any], ...]]:
-    rejected: list[dict[str, Any]] = []
-    allowed = {"queries", "citations", "topics"}
-    for key in value.keys() - allowed:
-        rejected.append(_rejection((key,), "extra_forbidden", value[key]))
-    queries_value = value.get("queries", [])
-    queries: list[str] = []
-    if isinstance(queries_value, list):
-        for index, query in enumerate(queries_value):
-            if isinstance(query, str) and query.strip():
-                queries.append(query.strip())
-            elif query != "":
-                rejected.append(_rejection(("queries", index), "string_type", query))
-    else:
-        rejected.append(_rejection(("queries",), "list_type", queries_value))
-
-    citations: list[ResearchCitation] = []
-    citations_value = value.get("citations", [])
-    if isinstance(citations_value, list):
-        for index, citation in enumerate(citations_value):
-            try:
-                citations.append(
-                    ResearchCitation.model_validate_json(json.dumps(citation, ensure_ascii=False))
-                )
-            except ValidationError as exc:
-                rejected.extend(_pydantic_rejections(("citations", index), exc, citation))
-    else:
-        rejected.append(_rejection(("citations",), "list_type", citations_value))
-
-    topics: list[ResearchTopic] = []
-    topics_value = value.get("topics", [])
-    if not isinstance(topics_value, list):
-        rejected.append(_rejection(("topics",), "list_type", topics_value))
-        topics_value = []
-    for topic_index, topic_value in enumerate(topics_value):
-        if not isinstance(topic_value, dict):
-            rejected.append(_rejection(("topics", topic_index), "dict_type", topic_value))
-            continue
-        sources_value = topic_value.get("sources", [])
-        valid_sources: list[ResearchSource] = []
-        if isinstance(sources_value, list):
-            for source_index, source_value in enumerate(sources_value):
-                try:
-                    valid_sources.append(
-                        ResearchSource.model_validate_json(
-                            json.dumps(source_value, ensure_ascii=False)
-                        )
-                    )
-                except ValidationError as exc:
-                    rejected.extend(
-                        _pydantic_rejections(
-                            ("topics", topic_index, "sources", source_index), exc, source_value
-                        )
-                    )
-        else:
-            rejected.append(
-                _rejection(("topics", topic_index, "sources"), "list_type", sources_value)
-            )
-        candidate = {
-            **topic_value,
-            "sources": [item.model_dump(mode="json") for item in valid_sources],
-        }
-        try:
-            topics.append(
-                ResearchTopic.model_validate_json(json.dumps(candidate, ensure_ascii=False))
-            )
-        except ValidationError as exc:
-            rejected.extend(_pydantic_rejections(("topics", topic_index), exc, topic_value))
-    return (
-        ResearchBatch(queries=queries, citations=citations, topics=topics),
-        tuple(rejected),
-    )
-
-
-def _pydantic_rejections(
-    prefix: tuple[str | int, ...], error: ValidationError, raw: object
-) -> list[dict[str, Any]]:
-    return [
-        _rejection((*prefix, *item["loc"]), str(item["type"]), raw)
-        for item in error.errors(include_url=False, include_context=False, include_input=False)
-    ]
-
-
-def _rejection(path: tuple[str | int, ...], code: str, raw: object) -> dict[str, Any]:
-    encoded = json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str).encode()
-    return {
-        "path": [str(part) for part in path],
-        "code": code,
-        "value_sha256": hashlib.sha256(encoded).hexdigest(),
-    }
-
-
-def _to_domain_batch(
-    parameters: DiscoverEditionParameters,
-    request_hash: str,
-    result: ResearchBatch,
-    research_run_id: UUID,
-    structuring_run_id: UUID,
-    bridge_capabilities: Mapping[str, object],
-) -> DiscoveryBatch:
-    candidates = []
-    for topic in result.topics:
-        artifacts = tuple(
-            name
-            for name, availability in topic.artifact_availability.model_dump().items()
-            if availability in {"yes", "probable"}
-        )
-        sources = [
-            SourceCandidate(
-                url=source.url,
-                title=source.title,
-                publisher=source.publisher,
-                published_at=source.published_at,
-                event_date=source.event_date,
-                role=source.source_role,
-                citation=source.citation,
-                tlp=parameters.tlp,
-                sensitivity=parameters.sensitivity,
-                external_llm_allowed=parameters.external_llm_allowed,
-            )
-            for source in topic.sources
-        ]
-        candidates.append(
-            CandidateTopic(
-                title=topic.provisional_title,
-                summary=topic.summary,
-                novelty=topic.novelty,
-                technical_potential=topic.technical_potential,
-                event_date=topic.event_date,
-                uncertainties=tuple(topic.uncertainties),
-                relevance_reasons=tuple(topic.reasons_for_relevance),
-                actors=tuple(topic.actors),
-                campaigns=tuple(topic.campaigns),
-                malware=tuple(topic.malware),
-                cves=tuple(topic.cves),
-                victims=tuple(topic.victims),
-                sectors=tuple(topic.sectors),
-                countries=tuple(topic.countries),
-                likely_artifacts=artifacts,
-                sources=sources,
-                tlp=parameters.tlp,
-                sensitivity=parameters.sensitivity,
-                external_llm_allowed=parameters.external_llm_allowed,
-                iocs=tuple(topic.iocs),
-            )
-        )
-    return DiscoveryBatch(
-        edition_id=parameters.edition_id,
-        request_hash=request_hash,
-        complementary_axis=parameters.complementary_axis,
-        queries=tuple(result.queries),
-        citations=tuple(citation.model_dump() for citation in result.citations),
-        contributions=_wrap_candidates_as_contributions(candidates, ContributionStatus.ACCEPTED),
-        discovery_model_run_id=research_run_id,
-        structuring_model_run_id=structuring_run_id,
-        tlp=parameters.tlp,
-        sensitivity=parameters.sensitivity,
-        external_llm_allowed=parameters.external_llm_allowed,
-        source_mode=DiscoverySourceMode.VISIBLE_CITATIONS_ONLY,
-        bridge_capabilities=dict(bridge_capabilities),
-        citation_count=len(result.citations),
-        source_coverage_complete=False,
-        source_coverage_incomplete_reason=(
-            "Recherche effectuée depuis les citations visibles de ChatGPT ; "
-            "la liste native complète des sources consultées n'est pas disponible."
-        ),
-    )
-
 
 def _parsed_to_domain_batch(
     parameters: DiscoverEditionParameters,

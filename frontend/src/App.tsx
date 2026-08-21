@@ -19,7 +19,7 @@ import {
   previewManualDiscoveryRecovery,
   previewVisibleDiscoveryRecovery,
   requestDiscoveryCompletion,
-  retryDiscoveryStructuring,
+  reprocessReport as reprocessReportFn,
   type DiscoveryRecoveryPreview,
   type SourceVerificationStatus,
 } from "./api/discovery";
@@ -678,7 +678,7 @@ function DiscoveryPanel({
   });
   const reprocessReport = useMutation({
     mutationFn: (researchModelRunId: string) =>
-      retryDiscoveryStructuring(
+      reprocessReportFn(
         editionId,
         researchModelRunId,
         axis.trim() || "initial",
