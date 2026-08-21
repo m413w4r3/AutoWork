@@ -1473,11 +1473,13 @@ def _create_brief_evidence_packs() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("built_from_snapshot_id", sa.Uuid(), nullable=True),
         sa.Column("built_from_snapshot_version", sa.Integer(), nullable=True),
-        sa.Column("covered_contribution_ids", postgresql.ARRAY(sa.Uuid()), nullable=True),
+        sa.Column(
+            "covered_contribution_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False
+        ),
         sa.Column(
             "scope",
             sa.String(length=10),
-            nullable=True,
+            nullable=False,
             server_default=sa.text("'full'::character varying"),
         ),
         sa.Column("base_pack_id", sa.Uuid(), nullable=True),
@@ -1572,11 +1574,11 @@ def _create_model_conversations() -> None:
         sa.Column("expected_profile", sa.String(255), nullable=True),
         sa.Column("requested_model", sa.String(255), nullable=True),
         sa.Column("head_turn_id", sa.Uuid(), nullable=True),
-        sa.Column("turn_count", sa.Integer(), nullable=False),
+        sa.Column("turn_count", sa.BigInteger(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("last_used_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("version", sa.Integer(), nullable=False),
+        sa.Column("version", sa.BigInteger(), nullable=False),
         sa.CheckConstraint(
             "provider IN ('openai','qwen','fake')", name="ck_model_conversations_provider"
         ),
@@ -1613,7 +1615,7 @@ def _create_model_conversation_turns() -> None:
         "model_conversation_turns",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("conversation_id", sa.Uuid(), nullable=False),
-        sa.Column("sequence", sa.Integer(), nullable=False),
+        sa.Column("sequence", sa.BigInteger(), nullable=False),
         sa.Column("parent_turn_id", sa.Uuid(), nullable=True),
         sa.Column("model_run_id", sa.Uuid(), nullable=False),
         sa.Column("input_blob_reference", sa.Text(), nullable=False),
@@ -1704,7 +1706,7 @@ def _create_subject_production_runs() -> None:
         sa.Column("run_number", sa.Integer(), nullable=False),
         sa.Column("error_code", sa.String(64), nullable=True),
         sa.Column("error_message", sa.String(500), nullable=True),
-        sa.Column("error_details", sa.JSON(), nullable=True),
+        sa.Column("error_details", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
@@ -1765,7 +1767,9 @@ def _create_production_artifacts() -> None:
         sa.Column("rendered_blob_id", sa.Uuid(), nullable=True),
         sa.Column("model_run_id", sa.Uuid(), nullable=True),
         sa.Column("conversation_turn_id", sa.Uuid(), nullable=True),
-        sa.Column("metadata", sa.JSON(), nullable=False, server_default="{}"),
+        sa.Column(
+            "metadata", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default="{}"
+        ),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),

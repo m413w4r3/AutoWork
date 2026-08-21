@@ -97,37 +97,8 @@ KNOWN_EXTRA_FOREIGN_KEYS: dict[str, set[ForeignKeyShape]] = {
     },
 }
 
-# Column definitions where the live migrated schema disagrees with the ORM
-# model: type family, nullability, or both.
+# Column definitions: type family, nullability, or both.
 ColumnShape = tuple[str, bool, int | None]
-KNOWN_COLUMN_DRIFT: dict[str, dict[str, ColumnShape]] = {
-    "brief_evidence_packs": {
-        # 0021 added both as nullable; the model declares non-null `JSONB` for
-        # `covered_contribution_ids` (actual DB type is `uuid[]`) and non-null
-        # for `scope`.
-        "covered_contribution_ids": ("array<uuid>", True, None),
-        "scope": ("string", True, 10),
-    },
-    "model_conversation_turns": {
-        # 0011 declares `sequence` as `Integer`; the model declares `BigInteger`.
-        "sequence": ("integer", False, None),
-    },
-    "model_conversations": {
-        # 0011 declares both as `Integer`; the model declares `BigInteger`.
-        "turn_count": ("integer", False, None),
-        "version": ("integer", False, None),
-    },
-    "production_artifacts": {
-        # 0016 declares `metadata` as plain `sa.JSON()`; the model maps the
-        # `artifact_metadata` attribute to that column as `JSONB`.
-        "metadata": ("json", False, None),
-    },
-    "subject_production_runs": {
-        # 0016 declares `error_details` as plain `sa.JSON()`; the model
-        # declares `JSONB`.
-        "error_details": ("json", True, None),
-    },
-}
 
 # Check constraints that exist in the database but have no corresponding
 # `CheckConstraint` at all on the ORM model (the model's `__table_args__`
@@ -492,9 +463,7 @@ def test_orm_table_matches_migrated_schema(
     table = Base.metadata.tables[table_name]
     actual = schema_snapshot[table_name]
 
-    expected_columns = _expected_columns(table)
-    expected_columns.update(KNOWN_COLUMN_DRIFT.get(table_name, {}))
-    assert actual["columns"] == expected_columns
+    assert actual["columns"] == _expected_columns(table)
 
     assert actual["pk"] == _expected_primary_key(table)
 
