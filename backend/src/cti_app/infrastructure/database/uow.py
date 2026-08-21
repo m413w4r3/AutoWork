@@ -43,17 +43,19 @@ from cti_app.application.persistence import (
 from cti_app.infrastructure.database.repositories import (
     SqlAlchemyBriefDraftRepository,
     SqlAlchemyBriefEvidencePackRepository,
+    SqlAlchemyEditionProductionBatchItemRepository,
+    SqlAlchemyEditionProductionBatchRepository,
+    SqlAlchemyProductionArtifactRepository,
+    SqlAlchemySubjectProductionRunRepository,
+)
+from cti_app.infrastructure.database.repositories.collection import (
     SqlAlchemyClaimRepository,
     SqlAlchemyCollectionAttemptRepository,
     SqlAlchemyCollectionPolicySnapshotRepository,
     SqlAlchemyDerivedArtifactRepository,
-    SqlAlchemyEditionProductionBatchItemRepository,
-    SqlAlchemyEditionProductionBatchRepository,
     SqlAlchemyIndicatorRepository,
-    SqlAlchemyProductionArtifactRepository,
     SqlAlchemyRejectedModelProposalRepository,
     SqlAlchemySourceCollectionRepository,
-    SqlAlchemySubjectProductionRunRepository,
 )
 from cti_app.infrastructure.database.repositories.core import (
     SqlAlchemyBlobRepository,
