@@ -60,8 +60,6 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyEditorialGroupRepository,
     SqlAlchemyHumanDecisionRepository,
     SqlAlchemyIndicatorRepository,
-    SqlAlchemyJobEventRepository,
-    SqlAlchemyJobRepository,
     SqlAlchemyModelConversationRepository,
     SqlAlchemyModelConversationTurnRepository,
     SqlAlchemyModelOutputRejectionRepository,
@@ -79,6 +77,10 @@ from cti_app.infrastructure.database.repositories.core import (
     SqlAlchemySampleRepository,
     SqlAlchemySourceDocumentRepository,
     SqlAlchemySubjectRepository,
+)
+from cti_app.infrastructure.database.repositories.jobs import (
+    SqlAlchemyJobEventRepository,
+    SqlAlchemyJobRepository,
 )
 
 
