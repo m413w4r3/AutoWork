@@ -47,10 +47,6 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyCollectionAttemptRepository,
     SqlAlchemyCollectionPolicySnapshotRepository,
     SqlAlchemyDerivedArtifactRepository,
-    SqlAlchemyDiscoveryIntakeRepository,
-    SqlAlchemyDiscoveryMergeRunRepository,
-    SqlAlchemyDiscoverySnapshotRepository,
-    SqlAlchemyDiscoverySubjectIdentityRepository,
     SqlAlchemyEditionProductionBatchItemRepository,
     SqlAlchemyEditionProductionBatchRepository,
     SqlAlchemyEditorialGroupRepository,
@@ -59,8 +55,6 @@ from cti_app.infrastructure.database.repositories import (
     SqlAlchemyProductionArtifactRepository,
     SqlAlchemyRejectedModelProposalRepository,
     SqlAlchemySourceCollectionRepository,
-    SqlAlchemySubjectContributionRepository,
-    SqlAlchemySubjectMergeEventRepository,
     SqlAlchemySubjectProductionRunRepository,
 )
 from cti_app.infrastructure.database.repositories.core import (
@@ -72,6 +66,14 @@ from cti_app.infrastructure.database.repositories.core import (
 )
 from cti_app.infrastructure.database.repositories.discovery import (
     SqlAlchemyDiscoveryBatchRepository,
+)
+from cti_app.infrastructure.database.repositories.discovery_cumulative import (
+    SqlAlchemyDiscoveryIntakeRepository,
+    SqlAlchemyDiscoveryMergeRunRepository,
+    SqlAlchemyDiscoverySnapshotRepository,
+    SqlAlchemyDiscoverySubjectIdentityRepository,
+    SqlAlchemySubjectContributionRepository,
+    SqlAlchemySubjectMergeEventRepository,
 )
 from cti_app.infrastructure.database.repositories.editions import (
     SqlAlchemyEditionAuditRepository,
