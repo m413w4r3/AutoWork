@@ -41,12 +41,14 @@ from cti_app.application.persistence import (
     SubjectRepository,
 )
 from cti_app.infrastructure.database.repositories import (
-    SqlAlchemyBriefDraftRepository,
-    SqlAlchemyBriefEvidencePackRepository,
     SqlAlchemyEditionProductionBatchItemRepository,
     SqlAlchemyEditionProductionBatchRepository,
     SqlAlchemyProductionArtifactRepository,
     SqlAlchemySubjectProductionRunRepository,
+)
+from cti_app.infrastructure.database.repositories.briefs import (
+    SqlAlchemyBriefDraftRepository,
+    SqlAlchemyBriefEvidencePackRepository,
 )
 from cti_app.infrastructure.database.repositories.collection import (
     SqlAlchemyClaimRepository,
