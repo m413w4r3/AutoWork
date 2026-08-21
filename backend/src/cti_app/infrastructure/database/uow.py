@@ -40,12 +40,6 @@ from cti_app.application.persistence import (
     SubjectProductionRunRepository,
     SubjectRepository,
 )
-from cti_app.infrastructure.database.repositories import (
-    SqlAlchemyEditionProductionBatchItemRepository,
-    SqlAlchemyEditionProductionBatchRepository,
-    SqlAlchemyProductionArtifactRepository,
-    SqlAlchemySubjectProductionRunRepository,
-)
 from cti_app.infrastructure.database.repositories.briefs import (
     SqlAlchemyBriefDraftRepository,
     SqlAlchemyBriefEvidencePackRepository,
@@ -97,6 +91,12 @@ from cti_app.infrastructure.database.repositories.model_conversations import (
 from cti_app.infrastructure.database.repositories.model_runs import (
     SqlAlchemyModelOutputRejectionRepository,
     SqlAlchemyModelRunRepository,
+)
+from cti_app.infrastructure.database.repositories.production import (
+    SqlAlchemyEditionProductionBatchItemRepository,
+    SqlAlchemyEditionProductionBatchRepository,
+    SqlAlchemyProductionArtifactRepository,
+    SqlAlchemySubjectProductionRunRepository,
 )
 
 
