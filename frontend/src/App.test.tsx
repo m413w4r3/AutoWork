@@ -394,6 +394,22 @@ describe("App éditions", () => {
               verification_changed_by: null,
             },
           ],
+          incomplete_sources: [
+            {
+              id: "5b02f2c6-7a8e-4c0f-9f8e-3a2b4e6f1d90",
+              title: "Publication incomplète",
+              publisher: "unknown",
+              raw_url: null,
+              local_ref: "P2",
+              published_at: null,
+              period_relation: "unknown",
+              role: "unknown",
+              ioc_presence: "unknown",
+              ioc_declared_count: null,
+              ioc_visible_count: null,
+              parsing_warnings: ["publication P2: no_explicit_url"],
+            },
+          ],
         },
       ],
       total: 1,
@@ -408,6 +424,34 @@ describe("App éditions", () => {
               : input instanceof URL
                 ? input.href
                 : input.url;
+          if (url.includes("/incomplete-sources/") && init?.method === "PATCH") {
+            return Response.json({
+              source: {
+                id: "5b02f2c6-7a8e-4c0f-9f8e-3a2b4e6f1d90",
+                url: "https://vendor.example/recovered",
+                canonical_url: "https://vendor.example/recovered",
+                raw_url: "https://vendor.example/recovered",
+                local_ref: "P2",
+                source_ref: "source-recovered",
+                title: "Publication incomplète",
+                publisher: "unknown",
+                role: "unknown",
+                published_at: null,
+                event_date: null,
+                citation: null,
+                period_relation: "unknown",
+                ioc_presence: "unknown",
+                ioc_declared_count: null,
+                ioc_visible_count: null,
+                parsing_warnings: ["url_attached_manually"],
+                verification_status: "unverified",
+                relationship_status: "provisional",
+                verification_changed_at: null,
+                verification_changed_by: null,
+              },
+              updated_subject_ids: [candidateResult.candidates[0]!.id],
+            });
+          }
           if (url.includes("/discovery/candidates"))
             return Response.json(candidateResult);
           if (url.includes("/editorial-groups"))
@@ -491,6 +535,33 @@ describe("App éditions", () => {
     expect(screen.getByText(/Exemples : 192\.0\.2\.1/)).toBeInTheDocument();
     await user.click(screen.getByText("Voir la liste complète (1)"));
     expect(screen.getByText("192.0.2.1")).toBeInTheDocument();
+
+    expect(screen.getByText(/URL absente/)).toBeInTheDocument();
+    const urlInput = screen.getByPlaceholderText("https://...");
+    await user.type(urlInput, "https://vendor.example/recovered");
+    await user.click(
+      screen.getByRole("button", { name: "Associer le lien" }),
+    );
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([input, init]) => {
+          const url =
+            typeof input === "string"
+              ? input
+              : input instanceof URL
+                ? input.href
+                : input.url;
+          return (
+            url.includes(
+              "/incomplete-sources/5b02f2c6-7a8e-4c0f-9f8e-3a2b4e6f1d90",
+            ) &&
+            init?.method === "PATCH" &&
+            init?.body === JSON.stringify({ url: "https://vendor.example/recovered" })
+          );
+        }),
+      ).toBe(true);
+    });
+
     await user.click(screen.getByText(/Rapport et diagnostic/));
     expect(screen.getByText("Citation orpheline")).toBeVisible();
     expect(
@@ -575,5 +646,164 @@ describe("App éditions", () => {
     expect(urls.some((url) => url.endsWith("/discovery/import/confirm"))).toBe(
       true,
     );
+  });
+
+  it("attend la réconciliation d'un import avant de rafraîchir la sélection des sujets", async () => {
+    // Régression : un import Markdown déclenche un job de réconciliation
+    // asynchrone côté backend. Rafraîchir immédiatement (sans l'attendre)
+    // faisait la course avec ce job et laissait la sélection des sujets
+    // vide, notamment quand l'import n'apporte qu'un seul candidat.
+    const reconciliationJobId = "8f14e45f-ceea-467e-88bb-7c31f5d59c37";
+    const consolidatedCandidate = {
+      id: "cand-1",
+      batch_id: "9e2f4a1c-1d2b-4a3f-8c5e-6a7b8c9d0e1f",
+      title: "Campagne consolidée",
+      summary: "Résumé.",
+      novelty: "Nouveau.",
+      technical_potential: 2,
+      event_date: null,
+      uncertainties: [],
+      relevance_reasons: [],
+      actors: [],
+      campaigns: [],
+      malware: [],
+      cves: [],
+      victims: [],
+      sectors: [],
+      countries: [],
+      likely_artifacts: [],
+      iocs: [],
+      editorial_status: "proposed",
+      sources: [],
+      incomplete_sources: [],
+      local_ref: "S1",
+      actor_or_campaign: "unknown",
+      technical_potential_reason: "n/a",
+      parsing_warnings: [],
+      context_only: false,
+      selectable: false,
+      valid_publication_count: 0,
+      incomplete_publication_count: 0,
+    };
+    let candidatesCallCount = 0;
+    const fetchMock = vi.fn(
+      withProductionNotStarted((input: RequestInfo | URL) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        if (url.endsWith("/discovery/import/preview")) {
+          return Response.json({
+            sha256: "b".repeat(64),
+            subject_count: 1,
+            publication_count: 0,
+            ioc_count: 0,
+            ioc_type_counts: {},
+            subjects: ["Campagne consolidée"],
+            warnings: [],
+          });
+        }
+        if (url.endsWith("/discovery/import/confirm")) {
+          return Response.json({
+            batch_id: "9e2f4a1c-1d2b-4a3f-8c5e-6a7b8c9d0e1f",
+            reused: false,
+            source_mode: "manual_import",
+            subject_count: 1,
+            publication_count: 0,
+            reconciliation_job_id: reconciliationJobId,
+          });
+        }
+        if (url.includes(`/api/jobs/${reconciliationJobId}`)) {
+          return Response.json({
+            id: reconciliationJobId,
+            kind: "reconcile_discovery",
+            aggregate_type: "edition",
+            aggregate_id: iranEdition.id,
+            status: "succeeded",
+            progress_current: 1,
+            progress_total: 1,
+            user_message: null,
+            attempt: 1,
+            max_attempts: 3,
+            next_retry_at: null,
+            started_at: "2026-08-10T10:00:00Z",
+            finished_at: "2026-08-10T10:01:00Z",
+            heartbeat_at: "2026-08-10T10:01:00Z",
+            error_code: null,
+            error_message: null,
+            error_details: null,
+            correlation_id: "reconcile-test",
+            output_reference: null,
+            cancellation_requested: false,
+            created_at: "2026-08-10T10:00:00Z",
+            updated_at: "2026-08-10T10:01:00Z",
+          });
+        }
+        if (url.includes("/discovery/candidates")) {
+          candidatesCallCount += 1;
+          // Le premier appel a lieu avant la réconciliation : rien de
+          // consolidé pour l'instant, comme le backend le renverrait tant
+          // que le job n'a pas tourné.
+          const consolidated = candidatesCallCount > 1;
+          return Response.json({
+            batches: [],
+            candidates: consolidated ? [consolidatedCandidate] : [],
+            total: consolidated ? 1 : 0,
+            merge_stats: {
+              raw_batch_count: 1,
+              raw_candidate_count: 1,
+              consolidated_candidate_count: consolidated ? 1 : 0,
+              unique_publication_count: 0,
+              duplicate_publication_occurrence_count: 0,
+            },
+            warning: "",
+          });
+        }
+        if (url.includes("/editorial-groups"))
+          return Response.json(emptyEditorialBoard);
+        if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+        return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Coller une réponse ChatGPT" }),
+    );
+    await user.type(
+      await screen.findByLabelText("Réponse ChatGPT"),
+      "# SUJETS CANDIDATS",
+    );
+    await user.click(screen.getByRole("button", { name: "Prévisualiser" }));
+    await screen.findByText(/1 sujets · 0 publications · 0 IOC provisoires/);
+    await user.click(
+      screen.getByRole("button", { name: "Confirmer et intégrer" }),
+    );
+
+    // Le job de réconciliation est suivi (comme une recherche ChatGPT) au
+    // lieu d'être ignoré.
+    expect(await screen.findByText("Terminée")).toBeInTheDocument();
+    // Et la sélection des sujets ne se met à jour qu'une fois ce job
+    // terminal, en montrant le sujet consolidé.
+    expect(
+      await screen.findByRole("heading", { name: "Sélection des sujets" }),
+    ).toBeInTheDocument();
+    expect(candidatesCallCount).toBeGreaterThan(1);
+    expect(
+      fetchMock.mock.calls.some(([input]) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        return url.includes(`/api/jobs/${reconciliationJobId}`);
+      }),
+    ).toBe(true);
   });
 });

@@ -1,7 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type FormEvent, useCallback, useEffect, useState } from "react";
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 import {
+  attachIncompleteSourceUrl,
   confirmManualDiscoveryRecovery,
   confirmVisibleDiscoveryRecovery,
   fetchDiscovery,
@@ -28,6 +35,7 @@ import {
   transitionEdition,
   type Tlp,
 } from "./api/editions";
+import { renderDiscoveryMarkdown } from "./discoveryMarkdownExport";
 import { JobStatusCard } from "./components/JobStatusCard";
 import { EditorialBoard } from "./components/EditorialBoard";
 import { DiscoveryMergeReview } from "./components/DiscoveryMergeReview";
@@ -64,6 +72,47 @@ function usePathname() {
 function navigate(path: string) {
   window.history.pushState({}, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+function IncompleteSourceUrlForm({
+  onSubmit,
+  pending,
+  error,
+}: {
+  onSubmit: (url: string) => void;
+  pending: boolean;
+  error: Error | null;
+}) {
+  const [url, setUrl] = useState("");
+  return (
+    <form
+      className="incomplete-source-url-form"
+      onSubmit={(event: FormEvent) => {
+        event.preventDefault();
+        const trimmed = url.trim();
+        if (!trimmed) return;
+        onSubmit(trimmed);
+      }}
+    >
+      <label>
+        Lien manquant
+        <input
+          type="url"
+          required
+          placeholder="https://..."
+          value={url}
+          disabled={pending}
+          onChange={(event) => setUrl(event.target.value)}
+        />
+      </label>
+      <button type="submit" disabled={pending || !url.trim()}>
+        {pending ? "Association…" : "Associer le lien"}
+      </button>
+      {error ? (
+        <ErrorMessage error={error} fallback="Le lien n'a pas pu être associé." />
+      ) : null}
+    </form>
+  );
 }
 
 function Link({ to, children }: { to: string; children: React.ReactNode }) {
@@ -614,6 +663,19 @@ function DiscoveryPanel({
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: ["discovery", editionId] }),
   });
+  const attachUrl = useMutation({
+    mutationFn: ({
+      subjectId,
+      incompleteSourceId,
+      url,
+    }: {
+      subjectId: string;
+      incompleteSourceId: string;
+      url: string;
+    }) => attachIncompleteSourceUrl(editionId, subjectId, incompleteSourceId, url),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: ["discovery", editionId] }),
+  });
   const reprocessReport = useMutation({
     mutationFn: (researchModelRunId: string) =>
       retryDiscoveryStructuring(
@@ -713,17 +775,29 @@ function DiscoveryPanel({
         axis.trim() || "manual-import",
       );
     },
-    onSuccess: () => {
-      // L'import est parsé localement : aucun job, aucun ModelRun à suivre.
+    onSuccess: (result) => {
+      // L'import est parsé localement, mais la consolidation en sujets tourne
+      // dans un job de réconciliation asynchrone déclenché côté backend. Le
+      // suivre comme les autres jobs de découverte : rafraîchir tout de suite
+      // ferait la course avec ce job et laisserait la sélection des sujets
+      // vide (0 sujet consolidé) quand l'import n'apporte qu'un seul candidat.
       setShowManualImport(false);
       setManualImportMarkdown("");
       setManualImportPreview(null);
-      void queryClient.invalidateQueries({
-        queryKey: ["discovery", editionId],
-      });
-      void queryClient.invalidateQueries({
-        queryKey: ["editorial-board", editionId],
-      });
+      if (result.reconciliation_job_id) {
+        setJobId(result.reconciliation_job_id);
+        setJobStatus(null);
+        window.localStorage.setItem(storageKey, result.reconciliation_job_id);
+        onRunningChange(true);
+      } else {
+        // reused=true : déjà consolidé par un import précédent, rien à attendre.
+        void queryClient.invalidateQueries({
+          queryKey: ["discovery", editionId],
+        });
+        void queryClient.invalidateQueries({
+          queryKey: ["editorial-board", editionId],
+        });
+      }
     },
   });
   const abandonRecovery = useMutation({
@@ -738,6 +812,10 @@ function DiscoveryPanel({
     },
   });
   const candidates = discovery.data?.candidates ?? [];
+  const discoveryMarkdownExport = useMemo(
+    () => renderDiscoveryMarkdown(candidates),
+    [candidates],
+  );
   const batches = discovery.data?.batches ?? [];
   const mergeStats = discovery.data?.merge_stats;
   const searchRunning =
@@ -1068,6 +1146,21 @@ function DiscoveryPanel({
       ) : null}
       <details className="technical-discovery-details">
         <summary>Détails techniques de la découverte</summary>
+        <p>
+          <a
+            className="button button--secondary"
+            download="decouverte.md"
+            href={`data:text/markdown;charset=utf-8,${encodeURIComponent(discoveryMarkdownExport)}`}
+          >
+            Exporter en Markdown
+          </a>{" "}
+          <span className="stats-caption">
+            Même schéma SUBJECT/PUBLICATION que les réponses ChatGPT — réutilisable
+            tel quel via « Coller une réponse ChatGPT » pour retrouver cet état
+            (sujets, sources, IOC), sans les informations de fusion. Seuls les
+            candidats correspondant aux filtres ci-dessous sont exportés.
+          </span>
+        </p>
         <div className="candidate-filters" aria-label="Filtres des candidats">
           <label>
             Recherche
@@ -1339,6 +1432,25 @@ function DiscoveryPanel({
                     {source.parsing_warnings.map((warning) => (
                       <small key={warning}>{warning}</small>
                     ))}
+                    <IncompleteSourceUrlForm
+                      pending={
+                        attachUrl.isPending &&
+                        attachUrl.variables?.incompleteSourceId === source.id
+                      }
+                      error={
+                        attachUrl.isError &&
+                        attachUrl.variables?.incompleteSourceId === source.id
+                          ? attachUrl.error
+                          : null
+                      }
+                      onSubmit={(url) =>
+                        attachUrl.mutate({
+                          subjectId: candidate.id,
+                          incompleteSourceId: source.id,
+                          url,
+                        })
+                      }
+                    />
                   </li>
                 ))}
               </ul>

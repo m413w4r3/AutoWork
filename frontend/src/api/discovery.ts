@@ -110,6 +110,10 @@ export interface ProvisionalDiscoveryIoc {
     | "unknown";
   status: "provisional_visible";
   publication_refs: string[];
+  // Pairs with publication_refs, but carries the surviving SourceCandidate.id
+  // for each relation instead of the (batch-local, so collision-prone once
+  // several research batches are consolidated) local_ref string.
+  publication_ids: string[];
   warnings: string[];
 }
 
@@ -185,6 +189,11 @@ export interface DiscoveryImportConfirmResult {
   source_mode: "manual_import";
   subject_count: number;
   publication_count: number;
+  // Consolidation into subjects runs in an async job dispatched right after
+  // this call returns; null when reused (already consolidated earlier).
+  // Callers must poll this job and only refresh discovery state once it is
+  // terminal — refreshing immediately races the job.
+  reconciliation_job_id: string | null;
 }
 
 export function launchDiscovery(
@@ -462,6 +471,28 @@ export function markDiscoverySource(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
+    },
+  );
+}
+
+export interface IncompleteSourceAttachmentResult {
+  source: SourceCandidate;
+  updated_subject_ids: string[];
+}
+
+export function attachIncompleteSourceUrl(
+  editionId: string,
+  subjectId: string,
+  incompleteSourceId: string,
+  url: string,
+): Promise<IncompleteSourceAttachmentResult> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/candidates/` +
+      `${encodeURIComponent(subjectId)}/incomplete-sources/${encodeURIComponent(incompleteSourceId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
     },
   );
 }

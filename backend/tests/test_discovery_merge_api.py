@@ -7,9 +7,15 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from cti_app.api.discovery import merge_runs_router
+from cti_app.api.discovery import merge_runs_router, router
 from cti_app.application.discovery_cumulative import MergeHandleLabel
+from cti_app.application.discovery_manual_source_edits import (
+    IncompleteSourceCandidateNotFoundError,
+    ManualSourceEditResult,
+)
 from cti_app.application.identity import LocalIdentityProvider
+from cti_app.domain.classification import TLP
+from cti_app.domain.discovery import SourceCandidate, SourceRole
 from cti_app.domain.discovery_cumulative import (
     DiscoveryMergeRun,
     DiscoveryPlannerKind,
@@ -130,3 +136,103 @@ async def test_merge_review_api_lists_details_and_resolves_plan() -> None:
     assert detail.json()["projected_diff"][0]["incoming_candidate_handles"] == ["C1"]
     assert resolution.json() == {"snapshot_id": str(snapshot.id), "snapshot_version": 3}
     assert len(service.decisions) == 1
+
+
+class FakeManualSourceEditService:
+    def __init__(self, result: ManualSourceEditResult | None, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.calls: list[tuple[UUID, UUID, UUID, str, str]] = []
+
+    async def attach_incomplete_source_url(
+        self,
+        edition_id: UUID,
+        subject_id: UUID,
+        incomplete_source_id: UUID,
+        url: str,
+        *,
+        actor_id: str,
+    ) -> ManualSourceEditResult:
+        self.calls.append((edition_id, subject_id, incomplete_source_id, url, actor_id))
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+
+def _promoted_source(url: str) -> SourceCandidate:
+    return SourceCandidate(
+        url=url,
+        title="Iran central bank says no new disruption after banking cyberattack",
+        publisher="bne IntelliNews",
+        role=SourceRole.INDEPENDENT,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_attach_incomplete_source_url_promotes_and_reports_updated_subjects() -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    incomplete_source_id = uuid4()
+    other_subject_id = uuid4()
+    promoted = _promoted_source("https://bne-intellinews.example/story")
+    service = FakeManualSourceEditService(
+        ManualSourceEditResult(
+            promoted_source=promoted,
+            updated_subject_ids=(subject_id, other_subject_id),
+        )
+    )
+    application = FastAPI()
+    application.include_router(router)
+    application.state.manual_source_edit_service = service
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.patch(
+            f"/api/editions/{edition_id}/discovery/candidates/{subject_id}"
+            f"/incomplete-sources/{incomplete_source_id}",
+            json={"url": "https://bne-intellinews.example/story"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"]["url"] == "https://bne-intellinews.example/story"
+    assert set(body["updated_subject_ids"]) == {str(subject_id), str(other_subject_id)}
+    assert service.calls == [
+        (
+            edition_id,
+            subject_id,
+            incomplete_source_id,
+            "https://bne-intellinews.example/story",
+            "dev-analyst",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_attach_incomplete_source_url_reports_not_found_as_404() -> None:
+    edition_id, subject_id, incomplete_source_id = uuid4(), uuid4(), uuid4()
+    service = FakeManualSourceEditService(
+        None, error=IncompleteSourceCandidateNotFoundError(str(incomplete_source_id))
+    )
+    application = FastAPI()
+    application.include_router(router)
+    application.state.manual_source_edit_service = service
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.patch(
+            f"/api/editions/{edition_id}/discovery/candidates/{subject_id}"
+            f"/incomplete-sources/{incomplete_source_id}",
+            json={"url": "https://example.test/a"},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "incomplete_source_candidate_not_found"

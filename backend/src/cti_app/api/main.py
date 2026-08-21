@@ -25,6 +25,7 @@ from cti_app.application.discovery_cumulative import (
     CumulativeDiscoveryService,
     ReconcileDiscoveryParameters,
 )
+from cti_app.application.discovery_manual_source_edits import ManualSourceEditService
 from cti_app.application.editions import EditionService
 from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.http_collection import (
@@ -169,6 +170,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         allow_chatgpt_structuring_fallback=settings.discovery_chatgpt_structuring_fallback,
         background_poll_interval_seconds=settings.discovery_bridge_poll_interval_seconds,
     )
+    manual_source_edit_service = ManualSourceEditService(
+        uow_factory, model_gateway, cumulative_discovery_service
+    )
     collection_service = SubjectCollectionService(
         uow_factory,
         SafeHttpCollector(
@@ -235,6 +239,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.model_conversation_service = model_conversation_service
     app.state.discovery_service = discovery_service
     app.state.cumulative_discovery_service = cumulative_discovery_service
+    app.state.manual_source_edit_service = manual_source_edit_service
     app.state.editorial_service = editorial_service
     app.state.collection_service = collection_service
     app.state.brief_service = brief_service

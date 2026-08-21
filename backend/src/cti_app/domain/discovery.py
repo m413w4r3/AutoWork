@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -136,7 +136,7 @@ class SourceCandidate:
     verification_changed_at: datetime | None = None
     verification_changed_by: str | None = None
     canonical_url: str = field(init=False)
-    title_fingerprint: str = field(init=False)
+    title_fingerprint: str | None = field(init=False)
 
     def __post_init__(self) -> None:
         self.canonical_url = canonicalize_http_url(self.url)
@@ -145,7 +145,7 @@ class SourceCandidate:
         self.title = self.title.strip()
         self.publisher = self.publisher.strip()
         self.sensitivity = self.sensitivity.strip()
-        self.title_fingerprint = fingerprint_title(self.title)
+        self.title_fingerprint = _identity_fingerprint(self.title)
         if not self.title or not self.publisher or not self.sensitivity:
             raise ValueError("Source title, publisher and sensitivity are required")
         if self.ioc_declared_count is not None and self.ioc_declared_count < 0:
@@ -176,10 +176,12 @@ class IncompleteSourceCandidate:
     parsing_warnings: tuple[str, ...] = ()
     markdown_block: str | None = None
     id: UUID = field(default_factory=uuid4)
+    title_fingerprint: str | None = field(init=False)
 
     def __post_init__(self) -> None:
         self.title = self.title.strip() or "Publication incomplète"
         self.publisher = self.publisher.strip() or "unknown"
+        self.title_fingerprint = _identity_fingerprint(self.title)
 
 
 @dataclass(slots=True)
@@ -228,7 +230,14 @@ class CandidateTopic:
             raise ValueError("Technical potential must be between 0 and 4")
         if self.editorial_status != "proposed":
             raise ValueError("Discovery cannot select a topic automatically")
-        self.sources = deduplicate_sources(self.sources)
+        self.sources, source_id_remap = deduplicate_sources(self.sources)
+        if source_id_remap:
+            self.provisional_iocs = remap_ioc_publication_ids(
+                self.provisional_iocs, source_id_remap
+            )
+        self.incomplete_sources = recover_incomplete_source_urls(
+            self.sources, deduplicate_incomplete_sources(self.incomplete_sources)
+        )
 
     @property
     def selectable(self) -> bool:
@@ -380,15 +389,211 @@ def fingerprint_title(value: str) -> str:
     return hashlib.sha256(" ".join(words).encode()).hexdigest()
 
 
-def deduplicate_sources(sources: list[SourceCandidate]) -> list[SourceCandidate]:
-    seen_urls: set[str] = set()
+_MIN_IDENTIFYING_WORDS = 3
+_PLACEHOLDER_TITLES = {"publication incomplète"}
+
+
+def _identity_fingerprint(title: str) -> str | None:
+    """Fingerprint used to decide whether two publications are the same article.
+
+    Returns None for placeholders (an empty title becomes "Publication
+    incomplète") and for titles too short/generic to be a reliable
+    identifier on their own — those must never be treated as matching each
+    other just because they happen to share a fingerprint.
+    """
+    normalized = title.strip().casefold()
+    if not normalized or normalized in _PLACEHOLDER_TITLES:
+        return None
+    ascii_words = re.findall(
+        r"[a-z0-9]+", unicodedata.normalize("NFKD", normalized).encode("ascii", "ignore").decode()
+    )
+    if len(ascii_words) < _MIN_IDENTIFYING_WORDS:
+        return None
+    try:
+        return fingerprint_title(title)
+    except ValueError:
+        return None
+
+
+def _normalize_publisher(value: str) -> str:
+    """Fold a publisher string to a word-order-independent key.
+
+    Bylines are frequently written both ways ("Insikt Group / Recorded
+    Future" vs "Recorded Future / Insikt Group" — a co-published/syndicated
+    report attributed to both organizations, order not meaningful), so the
+    tokens are sorted rather than just casefolded — otherwise those two
+    strings fail to corroborate a match in `same_publication` even though
+    they name the exact same publisher pairing.
+    """
+    normalized = unicodedata.normalize("NFKD", value.casefold())
+    words = re.findall(r"[a-z0-9]+", normalized.encode("ascii", "ignore").decode())
+    return " ".join(sorted(words))
+
+
+def _registrable_domain(url: str | None) -> str | None:
+    if not url:
+        return None
+    try:
+        host = urlsplit(url.strip()).hostname
+    except ValueError:
+        return None
+    if not host:
+        return None
+    parts = host.lower().split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def _date_corroborates(
+    a: SourceCandidate | IncompleteSourceCandidate, b: SourceCandidate | IncompleteSourceCandidate
+) -> bool:
+    for attr in ("published_at", "event_date"):
+        a_value = getattr(a, attr, None)
+        b_value = getattr(b, attr, None)
+        if a_value is not None and b_value is not None:
+            return bool(a_value == b_value)
+    return False
+
+
+def same_publication(
+    a: SourceCandidate | IncompleteSourceCandidate, b: SourceCandidate | IncompleteSourceCandidate
+) -> bool:
+    """True when `a` and `b` describe the same real-world publication.
+
+    This is the single identity rule shared by every dedup/matching site
+    (intra-batch dedup, cross-batch merge, and incomplete-source URL
+    recovery) so "same article" is defined exactly once. An exact
+    `canonical_url` match is always sufficient. Otherwise a shared title
+    fingerprint is required *and* at least one corroborating signal must
+    agree (publisher, date, or registrable domain) — title alone is not
+    enough, since distinct articles can legitimately share a title (e.g.
+    recurring "Weekly roundup" pieces).
+    """
+    a_url = getattr(a, "canonical_url", None)
+    b_url = getattr(b, "canonical_url", None)
+    if a_url is not None and b_url is not None and a_url == b_url:
+        return True
+    if a.title_fingerprint is None or a.title_fingerprint != b.title_fingerprint:
+        return False
+    a_publisher = _normalize_publisher(a.publisher)
+    b_publisher = _normalize_publisher(b.publisher)
+    if a_publisher and a_publisher not in {"unknown"} and a_publisher == b_publisher:
+        return True
+    if _date_corroborates(a, b):
+        return True
+    a_domain = _registrable_domain(a_url or getattr(a, "raw_url", None))
+    b_domain = _registrable_domain(b_url or getattr(b, "raw_url", None))
+    if a_domain and a_domain == b_domain:
+        return True
+    return False
+
+
+def remap_ioc_publication_ids(
+    iocs: list[ProvisionalDiscoveryIoc], remap: dict[UUID, UUID]
+) -> list[ProvisionalDiscoveryIoc]:
+    """Rewrite publication_relations after deduplicate_sources drops a source.
+
+    ProvisionalIocPublicationRelation.publication_id references a
+    SourceCandidate.id; folding two sources together must not leave IOCs
+    pointing at an id that no longer exists in candidate.sources.
+    """
+    for ioc in iocs:
+        relations = tuple(
+            replace(relation, publication_id=remap.get(relation.publication_id, relation.publication_id))
+            for relation in ioc.publication_relations
+        )
+        seen: set[tuple[UUID, str]] = set()
+        deduped: list[ProvisionalIocPublicationRelation] = []
+        for relation in relations:
+            key = (relation.publication_id, relation.publication_ref)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(relation)
+        ioc.publication_relations = tuple(deduped)
+    return iocs
+
+
+def deduplicate_sources(
+    sources: list[SourceCandidate],
+) -> tuple[list[SourceCandidate], dict[UUID, UUID]]:
+    """Collapse sources that are the same real-world publication.
+
+    Returns the deduplicated list plus a map from each dropped source's id
+    to the surviving source's id, so callers can remap anything that still
+    references a dropped source (see `remap_ioc_publication_ids`).
+    """
     unique: list[SourceCandidate] = []
+    remap: dict[UUID, UUID] = {}
     for source in sources:
-        if source.canonical_url in seen_urls:
+        match = next((existing for existing in unique if same_publication(existing, source)), None)
+        if match is None:
+            unique.append(source)
             continue
-        seen_urls.add(source.canonical_url)
-        unique.append(source)
+        remap[source.id] = match.id
+        if match.publisher.casefold() in {"", "unknown"} and source.publisher.casefold() not in {
+            "",
+            "unknown",
+        }:
+            match.publisher = source.publisher
+        if match.published_at is None:
+            match.published_at = source.published_at
+        if match.event_date is None:
+            match.event_date = source.event_date
+        match.parsing_warnings = tuple(
+            dict.fromkeys((*match.parsing_warnings, *source.parsing_warnings))
+        )
+    return unique, remap
+
+
+def deduplicate_incomplete_sources(
+    sources: list[IncompleteSourceCandidate],
+) -> list[IncompleteSourceCandidate]:
+    unique: list[IncompleteSourceCandidate] = []
+    for source in sources:
+        match = next((existing for existing in unique if same_publication(existing, source)), None)
+        if match is None:
+            unique.append(source)
+            continue
+        if match.publisher.casefold() in {"", "unknown"} and source.publisher.casefold() not in {
+            "",
+            "unknown",
+        }:
+            match.publisher = source.publisher
+        if match.raw_url is None:
+            match.raw_url = source.raw_url
+        if match.published_at is None:
+            match.published_at = source.published_at
+        match.parsing_warnings = tuple(
+            dict.fromkeys((*match.parsing_warnings, *source.parsing_warnings))
+        )
     return unique
+
+
+def recover_incomplete_source_urls(
+    sources: list[SourceCandidate], incomplete_sources: list[IncompleteSourceCandidate]
+) -> list[IncompleteSourceCandidate]:
+    """Drop an incomplete publication when exactly one full source already
+    covers the same article, instead of leaving both around forever.
+
+    Only promotes on an unambiguous match: if more than one source in scope
+    matches the same incomplete publication, guessing which one is right
+    would be worse than leaving it incomplete, so it is kept with a
+    `url_recovery_ambiguous` warning instead of being silently dropped.
+    """
+    remaining: list[IncompleteSourceCandidate] = []
+    for incomplete in incomplete_sources:
+        matches = [source for source in sources if same_publication(incomplete, source)]
+        if len(matches) == 1:
+            matches[0].parsing_warnings = tuple(
+                dict.fromkeys((*matches[0].parsing_warnings, "url_recovered_from_local_match"))
+            )
+            continue
+        if len(matches) > 1:
+            incomplete.parsing_warnings = tuple(
+                dict.fromkeys((*incomplete.parsing_warnings, "url_recovery_ambiguous"))
+            )
+        remaining.append(incomplete)
+    return remaining
 
 
 def deduplicate_topics(topics: list[CandidateTopic]) -> list[CandidateTopic]:
@@ -398,7 +603,15 @@ def deduplicate_topics(topics: list[CandidateTopic]) -> list[CandidateTopic]:
         if existing is None:
             unique[topic.title_fingerprint] = topic
             continue
-        existing.sources = deduplicate_sources([*existing.sources, *topic.sources])
+        merged_sources, source_id_remap = deduplicate_sources([*existing.sources, *topic.sources])
+        existing.sources = merged_sources
+        if source_id_remap:
+            existing.provisional_iocs = remap_ioc_publication_ids(
+                [*existing.provisional_iocs, *topic.provisional_iocs], source_id_remap
+            )
+        existing.incomplete_sources = deduplicate_incomplete_sources(
+            [*existing.incomplete_sources, *topic.incomplete_sources]
+        )
         existing.technical_potential = max(existing.technical_potential, topic.technical_potential)
         existing.uncertainties = tuple(
             dict.fromkeys((*existing.uncertainties, *topic.uncertainties))

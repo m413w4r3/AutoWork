@@ -20,6 +20,7 @@ from cti_app.domain.discovery import (
     DiscoveryBatch,
     DiscoveryContribution,
     DiscoverySourceMode,
+    IncompleteSourceCandidate,
     SourceCandidate,
     SourceRole,
 )
@@ -165,6 +166,218 @@ async def test_enrichment_keeps_identity_title_and_all_sources() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cross_batch_near_duplicate_urls_collapse_into_one_source() -> None:
+    """Regression test for the "same article proposed 10+ times" bug.
+
+    Independent report runs often cite the same article via slightly
+    different URL shapes; each contribution here uses a distinct mirror URL
+    for the same title+publisher, and the merged subject must end up with
+    exactly one source, not one per contribution.
+    """
+    edition_id = uuid4()
+    planner = HeuristicMergePlanner()
+    subject_title = "Iran central bank says no new disruption after banking cyberattack"
+    snapshot: object | None = None
+    for index, url in enumerate(
+        [
+            "https://mirror-one.example/story?ref=123",
+            "https://mirror-two.example/story?session=abc",
+            "https://mirror-three.example/story?tracking=xyz",
+        ]
+    ):
+        batch = _batch(
+            edition_id, [_candidate(subject_title, url, summary=f"Contribution {index}")]
+        )
+        intake = _intake(batch)
+        delta = build_discovery_delta(intake, batch)
+        handles = build_merge_handles(snapshot, delta)
+        plan = (
+            await planner.plan(
+                snapshot,
+                delta,
+                handles,
+                edition_id=edition_id,
+                external_llm_allowed=True,
+                sensitivity="internal",
+            )
+        ).plan
+        run = make_merge_run(
+            edition_id=edition_id,
+            parent_snapshot=snapshot,
+            intake=intake,
+            delta=delta,
+            planner=planner,
+            handles=handles,
+        )
+        snapshot = apply_discovery_merge_plan(
+            snapshot,
+            delta,
+            plan,
+            resolved_handles=handles,
+            planner_kind=run.planner_kind,
+            edition_id=edition_id,
+            intake_id=intake.id,
+            merge_run_id=run.id,
+        ).snapshot
+
+    assert len(snapshot.subjects) == 1
+    assert len(snapshot.subjects[0].candidate.sources) == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_batch_repeated_incomplete_citation_does_not_balloon() -> None:
+    """The incomplete-source counterpart of the near-duplicate-URL test above."""
+    edition_id = uuid4()
+    planner = HeuristicMergePlanner()
+    snapshot: object | None = None
+    for index in range(3):
+        batch = _batch(
+            edition_id,
+            [
+                _candidate_with_incomplete(
+                    "Canonical title", f"https://example.test/anchor-{index}"
+                )
+            ],
+        )
+        intake = _intake(batch)
+        delta = build_discovery_delta(intake, batch)
+        handles = build_merge_handles(snapshot, delta)
+        plan = (
+            await planner.plan(
+                snapshot,
+                delta,
+                handles,
+                edition_id=edition_id,
+                external_llm_allowed=True,
+                sensitivity="internal",
+            )
+        ).plan
+        run = make_merge_run(
+            edition_id=edition_id,
+            parent_snapshot=snapshot,
+            intake=intake,
+            delta=delta,
+            planner=planner,
+            handles=handles,
+        )
+        snapshot = apply_discovery_merge_plan(
+            snapshot,
+            delta,
+            plan,
+            resolved_handles=handles,
+            planner_kind=run.planner_kind,
+            edition_id=edition_id,
+            intake_id=intake.id,
+            merge_run_id=run.id,
+        ).snapshot
+
+    assert len(snapshot.subjects) == 1
+    assert len(snapshot.subjects[0].candidate.incomplete_sources) == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_batch_incomplete_source_recovers_url_from_sibling_contribution() -> None:
+    """One contribution cites the article without a URL, another (to the same
+    subject) cites it with one — the merged subject should end up with the
+    URL attached and no lingering incomplete entry, not both side by side."""
+    edition_id = uuid4()
+    planner = HeuristicMergePlanner()
+    subject_title = "Iran central bank says no new disruption after banking cyberattack"
+
+    first_batch = _batch(edition_id, [_candidate(subject_title, "https://example.test/anchor")])
+    first_intake = _intake(first_batch)
+    first_delta = build_discovery_delta(first_intake, first_batch)
+    first_handles = build_merge_handles(None, first_delta)
+    first_run = make_merge_run(
+        edition_id=edition_id,
+        parent_snapshot=None,
+        intake=first_intake,
+        delta=first_delta,
+        planner=planner,
+        handles=first_handles,
+    )
+    snapshot = apply_discovery_merge_plan(
+        None,
+        first_delta,
+        (
+            await planner.plan(
+                None,
+                first_delta,
+                first_handles,
+                edition_id=edition_id,
+                external_llm_allowed=True,
+                sensitivity="internal",
+            )
+        ).plan,
+        resolved_handles=first_handles,
+        planner_kind=first_run.planner_kind,
+        edition_id=edition_id,
+        intake_id=first_intake.id,
+        merge_run_id=first_run.id,
+    ).snapshot
+
+    # The second contribution's own anchor source must have a distinct title
+    # from the incomplete entry below — otherwise recovery would already fire
+    # intra-candidate (during this CandidateTopic's own construction) and the
+    # test would not exercise the cross-batch path at all. The incomplete
+    # entry instead matches the *first* contribution's anchor article.
+    second_candidate = _candidate(
+        subject_title, "https://example.test/anchor-2", summary="Second contribution"
+    )
+    second_candidate.sources = [
+        SourceCandidate(
+            url="https://example.test/anchor-2",
+            title="An unrelated second-contribution article headline",
+            publisher="Publisher",
+            role=SourceRole.PRIMARY,
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        )
+    ]
+    second_candidate.incomplete_sources = [
+        IncompleteSourceCandidate(
+            title="Iran central bank says no new disruption after banking cyberattack",
+            publisher="Publisher",
+        )
+    ]
+    second_batch = _batch(edition_id, [second_candidate])
+    second_intake = _intake(second_batch)
+    second_delta = build_discovery_delta(second_intake, second_batch)
+    second_handles = build_merge_handles(snapshot, second_delta)
+    second_run = make_merge_run(
+        edition_id=edition_id,
+        parent_snapshot=snapshot,
+        intake=second_intake,
+        delta=second_delta,
+        planner=planner,
+        handles=second_handles,
+    )
+    result = apply_discovery_merge_plan(
+        snapshot,
+        second_delta,
+        (
+            await planner.plan(
+                snapshot,
+                second_delta,
+                second_handles,
+                edition_id=edition_id,
+                external_llm_allowed=True,
+                sensitivity="internal",
+            )
+        ).plan,
+        resolved_handles=second_handles,
+        planner_kind=second_run.planner_kind,
+        edition_id=edition_id,
+        intake_id=second_intake.id,
+        merge_run_id=second_run.id,
+    ).snapshot
+
+    assert len(result.subjects) == 1
+    assert result.subjects[0].candidate.incomplete_sources == []
+
+
+@pytest.mark.asyncio
 async def test_unmentioned_parent_subject_is_carried_forward_unchanged() -> None:
     edition_id = uuid4()
     planner = HeuristicMergePlanner()
@@ -307,6 +520,24 @@ def _candidate(title: str, url: str, *, summary: str = "Summary") -> CandidateTo
         external_llm_allowed=True,
         local_ref="S1",
     )
+
+
+def _candidate_with_incomplete(title: str, anchor_url: str) -> CandidateTopic:
+    """A candidate whose only non-anchor publication has no URL.
+
+    `anchor_url` gives the subject a stable real source so cross-batch
+    identity matching (which anchors on shared entities/URLs) groups these
+    contributions into the same subject; the incomplete_sources entry is the
+    one under test.
+    """
+    candidate = _candidate(title, anchor_url)
+    candidate.incomplete_sources = [
+        IncompleteSourceCandidate(
+            title="Iran central bank says no new disruption after banking cyberattack",
+            publisher="bne IntelliNews",
+        )
+    ]
+    return candidate
 
 
 def _batch(edition_id: UUID, candidates: list[CandidateTopic]) -> DiscoveryBatch:

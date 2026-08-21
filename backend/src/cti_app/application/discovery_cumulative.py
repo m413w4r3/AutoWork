@@ -39,6 +39,9 @@ from cti_app.domain.discovery import (
     ProvisionalDiscoveryIoc,
     SourceCandidate,
     SourceRole,
+    recover_incomplete_source_urls,
+    remap_ioc_publication_ids,
+    same_publication,
 )
 from cti_app.domain.discovery_cumulative import (
     DiscoveryInputMode,
@@ -724,6 +727,79 @@ class HumanMergePlanner:
         return PlannedDiscoveryMerge(plan, warnings=warnings)
 
 
+class TargetedMergePlanner:
+    """Deterministically merges one known incoming candidate into one known
+    existing subject — no identity-matching, no ambiguity possible.
+
+    Used for edits where the caller already knows exactly which subject an
+    incoming candidate belongs to (e.g. attaching a URL to an incomplete
+    source) and must not let a planner rediscover it: `HeuristicMergePlanner`
+    would refuse to pick a subject if more than one shares its title
+    (`candidates_match_strongly`), and `ChatGptMergePlanner` is
+    nondeterministic and the wrong tool for a one-field correction. This
+    planner never inspects the candidate at all — it trusts the caller.
+    """
+
+    kind = DiscoveryPlannerKind.HUMAN
+    policy_version = "targeted-attach-v1"
+
+    def __init__(self, target_subject_id: UUID, incoming_candidate_key: UUID) -> None:
+        self._target_subject_id = target_subject_id
+        self._incoming_candidate_key = incoming_candidate_key
+
+    async def plan(
+        self,
+        parent_snapshot: DiscoverySnapshot | None,
+        delta: DiscoveryDelta,
+        handles: ResolvedMergeHandles,
+        *,
+        edition_id: UUID,
+        external_llm_allowed: bool,
+        sensitivity: str,
+    ) -> PlannedDiscoveryMerge:
+        del edition_id, external_llm_allowed, sensitivity
+        if parent_snapshot is None:
+            raise ValueError("TargetedMergePlanner requires an existing parent snapshot")
+        target_handle = next(
+            (
+                handle
+                for handle, subject_id in handles.existing.items()
+                if subject_id == self._target_subject_id
+            ),
+            None,
+        )
+        if target_handle is None:
+            raise ValueError(
+                f"Target subject {self._target_subject_id} was not included in this merge"
+            )
+        incoming_handle = next(
+            (
+                handle
+                for handle, item in handles.incoming.items()
+                if item.candidate_key == self._incoming_candidate_key
+            ),
+            None,
+        )
+        if incoming_handle is None:
+            raise ValueError(
+                f"Incoming candidate {self._incoming_candidate_key} was not found in this delta"
+            )
+        plan = DiscoveryMergePlanV1(
+            groups=[
+                DiscoveryMergeGroup(
+                    existing_subject_handles=[target_handle],
+                    incoming_candidate_handles=[incoming_handle],
+                    confidence=MergeConfidence.HIGH,
+                    disposition=MergeDisposition.APPLY,
+                    rationale="manual URL attachment",
+                    evidence=MergeEvidence(semantic_basis=["manual edit"]),
+                )
+            ]
+        )
+        validated, warnings = validate_merge_plan(plan, handles)
+        return PlannedDiscoveryMerge(validated, warnings=warnings)
+
+
 def _merge_prompt(current: list[dict[str, object]], incoming: list[dict[str, object]]) -> str:
     return (
         DISCOVERY_MERGE_PROMPT
@@ -1216,6 +1292,7 @@ class CumulativeDiscoveryService:
         expected_parent_snapshot_id: UUID | None,
         actor_id: str,
         rebase_count: int = 0,
+        planner_override: DiscoveryMergePlanner | None = None,
     ) -> DiscoverySnapshot:
         async with self._uow_factory() as uow:
             already_applied = await uow.discovery_snapshots.get_for_intake(intake_id)
@@ -1273,7 +1350,9 @@ class CumulativeDiscoveryService:
             )
             handles = build_merge_handles(parent, delta, included_subjects=included)
             planner: DiscoveryMergePlanner = (
-                HeuristicMergePlanner() if parent is None else self._planner
+                HeuristicMergePlanner()
+                if parent is None
+                else (planner_override or self._planner)
             )
             excluded_subject_count = len(parent.subjects) - len(handles.existing) if parent else 0
             cache_key_run = make_merge_run(
@@ -1993,14 +2072,19 @@ def _merge_candidates(
                 values.setdefault(normalize(value), value)
         setattr(result, field_name, tuple(values[key] for key in sorted(values)))
     result.technical_potential = max(item.technical_potential for item in all_candidates)
-    result.sources = _merge_sources(all_candidates, warnings)
+    result.sources, source_id_remap = _merge_sources(all_candidates, warnings)
     result.provisional_iocs = _merge_iocs(all_candidates)
-    references: dict[str, IncompleteSourceCandidate] = {}
-    for candidate in all_candidates:
-        for source in candidate.incomplete_sources:
-            key = f"{source.local_ref or ''}:{source.raw_url or ''}:{source.title}"
-            references.setdefault(key, deepcopy(source))
-    result.incomplete_sources = [references[key] for key in sorted(references)]
+    if source_id_remap:
+        result.provisional_iocs = remap_ioc_publication_ids(
+            result.provisional_iocs, source_id_remap
+        )
+    # Same-subject only: an incomplete source here might now match a full
+    # source that arrived from a *different* contribution to this same
+    # subject, so recover it against the just-merged `result.sources` rather
+    # than only what its own contribution originally had.
+    result.incomplete_sources = recover_incomplete_source_urls(
+        result.sources, _merge_incomplete_sources(all_candidates)
+    )
     # D10: title, summary and creation-facing prose always come from the existing
     # subject (or the deterministic representative for a new subject).
     return result, warnings
@@ -2008,7 +2092,17 @@ def _merge_candidates(
 
 def _merge_sources(
     candidates: Sequence[CandidateTopic], warnings: list[str]
-) -> list[SourceCandidate]:
+) -> tuple[list[SourceCandidate], dict[UUID, UUID]]:
+    """Fold every contribution's sources into one list, one row per real article.
+
+    Sources are the same publication per `same_publication` (exact
+    canonical_url, or a corroborated title-fingerprint match) — not raw
+    canonical_url equality alone, since the same article is often cited via
+    slightly different URL shapes across independent report runs. Returns
+    the merged list plus a map from each folded-away source's id to the
+    surviving source's id, so callers can keep IOC publication references
+    pointing at a source that still exists.
+    """
     role_priority = {
         SourceRole.PRIMARY: 5,
         SourceRole.INDEPENDENT: 4,
@@ -2017,13 +2111,17 @@ def _merge_sources(
         SourceRole.SOCIAL: 2,
         SourceRole.UNKNOWN: 1,
     }
-    sources: dict[str, SourceCandidate] = {}
+    merged: list[SourceCandidate] = []
+    remap: dict[UUID, UUID] = {}
     for candidate in candidates:
         for incoming in candidate.sources:
-            existing = sources.get(incoming.canonical_url)
+            existing = next(
+                (item for item in merged if same_publication(item, incoming)), None
+            )
             if existing is None:
-                sources[incoming.canonical_url] = deepcopy(incoming)
+                merged.append(deepcopy(incoming))
                 continue
+            remap[incoming.id] = existing.id
             if existing.publisher.casefold() in {"", "unknown"}:
                 existing.publisher = incoming.publisher
             elif (
@@ -2035,7 +2133,7 @@ def _merge_sources(
                     incoming.publisher,
                     key=lambda value: (value.casefold(), value),
                 )
-                warnings.append(f"publisher conflict for {incoming.canonical_url}: kept {chosen}")
+                warnings.append(f"publisher conflict for {existing.canonical_url}: kept {chosen}")
                 existing.publisher = chosen
             for field_name in ("published_at", "event_date"):
                 current = getattr(existing, field_name)
@@ -2043,10 +2141,48 @@ def _merge_sources(
                 if current is None or (value is not None and value < current):
                     setattr(existing, field_name, value)
                 elif value is not None and current != value:
-                    warnings.append(f"{field_name} conflict for {incoming.canonical_url}")
+                    warnings.append(f"{field_name} conflict for {existing.canonical_url}")
             if role_priority[incoming.role] > role_priority[existing.role]:
                 existing.role = incoming.role
-    return [sources[key] for key in sorted(sources)]
+            if existing.canonical_url != incoming.canonical_url:
+                warnings.append(
+                    f"folded near-duplicate publication {incoming.canonical_url} "
+                    f"into {existing.canonical_url}"
+                )
+            existing.parsing_warnings = tuple(
+                dict.fromkeys((*existing.parsing_warnings, *incoming.parsing_warnings))
+            )
+    return sorted(merged, key=lambda item: item.canonical_url), remap
+
+
+def _merge_incomplete_sources(
+    candidates: Sequence[CandidateTopic],
+) -> list[IncompleteSourceCandidate]:
+    """Fold incomplete (no-URL) publications the same way `_merge_sources` does.
+
+    The previous key (`local_ref:raw_url:title`) included `local_ref`, which
+    is batch-local and not stable across independent LLM report runs, so a
+    repeatedly-recited no-URL article never collapsed across contributions.
+    """
+    merged: list[IncompleteSourceCandidate] = []
+    for candidate in candidates:
+        for incoming in candidate.incomplete_sources:
+            existing = next(
+                (item for item in merged if same_publication(item, incoming)), None
+            )
+            if existing is None:
+                merged.append(deepcopy(incoming))
+                continue
+            if existing.publisher.casefold() in {"", "unknown"}:
+                existing.publisher = incoming.publisher
+            if existing.raw_url is None:
+                existing.raw_url = incoming.raw_url
+            if existing.published_at is None:
+                existing.published_at = incoming.published_at
+            existing.parsing_warnings = tuple(
+                dict.fromkeys((*existing.parsing_warnings, *incoming.parsing_warnings))
+            )
+    return sorted(merged, key=lambda item: (item.local_ref or "", item.title))
 
 
 def _merge_iocs(candidates: Sequence[CandidateTopic]) -> list[ProvisionalDiscoveryIoc]:
@@ -2135,19 +2271,15 @@ def _candidate_content(
 def _assert_non_loss(
     parent: DiscoverySnapshot | None, delta: DiscoveryDelta, result: DiscoverySnapshot
 ) -> None:
-    final_urls = {
-        source.canonical_url for subject in result.subjects for source in subject.candidate.sources
-    }
-    expected_urls = {
-        source.canonical_url
-        for candidate in delta.candidates
-        for source in candidate.candidate.sources
-    }
+    final_sources = [
+        source for subject in result.subjects for source in subject.candidate.sources
+    ]
+    expected_sources = [
+        source for candidate in delta.candidates for source in candidate.candidate.sources
+    ]
     if parent is not None:
-        expected_urls.update(
-            source.canonical_url
-            for subject in parent.subjects
-            for source in subject.candidate.sources
+        expected_sources.extend(
+            source for subject in parent.subjects for source in subject.candidate.sources
         )
         parent_refs = {
             (ref.batch_id, ref.candidate_id)
@@ -2161,7 +2293,16 @@ def _assert_non_loss(
         }
         if not parent_refs <= final_refs:
             raise RuntimeError("Discovery merge lost member references")
-    if not expected_urls <= final_urls:
+    # A source counts as preserved if it's still present directly, or if it
+    # was intentionally folded into a surviving near-duplicate publication
+    # (see `_merge_sources` / `same_publication`) — not just exact
+    # canonical_url equality, since that folding is the whole point of the fix.
+    lost = [
+        source
+        for source in expected_sources
+        if not any(same_publication(source, final) for final in final_sources)
+    ]
+    if lost:
         raise RuntimeError("Discovery merge lost sources")
 
 

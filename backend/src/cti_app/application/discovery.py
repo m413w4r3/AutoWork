@@ -759,7 +759,7 @@ class DiscoveryService:
         *,
         expected_sha256: str,
         actor_id: str,
-    ) -> tuple[DiscoveryBatch, bool]:
+    ) -> tuple[DiscoveryBatch, bool, UUID | None]:
         """Importer une réponse ChatGPT Markdown en tant que contribution autonome.
 
         Étapes:
@@ -770,8 +770,8 @@ class DiscoveryService:
         5. Parser le rapport
         6. Enregistrer les diagnostics parser
         7. Transformer en DiscoveryBatch
-        8. Déclencher la réconciliation cumulative.
-        9. Retourner (batch, reused=False)
+        8. Déclencher la réconciliation cumulative (job asynchrone).
+        9. Retourner (batch, reused=False, reconciliation_job_id)
         """
         if self._output_archive is None:
             raise ModelGatewayError("Model output archive is unavailable")
@@ -796,7 +796,7 @@ class DiscoveryService:
                 parameters.edition_id, manual_request_hash
             )
             if existing_batch is not None:
-                return existing_batch, True
+                return existing_batch, True, None
 
         # 3. Créer le ModelRun synthétique manual-import
         await self._output_archive.create_manual_research_output(
@@ -850,14 +850,24 @@ class DiscoveryService:
                 if existing is None:
                     raise RuntimeError("Discovery conflict without canonical batch")
                 await uow.commit()
-                return existing, True
+                return existing, True, None
             await uow.commit()
 
-        # 8. Regrouper éditorialement la nouvelle contribution.
+        # 8. Regrouper éditorialement la nouvelle contribution. Ceci ne fait que
+        # soumettre et dispatcher un job de réconciliation ASYNCHRONE : la
+        # consolidation (fusion en sujets) n'est pas terminée quand cet appel
+        # revient. Le job id est renvoyé pour que l'appelant puisse suivre son
+        # achèvement au lieu de rafraîchir l'état trop tôt.
+        reconciliation_job_id: UUID | None = None
         if self._after_persisted_batch is not None:
-            await self._after_persisted_batch(batch, DiscoveryInputMode.MANUAL_IMPORT, actor_id)
+            job = await self._after_persisted_batch(
+                batch, DiscoveryInputMode.MANUAL_IMPORT, actor_id
+            )
+            job_id = getattr(job, "id", None)
+            if isinstance(job_id, UUID):
+                reconciliation_job_id = job_id
 
-        return batch, False
+        return batch, False, reconciliation_job_id
 
     async def _poll_background_research(
         self,

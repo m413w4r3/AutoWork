@@ -27,6 +27,10 @@ from cti_app.application.discovery_cumulative import (
     DiscoverySnapshotStaleError,
     HumanMergeDecision,
 )
+from cti_app.application.discovery_manual_source_edits import (
+    IncompleteSourceCandidateNotFoundError,
+    ManualSourceEditService,
+)
 from cti_app.application.discovery_report_parser import ReportParsingError
 from cti_app.application.editions import EditionNotFoundError, EditionService
 from cti_app.application.identity import IdentityProvider
@@ -131,6 +135,13 @@ class ProvisionalIocView(BaseModel):
     proposed_type: DiscoveryIocType
     status: Literal["provisional_visible"]
     publication_refs: list[str]
+    # `publication_refs` alone is ambiguous once several research batches are
+    # consolidated: local_ref (e.g. "P3") is only unique within its own
+    # batch, so two different sources in a merged candidate can share the
+    # same ref. `publication_ids` pairs each relation with the surviving
+    # SourceCandidate.id (stable across merges via remap_ioc_publication_ids)
+    # so a consumer can attach IOCs to the correct source unambiguously.
+    publication_ids: list[UUID]
     warnings: list[str]
 
 
@@ -262,6 +273,17 @@ class SourceStatusUpdate(BaseModel):
     status: SourceVerificationStatus
 
 
+class IncompleteSourceUrlAttachment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1, max_length=4000)
+
+
+class IncompleteSourceAttachmentView(BaseModel):
+    source: SourceView
+    updated_subject_ids: list[UUID]
+
+
 class RecoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -319,6 +341,13 @@ class DiscoveryImportConfirmView(BaseModel):
     source_mode: Literal["manual_import"]
     subject_count: int
     publication_count: int
+    # Consolidation into subjects happens in an async job dispatched right
+    # after this call returns. None when reused=True (already consolidated
+    # by an earlier confirm of the same content). The caller should poll
+    # this job and only refresh the discovery state once it is terminal —
+    # refreshing immediately races the job and can show 0 consolidated
+    # subjects for a report that only contributed one candidate.
+    reconciliation_job_id: UUID | None = None
 
 
 class MergeHandleLabelView(BaseModel):
@@ -811,7 +840,7 @@ async def confirm_discovery_import(
             sensitivity=payload.sensitivity,
             external_llm_allowed=payload.external_llm_allowed,
         )
-        batch, reused = await service.import_standalone_report(
+        batch, reused, reconciliation_job_id = await service.import_standalone_report(
             parameters,
             payload.markdown,
             expected_sha256=payload.expected_sha256,
@@ -821,6 +850,7 @@ async def confirm_discovery_import(
         return DiscoveryImportConfirmView(
             batch_id=batch.id,
             reused=reused,
+            reconciliation_job_id=reconciliation_job_id,
             source_mode="manual_import",
             subject_count=len(batch.candidates),
             publication_count=sum(len(c.sources) for c in batch.candidates),
@@ -898,6 +928,36 @@ async def mark_source(
             await service.mark_source(
                 edition_id, source_id, payload.status, actor_id=identity.actor_id
             )
+        )
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.patch(
+    "/candidates/{subject_id}/incomplete-sources/{incomplete_source_id}",
+    response_model=IncompleteSourceAttachmentView,
+)
+async def attach_incomplete_source_url(
+    edition_id: UUID,
+    subject_id: UUID,
+    incomplete_source_id: UUID,
+    payload: IncompleteSourceUrlAttachment,
+    request: Request,
+) -> IncompleteSourceAttachmentView:
+    service: ManualSourceEditService = request.app.state.manual_source_edit_service
+    provider: IdentityProvider = request.app.state.identity_provider
+    try:
+        identity = await provider.current()
+        result = await service.attach_incomplete_source_url(
+            edition_id,
+            subject_id,
+            incomplete_source_id,
+            payload.url,
+            actor_id=identity.actor_id,
+        )
+        return IncompleteSourceAttachmentView(
+            source=_source_view(result.promoted_source),
+            updated_subject_ids=list(result.updated_subject_ids),
         )
     except Exception as exc:
         _raise_api_error(exc)
@@ -1136,6 +1196,9 @@ def _provisional_ioc_view(ioc: ProvisionalDiscoveryIoc) -> ProvisionalIocView:
         publication_refs=list(
             dict.fromkeys(relation.publication_ref for relation in ioc.publication_relations)
         ),
+        publication_ids=list(
+            dict.fromkeys(relation.publication_id for relation in ioc.publication_relations)
+        ),
         warnings=list(ioc.warnings),
     )
 
@@ -1226,6 +1289,10 @@ def _raise_api_error(exc: Exception) -> NoReturn:
         raise HTTPException(status_code=404, detail={"code": "edition_not_found"}) from exc
     if isinstance(exc, SourceCandidateNotFoundError):
         raise HTTPException(status_code=404, detail={"code": "source_candidate_not_found"}) from exc
+    if isinstance(exc, IncompleteSourceCandidateNotFoundError):
+        raise HTTPException(
+            status_code=404, detail={"code": "incomplete_source_candidate_not_found"}
+        ) from exc
     if isinstance(exc, ReportParsingError):
         status_code = 404 if exc.code == "report_unavailable" else 422
         raise HTTPException(

@@ -1060,7 +1060,7 @@ async def test_standalone_import_creates_batch_without_job_or_model_call() -> No
     assert preview["subject_count"] >= 1
     assert preview["publication_count"] >= 1
 
-    batch, reused = await service.import_standalone_report(
+    batch, reused, _reconciliation_job_id = await service.import_standalone_report(
         params,
         markdown,
         expected_sha256=preview["sha256"],
@@ -1084,11 +1084,11 @@ async def test_standalone_import_is_idempotent_on_identical_markdown() -> None:
     markdown = research_markdown_fixture()
     digest = (await service.preview_standalone_import(params, markdown))["sha256"]
 
-    first, reused_first = await service.import_standalone_report(
+    first, reused_first, _first_job_id = await service.import_standalone_report(
         params, markdown, expected_sha256=digest, actor_id="dev-analyst"
     )
     # L'axe ne doit pas entrer dans l'idempotence du contenu.
-    second, reused_second = await service.import_standalone_report(
+    second, reused_second, _second_job_id = await service.import_standalone_report(
         parameters(axis="axe-renomme").model_copy(update={"edition_id": params.edition_id}),
         markdown,
         expected_sha256=digest,
@@ -1103,6 +1103,55 @@ async def test_standalone_import_is_idempotent_on_identical_markdown() -> None:
         batch for batch in await service.list_batches(params.edition_id) if batch.is_active_revision
     ]
     assert len(active) == 1
+
+
+async def test_standalone_import_returns_reconciliation_job_id() -> None:
+    """Régression : la consolidation en sujets tourne dans un job asynchrone.
+
+    Le job id doit être renvoyé à l'appelant (§32.5 ne dispensait que du
+    ModelRun/appel modèle préalable, pas de la réconciliation qui suit) pour
+    qu'il puisse en attendre la fin avant de rafraîchir l'état, au lieu de
+    faire la course avec ce job.
+    """
+    adapter = TransientResearchAdapter()
+    gateway, _, _ = gateway_for_adapter(adapter)
+    discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
+    expected_job_id = uuid4()
+
+    class _StubJob:
+        id = expected_job_id
+
+    async def after_persisted_batch(
+        batch: DiscoveryBatch, input_mode: object, actor_id: str
+    ) -> _StubJob:
+        del batch, input_mode, actor_id
+        return _StubJob()
+
+    service = DiscoveryService(
+        discovery_uow,
+        gateway,
+        gateway,
+        bridge_capabilities_provider=FakeBridgeCapabilities(),
+        after_persisted_batch=after_persisted_batch,
+    )
+    params = parameters(axis="manual-import")
+    markdown = research_markdown_fixture()
+    digest = (await service.preview_standalone_import(params, markdown))["sha256"]
+
+    batch, reused, job_id = await service.import_standalone_report(
+        params, markdown, expected_sha256=digest, actor_id="dev-analyst"
+    )
+    assert reused is False
+    assert job_id == expected_job_id
+
+    # Un réimport idempotent ne redéclenche pas de réconciliation : rien à
+    # attendre de plus.
+    _replay_batch, replay_reused, replay_job_id = await service.import_standalone_report(
+        params, markdown, expected_sha256=digest, actor_id="dev-analyst"
+    )
+    assert replay_reused is True
+    assert replay_job_id is None
+    assert _replay_batch.id == batch.id
 
 
 async def test_standalone_import_rejects_stale_confirmation() -> None:

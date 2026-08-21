@@ -11,6 +11,7 @@ from cti_app.application.discovery_cumulative import (
     HumanMergeDecision,
     HumanMergePlanner,
     MergeModelUnavailableError,
+    TargetedMergePlanner,
     apply_discovery_merge_plan,
     build_discovery_delta,
     build_merge_handles,
@@ -30,6 +31,7 @@ from cti_app.domain.discovery_cumulative import (
     MergeDisposition,
     MergeEvidence,
     MergeValidationStatus,
+    discovery_candidate_key,
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelRunStatus
 from tests.test_discovery_cumulative import _batch, _candidate, _intake
@@ -443,6 +445,101 @@ async def test_human_planner_confirms_existing_subject_fusion_through_same_appli
     assert applied.snapshot.subjects[0].subject_id == handles.existing["X1"]
     assert applied.merge_events[0].from_subject_id == handles.existing["X2"]
     assert applied.merge_events[0].into_subject_id == handles.existing["X1"]
+
+
+@pytest.mark.asyncio
+async def test_targeted_planner_deterministically_targets_the_known_subject() -> None:
+    """The manual-URL-attach path already knows exactly which subject an
+    incoming candidate belongs to; TargetedMergePlanner must group it there
+    regardless of what other subjects exist, without needing
+    `candidates_match_strongly` to (dis)agree — unlike `HeuristicMergePlanner`,
+    which could refuse to pick a subject, or pick the wrong one, if identity
+    matching is ambiguous."""
+    edition_id = uuid4()
+    parent = await _bootstrap(
+        edition_id,
+        [
+            _candidate("Campaign A", "https://example.test/a"),
+            _candidate("Campaign B", "https://example.test/b"),
+        ],
+    )
+    assert len(parent.subjects) == 2
+    target_subject_id = next(
+        s.subject_id for s in parent.subjects if s.canonical_title == "Campaign A"
+    )
+
+    # Deliberately a title that would NOT deterministically match "Campaign A"
+    # under HeuristicMergePlanner's identity rules — TargetedMergePlanner must
+    # still land it on the requested subject.
+    batch = _batch(edition_id, [_candidate("Unrelated headline", "https://example.test/c")])
+    intake = _intake(batch)
+    delta = build_discovery_delta(intake, batch)
+    handles = build_merge_handles(parent, delta)
+    incoming_candidate_key = discovery_candidate_key(intake.id, "S1")
+
+    planner = TargetedMergePlanner(target_subject_id, incoming_candidate_key)
+    outcome = await planner.plan(
+        parent,
+        delta,
+        handles,
+        edition_id=edition_id,
+        external_llm_allowed=False,
+        sensitivity="internal",
+    )
+
+    assert len(outcome.plan.groups) == 1
+    group = outcome.plan.groups[0]
+    assert handles.existing[group.existing_subject_handles[0]] == target_subject_id
+    assert group.disposition is MergeDisposition.APPLY
+
+    run = make_merge_run(
+        edition_id=edition_id,
+        parent_snapshot=parent,
+        intake=intake,
+        delta=delta,
+        planner=planner,
+        handles=handles,
+        outcome=outcome,
+    )
+    applied = apply_discovery_merge_plan(
+        parent,
+        delta,
+        outcome.plan,
+        resolved_handles=handles,
+        planner_kind=DiscoveryPlannerKind.HUMAN,
+        edition_id=edition_id,
+        intake_id=intake.id,
+        merge_run_id=run.id,
+    )
+
+    assert len(applied.snapshot.subjects) == 2
+    updated = next(s for s in applied.snapshot.subjects if s.subject_id == target_subject_id)
+    assert {source.canonical_url for source in updated.candidate.sources} == {
+        "https://example.test/a",
+        "https://example.test/c",
+    }
+
+
+@pytest.mark.asyncio
+async def test_targeted_planner_rejects_a_subject_that_is_not_in_scope() -> None:
+    edition_id = uuid4()
+    parent = await _bootstrap(edition_id, [_candidate("Campaign A", "https://example.test/a")])
+    batch = _batch(edition_id, [_candidate("Campaign A", "https://example.test/b")])
+    intake = _intake(batch)
+    delta = build_discovery_delta(intake, batch)
+    handles = build_merge_handles(parent, delta)
+    incoming_candidate_key = discovery_candidate_key(intake.id, "S1")
+
+    planner = TargetedMergePlanner(uuid4(), incoming_candidate_key)
+    with pytest.raises(ValueError):
+        await planner.plan(
+            parent,
+            delta,
+            handles,
+            edition_id=edition_id,
+            external_llm_allowed=False,
+            sensitivity="internal",
+        )
 
 
 @pytest.mark.asyncio
