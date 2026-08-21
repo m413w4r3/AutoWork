@@ -12,11 +12,15 @@ These instructions preserve the architectural split during refactoring.
 
 ## Shared infrastructure primitives
 
-- `_shared.py` contains **only** generic infrastructure helpers: coercions, datetime
-  serialization, generic UUID handling—nothing with business knowledge.
+- There is no `_shared.py` by default. Generic infrastructure helpers (coercions,
+  datetime serialization, UUID handling) remain with their canonical owner.
+- Create a shared helper only when an infrastructure-generic need emerges and is
+  reused across multiple contexts. Do not create `_shared.py` for hypothetical
+  or single-use abstractions.
 - A business-specific helper (domain payload builder, value serializer, enum
   mapping) stays in its canonical repository module, even if the signature
-  looks generic. Promote to `_shared.py` only when reused across two+ contexts.
+  looks generic. Never promote a business helper to `_shared.py` merely because
+  it has two callers.
 - Never duplicate a helper to avoid an import. If you need a shared primitive
   that does not exist and ownership is unclear, stop and decide ownership
   explicitly rather than copy it.
@@ -24,7 +28,8 @@ These instructions preserve the architectural split during refactoring.
 ## Ownership and cross-module references
 
 - **Discovery** owns the `CandidateTopic` codec and payload builders.
-- **discovery_cumulative** imports `CandidateTopic` from `discovery`.
+- **discovery_cumulative** imports the `CandidateTopic` payload codec
+  from `repositories.discovery`.
 - A business serializer shared across contexts remains owned by its canonical
   context and is imported by others (e.g., discovery → discovery_cumulative).
 

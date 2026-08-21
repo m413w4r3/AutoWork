@@ -105,6 +105,7 @@ EXCLUDE_DIR_PARTS = {
 EXCLUDE_PREFIXES = {
     "backend/tests/fixtures/",
     "frontend/node_modules/",
+    "refacto_baseLine/",
 }
 
 EXCLUDE_BASENAMES = {

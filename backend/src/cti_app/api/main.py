@@ -18,6 +18,7 @@ from cti_app.api.production import router as production_router
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery import DiscoveryService
 from cti_app.application.discovery_cumulative import (
     RECONCILE_DISCOVERY_JOB_KIND,
@@ -39,7 +40,6 @@ from cti_app.application.jobs import DuplicateJobError, JobService, create_job_r
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import (
@@ -88,7 +88,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         materializer=SubjectWorkspaceMaterializer(blob_store),
         workspace_root=settings.subject_workspace_root,
     )
-    production_diagnostics = ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root)
+    production_diagnostics = DiagnosticsLog.from_env(settings.diagnostics_log_root)
     cumulative_discovery_service = CumulativeDiscoveryService(
         uow_factory,
         planner=ChatGptMergePlanner(
@@ -253,7 +253,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     application = FastAPI(title="CTI Bulletin API", version="0.1.0", lifespan=lifespan)
     settings = get_settings()
-    request_failures = ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root)
+    request_failures = DiagnosticsLog.from_env(settings.diagnostics_log_root)
 
     def record_request_failure(request: Request, error: BaseException) -> None:
         # Keyed by correlation id rather than a domain id: at this level the

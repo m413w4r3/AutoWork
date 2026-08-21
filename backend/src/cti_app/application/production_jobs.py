@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import ConfigDict, Field
 
 from cti_app.application.collection import SubjectCollectionService
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.jobs import (
     JobDispatcher,
     JobExecutionContext,
@@ -18,7 +19,6 @@ from cti_app.application.jobs import (
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import EditionProductionService
 from cti_app.domain.production import (
@@ -114,7 +114,7 @@ def register_production_jobs(
     model_service: ModelConversationService | None = None,
     collection_service: SubjectCollectionService | None = None,
     artifact_store: ProductionArtifactStore | None = None,
-    diagnostics: ProductionDiagnosticsLog | None = None,
+    diagnostics: DiagnosticsLog | None = None,
 ) -> None:
     """Register the five production stage jobs."""
     stage_chain = chain or ProductionStageChain()

@@ -16,8 +16,8 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.application.production_parsers import reference_report_from_json
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.collection import CollectionState
@@ -232,7 +232,7 @@ class _Uow:
 
 
 def _build(
-    answers: list[str], diagnostics: ProductionDiagnosticsLog | None = None
+    answers: list[str], diagnostics: DiagnosticsLog | None = None
 ) -> tuple[ProductionWorkflowOrchestrator, _Uow, _FakeConversations]:
     run = SubjectProductionRun(
         subject_id=uuid4(), edition_id=uuid4(), profile=ProductionProfile.BRIEF_AUTO
@@ -431,7 +431,7 @@ async def test_source_forbidding_external_model_blocks_the_stage() -> None:
 
 async def test_diagnostics_trail_captures_the_whole_stage(tmp_path: Path) -> None:
     """After a run, the trail must answer what was asked and what came back."""
-    log = ProductionDiagnosticsLog.from_env(tmp_path)
+    log = DiagnosticsLog.from_env(tmp_path)
     orchestrator, uow, _ = _build([PERFECT_Q1], diagnostics=log)
     uow.run.current_stage = SubjectProductionStage.REFERENCES
 
@@ -462,7 +462,7 @@ async def test_diagnostics_trail_captures_the_whole_stage(tmp_path: Path) -> Non
 
 async def test_diagnostics_trail_records_a_format_repair(tmp_path: Path) -> None:
     """A repair must be visible as its own model exchange."""
-    log = ProductionDiagnosticsLog.from_env(tmp_path)
+    log = DiagnosticsLog.from_env(tmp_path)
     orchestrator, uow, _ = _build([BROKEN_Q1, PERFECT_Q1], diagnostics=log)
     uow.run.current_stage = SubjectProductionStage.REFERENCES
 

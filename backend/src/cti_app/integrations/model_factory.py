@@ -1,9 +1,9 @@
 from minio import Minio
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.model_gateway import ModelGateway, ModelRouter
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.config import Settings
 from cti_app.domain.model_runs import ModelProvider
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
@@ -74,7 +74,7 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
         router,
         uow_factory,
         output_store,
-        diagnostics=ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root),
+        diagnostics=DiagnosticsLog.from_env(settings.diagnostics_log_root),
     )
 
 

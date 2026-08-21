@@ -90,7 +90,7 @@ format:
 	cd frontend && $(PNPM) format
 
 ctx:
-	$(UV) run scripts/ctx/ctx.py build --prune
+	$(UV) run scripts/ctx/ctx.py build
 
 ctx-status:
 	$(UV) run scripts/ctx/ctx.py status

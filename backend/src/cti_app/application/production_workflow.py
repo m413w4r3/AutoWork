@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from cti_app.application.collection import SupplementalSource
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_context import build_subject_production_context
-from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.application.production_parsers import (
     ParsedEvent,
     ParseResult,
@@ -108,13 +108,13 @@ class ProductionWorkflowOrchestrator:
         model_service: ModelConversationService | None = None,
         collection_service: SubjectCollectionService | None = None,
         artifact_store: ProductionArtifactStore | None = None,
-        diagnostics: ProductionDiagnosticsLog | None = None,
+        diagnostics: DiagnosticsLog | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._model_service = model_service
         self._collection_service = collection_service
         self._artifact_store = artifact_store
-        self._diagnostics = diagnostics or ProductionDiagnosticsLog(None)
+        self._diagnostics = diagnostics or DiagnosticsLog(None)
         self._correlation_id = "-"
         self._references = ReferenceResearchService(uow_factory, artifact_store)
         self._extraction = ExtractionService(uow_factory, artifact_store)

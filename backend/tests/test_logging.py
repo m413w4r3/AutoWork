@@ -5,7 +5,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 
-from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.logging import CorrelationIdMiddleware, JsonFormatter
 
 
@@ -27,7 +27,7 @@ async def test_an_unhandled_request_failure_reaches_the_diagnostics_trail(tmp_pa
     # container log is wiped by the next rebuild. Without this hook a failing
     # endpoint leaves nothing behind to diagnose it with.
     application = FastAPI()
-    trail = ProductionDiagnosticsLog.from_env(tmp_path)
+    trail = DiagnosticsLog.from_env(tmp_path)
 
     def record(request: Request, error: BaseException) -> None:
         trail.record_failure(

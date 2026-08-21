@@ -8,6 +8,7 @@ from minio import Minio
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery import DISCOVERY_JOB_KIND, DiscoveryService
 from cti_app.application.discovery_cumulative import (
     RECONCILE_DISCOVERY_JOB_KIND,
@@ -31,7 +32,6 @@ from cti_app.application.jobs import (
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
@@ -86,7 +86,7 @@ async def _execute_job(job_id: UUID) -> int | None:
         return SqlAlchemyUnitOfWork(session_factory)
 
     try:
-        production_diagnostics = ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root)
+        production_diagnostics = DiagnosticsLog.from_env(settings.diagnostics_log_root)
         model_gateway = create_model_gateway(settings, uow_factory)
         editorial_service = EditorialGroupingService(uow_factory)
         cumulative_discovery_service = CumulativeDiscoveryService(

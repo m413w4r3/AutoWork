@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from cti_app.application.diagnostics import (
     MAX_PAYLOAD_BYTES,
-    DiagnosticsLog as ProductionDiagnosticsLog,
+    DiagnosticsLog,
 )
 
 
@@ -24,14 +24,14 @@ def _events(root: Path) -> list[dict[str, object]]:
 
 def test_disabled_by_default_and_silent(tmp_path: Path) -> None:
     """No configured root means no trail, and no error either."""
-    log = ProductionDiagnosticsLog.from_env(None)
+    log = DiagnosticsLog.from_env(None)
 
     assert log.enabled is False
     log.record(event="anything", run_id=uuid4())  # must not raise
 
 
 def test_model_answer_is_recorded_verbatim(tmp_path: Path) -> None:
-    log = ProductionDiagnosticsLog.from_env(tmp_path)
+    log = DiagnosticsLog.from_env(tmp_path)
     run_id, subject_id = uuid4(), uuid4()
 
     log.record_model_answer(
@@ -57,7 +57,7 @@ def test_model_answer_is_recorded_verbatim(tmp_path: Path) -> None:
 
 def test_parse_result_keeps_the_dropped_blocks(tmp_path: Path) -> None:
     """The dropped blocks are the whole point: they say what was unreadable."""
-    log = ProductionDiagnosticsLog.from_env(tmp_path)
+    log = DiagnosticsLog.from_env(tmp_path)
     run_id = uuid4()
 
     log.record_parse(
@@ -83,7 +83,7 @@ def test_parse_result_keeps_the_dropped_blocks(tmp_path: Path) -> None:
 
 
 def test_payloads_are_numbered_in_stage_order(tmp_path: Path) -> None:
-    log = ProductionDiagnosticsLog.from_env(tmp_path)
+    log = DiagnosticsLog.from_env(tmp_path)
     run_id, subject_id = uuid4(), uuid4()
 
     for stage in ("references", "extraction", "synthesis"):
@@ -106,7 +106,7 @@ def test_payloads_are_numbered_in_stage_order(tmp_path: Path) -> None:
 
 
 def test_runaway_payload_is_truncated(tmp_path: Path) -> None:
-    log = ProductionDiagnosticsLog.from_env(tmp_path)
+    log = DiagnosticsLog.from_env(tmp_path)
     run_id = uuid4()
 
     log.record(
@@ -129,14 +129,14 @@ def test_an_unwritable_root_disables_the_trail_instead_of_failing(
     blocker = tmp_path / "not-a-directory"
     blocker.write_text("occupied", encoding="utf-8")
 
-    log = ProductionDiagnosticsLog.from_env(blocker)
+    log = DiagnosticsLog.from_env(blocker)
 
     assert log.enabled is False
     log.record(event="ignored", run_id=uuid4())
 
 
 def test_a_write_failure_is_swallowed(tmp_path: Path) -> None:
-    log = ProductionDiagnosticsLog.from_env(tmp_path)
+    log = DiagnosticsLog.from_env(tmp_path)
     # Replace the index with a directory so appending to it fails.
     (tmp_path / "events.jsonl").mkdir()
 

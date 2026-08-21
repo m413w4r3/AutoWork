@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery import DISCOVERY_JOB_KIND
 from cti_app.application.jobs import (
     DemoJobParameters,
@@ -19,7 +20,6 @@ from cti_app.application.jobs import (
     SynchronousJobDispatcher,
     create_job_registry,
 )
-from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.domain.jobs import Job, JobStatus
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 
@@ -149,7 +149,7 @@ async def test_a_crashed_job_leaves_its_traceback_in_the_diagnostics_trail(
 
     registry.register("test.unsafe", DemoJobParameters, unsafe_handler)
     service = JobService(factory, registry)
-    diagnostics = ProductionDiagnosticsLog.from_env(tmp_path)
+    diagnostics = DiagnosticsLog.from_env(tmp_path)
     dispatcher = SynchronousJobDispatcher(
         JobExecutor(factory, registry, diagnostics=diagnostics)
     )
@@ -190,7 +190,7 @@ async def test_a_controlled_job_failure_is_recorded_with_its_code(tmp_path: Path
 
     registry.register("test.refusing", DemoJobParameters, refusing_handler)
     service = JobService(factory, registry)
-    diagnostics = ProductionDiagnosticsLog.from_env(tmp_path)
+    diagnostics = DiagnosticsLog.from_env(tmp_path)
     dispatcher = SynchronousJobDispatcher(
         JobExecutor(factory, registry, diagnostics=diagnostics)
     )

@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ValidationError
 
-from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.domain.model_conversations import (
     ConversationPolicy,
 )
@@ -342,14 +342,14 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         router: ModelRouter,
         uow_factory: ModelRunUnitOfWorkFactory,
         output_store: ModelOutputStore,
-        diagnostics: ProductionDiagnosticsLog | None = None,
+        diagnostics: DiagnosticsLog | None = None,
     ) -> None:
         self._router = router
         self._uow_factory = uow_factory
         self._output_store = output_store
         # Research, merge, extraction and drafting all funnel through _execute,
         # so a bridge or Qwen failure is recorded once here for every caller.
-        self._diagnostics = diagnostics or ProductionDiagnosticsLog(None)
+        self._diagnostics = diagnostics or DiagnosticsLog(None)
 
     async def research(self, request: ModelRequest) -> ModelExecution:
         return await self._execute(request, ModelRole.RESEARCH)

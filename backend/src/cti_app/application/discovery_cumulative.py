@@ -14,6 +14,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import ValidationError, field_validator
 
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery import BridgeCapabilitiesProvider
 from cti_app.application.discovery_identity import candidates_match_strongly, normalize
 from cti_app.application.jobs import (
@@ -31,7 +32,6 @@ from cti_app.application.model_gateway import (
     ModelRoutingHint,
 )
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
@@ -1217,14 +1217,14 @@ class CumulativeDiscoveryService:
         planner: DiscoveryMergePlanner | None = None,
         blocking_strategy: DiscoveryBlockingStrategy | None = None,
         after_activation: Callable[[UUID], Awaitable[object]] | None = None,
-        diagnostics: ProductionDiagnosticsLog | None = None,
+        diagnostics: DiagnosticsLog | None = None,
         replan_intake: Callable[[ReconcileDiscoveryParameters], Awaitable[object]] | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._planner = planner or HeuristicMergePlanner()
         self._blocking = blocking_strategy or DiscoveryBlockingStrategy()
         self._after_activation = after_activation
-        self._diagnostics = diagnostics or ProductionDiagnosticsLog(None)
+        self._diagnostics = diagnostics or DiagnosticsLog(None)
         # Replanning calls the merge model, so it cannot run inside the request
         # that discovered the staleness; the host hands over a way to queue it.
         self._replan_intake = replan_intake

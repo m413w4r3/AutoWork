@@ -11,8 +11,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.persistence import JobUnitOfWork, JobUnitOfWorkFactory
-from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics, JobStatus
 from cti_app.logging import reset_correlation_id, set_correlation_id
 
@@ -370,7 +370,7 @@ class JobExecutor:
         retry_base_seconds: float = 1.0,
         retry_max_seconds: float = 300.0,
         heartbeat_interval_seconds: float = 20.0,
-        diagnostics: ProductionDiagnosticsLog | None = None,
+        diagnostics: DiagnosticsLog | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._registry = registry
@@ -379,7 +379,7 @@ class JobExecutor:
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         # Every stage of the chain runs as a job, so this is the one place that
         # sees each failure regardless of which service produced it.
-        self._diagnostics = diagnostics or ProductionDiagnosticsLog(None)
+        self._diagnostics = diagnostics or DiagnosticsLog(None)
 
     async def execute(self, job_id: UUID, *, allow_early_retry: bool = False) -> Job:
         job, claimed = await self._start(job_id, allow_early_retry=allow_early_retry)
@@ -657,9 +657,9 @@ def create_job_registry(
             raise TypeError("brief_service must be a BriefService")
         register_brief_jobs(registry, brief_service)
     if uow_factory is not None:
+        from cti_app.application.diagnostics import DiagnosticsLog
         from cti_app.application.model_conversations import ModelConversationService
         from cti_app.application.production_artifact_store import ProductionArtifactStore
-        from cti_app.application.diagnostics import DiagnosticsLog as ProductionDiagnosticsLog
         from cti_app.application.production_jobs import (
             ProductionStageChain,
             register_production_jobs,
@@ -678,9 +678,9 @@ def create_job_registry(
         ):
             raise TypeError("production_artifact_store must be a ProductionArtifactStore")
         if production_diagnostics is not None and not isinstance(
-            production_diagnostics, ProductionDiagnosticsLog
+            production_diagnostics, DiagnosticsLog
         ):
-            raise TypeError("production_diagnostics must be a ProductionDiagnosticsLog")
+            raise TypeError("production_diagnostics must be a DiagnosticsLog")
         register_production_jobs(
             registry,
             uow_factory,
