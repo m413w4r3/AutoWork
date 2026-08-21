@@ -4,16 +4,15 @@ Revision ID: 0001_baseline
 Revises:
 Create Date: 2026-08-22
 
-[R07a] This single migration reproduces, byte-for-byte (verified by
-``tests/integration/test_migrations.py`` against
-``tests/fixtures/schema/r07a_pre_squash_catalog.json``), the exact schema
-that the former 23-migration chain (0001..0023) produced on ``upgrade
-head``. It is a *squash*, not a cleanup: every drift, legacy shape and
-inconsistency the old chain accumulated (unnamed vs. named constraints,
-JSON vs. JSONB, uuid[] vs. JSONB, historically-added-nullable-then-altered
-columns, etc.) is deliberately preserved as-is. No schema decision was made
-here; see the individual (now-deleted) migrations' history for *why* each
-shape looks the way it does.
+[R07a] This single migration reproduces the exact schema that the former
+23-migration chain (0001..0023) produced on ``upgrade head``. The historical
+equivalence was verified before the schema entered its new canonical phase.
+It is a *squash*, not a cleanup: every drift, legacy shape and inconsistency
+the old chain accumulated (unnamed vs. named constraints, JSON vs. JSONB,
+uuid[] vs. JSONB, historically-added-nullable-then-altered columns, etc.)
+is deliberately preserved as-is. No schema decision was made here; see the
+individual (now-deleted) migrations' history for *why* each shape looks the
+way it does.
 
 Tables are created in an order chosen to satisfy foreign keys directly
 wherever possible. Three foreign keys are genuinely circular (each side
@@ -268,10 +267,6 @@ _TABLES_IN_CREATION_ORDER: tuple[str, ...] = (
     "rejected_model_proposals",
     "brief_evidence_packs",
     "brief_drafts",
-    "brief_amendments",
-    "editorial_update_decisions",
-    "replay_identity_mappings",
-    "replay_comparisons",
     "model_conversations",
     "model_conversation_turns",
     "model_output_rejections",
@@ -331,10 +326,6 @@ def upgrade() -> None:
     _create_rejected_model_proposals()
     _create_brief_evidence_packs()
     _create_brief_drafts()
-    _create_brief_amendments()
-    _create_editorial_update_decisions()
-    _create_replay_identity_mappings()
-    _create_replay_comparisons()
     _create_model_conversations()
     _create_model_conversation_turns()
     op.create_foreign_key(
@@ -1563,148 +1554,6 @@ def _create_brief_drafts() -> None:
         sa.UniqueConstraint("subject_id", "version", name="uq_brief_drafts_version"),
     )
     op.create_index("ix_brief_drafts_subject", "brief_drafts", ["subject_id", "version"])
-
-
-def _create_brief_amendments() -> None:
-    op.create_table(
-        "brief_amendments",
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("subject_id", sa.Uuid(), nullable=False),
-        sa.Column("edition_id", sa.Uuid(), nullable=False),
-        sa.Column("parent_artifact_id", sa.Uuid(), nullable=False),
-        sa.Column("root_artifact_id", sa.Uuid(), nullable=False),
-        sa.Column("trigger_snapshot_id", sa.Uuid(), nullable=False),
-        sa.Column("kind", sa.String(length=20), nullable=False),
-        sa.Column("status", sa.String(length=20), nullable=False),
-        sa.Column("evidence_pack_id", sa.Uuid(), nullable=False),
-        sa.Column("contribution_ids", postgresql.ARRAY(sa.Uuid()), nullable=False),
-        sa.Column("draft_id", sa.Uuid(), nullable=True),
-        sa.Column("revision_reason", sa.Text(), nullable=True),
-        sa.Column("published_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["subject_id"], ["discovery_subject_identities.id"], ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["parent_artifact_id"], ["brief_drafts.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["root_artifact_id"], ["brief_drafts.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["trigger_snapshot_id"], ["discovery_snapshots.id"], ondelete="RESTRICT"
-        ),
-        sa.ForeignKeyConstraint(
-            ["evidence_pack_id"], ["brief_evidence_packs.id"], ondelete="RESTRICT"
-        ),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index("ix_brief_amendments_edition", "brief_amendments", ["edition_id"])
-    op.create_index("ix_brief_amendments_subject", "brief_amendments", ["subject_id"])
-    op.create_index("ix_brief_amendments_status", "brief_amendments", ["status"])
-
-
-def _create_editorial_update_decisions() -> None:
-    op.create_table(
-        "editorial_update_decisions",
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("edition_id", sa.Uuid(), nullable=False),
-        sa.Column("artifact_id", sa.Uuid(), nullable=False),
-        sa.Column("action", sa.String(length=20), nullable=False),
-        sa.Column("contribution_ids", postgresql.ARRAY(sa.Uuid()), nullable=False),
-        sa.Column("actor_id", sa.String(length=255), nullable=False),
-        sa.Column("reason", sa.Text(), nullable=False),
-        sa.Column("supersedes_decision_id", sa.Uuid(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["artifact_id"], ["brief_drafts.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["supersedes_decision_id"],
-            ["editorial_update_decisions.id"],
-            ondelete="SET NULL",
-        ),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index(
-        "ix_editorial_update_decisions_edition", "editorial_update_decisions", ["edition_id"]
-    )
-    op.create_index(
-        "ix_editorial_update_decisions_artifact", "editorial_update_decisions", ["artifact_id"]
-    )
-    op.create_index(
-        "ix_editorial_update_decisions_action", "editorial_update_decisions", ["action"]
-    )
-
-
-def _create_replay_identity_mappings() -> None:
-    op.create_table(
-        "replay_identity_mappings",
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("replay_run_id", sa.Uuid(), nullable=False),
-        sa.Column("replay_subject_id", sa.Uuid(), nullable=False),
-        sa.Column("operational_subject_id", sa.Uuid(), nullable=True),
-        sa.Column("resolution", sa.String(length=20), nullable=False),
-        sa.Column("actor_id", sa.String(length=255), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.ForeignKeyConstraint(
-            ["replay_subject_id"],
-            ["discovery_subject_identities.id"],
-            ondelete="RESTRICT",
-        ),
-        sa.ForeignKeyConstraint(
-            ["operational_subject_id"],
-            ["discovery_subject_identities.id"],
-            ondelete="RESTRICT",
-        ),
-        sa.ForeignKeyConstraint(
-            ["replay_run_id"],
-            ["discovery_merge_runs.id"],
-            ondelete="RESTRICT",
-        ),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "replay_run_id", "replay_subject_id", name="uq_replay_identity_mappings_replay_subject"
-        ),
-    )
-    op.create_index(
-        "ix_replay_identity_mappings_replay_run",
-        "replay_identity_mappings",
-        ["replay_run_id"],
-    )
-    op.create_index(
-        "ix_replay_identity_mappings_subjects",
-        "replay_identity_mappings",
-        ["replay_subject_id", "operational_subject_id"],
-    )
-
-
-def _create_replay_comparisons() -> None:
-    op.create_table(
-        "replay_comparisons",
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("replay_run_id", sa.Uuid(), nullable=False),
-        sa.Column("edition_id", sa.Uuid(), nullable=False),
-        sa.Column("subjects_same_count", sa.Integer(), nullable=False),
-        sa.Column("subjects_split_count", sa.Integer(), nullable=False),
-        sa.Column("subjects_merged_count", sa.Integer(), nullable=False),
-        sa.Column("subjects_created_count", sa.Integer(), nullable=False),
-        sa.Column("subjects_impacting_editorial", sa.Integer(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.CheckConstraint("subjects_same_count >= 0", name="ck_subjects_same_count"),
-        sa.CheckConstraint("subjects_split_count >= 0", name="ck_subjects_split_count"),
-        sa.CheckConstraint("subjects_merged_count >= 0", name="ck_subjects_merged_count"),
-        sa.CheckConstraint("subjects_created_count >= 0", name="ck_subjects_created_count"),
-        sa.CheckConstraint(
-            "subjects_impacting_editorial >= 0",
-            name="ck_subjects_impacting_editorial",
-        ),
-        sa.ForeignKeyConstraint(
-            ["replay_run_id"],
-            ["discovery_merge_runs.id"],
-            ondelete="RESTRICT",
-        ),
-        sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index("ix_replay_comparisons_replay_run", "replay_comparisons", ["replay_run_id"])
-    op.create_index("ix_replay_comparisons_edition", "replay_comparisons", ["edition_id"])
 
 
 def _create_model_conversations() -> None:

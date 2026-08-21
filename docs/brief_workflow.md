@@ -16,9 +16,9 @@ canonique est stocké dans le bucket logique `brief-evidence-packs`; son SHA-256
 
 Un gel identique réutilise la version existante. Dès qu’une preuve ou décision de preuve change,
 le hash change et une version additive est créée. Les tables `brief_evidence_packs` et
-`brief_drafts` sont protégées par les triggers append-only de la migration `0009`. Un brouillon est
-automatiquement `stale` lorsque son `pack_id` n’est plus celui du pack courant ; aucune mise à jour
-rétroactive n’est nécessaire.
+`brief_drafts` sont protégées par des triggers append-only définis dans le schéma PostgreSQL.
+Un brouillon est automatiquement `stale` lorsque son `pack_id` n’est plus celui du pack courant ;
+aucune mise à jour rétroactive n’est nécessaire.
 
 ## Génération et édition
 

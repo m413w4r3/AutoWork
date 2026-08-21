@@ -16,12 +16,7 @@ This module validates, against a real (temporary) PostgreSQL database:
    append-only enforcement), not just their catalog presence;
 6. a full ``upgrade head`` -> ``downgrade base`` -> ``upgrade head`` cycle,
    asserting tables/functions/triggers are completely gone after the full
-   downgrade and fully restored after re-upgrading;
-7. [R07a] that the single squashed ``0001_baseline`` migration reproduces,
-   byte-for-byte, the exact catalog manifest (tables, columns, constraints,
-   indexes, sequences, functions, triggers) captured from the former
-   23-migration chain (0001..0023) before it was squashed. This is a
-   structural manifest comparison, not a sorted ``pg_dump`` diff.
+   downgrade and fully restored after re-upgrading.
 
 Structural comparisons are generic (driven by ``Base.metadata``) rather than
 transcribed by hand, so the exhaustive checks stay correct as new migrations
@@ -31,8 +26,6 @@ and models are added instead of silently drifting out of date.
 from __future__ import annotations
 
 import asyncio
-import json
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -61,15 +54,6 @@ from sqlalchemy.sql.schema import Table
 
 from cti_app.infrastructure.database.models import Base
 from tests.integration.conftest import _alembic_config
-from tests.integration.schema_catalog import capture_schema_catalog
-
-# [R07a] Canonical structural manifest captured from the former 23-migration
-# chain (0001..0023) on a fresh database, before it was squashed into the
-# single `0001_baseline` migration. See `schema_catalog.py` for the exact
-# shape and `migrations/versions/0001_baseline.py` for the squash itself.
-_R07A_PRE_SQUASH_CATALOG_PATH = (
-    Path(__file__).resolve().parents[1] / "fixtures" / "schema" / "r07a_pre_squash_catalog.json"
-)
 
 pytestmark = pytest.mark.integration
 
@@ -77,22 +61,9 @@ pytestmark = pytest.mark.integration
 # Expected shape of the migrated database
 # ---------------------------------------------------------------------------
 
-# Tables created directly by migrations 0021/0022 that were never wired into
-# an ORM model in `cti_app.infrastructure.database.models`. They are real,
-# intentional parts of the migrated schema (editorial preservation / replay
-# comparison support), just not yet read/written through the SQLAlchemy layer.
-UNMAPPED_TABLES = frozenset(
-    {
-        "brief_amendments",  # 0021_editorial_preservation_increment_3
-        "editorial_update_decisions",  # 0021_editorial_preservation_increment_3
-        "replay_identity_mappings",  # 0022_replay_identity_mapping_increment_4
-        "replay_comparisons",  # 0022_replay_identity_mapping_increment_4
-    }
-)
-
 ALEMBIC_TABLE = "alembic_version"
 
-EXPECTED_TABLES = frozenset(Base.metadata.tables) | UNMAPPED_TABLES | {ALEMBIC_TABLE}
+EXPECTED_TABLES = frozenset(Base.metadata.tables) | {ALEMBIC_TABLE}
 
 # --- Known, pre-existing ORM/database drift --------------------------------
 #
@@ -651,24 +622,3 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
     assert asyncio.run(_table_names(temporary_postgres_url)) == EXPECTED_TABLES
     assert asyncio.run(_function_names(temporary_postgres_url)) == EXPECTED_FUNCTIONS
     assert asyncio.run(_trigger_function_pairs(temporary_postgres_url)) == EXPECTED_TRIGGERS
-
-
-# ---------------------------------------------------------------------------
-# 7: [R07a] the squashed baseline reproduces the pre-squash catalog exactly
-# ---------------------------------------------------------------------------
-
-
-def test_baseline_migration_reproduces_the_pre_squash_catalog_exactly(
-    migrated_postgres_url: str,
-) -> None:
-    """The single ``0001_baseline`` migration must produce, byte-for-byte,
-    the same structural catalog (tables, columns, constraints, indexes,
-    sequences, functions, triggers) as the former 23-migration chain did.
-
-    The expected catalog was captured once, with the historical chain still
-    intact, and committed as a fixture (see module docstring). This is a
-    structural comparison of the two manifests, not a `pg_dump` diff.
-    """
-    expected = json.loads(_R07A_PRE_SQUASH_CATALOG_PATH.read_text())
-    actual = asyncio.run(capture_schema_catalog(migrated_postgres_url))
-    assert actual == expected

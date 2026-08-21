@@ -55,7 +55,7 @@ Le manifeste contient `"canonical": false`. Supprimer ou modifier un workspace n
 
 ## Migrations et tests
 
-Les révisions `0001` à `0006` sont additives. Leurs downgrades retirent triggers, index et
-tables dans l'ordre inverse. La CI démarre un PostgreSQL isolé, crée une base temporaire par
-fixture, teste `upgrade head`, `downgrade base`, les transactions, les triggers et les
+AutoWork utilise une unique migration de baseline (`0001_baseline`) qui définit le schéma
+complet à partir d'une base vide. La CI démarre un PostgreSQL isolé, crée une base temporaire
+par fixture, teste `upgrade head`, `downgrade base`, les transactions, les triggers et les
 repositories, puis supprime la base.

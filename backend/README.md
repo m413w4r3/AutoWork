@@ -61,16 +61,17 @@ future étape Analyse explicite.
   les propositions valides du même segment.
 - `human_decisions` porte les validations, corrections et rejets sans modifier l'extraction initiale.
 
-La migration additive et réversible `0015_collection_only_and_document_metadata` enrichit les
-documents sans supprimer les références historiques.
+Le schéma de base unique (`0001_baseline`) définit une sémantique complète pour les documents
+source et leurs métadonnées de collecte, protégée par des contraintes PostgreSQL.
 
 ## Brèves et evidence packs
 
-La migration additive `0009_brief_vertical` ajoute `brief_evidence_packs` et `brief_drafts`, toutes
-deux append-only. Les packs JSON immuables sont adressés par contenu dans le bucket logique
-`brief-evidence-packs`; PostgreSQL conserve leur version et la référence de blob. Les brouillons
-versionnés sont invalidés par lecture dès qu’un pack plus récent existe. Le parcours, la politique
-Qwen/OpenAI, les contrôles QA et l’export sont décrits dans `../docs/brief_workflow.md`.
+Les tables `brief_evidence_packs` et `brief_drafts` sont append-only et protégées par des
+triggers PostgreSQL définis dans le schéma de base. Les packs JSON immuables sont adressés par
+contenu dans le bucket logique `brief-evidence-packs`; PostgreSQL conserve leur version et la
+référence de blob. Les brouillons versionnés sont invalidés par lecture dès qu’un pack plus
+récent existe. Le parcours, la politique Qwen/OpenAI, les contrôles QA et l’export sont
+décrits dans `../docs/brief_workflow.md`.
 
 Le collecteur accepte uniquement HTTP(S), refuse credentials, localhost, metadata cloud et plages
 privées, loopback, link-local, multicast ou réservées IPv4/IPv6. Il contrôle deux réponses DNS puis
