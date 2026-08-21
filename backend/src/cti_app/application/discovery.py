@@ -55,11 +55,12 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
     canonicalize_http_url,
 )
+from cti_app.domain.discovery_cumulative import DiscoveryInputMode
 from cti_app.domain.model_conversations import (
+    ConversationLifecycle,
     ConversationPolicy,
     ConversationReleaseOutcome,
 )
-from cti_app.domain.discovery_cumulative import DiscoveryInputMode
 from cti_app.domain.model_runs import ModelProvider, ModelRun, ModelRunStatus
 from cti_app.logging import get_correlation_id
 
@@ -455,6 +456,10 @@ class DiscoveryService:
                 lifecycle.release(outcome=ConversationReleaseOutcome.SUCCESS)
                 await uow.conversation_lifecycles.save(lifecycle)
                 await uow.commit()
+        # DELETE_ON_SUCCESS only means something if something acts on it: the
+        # lifecycle row above records the policy, this call is what actually
+        # closes the ChatGPT-side conversation now that it succeeded.
+        await self._archive_ephemeral_conversation(fresh_conversation_id)
 
         if self._after_persisted_batch is not None:
             await self._after_persisted_batch(

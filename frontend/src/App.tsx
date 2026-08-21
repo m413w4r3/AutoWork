@@ -30,6 +30,7 @@ import {
 } from "./api/editions";
 import { JobStatusCard } from "./components/JobStatusCard";
 import { EditorialBoard } from "./components/EditorialBoard";
+import { DiscoveryMergeReview } from "./components/DiscoveryMergeReview";
 import { SubjectWorkbench } from "./components/SubjectWorkbench";
 import { ProductionArtifactView } from "./components/ProductionArtifactView";
 import {
@@ -537,6 +538,11 @@ function DiscoveryPanel({
   );
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
   const [lastJob, setLastJob] = useState<JobView | null>(null);
+  // The merge planner also calls the single-slot ChatGPT bridge, in the
+  // background, before any merge run exists to poll on its own — launching a
+  // second bridge action while it runs would just contend for the same slot
+  // and look stuck rather than fail cleanly.
+  const [mergeReconciling, setMergeReconciling] = useState(false);
   const [axis, setAxis] = useState("initial");
   const [manualMarkdown, setManualMarkdown] = useState("");
   const [showManualRecovery, setShowManualRecovery] = useState(false);
@@ -764,7 +770,7 @@ function DiscoveryPanel({
         <div className="input-choice-buttons">
           <button
             className="button"
-            disabled={launch.isPending || searchRunning}
+            disabled={launch.isPending || searchRunning || mergeReconciling}
             onClick={() => launch.mutate()}
           >
             {launch.isPending ? "Lancement…" : "Nouvelle recherche ChatGPT"}
@@ -778,6 +784,13 @@ function DiscoveryPanel({
           </button>
         </div>
       </div>
+      {mergeReconciling ? (
+        <p className="merge-review__blocked" role="status">
+          Le bridge ChatGPT est occupé à évaluer la dernière contribution
+          pour la fusion : attendez que cette évaluation se termine avant de
+          lancer une nouvelle recherche.
+        </p>
+      ) : null}
       <ol className="discovery-steps" aria-label="Étapes de découverte">
         <li>1. Recherche ChatGPT</li>
         <li>2. Analyse locale du rapport</li>
@@ -1118,38 +1131,67 @@ function DiscoveryPanel({
         {mergeStats ? (
           <section className="discovery-consolidation-stats">
             <h4>Découverte cumulée</h4>
+            <p className="stats-caption">
+              Chaque contribution apporte des candidats bruts, que la
+              consolidation regroupe en sujets uniques.
+            </p>
             <div className="stats-grid">
               <div className="stat-item">
                 <span className="stat-label">Contributions</span>
                 <span className="stat-value">{mergeStats.raw_batch_count}</span>
+                <span className="stat-hint">recherches et imports reçus</span>
               </div>
               <div className="stat-item">
                 <span className="stat-label">Candidats bruts</span>
                 <span className="stat-value">
                   {mergeStats.raw_candidate_count}
                 </span>
+                <span className="stat-hint">avant regroupement</span>
               </div>
               <div className="stat-item">
                 <span className="stat-label">Sujets consolidés</span>
                 <span className="stat-value">
                   {mergeStats.consolidated_candidate_count}
                 </span>
+                <span className="stat-hint">après regroupement</span>
+              </div>
+              <div className="stat-item">
+                <span className="stat-label">Candidats regroupés</span>
+                {/* The number the analyst actually looks for: how much the
+                    consolidation collapsed. It is derived, not returned. */}
+                <span className="stat-value">
+                  {Math.max(
+                    0,
+                    mergeStats.raw_candidate_count -
+                      mergeStats.consolidated_candidate_count,
+                  )}
+                </span>
+                <span className="stat-hint">candidats absorbés dans un sujet</span>
               </div>
               <div className="stat-item">
                 <span className="stat-label">Publications uniques</span>
                 <span className="stat-value">
                   {mergeStats.unique_publication_count}
                 </span>
+                <span className="stat-hint">URL distinctes citées</span>
               </div>
               <div className="stat-item">
-                <span className="stat-label">Doublons fusionnés</span>
+                {/* Named for what it counts: repeated publication URLs, not
+                    merged subjects — reading it as "no merge happened" is a
+                    trap this label used to set. */}
+                <span className="stat-label">Publications en double</span>
                 <span className="stat-value">
                   {mergeStats.duplicate_publication_occurrence_count}
                 </span>
+                <span className="stat-hint">citées par plusieurs candidats</span>
               </div>
             </div>
           </section>
         ) : null}
+        <DiscoveryMergeReview
+          editionId={editionId}
+          onReconciling={setMergeReconciling}
+        />
         <div className="candidate-list">
           {candidates.map((candidate) => (
             <article className="candidate-card" key={candidate.id}>
@@ -1358,7 +1400,7 @@ function DiscoveryPanel({
                 </button>
                 <button
                   className="button button--secondary"
-                  disabled={relaunch.isPending}
+                  disabled={relaunch.isPending || mergeReconciling}
                   onClick={() => {
                     if (
                       window.confirm(

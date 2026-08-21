@@ -86,12 +86,17 @@ async def _execute_job(job_id: UUID) -> int | None:
         return SqlAlchemyUnitOfWork(session_factory)
 
     try:
+        production_diagnostics = ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root)
         model_gateway = create_model_gateway(settings, uow_factory)
         editorial_service = EditorialGroupingService(uow_factory)
         cumulative_discovery_service = CumulativeDiscoveryService(
             uow_factory,
-            planner=ChatGptMergePlanner(model_gateway),
+            planner=ChatGptMergePlanner(
+                model_gateway,
+                bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
+            ),
             after_activation=editorial_service.synchronize,
+            diagnostics=production_diagnostics,
         )
         job_service: JobService
         job_dispatcher = DramatiqJobDispatcher()
@@ -179,7 +184,6 @@ async def _execute_job(job_id: UUID) -> int | None:
         )
         # Production stage jobs run here, so the worker needs the production
         # registrations and a bound chain to queue the following stage.
-        production_diagnostics = ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root)
         production_artifact_store = ProductionArtifactStore(
             BlobCatalogService(blob_store, uow_factory)
         )
@@ -204,6 +208,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             retry_base_seconds=settings.job_retry_base_seconds,
             retry_max_seconds=settings.job_retry_max_seconds,
             heartbeat_interval_seconds=min(20.0, settings.job_heartbeat_timeout_seconds / 3),
+            diagnostics=production_diagnostics,
         )
         job = await executor.execute(job_id)
         if job.status is JobStatus.QUEUED and job.next_retry_at is not None:

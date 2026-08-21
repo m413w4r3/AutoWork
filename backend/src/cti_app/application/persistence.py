@@ -101,6 +101,10 @@ class JobRepository(Protocol):
 
     async def list_abandoned(self, heartbeat_before: datetime) -> Sequence[Job]: ...
 
+    async def list_for_aggregate(
+        self, aggregate_type: str, aggregate_id: UUID, *, kind: str | None = None
+    ) -> Sequence[Job]: ...
+
     async def operational_metrics(self) -> JobOperationalMetrics: ...
 
 
@@ -198,7 +202,9 @@ class ConversationLifecycleRepository(Protocol):
 
     async def get(self, lifecycle_id: UUID) -> ConversationLifecycle | None: ...
 
-    async def get_by_conversation_id(self, conversation_id: UUID) -> ConversationLifecycle | None: ...
+    async def get_by_conversation_id(
+        self, conversation_id: UUID
+    ) -> ConversationLifecycle | None: ...
 
     async def save(self, lifecycle: ConversationLifecycle) -> None: ...
 
@@ -267,6 +273,8 @@ class DiscoverySnapshotRepository(Protocol):
 
 class DiscoveryMergeRunRepository(Protocol):
     async def add_if_absent(self, run: DiscoveryMergeRun) -> bool: ...
+
+    async def mark_resolved(self, run_id: UUID) -> None: ...
 
     async def get(self, run_id: UUID) -> DiscoveryMergeRun | None: ...
 
@@ -491,6 +499,7 @@ class EditionUnitOfWorkFactory(Protocol):
 
 class DiscoveryUnitOfWork(Protocol):
     discovery_batches: DiscoveryBatchRepository
+    conversation_lifecycles: ConversationLifecycleRepository
 
     async def __aenter__(self) -> Self: ...
 

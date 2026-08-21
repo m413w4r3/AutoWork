@@ -301,9 +301,23 @@ class ConversationLifecycle:
             # FAILURE, NEEDS_REVIEW, CANCELLED all preserve the conversation
             self.status = ConversationLifecycleStatus.RETAINED
 
+    #: States a cleanup attempt may act on. CLEANUP_FAILED belongs here: the
+    #: repository lists those rows precisely so they can be retried, and leaving
+    #: it out stranded every conversation whose first deletion attempt failed.
+    _RETRYABLE_CLEANUP_STATES = frozenset(
+        {
+            ConversationLifecycleStatus.DELETE_PENDING,
+            ConversationLifecycleStatus.DELETING,
+            ConversationLifecycleStatus.CLEANUP_FAILED,
+        }
+    )
+
     def start_cleanup(self, *, now: datetime | None = None) -> None:
         """Transition to DELETING state (cleanup in progress)."""
-        if self.status != ConversationLifecycleStatus.DELETE_PENDING:
+        if self.status not in {
+            ConversationLifecycleStatus.DELETE_PENDING,
+            ConversationLifecycleStatus.CLEANUP_FAILED,
+        }:
             raise ValueError(
                 f"Cannot start cleanup from status {self.status.value}"
             )
@@ -319,10 +333,7 @@ class ConversationLifecycle:
         now: datetime | None = None,
     ) -> None:
         """Mark cleanup attempt as failed (retryable)."""
-        if self.status not in {
-            ConversationLifecycleStatus.DELETE_PENDING,
-            ConversationLifecycleStatus.DELETING,
-        }:
+        if self.status not in self._RETRYABLE_CLEANUP_STATES:
             # Idempotence: ignore if not in cleanup states
             return
 
@@ -336,10 +347,7 @@ class ConversationLifecycle:
 
     def mark_deleted(self, *, now: datetime | None = None) -> None:
         """Mark as deleted after successful cleanup."""
-        if self.status not in {
-            ConversationLifecycleStatus.DELETE_PENDING,
-            ConversationLifecycleStatus.DELETING,
-        }:
+        if self.status not in self._RETRYABLE_CLEANUP_STATES:
             # Idempotence: ignore if not in cleanup states
             return
 

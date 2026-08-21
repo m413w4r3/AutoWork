@@ -47,6 +47,19 @@ class InMemoryJobRepository:
             and job.heartbeat_at < heartbeat_before
         ]
 
+    async def list_for_aggregate(
+        self, aggregate_type: str, aggregate_id: UUID, *, kind: str | None = None
+    ) -> Sequence[Job]:
+        return [
+            deepcopy(job)
+            for job in sorted(
+                self._jobs.values(), key=lambda item: item.created_at, reverse=True
+            )
+            if job.aggregate_type == aggregate_type
+            and job.aggregate_id == aggregate_id
+            and (kind is None or job.kind == kind)
+        ]
+
     async def operational_metrics(self) -> JobOperationalMetrics:
         counts = {
             status: sum(job.status is status for job in self._jobs.values()) for status in JobStatus

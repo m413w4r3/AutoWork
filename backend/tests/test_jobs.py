@@ -1,5 +1,7 @@
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -17,6 +19,7 @@ from cti_app.application.jobs import (
     SynchronousJobDispatcher,
     create_job_registry,
 )
+from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
 from cti_app.domain.jobs import Job, JobStatus
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 
@@ -127,6 +130,89 @@ async def test_permanent_and_unexpected_errors_are_not_retried_or_leaked() -> No
     assert metrics.total == 1
     assert metrics.counts_by_status[JobStatus.FAILED] == 1
     assert metrics.failure_rate == 1.0
+
+
+async def test_a_crashed_job_leaves_its_traceback_in_the_diagnostics_trail(
+    tmp_path: Path,
+) -> None:
+    """The public failure is deliberately vague, so the trail is the only lead.
+
+    A user reporting "internal_error" plus a diagnostic id must be enough for us
+    to find the stack that produced it, without the container logs.
+    """
+    factory = InMemoryJobUnitOfWorkFactory()
+    registry = JobRegistry()
+
+    async def unsafe_handler(parameters: JobParameters, context: JobExecutionContext) -> None:
+        del parameters, context
+        raise RuntimeError("boom-inside-the-chain")
+
+    registry.register("test.unsafe", DemoJobParameters, unsafe_handler)
+    service = JobService(factory, registry)
+    diagnostics = ProductionDiagnosticsLog.from_env(tmp_path)
+    dispatcher = SynchronousJobDispatcher(
+        JobExecutor(factory, registry, diagnostics=diagnostics)
+    )
+    job = await service.submit(
+        kind="test.unsafe",
+        aggregate_type="subject",
+        aggregate_id=uuid4(),
+        idempotency_key="crash",
+        correlation_id="corr-crash",
+        input_parameters={"steps": 1},
+    )
+
+    await dispatcher.dispatch(job.id)
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    crash = next(event for event in events if event["event"] == "job.crashed")
+    assert crash["correlation_id"] == "corr-crash"
+    assert crash["stage"] == "test.unsafe"
+    assert crash["error_code"] == "internal_error"
+    assert crash["error_type"] == "RuntimeError"
+    traceback_text = (tmp_path / crash["payload_file"]).read_text(encoding="utf-8")
+    assert "boom-inside-the-chain" in traceback_text
+    assert "unsafe_handler" in traceback_text
+
+
+async def test_a_controlled_job_failure_is_recorded_with_its_code(tmp_path: Path) -> None:
+    factory = InMemoryJobUnitOfWorkFactory()
+    registry = JobRegistry()
+
+    async def refusing_handler(parameters: JobParameters, context: JobExecutionContext) -> None:
+        del parameters, context
+        raise JobHandlerError(
+            "bridge_unavailable", "Le pont ChatGPT est injoignable.", transient=False
+        )
+
+    registry.register("test.refusing", DemoJobParameters, refusing_handler)
+    service = JobService(factory, registry)
+    diagnostics = ProductionDiagnosticsLog.from_env(tmp_path)
+    dispatcher = SynchronousJobDispatcher(
+        JobExecutor(factory, registry, diagnostics=diagnostics)
+    )
+    job = await service.submit(
+        kind="test.refusing",
+        aggregate_type="subject",
+        aggregate_id=uuid4(),
+        idempotency_key="refused",
+        correlation_id="corr-refused",
+        input_parameters={"steps": 1},
+    )
+
+    await dispatcher.dispatch(job.id)
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    failure = next(event for event in events if event["event"] == "job.failed")
+    assert failure["error_code"] == "bridge_unavailable"
+    assert failure["job_kind"] == "test.refusing"
+    assert failure["transient"] is False
 
 
 async def test_abandoned_running_job_is_requeued() -> None:

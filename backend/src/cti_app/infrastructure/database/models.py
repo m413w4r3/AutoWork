@@ -1154,6 +1154,17 @@ class BriefEvidencePackRow(Base):
     )
     created_by: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Added by migration 0021; nullable because packs frozen before it have no
+    # snapshot of origin.
+    built_from_snapshot_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    built_from_snapshot_version: Mapped[int | None] = mapped_column(nullable=True)
+    covered_contribution_ids: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    scope: Mapped[str] = mapped_column(String(10), nullable=False, default="full")
+    base_pack_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
 
 
 class BriefDraftRow(Base):
@@ -1354,7 +1365,8 @@ class ConversationLifecycleRow(Base):
             name="ck_conv_lifecycle_status",
         ),
         CheckConstraint(
-            f"release_outcome IS NULL OR release_outcome IN ({CONVERSATION_RELEASE_OUTCOME_VALUES_SQL})",
+            "release_outcome IS NULL OR release_outcome IN "
+            f"({CONVERSATION_RELEASE_OUTCOME_VALUES_SQL})",
             name="ck_conv_lifecycle_outcome",
         ),
         CheckConstraint("cleanup_attempt_count >= 0", name="ck_conv_lifecycle_attempts"),
@@ -1368,7 +1380,9 @@ class ConversationLifecycleRow(Base):
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cleanup_attempt_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
-    last_cleanup_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_cleanup_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_cleanup_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

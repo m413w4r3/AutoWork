@@ -24,6 +24,7 @@ from cti_app.application.discovery import (
 from cti_app.application.discovery_cumulative import (
     CumulativeDiscoveryService,
     DiscoveryMergeNeedsReview,
+    DiscoverySnapshotStaleError,
     HumanMergeDecision,
 )
 from cti_app.application.discovery_report_parser import ReportParsingError
@@ -320,6 +321,13 @@ class DiscoveryImportConfirmView(BaseModel):
     publication_count: int
 
 
+class MergeHandleLabelView(BaseModel):
+    handle: str
+    title: str
+    summary: str
+    source_urls: list[str]
+
+
 class MergeRunView(BaseModel):
     id: UUID
     edition_id: UUID
@@ -331,6 +339,9 @@ class MergeRunView(BaseModel):
     warnings: list[str]
     plan: dict[str, object] | None
     projected_diff: list[dict[str, object]]
+    # Only populated on the single-run read: resolving handles costs a snapshot
+    # and a batch load, which the list view does not need.
+    handle_labels: dict[str, MergeHandleLabelView] = Field(default_factory=dict)
     supersedes_merge_run_id: UUID | None
     created_at: datetime
 
@@ -364,7 +375,18 @@ async def list_merge_runs(edition_id: UUID, request: Request) -> list[MergeRunVi
 async def read_merge_run(edition_id: UUID, run_id: UUID, request: Request) -> MergeRunView:
     service: CumulativeDiscoveryService = request.app.state.cumulative_discovery_service
     try:
-        return _merge_run_view(await service.get_merge_run(edition_id, run_id))
+        view = _merge_run_view(await service.get_merge_run(edition_id, run_id))
+        labels = await service.describe_merge_handles(edition_id, run_id)
+        view.handle_labels = {
+            handle: MergeHandleLabelView(
+                handle=label.handle,
+                title=label.title,
+                summary=label.summary,
+                source_urls=list(label.source_urls),
+            )
+            for handle, label in labels.items()
+        }
+        return view
     except LookupError as exc:
         raise HTTPException(
             status_code=404, detail={"code": "merge_run_not_found", "message": str(exc)}
@@ -405,6 +427,10 @@ async def resolve_merge_run(
             status_code=409,
             detail={
                 "code": "merge_still_needs_review",
+                "message": (
+                    "Des groupes sont restés sans décision : "
+                    "une nouvelle proposition de fusion les reprend."
+                ),
                 "merge_run_id": str(exc.run_id),
                 "reasons": list(exc.reasons),
             },
@@ -1129,6 +1155,11 @@ def _merge_run_view(run: DiscoveryMergeRun) -> MergeRunView:
                         "incoming_candidate_handles": group.get("incoming_candidate_handles", []),
                         "disposition": group.get("disposition"),
                         "flags": group.get("flags", []),
+                        # A reviewer cannot accept or reject a grouping without
+                        # seeing why the planner proposed it.
+                        "confidence": group.get("confidence"),
+                        "rationale": group.get("rationale", ""),
+                        "evidence": group.get("evidence", {}),
                     }
                 )
     return MergeRunView(
@@ -1205,6 +1236,19 @@ def _raise_api_error(exc: Exception) -> NoReturn:
         raise HTTPException(
             status_code=409,
             detail={"code": "recovery_unavailable", "message": str(exc)},
+        ) from exc
+    # Checked before ValueError so that a subclass added later cannot silently
+    # be reported as a malformed request.
+    if isinstance(exc, DiscoverySnapshotStaleError):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "discovery_snapshot_stale",
+                "message": (
+                    "Une contribution plus récente a modifié l'édition. "
+                    "Rechargez pour voir l'état actuel."
+                ),
+            },
         ) from exc
     if isinstance(exc, ValueError):
         raise HTTPException(

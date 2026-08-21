@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.discovery import merge_runs_router
+from cti_app.application.discovery_cumulative import MergeHandleLabel
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.domain.discovery_cumulative import (
     DiscoveryMergeRun,
@@ -30,6 +31,21 @@ class FakeCumulativeDiscoveryService:
         if edition_id != self.run.edition_id or run_id != self.run.id:
             raise LookupError(run_id)
         return self.run
+
+    async def describe_merge_handles(
+        self, edition_id: UUID, run_id: UUID
+    ) -> dict[str, MergeHandleLabel]:
+        if edition_id != self.run.edition_id or run_id != self.run.id:
+            raise LookupError(run_id)
+        return {
+            handle: MergeHandleLabel(
+                handle=handle,
+                title=f"Sujet {handle}",
+                summary=f"Résumé {handle}",
+                source_urls=("https://example.test/a",),
+            )
+            for handle in self.run.handle_map
+        }
 
     async def resolve_merge_run(
         self,

@@ -1,7 +1,8 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from uuid import NAMESPACE_URL, uuid5
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from minio import Minio
 
 from cti_app.api.briefs import router as briefs_router
@@ -86,10 +87,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         materializer=SubjectWorkspaceMaterializer(blob_store),
         workspace_root=settings.subject_workspace_root,
     )
+    production_diagnostics = ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root)
     cumulative_discovery_service = CumulativeDiscoveryService(
         uow_factory,
-        planner=ChatGptMergePlanner(model_gateway),
+        planner=ChatGptMergePlanner(
+            model_gateway,
+            bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
+        ),
         after_activation=editorial_service.synchronize,
+        diagnostics=production_diagnostics,
     )
     job_service: JobService
     job_dispatcher: DramatiqJobDispatcher
@@ -129,6 +135,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             return job
         except DuplicateJobError as exc:
             return await job_service.get(exc.existing_job_id)
+
+    async def replan_discovery_intake(parameters: ReconcileDiscoveryParameters) -> object:
+        # The parent snapshot is part of the key: the first reconciliation of this
+        # intake already claimed the bare one, and this is a different attempt
+        # against a state that has moved on since.
+        parent = parameters.expected_parent_snapshot_id
+        key = f"reconcile-discovery:{parameters.intake_id}:{parent or 'root'}"
+        try:
+            job = await job_service.submit(
+                kind=RECONCILE_DISCOVERY_JOB_KIND,
+                aggregate_type="edition",
+                aggregate_id=parameters.edition_id,
+                idempotency_key=key,
+                correlation_id=get_correlation_id(),
+                input_parameters=parameters.model_dump(mode="json"),
+                max_attempts=3,
+                actor_id=parameters.actor_id,
+            )
+            await job_dispatcher.dispatch(job.id)
+            return job
+        except DuplicateJobError as exc:
+            return await job_service.get(exc.existing_job_id)
+
+    cumulative_discovery_service.set_replan_intake(replan_discovery_intake)
 
     discovery_service = DiscoveryService(
         uow_factory,
@@ -175,7 +205,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model_service=model_conversation_service,
     )
 
-    production_diagnostics = ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root)
     production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
     production_chain = ProductionStageChain()
     registry = create_job_registry(
@@ -219,7 +248,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     application = FastAPI(title="CTI Bulletin API", version="0.1.0", lifespan=lifespan)
-    application.add_middleware(CorrelationIdMiddleware)
+    settings = get_settings()
+    request_failures = ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root)
+
+    def record_request_failure(request: Request, error: BaseException) -> None:
+        # Keyed by correlation id rather than a domain id: at this level the
+        # request is all we know, and it is what the browser can be traced back
+        # through. The endpoint's own event, when there is one, carries the rest.
+        request_failures.record_failure(
+            event="http.request_failed",
+            run_id=uuid5(NAMESPACE_URL, f"http-request:{get_correlation_id()}"),
+            stage="http",
+            correlation_id=get_correlation_id(),
+            error=error,
+            http_method=request.method,
+            http_path=request.url.path,
+            http_query=str(request.url.query) or None,
+        )
+
+    application.add_middleware(CorrelationIdMiddleware, on_failure=record_request_failure)
     application.include_router(health_router)
     application.include_router(editions_router)
     application.include_router(discovery_router)

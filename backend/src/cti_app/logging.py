@@ -1,5 +1,6 @@
 import json
 import logging
+from collections.abc import Callable
 from contextvars import ContextVar, Token
 from datetime import UTC, datetime
 from typing import Any
@@ -84,6 +85,22 @@ def configure_logging(level: str) -> None:
 
 
 class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    """Tags every request, and gives unhandled failures somewhere durable to go.
+
+    `on_failure` receives the request and the exception that escaped the
+    endpoint. The container log holds the traceback too, but it is gone on the
+    next rebuild — which is why an API error that produced a generic message in
+    the browser used to leave nothing behind to diagnose it with.
+    """
+
+    def __init__(
+        self,
+        app: Any,
+        on_failure: Callable[[Request, BaseException], None] | None = None,
+    ) -> None:
+        super().__init__(app)
+        self._on_failure = on_failure
+
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         supplied_id = request.headers.get(CORRELATION_HEADER, "").strip()
         correlation_id = supplied_id[:128] if supplied_id else str(uuid4())
@@ -91,11 +108,17 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
         try:
             try:
                 response = await call_next(request)
-            except Exception:
+            except Exception as exc:
                 _http_logger.exception(
                     "http_request_failed",
                     extra={"http_method": request.method, "http_path": request.url.path},
                 )
+                if self._on_failure is not None:
+                    # A diagnostics sink must never turn a 500 into a crash.
+                    try:
+                        self._on_failure(request, exc)
+                    except Exception:
+                        _http_logger.warning("http_failure_trail_unavailable")
                 raise
             # Les probes Compose/Kubernetes sont très fréquents : conserver les
             # échecs, mais ne pas noyer les événements métier avec les succès.

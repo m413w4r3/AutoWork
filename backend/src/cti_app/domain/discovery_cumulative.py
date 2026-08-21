@@ -41,6 +41,10 @@ class MergeValidationStatus(StrEnum):
     REPAIRED = "repaired"
     INVALID = "invalid"
     NEEDS_REVIEW = "needs_review"
+    # A run that was awaiting review and has since been settled by a human. It
+    # keeps its plan for lineage, but it is no longer actionable: leaving it on
+    # NEEDS_REVIEW is what made the review panel outlive the decision it applied.
+    RESOLVED = "resolved"
 
 
 class MergeConfidence(StrEnum):
@@ -221,7 +225,7 @@ class DiscoveryMergeRun:
 
 
 class MergeEvidence(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid")
 
     shared_publication_urls: list[str] = Field(default_factory=list)
     shared_campaigns: list[str] = Field(default_factory=list)
@@ -232,7 +236,7 @@ class MergeEvidence(BaseModel):
 
 
 class DiscoveryMergeGroup(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid")
 
     existing_subject_handles: list[str]
     incoming_candidate_handles: list[str] = Field(min_length=1)
@@ -244,7 +248,7 @@ class DiscoveryMergeGroup(BaseModel):
 
 
 class DiscoveryMergePlanV1(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["1"] = "1"
     groups: list[DiscoveryMergeGroup]

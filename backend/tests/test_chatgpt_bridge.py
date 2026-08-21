@@ -956,6 +956,10 @@ def test_compose_and_makefile_bridge_lifecycle_contract() -> None:
 
     assert "$(COMPOSE) up -d --build --wait" in makefile
     assert "$(COMPOSE) down -v" not in makefile
+    # A data reset must never drop bridge_data: it holds the authenticated
+    # ChatGPT browser profile, and losing it means logging the bridge back in.
+    assert "docker volume rm" in makefile
+    assert "bridge_data" not in makefile.split("CLEAN_VOLUMES = ", 1)[1].split("\n", 1)[0]
     assert "python tools/status.py" in makefile
     status_script = (root / "chatgpt-bridge" / "tools" / "status.py").read_text()
     assert 'os.getenv("BRIDGE_API_KEY")' in status_script

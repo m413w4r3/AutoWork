@@ -1290,3 +1290,251 @@ h1 {
   height: 1.15rem;
   margin-right: 0.2rem;
 }
+
+/* Revue de fusion : la consolidation s'arrête ici quand elle hésite. */
+.merge-review {
+  margin: 2rem 0;
+  padding: 1.5rem;
+  background: #fffbeb;
+  border: 1px solid #f59e0b;
+  border-radius: 0.5rem;
+}
+
+.merge-review h4 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 1rem;
+  color: #78350f;
+}
+
+.merge-review__reasons {
+  margin: 0.5rem 0 1rem;
+  padding-left: 1.25rem;
+  color: #92400e;
+}
+
+.merge-review__warnings,
+.merge-review__blocked {
+  font-size: 0.875rem;
+  color: #92400e;
+}
+
+.merge-review-idle {
+  margin: 1rem 0;
+  font-size: 0.875rem;
+  color: #64748b;
+}
+
+.merge-group-card {
+  margin: 1rem 0;
+  padding: 1rem;
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.375rem;
+}
+
+.merge-group-card__heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.merge-group-card__heading h4 {
+  margin: 0;
+  color: #1f2937;
+}
+
+.merge-group-card__sides {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1rem;
+  margin: 0.75rem 0;
+}
+
+.merge-handle-list {
+  margin: 0.25rem 0 0;
+  padding-left: 1.25rem;
+}
+
+.merge-handle {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8125rem;
+  padding: 0 0.25rem;
+  background: #f1f5f9;
+  border-radius: 0.25rem;
+}
+
+.merge-handle-sources {
+  color: #64748b;
+  font-size: 0.875rem;
+}
+
+.merge-confidence {
+  font-size: 0.8125rem;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+}
+
+.merge-confidence.is-high {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.merge-confidence.is-medium {
+  background: #fef9c3;
+  color: #854d0e;
+}
+
+.merge-confidence.is-low {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.merge-group-card__rationale {
+  font-size: 0.9375rem;
+}
+
+.merge-group-card__conflicts {
+  color: #991b1b;
+  font-size: 0.9375rem;
+}
+
+.merge-group-card__decision {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #e2e8f0;
+}
+
+.merge-group-card__decision label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.875rem;
+  color: #475569;
+}
+
+.merge-review.is-blocked {
+  background: #fef2f2;
+  border-color: #ef4444;
+}
+
+.merge-review.is-blocked h4 {
+  color: #991b1b;
+}
+
+.merge-review__queued {
+  font-size: 0.875rem;
+  color: #92400e;
+}
+
+.stats-caption {
+  margin: -0.5rem 0 1rem;
+  font-size: 0.875rem;
+  color: #64748b;
+}
+
+.stat-hint {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
+.merge-side {
+  padding: 0.75rem;
+  border-radius: 0.375rem;
+}
+
+.merge-side h5 {
+  margin: 0 0 0.5rem;
+  font-size: 0.8125rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.merge-side--existing {
+  background: #f1f5f9;
+}
+
+.merge-side--existing h5 {
+  color: #475569;
+}
+
+.merge-side--incoming {
+  background: #eff6ff;
+}
+
+.merge-side--incoming h5 {
+  color: #1d4ed8;
+}
+
+.merge-handle-list > li + li {
+  margin-top: 0.75rem;
+}
+
+.merge-handle-summary {
+  margin: 0.25rem 0;
+  font-size: 0.875rem;
+  color: #475569;
+}
+
+.merge-handle-sources {
+  margin: 0.25rem 0 0;
+  padding-left: 1rem;
+  font-size: 0.8125rem;
+}
+
+.merge-handle-sources a {
+  color: #1d4ed8;
+  word-break: break-all;
+}
+
+.merge-group-card__help {
+  margin: 0.5rem 0 0;
+  font-size: 0.875rem;
+  color: #475569;
+  font-style: italic;
+}
+
+/* Distinguishes a real merge proposal from a lone incoming candidate the
+   planner is only flagging for a look before it becomes a new subject. */
+.merge-group-kind {
+  font-size: 0.8125rem;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  background: #e0e7ff;
+  color: #3730a3;
+}
+
+.merge-group-kind.is-new {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.merge-group-card__hint {
+  margin: 0.5rem 0;
+  font-size: 0.875rem;
+  color: #64748b;
+}
+
+.merge-group-card__warnings {
+  margin: 0.5rem 0;
+  padding-left: 1.25rem;
+  font-size: 0.8125rem;
+  color: #92400e;
+}
+
+/* The bridge is single-slot: while the planner is calling ChatGPT in the
+   background, this replaces the silence that used to sit where a proposal
+   would eventually appear. */
+.merge-review__job {
+  background: #eff6ff;
+  border-color: #93c5fd;
+}
+
+.merge-review__job h4 {
+  color: #1d4ed8;
+}

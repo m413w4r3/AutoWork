@@ -51,6 +51,25 @@ export const terminalJobStatuses: ReadonlySet<JobStatus> = new Set([
   "cancelled",
 ]);
 
+/** Jobs for one aggregate, most recent first — for background work the caller
+ * only knows the edition it belongs to, not a job id to poll directly. */
+export async function listJobs(
+  aggregateType: string,
+  aggregateId: string,
+  kind?: string,
+): Promise<JobView[]> {
+  const parameters = new URLSearchParams({
+    aggregate_type: aggregateType,
+    aggregate_id: aggregateId,
+  });
+  if (kind) parameters.set("kind", kind);
+  const response = await fetch(`/api/jobs?${parameters.toString()}`);
+  if (!response.ok) {
+    throw new Error(`Job listing returned ${response.status}`);
+  }
+  return (await response.json()) as JobView[];
+}
+
 export async function fetchJob(jobId: string): Promise<JobView> {
   const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
   if (!response.ok) {

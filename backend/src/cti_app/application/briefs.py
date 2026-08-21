@@ -40,6 +40,7 @@ from cti_app.domain.editorial import (
     HumanDecision,
     HumanDecisionType,
 )
+from cti_app.domain.model_runs import ModelRunStatus
 
 BRIEF_STYLE_GUIDE_VERSION = "1.0"
 BRIEF_STYLE_GUIDE = """Rédige en français une brève factuelle de 1 à 3 paragraphes.
@@ -197,6 +198,13 @@ class BriefService:
             ),
             BriefDraftOutput,
         )
+        # A stalled bridge returns a run with no output at all. Reporting that as
+        # a malformed brief sends the reader hunting for a prompt bug that does
+        # not exist, so name the actual incident.
+        if execution.run.status is not ModelRunStatus.SUCCEEDED:
+            raise BriefError(
+                execution.run.error_message or "Le modèle n'a pas produit de réponse finale."
+            )
         output = execution.structured_output
         if not isinstance(output, BriefDraftOutput):
             raise BriefError("Le modèle n'a pas retourné une brève structurée.")

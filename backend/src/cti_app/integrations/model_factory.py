@@ -3,6 +3,7 @@ from minio import Minio
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.model_gateway import ModelGateway, ModelRouter
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
 from cti_app.config import Settings
 from cti_app.domain.model_runs import ModelProvider
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
@@ -69,7 +70,12 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
     )
     blob_store = MinioBlobStore(minio_client, physical_bucket=settings.s3_bucket)
     output_store = BlobModelOutputStore(BlobCatalogService(blob_store, uow_factory))
-    return ModelGateway(router, uow_factory, output_store)
+    return ModelGateway(
+        router,
+        uow_factory,
+        output_store,
+        diagnostics=ProductionDiagnosticsLog.from_env(settings.diagnostics_log_root),
+    )
 
 
 def create_bridge_capabilities_provider(settings: Settings) -> ChatGPTBridgeTransport:

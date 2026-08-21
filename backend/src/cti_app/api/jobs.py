@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -116,6 +116,24 @@ async def submit_job(payload: JobSubmission, request: Request) -> JobView:
         ) from exc
     await dispatcher.dispatch(job.id)
     return _job_view(await service.get(job.id))
+
+
+@router.get("", response_model=list[JobView])
+async def list_jobs(
+    request: Request,
+    aggregate_type: str = Query(min_length=1, max_length=64),
+    aggregate_id: UUID = Query(),
+    kind: str | None = Query(default=None, min_length=1, max_length=128),
+) -> list[JobView]:
+    """Jobs for one aggregate, most recent first.
+
+    Used by the frontend to surface a background job (e.g. the ChatGPT-backed
+    merge reconciliation) that isn't otherwise addressable by id — the caller
+    only knows the edition it belongs to, not the job it produced.
+    """
+    service, _ = _runtime(request)
+    jobs = await service.list_for_aggregate(aggregate_type, aggregate_id, kind=kind)
+    return [_job_view(job) for job in jobs]
 
 
 @router.get("/{job_id}", response_model=JobView)

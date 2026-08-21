@@ -39,7 +39,7 @@ from cti_app.domain.editorial import (
     HumanDecisionType,
 )
 from cti_app.domain.entities import SourceDocument, Subject
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
+from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelRunStatus
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.collection_support import InMemoryCollectionUnitOfWorkFactory
 
@@ -61,6 +61,10 @@ class DraftModel:
             authorized_input_hash="a" * 64,
             evidence_pack_hash="b" * 64,
             parameters={},
+            # The gateway only hands back a structured output on a run it has
+            # completed; leaving the default RUNNING here would let the double
+            # accept states the real gateway never produces.
+            status=ModelRunStatus.SUCCEEDED,
         )
         return ModelExecution(run=run, structured_output=self.output)
 

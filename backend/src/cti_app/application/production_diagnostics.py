@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -56,7 +57,20 @@ class ProductionDiagnosticsLog:
                     "Écrit par la production CTI. Contient les réponses brutes du modèle\n"
                     "et les décisions du parser. Local et ignoré par git — ne pas diffuser.\n\n"
                     "- `events.jsonl` : un événement par ligne (index)\n"
-                    "- `runs/<run_id>/` : payloads bruts, dans l'ordre des étapes\n",
+                    "- `runs/<run_id>/` : payloads bruts, dans l'ordre des étapes\n\n"
+                    "Lecture : `make diagnostics`, par exemple\n"
+                    "`make diagnostics ARGS=\"--failures -v\"` ou\n"
+                    "`make diagnostics ARGS=\"merge. -n 100\"`.\n\n"
+                    "Familles d'événements :\n\n"
+                    "- `model.*`, `parse.*`, `stage.*` : ce que le modèle a répondu\n"
+                    "  et ce que le parser en a fait\n"
+                    "- `merge.*` : consolidation cumulative. `merge.needs_review` et\n"
+                    "  `merge.plan_invalid` s'arrêtent avant d'appliquer ;\n"
+                    "  `merge.resolve_*` couvre la décision humaine (`_applied`,\n"
+                    "  `_deferred`, `_stale`, `_already_applied`, `_failed`)\n"
+                    "- `http.request_failed` : toute erreur non rattrapée d'une requête,\n"
+                    "  avec sa trace — le message rendu au navigateur est volontairement\n"
+                    "  vague, c'est ici que se trouve la cause\n",
                     encoding="utf-8",
                 )
         except OSError:
@@ -200,4 +214,40 @@ class ProductionDiagnosticsLog:
             stage=stage,
             correlation_id=correlation_id,
             **summary,
+        )
+
+    def record_failure(
+        self,
+        *,
+        event: str,
+        run_id: UUID,
+        stage: str | None = None,
+        correlation_id: str | None = None,
+        error: BaseException | None = None,
+        error_code: str | None = None,
+        **fields: Any,
+    ) -> None:
+        """Why something in the chain stopped, with the traceback kept verbatim.
+
+        Public error messages are deliberately vague ("une erreur interne est
+        survenue"); without the traceback stored here, the only remaining copy
+        is the container log, which is gone on the next rebuild.
+        """
+        payload = None
+        if error is not None:
+            fields.setdefault("error_type", type(error).__name__)
+            fields.setdefault("error", str(error))
+            payload = "".join(
+                traceback.format_exception(type(error), error, error.__traceback__)
+            )
+        if error_code is not None:
+            fields["error_code"] = error_code
+        self.record(
+            event=event,
+            run_id=run_id,
+            stage=stage,
+            correlation_id=correlation_id,
+            payload=payload,
+            payload_name=f"{stage or event}-traceback",
+            **fields,
         )

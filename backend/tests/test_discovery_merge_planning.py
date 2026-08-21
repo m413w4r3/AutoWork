@@ -10,6 +10,7 @@ from cti_app.application.discovery_cumulative import (
     DiscoveryBlockingStrategy,
     HumanMergeDecision,
     HumanMergePlanner,
+    MergeModelUnavailableError,
     apply_discovery_merge_plan,
     build_discovery_delta,
     build_merge_handles,
@@ -32,6 +33,26 @@ from cti_app.domain.discovery_cumulative import (
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelRunStatus
 from tests.test_discovery_cumulative import _batch, _candidate, _intake
+
+
+class RecordingBridgeCapabilitiesProvider:
+    """Stands in for the bridge transport just to record archive calls.
+
+    DELETE_ON_SUCCESS is declared on every merge conversation; this is what
+    proves the planner actually closes them rather than only declaring it.
+    """
+
+    def __init__(self) -> None:
+        self.archived: list[UUID] = []
+
+    async def capabilities(self) -> dict[str, object]:
+        return {}
+
+    async def archive_conversation(self, conversation_id: UUID) -> None:
+        self.archived.append(conversation_id)
+
+    async def preview_visible_recovery(self, bridge_run_id: str) -> dict[str, object]:
+        return {}
 
 
 class RecordingDraftingModel:
@@ -145,6 +166,111 @@ async def test_chatgpt_merge_repairs_structure_once_and_preserves_distinct_subje
 
 
 @pytest.mark.asyncio
+async def test_chatgpt_merge_archives_its_conversation_on_direct_success() -> None:
+    edition_id = uuid4()
+    parent = await _bootstrap(
+        edition_id, [_candidate("APT42 SpearSpecter", "https://example.test/a")]
+    )
+    batch = _batch(
+        edition_id,
+        [_candidate("APT42 SpearSpecter cloud update", "https://example.test/b")],
+    )
+    intake = _intake(batch)
+    delta = build_discovery_delta(intake, batch)
+    handles = build_merge_handles(parent, delta)
+    plan = DiscoveryMergePlanV1(
+        groups=[
+            DiscoveryMergeGroup(
+                existing_subject_handles=["X1"],
+                incoming_candidate_handles=["C1"],
+                confidence=MergeConfidence.HIGH,
+                disposition=MergeDisposition.APPLY,
+                rationale="same campaign",
+                evidence=MergeEvidence(shared_campaigns=["SpearSpecter"]),
+            )
+        ]
+    )
+    model = RecordingDraftingModel([plan.model_dump_json()])
+    bridge = RecordingBridgeCapabilitiesProvider()
+
+    await ChatGptMergePlanner(model, bridge_capabilities_provider=bridge).plan(
+        parent,
+        delta,
+        handles,
+        edition_id=edition_id,
+        external_llm_allowed=True,
+        sensitivity="internal",
+    )
+
+    assert bridge.archived == [model.requests[0].conversation.id]
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_merge_archives_both_conversations_after_repair() -> None:
+    edition_id = uuid4()
+    parent = await _bootstrap(
+        edition_id, [_candidate("Screening Serpens MiniUpdate", "https://example.test/a")]
+    )
+    batch = _batch(edition_id, [_candidate("Nimbus Manticore MiniFast", "https://example.test/b")])
+    intake = _intake(batch)
+    delta = build_discovery_delta(intake, batch)
+    handles = build_merge_handles(parent, delta)
+    distinct = DiscoveryMergePlanV1(
+        groups=[
+            DiscoveryMergeGroup(
+                existing_subject_handles=[],
+                incoming_candidate_handles=["C1"],
+                confidence=MergeConfidence.HIGH,
+                disposition=MergeDisposition.APPLY,
+                rationale="distinct campaigns and malware",
+                evidence=MergeEvidence(semantic_basis=["distinct"]),
+            )
+        ]
+    )
+    model = RecordingDraftingModel(["{}", distinct.model_dump_json()])
+    bridge = RecordingBridgeCapabilitiesProvider()
+
+    await ChatGptMergePlanner(model, bridge_capabilities_provider=bridge).plan(
+        parent,
+        delta,
+        handles,
+        edition_id=edition_id,
+        external_llm_allowed=True,
+        sensitivity="internal",
+    )
+
+    assert len(model.requests) == 2
+    assert bridge.archived == [
+        model.requests[0].conversation.id,
+        model.requests[1].conversation.id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_merge_leaves_conversation_for_debugging_when_unresolved() -> None:
+    """A failure that never reaches a valid plan keeps its transcript around —
+    deleting it would remove the only way to see what went wrong."""
+    edition_id = uuid4()
+    batch = _batch(edition_id, [_candidate("A", "https://example.test/a")])
+    intake = _intake(batch)
+    delta = build_discovery_delta(intake, batch)
+    model = StalledDraftingModel()
+    bridge = RecordingBridgeCapabilitiesProvider()
+
+    with pytest.raises(MergeModelUnavailableError):
+        await ChatGptMergePlanner(model, bridge_capabilities_provider=bridge).plan(
+            None,
+            delta,
+            build_merge_handles(None, delta),
+            edition_id=edition_id,
+            external_llm_allowed=True,
+            sensitivity="internal",
+        )
+
+    assert bridge.archived == []
+
+
+@pytest.mark.asyncio
 async def test_chatgpt_merge_does_not_call_model_when_external_policy_blocks_it() -> None:
     edition_id = uuid4()
     batch = _batch(edition_id, [_candidate("A", "https://example.test/a")])
@@ -162,6 +288,63 @@ async def test_chatgpt_merge_does_not_call_model_when_external_policy_blocks_it(
             sensitivity="internal",
         )
     assert model.requests == []
+
+
+class StalledDraftingModel:
+    """Reproduces a bridge that stops without ever producing a final answer."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def draft(
+        self, request: ModelRequest, output_schema: type[object] | None = None
+    ) -> ModelExecution:
+        del output_schema
+        self.calls += 1
+        run = ModelRun(
+            provider=ModelProvider.OPENAI,
+            model_role=ModelRole.DRAFTING,
+            requested_model="chatgpt-web",
+            prompt_template_id=request.prompt_template_id,
+            prompt_template_version=request.prompt_template_version,
+            authorized_input_hash="a" * 64,
+            evidence_pack_hash=request.evidence_pack_hash,
+            parameters=request.parameters,
+            id=request.run_id or uuid4(),
+            status=ModelRunStatus.NEEDS_REVIEW,
+            error_code="active_signal_stalled",
+            error_message="ChatGPT s'est arrêté sans produire de réponse finale.",
+        )
+        return ModelExecution(run, output_text=None)
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_merge_model_is_not_reported_as_an_invalid_plan() -> None:
+    """A silent bridge is an incident, not an editorial decision.
+
+    Reporting it as `plan_invalid_after_repair` used to persist a merge run with
+    zero groups, which no human could resolve and which blocked every later
+    contribution behind it.
+    """
+    edition_id = uuid4()
+    batch = _batch(edition_id, [_candidate("A", "https://example.test/a")])
+    intake = _intake(batch)
+    delta = build_discovery_delta(intake, batch)
+    model = StalledDraftingModel()
+
+    with pytest.raises(MergeModelUnavailableError) as raised:
+        await ChatGptMergePlanner(model).plan(
+            None,
+            delta,
+            build_merge_handles(None, delta),
+            edition_id=edition_id,
+            external_llm_allowed=True,
+            sensitivity="internal",
+        )
+
+    assert raised.value.code == "active_signal_stalled"
+    # No repair attempt: there was no answer to repair.
+    assert model.calls == 1
 
 
 def test_merge_projection_is_an_explicit_allowlist_without_internal_fields() -> None:

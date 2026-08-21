@@ -13,10 +13,9 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ValidationError
 
+from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
 from cti_app.domain.model_conversations import (
-    ConversationLifecycle,
     ConversationPolicy,
-    ConversationReleaseOutcome,
 )
 from cti_app.domain.model_runs import (
     ModelOutputRejection,
@@ -26,6 +25,7 @@ from cti_app.domain.model_runs import (
     ModelRunStatus,
     ModelUsage,
 )
+from cti_app.logging import get_correlation_id
 
 
 class ModelGatewayError(RuntimeError):
@@ -143,8 +143,11 @@ class ModelRequest:
     parameters: dict[str, Any] = field(default_factory=dict)
     background: bool = False
     provider: ModelProvider | None = None
-    conversation: ConversationContext  # ← MANDATORY (no more backward compat)
-    conversation_lifecycle: ConversationLifecycleSpec  # ← MANDATORY for fresh conversations
+    # Stateless requests (bulk extraction, drafting) carry no conversation at all.
+    conversation: ConversationContext | None = None
+    # Mandatory whenever `conversation.mode == "fresh"`: opening a conversation
+    # without declaring how it is disposed of leaks it on the ChatGPT side.
+    conversation_lifecycle: ConversationLifecycleSpec | None = None
     run_id: UUID | None = None
 
     def __post_init__(self) -> None:
@@ -156,10 +159,13 @@ class ModelRequest:
             raise ValueError("evidence_pack_hash must be a lowercase SHA-256")
         if _contains_binary(self.metadata) or _contains_binary(self.parameters):
             raise BinaryModelInputError("Binary values cannot be sent to a model")
-        # Invariant: fresh requires explicit policy, continue reuses existing policy
-        if self.conversation.mode == "fresh":
-            # conversation_lifecycle is mandatory and should define policy
-            pass  # Validation enforced by type system (no None allowed)
+        # Invariant: fresh requires an explicit policy, continue reuses the existing one.
+        if (
+            self.conversation is not None
+            and self.conversation.mode == "fresh"
+            and self.conversation_lifecycle is None
+        ):
+            raise ValueError("A fresh conversation requires an explicit conversation_lifecycle")
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,10 +342,14 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         router: ModelRouter,
         uow_factory: ModelRunUnitOfWorkFactory,
         output_store: ModelOutputStore,
+        diagnostics: ProductionDiagnosticsLog | None = None,
     ) -> None:
         self._router = router
         self._uow_factory = uow_factory
         self._output_store = output_store
+        # Research, merge, extraction and drafting all funnel through _execute,
+        # so a bridge or Qwen failure is recorded once here for every caller.
+        self._diagnostics = diagnostics or ProductionDiagnosticsLog(None)
 
     async def research(self, request: ModelRequest) -> ModelExecution:
         return await self._execute(request, ModelRole.RESEARCH)
@@ -689,6 +699,22 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 await uow.commit()
                 return execution
         except Exception as exc:
+            self._diagnostics.record_failure(
+                event="model.call_failed",
+                run_id=run.id,
+                stage=request.prompt_template_id,
+                correlation_id=get_correlation_id(),
+                error=exc,
+                error_code=str(getattr(exc, "code", "model_call_failed")),
+                provider=run.provider.value if run.provider else None,
+                model_role=role.value,
+                routing_hint=request.routing_hint.value,
+                background=request.background,
+                conversation_mode=(
+                    request.conversation.mode if request.conversation else None
+                ),
+                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+            )
             async with self._uow_factory() as uow:
                 persisted = await uow.model_runs.get_for_update(run.id)
                 if persisted and persisted.status in {

@@ -14,6 +14,7 @@ from cti_app.domain.briefs import (
     BriefDraftStatus,
     BriefEvidencePack,
     BriefSentence,
+    EvidencePackScope,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
@@ -115,6 +116,7 @@ from cti_app.infrastructure.database.models import (
     ClaimRow,
     CollectionAttemptRow,
     CollectionPolicySnapshotRow,
+    ConversationLifecycleRow,
     DerivedArtifactRow,
     DiscoveryBatchRow,
     DiscoveryIntakeRow,
@@ -130,7 +132,6 @@ from cti_app.infrastructure.database.models import (
     IndicatorRow,
     JobEventRow,
     JobRow,
-    ConversationLifecycleRow,
     ModelConversationRow,
     ModelConversationTurnRow,
     ModelOutputRejectionRow,
@@ -421,6 +422,22 @@ class SqlAlchemyJobRepository:
             .order_by(JobRow.heartbeat_at, JobRow.id)
             .with_for_update(skip_locked=True)
         )
+        return [_job_from_row(row) for row in rows]
+
+    async def list_for_aggregate(
+        self, aggregate_type: str, aggregate_id: UUID, *, kind: str | None = None
+    ) -> Sequence[Job]:
+        statement = (
+            select(JobRow)
+            .where(
+                JobRow.aggregate_type == aggregate_type,
+                JobRow.aggregate_id == aggregate_id,
+            )
+            .order_by(JobRow.created_at.desc())
+        )
+        if kind is not None:
+            statement = statement.where(JobRow.kind == kind)
+        rows = await self._session.scalars(statement)
         return [_job_from_row(row) for row in rows]
 
     async def operational_metrics(self) -> JobOperationalMetrics:
@@ -1024,7 +1041,10 @@ class SqlAlchemyConversationLifecycleRepository:
         """List all lifecycles waiting for cleanup."""
         rows = await self._session.scalars(
             select(ConversationLifecycleRow)
-            .where(ConversationLifecycleRow.status == ConversationLifecycleStatus.DELETE_PENDING.value)
+            .where(
+                ConversationLifecycleRow.status
+                == ConversationLifecycleStatus.DELETE_PENDING.value
+            )
             .order_by(ConversationLifecycleRow.created_at)
         )
         return [_conversation_lifecycle_from_row(row) for row in rows]
@@ -1033,7 +1053,10 @@ class SqlAlchemyConversationLifecycleRepository:
         """List all lifecycles with failed cleanup attempts."""
         rows = await self._session.scalars(
             select(ConversationLifecycleRow)
-            .where(ConversationLifecycleRow.status == ConversationLifecycleStatus.CLEANUP_FAILED.value)
+            .where(
+                ConversationLifecycleRow.status
+                == ConversationLifecycleStatus.CLEANUP_FAILED.value
+            )
             .order_by(ConversationLifecycleRow.last_cleanup_attempt_at)
         )
         return [_conversation_lifecycle_from_row(row) for row in rows]
@@ -1155,6 +1178,17 @@ class SqlAlchemyDiscoveryMergeRunRepository:
             .returning(DiscoveryMergeRunRow.id)
         )
         return await self._session.scalar(statement) is not None
+
+    async def mark_resolved(self, run_id: UUID) -> None:
+        await self._session.execute(
+            update(DiscoveryMergeRunRow)
+            .where(
+                DiscoveryMergeRunRow.id == run_id,
+                DiscoveryMergeRunRow.validation_status
+                == MergeValidationStatus.NEEDS_REVIEW.value,
+            )
+            .values(validation_status=MergeValidationStatus.RESOLVED.value)
+        )
 
     async def get(self, run_id: UUID) -> DiscoveryMergeRun | None:
         row = await self._session.get(DiscoveryMergeRunRow, run_id)
@@ -3093,6 +3127,11 @@ def _brief_pack_values(pack: BriefEvidencePack) -> dict[str, object]:
         "blob_id": pack.blob_id,
         "created_by": pack.created_by,
         "created_at": pack.created_at,
+        "built_from_snapshot_id": pack.built_from_snapshot_id,
+        "built_from_snapshot_version": pack.built_from_snapshot_version,
+        "covered_contribution_ids": [str(value) for value in pack.covered_contribution_ids],
+        "scope": pack.scope.value,
+        "base_pack_id": pack.base_pack_id,
     }
 
 
@@ -3114,6 +3153,11 @@ def _brief_pack_from_row(row: BriefEvidencePackRow) -> BriefEvidencePack:
         blob_id=row.blob_id,
         created_by=row.created_by,
         created_at=row.created_at,
+        built_from_snapshot_id=row.built_from_snapshot_id,
+        built_from_snapshot_version=row.built_from_snapshot_version,
+        covered_contribution_ids=tuple(UUID(value) for value in row.covered_contribution_ids or ()),
+        scope=EvidencePackScope(row.scope or "full"),
+        base_pack_id=row.base_pack_id,
     )
 
 
@@ -3612,7 +3656,9 @@ def _conversation_lifecycle_from_row(row: ConversationLifecycleRow) -> Conversat
         id=row.id,
         policy=ConversationPolicy(row.policy),
         status=ConversationLifecycleStatus(row.status),
-        release_outcome=ConversationReleaseOutcome(row.release_outcome) if row.release_outcome else None,
+        release_outcome=(
+            ConversationReleaseOutcome(row.release_outcome) if row.release_outcome else None
+        ),
         released_at=row.released_at,
         deleted_at=row.deleted_at,
         cleanup_attempt_count=row.cleanup_attempt_count,

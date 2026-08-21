@@ -14,17 +14,26 @@ function urlOf(input: RequestInfo | URL): string {
 }
 
 /**
- * Answers 404 on the production endpoints — the real "nothing started yet"
- * state — and delegates everything else to `fallback`.
+ * Answers the endpoints polled by components mounted *alongside* the one under
+ * test with their real "nothing here yet" state, and delegates everything else
+ * to `fallback`.
  *
- * Components mounted alongside the one under test (SubjectProduction,
- * ProductionQueue) poll those endpoints, so a mock that returns the same
- * payload for every URL feeds them a shape they cannot render.
+ * SubjectProduction and ProductionQueue poll `/production`; DiscoveryMergeReview
+ * polls `/merge-runs` and, to know whether the ChatGPT bridge is busy planning
+ * a merge, `/api/jobs?...`. A mock that returns the same payload for every URL
+ * feeds them a shape they cannot render, so each needs its own empty answer.
  */
 export function withProductionNotStarted(fallback: FetchHandler): FetchHandler {
   return (input, init) => {
-    if (urlOf(input).includes("/production")) {
+    const url = urlOf(input);
+    if (url.includes("/production")) {
       return new Response(null, { status: 404 });
+    }
+    if (url.includes("/merge-runs")) {
+      return Response.json([]);
+    }
+    if (url.includes("/api/jobs?")) {
+      return Response.json([]);
     }
     return fallback(input, init);
   };

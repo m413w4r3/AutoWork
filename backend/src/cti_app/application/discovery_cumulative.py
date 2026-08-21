@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Iterable, Sequence
@@ -13,20 +14,24 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import ValidationError, field_validator
 
+from cti_app.application.discovery import BridgeCapabilitiesProvider
 from cti_app.application.discovery_identity import candidates_match_strongly, normalize
 from cti_app.application.jobs import (
     JobExecutionContext,
+    JobHandlerError,
     JobParameters,
     JobRegistry,
 )
 from cti_app.application.model_gateway import (
     ConversationContext,
+    ConversationLifecycleSpec,
     DraftingModel,
     ExternalModelBlockedError,
     ModelRequest,
     ModelRoutingHint,
 )
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
@@ -57,6 +62,11 @@ from cti_app.domain.discovery_cumulative import (
     discovery_origin_key,
     discovery_subject_id,
 )
+from cti_app.domain.model_conversations import ConversationPolicy
+from cti_app.domain.model_runs import ModelRunStatus
+from cti_app.logging import get_correlation_id
+
+logger = logging.getLogger(__name__)
 
 HEURISTIC_POLICY_VERSION = "heuristic-v2"
 NO_BLOCKING_VERSION = "all-active-v1"
@@ -67,7 +77,19 @@ RECONCILE_DISCOVERY_JOB_KIND = "reconcile_discovery"
 
 
 class DiscoverySnapshotStaleError(RuntimeError):
-    pass
+    """The snapshot a merge was planned against is no longer the edition state.
+
+    `replan` carries the parameters of the reconciliation that should take this
+    plan's place. A reviewed plan names subjects by handles resolved against its
+    parent snapshot, so once that parent is superseded the plan is unusable and
+    the contribution has to be planned again from the current state.
+    """
+
+    def __init__(
+        self, reason: str, *, replan: ReconcileDiscoveryParameters | None = None
+    ) -> None:
+        super().__init__(reason)
+        self.replan = replan
 
 
 class DiscoveryMergeNeedsReview(RuntimeError):
@@ -90,6 +112,21 @@ class MergePlanInvalidError(RuntimeError):
         self.merge_model_run_id = merge_model_run_id
         self.raw_output_reference = raw_output_reference
         self.normalized_output_reference = normalized_output_reference
+
+
+class MergeModelUnavailableError(RuntimeError):
+    """The merge model never produced an answer — nothing was planned at all.
+
+    Distinct from MergePlanInvalidError on purpose: a stalled bridge is a
+    transient incident to retry, whereas a malformed plan is a real answer the
+    reviewer can be shown. Conflating them persists an empty merge run that no
+    human can resolve, and it silently blocks every later contribution.
+    """
+
+    def __init__(self, message: str, *, merge_model_run_id: UUID | None, code: str) -> None:
+        super().__init__(message)
+        self.merge_model_run_id = merge_model_run_id
+        self.code = code
 
 
 class ReconcileDiscoveryParameters(JobParameters):
@@ -449,8 +486,31 @@ class ChatGptMergePlanner:
     kind = DiscoveryPlannerKind.CHATGPT
     policy_version = DISCOVERY_MERGE_POLICY_VERSION
 
-    def __init__(self, model: DraftingModel) -> None:
+    def __init__(
+        self,
+        model: DraftingModel,
+        *,
+        bridge_capabilities_provider: BridgeCapabilitiesProvider | None = None,
+    ) -> None:
         self._model = model
+        # DELETE_ON_SUCCESS is declared on every conversation below, but the
+        # conversation only actually closes if something calls the bridge —
+        # this is that something.
+        self._bridge_capabilities_provider = bridge_capabilities_provider
+
+    async def _archive_conversation_best_effort(self, conversation_id: UUID) -> None:
+        if self._bridge_capabilities_provider is None:
+            return
+        try:
+            await self._bridge_capabilities_provider.archive_conversation(conversation_id)
+        except Exception as exc:
+            logger.warning(
+                "discovery_merge_conversation_archive_failed conversation_id=%s "
+                "correlation_id=%s error_type=%s",
+                conversation_id,
+                get_correlation_id(),
+                type(exc).__name__,
+            )
 
     async def plan(
         self,
@@ -475,6 +535,9 @@ class ChatGptMergePlanner:
             }
         )
         prompt = _merge_prompt(current, incoming)
+        initial_conversation_id = uuid5(
+            NAMESPACE_URL, f"discovery-merge-conversation:{merge_input_hash}"
+        )
         initial = await self._model.draft(
             ModelRequest(
                 text=prompt,
@@ -496,19 +559,29 @@ class ChatGptMergePlanner:
                     "blocking_version": DISCOVERY_BLOCKING_VERSION,
                 },
                 parameters={"temperature": 0},
-                conversation=ConversationContext(
-                    mode="fresh",
-                    id=uuid5(NAMESPACE_URL, f"discovery-merge-conversation:{merge_input_hash}"),
+                conversation=ConversationContext(mode="fresh", id=initial_conversation_id),
+                conversation_lifecycle=ConversationLifecycleSpec(
+                    policy=ConversationPolicy.DELETE_ON_SUCCESS,
                 ),
                 run_id=uuid5(NAMESPACE_URL, f"discovery-merge-model-run:{merge_input_hash}"),
             ),
             DiscoveryMergePlanV1,
         )
+        # A stalled or blocked bridge returns a run with no text at all. Feeding
+        # that None to the parser would report it as a schema violation and bury
+        # the real cause.
+        if initial.run.status is not ModelRunStatus.SUCCEEDED or not initial.output_text:
+            raise MergeModelUnavailableError(
+                initial.run.error_message or "Le modèle de fusion n'a pas répondu.",
+                merge_model_run_id=initial.run.id,
+                code=initial.run.error_code or "merge_model_no_answer",
+            )
         raw_reference = initial.run.output_references[0] if initial.run.output_references else None
         try:
             plan, warnings = _parse_and_validate_model_plan(
                 initial.output_text, handles, parent_snapshot=parent_snapshot
             )
+            await self._archive_conversation_best_effort(initial_conversation_id)
             return PlannedDiscoveryMerge(
                 plan,
                 merge_model_run_id=initial.run.id,
@@ -519,6 +592,9 @@ class ChatGptMergePlanner:
         except (ValidationError, ValueError, json.JSONDecodeError) as first_error:
             repair_hash = canonical_sha256(
                 {"merge_input_hash": merge_input_hash, "error": str(first_error)}
+            )
+            repair_conversation_id = uuid5(
+                NAMESPACE_URL, f"discovery-merge-repair:{merge_input_hash}"
             )
             repair = await self._model.draft(
                 ModelRequest(
@@ -536,14 +612,20 @@ class ChatGptMergePlanner:
                     sensitivity=sensitivity,
                     metadata={"defer_validation": True, "repair_of": str(initial.run.id)},
                     parameters={"temperature": 0},
-                    conversation=ConversationContext(
-                        mode="fresh",
-                        id=uuid5(NAMESPACE_URL, f"discovery-merge-repair:{merge_input_hash}"),
+                    conversation=ConversationContext(mode="fresh", id=repair_conversation_id),
+                    conversation_lifecycle=ConversationLifecycleSpec(
+                        policy=ConversationPolicy.DELETE_ON_SUCCESS,
                     ),
                     run_id=uuid5(NAMESPACE_URL, f"discovery-merge-repair-run:{repair_hash}"),
                 ),
                 DiscoveryMergePlanV1,
             )
+            if repair.run.status is not ModelRunStatus.SUCCEEDED or not repair.output_text:
+                raise MergeModelUnavailableError(
+                    repair.run.error_message or "Le modèle de fusion n'a pas répondu à la reprise.",
+                    merge_model_run_id=repair.run.id,
+                    code=repair.run.error_code or "merge_model_no_answer",
+                ) from first_error
             repaired_reference = (
                 repair.run.output_references[0] if repair.run.output_references else None
             )
@@ -558,6 +640,11 @@ class ChatGptMergePlanner:
                     raw_output_reference=raw_reference,
                     normalized_output_reference=repaired_reference,
                 ) from repair_error
+            # Both conversations are done once the repaired plan validates —
+            # the malformed initial one is no more useful to keep than the
+            # repair that fixed it.
+            await self._archive_conversation_best_effort(initial_conversation_id)
+            await self._archive_conversation_best_effort(repair_conversation_id)
             return PlannedDiscoveryMerge(
                 plan,
                 merge_model_run_id=initial.run.id,
@@ -658,7 +745,7 @@ def _parse_and_validate_model_plan(
 ) -> tuple[DiscoveryMergePlanV1, tuple[str, ...]]:
     if output_text is None:
         raise ValueError("Merge model returned no JSON")
-    parsed = DiscoveryMergePlanV1.model_validate_json(output_text, strict=True)
+    parsed = DiscoveryMergePlanV1.model_validate_json(output_text)
     known_urls = {
         source.canonical_url
         for item in handles.incoming.values()
@@ -954,6 +1041,28 @@ def apply_discovery_merge_plan(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class MergeHandleLabel:
+    """What a merge handle stands for, in reviewer-readable terms."""
+
+    handle: str
+    title: str
+    summary: str
+    source_urls: tuple[str, ...]
+
+
+def _handle_label(handle: str, candidate: CandidateTopic) -> MergeHandleLabel:
+    return MergeHandleLabel(
+        handle=handle,
+        title=candidate.title,
+        summary=candidate.summary,
+        source_urls=tuple(
+            source.canonical_url
+            for source in sorted(candidate.sources, key=lambda item: item.canonical_url)
+        ),
+    )
+
+
 def make_merge_run(
     *,
     edition_id: UUID,
@@ -1032,11 +1141,24 @@ class CumulativeDiscoveryService:
         planner: DiscoveryMergePlanner | None = None,
         blocking_strategy: DiscoveryBlockingStrategy | None = None,
         after_activation: Callable[[UUID], Awaitable[object]] | None = None,
+        diagnostics: ProductionDiagnosticsLog | None = None,
+        replan_intake: Callable[[ReconcileDiscoveryParameters], Awaitable[object]] | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._planner = planner or HeuristicMergePlanner()
         self._blocking = blocking_strategy or DiscoveryBlockingStrategy()
         self._after_activation = after_activation
+        self._diagnostics = diagnostics or ProductionDiagnosticsLog(None)
+        # Replanning calls the merge model, so it cannot run inside the request
+        # that discovered the staleness; the host hands over a way to queue it.
+        self._replan_intake = replan_intake
+
+    def set_replan_intake(
+        self, replan_intake: Callable[[ReconcileDiscoveryParameters], Awaitable[object]]
+    ) -> None:
+        """Wire replanning after construction: it needs the job service, which
+        is itself built from this service's job registrations."""
+        self._replan_intake = replan_intake
 
     async def ingest_batch(
         self,
@@ -1170,9 +1292,19 @@ class CumulativeDiscoveryService:
             )
             if cached is not None and cached.plan_payload is not None:
                 if cached.validation_status is MergeValidationStatus.NEEDS_REVIEW:
+                    self._diagnostics.record(
+                        event="merge.needs_review",
+                        run_id=cached.id,
+                        stage="discovery_merge",
+                        correlation_id=get_correlation_id(),
+                        edition_id=str(intake.edition_id),
+                        intake_id=str(intake.id),
+                        cached=True,
+                        review_reasons=list(cached.review_reasons),
+                    )
                     raise DiscoveryMergeNeedsReview(cached.id, cached.review_reasons)
                 outcome = PlannedDiscoveryMerge(
-                    DiscoveryMergePlanV1.model_validate(cached.plan_payload, strict=True),
+                    DiscoveryMergePlanV1.model_validate(cached.plan_payload),
                     merge_model_run_id=cached.merge_model_run_id,
                     raw_output_reference=cached.raw_output_reference,
                     normalized_output_reference=cached.normalized_output_reference,
@@ -1229,6 +1361,20 @@ class CumulativeDiscoveryService:
                     )
                     await uow.discovery_merge_runs.add_if_absent(run)
                     await uow.commit()
+                    self._diagnostics.record_failure(
+                        event="merge.plan_invalid",
+                        run_id=run.id,
+                        stage="discovery_merge",
+                        correlation_id=get_correlation_id(),
+                        error=exc,
+                        error_code="plan_invalid_after_repair",
+                        edition_id=str(intake.edition_id),
+                        intake_id=str(intake.id),
+                        merge_model_run_id=(
+                            str(exc.merge_model_run_id) if exc.merge_model_run_id else None
+                        ),
+                        raw_output_reference=exc.raw_output_reference,
+                    )
                     raise DiscoveryMergeNeedsReview(run.id, run.review_reasons) from exc
 
             # The guard is deliberately re-run for cached plans: editorial state may
@@ -1262,6 +1408,18 @@ class CumulativeDiscoveryService:
                 run = replace(run, validation_status=MergeValidationStatus.NEEDS_REVIEW)
                 await uow.discovery_merge_runs.add_if_absent(run)
                 await uow.commit()
+                self._diagnostics.record(
+                    event="merge.needs_review",
+                    run_id=run.id,
+                    stage="discovery_merge",
+                    correlation_id=get_correlation_id(),
+                    edition_id=str(intake.edition_id),
+                    intake_id=str(intake.id),
+                    planner_kind=run.planner_kind.value,
+                    review_reasons=list(review_reasons),
+                    group_count=len(plan.groups),
+                    warnings=list(outcome.warnings),
+                )
                 raise DiscoveryMergeNeedsReview(run.id, review_reasons)
             applied = apply_discovery_merge_plan(
                 parent,
@@ -1289,6 +1447,21 @@ class CumulativeDiscoveryService:
             await uow.subject_contributions.append_many(applied.contributions)
             await self._link_editorial_groups(uow, applied.snapshot)
             await uow.commit()
+            self._diagnostics.record(
+                event="merge.applied",
+                run_id=run.id,
+                stage="discovery_merge",
+                correlation_id=get_correlation_id(),
+                edition_id=str(intake.edition_id),
+                intake_id=str(intake.id),
+                planner_kind=run.planner_kind.value,
+                snapshot_id=str(applied.snapshot.id),
+                snapshot_version=applied.snapshot.version,
+                group_count=len(plan.groups),
+                subject_count=len(applied.snapshot.subjects),
+                merge_event_count=len(applied.merge_events),
+                warnings=list(applied.warnings),
+            )
             await self._after_snapshot_activation(applied.snapshot)
             return applied.snapshot
 
@@ -1324,6 +1497,39 @@ class CumulativeDiscoveryService:
             raise LookupError(f"Unknown discovery merge run {run_id}")
         return run
 
+    async def describe_merge_handles(
+        self, edition_id: UUID, run_id: UUID
+    ) -> dict[str, MergeHandleLabel]:
+        """Resolve X1/C2 back to the titles a reviewer can actually judge.
+
+        The plan speaks in handles because the model must not invent identifiers.
+        A human deciding whether two subjects are the same needs the titles and
+        the sources behind those handles.
+        """
+        async with self._uow_factory() as uow:
+            run = await uow.discovery_merge_runs.get(run_id)
+            if run is None or run.edition_id != edition_id:
+                raise LookupError(f"Unknown discovery merge run {run_id}")
+            labels: dict[str, MergeHandleLabel] = {}
+
+            if run.parent_snapshot_id is not None:
+                parent = await uow.discovery_snapshots.get(run.parent_snapshot_id)
+                if parent is not None:
+                    by_id = {subject.subject_id: subject for subject in parent.subjects}
+                    for handle, raw_id in run.handle_map.items():
+                        if not handle.startswith("X"):
+                            continue
+                        subject = by_id.get(UUID(raw_id))
+                        if subject is not None:
+                            labels[handle] = _handle_label(handle, subject.candidate)
+
+            intake = await uow.discovery_intakes.get(run.intake_id)
+            batch = await uow.discovery_batches.get(intake.batch_id) if intake else None
+            if intake is not None and batch is not None:
+                for item in build_discovery_delta(intake, batch).candidates:
+                    labels[item.handle] = _handle_label(item.handle, item.candidate)
+            return labels
+
     async def resolve_merge_run(
         self,
         edition_id: UUID,
@@ -1332,24 +1538,141 @@ class CumulativeDiscoveryService:
         *,
         actor_id: str,
     ) -> DiscoverySnapshot:
+        """Apply a reviewer's decisions, keeping the failure trail on disk.
+
+        Anything unexpected here reaches the browser as a generic message, and
+        the container log is gone on the next rebuild — so the traceback is
+        written to the diagnostics trail before it is re-raised.
+        """
+        try:
+            return await self._resolve_merge_run(
+                edition_id, run_id, decisions, actor_id=actor_id
+            )
+        except DiscoverySnapshotStaleError as exc:
+            # Queued outside the unit of work above: it holds a row lock on the
+            # active snapshot that the reconciliation would wait on.
+            if exc.replan is not None and self._replan_intake is not None:
+                await self._replan_intake(exc.replan)
+            raise
+        except DiscoveryMergeNeedsReview:
+            # An expected outcome that already carries its own event.
+            raise
+        except Exception as exc:
+            self._diagnostics.record_failure(
+                event="merge.resolve_failed",
+                run_id=run_id,
+                stage="discovery_merge_resolve",
+                correlation_id=get_correlation_id(),
+                error=exc,
+                error_code=type(exc).__name__,
+                edition_id=str(edition_id),
+                actor_id=actor_id,
+                decisions=[
+                    {
+                        "group_index": decision.group_index,
+                        "action": decision.action,
+                        "target_subject_handle": decision.target_subject_handle,
+                    }
+                    for decision in decisions
+                ],
+            )
+            raise
+
+    async def _resolve_merge_run(
+        self,
+        edition_id: UUID,
+        run_id: UUID,
+        decisions: Sequence[HumanMergeDecision],
+        *,
+        actor_id: str,
+    ) -> DiscoverySnapshot:
+        correlation_id = get_correlation_id()
+        decision_trail = [
+            {
+                "group_index": decision.group_index,
+                "action": decision.action,
+                "target_subject_handle": decision.target_subject_handle,
+            }
+            for decision in decisions
+        ]
         async with self._uow_factory() as uow:
             original = await uow.discovery_merge_runs.get(run_id)
             if original is None or original.edition_id != edition_id:
                 raise LookupError(f"Unknown discovery merge run {run_id}")
-            if original.validation_status is not MergeValidationStatus.NEEDS_REVIEW:
-                raise ValueError("Only a merge run awaiting review can be resolved")
             if original.plan_payload is None:
-                raise ValueError("This merge run has no plan to resolve")
+                raise ValueError("Cette fusion n'a aucun plan à appliquer.")
+
+            # Submitting a decision is idempotent. A double click, or a run left
+            # on NEEDS_REVIEW by an earlier bug, must return the snapshot that
+            # already consolidated this contribution rather than rebuild it: the
+            # snapshot id is derived from (parent, intake, merge run), so a replay
+            # collides on the primary key and surfaces as an opaque 500.
+            settled = await uow.discovery_snapshots.get_for_intake(original.intake_id)
+            if settled is not None:
+                if original.validation_status is MergeValidationStatus.NEEDS_REVIEW:
+                    await uow.discovery_merge_runs.mark_resolved(original.id)
+                    await uow.commit()
+                self._diagnostics.record(
+                    event="merge.resolve_already_applied",
+                    run_id=original.id,
+                    stage="discovery_merge_resolve",
+                    correlation_id=correlation_id,
+                    edition_id=str(edition_id),
+                    intake_id=str(original.intake_id),
+                    snapshot_id=str(settled.id),
+                    snapshot_version=settled.version,
+                    decisions=decision_trail,
+                )
+                return settled
+
+            if original.validation_status is not MergeValidationStatus.NEEDS_REVIEW:
+                raise ValueError(
+                    "Cette fusion n'attend plus de décision "
+                    f"(état : {original.validation_status.value})."
+                )
             intake = await uow.discovery_intakes.get(original.intake_id)
             if intake is None:
                 raise RuntimeError("Merge run references a missing intake")
             batch = await uow.discovery_batches.get(intake.batch_id)
             if batch is None:
                 raise RuntimeError("Merge run references a missing discovery batch")
+
+            # The reviewed plan names subjects by handle, and those handles were
+            # resolved against the snapshot the plan was built on. Applying it to
+            # any other snapshot silently rewrites a different edition state, so a
+            # run whose parent is no longer active is stale by construction.
             parent = await uow.discovery_snapshots.get_active_for_update(edition_id)
             parent_id = parent.id if parent else None
             if parent_id != original.parent_snapshot_id:
-                raise DiscoverySnapshotStaleError("reviewed_merge_parent_is_stale")
+                # Retire the plan rather than leave it awaiting a decision it can
+                # never receive: as the oldest pending run it would sit at the top
+                # of the review panel and hide every later contribution.
+                await uow.discovery_merge_runs.mark_resolved(original.id)
+                await uow.commit()
+                self._diagnostics.record(
+                    event="merge.resolve_stale",
+                    run_id=original.id,
+                    stage="discovery_merge_resolve",
+                    correlation_id=correlation_id,
+                    edition_id=str(edition_id),
+                    intake_id=str(original.intake_id),
+                    planned_against_snapshot_id=(
+                        str(original.parent_snapshot_id)
+                        if original.parent_snapshot_id
+                        else None
+                    ),
+                    active_snapshot_id=str(parent_id) if parent_id else None,
+                    decisions=decision_trail,
+                )
+                raise DiscoverySnapshotStaleError(
+                    "reviewed_merge_parent_is_stale",
+                    replan=ReconcileDiscoveryParameters(
+                        intake_id=original.intake_id,
+                        edition_id=edition_id,
+                        expected_parent_snapshot_id=parent_id,
+                        actor_id=actor_id,
+                    ),
+                )
 
             delta = build_discovery_delta(intake, batch)
             incoming = {item.handle: item for item in delta.candidates}
@@ -1359,7 +1682,21 @@ class CumulativeDiscoveryService:
                 if handle.startswith("X")
             }
             handles = ResolvedMergeHandles(existing=existing, incoming=incoming)
-            plan = DiscoveryMergePlanV1.model_validate(original.plan_payload, strict=True)
+            plan = DiscoveryMergePlanV1.model_validate(original.plan_payload)
+            # A decision that names no group, or names one twice, would otherwise
+            # be dropped without a word and read to the reviewer as "applied".
+            seen_indexes: set[int] = set()
+            for decision in decisions:
+                if not 0 <= decision.group_index < len(plan.groups):
+                    raise ValueError(
+                        f"Le groupe {decision.group_index} n'existe pas dans cette fusion "
+                        f"({len(plan.groups)} groupe(s))."
+                    )
+                if decision.group_index in seen_indexes:
+                    raise ValueError(
+                        f"Deux décisions ont été envoyées pour le groupe {decision.group_index}."
+                    )
+                seen_indexes.add(decision.group_index)
             editorial_groups = await uow.editorial_groups.list_for_edition(edition_id)
             editorial_subject_ids = {
                 group.discovery_subject_id
@@ -1409,7 +1746,22 @@ class CumulativeDiscoveryService:
             )
             if review_reasons:
                 await uow.discovery_merge_runs.add_if_absent(human_run)
+                # The successor now carries the outstanding groups; leaving the
+                # original actionable would offer the reviewer both at once.
+                await uow.discovery_merge_runs.mark_resolved(original.id)
                 await uow.commit()
+                self._diagnostics.record(
+                    event="merge.resolve_deferred",
+                    run_id=original.id,
+                    stage="discovery_merge_resolve",
+                    correlation_id=correlation_id,
+                    edition_id=str(edition_id),
+                    intake_id=str(intake.id),
+                    successor_run_id=str(human_run.id),
+                    deferred_group_indexes=sorted(deferred),
+                    group_count=len(plan.groups),
+                    decisions=decision_trail,
+                )
                 raise DiscoveryMergeNeedsReview(human_run.id, review_reasons)
             applied = apply_discovery_merge_plan(
                 parent,
@@ -1434,8 +1786,31 @@ class CumulativeDiscoveryService:
                 await uow.discovery_snapshots.deactivate(parent.id)
             await uow.discovery_snapshots.append(applied.snapshot)
             await uow.subject_contributions.append_many(applied.contributions)
+            # The decision is now materialised in a snapshot; the reviewed run is
+            # history and must stop being offered for review.
+            await uow.discovery_merge_runs.mark_resolved(original.id)
             await self._link_editorial_groups(uow, applied.snapshot)
             await uow.commit()
+            self._diagnostics.record(
+                event="merge.resolve_applied",
+                run_id=original.id,
+                stage="discovery_merge_resolve",
+                correlation_id=correlation_id,
+                edition_id=str(edition_id),
+                intake_id=str(intake.id),
+                actor_id=actor_id,
+                human_run_id=str(human_run.id),
+                parent_snapshot_id=str(parent.id) if parent else None,
+                snapshot_id=str(applied.snapshot.id),
+                snapshot_version=applied.snapshot.version,
+                group_count=len(plan.groups),
+                decisions=decision_trail,
+                subject_count_before=len(parent.subjects) if parent else 0,
+                subject_count=len(applied.snapshot.subjects),
+                merge_event_count=len(applied.merge_events),
+                contribution_count=len(applied.contributions),
+                warnings=list(applied.warnings),
+            )
         await self._after_snapshot_activation(applied.snapshot)
         return applied.snapshot
 
@@ -1526,6 +1901,21 @@ def register_cumulative_discovery_jobs(
                 "La réconciliation a dépassé la limite de rebase.",
                 {"reason": str(exc), "intake_id": str(parameters.intake_id)},
             )
+        except MergeModelUnavailableError as exc:
+            # No plan exists to review, so parking this for a human would create
+            # an empty merge run nobody can resolve. Retry instead: the bridge
+            # stalling is an incident, not an editorial decision.
+            raise JobHandlerError(
+                exc.code,
+                "Le modèle de fusion n'a pas répondu ; nouvelle tentative programmée.",
+                transient=True,
+                details={
+                    "intake_id": str(parameters.intake_id),
+                    "merge_model_run_id": (
+                        str(exc.merge_model_run_id) if exc.merge_model_run_id else None
+                    ),
+                },
+            ) from exc
         except DiscoveryMergeNeedsReview as exc:
             await context.wait_for_human(
                 "La réconciliation nécessite une décision humaine.",

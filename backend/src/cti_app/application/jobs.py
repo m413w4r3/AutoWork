@@ -12,6 +12,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.persistence import JobUnitOfWork, JobUnitOfWorkFactory
+from cti_app.application.production_diagnostics import ProductionDiagnosticsLog
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics, JobStatus
 from cti_app.logging import reset_correlation_id, set_correlation_id
 
@@ -341,6 +342,14 @@ class JobService:
             await uow.commit()
             return abandoned
 
+    async def list_for_aggregate(
+        self, aggregate_type: str, aggregate_id: UUID, *, kind: str | None = None
+    ) -> list[Job]:
+        async with self._uow_factory() as uow:
+            return list(
+                await uow.jobs.list_for_aggregate(aggregate_type, aggregate_id, kind=kind)
+            )
+
     async def history(self, job_id: UUID) -> list[JobEvent]:
         async with self._uow_factory() as uow:
             if await uow.jobs.get(job_id) is None:
@@ -361,12 +370,16 @@ class JobExecutor:
         retry_base_seconds: float = 1.0,
         retry_max_seconds: float = 300.0,
         heartbeat_interval_seconds: float = 20.0,
+        diagnostics: ProductionDiagnosticsLog | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._registry = registry
         self._retry_base_seconds = retry_base_seconds
         self._retry_max_seconds = retry_max_seconds
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        # Every stage of the chain runs as a job, so this is the one place that
+        # sees each failure regardless of which service produced it.
+        self._diagnostics = diagnostics or ProductionDiagnosticsLog(None)
 
     async def execute(self, job_id: UUID, *, allow_early_retry: bool = False) -> Job:
         job, claimed = await self._start(job_id, allow_early_retry=allow_early_retry)
@@ -386,13 +399,39 @@ class JobExecutor:
         except JobWaitingHumanError:
             return await self._get(job_id)
         except JobHandlerError as exc:
+            self._diagnostics.record_failure(
+                event="job.failed",
+                run_id=job.id,
+                stage=job.kind,
+                correlation_id=job.correlation_id,
+                error=exc,
+                error_code=exc.code,
+                job_kind=job.kind,
+                aggregate_id=str(job.aggregate_id),
+                attempt=job.attempt,
+                transient=exc.transient,
+                public_message=exc.public_message,
+            )
             return await self._handle_controlled_failure(job_id, exc)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "unexpected_job_failure job_id=%s correlation_id=%s kind=%s",
                 job.id,
                 job.correlation_id,
                 job.kind,
+            )
+            # The user only ever sees "internal_error" plus this correlation id,
+            # so the traceback has to survive somewhere they can reach it.
+            self._diagnostics.record_failure(
+                event="job.crashed",
+                run_id=job.id,
+                stage=job.kind,
+                correlation_id=job.correlation_id,
+                error=exc,
+                error_code=INTERNAL_ERROR_CODE,
+                job_kind=job.kind,
+                aggregate_id=str(job.aggregate_id),
+                attempt=job.attempt,
             )
             return await self._fail(job_id, INTERNAL_ERROR_CODE, INTERNAL_ERROR_MESSAGE)
         finally:

@@ -371,6 +371,86 @@ export function fetchDiscovery(
   );
 }
 
+export type MergeDecisionAction =
+  "accept" | "create_new" | "attach_to" | "merge_existing" | "defer";
+
+export interface MergeHandleLabel {
+  handle: string;
+  title: string;
+  summary: string;
+  source_urls: string[];
+}
+
+export interface MergeGroupDiff {
+  group_index: number;
+  existing_subject_handles: string[];
+  incoming_candidate_handles: string[];
+  disposition: "apply" | "review" | null;
+  flags: string[];
+  confidence: "high" | "medium" | "low" | null;
+  rationale: string;
+  evidence: {
+    shared_publication_urls?: string[];
+    shared_campaigns?: string[];
+    shared_malware?: string[];
+    shared_explicit_identifiers?: string[];
+    semantic_basis?: string[];
+    conflict_signals?: string[];
+  };
+}
+
+export interface MergeRun {
+  id: string;
+  edition_id: string;
+  parent_snapshot_id: string | null;
+  intake_id: string;
+  planner_kind: string;
+  validation_status: "valid" | "repaired" | "invalid" | "needs_review";
+  review_reasons: string[];
+  warnings: string[];
+  projected_diff: MergeGroupDiff[];
+  handle_labels: Record<string, MergeHandleLabel>;
+  supersedes_merge_run_id: string | null;
+  created_at: string;
+}
+
+export interface MergeResolution {
+  snapshot_id: string;
+  snapshot_version: number;
+}
+
+export function listMergeRuns(editionId: string): Promise<MergeRun[]> {
+  return request(`/api/editions/${encodeURIComponent(editionId)}/merge-runs`);
+}
+
+export function readMergeRun(
+  editionId: string,
+  runId: string,
+): Promise<MergeRun> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/merge-runs/${encodeURIComponent(runId)}`,
+  );
+}
+
+export function resolveMergeRun(
+  editionId: string,
+  runId: string,
+  decisions: Array<{
+    group_index: number;
+    action: MergeDecisionAction;
+    target_subject_handle?: string | null;
+  }>,
+): Promise<MergeResolution> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/merge-runs/${encodeURIComponent(runId)}/resolve`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ group_decisions: decisions }),
+    },
+  );
+}
+
 export function markDiscoverySource(
   editionId: string,
   sourceId: string,
@@ -393,10 +473,22 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     detail?: { code?: string; message?: string } | string;
   } | null;
   const detail = body?.detail;
+  if (typeof detail === "object" && detail?.message) {
+    throw new ApiError(
+      detail.message,
+      detail.code ?? "discovery_error",
+      response.status,
+    );
+  }
+  // A 500 carries FastAPI's bare "Internal Server Error" string, so the only
+  // thing worth telling the user is that the fault is server-side and where to
+  // look for it — an unqualified "l’opération a échoué" sends them nowhere.
+  const message =
+    response.status >= 500
+      ? `Erreur interne du serveur (HTTP ${response.status}). Le détail est dans le journal de diagnostic.`
+      : `La découverte n’a pas pu être effectuée (HTTP ${response.status}).`;
   throw new ApiError(
-    typeof detail === "object" && detail?.message
-      ? detail.message
-      : "La découverte n’a pas pu être effectuée.",
+    message,
     typeof detail === "object" && detail?.code
       ? detail.code
       : "discovery_error",
