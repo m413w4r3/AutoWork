@@ -67,19 +67,21 @@ dev:
 
 stop: down
 
+PYTHON_VERSION ?= 3.12
+
 test:
-	cd backend && $(UV) run pytest
+	cd backend && $(UV) run --python $(PYTHON_VERSION) pytest
 	cd frontend && $(PNPM) test --run
 
 test-integration:
-	cd backend && $(UV) run pytest -m integration
+	cd backend && $(UV) run --python $(PYTHON_VERSION) pytest -m integration
 
 lint:
-	cd backend && $(UV) run ruff check .
+	cd backend && $(UV) run --python $(PYTHON_VERSION) ruff check .
 	cd frontend && $(PNPM) lint
 
 typecheck:
-	cd backend && $(UV) run mypy src tests
+	cd backend && $(UV) run --python $(PYTHON_VERSION) mypy src tests
 	cd frontend && $(PNPM) typecheck
 
 format:

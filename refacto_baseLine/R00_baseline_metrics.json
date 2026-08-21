@@ -1,0 +1,126 @@
+{
+  "metadata": {
+    "date": "2026-08-21",
+    "model": "Haiku 4.5",
+    "project": "AutoWork CTI Application",
+    "python_version": "3.12.3",
+    "test_runner": "pytest 8.4.2",
+    "execution_time_seconds": 9.42
+  },
+  "test_execution": {
+    "total_collected": 489,
+    "total_passed": 461,
+    "total_failed": 10,
+    "total_skipped": 18,
+    "pass_rate": 94.27,
+    "skip_reason": "TEST_POSTGRES_ADMIN_DSN not set (integration tests)"
+  },
+  "failed_tests": [
+    {
+      "name": "tests/test_coverage_calculator.py::TestNewContributions::test_new_contribution_detected",
+      "error": "ValueError: Evidence pack hash must be a lowercase SHA-256",
+      "category": "test_data_validation"
+    },
+    {
+      "name": "tests/test_editorial_preservation_integration.py::TestPublishedBriefWithNewContributions::test_published_content_immutable_after_new_contributions",
+      "error": "ValueError: Evidence pack hash must be a lowercase SHA-256",
+      "category": "test_data_validation"
+    },
+    {
+      "name": "tests/test_editorial_preservation_integration.py::TestPublishedBriefWithNewContributions::test_correction_amendment_immutability",
+      "error": "ValueError: An amendment must address at least one contribution",
+      "category": "test_data_validation"
+    },
+    {
+      "name": "tests/test_editorial_preservation_integration.py::TestPublishedBriefWithNewContributions::test_merged_subject_preserves_contributions",
+      "error": "ValueError: Evidence pack hash must be a lowercase SHA-256",
+      "category": "test_data_validation"
+    },
+    {
+      "name": "tests/test_replay_activator.py::TestReplayActivator::test_activation_requires_mapping_for_published_subjects",
+      "error": "ValueError: Discovery snapshot hash must be a SHA-256",
+      "category": "test_data_validation"
+    },
+    {
+      "name": "tests/test_replay_activator.py::TestReplayActivator::test_activation_succeeds_with_complete_mapping",
+      "error": "ValueError: Discovery snapshot hash must be a SHA-256",
+      "category": "test_data_validation"
+    },
+    {
+      "name": "tests/test_replay_activator.py::TestReplayActivator::test_activation_allows_new_subjects",
+      "error": "ValueError: Discovery snapshot hash must be a SHA-256",
+      "category": "test_data_validation"
+    },
+    {
+      "name": "tests/test_replay_integration.py::TestReplayEditionWorkflow::test_replay_creates_separate_lineage",
+      "error": "ValueError: Discovery snapshot hash must be a SHA-256",
+      "category": "test_data_validation"
+    },
+    {
+      "name": "tests/test_replay_integration.py::TestReplayEditionWorkflow::test_published_artifact_bindings_preserved",
+      "error": "ValueError: A brief must contain one to three paragraphs",
+      "category": "test_data_validation"
+    },
+    {
+      "name": "tests/test_replay_service.py::TestReplayService::test_generate_comparison_report_all_same",
+      "error": "ValueError: Discovery snapshot hash must be a SHA-256",
+      "category": "test_data_validation"
+    }
+  ],
+  "test_files": {
+    "total_test_files": 45,
+    "test_modules": [
+      "tests/test_amendment_service.py",
+      "tests/test_blob_storage.py",
+      "tests/test_briefs.py",
+      "tests/test_briefs_api.py",
+      "tests/test_chatgpt_bridge.py",
+      "tests/test_config.py",
+      "tests/test_coverage_calculator.py",
+      "tests/test_discovery_api.py",
+      "tests/test_discovery_fakes.py",
+      "tests/test_discovery_graph.py",
+      "tests/test_discovery_sources.py",
+      "tests/test_discovery_tracking.py",
+      "tests/test_editorial_graph.py",
+      "tests/test_editorial_preservation_integration.py",
+      "tests/test_extraction.py",
+      "tests/test_feed_graph.py",
+      "tests/test_minio_blob_storage.py",
+      "tests/test_production.py",
+      "tests/test_production_api.py",
+      "tests/test_production_chain.py",
+      "tests/test_production_parsers.py",
+      "tests/test_production_rendering.py",
+      "tests/test_production_workflow_stages.py",
+      "tests/test_publication_pipeline.py",
+      "tests/test_replay_activator.py",
+      "tests/test_replay_integration.py",
+      "tests/test_replay_service.py",
+      "tests/test_workers_tasks.py",
+      "tests/integration/*"
+    ]
+  },
+  "first_20_passing_tests": [
+    "tests/test_amendment_service.py::TestDeltaPackBuilder::test_delta_pack_has_correct_scope",
+    "tests/test_amendment_service.py::TestDeltaPackBuilder::test_delta_pack_cannot_have_full_scope_with_base",
+    "tests/test_amendment_service.py::TestDeltaPackBuilder::test_delta_pack_requires_base_pack",
+    "tests/test_amendment_service.py::TestAmendmentService::test_create_update_amendment_draft",
+    "tests/test_amendment_service.py::TestAmendmentService::test_correction_amendment_requires_reason",
+    "tests/test_amendment_service.py::TestAmendmentService::test_amendment_chain",
+    "tests/test_amendment_service.py::TestAmendmentService::test_redactional_revision",
+    "tests/test_amendment_service.py::TestAmendmentService::test_redactional_revision_only_for_published",
+    "tests/test_blob_storage.py::test_filesystem_blob_put_is_content_addressed_and_idempotent",
+    "tests/test_briefs.py::test_freeze_is_idempotent_and_new_evidence_invalidates_old_draft",
+    "tests/test_briefs.py::test_generation_rejects_an_ioc_added_by_the_model",
+    "tests/test_briefs.py::test_factual_sentence_requires_a_claim_reference",
+    "tests/test_briefs.py::test_approval_and_markdown_export_use_current_pack",
+    "tests/test_briefs_api.py::test_brief_api_freeze_generate_approve_and_export",
+    "tests/test_chatgpt_bridge.py::test_extension_reserves_request_before_real_send_click",
+    "tests/test_chatgpt_bridge.py::test_responses_facade_translates_web_search_and_rejects_binary_blocks",
+    "tests/test_chatgpt_bridge.py::test_recovery_message_is_forwarded_exactly_without_discovery_preamble",
+    "tests/test_chatgpt_bridge.py::test_responses_facade_completes_background_request_without_network",
+    "tests/test_chatgpt_bridge.py::test_native_bridge_contract_reports_honest_capabilities",
+    "tests/test_chatgpt_bridge.py::test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation"
+  ]
+}
