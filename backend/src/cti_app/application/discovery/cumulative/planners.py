@@ -1,7 +1,7 @@
 """Local, deterministic discovery merge planners — no external model calls.
 
 `ChatGptMergePlanner` (the non-deterministic, external-model-backed planner)
-stays in `service.py`; it is out of scope for this module.
+lives in `chatgpt_planner.py`; it is out of scope for this module.
 """
 
 from __future__ import annotations

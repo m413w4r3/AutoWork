@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
 from cti_app.application.discovery.cumulative.context import (
     DiscoveryBlockingStrategy,
     build_discovery_delta,
@@ -19,7 +20,6 @@ from cti_app.application.discovery.cumulative.planners import (
     TargetedMergePlanner,
 )
 from cti_app.application.discovery.cumulative.service import (
-    ChatGptMergePlanner,
     apply_discovery_merge_plan,
     make_merge_run,
 )
