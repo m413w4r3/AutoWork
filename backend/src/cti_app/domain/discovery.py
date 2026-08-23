@@ -267,7 +267,6 @@ class DiscoveryBatch:
     queries: tuple[str, ...]
     citations: tuple[dict[str, str | None], ...]
     discovery_model_run_id: UUID
-    structuring_model_run_id: UUID
     tlp: TLP
     sensitivity: str
     external_llm_allowed: bool

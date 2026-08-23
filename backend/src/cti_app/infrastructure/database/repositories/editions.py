@@ -92,7 +92,6 @@ class SqlAlchemyEditionRepository:
                     select(
                         DiscoveryBatchRow.id,
                         DiscoveryBatchRow.discovery_model_run_id,
-                        DiscoveryBatchRow.structuring_model_run_id,
                     ).where(DiscoveryBatchRow.edition_id == edition_id)
                 )
             ).all()
@@ -137,7 +136,6 @@ class SqlAlchemyEditionRepository:
             *claim_model_run_ids,
             *draft_model_run_ids,
             *(row.discovery_model_run_id for row in batch_rows),
-            *(row.structuring_model_run_id for row in batch_rows),
         }
 
         # Production artifacts reference conversation turns and model runs, so
@@ -266,13 +264,6 @@ class SqlAlchemyEditionRepository:
                 await self._session.scalars(
                     select(DiscoveryBatchRow.discovery_model_run_id).where(
                         DiscoveryBatchRow.discovery_model_run_id.in_(model_run_ids)
-                    )
-                )
-            )
-            referenced_run_ids.update(
-                await self._session.scalars(
-                    select(DiscoveryBatchRow.structuring_model_run_id).where(
-                        DiscoveryBatchRow.structuring_model_run_id.in_(model_run_ids)
                     )
                 )
             )

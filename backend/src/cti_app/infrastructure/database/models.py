@@ -566,9 +566,6 @@ class DiscoveryBatchRow(Base):
     discovery_model_run_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("model_runs.id", ondelete="RESTRICT"), nullable=False
     )
-    structuring_model_run_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("model_runs.id", ondelete="RESTRICT"), nullable=False
-    )
     tlp: Mapped[str] = mapped_column(String(16), nullable=False)
     sensitivity: Mapped[str] = mapped_column(String(64), nullable=False)
     external_llm_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)

@@ -123,7 +123,6 @@ export interface DiscoveryBatch {
   queries: string[];
   citations: Array<{ label: string; url: string; excerpt: string | null }>;
   discovery_model_run_id: string;
-  structuring_model_run_id: string;
   created_at: string;
   source_mode:
     | "native_complete"

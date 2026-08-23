@@ -169,10 +169,9 @@ Le parseur accepte exclusivement le contrat courant `SUBJECT` / `PUBLICATION`. U
 d'un ancien format est rejeté avec `report_schema_unsupported` et reste disponible dans
 l'archive brute pour diagnostic.
 
-Le batch conserve le ModelRun ChatGPT, le SHA-256 du rapport, la version du parseur, son statut
-et ses avertissements. Le champ historique `structuring_model_run_id` référence le même
-ModelRun ChatGPT afin de préserver la lecture des anciennes lignes sans migration destructive ;
-aucun ModelRun de structuration n'est créé.
+Le batch conserve le ModelRun ChatGPT (`discovery_model_run_id`), le SHA-256 du rapport, la
+version du parseur, son statut et ses avertissements. Le parsing du rapport est local et ne
+possède pas de ModelRun distinct.
 
 ## Reprise et sélection
 

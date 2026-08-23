@@ -258,7 +258,6 @@ def _build_manual_edit_batch(
             )
         ],
         discovery_model_run_id=manual_run_id,
-        structuring_model_run_id=manual_run_id,
         tlp=candidate.tlp,
         sensitivity=candidate.sensitivity,
         external_llm_allowed=candidate.external_llm_allowed,

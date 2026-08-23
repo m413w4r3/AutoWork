@@ -47,7 +47,7 @@ async def test_database_rejects_verified_relationship_without_qualified_evidence
             evidence_pack_hash="b" * 64,
             parameters={},
         )
-        for run_id in (batch.discovery_model_run_id, batch.structuring_model_run_id)
+        for run_id in (batch.discovery_model_run_id,)
     ]
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)

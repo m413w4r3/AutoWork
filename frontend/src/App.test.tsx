@@ -330,7 +330,6 @@ describe("App éditions", () => {
             },
           ],
           discovery_model_run_id: "f7fd2882-da41-4d3c-9bea-e592b6d2524a",
-          structuring_model_run_id: "4c84c931-989b-498b-84b0-60901671321d",
           created_at: "2026-08-10T10:00:00Z",
           parsing_warnings: [],
           unattached_visible_citations: [

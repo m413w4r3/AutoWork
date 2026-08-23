@@ -373,7 +373,6 @@ def _batch(
             )
         ],
         discovery_model_run_id=model_run_id,
-        structuring_model_run_id=model_run_id,
         tlp=TLP.AMBER,
         sensitivity="internal",
         external_llm_allowed=True,

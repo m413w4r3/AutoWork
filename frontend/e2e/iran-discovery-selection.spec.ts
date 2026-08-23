@@ -190,8 +190,6 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
                     citations: [],
                     discovery_model_run_id:
                       "ffffffff-ffff-4fff-8fff-ffffffffffff",
-                    structuring_model_run_id:
-                      "ffffffff-ffff-4fff-8fff-ffffffffffff",
                     created_at: "2026-06-01T00:00:00Z",
                     source_mode: "model_declared_urls",
                     bridge_capabilities: {},

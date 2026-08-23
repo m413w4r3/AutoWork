@@ -228,7 +228,6 @@ class BatchView(BaseModel):
     queries: list[str]
     citations: list[dict[str, str | None]]
     discovery_model_run_id: UUID
-    structuring_model_run_id: UUID
     created_at: datetime
     source_mode: DiscoverySourceMode
     bridge_capabilities: dict[str, object]
@@ -970,7 +969,6 @@ def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
         queries=list(batch.queries),
         citations=list(batch.citations),
         discovery_model_run_id=batch.discovery_model_run_id,
-        structuring_model_run_id=batch.structuring_model_run_id,
         created_at=batch.created_at,
         source_mode=batch.source_mode,
         bridge_capabilities=batch.bridge_capabilities,

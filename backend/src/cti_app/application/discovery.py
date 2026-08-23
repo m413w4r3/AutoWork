@@ -1160,9 +1160,6 @@ def _parsed_to_domain_batch(
             result.candidates, ContributionStatus.ACCEPTED
         ),
         discovery_model_run_id=research_run_id,
-        # The historical column remains non-null for backwards compatibility. Reusing
-        # the research run ID explicitly means that no structuring ModelRun was created.
-        structuring_model_run_id=research_run_id,
         tlp=parameters.tlp,
         sensitivity=parameters.sensitivity,
         external_llm_allowed=parameters.external_llm_allowed,

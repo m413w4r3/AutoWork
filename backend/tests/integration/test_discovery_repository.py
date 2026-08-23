@@ -42,7 +42,6 @@ async def test_discovery_batch_round_trip_and_source_status(
         source_profile="iran-default",
     )
     research_run = _run("research", "a")
-    structuring_run = _run("structured", "b")
     source = SourceCandidate(
         url="https://vendor.example/report?utm_source=test",
         title="Original report",
@@ -126,7 +125,6 @@ async def test_discovery_batch_round_trip_and_source_status(
         ),
         candidates=[candidate],
         discovery_model_run_id=research_run.id,
-        structuring_model_run_id=structuring_run.id,
         tlp=TLP.AMBER,
         sensitivity="internal",
         external_llm_allowed=True,
@@ -149,7 +147,6 @@ async def test_discovery_batch_round_trip_and_source_status(
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             assert await uow.editions.add_if_absent(edition)
             await uow.model_runs.add(research_run)
-            await uow.model_runs.add(structuring_run)
             assert await uow.discovery_batches.add_if_absent(batch)
             await uow.commit()
 
@@ -192,7 +189,6 @@ async def test_discovery_batch_round_trip_and_source_status(
             assert await uow.editions.get(edition.id) is None
             assert await uow.discovery_batches.get(batch.id) is None
             assert await uow.model_runs.get(research_run.id) is None
-            assert await uow.model_runs.get(structuring_run.id) is None
     finally:
         await engine.dispose()
 

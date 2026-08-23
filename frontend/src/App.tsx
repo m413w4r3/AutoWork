@@ -1481,10 +1481,6 @@ function DiscoveryPanel({
                   <dd>{batch.discovery_model_run_id}</dd>
                 </div>
                 <div>
-                  <dt>ModelRun de parsing</dt>
-                  <dd>{batch.structuring_model_run_id}</dd>
-                </div>
-                <div>
                   <dt>Correlation ID</dt>
                   <dd>{lastJob?.correlation_id ?? "Non disponible"}</dd>
                 </div>

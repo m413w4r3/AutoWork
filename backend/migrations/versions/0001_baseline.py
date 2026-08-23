@@ -711,7 +711,6 @@ def _create_discovery_batches() -> None:
         sa.Column("complementary_axis", sa.String(length=500), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("discovery_model_run_id", sa.Uuid(), nullable=False),
-        sa.Column("structuring_model_run_id", sa.Uuid(), nullable=False),
         sa.Column("tlp", sa.String(length=16), nullable=False),
         sa.Column("sensitivity", sa.String(length=64), nullable=False),
         sa.Column("external_llm_allowed", sa.Boolean(), nullable=False),
@@ -727,9 +726,6 @@ def _create_discovery_batches() -> None:
         sa.CheckConstraint("jsonb_typeof(payload) = 'object'", name="ck_discovery_payload_object"),
         sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["discovery_model_run_id"], ["model_runs.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["structuring_model_run_id"], ["model_runs.id"], ondelete="RESTRICT"
-        ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("edition_id", "request_hash", name="uq_discovery_batches_request"),
     )
