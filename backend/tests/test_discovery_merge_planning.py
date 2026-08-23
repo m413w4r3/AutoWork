@@ -5,18 +5,20 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.discovery.cumulative.context import (
+    DiscoveryBlockingStrategy,
+    build_discovery_delta,
+    build_merge_handles,
+    project_merge_subject,
+)
 from cti_app.application.discovery.cumulative.errors import MergeModelUnavailableError
 from cti_app.application.discovery.cumulative.service import (
     ChatGptMergePlanner,
-    DiscoveryBlockingStrategy,
     HumanMergeDecision,
     HumanMergePlanner,
     TargetedMergePlanner,
     apply_discovery_merge_plan,
-    build_discovery_delta,
-    build_merge_handles,
     make_merge_run,
-    project_merge_subject,
 )
 from cti_app.application.model_gateway import (
     ExternalModelBlockedError,
