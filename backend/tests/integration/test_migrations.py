@@ -4,7 +4,7 @@ This module validates, against a real (temporary) PostgreSQL database:
 
 1. the exact set of application tables produced by ``alembic upgrade head``;
 2. that this set matches ``Base.metadata.tables`` (module-level ORM models),
-   modulo a short, explicitly documented list of known exceptions;
+   exactly, with no exceptions;
 3. for every ORM-mapped table: columns (name, type family, nullability,
    varchar length), primary key, foreign keys (incl. ``ON DELETE``), unique
    constraints, check constraints and indexes (incl. partial indexes) —
@@ -65,18 +65,6 @@ ALEMBIC_TABLE = "alembic_version"
 
 EXPECTED_TABLES = frozenset(Base.metadata.tables) | {ALEMBIC_TABLE}
 
-# --- Known, pre-existing ORM/database drift --------------------------------
-#
-# The comparisons below are written to be exact (`==`), not subset checks, so
-# that any *new* drift between a migration and `models.py` fails the suite.
-# The migration chain has nonetheless accumulated a number of small, real
-# discrepancies over time (typically: a migration was hand-written straight
-# against the database and `models.py` was never updated to match, or vice
-# versa). Each one is catalogued here instead of silently loosening the
-# corresponding assertion, so the exhaustive checks stay exact everywhere else
-# and every known gap is visible, attributed to the migration that caused it,
-# and easy to grep for when someone eventually reconciles them.
-
 # (local columns, referred table, referred columns, ON DELETE) — shared by
 # both the ORM-derived and the reflected-from-database foreign key shapes.
 ForeignKeyShape = tuple[tuple[str, ...], str, tuple[str, ...], str | None]
@@ -89,9 +77,8 @@ ColumnShape = tuple[str, bool, int | None]
 IndexShape = tuple[str, tuple[str, ...], bool, bool]
 
 # (table, trigger_name) -> function_name, for every trigger installed by the
-# migration chain. Built by hand from the CREATE TRIGGER / CREATE FUNCTION
-# statements across 0001-0023; nothing in this chain drops a trigger or
-# function on the way to head, so this is the complete set at "head".
+# migration chain at HEAD. This is the complete, canonical baseline installed
+# by the current migration chain.
 EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
     ("subjects", "trg_subjects_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
     ("source_documents", "trg_source_documents_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
