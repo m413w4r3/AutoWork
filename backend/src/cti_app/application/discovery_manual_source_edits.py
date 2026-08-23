@@ -223,8 +223,8 @@ def _find_incomplete_source(
     return subject, incomplete
 
 
+# Not produced by discovery_report_parser: identifies analyst-attached URLs.
 MANUAL_SOURCE_EDIT_VERSION = "manual-url-attach-v1"
-"""Not produced by discovery_report_parser: identifies analyst-attached URLs."""
 
 
 def _manual_edit_content(

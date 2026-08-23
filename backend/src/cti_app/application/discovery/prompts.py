@@ -132,15 +132,3 @@ ioc-note: <une phrase courte ou none>
 <limites principales de la recherche et de l’accès aux sources>"""
 
 
-def _source_profile_description(profile_id: str) -> str:
-    profiles = {
-        "iran-default": (
-            "sources CTI primaires, CERT nationaux, chercheurs techniques indépendants, "
-            "puis relais et agrégateurs explicitement étiquetés"
-        )
-    }
-    return profiles.get(
-        profile_id,
-        "sources primaires et institutionnelles, corroborations techniques indépendantes, "
-        "puis relais explicitement étiquetés",
-    )
