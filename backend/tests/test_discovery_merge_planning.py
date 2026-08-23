@@ -12,11 +12,14 @@ from cti_app.application.discovery.cumulative.context import (
     project_merge_subject,
 )
 from cti_app.application.discovery.cumulative.errors import MergeModelUnavailableError
-from cti_app.application.discovery.cumulative.service import (
-    ChatGptMergePlanner,
+from cti_app.application.discovery.cumulative.planners import (
+    HeuristicMergePlanner,
     HumanMergeDecision,
     HumanMergePlanner,
     TargetedMergePlanner,
+)
+from cti_app.application.discovery.cumulative.service import (
+    ChatGptMergePlanner,
     apply_discovery_merge_plan,
     make_merge_run,
 )
@@ -580,8 +583,6 @@ async def _bootstrap(edition_id: UUID, candidates: list[CandidateTopic]) -> Disc
     intake = _intake(batch)
     delta = build_discovery_delta(intake, batch)
     handles = build_merge_handles(None, delta)
-    from cti_app.application.discovery.cumulative.service import HeuristicMergePlanner
-
     planner = HeuristicMergePlanner()
     outcome = await planner.plan(
         None,

@@ -9,8 +9,8 @@ from cti_app.application.discovery.cumulative.context import (
     build_discovery_delta,
     build_merge_handles,
 )
+from cti_app.application.discovery.cumulative.planners import HeuristicMergePlanner
 from cti_app.application.discovery.cumulative.service import (
-    HeuristicMergePlanner,
     apply_discovery_merge_plan,
     make_merge_run,
 )

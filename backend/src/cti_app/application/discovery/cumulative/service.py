@@ -28,19 +28,9 @@ from cti_app.application.discovery.cumulative.errors import (
     MergePlanInvalidError,
 )
 from cti_app.application.discovery.cumulative.planners import (
-    HEURISTIC_POLICY_VERSION as HEURISTIC_POLICY_VERSION,
-)
-from cti_app.application.discovery.cumulative.planners import (
-    HeuristicMergePlanner as HeuristicMergePlanner,
-)
-from cti_app.application.discovery.cumulative.planners import (
-    HumanMergeDecision as HumanMergeDecision,
-)
-from cti_app.application.discovery.cumulative.planners import (
-    HumanMergePlanner as HumanMergePlanner,
-)
-from cti_app.application.discovery.cumulative.planners import (
-    TargetedMergePlanner as TargetedMergePlanner,
+    HeuristicMergePlanner,
+    HumanMergeDecision,
+    HumanMergePlanner,
 )
 from cti_app.application.discovery.cumulative.types import (
     AppliedDiscoveryMerge,

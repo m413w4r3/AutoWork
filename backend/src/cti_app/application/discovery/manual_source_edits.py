@@ -11,8 +11,8 @@ the subject the analyst already picked, not ask a planner to rediscover it:
 `HeuristicMergePlanner` can create a spurious new subject when more than one
 existing subject shares a title, and the production planner is the
 nondeterministic `ChatGptMergePlanner`. `TargetedMergePlanner`
-(discovery_cumulative.py) is the deterministic, single-group planner built
-for exactly this.
+(discovery/cumulative/planners.py) is the deterministic, single-group planner
+built for exactly this.
 """
 
 from __future__ import annotations

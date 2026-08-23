@@ -20,10 +20,8 @@ from cti_app.application.discovery.cumulative.errors import (
     DiscoveryMergeNeedsReview,
     DiscoverySnapshotStaleError,
 )
-from cti_app.application.discovery.cumulative.service import (
-    CumulativeDiscoveryService,
-    HumanMergeDecision,
-)
+from cti_app.application.discovery.cumulative.planners import HumanMergeDecision
+from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.manual_source_edits import (
     IncompleteSourceCandidateNotFoundError,
