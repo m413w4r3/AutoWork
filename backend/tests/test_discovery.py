@@ -10,13 +10,13 @@ from pydantic import BaseModel
 from cti_app.application.discovery import (
     DISCOVERY_JOB_KIND,
     DiscoveryService,
-    _research_prompt,
 )
 from cti_app.application.discovery.contracts import (
     DiscoverEditionParameters,
     discovery_idempotency_key,
     discovery_request_hash,
 )
+from cti_app.application.discovery.prompts import _research_prompt
 from cti_app.application.jobs import (
     DuplicateJobError,
     JobExecutor,
