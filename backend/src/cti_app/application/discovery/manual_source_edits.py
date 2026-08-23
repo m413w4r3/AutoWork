@@ -23,11 +23,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from cti_app.application.discovery.ports import ModelOutputArchive
-from cti_app.application.discovery_cumulative import (
+from cti_app.application.discovery.cumulative.service import (
     CumulativeDiscoveryService,
     TargetedMergePlanner,
 )
+from cti_app.application.discovery.ports import ModelOutputArchive
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.discovery import (
     CandidateTopic,

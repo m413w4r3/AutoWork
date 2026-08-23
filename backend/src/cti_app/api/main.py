@@ -19,14 +19,14 @@ from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
-from cti_app.application.discovery.service import DiscoveryService
-from cti_app.application.discovery_cumulative import (
+from cti_app.application.discovery.cumulative.service import (
     RECONCILE_DISCOVERY_JOB_KIND,
     ChatGptMergePlanner,
     CumulativeDiscoveryService,
     ReconcileDiscoveryParameters,
 )
+from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
+from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.editions import EditionService
 from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.http_collection import (

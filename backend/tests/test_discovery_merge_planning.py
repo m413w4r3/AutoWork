@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.discovery_cumulative import (
+from cti_app.application.discovery.cumulative.service import (
     ChatGptMergePlanner,
     DiscoveryBlockingStrategy,
     HumanMergeDecision,
@@ -578,7 +578,7 @@ async def _bootstrap(edition_id: UUID, candidates: list[CandidateTopic]) -> Disc
     intake = _intake(batch)
     delta = build_discovery_delta(intake, batch)
     handles = build_merge_handles(None, delta)
-    from cti_app.application.discovery_cumulative import HeuristicMergePlanner
+    from cti_app.application.discovery.cumulative.service import HeuristicMergePlanner
 
     planner = HeuristicMergePlanner()
     outcome = await planner.plan(

@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.discovery_cumulative import (
+from cti_app.application.discovery.cumulative.service import (
     HeuristicMergePlanner,
     apply_discovery_merge_plan,
     build_discovery_delta,

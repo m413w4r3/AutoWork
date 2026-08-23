@@ -12,7 +12,7 @@ from uuid import UUID
 
 import pytest
 
-from cti_app.application.discovery_cumulative import (
+from cti_app.application.discovery.cumulative.service import (
     CumulativeDiscoveryService,
     DiscoveryDelta,
     DiscoveryMergeNeedsReview,

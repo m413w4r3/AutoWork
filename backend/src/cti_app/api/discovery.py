@@ -16,6 +16,12 @@ from cti_app.application.discovery.contracts import (
     discovery_idempotency_key,
     discovery_request_hash,
 )
+from cti_app.application.discovery.cumulative.service import (
+    CumulativeDiscoveryService,
+    DiscoveryMergeNeedsReview,
+    DiscoverySnapshotStaleError,
+    HumanMergeDecision,
+)
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.manual_source_edits import (
     IncompleteSourceCandidateNotFoundError,
@@ -24,12 +30,6 @@ from cti_app.application.discovery.manual_source_edits import (
 from cti_app.application.discovery.service import (
     DiscoveryService,
     SourceCandidateNotFoundError,
-)
-from cti_app.application.discovery_cumulative import (
-    CumulativeDiscoveryService,
-    DiscoveryMergeNeedsReview,
-    DiscoverySnapshotStaleError,
-    HumanMergeDecision,
 )
 from cti_app.application.discovery_report_parser import ReportParsingError
 from cti_app.application.editions import EditionNotFoundError, EditionService

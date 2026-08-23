@@ -3,7 +3,7 @@ from uuid import UUID
 
 import pytest
 
-from cti_app.application.discovery_cumulative import CumulativeDiscoveryService
+from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
