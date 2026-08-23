@@ -634,9 +634,11 @@ def create_job_registry(
             raise TypeError("discovery_service must be a DiscoveryService")
         register_discovery_jobs(registry, discovery_service)
     if cumulative_discovery_service is not None:
+        from cti_app.application.discovery.cumulative.jobs import (
+            register_cumulative_discovery_jobs,
+        )
         from cti_app.application.discovery.cumulative.service import (
             CumulativeDiscoveryService,
-            register_cumulative_discovery_jobs,
         )
 
         if not isinstance(cumulative_discovery_service, CumulativeDiscoveryService):

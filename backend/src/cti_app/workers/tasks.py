@@ -11,10 +11,8 @@ from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
 from cti_app.application.discovery.cumulative.contracts import ReconcileDiscoveryParameters
-from cti_app.application.discovery.cumulative.service import (
-    RECONCILE_DISCOVERY_JOB_KIND,
-    CumulativeDiscoveryService,
-)
+from cti_app.application.discovery.cumulative.jobs import RECONCILE_DISCOVERY_JOB_KIND
+from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.editorial import EditorialGroupingService
