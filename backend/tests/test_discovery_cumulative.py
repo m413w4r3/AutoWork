@@ -13,8 +13,8 @@ from cti_app.application.discovery.cumulative.service import (
     HeuristicMergePlanner,
     apply_discovery_merge_plan,
     make_merge_run,
-    validate_merge_plan,
 )
+from cti_app.application.discovery.cumulative.validation import validate_merge_plan
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
