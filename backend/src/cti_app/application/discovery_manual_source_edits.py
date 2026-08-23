@@ -223,6 +223,10 @@ def _find_incomplete_source(
     return subject, incomplete
 
 
+MANUAL_SOURCE_EDIT_VERSION = "manual-url-attach-v1"
+"""Not produced by discovery_report_parser: identifies analyst-attached URLs."""
+
+
 def _manual_edit_content(
     edition_id: UUID, subject_id: UUID, incomplete_source_id: UUID, url: str
 ) -> bytes:
@@ -261,6 +265,7 @@ def _build_manual_edit_batch(
         tlp=candidate.tlp,
         sensitivity=candidate.sensitivity,
         external_llm_allowed=candidate.external_llm_allowed,
+        parser_version=MANUAL_SOURCE_EDIT_VERSION,
         report_sha256=digest,
         source_mode=DiscoverySourceMode.MANUAL_IMPORT,
         source_coverage_complete=False,

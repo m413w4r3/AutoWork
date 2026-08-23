@@ -453,6 +453,168 @@ async def test_discovery_batch_candidate_without_contribution_metadata_fails(
         _discovery_batch_from_row(row)
 
 
+async def test_discovery_batch_contribution_meta_missing_accepted_at_fails(
+    migrated_postgres_url: str,
+) -> None:
+    """Contribution metadata without the accepted_at key must cause KeyError."""
+    from uuid import uuid4 as make_uuid
+
+    from cti_app.infrastructure.database.models import DiscoveryBatchRow
+    from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
+
+    candidate_id = make_uuid()
+    row = DiscoveryBatchRow(
+        id=make_uuid(),
+        edition_id=make_uuid(),
+        request_hash="test",
+        complementary_axis="initial",
+        status="completed",
+        discovery_model_run_id=make_uuid(),
+        tlp="AMBER",
+        sensitivity="internal",
+        external_llm_allowed=True,
+        payload={
+            "candidates": [
+                {
+                    "id": str(candidate_id),
+                    "title": "Test",
+                    "summary": "Summary.",
+                    "novelty": "Novel.",
+                    "technical_potential": 1,
+                    "tlp": "AMBER",
+                    "sensitivity": "internal",
+                    "external_llm_allowed": True,
+                    "sources": [],
+                    "incomplete_sources": [],
+                    "provisional_iocs": [],
+                    "likely_artifacts": [],
+                    "uncertainties": [],
+                    "relevance_reasons": [],
+                    "actors": [],
+                    "campaigns": [],
+                    "malware": [],
+                    "cves": [],
+                    "victims": [],
+                    "sectors": [],
+                    "countries": [],
+                    "iocs": [],
+                    "parsing_warnings": [],
+                }
+            ],
+            "contributions_meta": [
+                {
+                    "candidate_id": str(candidate_id),
+                    "status": "accepted",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    # Missing: accepted_at
+                    "human_note": "",
+                }
+            ],
+            "queries": [],
+            "citations": [],
+            "parser_version": "v1",
+            "parsing_status": "completed",
+            "parsing_warnings": [],
+            "unattached_visible_citations": [],
+            "parsing_revision": 1,
+            "supersedes_batch_id": None,
+            "replaced_by_batch_id": None,
+            "source_mode": "visible_citations_only",
+            "bridge_capabilities": {},
+            "citation_count": 0,
+            "source_coverage_complete": False,
+            "source_coverage_incomplete_reason": None,
+            "report_sha256": None,
+        },
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(KeyError, match="accepted_at"):
+        _discovery_batch_from_row(row)
+
+
+async def test_discovery_batch_contribution_meta_missing_human_note_fails(
+    migrated_postgres_url: str,
+) -> None:
+    """Contribution metadata without the human_note key must cause KeyError."""
+    from uuid import uuid4 as make_uuid
+
+    from cti_app.infrastructure.database.models import DiscoveryBatchRow
+    from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
+
+    candidate_id = make_uuid()
+    row = DiscoveryBatchRow(
+        id=make_uuid(),
+        edition_id=make_uuid(),
+        request_hash="test",
+        complementary_axis="initial",
+        status="completed",
+        discovery_model_run_id=make_uuid(),
+        tlp="AMBER",
+        sensitivity="internal",
+        external_llm_allowed=True,
+        payload={
+            "candidates": [
+                {
+                    "id": str(candidate_id),
+                    "title": "Test",
+                    "summary": "Summary.",
+                    "novelty": "Novel.",
+                    "technical_potential": 1,
+                    "tlp": "AMBER",
+                    "sensitivity": "internal",
+                    "external_llm_allowed": True,
+                    "sources": [],
+                    "incomplete_sources": [],
+                    "provisional_iocs": [],
+                    "likely_artifacts": [],
+                    "uncertainties": [],
+                    "relevance_reasons": [],
+                    "actors": [],
+                    "campaigns": [],
+                    "malware": [],
+                    "cves": [],
+                    "victims": [],
+                    "sectors": [],
+                    "countries": [],
+                    "iocs": [],
+                    "parsing_warnings": [],
+                }
+            ],
+            "contributions_meta": [
+                {
+                    "candidate_id": str(candidate_id),
+                    "status": "accepted",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "accepted_at": datetime.now(UTC).isoformat(),
+                    # Missing: human_note
+                }
+            ],
+            "queries": [],
+            "citations": [],
+            "parser_version": "v1",
+            "parsing_status": "completed",
+            "parsing_warnings": [],
+            "unattached_visible_citations": [],
+            "parsing_revision": 1,
+            "supersedes_batch_id": None,
+            "replaced_by_batch_id": None,
+            "source_mode": "visible_citations_only",
+            "bridge_capabilities": {},
+            "citation_count": 0,
+            "source_coverage_complete": False,
+            "source_coverage_incomplete_reason": None,
+            "report_sha256": None,
+        },
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(KeyError, match="human_note"):
+        _discovery_batch_from_row(row)
+
+
 def _run(template: str, hash_prefix: str) -> ModelRun:
     return ModelRun(
         provider=ModelProvider.FAKE,

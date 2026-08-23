@@ -203,6 +203,7 @@ def _batch(
         tlp=TLP.AMBER,
         sensitivity="internal",
         external_llm_allowed=True,
+        parser_version="test-parser-v1",
         report_sha256="d" * 64,
         source_mode=DiscoverySourceMode.MODEL_DECLARED_URLS,
     )

@@ -251,17 +251,16 @@ def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
     contributions = []
     for candidate in candidates:
         meta = contrib_map[candidate.id]
+        accepted_at_raw = meta["accepted_at"]
         contributions.append(
             DiscoveryContribution(
                 candidate=candidate,
                 status=ContributionStatus(meta["status"]),
                 created_at=datetime.fromisoformat(meta["created_at"]),
                 accepted_at=(
-                    datetime.fromisoformat(meta["accepted_at"])
-                    if meta.get("accepted_at")
-                    else None
+                    datetime.fromisoformat(accepted_at_raw) if accepted_at_raw else None
                 ),
-                human_note=meta.get("human_note", ""),
+                human_note=meta["human_note"],
             )
         )
     return DiscoveryBatch(

@@ -170,6 +170,7 @@ def selected_subject(
         tlp=TLP.AMBER,
         sensitivity="internal",
         external_llm_allowed=False,
+        parser_version="test-parser-v1",
     )
     subject = Subject(
         external_id=f"subject-{uuid4()}", slug=f"subject-{uuid4().hex}", tlp=TLP.AMBER
@@ -732,6 +733,7 @@ async def test_new_contribution_does_not_recollect_an_already_known_url(
         tlp=TLP.AMBER,
         sensitivity="internal",
         external_llm_allowed=False,
+        parser_version="test-parser-v1",
     )
     factory.batches[complement.id] = complement
     group.add_candidates((CandidateReference(complement.id, complement_candidate.id),))

@@ -270,10 +270,10 @@ class DiscoveryBatch:
     tlp: TLP
     sensitivity: str
     external_llm_allowed: bool
+    parser_version: str
     contributions: list[DiscoveryContribution] = field(default_factory=list)
     candidates: list[CandidateTopic] = field(default_factory=list)
     report_sha256: str | None = None
-    parser_version: str = "legacy-model-structured"
     parsing_status: str = "completed"
     parsing_warnings: tuple[str, ...] = ()
     unattached_visible_citations: tuple[dict[str, str | None], ...] = ()

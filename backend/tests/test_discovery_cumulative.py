@@ -566,6 +566,7 @@ def _batch(edition_id: UUID, candidates: list[CandidateTopic]) -> DiscoveryBatch
         tlp=TLP.AMBER,
         sensitivity="internal",
         external_llm_allowed=True,
+        parser_version="test-parser-v1",
         report_sha256=uuid4().hex * 2,
         source_mode=DiscoverySourceMode.VISIBLE_CITATIONS_ONLY,
     )
