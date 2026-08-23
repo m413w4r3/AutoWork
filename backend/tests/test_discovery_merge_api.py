@@ -8,11 +8,11 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.discovery import merge_runs_router, router
-from cti_app.application.discovery_cumulative import MergeHandleLabel
-from cti_app.application.discovery_manual_source_edits import (
+from cti_app.application.discovery.manual_source_edits import (
     IncompleteSourceCandidateNotFoundError,
     ManualSourceEditResult,
 )
+from cti_app.application.discovery_cumulative import MergeHandleLabel
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceCandidate, SourceRole
