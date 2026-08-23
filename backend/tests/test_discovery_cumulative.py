@@ -5,15 +5,13 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.discovery.cumulative.apply import apply_discovery_merge_plan
 from cti_app.application.discovery.cumulative.context import (
     build_discovery_delta,
     build_merge_handles,
 )
 from cti_app.application.discovery.cumulative.planners import HeuristicMergePlanner
-from cti_app.application.discovery.cumulative.service import (
-    apply_discovery_merge_plan,
-    make_merge_run,
-)
+from cti_app.application.discovery.cumulative.service import make_merge_run
 from cti_app.application.discovery.cumulative.validation import validate_merge_plan
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (

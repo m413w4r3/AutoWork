@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.discovery.cumulative.apply import apply_discovery_merge_plan
 from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
 from cti_app.application.discovery.cumulative.context import (
     DiscoveryBlockingStrategy,
@@ -19,10 +20,7 @@ from cti_app.application.discovery.cumulative.planners import (
     HumanMergePlanner,
     TargetedMergePlanner,
 )
-from cti_app.application.discovery.cumulative.service import (
-    apply_discovery_merge_plan,
-    make_merge_run,
-)
+from cti_app.application.discovery.cumulative.service import make_merge_run
 from cti_app.application.model_gateway import (
     ExternalModelBlockedError,
     ModelExecution,
