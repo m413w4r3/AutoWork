@@ -241,41 +241,29 @@ def _provisional_ioc_payload(ioc: ProvisionalDiscoveryIoc) -> dict[str, object]:
 def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
     payload = row.payload
     # Load candidates from payload
-    candidates = [_candidate_from_payload(item) for item in payload.get("candidates", [])]
+    candidates = [_candidate_from_payload(item) for item in payload["candidates"]]
 
-    # Load contribution metadata if available (new format)
-    contributions_meta = payload.get("contributions_meta", [])
-    contrib_map = {UUID(m["candidate_id"]): m for m in contributions_meta if "candidate_id" in m}
+    # Load contribution metadata
+    contributions_meta = payload["contributions_meta"]
+    contrib_map = {UUID(m["candidate_id"]): m for m in contributions_meta}
 
-    # Reconstruct contributions
+    # Reconstruct contributions from metadata
     contributions = []
     for candidate in candidates:
-        meta = contrib_map.get(candidate.id)
-        if meta:
-            # New format: use metadata from storage
-            contributions.append(
-                DiscoveryContribution(
-                    candidate=candidate,
-                    status=ContributionStatus(meta["status"]),
-                    created_at=datetime.fromisoformat(meta["created_at"]),
-                    accepted_at=(
-                        datetime.fromisoformat(meta["accepted_at"])
-                        if meta.get("accepted_at")
-                        else None
-                    ),
-                    human_note=meta.get("human_note", ""),
-                )
+        meta = contrib_map[candidate.id]
+        contributions.append(
+            DiscoveryContribution(
+                candidate=candidate,
+                status=ContributionStatus(meta["status"]),
+                created_at=datetime.fromisoformat(meta["created_at"]),
+                accepted_at=(
+                    datetime.fromisoformat(meta["accepted_at"])
+                    if meta.get("accepted_at")
+                    else None
+                ),
+                human_note=meta.get("human_note", ""),
             )
-        else:
-            # Legacy format: all candidates marked as ACCEPTED
-            contributions.append(
-                DiscoveryContribution(
-                    candidate=candidate,
-                    status=ContributionStatus.ACCEPTED,
-                    created_at=row.created_at,
-                    accepted_at=row.created_at,
-                )
-            )
+        )
     return DiscoveryBatch(
         id=row.id,
         edition_id=row.edition_id,
@@ -286,34 +274,32 @@ def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
         tlp=TLP(row.tlp),
         sensitivity=row.sensitivity,
         external_llm_allowed=row.external_llm_allowed,
-        queries=tuple(payload.get("queries", [])),
-        citations=tuple(payload.get("citations", [])),
+        queries=tuple(payload["queries"]),
+        citations=tuple(payload["citations"]),
         contributions=contributions,
-        report_sha256=(str(payload["report_sha256"]) if payload.get("report_sha256") else None),
-        parser_version=str(payload.get("parser_version", "legacy-model-structured")),
-        parsing_status=str(payload.get("parsing_status", "completed")),
-        parsing_warnings=_string_tuple(payload.get("parsing_warnings", [])),
-        unattached_visible_citations=tuple(payload.get("unattached_visible_citations", [])),
-        parsing_revision=int(payload.get("parsing_revision", 1)),
+        report_sha256=(str(payload["report_sha256"]) if payload["report_sha256"] else None),
+        parser_version=str(payload["parser_version"]),
+        parsing_status=str(payload["parsing_status"]),
+        parsing_warnings=_string_tuple(payload["parsing_warnings"]),
+        unattached_visible_citations=tuple(payload["unattached_visible_citations"]),
+        parsing_revision=int(payload["parsing_revision"]),
         supersedes_batch_id=(
             UUID(str(payload["supersedes_batch_id"]))
-            if payload.get("supersedes_batch_id")
+            if payload["supersedes_batch_id"]
             else None
         ),
         replaced_by_batch_id=(
             UUID(str(payload["replaced_by_batch_id"]))
-            if payload.get("replaced_by_batch_id")
+            if payload["replaced_by_batch_id"]
             else None
         ),
-        source_mode=DiscoverySourceMode(
-            str(payload.get("source_mode", DiscoverySourceMode.VISIBLE_CITATIONS_ONLY.value))
-        ),
-        bridge_capabilities=cast(dict[str, object], payload.get("bridge_capabilities", {})),
-        citation_count=int(payload.get("citation_count", len(payload.get("citations", [])))),
-        source_coverage_complete=bool(payload.get("source_coverage_complete", False)),
+        source_mode=DiscoverySourceMode(str(payload["source_mode"])),
+        bridge_capabilities=cast(dict[str, object], payload["bridge_capabilities"]),
+        citation_count=int(payload["citation_count"]),
+        source_coverage_complete=bool(payload["source_coverage_complete"]),
         source_coverage_incomplete_reason=(
             str(payload["source_coverage_incomplete_reason"])
-            if payload.get("source_coverage_incomplete_reason") is not None
+            if payload["source_coverage_incomplete_reason"] is not None
             else None
         ),
         created_at=row.created_at,

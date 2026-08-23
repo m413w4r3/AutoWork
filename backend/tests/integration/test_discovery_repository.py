@@ -193,6 +193,266 @@ async def test_discovery_batch_round_trip_and_source_status(
         await engine.dispose()
 
 
+async def test_discovery_batch_contributions_metadata_preserved(
+    migrated_postgres_url: str,
+) -> None:
+    """Verify contributions metadata is preserved in round-trip."""
+    from cti_app.domain.discovery import ContributionStatus, DiscoveryContribution
+
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    edition = Edition(
+        country="Iran",
+        country_code="IR",
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        tlp=TLP.AMBER,
+        languages=("fr", "en", "fa"),
+        target_major_articles=2,
+        target_briefs=6,
+        source_profile="iran-default",
+    )
+    research_run = _run("research", "a")
+    source = SourceCandidate(
+        url="https://vendor.example/report",
+        title="Report",
+        publisher="Vendor",
+        role=SourceRole.PRIMARY,
+        published_at=date(2026, 7, 10),
+        citation="Citation",
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+    )
+    candidate = CandidateTopic(
+        title="Candidate",
+        summary="Summary.",
+        novelty="Novel.",
+        technical_potential=4,
+        uncertainties=(),
+        relevance_reasons=(),
+        actors=(),
+        campaigns=(),
+        malware=(),
+        cves=(),
+        victims=(),
+        sectors=(),
+        countries=(),
+        likely_artifacts=(),
+        sources=[source],
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+    )
+    now = datetime.now(UTC)
+    batch = DiscoveryBatch(
+        edition_id=edition.id,
+        request_hash="d" * 64,
+        complementary_axis="initial",
+        queries=("Query",),
+        citations=(),
+        candidates=[candidate],
+        discovery_model_run_id=research_run.id,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        parser_version="v1",
+        parsing_status="completed",
+        contributions=[
+            DiscoveryContribution(
+                candidate=candidate,
+                status=ContributionStatus.ACCEPTED,
+                created_at=now,
+                accepted_at=now,
+                human_note="Manual review: valid candidate",
+            )
+        ],
+    )
+    try:
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.add_if_absent(edition)
+            await uow.model_runs.add(research_run)
+            assert await uow.discovery_batches.add_if_absent(batch)
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            persisted = await uow.discovery_batches.get_by_request_hash(edition.id, "d" * 64)
+            assert persisted is not None
+            assert len(persisted.contributions) == 1
+            contrib = persisted.contributions[0]
+            assert contrib.status == ContributionStatus.ACCEPTED
+            assert contrib.created_at == now
+            assert contrib.accepted_at == now
+            assert contrib.human_note == "Manual review: valid candidate"
+            assert contrib.candidate.id == candidate.id
+    finally:
+        await engine.dispose()
+
+
+async def test_discovery_batch_missing_contributions_meta_fails(
+    migrated_postgres_url: str,
+) -> None:
+    """Missing contributions_meta must cause KeyError."""
+    from cti_app.infrastructure.database.models import DiscoveryBatchRow
+    from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
+
+    # Manually construct a row with missing contributions_meta
+    row = DiscoveryBatchRow(
+        id=uuid4(),
+        edition_id=uuid4(),
+        request_hash="test",
+        complementary_axis="initial",
+        status="completed",
+        discovery_model_run_id=uuid4(),
+        tlp="AMBER",
+        sensitivity="internal",
+        external_llm_allowed=True,
+        payload={
+            "candidates": [],
+            # Missing: contributions_meta
+            "queries": [],
+            "citations": [],
+            "parser_version": "v1",
+            "parsing_status": "completed",
+            "parsing_warnings": [],
+            "unattached_visible_citations": [],
+            "parsing_revision": 1,
+            "supersedes_batch_id": None,
+            "replaced_by_batch_id": None,
+            "source_mode": "visible_citations_only",
+            "bridge_capabilities": {},
+            "citation_count": 0,
+            "source_coverage_complete": False,
+            "source_coverage_incomplete_reason": None,
+            "report_sha256": None,
+        },
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(KeyError, match="contributions_meta"):
+        _discovery_batch_from_row(row)
+
+
+async def test_discovery_batch_missing_parser_version_fails(
+    migrated_postgres_url: str,
+) -> None:
+    """Missing parser_version must cause KeyError."""
+    from cti_app.infrastructure.database.models import DiscoveryBatchRow
+    from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
+
+    row = DiscoveryBatchRow(
+        id=uuid4(),
+        edition_id=uuid4(),
+        request_hash="test",
+        complementary_axis="initial",
+        status="completed",
+        discovery_model_run_id=uuid4(),
+        tlp="AMBER",
+        sensitivity="internal",
+        external_llm_allowed=True,
+        payload={
+            "candidates": [],
+            "contributions_meta": [],
+            "queries": [],
+            "citations": [],
+            # Missing: parser_version
+            "parsing_status": "completed",
+            "parsing_warnings": [],
+            "unattached_visible_citations": [],
+            "parsing_revision": 1,
+            "supersedes_batch_id": None,
+            "replaced_by_batch_id": None,
+            "source_mode": "visible_citations_only",
+            "bridge_capabilities": {},
+            "citation_count": 0,
+            "source_coverage_complete": False,
+            "source_coverage_incomplete_reason": None,
+            "report_sha256": None,
+        },
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(KeyError, match="parser_version"):
+        _discovery_batch_from_row(row)
+
+
+async def test_discovery_batch_candidate_without_contribution_metadata_fails(
+    migrated_postgres_url: str,
+) -> None:
+    """Candidate without matching contribution metadata must cause KeyError."""
+    from uuid import uuid4 as make_uuid
+
+    from cti_app.infrastructure.database.models import DiscoveryBatchRow
+    from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
+
+    candidate_id = make_uuid()
+    row = DiscoveryBatchRow(
+        id=make_uuid(),
+        edition_id=make_uuid(),
+        request_hash="test",
+        complementary_axis="initial",
+        status="completed",
+        discovery_model_run_id=make_uuid(),
+        tlp="AMBER",
+        sensitivity="internal",
+        external_llm_allowed=True,
+        payload={
+            "candidates": [
+                {
+                    "id": str(candidate_id),
+                    "title": "Test",
+                    "summary": "Summary.",
+                    "novelty": "Novel.",
+                    "technical_potential": 1,
+                    "tlp": "AMBER",
+                    "sensitivity": "internal",
+                    "external_llm_allowed": True,
+                    "sources": [],
+                    "incomplete_sources": [],
+                    "provisional_iocs": [],
+                    "likely_artifacts": [],
+                    "uncertainties": [],
+                    "relevance_reasons": [],
+                    "actors": [],
+                    "campaigns": [],
+                    "malware": [],
+                    "cves": [],
+                    "victims": [],
+                    "sectors": [],
+                    "countries": [],
+                    "iocs": [],
+                    "parsing_warnings": [],
+                }
+            ],
+            "contributions_meta": [
+                # Missing entry for candidate_id
+            ],
+            "queries": [],
+            "citations": [],
+            "parser_version": "v1",
+            "parsing_status": "completed",
+            "parsing_warnings": [],
+            "unattached_visible_citations": [],
+            "parsing_revision": 1,
+            "supersedes_batch_id": None,
+            "replaced_by_batch_id": None,
+            "source_mode": "visible_citations_only",
+            "bridge_capabilities": {},
+            "citation_count": 0,
+            "source_coverage_complete": False,
+            "source_coverage_incomplete_reason": None,
+            "report_sha256": None,
+        },
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(KeyError):
+        _discovery_batch_from_row(row)
+
+
 def _run(template: str, hash_prefix: str) -> ModelRun:
     return ModelRun(
         provider=ModelProvider.FAKE,
