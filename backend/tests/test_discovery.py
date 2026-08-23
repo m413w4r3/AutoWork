@@ -9,9 +9,11 @@ from pydantic import BaseModel
 
 from cti_app.application.discovery import (
     DISCOVERY_JOB_KIND,
-    DiscoverEditionParameters,
     DiscoveryService,
     _research_prompt,
+)
+from cti_app.application.discovery.contracts import (
+    DiscoverEditionParameters,
     discovery_idempotency_key,
     discovery_request_hash,
 )

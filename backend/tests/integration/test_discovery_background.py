@@ -6,8 +6,10 @@ import pytest
 
 from cti_app.application.discovery import (
     DISCOVERY_JOB_KIND,
-    DiscoverEditionParameters,
     DiscoveryService,
+)
+from cti_app.application.discovery.contracts import (
+    DiscoverEditionParameters,
     discovery_idempotency_key,
 )
 from cti_app.application.editions import EditionService

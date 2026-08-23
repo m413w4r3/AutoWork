@@ -13,9 +13,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.discovery import (
     DISCOVERY_JOB_KIND,
-    DiscoverEditionParameters,
     DiscoveryService,
     SourceCandidateNotFoundError,
+)
+from cti_app.application.discovery.contracts import (
+    DiscoverEditionParameters,
     discovery_idempotency_key,
     discovery_request_hash,
 )

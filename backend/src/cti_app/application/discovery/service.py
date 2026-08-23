@@ -3,16 +3,17 @@ from __future__ import annotations
 # ruff: noqa: RUF001 - The exact French business prompt intentionally uses typographic apostrophes.
 import asyncio
 import hashlib
-import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from typing import Any, NoReturn
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from pydantic import Field, field_validator
-
+from cti_app.application.discovery.contracts import (
+    DiscoverEditionParameters,
+    discovery_request_hash,
+)
 from cti_app.application.discovery.ports import (
     BridgeCapabilitiesProvider,
     ModelOutputArchive,
@@ -40,7 +41,6 @@ from cti_app.application.model_gateway import (
     ResearchModel,
 )
 from cti_app.application.persistence import DiscoveryUnitOfWorkFactory
-from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     ContributionStatus,
@@ -81,39 +81,6 @@ def _wrap_candidates_as_contributions(
         )
         for candidate in candidates
     ]
-
-
-class DiscoverEditionParameters(JobParameters):
-    edition_id: UUID
-    country: str = Field(min_length=2, max_length=100)
-    country_aliases: list[str] = Field(min_length=1, max_length=30)
-    period_start: date
-    period_end: date
-    as_of_date: date = Field(default_factory=date.today)
-    languages: list[str] = Field(min_length=1, max_length=10)
-    source_profile: str = Field(min_length=1, max_length=128)
-    keywords: list[str] = Field(default_factory=list, max_length=100)
-    exclusions: list[str] = Field(default_factory=list, max_length=100)
-    complementary_axis: str = Field(default="initial", min_length=1, max_length=500)
-    tlp: TLP
-    sensitivity: str = Field(default="internal", min_length=1, max_length=64)
-    external_llm_allowed: bool = True
-    research_nonce: UUID | None = None
-
-    @field_validator("edition_id", "research_nonce", mode="before")
-    @classmethod
-    def parse_edition_id(cls, value: object) -> object:
-        return UUID(value) if isinstance(value, str) and value else value
-
-    @field_validator("period_start", "period_end", "as_of_date", mode="before")
-    @classmethod
-    def parse_date(cls, value: object) -> object:
-        return date.fromisoformat(value) if isinstance(value, str) else value
-
-    @field_validator("tlp", mode="before")
-    @classmethod
-    def parse_tlp(cls, value: object) -> object:
-        return TLP(value) if isinstance(value, str) else value
 
 
 class SourceCandidateNotFoundError(LookupError):
@@ -927,23 +894,6 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
         handler,
         resume_after_worker_loss=True,
     )
-
-
-def discovery_request_hash(parameters: DiscoverEditionParameters) -> str:
-    value = parameters.model_dump(mode="json")
-    for key in ("country_aliases", "languages", "keywords", "exclusions"):
-        cleaned = [item.strip() for item in value[key] if item.strip()]
-        value[key] = (
-            sorted({item.casefold() for item in cleaned})
-            if key in {"country_aliases", "languages"}
-            else sorted(dict.fromkeys(cleaned))
-        )
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
-def discovery_idempotency_key(parameters: DiscoverEditionParameters) -> str:
-    return f"discover-edition:{parameters.edition_id}:{discovery_request_hash(parameters)}"
 
 
 def _research_prompt(parameters: DiscoverEditionParameters) -> str:
