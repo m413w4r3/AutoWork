@@ -84,32 +84,6 @@ ForeignKeyShape = tuple[tuple[str, ...], str, tuple[str, ...], str | None]
 # Column definitions: type family, nullability, or both.
 ColumnShape = tuple[str, bool, int | None]
 
-# Check constraints the model names explicitly, but whose migration
-# (0016/0017) created them unnamed, so Postgres fell back to its own
-# `<table>_<column>_check` naming convention instead. `{model_name: db_name}`.
-KNOWN_CHECK_CONSTRAINT_RENAMES: dict[str, dict[str, str]] = {
-    "edition_production_batch_items": {
-        "ck_batch_item_position": "edition_production_batch_items_position_check",
-    },
-    "edition_production_batches": {
-        "ck_batch_profile": "edition_production_batches_profile_check",
-        "ck_batch_status": "edition_production_batches_status_check",
-    },
-    "production_artifacts": {
-        "ck_artifact_status": "production_artifacts_status_check",
-        "ck_artifact_stage": "production_artifacts_stage_check",
-        "ck_artifact_version": "production_artifacts_version_check",
-        "ck_artifact_input_hash": "production_artifacts_input_hash_check",
-    },
-    "subject_production_runs": {
-        "ck_run_version": "subject_production_runs_version_check",
-        "ck_run_status": "subject_production_runs_status_check",
-        "ck_run_stage": "subject_production_runs_current_stage_check",
-        "ck_run_profile": "subject_production_runs_profile_check",
-        "ck_run_number": "subject_production_runs_run_number_check",
-    },
-}
-
 # (index name, ordered columns, unique, is_partial) — shared by both the
 # ORM-derived and the reflected-from-database index shapes.
 IndexShape = tuple[str, tuple[str, ...], bool, bool]
@@ -412,10 +386,7 @@ def test_orm_table_matches_migrated_schema(
 
     assert actual["uniques"] == _expected_unique_constraints(table)
 
-    expected_checks = _expected_check_constraint_names(table)
-    renames = KNOWN_CHECK_CONSTRAINT_RENAMES.get(table_name, {})
-    expected_checks = (expected_checks - set(renames)) | set(renames.values())
-    assert actual["checks"] == expected_checks
+    assert actual["checks"] == _expected_check_constraint_names(table)
 
     assert actual["indexes"] == _expected_indexes(table)
 

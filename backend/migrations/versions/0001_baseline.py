@@ -1723,15 +1723,17 @@ def _create_subject_production_runs() -> None:
         ),
         sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
         sa.Column("research_date", sa.Date(), nullable=True),
-        sa.CheckConstraint("version >= 1"),
-        sa.CheckConstraint("run_number >= 1"),
+        sa.CheckConstraint("version >= 1", name="ck_run_version"),
+        sa.CheckConstraint("run_number >= 1", name="ck_run_number"),
         sa.CheckConstraint(
-            "status IN ('queued','running','ready','needs_review','failed','cancelled')"
+            "status IN ('queued','running','ready','needs_review','failed','cancelled')",
+            name="ck_run_status",
         ),
         sa.CheckConstraint(
-            "current_stage IN ('sources','references','extraction','synthesis','assembly')"
+            "current_stage IN ('sources','references','extraction','synthesis','assembly')",
+            name="ck_run_stage",
         ),
-        sa.CheckConstraint("profile IN ('brief_auto','major_assisted')"),
+        sa.CheckConstraint("profile IN ('brief_auto','major_assisted')", name="ck_run_profile"),
         sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
@@ -1776,10 +1778,14 @@ def _create_production_artifacts() -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
-        sa.CheckConstraint("version >= 1"),
-        sa.CheckConstraint("stage IN ('references','extraction','synthesis','brief')"),
-        sa.CheckConstraint("status IN ('verified','stale','needs_review')"),
-        sa.CheckConstraint("LENGTH(input_hash) = 64"),
+        sa.CheckConstraint("version >= 1", name="ck_artifact_version"),
+        sa.CheckConstraint(
+            "stage IN ('references','extraction','synthesis','brief')", name="ck_artifact_stage"
+        ),
+        sa.CheckConstraint(
+            "status IN ('verified','stale','needs_review')", name="ck_artifact_status"
+        ),
+        sa.CheckConstraint("LENGTH(input_hash) = 64", name="ck_artifact_input_hash"),
         sa.ForeignKeyConstraint(
             ["production_run_id"], ["subject_production_runs.id"], ondelete="CASCADE"
         ),
@@ -1818,9 +1824,10 @@ def _create_edition_production_batches() -> None:
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
         sa.CheckConstraint(
-            "status IN ('queued','running','completed','completed_with_issues','cancelled')"
+            "status IN ('queued','running','completed','completed_with_issues','cancelled')",
+            name="ck_batch_status",
         ),
-        sa.CheckConstraint("profile IN ('brief_auto','major_assisted')"),
+        sa.CheckConstraint("profile IN ('brief_auto','major_assisted')", name="ck_batch_profile"),
         sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
     )
@@ -1845,7 +1852,7 @@ def _create_edition_production_batch_items() -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
-        sa.CheckConstraint("position >= 1"),
+        sa.CheckConstraint("position >= 1", name="ck_batch_item_position"),
         sa.ForeignKeyConstraint(
             ["batch_id"], ["edition_production_batches.id"], ondelete="CASCADE"
         ),
