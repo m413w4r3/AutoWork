@@ -14,13 +14,13 @@ from cti_app.application.discovery.cumulative.context import (
     project_merge_subject,
 )
 from cti_app.application.discovery.cumulative.errors import MergeModelUnavailableError
+from cti_app.application.discovery.cumulative.merge_runs import make_merge_run
 from cti_app.application.discovery.cumulative.planners import (
     HeuristicMergePlanner,
     HumanMergeDecision,
     HumanMergePlanner,
     TargetedMergePlanner,
 )
-from cti_app.application.discovery.cumulative.service import make_merge_run
 from cti_app.application.model_gateway import (
     ExternalModelBlockedError,
     ModelExecution,
