@@ -81,51 +81,8 @@ EXPECTED_TABLES = frozenset(Base.metadata.tables) | {ALEMBIC_TABLE}
 # both the ORM-derived and the reflected-from-database foreign key shapes.
 ForeignKeyShape = tuple[tuple[str, ...], str, tuple[str, ...], str | None]
 
-# Foreign keys present in the database but not declared on the ORM model.
-KNOWN_EXTRA_FOREIGN_KEYS: dict[str, set[ForeignKeyShape]] = {
-    "brief_evidence_packs": {
-        # 0021 added both with raw `op.create_foreign_key`; `BriefEvidencePackRow`
-        # declares `built_from_snapshot_id` / `base_pack_id` as bare `Uuid` columns.
-        (("built_from_snapshot_id",), "discovery_snapshots", ("id",), "RESTRICT"),
-        (("base_pack_id",), "brief_evidence_packs", ("id",), "RESTRICT"),
-    },
-    "discovery_merge_runs": {
-        # 0019 adds this FK by ALTER after creating `discovery_snapshots` (which
-        # itself depends on `discovery_merge_runs`); `DiscoveryMergeRunRow`
-        # declares `parent_snapshot_id` as a bare `Uuid` column.
-        (("parent_snapshot_id",), "discovery_snapshots", ("id",), "RESTRICT"),
-    },
-}
-
 # Column definitions: type family, nullability, or both.
 ColumnShape = tuple[str, bool, int | None]
-
-# Check constraints that exist in the database but have no corresponding
-# `CheckConstraint` at all on the ORM model (the model's `__table_args__`
-# simply never picked them up).
-KNOWN_EXTRA_CHECK_CONSTRAINTS: dict[str, set[str]] = {
-    "claims": {"ck_claims_local_span"},  # 0008
-    "collection_attempts": {  # 0008
-        "ck_collection_attempts_decoded_sha256",
-        "ck_collection_attempts_encoded_sha256",
-    },
-    "collection_policy_snapshots": {"ck_collection_policy_snapshots_id"},  # 0008
-    "discovery_batches": {"ck_discovery_payload_object"},  # 0005
-    "editions": {"ck_editions_complete_month", "ck_editions_languages"},  # 0003
-    "editorial_groups": {"ck_editorial_payload_object"},  # 0006
-    "human_decisions": {  # 0006
-        "ck_human_decisions_groups_array",
-        "ck_human_decisions_payload_object",
-    },
-    "model_conversation_turns": {"ck_model_conversation_turns_hashes"},  # 0011
-    "model_output_rejections": {"ck_model_output_rejections_hash"},  # 0012
-    "model_runs": {  # 0004 / 0012
-        "ck_model_runs_parameters_object",
-        "ck_model_runs_output_diagnostic_counts",
-        "ck_model_runs_output_references_array",
-    },
-    "subject_merge_events": {"ck_subject_merge_events_distinct"},  # 0019
-}
 
 # Check constraints the model names explicitly, but whose migration
 # (0016/0017) created them unnamed, so Postgres fell back to its own
@@ -156,22 +113,6 @@ KNOWN_CHECK_CONSTRAINT_RENAMES: dict[str, dict[str, str]] = {
 # (index name, ordered columns, unique, is_partial) — shared by both the
 # ORM-derived and the reflected-from-database index shapes.
 IndexShape = tuple[str, tuple[str, ...], bool, bool]
-
-# Indexes that exist in the database but have no corresponding `Index` at all
-# declared on the ORM model's `__table_args__`.
-KNOWN_EXTRA_INDEXES: dict[str, set[IndexShape]] = {
-    "conversation_lifecycles": {  # 0023 creates these; ConversationLifecycleRow
-        # declares no `Index` objects at all.
-        ("ix_conversation_lifecycles_conversation_id", ("conversation_id",), False, False),
-        ("ix_conversation_lifecycles_status", ("status",), False, False),
-        ("ix_conversation_lifecycles_created_at", ("created_at",), False, False),
-    },
-    "editorial_groups": {
-        # 0019 adds this index alongside `discovery_subject_id`; EditorialGroupRow
-        # never declares it.
-        ("ix_editorial_groups_discovery_subject", ("discovery_subject_id",), False, False),
-    },
-}
 
 # (table, trigger_name) -> function_name, for every trigger installed by the
 # migration chain. Built by hand from the CREATE TRIGGER / CREATE FUNCTION
@@ -467,19 +408,16 @@ def test_orm_table_matches_migrated_schema(
 
     assert actual["pk"] == _expected_primary_key(table)
 
-    expected_fks = _expected_foreign_keys(table) | KNOWN_EXTRA_FOREIGN_KEYS.get(table_name, set())
-    assert actual["fks"] == expected_fks
+    assert actual["fks"] == _expected_foreign_keys(table)
 
     assert actual["uniques"] == _expected_unique_constraints(table)
 
     expected_checks = _expected_check_constraint_names(table)
     renames = KNOWN_CHECK_CONSTRAINT_RENAMES.get(table_name, {})
     expected_checks = (expected_checks - set(renames)) | set(renames.values())
-    expected_checks |= KNOWN_EXTRA_CHECK_CONSTRAINTS.get(table_name, set())
     assert actual["checks"] == expected_checks
 
-    expected_indexes = _expected_indexes(table) | KNOWN_EXTRA_INDEXES.get(table_name, set())
-    assert actual["indexes"] == expected_indexes
+    assert actual["indexes"] == _expected_indexes(table)
 
 
 # ---------------------------------------------------------------------------

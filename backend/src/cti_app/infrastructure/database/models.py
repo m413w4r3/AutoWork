@@ -274,6 +274,13 @@ class EditionRow(Base):
         CheckConstraint("target_major_articles BETWEEN 0 AND 20", name="ck_editions_major"),
         CheckConstraint("target_briefs BETWEEN 0 AND 100", name="ck_editions_briefs"),
         CheckConstraint("period_start <= period_end", name="ck_editions_period_order"),
+        CheckConstraint(
+            "period_start = date_trunc('month', period_start)::date "
+            "AND period_end = (date_trunc('month', period_start) + "
+            "interval '1 month - 1 day')::date",
+            name="ck_editions_complete_month",
+        ),
+        CheckConstraint("jsonb_typeof(languages) = 'array'", name="ck_editions_languages"),
         Index("ix_editions_country_status", "country_code", "status"),
         Index("ix_editions_period", "period_start", "period_end"),
     )
@@ -354,6 +361,18 @@ class ModelRunRow(Base):
             "char_length(evidence_pack_hash) = 64",
             name="ck_model_runs_evidence_hash_length",
         ),
+        CheckConstraint(
+            "jsonb_typeof(parameters) = 'object'", name="ck_model_runs_parameters_object"
+        ),
+        CheckConstraint(
+            "jsonb_typeof(output_references) = 'array'",
+            name="ck_model_runs_output_references_array",
+        ),
+        CheckConstraint(
+            "(raw_output_chars IS NULL OR raw_output_chars >= 0) "
+            "AND citation_count >= 0 AND extracted_url_count >= 0",
+            name="ck_model_runs_output_diagnostic_counts",
+        ),
         Index("ix_model_runs_status", "status", "updated_at"),
         Index("ix_model_runs_evidence", "evidence_pack_hash", "started_at"),
     )
@@ -398,7 +417,12 @@ class ModelRunRow(Base):
 
 class ModelOutputRejectionRow(Base):
     __tablename__ = "model_output_rejections"
-    __table_args__ = (Index("ix_model_output_rejections_run", "model_run_id", "created_at"),)
+    __table_args__ = (
+        CheckConstraint(
+            "value_sha256 ~ '^[0-9a-f]{64}$'", name="ck_model_output_rejections_hash"
+        ),
+        Index("ix_model_output_rejections_run", "model_run_id", "created_at"),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     model_run_id: Mapped[UUID] = mapped_column(
@@ -475,6 +499,11 @@ class ModelConversationTurnRow(Base):
             name="ck_model_conversation_turns_status",
         ),
         CheckConstraint("sequence >= 1", name="ck_model_conversation_turns_sequence"),
+        CheckConstraint(
+            "input_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND (output_sha256 IS NULL OR output_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_model_conversation_turns_hashes",
+        ),
         Index("ix_model_conversation_turns_conversation", "conversation_id", "sequence"),
         Index(
             "uq_model_conversation_turn_running",
@@ -523,6 +552,7 @@ class DiscoveryBatchRow(Base):
             name="ck_discovery_batches_request_hash",
         ),
         CheckConstraint("status = 'completed'", name="ck_discovery_batches_status"),
+        CheckConstraint("jsonb_typeof(payload) = 'object'", name="ck_discovery_payload_object"),
         Index("ix_discovery_batches_edition", "edition_id", "created_at"),
     )
 
@@ -590,7 +620,15 @@ class DiscoveryMergeRunRow(Base):
     edition_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
     )
-    parent_snapshot_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    parent_snapshot_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "discovery_snapshots.id",
+            name="fk_discovery_merge_runs_parent_snapshot",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+    )
     intake_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("discovery_intakes.id", ondelete="RESTRICT"), nullable=False
     )
@@ -692,7 +730,12 @@ class DiscoverySnapshotRow(Base):
 
 class SubjectMergeEventRow(Base):
     __tablename__ = "subject_merge_events"
-    __table_args__ = (Index("ix_subject_merge_events_edition", "edition_id", "created_at"),)
+    __table_args__ = (
+        CheckConstraint(
+            "from_subject_id <> into_subject_id", name="ck_subject_merge_events_distinct"
+        ),
+        Index("ix_subject_merge_events_edition", "edition_id", "created_at"),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     edition_id: Mapped[UUID] = mapped_column(
@@ -780,7 +823,9 @@ class EditorialGroupRow(Base):
             name="ck_editorial_groups_confidence",
         ),
         CheckConstraint("version > 0", name="ck_editorial_groups_version"),
+        CheckConstraint("jsonb_typeof(payload) = 'object'", name="ck_editorial_payload_object"),
         Index("ix_editorial_groups_edition", "edition_id", "status", "created_at"),
+        Index("ix_editorial_groups_discovery_subject", "discovery_subject_id"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -818,6 +863,12 @@ class HumanDecisionRow(Base):
         CheckConstraint(
             f"decision_type IN ({HUMAN_DECISION_VALUES_SQL})",
             name="ck_human_decisions_type",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(group_ids) = 'array'", name="ck_human_decisions_groups_array"
+        ),
+        CheckConstraint(
+            "jsonb_typeof(payload) = 'object'", name="ck_human_decisions_payload_object"
         ),
         Index("ix_human_decisions_edition", "edition_id", "occurred_at"),
     )
@@ -924,6 +975,12 @@ class SourceCollectionRow(Base):
 
 class CollectionPolicySnapshotRow(Base):
     __tablename__ = "collection_policy_snapshots"
+    __table_args__ = (
+        CheckConstraint(
+            "char_length(id) = 64 AND id ~ '^[0-9a-f]{64}$'",
+            name="ck_collection_policy_snapshots_id",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     max_redirects: Mapped[int] = mapped_column(nullable=False)
@@ -957,6 +1014,16 @@ class CollectionAttemptRow(Base):
         CheckConstraint(
             "decoded_size IS NULL OR decoded_size >= 0",
             name="ck_collection_attempts_decoded_size",
+        ),
+        CheckConstraint(
+            "encoded_sha256 IS NULL OR "
+            "(char_length(encoded_sha256) = 64 AND encoded_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_collection_attempts_encoded_sha256",
+        ),
+        CheckConstraint(
+            "decoded_sha256 IS NULL OR "
+            "(char_length(decoded_sha256) = 64 AND decoded_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_collection_attempts_decoded_sha256",
         ),
         Index("ix_collection_attempts_collection", "collection_id", "attempted_at"),
         Index("ix_collection_attempts_job", "job_id"),
@@ -1021,6 +1088,11 @@ class ClaimRow(Base):
     __table_args__ = (
         CheckConstraint(f"kind IN ({CLAIM_KIND_VALUES_SQL})", name="ck_claims_kind"),
         CheckConstraint("span_start >= 0 AND span_end > span_start", name="ck_claims_span"),
+        CheckConstraint(
+            "(local_span_start IS NULL AND local_span_end IS NULL) OR "
+            "(local_span_start >= 0 AND local_span_end > local_span_start)",
+            name="ck_claims_local_span",
+        ),
         Index("ix_claims_subject", "subject_id", "created_at"),
         Index("ix_claims_source", "source_document_id"),
     )
@@ -1157,14 +1229,28 @@ class BriefEvidencePackRow(Base):
     # Added by migration 0021; nullable because packs frozen before it have no
     # snapshot of origin.
     built_from_snapshot_id: Mapped[UUID | None] = mapped_column(
-        Uuid(as_uuid=True), nullable=True
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "discovery_snapshots.id",
+            name="fk_brief_evidence_packs_snapshot",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
     )
     built_from_snapshot_version: Mapped[int | None] = mapped_column(nullable=True)
     covered_contribution_ids: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list
     )
     scope: Mapped[str] = mapped_column(String(10), nullable=False, default="full")
-    base_pack_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    base_pack_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "brief_evidence_packs.id",
+            name="fk_brief_evidence_packs_base",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
 
 
 class BriefDraftRow(Base):
@@ -1370,6 +1456,9 @@ class ConversationLifecycleRow(Base):
             name="ck_conv_lifecycle_outcome",
         ),
         CheckConstraint("cleanup_attempt_count >= 0", name="ck_conv_lifecycle_attempts"),
+        Index("ix_conversation_lifecycles_conversation_id", "conversation_id"),
+        Index("ix_conversation_lifecycles_status", "status"),
+        Index("ix_conversation_lifecycles_created_at", "created_at"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
