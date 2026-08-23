@@ -16,10 +16,12 @@ from cti_app.application.discovery.contracts import (
     discovery_idempotency_key,
     discovery_request_hash,
 )
-from cti_app.application.discovery.cumulative.service import (
-    CumulativeDiscoveryService,
+from cti_app.application.discovery.cumulative.errors import (
     DiscoveryMergeNeedsReview,
     DiscoverySnapshotStaleError,
+)
+from cti_app.application.discovery.cumulative.service import (
+    CumulativeDiscoveryService,
     HumanMergeDecision,
 )
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND

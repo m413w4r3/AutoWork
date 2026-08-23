@@ -12,14 +12,18 @@ from uuid import UUID
 
 import pytest
 
-from cti_app.application.discovery.cumulative.service import (
-    CumulativeDiscoveryService,
-    DiscoveryDelta,
+from cti_app.application.discovery.cumulative.contracts import ReconcileDiscoveryParameters
+from cti_app.application.discovery.cumulative.errors import (
     DiscoveryMergeNeedsReview,
     DiscoverySnapshotStaleError,
+)
+from cti_app.application.discovery.cumulative.service import (
+    CumulativeDiscoveryService,
     HumanMergeDecision,
+)
+from cti_app.application.discovery.cumulative.types import (
+    DiscoveryDelta,
     PlannedDiscoveryMerge,
-    ReconcileDiscoveryParameters,
     ResolvedMergeHandles,
 )
 from cti_app.domain.classification import TLP

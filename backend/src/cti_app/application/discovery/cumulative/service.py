@@ -9,12 +9,27 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
-from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from pydantic import ValidationError, field_validator
+from pydantic import ValidationError
 
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.discovery.cumulative.contracts import ReconcileDiscoveryParameters
+from cti_app.application.discovery.cumulative.errors import (
+    DiscoveryMergeNeedsReview,
+    DiscoverySnapshotStaleError,
+    MergeModelUnavailableError,
+    MergePlanInvalidError,
+)
+from cti_app.application.discovery.cumulative.types import (
+    AppliedDiscoveryMerge,
+    DiscoveryDelta,
+    DiscoveryMergePlanner,
+    IncomingDiscoveryCandidate,
+    MergeHandleLabel,
+    PlannedDiscoveryMerge,
+    ResolvedMergeHandles,
+)
 from cti_app.application.discovery.ports import BridgeCapabilitiesProvider
 from cti_app.application.discovery_identity import candidates_match_strongly, normalize
 from cti_app.application.jobs import (
@@ -77,128 +92,6 @@ DISCOVERY_BLOCKING_VERSION = "recall-v1"
 DISCOVERY_MERGE_PROMPT_VERSION = "1.0"
 DISCOVERY_MERGE_POLICY_VERSION = "identity-v1"
 RECONCILE_DISCOVERY_JOB_KIND = "reconcile_discovery"
-
-
-class DiscoverySnapshotStaleError(RuntimeError):
-    """The snapshot a merge was planned against is no longer the edition state.
-
-    `replan` carries the parameters of the reconciliation that should take this
-    plan's place. A reviewed plan names subjects by handles resolved against its
-    parent snapshot, so once that parent is superseded the plan is unusable and
-    the contribution has to be planned again from the current state.
-    """
-
-    def __init__(
-        self, reason: str, *, replan: ReconcileDiscoveryParameters | None = None
-    ) -> None:
-        super().__init__(reason)
-        self.replan = replan
-
-
-class DiscoveryMergeNeedsReview(RuntimeError):
-    def __init__(self, run_id: UUID, reasons: Sequence[str]) -> None:
-        super().__init__(", ".join(reasons))
-        self.run_id = run_id
-        self.reasons = tuple(reasons)
-
-
-class MergePlanInvalidError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        merge_model_run_id: UUID | None,
-        raw_output_reference: str | None,
-        normalized_output_reference: str | None,
-    ) -> None:
-        super().__init__(message)
-        self.merge_model_run_id = merge_model_run_id
-        self.raw_output_reference = raw_output_reference
-        self.normalized_output_reference = normalized_output_reference
-
-
-class MergeModelUnavailableError(RuntimeError):
-    """The merge model never produced an answer — nothing was planned at all.
-
-    Distinct from MergePlanInvalidError on purpose: a stalled bridge is a
-    transient incident to retry, whereas a malformed plan is a real answer the
-    reviewer can be shown. Conflating them persists an empty merge run that no
-    human can resolve, and it silently blocks every later contribution.
-    """
-
-    def __init__(self, message: str, *, merge_model_run_id: UUID | None, code: str) -> None:
-        super().__init__(message)
-        self.merge_model_run_id = merge_model_run_id
-        self.code = code
-
-
-class ReconcileDiscoveryParameters(JobParameters):
-    intake_id: UUID
-    edition_id: UUID
-    expected_parent_snapshot_id: UUID | None
-    actor_id: str
-    rebase_count: int = 0
-
-    @field_validator("intake_id", "edition_id", "expected_parent_snapshot_id", mode="before")
-    @classmethod
-    def parse_uuid(cls, value: object) -> object:
-        return UUID(value) if isinstance(value, str) and value else value
-
-
-@dataclass(frozen=True, slots=True)
-class IncomingDiscoveryCandidate:
-    handle: str
-    candidate_key: UUID
-    candidate: CandidateTopic
-    batch_id: UUID
-
-
-@dataclass(frozen=True, slots=True)
-class DiscoveryDelta:
-    intake_id: UUID
-    candidates: tuple[IncomingDiscoveryCandidate, ...]
-    delta_hash: str
-
-
-@dataclass(frozen=True, slots=True)
-class ResolvedMergeHandles:
-    existing: dict[str, UUID]
-    incoming: dict[str, IncomingDiscoveryCandidate]
-
-
-@dataclass(frozen=True, slots=True)
-class AppliedDiscoveryMerge:
-    snapshot: DiscoverySnapshot
-    identities: tuple[DiscoverySubjectIdentity, ...]
-    contributions: tuple[SubjectContribution, ...]
-    merge_events: tuple[SubjectMergeEvent, ...]
-    warnings: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class PlannedDiscoveryMerge:
-    plan: DiscoveryMergePlanV1
-    merge_model_run_id: UUID | None = None
-    raw_output_reference: str | None = None
-    normalized_output_reference: str | None = None
-    validation_status: MergeValidationStatus = MergeValidationStatus.VALID
-    warnings: tuple[str, ...] = ()
-
-
-class DiscoveryMergePlanner(Protocol):
-    kind: DiscoveryPlannerKind
-    policy_version: str
-
-    async def plan(
-        self,
-        parent_snapshot: DiscoverySnapshot | None,
-        delta: DiscoveryDelta,
-        handles: ResolvedMergeHandles,
-        *,
-        edition_id: UUID,
-        external_llm_allowed: bool,
-        sensitivity: str,
-    ) -> PlannedDiscoveryMerge: ...
 
 
 class HeuristicMergePlanner:
@@ -1115,16 +1008,6 @@ def apply_discovery_merge_plan(
         merge_events=tuple(merge_events),
         warnings=tuple(dict.fromkeys(warnings)),
     )
-
-
-@dataclass(frozen=True, slots=True)
-class MergeHandleLabel:
-    """What a merge handle stands for, in reviewer-readable terms."""
-
-    handle: str
-    title: str
-    summary: str
-    source_urls: tuple[str, ...]
 
 
 def _handle_label(handle: str, candidate: CandidateTopic) -> MergeHandleLabel:
