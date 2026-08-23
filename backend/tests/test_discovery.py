@@ -7,7 +7,6 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import pytest
 from pydantic import BaseModel
 
-from cti_app.application.discovery import DiscoveryService
 from cti_app.application.discovery.contracts import (
     DiscoverEditionParameters,
     discovery_idempotency_key,
@@ -15,6 +14,7 @@ from cti_app.application.discovery.contracts import (
 )
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.prompts import _research_prompt
+from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.jobs import (
     DuplicateJobError,
     JobExecutor,

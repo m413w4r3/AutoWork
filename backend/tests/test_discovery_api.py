@@ -6,7 +6,7 @@ from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.discovery import router as discovery_router
 from cti_app.api.jobs import router as jobs_router
-from cti_app.application.discovery import DiscoveryService
+from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.editions import EditionService
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import (

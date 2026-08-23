@@ -11,10 +11,6 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from cti_app.application.discovery import (
-    DiscoveryService,
-    SourceCandidateNotFoundError,
-)
 from cti_app.application.discovery.contracts import (
     DiscoverEditionParameters,
     discovery_idempotency_key,
@@ -24,6 +20,10 @@ from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.manual_source_edits import (
     IncompleteSourceCandidateNotFoundError,
     ManualSourceEditService,
+)
+from cti_app.application.discovery.service import (
+    DiscoveryService,
+    SourceCandidateNotFoundError,
 )
 from cti_app.application.discovery_cumulative import (
     CumulativeDiscoveryService,
