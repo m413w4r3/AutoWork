@@ -1033,7 +1033,6 @@ class CollectionAttemptRow(Base):
     job_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("jobs.id", ondelete="RESTRICT"), nullable=False
     )
-    configuration_id: Mapped[str] = mapped_column(String(64), nullable=False)
     policy_snapshot_id: Mapped[str] = mapped_column(
         String(64),
         ForeignKey("collection_policy_snapshots.id", ondelete="RESTRICT"),

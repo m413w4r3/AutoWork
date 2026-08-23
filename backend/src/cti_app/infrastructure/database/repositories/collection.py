@@ -287,7 +287,6 @@ def _collection_attempt_values(attempt: CollectionAttempt) -> dict[str, object]:
         "id": attempt.id,
         "collection_id": attempt.collection_id,
         "job_id": attempt.job_id,
-        "configuration_id": attempt.policy_snapshot_id,
         "policy_snapshot_id": attempt.policy_snapshot_id,
         "requested_url": attempt.requested_url,
         "final_url": attempt.final_url,

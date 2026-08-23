@@ -243,10 +243,6 @@ class SubjectCollectionService:
             return await uow.subjects.get(subject_id) is not None
 
     @property
-    def configuration_id(self) -> str:
-        return self._policy_snapshot.id
-
-    @property
     def policy_snapshot(self) -> CollectionPolicySnapshot:
         return self._policy_snapshot
 
@@ -1024,13 +1020,13 @@ def register_collection_jobs(registry: JobRegistry, service: SubjectCollectionSe
 
 def collection_idempotency_key(
     subject_id: UUID,
-    configuration_id: str,
+    policy_snapshot_id: str,
     round_number: int,
     *,
     collection_id: UUID | None = None,
 ) -> str:
     target = str(collection_id) if collection_id else "all"
-    return f"source.collect:{subject_id}:{target}:{configuration_id}:{round_number}"
+    return f"source.collect:{subject_id}:{target}:{policy_snapshot_id}:{round_number}"
 
 
 def _new_collection(

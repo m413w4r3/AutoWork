@@ -12,7 +12,10 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.collection import SubjectCollectionService
+from cti_app.application.collection import (
+    SubjectCollectionService,
+    collection_idempotency_key,
+)
 from cti_app.application.http_collection import (
     CollectionPolicy,
     PinnedHttpRequest,
@@ -392,7 +395,7 @@ async def test_expired_fetch_lease_is_recovered_with_interruption_attempt(tmp_pa
     source.claim_fetch(
         uuid4(),
         lease_duration=timedelta(seconds=1),
-        policy_snapshot_id=app.configuration_id,
+        policy_snapshot_id=app.policy_snapshot.id,
         now=datetime.now(UTC) - timedelta(minutes=5),
     )
     factory.collections[source.id] = source
@@ -739,3 +742,12 @@ async def test_new_contribution_does_not_recollect_an_already_known_url(
         "https://one.example/report",
         "https://three.example/report",
     ]
+
+
+def test_collection_idempotency_key_matches_historical_format() -> None:
+    subject_id = uuid4()
+    snapshot_id = "policy-snapshot-abc"
+
+    key = collection_idempotency_key(subject_id, snapshot_id, 3)
+
+    assert key == f"source.collect:{subject_id}:all:{snapshot_id}:3"

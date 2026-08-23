@@ -1258,7 +1258,6 @@ def _create_collection_attempts() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("collection_id", sa.Uuid(), nullable=False),
         sa.Column("job_id", sa.Uuid(), nullable=False),
-        sa.Column("configuration_id", sa.String(length=64), nullable=False),
         sa.Column("requested_url", sa.Text(), nullable=False),
         sa.Column("final_url", sa.Text(), nullable=True),
         sa.Column("redirect_chain", postgresql.JSONB(astext_type=sa.Text()), nullable=False),

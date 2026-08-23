@@ -140,7 +140,7 @@ async def launch_collection(subject_id: UUID, request: Request) -> CollectionLau
         ),
         default=1,
     )
-    key = collection_idempotency_key(subject_id, collection.configuration_id, round_number)
+    key = collection_idempotency_key(subject_id, collection.policy_snapshot.id, round_number)
     duplicate = False
     try:
         job = await jobs.submit(
@@ -180,7 +180,7 @@ async def retry_source(
     actor_id = await _actor_id(request)
     key = collection_idempotency_key(
         subject_id,
-        collection.configuration_id,
+        collection.policy_snapshot.id,
         source.attempt_count + 1,
         collection_id=source.id,
     )
