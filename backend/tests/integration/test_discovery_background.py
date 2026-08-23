@@ -4,14 +4,12 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from cti_app.application.discovery import (
-    DISCOVERY_JOB_KIND,
-    DiscoveryService,
-)
+from cti_app.application.discovery import DiscoveryService
 from cti_app.application.discovery.contracts import (
     DiscoverEditionParameters,
     discovery_idempotency_key,
 )
+from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.editions import EditionService
 from cti_app.application.jobs import JobExecutor, JobService, create_job_registry
 from cti_app.application.model_gateway import ModelGateway, ModelRouter

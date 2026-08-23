@@ -1,4 +1,4 @@
-from cti_app.application.discovery import DISCOVERY_JOB_KIND
+from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.config import get_settings
 from cti_app.workers.tasks import DURABLE_RESUME_JOB_KINDS, execute_job
 

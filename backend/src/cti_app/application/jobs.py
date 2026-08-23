@@ -627,7 +627,8 @@ def create_job_registry(
             raise TypeError("model_gateway must be a ModelGateway")
         register_model_jobs(registry, model_gateway)
     if discovery_service is not None:
-        from cti_app.application.discovery import DiscoveryService, register_discovery_jobs
+        from cti_app.application.discovery.jobs import register_discovery_jobs
+        from cti_app.application.discovery.service import DiscoveryService
 
         if not isinstance(discovery_service, DiscoveryService):
             raise TypeError("discovery_service must be a DiscoveryService")

@@ -12,7 +12,6 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.discovery import (
-    DISCOVERY_JOB_KIND,
     DiscoveryService,
     SourceCandidateNotFoundError,
 )
@@ -21,6 +20,7 @@ from cti_app.application.discovery.contracts import (
     discovery_idempotency_key,
     discovery_request_hash,
 )
+from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery_cumulative import (
     CumulativeDiscoveryService,
     DiscoveryMergeNeedsReview,

@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.discovery import DISCOVERY_JOB_KIND
+from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.jobs import (
     DemoJobParameters,
     DuplicateJobError,

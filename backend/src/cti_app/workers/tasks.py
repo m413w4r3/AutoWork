@@ -9,7 +9,8 @@ from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.discovery import DISCOVERY_JOB_KIND, DiscoveryService
+from cti_app.application.discovery import DiscoveryService
+from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery_cumulative import (
     RECONCILE_DISCOVERY_JOB_KIND,
     ChatGptMergePlanner,
