@@ -1,9 +1,7 @@
 from cti_app.application.discovery.service import (
     DISCOVERY_JOB_KIND,
-    BridgeCapabilitiesProvider,
     DiscoverEditionParameters,
     DiscoveryService,
-    ModelOutputArchive,
     SourceCandidateNotFoundError,
     _research_prompt,
     discovery_idempotency_key,
@@ -13,10 +11,8 @@ from cti_app.application.discovery.service import (
 
 __all__ = [
     "DISCOVERY_JOB_KIND",
-    "BridgeCapabilitiesProvider",
     "DiscoverEditionParameters",
     "DiscoveryService",
-    "ModelOutputArchive",
     "SourceCandidateNotFoundError",
     "_research_prompt",
     "discovery_idempotency_key",
