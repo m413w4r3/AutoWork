@@ -397,7 +397,7 @@ class Claim:
     span: SourceSpan
     extraction_method: str
     extraction_payload: dict[str, Any]
-    chunk_id: str = "legacy-full-document"
+    chunk_id: str
     local_span: SourceSpan | None = None
     model_run_id: UUID | None = None
     id: UUID = field(default_factory=uuid4)

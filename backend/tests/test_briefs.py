@@ -142,6 +142,7 @@ async def _context(
         span=SourceSpan(0, 26),
         extraction_method="deterministic-test",
         extraction_payload={},
+        chunk_id="test-chunk-1",
     )
     indicator = Indicator(
         subject_id=subject.id,
