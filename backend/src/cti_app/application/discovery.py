@@ -7,12 +7,11 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any, Literal, NoReturn, Protocol
+from typing import Any, NoReturn, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import Field, field_validator
 
 from cti_app.application.discovery_report_parser import (
     PARSER_VERSION,
@@ -45,9 +44,7 @@ from cti_app.domain.discovery import (
     DiscoveryContribution,
     DiscoverySourceMode,
     SourceCandidate,
-    SourceRole,
     SourceVerificationStatus,
-    canonicalize_http_url,
 )
 from cti_app.domain.discovery_cumulative import DiscoveryInputMode
 from cti_app.domain.model_conversations import (

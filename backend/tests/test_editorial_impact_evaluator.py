@@ -4,7 +4,6 @@ Tests for editorial impact evaluation.
 Incrément 3: Préservation éditoriale
 """
 
-import pytest
 from uuid import uuid4
 
 from cti_app.application.editorial_impact_evaluator import (
@@ -12,13 +11,12 @@ from cti_app.application.editorial_impact_evaluator import (
     ImpactEvaluationContext,
 )
 from cti_app.domain.editorial import EditorialImpactLevel
-from cti_app.domain.discovery_cumulative import SubjectContribution
 
 
 class TestEditorialImpactEvaluator:
     """Test editorial impact evaluation."""
 
-    def test_no_changes_when_no_new_contributions(self):
+    def test_no_changes_when_no_new_contributions(self) -> None:
         """No new contributions means NO_CHANGE."""
         evaluator = EditorialImpactEvaluator()
         context = ImpactEvaluationContext(
@@ -31,7 +29,7 @@ class TestEditorialImpactEvaluator:
 
         assert result == EditorialImpactLevel.NO_CHANGE
 
-    def test_new_evidence_with_contributions(self):
+    def test_new_evidence_with_contributions(self) -> None:
         """V1: Any new contribution is NEW_EVIDENCE."""
         evaluator = EditorialImpactEvaluator()
         context = ImpactEvaluationContext(
@@ -44,7 +42,7 @@ class TestEditorialImpactEvaluator:
 
         assert result == EditorialImpactLevel.NEW_EVIDENCE
 
-    def test_batch_evaluation(self):
+    def test_batch_evaluation(self) -> None:
         """Evaluate multiple subjects efficiently."""
         evaluator = EditorialImpactEvaluator()
         contexts = [

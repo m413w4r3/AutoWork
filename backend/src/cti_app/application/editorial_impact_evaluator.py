@@ -12,8 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
-from cti_app.domain.editorial import EditorialImpactLevel
 from cti_app.domain.discovery_cumulative import SubjectContribution
+from cti_app.domain.editorial import EditorialImpactLevel
 
 
 @dataclass

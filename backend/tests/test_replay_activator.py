@@ -4,17 +4,18 @@ Tests for replay activation - validating and promoting replays.
 Incrément 4: Replay and lineage
 """
 
-import pytest
 from uuid import uuid4
 
+import pytest
+
 from cti_app.application.replay_activator import (
-    ReplayActivator,
     ReplayActivationError,
+    ReplayActivator,
 )
 from cti_app.domain.discovery_cumulative import (
+    DiscoveryPlannerKind,
     DiscoverySnapshot,
     DiscoverySnapshotLineage,
-    DiscoveryPlannerKind,
     ReplayIdentityMapping,
     ReplayIdentityResolution,
 )
@@ -24,7 +25,7 @@ class TestReplayActivator:
     """Test replay activation and precondition validation."""
 
     @pytest.mark.asyncio
-    async def test_activation_requires_mapping_for_published_subjects(self):
+    async def test_activation_requires_mapping_for_published_subjects(self) -> None:
         """Cannot activate replay if published subject has no mapping."""
         activator = ReplayActivator()
         edition_id = uuid4()
@@ -65,7 +66,7 @@ class TestReplayActivator:
             )
 
     @pytest.mark.asyncio
-    async def test_activation_succeeds_with_complete_mapping(self):
+    async def test_activation_succeeds_with_complete_mapping(self) -> None:
         """Activation succeeds when all published subjects have mappings."""
         activator = ReplayActivator()
         edition_id = uuid4()
@@ -115,7 +116,7 @@ class TestReplayActivator:
         )
 
     @pytest.mark.asyncio
-    async def test_activation_allows_new_subjects(self):
+    async def test_activation_allows_new_subjects(self) -> None:
         """NEW subjects don't need operational mapping for activation."""
         activator = ReplayActivator()
         edition_id = uuid4()

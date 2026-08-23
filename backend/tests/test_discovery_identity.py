@@ -10,7 +10,9 @@ functions that apply it.
 from __future__ import annotations
 
 from datetime import date
+from typing import Any
 
+from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryIocType,
@@ -25,7 +27,6 @@ from cti_app.domain.discovery import (
     remap_ioc_publication_ids,
     same_publication,
 )
-from cti_app.domain.classification import TLP
 
 
 def make_source(
@@ -33,7 +34,7 @@ def make_source(
     title: str = "Iran central bank says no new disruption after banking cyberattack",
     publisher: str = "bne IntelliNews",
     published_at: date | None = None,
-    **kwargs: object,
+    **kwargs: Any,
 ) -> SourceCandidate:
     return SourceCandidate(
         url=url,
@@ -51,7 +52,7 @@ def make_source(
 def make_incomplete(
     title: str = "Iran central bank says no new disruption after banking cyberattack",
     publisher: str = "bne IntelliNews",
-    **kwargs: object,
+    **kwargs: Any,
 ) -> IncompleteSourceCandidate:
     return IncompleteSourceCandidate(title=title, publisher=publisher, **kwargs)
 
@@ -120,7 +121,9 @@ def test_same_publication_never_matches_generic_short_titles() -> None:
 def test_deduplicate_sources_collapses_near_duplicate_urls_and_unions_warnings() -> None:
     first = make_source("https://mirror-one.example/story?ref=123", publisher="bne IntelliNews")
     first.parsing_warnings = ("first warning",)
-    second = make_source("https://mirror-two.example/story?session=abc", publisher="bne IntelliNews")
+    second = make_source(
+        "https://mirror-two.example/story?session=abc", publisher="bne IntelliNews"
+    )
     second.parsing_warnings = ("second warning",)
 
     deduped, remap = deduplicate_sources([first, second])
@@ -149,7 +152,9 @@ def test_deduplicate_incomplete_sources_keeps_distinct_articles_separate() -> No
 
 def test_remap_ioc_publication_ids_follows_dropped_source_to_survivor() -> None:
     first = make_source("https://mirror-one.example/story?ref=123", publisher="bne IntelliNews")
-    second = make_source("https://mirror-two.example/story?session=abc", publisher="bne IntelliNews")
+    second = make_source(
+        "https://mirror-two.example/story?session=abc", publisher="bne IntelliNews"
+    )
     ioc = ProvisionalDiscoveryIoc(
         raw_value="1.2.3.4",
         normalized_value="1.2.3.4",

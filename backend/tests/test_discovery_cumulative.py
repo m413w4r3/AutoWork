@@ -29,6 +29,7 @@ from cti_app.domain.discovery_cumulative import (
     DiscoveryIntake,
     DiscoveryMergeGroup,
     DiscoveryMergePlanV1,
+    DiscoverySnapshot,
     MergeConfidence,
     MergeDisposition,
     MergeEvidence,
@@ -177,7 +178,7 @@ async def test_cross_batch_near_duplicate_urls_collapse_into_one_source() -> Non
     edition_id = uuid4()
     planner = HeuristicMergePlanner()
     subject_title = "Iran central bank says no new disruption after banking cyberattack"
-    snapshot: object | None = None
+    snapshot: DiscoverySnapshot | None = None
     for index, url in enumerate(
         [
             "https://mirror-one.example/story?ref=123",
@@ -220,6 +221,7 @@ async def test_cross_batch_near_duplicate_urls_collapse_into_one_source() -> Non
             merge_run_id=run.id,
         ).snapshot
 
+    assert snapshot is not None
     assert len(snapshot.subjects) == 1
     assert len(snapshot.subjects[0].candidate.sources) == 1
 
@@ -229,7 +231,7 @@ async def test_cross_batch_repeated_incomplete_citation_does_not_balloon() -> No
     """The incomplete-source counterpart of the near-duplicate-URL test above."""
     edition_id = uuid4()
     planner = HeuristicMergePlanner()
-    snapshot: object | None = None
+    snapshot: DiscoverySnapshot | None = None
     for index in range(3):
         batch = _batch(
             edition_id,
@@ -271,6 +273,7 @@ async def test_cross_batch_repeated_incomplete_citation_does_not_balloon() -> No
             merge_run_id=run.id,
         ).snapshot
 
+    assert snapshot is not None
     assert len(snapshot.subjects) == 1
     assert len(snapshot.subjects[0].candidate.incomplete_sources) == 1
 

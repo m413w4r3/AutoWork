@@ -23,10 +23,12 @@ from cti_app.application.model_gateway import (
     ModelExecution,
     ModelRequest,
 )
+from cti_app.domain.discovery import CandidateTopic
 from cti_app.domain.discovery_cumulative import (
     DiscoveryMergeGroup,
     DiscoveryMergePlanV1,
     DiscoveryPlannerKind,
+    DiscoverySnapshot,
     MergeConfidence,
     MergeDisposition,
     MergeEvidence,
@@ -204,7 +206,9 @@ async def test_chatgpt_merge_archives_its_conversation_on_direct_success() -> No
         sensitivity="internal",
     )
 
-    assert bridge.archived == [model.requests[0].conversation.id]
+    conversation = model.requests[0].conversation
+    assert conversation is not None
+    assert bridge.archived == [conversation.id]
 
 
 @pytest.mark.asyncio
@@ -242,10 +246,11 @@ async def test_chatgpt_merge_archives_both_conversations_after_repair() -> None:
     )
 
     assert len(model.requests) == 2
-    assert bridge.archived == [
-        model.requests[0].conversation.id,
-        model.requests[1].conversation.id,
-    ]
+    first_conversation = model.requests[0].conversation
+    second_conversation = model.requests[1].conversation
+    assert first_conversation is not None
+    assert second_conversation is not None
+    assert bridge.archived == [first_conversation.id, second_conversation.id]
 
 
 @pytest.mark.asyncio
@@ -369,7 +374,9 @@ def test_merge_projection_is_an_explicit_allowlist_without_internal_fields() -> 
         "uncertainties",
         "sources",
     }
-    assert set(projection["sources"][0]) == {
+    sources = projection["sources"]
+    assert isinstance(sources, list)
+    assert set(sources[0]) == {
         "canonical_url",
         "title",
         "publisher",
@@ -566,7 +573,7 @@ async def test_blocking_keeps_strict_shared_entity_when_snapshot_is_large() -> N
     assert len(selected) < len(parent.subjects)
 
 
-async def _bootstrap(edition_id: UUID, candidates: list[object]):
+async def _bootstrap(edition_id: UUID, candidates: list[CandidateTopic]) -> DiscoverySnapshot:
     batch = _batch(edition_id, candidates)
     intake = _intake(batch)
     delta = build_discovery_delta(intake, batch)

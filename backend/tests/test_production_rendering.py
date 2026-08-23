@@ -32,6 +32,7 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
 )
+from cti_app.domain.publication import ArtifactType
 
 RESEARCH_DATE = date(2026, 8, 1)
 
@@ -83,7 +84,7 @@ def _item(
         category=category,
         value=value,
         context="ctx",
-        artifact_type=artifact_type,
+        artifact_type=ArtifactType(artifact_type) if artifact_type is not None else None,
         attack_id=None,
         reference_ids=("R1",),
         source_ids=("S1",),

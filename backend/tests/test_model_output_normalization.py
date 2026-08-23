@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from datetime import date
 from typing import Any
 
 from cti_app.application.model_output_normalization import normalize_discovery_output
@@ -20,7 +19,9 @@ def _raw_payload() -> dict[str, Any]:
         "topics": [
             {
                 "provisional_title": "MuddyWater déploie une nouvelle chaîne d'infection",
-                "summary": "Une campagne visant plusieurs secteurs iraniens expose une chaîne technique.",
+                "summary": (
+                    "Une campagne visant plusieurs secteurs iraniens expose une chaîne technique."
+                ),
                 "novelty": "Nouvelle configuration et nouvelles TTP documentées.",
                 "technical_potential": 4,
                 "event_date": "2026-07-02",
@@ -64,7 +65,9 @@ def _raw_payload() -> dict[str, Any]:
             },
             {
                 "provisional_title": "MuddyWater déploie une nouvelle chaîne d'infection",
-                "summary": "Une campagne visant plusieurs secteurs iraniens expose une chaîne technique.",
+                "summary": (
+                    "Une campagne visant plusieurs secteurs iraniens expose une chaîne technique."
+                ),
                 "novelty": "Nouvelle configuration et nouvelles TTP documentées.",
                 "technical_potential": 4,
                 "event_date": "2026-07-02",

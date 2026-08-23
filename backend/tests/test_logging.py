@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -22,7 +23,7 @@ def test_json_formatter_emits_structured_record() -> None:
     assert payload["http_status"] == 200
 
 
-async def test_an_unhandled_request_failure_reaches_the_diagnostics_trail(tmp_path) -> None:
+async def test_an_unhandled_request_failure_reaches_the_diagnostics_trail(tmp_path: Path) -> None:
     # The browser only ever sees "une erreur interne est survenue", and the
     # container log is wiped by the next rebuild. Without this hook a failing
     # endpoint leaves nothing behind to diagnose it with.

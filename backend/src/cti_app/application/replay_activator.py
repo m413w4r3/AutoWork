@@ -11,13 +11,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from uuid import UUID
-from datetime import UTC, datetime
 
 from cti_app.domain.discovery_cumulative import (
     DiscoverySnapshot,
-    DiscoverySnapshotLineage,
     ReplayIdentityMapping,
-    ReplayIdentityResolution,
 )
 
 
@@ -113,7 +110,7 @@ class ReplayActivator:
         await self.validate_activation_preconditions(
             replay_snapshot,
             mappings,
-            set(),  # Would query published subjects
+            list[UUID](),  # Would query published subjects
         )
 
         # In real implementation, would:

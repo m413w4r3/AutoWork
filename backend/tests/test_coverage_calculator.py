@@ -4,35 +4,32 @@ Tests for coverage calculator - contribution closure and new contributions detec
 Incrément 3: Préservation éditoriale
 """
 
+from uuid import uuid4
+
 import pytest
-from uuid import UUID, uuid4
-from datetime import UTC, datetime
 
 from cti_app.application.coverage_calculator import (
-    resolve_canonical_subject,
     contribution_closure,
     new_contributions,
+    resolve_canonical_subject,
 )
 from cti_app.domain.discovery_cumulative import (
-    SubjectMergeEvent,
-    DiscoverySnapshot,
-    DiscoverySnapshotLineage,
     DiscoveryPlannerKind,
-    DiscoverySubject,
+    DiscoverySnapshot,
+    SubjectMergeEvent,
 )
-from cti_app.domain.discovery import CandidateTopic, SourceRelationshipStatus
 
 
 class TestResolveCanonicalSubject:
     """Test subject_id resolution through merge chains."""
 
-    def test_active_subject_resolves_to_itself(self):
+    def test_active_subject_resolves_to_itself(self) -> None:
         """An ACTIVE subject with no merges resolves to itself."""
         subject_id = uuid4()
         result = resolve_canonical_subject(subject_id, [])
         assert result == subject_id
 
-    def test_simple_merge_chain(self):
+    def test_simple_merge_chain(self) -> None:
         """Y → X resolves Y to X."""
         x_id = uuid4()
         y_id = uuid4()
@@ -52,7 +49,7 @@ class TestResolveCanonicalSubject:
         # X should resolve to itself
         assert resolve_canonical_subject(x_id, [event]) == x_id
 
-    def test_chain_z_to_y_to_x(self):
+    def test_chain_z_to_y_to_x(self) -> None:
         """Z → Y → X: Z resolves to X through chain."""
         x_id = uuid4()
         y_id = uuid4()
@@ -82,7 +79,7 @@ class TestResolveCanonicalSubject:
         # Z should resolve to X (canonical)
         assert resolve_canonical_subject(z_id, events) == x_id
 
-    def test_cycle_detection(self):
+    def test_cycle_detection(self) -> None:
         """A → B → A cycle raises ValueError."""
         a_id = uuid4()
         b_id = uuid4()
@@ -116,7 +113,7 @@ class TestResolveCanonicalSubject:
 class TestContributionClosure:
     """Test contribution closure - finding all contributions for a subject including merged ones."""
 
-    def test_subject_with_no_merges(self):
+    def test_subject_with_no_merges(self) -> None:
         """A subject with no merges has its own contributions."""
         subject_id = uuid4()
         contribution_ids = {uuid4(), uuid4(), uuid4()}
@@ -125,7 +122,7 @@ class TestContributionClosure:
         closure = contribution_closure(subject_id, [], all_contributions)
         assert closure == contribution_ids
 
-    def test_subject_absorbs_merged_contribution(self):
+    def test_subject_absorbs_merged_contribution(self) -> None:
         """When Y → X, X's closure includes Y's contributions."""
         x_id = uuid4()
         y_id = uuid4()
@@ -148,7 +145,7 @@ class TestContributionClosure:
         closure = contribution_closure(x_id, [event], all_contributions)
         assert closure == x_contrib | y_contrib
 
-    def test_multiple_merges_into_canonical(self):
+    def test_multiple_merges_into_canonical(self) -> None:
         """Multiple subjects merged into X all contribute to X's closure."""
         x_id = uuid4()
         y_id = uuid4()
@@ -187,7 +184,7 @@ class TestContributionClosure:
 class TestNewContributions:
     """Test detection of new contributions not yet covered by artifact."""
 
-    def test_no_new_contributions_when_all_covered(self):
+    def test_no_new_contributions_when_all_covered(self) -> None:
         """If all contributions are covered, new_contributions is empty."""
         artifact_id = uuid4()
         subject_id = uuid4()
@@ -195,7 +192,6 @@ class TestNewContributions:
 
         contrib1 = uuid4()
         contrib2 = uuid4()
-        all_contributions = {subject_id: {contrib1, contrib2}}
 
         # Both contributions are covered by the pack
         artifact_packs = [(uuid4(), {contrib1, contrib2})]
@@ -223,7 +219,7 @@ class TestNewContributions:
 
         assert result == set()
 
-    def test_new_contribution_detected(self):
+    def test_new_contribution_detected(self) -> None:
         """New contributions not in any pack are detected."""
         artifact_id = uuid4()
         subject_id = uuid4()
@@ -233,7 +229,6 @@ class TestNewContributions:
         contrib2 = uuid4()
         contrib_new = uuid4()
 
-        all_contributions = {subject_id: {contrib1, contrib2, contrib_new}}
         # Pack only covers first two
         artifact_packs = [(uuid4(), {contrib1, contrib2})]
 
@@ -259,7 +254,7 @@ class TestNewContributions:
 
         assert result == {contrib_new}
 
-    def test_dismissed_contributions_not_returned(self):
+    def test_dismissed_contributions_not_returned(self) -> None:
         """Dismissed contributions are excluded from new contributions."""
         artifact_id = uuid4()
         subject_id = uuid4()
@@ -268,7 +263,6 @@ class TestNewContributions:
         contrib1 = uuid4()
         contrib2 = uuid4()
 
-        all_contributions = {subject_id: {contrib1, contrib2}}
         artifact_packs = [(uuid4(), {contrib1})]
 
         snapshot = DiscoverySnapshot(

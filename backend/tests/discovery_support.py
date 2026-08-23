@@ -69,7 +69,7 @@ class InMemoryConversationLifecycleRepository:
         self, conversation_id: UUID
     ) -> ConversationLifecycle | None:
         return next(
-            (item for item in self._state.values() if item.conversation_id == conversation_id),
+            (item for item in self._state.values() if item.id == conversation_id),
             None,
         )
 

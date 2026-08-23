@@ -9,42 +9,33 @@ Tests the complete flow:
 - Published content remains immutable
 """
 
-import pytest
-from uuid import uuid4
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from cti_app.application.coverage_calculator import (
     contribution_closure,
     new_contributions,
 )
-from cti_app.application.editorial_impact_evaluator import (
-    EditorialImpactEvaluator,
-    ImpactEvaluationContext,
-)
 from cti_app.domain.briefs import (
-    BriefEvidencePack,
-    BriefDraft,
-    BriefDraftStatus,
-    BriefAmendment,
     AmendmentKind,
     AmendmentStatus,
+    BriefAmendment,
+    BriefDraft,
+    BriefDraftStatus,
+    BriefEvidencePack,
     EvidencePackScope,
 )
 from cti_app.domain.discovery_cumulative import (
-    DiscoverySnapshot,
-    DiscoverySnapshotLineage,
     DiscoveryPlannerKind,
-    DiscoverySubject,
-    SubjectContribution,
+    DiscoverySnapshot,
     SubjectMergeEvent,
 )
-from cti_app.domain.discovery import CandidateTopic
 
 
 class TestPublishedBriefWithNewContributions:
     """Test scenario: published brief receives new contributions."""
 
-    def test_published_content_immutable_after_new_contributions(self):
+    def test_published_content_immutable_after_new_contributions(self) -> None:
         """Published brief content is never modified, NEW_AVAILABLE signal added."""
         subject_id = uuid4()
         edition_id = uuid4()
@@ -87,10 +78,6 @@ class TestPublishedBriefWithNewContributions:
             status=BriefDraftStatus.APPROVED,
         )
 
-        # New contributions arrive in next snapshot
-        new_contrib1 = uuid4()
-        new_contrib2 = uuid4()
-
         snapshot = DiscoverySnapshot(
             edition_id=edition_id,
             version=2,
@@ -104,14 +91,8 @@ class TestPublishedBriefWithNewContributions:
 
         # Detect new contributions
         artifact_packs = [(published_pack.id, set(published_pack.covered_contribution_ids))]
-        all_subject_contributions = {
-            subject_id: set(published_pack.covered_contribution_ids) | {new_contrib1, new_contrib2}
-        }
 
-        # Build contribution map for closure
-        all_contributions_map = all_subject_contributions
-
-        new_contribs = new_contributions(
+        new_contributions(
             artifact_id=published_brief.id,
             artifact_subject_id=subject_id,
             artifact_packs=artifact_packs,
@@ -123,7 +104,7 @@ class TestPublishedBriefWithNewContributions:
         # We'd get new contributions detected (in real implementation)
         # For now, just verify the logic works
 
-    def test_amendment_chain_for_updates(self):
+    def test_amendment_chain_for_updates(self) -> None:
         """Multiple updates to a published brief create amendment chain."""
         subject_id = uuid4()
         edition_id = uuid4()
@@ -166,7 +147,7 @@ class TestPublishedBriefWithNewContributions:
         assert amend1.parent_artifact_id == root_brief_id
         assert amend2.parent_artifact_id == amend1.id
 
-    def test_correction_amendment_immutability(self):
+    def test_correction_amendment_immutability(self) -> None:
         """CORRECTION amendments don't modify original, create new version."""
         subject_id = uuid4()
         edition_id = uuid4()
@@ -195,7 +176,7 @@ class TestPublishedBriefWithNewContributions:
         # Amendment references it but doesn't modify it
         assert corrected.evidence_pack_id == original_pack_id
 
-    def test_merged_subject_preserves_contributions(self):
+    def test_merged_subject_preserves_contributions(self) -> None:
         """When a subject is merged, its contributions are included in UPDATE_AVAILABLE."""
         x_id = uuid4()  # Canonical
         y_id = uuid4()  # Merged into X
@@ -207,27 +188,6 @@ class TestPublishedBriefWithNewContributions:
 
         # X's contributions
         x_contrib1 = uuid4()
-
-        # X has a published brief covering only its own contributions
-        x_pack = BriefEvidencePack(
-            subject_id=x_id,
-            edition_id=edition_id,
-            group_id=uuid4(),
-            version=1,
-            content_hash="x_pack" + "0" * 58,
-            object_hashes=(),
-            sources=(),
-            claims=(),
-            indicators=(),
-            normalized_entities=(),
-            uncertainties=(),
-            human_decisions=(),
-            blob_id=uuid4(),
-            built_from_snapshot_id=uuid4(),
-            built_from_snapshot_version=1,
-            covered_contribution_ids=(x_contrib1,),
-            scope=EvidencePackScope.FULL,
-        )
 
         # Y is merged into X
         merge_event = SubjectMergeEvent(
@@ -248,6 +208,5 @@ class TestPublishedBriefWithNewContributions:
         assert x_contrib1 in closure
 
         # New contributions signal should include Y's contributions
-        artifact_packs = [(x_pack.id, {x_contrib1})]
         # All would show as "new" since they weren't in the original pack
         # This is important: merged subject's contributions don't get hidden

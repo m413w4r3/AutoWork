@@ -11,15 +11,14 @@ This module handles:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from uuid import UUID
 
 from cti_app.domain.briefs import (
-    BriefAmendment,
-    AmendmentStatus,
     AmendmentKind,
-    EvidencePackScope,
+    AmendmentStatus,
+    BriefAmendment,
     BriefEvidencePack,
+    EvidencePackScope,
 )
 
 

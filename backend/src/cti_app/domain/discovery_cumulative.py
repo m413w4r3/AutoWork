@@ -308,9 +308,15 @@ class ReplayIdentityMapping:
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
-        if self.resolution == ReplayIdentityResolution.SAME and self.operational_subject_id is None:
+        if (
+            self.resolution == ReplayIdentityResolution.SAME
+            and self.operational_subject_id is None
+        ):
             raise ValueError("SAME resolution requires an operational subject")
-        if self.resolution == ReplayIdentityResolution.NEW and self.operational_subject_id is not None:
+        if (
+            self.resolution == ReplayIdentityResolution.NEW
+            and self.operational_subject_id is not None
+        ):
             raise ValueError("NEW resolution must not have an operational subject")
         if not self.actor_id.strip():
             raise ValueError("Replay identity mapping requires an actor")

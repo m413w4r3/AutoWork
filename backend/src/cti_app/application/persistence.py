@@ -411,6 +411,7 @@ class UnitOfWork(Protocol):
     model_output_rejections: ModelOutputRejectionRepository
     model_conversations: ModelConversationRepository
     model_conversation_turns: ModelConversationTurnRepository
+    conversation_lifecycles: ConversationLifecycleRepository
     discovery_batches: DiscoveryBatchRepository
     discovery_intakes: DiscoveryIntakeRepository
     discovery_subject_identities: DiscoverySubjectIdentityRepository

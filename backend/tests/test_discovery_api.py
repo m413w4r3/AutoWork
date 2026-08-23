@@ -305,7 +305,7 @@ async def _recovery_application() -> tuple[
 
 async def test_recovery_of_cancelled_job_returns_original_job() -> None:
     """After removing the structuring pipeline, manual recovery returns the original job."""
-    application, edition, job_uow, _ = await _recovery_application()
+    application, edition, _job_uow, _ = await _recovery_application()
     markdown = research_markdown_fixture()
 
     async with AsyncClient(

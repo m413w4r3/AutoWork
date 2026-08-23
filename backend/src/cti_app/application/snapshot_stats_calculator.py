@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from uuid import UUID
-from datetime import UTC, datetime
 
 from cti_app.domain.discovery_cumulative import DiscoveryInputMode
 

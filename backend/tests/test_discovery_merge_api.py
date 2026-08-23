@@ -139,7 +139,9 @@ async def test_merge_review_api_lists_details_and_resolves_plan() -> None:
 
 
 class FakeManualSourceEditService:
-    def __init__(self, result: ManualSourceEditResult | None, error: Exception | None = None) -> None:
+    def __init__(
+        self, result: ManualSourceEditResult | None, error: Exception | None = None
+    ) -> None:
         self.result = result
         self.error = error
         self.calls: list[tuple[UUID, UUID, UUID, str, str]] = []

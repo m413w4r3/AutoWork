@@ -9,27 +9,24 @@ Tests the complete flow:
 - Verify published artifacts keep historical bindings
 """
 
-import pytest
 from uuid import uuid4
-from datetime import UTC, datetime
 
+from cti_app.domain.briefs import BriefDraft, BriefDraftStatus
 from cti_app.domain.discovery_cumulative import (
+    DiscoveryIdentityStatus,
+    DiscoveryPlannerKind,
     DiscoverySnapshot,
     DiscoverySnapshotLineage,
-    DiscoveryPlannerKind,
+    DiscoverySubjectIdentity,
     ReplayIdentityMapping,
     ReplayIdentityResolution,
-    ReplayComparison,
-    DiscoverySubjectIdentity,
-    DiscoveryIdentityStatus,
 )
-from cti_app.domain.briefs import BriefDraft, BriefDraftStatus
 
 
 class TestReplayEditionWorkflow:
     """Test complete replay edition workflow."""
 
-    def test_replay_creates_separate_lineage(self):
+    def test_replay_creates_separate_lineage(self) -> None:
         """Replay creates snapshot marked with REPLAY lineage."""
         edition_id = uuid4()
 
@@ -68,7 +65,7 @@ class TestReplayEditionWorkflow:
         assert operational.is_active is True
         assert replay.is_active is False
 
-    def test_identity_mapping_same_resolution(self):
+    def test_identity_mapping_same_resolution(self) -> None:
         """SAME resolution: replay origin_key == operational origin_key."""
         origin_key = "apt42:campaign_x"
 
@@ -100,7 +97,7 @@ class TestReplayEditionWorkflow:
         assert mapping.resolution == ReplayIdentityResolution.SAME
         assert mapping.replay_subject_id == mapping.operational_subject_id
 
-    def test_identity_mapping_split_resolution(self):
+    def test_identity_mapping_split_resolution(self) -> None:
         """SPLIT resolution: replay split what was merged operationally."""
         # Operationally, X and Y are merged (Y → X)
         x_id = uuid4()
@@ -130,10 +127,9 @@ class TestReplayEditionWorkflow:
         assert mapping_x.resolution == ReplayIdentityResolution.SPLIT_OF
         assert mapping_y.resolution == ReplayIdentityResolution.SPLIT_OF
 
-    def test_published_artifact_bindings_preserved(self):
+    def test_published_artifact_bindings_preserved(self) -> None:
         """After replay activation, published artifacts keep historical bindings."""
         subject_id = uuid4()
-        snapshot_v1_id = uuid4()
         pack_id = uuid4()
 
         # Published brief created in V1
@@ -164,13 +160,8 @@ class TestReplayEditionWorkflow:
         # - UI queries resolve subject_id through current identity
         # - Historical lineage preserved
 
-    def test_replay_comparison_report(self):
+    def test_replay_comparison_report(self) -> None:
         """Generate comparison report for replay vs operational."""
-        from cti_app.application.replay_service import ReplayService
-
-        service = ReplayService()
-        edition_id = uuid4()
-
         # Create mappings representing different outcomes
         mappings = {
             # 3 subjects that stayed same

@@ -53,6 +53,24 @@ select = ["E", "F", "I", "B", "UP", "ASYNC", "RUF"]
 # newlines into the prompts themselves.
 "src/cti_app/application/production_prompts.py" = ["E501"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI parameter markers are evaluated once at import time and reused by
+# design; that's the framework's contract, not the mutable-default-argument
+# bug B008 looks for. Ruff already treats these as immutable when the
+# parameter's own type annotation is immutable (e.g. `str`); this extends the
+# same treatment to annotations B008 doesn't otherwise recognize (e.g. `UUID`).
+extend-immutable-calls = [
+    "fastapi.Query",
+    "fastapi.Depends",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Security",
+]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

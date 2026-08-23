@@ -498,7 +498,10 @@ def remap_ioc_publication_ids(
     """
     for ioc in iocs:
         relations = tuple(
-            replace(relation, publication_id=remap.get(relation.publication_id, relation.publication_id))
+            replace(
+                relation,
+                publication_id=remap.get(relation.publication_id, relation.publication_id),
+            )
             for relation in ioc.publication_relations
         )
         seen: set[tuple[UUID, str]] = set()

@@ -4,16 +4,18 @@ Tests for amendment service - creating amendments and delta packs.
 Incrément 3: Préservation éditoriale
 """
 
-import pytest
-from uuid import uuid4
 from datetime import UTC, datetime
+from typing import Any
+from uuid import uuid4
+
+import pytest
 
 from cti_app.application.amendment_service import AmendmentService, DeltaPackBuilder
 from cti_app.domain.briefs import (
-    BriefEvidencePack,
-    BriefAmendment,
     AmendmentKind,
     AmendmentStatus,
+    BriefAmendment,
+    BriefEvidencePack,
     EvidencePackScope,
 )
 
@@ -45,7 +47,7 @@ def base_pack() -> BriefEvidencePack:
 class TestDeltaPackBuilder:
     """Test DELTA pack construction."""
 
-    def test_delta_pack_has_correct_scope(self, base_pack):
+    def test_delta_pack_has_correct_scope(self, base_pack: BriefEvidencePack) -> None:
         """A DELTA pack must have scope=DELTA and reference base pack."""
         builder = DeltaPackBuilder(
             parent_pack=base_pack,
@@ -65,9 +67,11 @@ class TestDeltaPackBuilder:
         assert delta_pack.base_pack_id == base_pack.id
         assert delta_pack.built_from_snapshot_version == 2
 
-    def test_delta_pack_cannot_have_full_scope_with_base(self, base_pack):
+    def test_delta_pack_cannot_have_full_scope_with_base(
+        self, base_pack: BriefEvidencePack
+    ) -> None:
         """A FULL pack must not reference a base pack."""
-        full_pack_params = {
+        full_pack_params: dict[str, Any] = {
             "subject_id": base_pack.subject_id,
             "edition_id": base_pack.edition_id,
             "group_id": base_pack.group_id,
@@ -91,9 +95,9 @@ class TestDeltaPackBuilder:
         with pytest.raises(ValueError, match="FULL pack must not reference"):
             BriefEvidencePack(**full_pack_params)
 
-    def test_delta_pack_requires_base_pack(self, base_pack):
+    def test_delta_pack_requires_base_pack(self, base_pack: BriefEvidencePack) -> None:
         """A DELTA pack must reference a base pack."""
-        delta_pack_params = {
+        delta_pack_params: dict[str, Any] = {
             "subject_id": base_pack.subject_id,
             "edition_id": base_pack.edition_id,
             "group_id": base_pack.group_id,
@@ -122,7 +126,7 @@ class TestAmendmentService:
     """Test amendment creation and management."""
 
     @pytest.mark.asyncio
-    async def test_create_update_amendment_draft(self, base_pack):
+    async def test_create_update_amendment_draft(self, base_pack: BriefEvidencePack) -> None:
         """Create an UPDATE amendment in DRAFT status."""
         service = AmendmentService()
         subject_id = uuid4()
@@ -150,7 +154,7 @@ class TestAmendmentService:
         assert amendment.contribution_ids == tuple(new_contrib_ids)
 
     @pytest.mark.asyncio
-    async def test_correction_amendment_requires_reason(self, base_pack):
+    async def test_correction_amendment_requires_reason(self, base_pack: BriefEvidencePack) -> None:
         """CORRECTION amendments must have revision_reason."""
         service = AmendmentService()
 
@@ -169,7 +173,7 @@ class TestAmendmentService:
             )
 
     @pytest.mark.asyncio
-    async def test_amendment_chain(self, base_pack):
+    async def test_amendment_chain(self, base_pack: BriefEvidencePack) -> None:
         """Amendments can chain: amendment of amendment."""
         service = AmendmentService()
         edition_id = uuid4()
@@ -205,7 +209,7 @@ class TestAmendmentService:
         assert amend2.parent_artifact_id == amend1.id
         assert amend2.root_artifact_id == root_artifact_id
 
-    def test_redactional_revision(self, base_pack):
+    def test_redactional_revision(self, base_pack: BriefEvidencePack) -> None:
         """Create a redactional revision of a published amendment."""
         service = AmendmentService()
 
@@ -233,7 +237,7 @@ class TestAmendmentService:
         assert revised.revision_reason == "Fixed typo in third paragraph"
         assert revised.evidence_pack_id == published.evidence_pack_id
 
-    def test_redactional_revision_only_for_published(self, base_pack):
+    def test_redactional_revision_only_for_published(self, base_pack: BriefEvidencePack) -> None:
         """Redactional revisions only work on published amendments."""
         service = AmendmentService()
 

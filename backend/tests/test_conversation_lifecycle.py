@@ -4,7 +4,6 @@ Tests the state machine, idempotence, and invariants required by the mission.
 """
 
 from datetime import UTC, datetime
-from uuid import uuid4
 
 import pytest
 
@@ -220,11 +219,16 @@ class TestCleanupWorkflow:
 
         # Start cleanup
         lc.start_cleanup()
-        assert lc.status == ConversationLifecycleStatus.DELETING
+        # Bound to a local first: mypy narrows `lc.status` from the assert
+        # above and doesn't know `start_cleanup()` mutates it, which would
+        # otherwise make this comparison a spurious "non-overlapping" error.
+        expected_status = ConversationLifecycleStatus.DELETING
+        assert lc.status == expected_status
 
         # Mark deleted
         lc.mark_deleted()
-        assert lc.status == ConversationLifecycleStatus.DELETED
+        expected_status = ConversationLifecycleStatus.DELETED
+        assert lc.status == expected_status
 
     def test_full_workflow_delete_on_success_with_retry(self) -> None:
         """Full workflow with cleanup failure and retry:
@@ -240,7 +244,11 @@ class TestCleanupWorkflow:
 
         # Retry succeeds
         lc.mark_deleted()
-        assert lc.status == ConversationLifecycleStatus.DELETED
+        # Bound to a local first: mypy narrows `lc.status` from the assert
+        # above and doesn't know `mark_deleted()` mutates it, which would
+        # otherwise make this comparison a spurious "non-overlapping" error.
+        expected_status = ConversationLifecycleStatus.DELETED
+        assert lc.status == expected_status
         assert lc.cleanup_attempt_count == 2
 
     def test_failure_outcome_prevents_cleanup(self) -> None:

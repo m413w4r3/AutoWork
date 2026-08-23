@@ -9,10 +9,10 @@ This module handles:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from uuid import UUID
-from typing import Sequence
 
-from cti_app.domain.discovery_cumulative import SubjectMergeEvent, DiscoverySnapshot
+from cti_app.domain.discovery_cumulative import DiscoverySnapshot, SubjectMergeEvent
 
 
 def resolve_canonical_subject(

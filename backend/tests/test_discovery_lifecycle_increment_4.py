@@ -7,12 +7,8 @@ Tests verify that:
 4. Analyst assistance conversations use KEEP policy
 """
 
-from datetime import UTC, date, datetime
-from uuid import UUID, uuid4
-import pytest
+from uuid import uuid4
 
-from cti_app.application.discovery import DiscoverEditionParameters
-from cti_app.domain.classification import TLP
 from cti_app.domain.model_conversations import (
     ConversationLifecycle,
     ConversationLifecycleStatus,
@@ -84,15 +80,21 @@ class TestDiscoveryLifecycleWorkflow:
 
         # After success release
         lifecycle.release(outcome=ConversationReleaseOutcome.SUCCESS)
-        assert lifecycle.status == ConversationLifecycleStatus.DELETE_PENDING
+        # Bound to a local first: mypy narrows `lifecycle.status` from the
+        # assert above and doesn't know `release()` mutates it, which would
+        # otherwise make this comparison a spurious "non-overlapping" error.
+        expected_status = ConversationLifecycleStatus.DELETE_PENDING
+        assert lifecycle.status == expected_status
 
         # Cleanup starts
         lifecycle.start_cleanup()
-        assert lifecycle.status == ConversationLifecycleStatus.DELETING
+        expected_status = ConversationLifecycleStatus.DELETING
+        assert lifecycle.status == expected_status
 
         # Cleanup succeeds
         lifecycle.mark_deleted()
-        assert lifecycle.status == ConversationLifecycleStatus.DELETED
+        expected_status = ConversationLifecycleStatus.DELETED
+        assert lifecycle.status == expected_status
 
     def test_failure_outcome_prevents_cleanup(self) -> None:
         """FAILURE outcome should preserve conversation (no cleanup)."""
@@ -167,10 +169,15 @@ class TestConversationLifecycleCleanupFlow:
 
         # First attempt fails
         lifecycle.mark_cleanup_failed(error_code="network_timeout")
-        assert lifecycle.status == ConversationLifecycleStatus.CLEANUP_FAILED
+        # Bound to a local first: mypy narrows `lifecycle.status` from the
+        # assert above and doesn't know `mark_cleanup_failed()` mutates it,
+        # which would otherwise make this comparison a spurious error.
+        expected_status = ConversationLifecycleStatus.CLEANUP_FAILED
+        assert lifecycle.status == expected_status
         assert lifecycle.cleanup_attempt_count == 1
 
         # Retry succeeds
         lifecycle.mark_deleted()
-        assert lifecycle.status == ConversationLifecycleStatus.DELETED
+        expected_status = ConversationLifecycleStatus.DELETED
+        assert lifecycle.status == expected_status
         assert lifecycle.cleanup_attempt_count == 2

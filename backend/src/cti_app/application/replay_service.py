@@ -10,18 +10,13 @@ This module handles:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from uuid import UUID
-from datetime import UTC, datetime
 
 from cti_app.domain.discovery_cumulative import (
     DiscoverySnapshot,
-    DiscoverySnapshotLineage,
-    DiscoveryPlannerKind,
-    DiscoveryIntake,
+    ReplayComparison,
     ReplayIdentityMapping,
     ReplayIdentityResolution,
-    ReplayComparison,
 )
 
 
@@ -104,8 +99,6 @@ class ReplayService:
         Raises:
             ValueError: If published subject has no mapping
         """
-        mappings: dict[UUID, ReplayIdentityMapping] = {}
-
         # In real implementation, would:
         # 1. Compare origin_keys between snapshots
         # 2. Auto-map SAME cases

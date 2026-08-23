@@ -85,7 +85,7 @@ class ManualSourceEditService:
         canonicalize_http_url(url)
 
         snapshot = await self._cumulative.active_snapshot(edition_id)
-        subject, incomplete = _find_incomplete_source(snapshot, subject_id, incomplete_source_id)
+        _subject, incomplete = _find_incomplete_source(snapshot, subject_id, incomplete_source_id)
         assert snapshot is not None  # guaranteed by _find_incomplete_source above
 
         # Cross-instance propagation: any *other* subject whose incomplete
@@ -134,7 +134,9 @@ class ManualSourceEditService:
         subject, _ = _find_incomplete_source(snapshot, subject_id, incomplete_source_id)
         assert snapshot is not None  # guaranteed by _find_incomplete_source above
         candidate = deepcopy(subject.candidate)
-        target = next(item for item in candidate.incomplete_sources if item.id == incomplete_source_id)
+        target = next(
+            item for item in candidate.incomplete_sources if item.id == incomplete_source_id
+        )
 
         promoted = SourceCandidate(
             url=url,
@@ -168,7 +170,9 @@ class ManualSourceEditService:
         promoted = next(item for item in candidate.sources if item.id == promoted_id)
         candidate.local_ref = "manual-url-attach"
 
-        batch, digest = _build_manual_edit_batch(edition_id, subject_id, incomplete_source_id, url, candidate)
+        batch, digest = _build_manual_edit_batch(
+            edition_id, subject_id, incomplete_source_id, url, candidate
+        )
         await self._model_output_archive.create_manual_research_output(
             batch.discovery_model_run_id,
             _manual_edit_content(edition_id, subject_id, incomplete_source_id, url),
