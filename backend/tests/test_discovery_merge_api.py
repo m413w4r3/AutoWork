@@ -7,7 +7,8 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from cti_app.api.discovery import merge_runs_router, router
+from cti_app.api.discovery import router
+from cti_app.api.discovery_merge import merge_runs_router
 from cti_app.application.discovery.cumulative.types import MergeHandleLabel
 from cti_app.application.discovery.manual_source_edits import (
     IncompleteSourceCandidateNotFoundError,

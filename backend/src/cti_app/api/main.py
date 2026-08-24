@@ -7,8 +7,8 @@ from minio import Minio
 
 from cti_app.api.briefs import router as briefs_router
 from cti_app.api.collection import router as collection_router
-from cti_app.api.discovery import merge_runs_router
 from cti_app.api.discovery import router as discovery_router
+from cti_app.api.discovery_merge import merge_runs_router
 from cti_app.api.editions import router as editions_router
 from cti_app.api.editorial import router as editorial_router
 from cti_app.api.health import router as health_router
