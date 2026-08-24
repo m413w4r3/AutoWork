@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import runpy
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -16,8 +17,13 @@ from starlette.requests import Request
 
 
 def load_bridge() -> dict[str, Any]:
-    path = Path(__file__).parents[2] / "chatgpt-bridge" / "server.py"
-    return runpy.run_path(str(path))
+    bridge_root = Path(__file__).parents[2] / "chatgpt-bridge"
+    old_sys_path = sys.path.copy()
+    try:
+        sys.path.insert(0, str(bridge_root))
+        return runpy.run_path(str(bridge_root / "server.py"))
+    finally:
+        sys.path = old_sys_path
 
 
 def test_extension_reserves_request_before_real_send_click() -> None:
