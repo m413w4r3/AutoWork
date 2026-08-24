@@ -580,6 +580,31 @@ Aucun autre fichier.
 
 ---
 
+## R73 — Runner reproductible
+
+`scripts/ctx/benchmark.py` rejoue mécaniquement les 12 requêtes ci-dessus
+contre l'index ctx.py courant, via les primitives existantes de `ctx.py`
+(`load_chunks`, `rank_chunks`, `select_results`). Il ne modifie ni les
+requêtes, ni la ground truth, ni le ranking.
+
+Commande (protocole lexical-only gelé) :
+
+    env -u BASE_URL -u EMBEDDING_API_KEY \
+      uv run scripts/ctx/ctx.py build --lexical-only
+
+    uv run scripts/ctx/benchmark.py --lexical-only
+
+ou, équivalent :
+
+    make ctx-benchmark
+
+Sort avec un code non-zero si `top3_hit_rate < 80%`,
+`top8_hit_rate < 83.3%`, ou `median_files_before_first_hit > 3`
+(seuils ajustables via `--min-top3` / `--min-top8` /
+`--max-median-files-before-hit`, ou désactivables via `--no-check`).
+
+---
+
 ## Acceptance
 
 - spec committée avant la première query ;

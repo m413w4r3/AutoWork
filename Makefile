@@ -1,6 +1,6 @@
 .PHONY: up down clean up-clean status logs bridge-status bridge-logs bridge-soak \
 	restart-bridge model-run-diagnostics diagnostics dev stop test test-integration \
-	lint format typecheck ctx ctx-lexical ctx-status ctx-doctor
+	lint format typecheck ctx ctx-lexical ctx-status ctx-doctor ctx-benchmark
 
 UV ?= uv
 PNPM ?= pnpm
@@ -102,3 +102,9 @@ ctx-status:
 
 ctx-doctor:
 	$(UV) run scripts/ctx/ctx.py doctor
+
+# Rejoue le benchmark de navigation gelé R67 (spec figée dans
+# refacto_baseLine/R67_benchmark_spec.md) contre l'index lexical courant.
+# Code de sortie non-zero si les seuils par défaut ne sont pas atteints.
+ctx-benchmark: ctx-lexical
+	env -u BASE_URL -u EMBEDDING_API_KEY $(UV) run scripts/ctx/benchmark.py --lexical-only
