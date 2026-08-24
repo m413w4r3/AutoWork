@@ -26,23 +26,33 @@ def load_bridge() -> dict[str, Any]:
         sys.path = old_sys_path
 
 
+def _runtime(module: dict[str, Any]) -> Any:
+    """The `BridgeApplication` composition root `server.py` wires up (R60).
+
+    `server.py` is now a thin launcher: the single owner of `bridge`,
+    `registry`, and the three route families is `bridge_application`, not a
+    handful of module globals.
+    """
+    return module["bridge_application"]
+
+
 def _openai_globals(module: dict[str, Any]) -> dict[str, Any]:
     """Module namespace of `bridge.routes_openai`, reached via the `OpenAIRoutes`
-    instance the server wires up (R59a). `bridge.generation`/`bridge.ui` are
+    instance `BridgeApplication` wires up. `bridge.generation`/`bridge.ui` are
     import-cached, so anything pulled from here shares state with the rest of
     the bridge across `load_bridge()` calls, same as `module[...]` did before
     these endpoints moved out of `server.py`.
     """
-    globals_: dict[str, Any] = module["openai_routes"].create_response_internal.__globals__
+    globals_: dict[str, Any] = _runtime(module).openai_routes.create_response_internal.__globals__
     return globals_
 
 
 def _bridge_globals(module: dict[str, Any]) -> dict[str, Any]:
     """Module namespace of `bridge.routes_bridge`, reached via the `BridgeRoutes`
-    instance the server wires up (R59b). Import-cached across `load_bridge()`
+    instance `BridgeApplication` wires up. Import-cached across `load_bridge()`
     calls just like `bridge.routes_openai` — see `_openai_globals`.
     """
-    globals_: dict[str, Any] = module["bridge_routes"].create_bridge_run.__globals__
+    globals_: dict[str, Any] = _runtime(module).bridge_routes.create_bridge_run.__globals__
     return globals_
 
 
@@ -73,7 +83,7 @@ def test_extension_reserves_request_before_real_send_click() -> None:
 
 class FakeExtension:
     def __init__(self, module: dict[str, Any], *, prompt_delay: float = 0) -> None:
-        self.module = module
+        self.runtime = _runtime(module)
         self.prompt_delay = prompt_delay
         self.prompt_count = 0
         self.sent: list[dict[str, Any]] = []
@@ -102,7 +112,7 @@ class FakeExtension:
                     }
                     for key, value in payload.get("controls", {}).items()
                 }
-            self.module["bridge"].dispatch(
+            self.runtime.bridge.dispatch(
                 {
                     "type": payload["type"],
                     "id": payload["id"],
@@ -118,7 +128,7 @@ class FakeExtension:
         elif payload["type"] == "prompt":
             self.prompt_count += 1
             await asyncio.sleep(self.prompt_delay)
-            self.module["bridge"].dispatch(
+            self.runtime.bridge.dispatch(
                 {"type": "heartbeat", "id": payload["id"], "event_id": "1"}
             )
             target = payload.get("conversation")
@@ -127,7 +137,7 @@ class FakeExtension:
                 if target["mode"] == "fresh":
                     self.locators[target["id"]] = f"https://chatgpt.com/simulated/{target['id']}"
                 elif self.locators.get(target["id"]) != target.get("external_locator"):
-                    self.module["bridge"].dispatch(
+                    self.runtime.bridge.dispatch(
                         {
                             "type": "error",
                             "id": payload["id"],
@@ -143,7 +153,7 @@ class FakeExtension:
                     "mode": target["mode"],
                     "verified": True,
                 }
-            self.module["bridge"].dispatch(
+            self.runtime.bridge.dispatch(
                 {
                     "type": "done",
                     "id": payload["id"],
@@ -181,16 +191,22 @@ def request_with_key(key: str) -> Request:
 
 
 def isolated_registry(module: dict[str, Any], tmp_path: Path) -> None:
-    registry = module["RunRegistry"](tmp_path / "runs.sqlite3")
+    runtime = _runtime(module)
+    # `RunRegistry` isn't statically importable from here (mypy can't resolve
+    # the `chatgpt-bridge` package outside its own sys.path insertion): reach
+    # it through the already-cached `bridge.routes_bridge` globals instead,
+    # same technique `_bridge_globals`/`_openai_globals` already rely on.
+    registry = _bridge_globals(module)["RunRegistry"](tmp_path / "runs.sqlite3")
     # `create_bridge_run`/`retrieve_bridge_run` no longer read a `run_registry`
     # global (R59b: they read `self.registry`, bound once at construction) — every
-    # real owner of a registry reference needs patching directly, including the
-    # `module["run_registry"]` entry itself, since later test code still reads it
-    # for direct `run_generation` calls.
-    module["run_registry"] = registry
-    module["openai_routes"].registry = registry
-    module["bridge_routes"].registry = registry
-    module["conversation_routes"].registry = registry
+    # real owner of a registry reference needs patching directly. `runtime.registry`
+    # is the default one `BridgeApplication` constructs; it isn't read by the
+    # routes themselves, but later test code still reads it for direct
+    # `run_generation` calls.
+    runtime.registry = registry
+    runtime.openai_routes.registry = registry
+    runtime.bridge_routes.registry = registry
+    runtime.conversation_routes.registry = registry
 
 
 def test_responses_facade_translates_web_search_and_rejects_binary_blocks() -> None:
@@ -229,6 +245,7 @@ def test_responses_facade_translates_web_search_and_rejects_binary_blocks() -> N
 
 def test_recovery_message_is_forwarded_exactly_without_discovery_preamble() -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     message = (
         "Ta réponse précédente ne contient pas de résultat final. Termine maintenant "
         "la mission initiale et fournis directement le rapport Markdown demandé, sans "
@@ -245,7 +262,7 @@ def test_recovery_message_is_forwarded_exactly_without_discovery_preamble() -> N
     )
 
     chat_request = _openai_globals(module)["_response_chat_request"](
-        module["bridge_routes"]._bridge_response_request(request)
+        runtime.bridge_routes._bridge_response_request(request)
     )
 
     assert len(chat_request.messages) == 1
@@ -258,6 +275,7 @@ async def test_responses_facade_completes_background_request_without_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
 
     async def fake_generation(*_: object, **__: object) -> AsyncIterator[str]:
         yield "résultat simulé"
@@ -266,11 +284,11 @@ async def test_responses_facade_completes_background_request_without_network(
     # bare assignment here would leak `fake_generation` into every later test in
     # this process. `monkeypatch` reverts it when this test ends.
     monkeypatch.setitem(
-        module["openai_routes"]._execute_background_response.__globals__,
+        runtime.openai_routes._execute_background_response.__globals__,
         "run_generation",
         fake_generation,
     )
-    module["bridge"].ws = object()
+    runtime.bridge.ws = object()
     request = _openai_globals(module)["ResponseRequest"](
         input="Recherche autorisée",
         tools=[{"type": "web_search"}],
@@ -278,9 +296,9 @@ async def test_responses_facade_completes_background_request_without_network(
     )
     http_request = Request({"type": "http", "method": "POST", "path": "/v1/responses"})
 
-    queued = await module["openai_routes"].create_response(request, http_request)
-    await module["openai_routes"].background_tasks[queued["id"]]
-    completed = await module["openai_routes"].retrieve_response(queued["id"])
+    queued = await runtime.openai_routes.create_response(request, http_request)
+    await runtime.openai_routes.background_tasks[queued["id"]]
+    completed = await runtime.openai_routes.retrieve_response(queued["id"])
 
     assert queued["status"] == "queued"
     assert completed["status"] == "completed"
@@ -290,6 +308,7 @@ async def test_responses_facade_completes_background_request_without_network(
 
 def test_native_bridge_contract_reports_honest_capabilities() -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     request = _bridge_globals(module)["BridgeRunRequest"](
         requested_model="premium-profile",
         input="Recherche autorisée",
@@ -298,7 +317,7 @@ def test_native_bridge_contract_reports_honest_capabilities() -> None:
         background=True,
     )
 
-    translated = module["bridge_routes"]._bridge_response_request(request)
+    translated = runtime.bridge_routes._bridge_response_request(request)
 
     assert translated.model == "premium-profile"
     assert translated.tools == [{"type": "web_search"}]
@@ -307,6 +326,7 @@ def test_native_bridge_contract_reports_honest_capabilities() -> None:
 
 def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation() -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     conversation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     fresh = _bridge_globals(module)["BridgeRunRequest"](
         input="A1",
@@ -322,8 +342,8 @@ def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation() ->
     )
 
     translate = _openai_globals(module)["_response_chat_request"]
-    assert translate(module["bridge_routes"]._bridge_response_request(fresh)).new_chat
-    assert not translate(module["bridge_routes"]._bridge_response_request(continued)).new_chat
+    assert translate(runtime.bridge_routes._bridge_response_request(fresh)).new_chat
+    assert not translate(runtime.bridge_routes._bridge_response_request(continued)).new_chat
     with pytest.raises(ValidationError):
         _bridge_globals(module)["BridgeRunRequest"](
             input="attaque SSRF",
@@ -342,14 +362,15 @@ def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation() ->
 
 async def test_fake_extension_routes_a_b_a_and_retry_clicks_once(tmp_path: Path) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module)
-    module["bridge"].ws = extension
+    runtime.bridge.ws = extension
     conversation_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     conversation_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
     async def send(key: str, conversation: dict[str, object]) -> dict[str, Any]:
-        result = await module["bridge_routes"].create_bridge_run(
+        result = await runtime.bridge_routes.create_bridge_run(
             _bridge_globals(module)["BridgeRunRequest"](input=key, conversation=conversation),
             request_with_key(key),
         )
@@ -377,8 +398,9 @@ async def test_fake_extension_routes_a_b_a_and_retry_clicks_once(tmp_path: Path)
 
 def test_requested_model_is_a_label_and_only_ui_model_drives_the_interface() -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     build = _bridge_globals(module)["BridgeRunRequest"]
-    bridge_controls = module["bridge_routes"]._bridge_controls
+    bridge_controls = runtime.bridge_routes._bridge_controls
 
     label = bridge_controls(build(requested_model="premium-profile", input="x"))
     driving = bridge_controls(
@@ -418,7 +440,7 @@ async def test_unverified_model_refuses_the_run_but_web_search_falls_back_to_the
     module = load_bridge()
     openai_globals = _openai_globals(module)
     controls = openai_globals["RunControls"]
-    bridge = module["bridge"]
+    bridge = _runtime(module).bridge
     prepare_run = openai_globals["prepare_run"]
 
     _stub_controls(
@@ -453,6 +475,7 @@ async def test_verified_ui_state_names_the_model_and_the_native_search_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     openai_globals = _openai_globals(module)
     state = openai_globals["prepare_run"].__globals__["UiState"].model_validate(
         {
@@ -468,7 +491,7 @@ async def test_verified_ui_state_names_the_model_and_the_native_search_tool(
     )
 
     report = await openai_globals["prepare_run"](
-        module["bridge"],
+        runtime.bridge,
         openai_globals["RunControls"](web_search=True),
         allow_unverified_model=False,
     )
@@ -497,9 +520,10 @@ async def test_verified_ui_state_names_the_model_and_the_native_search_tool(
 
 async def test_capabilities_degrade_visibly_without_a_connected_extension() -> None:
     module = load_bridge()
-    module["bridge"].ws = None
+    runtime = _runtime(module)
+    runtime.bridge.ws = None
 
-    caps = await module["bridge_routes"].bridge_capabilities()
+    caps = await runtime.bridge_routes.bridge_capabilities()
 
     assert caps["streaming"] == "final_delta_only"
     assert caps["web_search"] == "prompt_instructed"
@@ -512,13 +536,14 @@ async def test_capabilities_degrade_visibly_without_a_connected_extension() -> N
 
 async def test_ready_distinguishes_incomplete_absent_and_available_states() -> None:
     module = load_bridge()
-    globals_ = module["ready"].__globals__
+    runtime = _runtime(module)
+    globals_ = runtime.ready.__globals__
     globals_["HOST"] = "0.0.0.0"
     globals_["API_KEY"] = None
     globals_["WS_TOKEN"] = None
-    module["bridge"].ws = None
+    runtime.bridge.ws = None
 
-    incomplete = await module["ready"]()
+    incomplete = await runtime.ready()
     incomplete_body = json.loads(incomplete.body)
     assert incomplete.status_code == 503
     assert incomplete_body["status"] == "configuration_incomplete"
@@ -528,12 +553,12 @@ async def test_ready_distinguishes_incomplete_absent_and_available_states() -> N
 
     globals_["API_KEY"] = "not-logged-http-secret"
     globals_["WS_TOKEN"] = "not-logged-websocket-secret"
-    absent = await module["ready"]()
+    absent = await runtime.ready()
     assert absent.status_code == 503
     assert json.loads(absent.body)["status"] == "extension_absent"
 
-    module["bridge"].ws = FakeExtension(module)
-    available = await module["ready"]()
+    runtime.bridge.ws = FakeExtension(module)
+    available = await runtime.ready()
     assert available.status_code == 200
     assert json.loads(available.body)["status"] == "extension_available"
 
@@ -542,15 +567,16 @@ async def test_startup_reports_safe_configuration_states(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     isolated_registry(module, tmp_path)
-    globals_ = module["_configuration_state"].__globals__
+    globals_ = runtime._configuration_state.__globals__
     globals_["HOST"] = "0.0.0.0"
     globals_["API_KEY"] = "STARTUP-HTTP-SECRET"
     globals_["WS_TOKEN"] = "STARTUP-WS-SECRET"
-    module["bridge"].ws = None
+    runtime.bridge.ws = None
     caplog.set_level(logging.INFO, logger="chatgpt_bridge")
 
-    async with module["lifespan"](None):
+    async with runtime.lifespan(None):
         pass
 
     rendered = caplog.text
@@ -566,17 +592,18 @@ async def test_three_http_retries_with_same_key_submit_one_prompt_and_replay_res
     tmp_path: Path,
 ) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module, prompt_delay=0.02)
-    module["bridge"].ws = extension
+    runtime.bridge.ws = extension
     req = _bridge_globals(module)["BridgeRunRequest"](input="secret prompt")
 
     first, second, third = await asyncio.gather(
-        module["bridge_routes"].create_bridge_run(req, request_with_key("business-1")),
-        module["bridge_routes"].create_bridge_run(req, request_with_key("business-1")),
-        module["bridge_routes"].create_bridge_run(req, request_with_key("business-1")),
+        runtime.bridge_routes.create_bridge_run(req, request_with_key("business-1")),
+        runtime.bridge_routes.create_bridge_run(req, request_with_key("business-1")),
+        runtime.bridge_routes.create_bridge_run(req, request_with_key("business-1")),
     )
-    replay = await module["bridge_routes"].create_bridge_run(req, request_with_key("business-1"))
+    replay = await runtime.bridge_routes.create_bridge_run(req, request_with_key("business-1"))
 
     assert first["id"] == second["id"] == third["id"] == replay["id"]
     assert extension.prompt_count == 1
@@ -592,6 +619,7 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
     tmp_path: Path,
 ) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     isolated_registry(module, tmp_path)
     generation_started = asyncio.Event()
     release_generation = asyncio.Event()
@@ -604,7 +632,7 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
             self.prompt_count += 1
             generation_started.set()
             await release_generation.wait()
-            self.module["bridge"].dispatch(
+            self.runtime.bridge.dispatch(
                 {
                     "type": "done",
                     "id": payload["id"],
@@ -622,14 +650,14 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
             )
 
     extension = ControlledExtension(module)
-    module["bridge"].ws = extension
+    runtime.bridge.ws = extension
     request = _bridge_globals(module)["BridgeRunRequest"](input="durable", background=True)
 
-    create_bridge_run = module["bridge_routes"].create_bridge_run
+    create_bridge_run = runtime.bridge_routes.create_bridge_run
     accepted = await create_bridge_run(request, request_with_key("durable-background"))
     replay = await create_bridge_run(request, request_with_key("durable-background"))
     await generation_started.wait()
-    running = await module["bridge_routes"].retrieve_bridge_run(accepted["id"])
+    running = await runtime.bridge_routes.retrieve_bridge_run(accepted["id"])
 
     assert accepted["status"] in {"queued", "running"}
     assert replay["id"] == accepted["id"]
@@ -637,8 +665,8 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
     assert extension.prompt_count == 1
 
     release_generation.set()
-    await module["bridge_routes"].idempotent_tasks[accepted["id"]]
-    completed = await module["bridge_routes"].retrieve_bridge_run(accepted["id"])
+    await runtime.bridge_routes.idempotent_tasks[accepted["id"]]
+    completed = await runtime.bridge_routes.retrieve_bridge_run(accepted["id"])
 
     assert completed["status"] == "completed"
     assert completed["output_text"] == "snapshot final unique"
@@ -649,6 +677,7 @@ async def test_conversation_binding_precedes_incomplete_and_survives_restart(
     tmp_path: Path,
 ) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     database = tmp_path / "runs.sqlite3"
     isolated_registry(module, tmp_path)
     bound = asyncio.Event()
@@ -661,7 +690,7 @@ async def test_conversation_binding_precedes_incomplete_and_survives_restart(
 
         async def _respond(self, payload: dict[str, Any]) -> None:
             if payload["type"] == "recovery_capture":
-                self.module["bridge"].dispatch(
+                self.runtime.bridge.dispatch(
                     {
                         "type": "recovery_preview",
                         "id": payload["id"],
@@ -689,7 +718,7 @@ async def test_conversation_binding_precedes_incomplete_and_survives_restart(
                 "verified": True,
                 "verified_at": "2026-08-13T10:00:00.000Z",
             }
-            self.module["bridge"].dispatch(
+            self.runtime.bridge.dispatch(
                 {
                     "type": "conversation_bound",
                     "id": payload["id"],
@@ -699,7 +728,7 @@ async def test_conversation_binding_precedes_incomplete_and_survives_restart(
             )
             bound.set()
             await release.wait()
-            self.module["bridge"].dispatch(
+            self.runtime.bridge.dispatch(
                 {
                     "type": "incomplete",
                     "id": payload["id"],
@@ -715,45 +744,46 @@ async def test_conversation_binding_precedes_incomplete_and_survives_restart(
             )
 
     extension = IncompleteExtension(module)
-    module["bridge"].ws = extension
+    runtime.bridge.ws = extension
     request = _bridge_globals(module)["BridgeRunRequest"](
         input="mission",
         background=True,
         conversation={"mode": "fresh", "id": conversation_id},
     )
-    accepted = await module["bridge_routes"].create_bridge_run(
+    accepted = await runtime.bridge_routes.create_bridge_run(
         request, request_with_key("incomplete-bound")
     )
     await bound.wait()
 
-    persisted = module["bridge_routes"].registry.get_by_run_id(accepted["id"])
+    persisted = runtime.bridge_routes.registry.get_by_run_id(accepted["id"])
     assert persisted is not None
     binding = json.loads(persisted["conversation_json"])
     assert binding["external_locator"] == locator
     assert binding["assistant_turns_before"] == 2
 
     release.set()
-    await module["bridge_routes"].idempotent_tasks[accepted["id"]]
-    needs_review = await module["bridge_routes"].retrieve_bridge_run(accepted["id"])
+    await runtime.bridge_routes.idempotent_tasks[accepted["id"]]
+    needs_review = await runtime.bridge_routes.retrieve_bridge_run(accepted["id"])
     assert needs_review["status"] == "needs_review"
     assert needs_review["error"]["code"] == "no_final_answer"
 
-    restarted = module["RunRegistry"](database)
-    module["bridge_routes"].registry = restarted
-    preview = await module["bridge_routes"].preview_visible_recovery(accepted["id"])
+    restarted = _bridge_globals(module)["RunRegistry"](database)
+    runtime.bridge_routes.registry = restarted
+    preview = await runtime.bridge_routes.preview_visible_recovery(accepted["id"])
     assert preview["turn_id"] == "assistant-later"
     assert preview["text"].startswith("## SUBJECT S1")
     assert extension.prompt_count == 1
 
     extension.wrong_conversation = True
     with pytest.raises(HTTPException) as mismatched:
-        await module["bridge_routes"].preview_visible_recovery(accepted["id"])
+        await runtime.bridge_routes.preview_visible_recovery(accepted["id"])
     assert mismatched.value.status_code == 409
     assert extension.prompt_count == 1
 
 
 async def test_done_snapshot_replaces_rewritten_legacy_chunks(tmp_path: Path) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     isolated_registry(module, tmp_path)
 
     class RewritingExtension(FakeExtension):
@@ -763,7 +793,7 @@ async def test_done_snapshot_replaces_rewritten_legacy_chunks(tmp_path: Path) ->
                 return
             self.prompt_count += 1
             for sequence, text in enumerate(("ABC", "DE", "XYZ"), start=1):
-                self.module["bridge"].dispatch(
+                self.runtime.bridge.dispatch(
                     {
                         "type": "chunk",
                         "id": payload["id"],
@@ -771,7 +801,7 @@ async def test_done_snapshot_replaces_rewritten_legacy_chunks(tmp_path: Path) ->
                         "event_id": str(sequence),
                     }
                 )
-            self.module["bridge"].dispatch(
+            self.runtime.bridge.dispatch(
                 {
                     "type": "done",
                     "id": payload["id"],
@@ -789,9 +819,9 @@ async def test_done_snapshot_replaces_rewritten_legacy_chunks(tmp_path: Path) ->
             )
 
     extension = RewritingExtension(module)
-    module["bridge"].ws = extension
+    runtime.bridge.ws = extension
 
-    result = await module["bridge_routes"].create_bridge_run(
+    result = await runtime.bridge_routes.create_bridge_run(
         _bridge_globals(module)["BridgeRunRequest"](input="rewrite"),
         request_with_key("rewrite-final"),
     )
@@ -802,6 +832,7 @@ async def test_done_snapshot_replaces_rewritten_legacy_chunks(tmp_path: Path) ->
 
 async def test_done_rejects_incoherent_output_chars(tmp_path: Path) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     isolated_registry(module, tmp_path)
 
     class InvalidLengthExtension(FakeExtension):
@@ -810,7 +841,7 @@ async def test_done_rejects_incoherent_output_chars(tmp_path: Path) -> None:
                 await super()._respond(payload)
                 return
             self.prompt_count += 1
-            self.module["bridge"].dispatch(
+            self.runtime.bridge.dispatch(
                 {
                     "type": "done",
                     "id": payload["id"],
@@ -820,10 +851,10 @@ async def test_done_rejects_incoherent_output_chars(tmp_path: Path) -> None:
                 }
             )
 
-    module["bridge"].ws = InvalidLengthExtension(module)
+    runtime.bridge.ws = InvalidLengthExtension(module)
 
     with pytest.raises(HTTPException) as caught:
-        await module["bridge_routes"].create_bridge_run(
+        await runtime.bridge_routes.create_bridge_run(
             _bridge_globals(module)["BridgeRunRequest"](input="bad length"),
             request_with_key("bad-length"),
         )
@@ -833,11 +864,12 @@ async def test_done_rejects_incoherent_output_chars(tmp_path: Path) -> None:
 
 async def test_cancelled_http_wait_then_retry_joins_original_run(tmp_path: Path) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module, prompt_delay=0.05)
-    module["bridge"].ws = extension
+    runtime.bridge.ws = extension
     req = _bridge_globals(module)["BridgeRunRequest"](input="expensive prompt")
-    create_bridge_run = module["bridge_routes"].create_bridge_run
+    create_bridge_run = runtime.bridge_routes.create_bridge_run
 
     abandoned = asyncio.create_task(
         create_bridge_run(req, request_with_key("business-timeout"))
@@ -854,11 +886,12 @@ async def test_cancelled_http_wait_then_retry_joins_original_run(tmp_path: Path)
 
 async def test_shutdown_during_run_fails_safe_without_second_prompt(tmp_path: Path) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module, prompt_delay=60)
-    module["bridge"].ws = extension
+    runtime.bridge.ws = extension
     req = _bridge_globals(module)["BridgeRunRequest"](input="expensive prompt")
-    create_bridge_run = module["bridge_routes"].create_bridge_run
+    create_bridge_run = runtime.bridge_routes.create_bridge_run
 
     active = asyncio.create_task(create_bridge_run(req, request_with_key("sigterm-run")))
     for _ in range(100):
@@ -867,17 +900,17 @@ async def test_shutdown_during_run_fails_safe_without_second_prompt(tmp_path: Pa
         await asyncio.sleep(0.001)
     assert extension.prompt_count == 1
 
-    await module["shutdown_bridge"](0.01)
+    await runtime.shutdown_bridge(0.01)
     with pytest.raises(asyncio.CancelledError):
         await active
     assert extension.closed == (1001, "server shutdown")
 
     # Simule le redémarrage : la même clé rejoue l'échec SQLite et ne touche
     # pas la nouvelle extension, même si elle est disponible.
-    module["shutdown_bridge"].__globals__["accepting_runs"] = True
-    module["bridge"].closing = False
+    runtime.accepting_runs = True
+    runtime.bridge.closing = False
     replacement = FakeExtension(module)
-    module["bridge"].ws = replacement
+    runtime.bridge.ws = replacement
     replay = await create_bridge_run(req, request_with_key("sigterm-run"))
 
     assert replay.status_code == 503
@@ -887,15 +920,16 @@ async def test_shutdown_during_run_fails_safe_without_second_prompt(tmp_path: Pa
 
 async def test_same_key_different_payload_conflicts(tmp_path: Path) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module)
-    module["bridge"].ws = extension
-    await module["bridge_routes"].create_bridge_run(
+    runtime.bridge.ws = extension
+    await runtime.bridge_routes.create_bridge_run(
         _bridge_globals(module)["BridgeRunRequest"](input="one"), request_with_key("conflict")
     )
 
     with pytest.raises(HTTPException) as caught:
-        await module["bridge_routes"].create_bridge_run(
+        await runtime.bridge_routes.create_bridge_run(
             _bridge_globals(module)["BridgeRunRequest"](input="two"), request_with_key("conflict")
         )
     assert caught.value.status_code == 409
@@ -905,16 +939,17 @@ async def test_same_key_different_payload_conflicts(tmp_path: Path) -> None:
 
 async def test_completed_run_survives_registry_restart_without_ui(tmp_path: Path) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     database = tmp_path / "runs.sqlite3"
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module)
-    module["bridge"].ws = extension
+    runtime.bridge.ws = extension
     req = _bridge_globals(module)["BridgeRunRequest"](input="once")
-    first = await module["bridge_routes"].create_bridge_run(req, request_with_key("restart"))
+    first = await runtime.bridge_routes.create_bridge_run(req, request_with_key("restart"))
 
-    module["bridge_routes"].registry = module["RunRegistry"](database)
-    module["bridge"].ws = None
-    replay = await module["bridge_routes"].create_bridge_run(req, request_with_key("restart"))
+    runtime.bridge_routes.registry = _bridge_globals(module)["RunRegistry"](database)
+    runtime.bridge.ws = None
+    replay = await runtime.bridge_routes.create_bridge_run(req, request_with_key("restart"))
 
     assert replay["id"] == first["id"]
     assert extension.prompt_count == 1
@@ -922,14 +957,15 @@ async def test_completed_run_survives_registry_restart_without_ui(tmp_path: Path
 
 async def test_capabilities_never_waits_for_a_blocked_extension() -> None:
     module = load_bridge()
+    runtime = _runtime(module)
 
     class Blocked:
         async def send_json(self, _: dict[str, Any]) -> None:
             await asyncio.Event().wait()
 
-    module["bridge"].ws = Blocked()
+    runtime.bridge.ws = Blocked()
     started = asyncio.get_running_loop().time()
-    caps = await module["bridge_routes"].bridge_capabilities()
+    caps = await runtime.bridge_routes.bridge_capabilities()
     elapsed = asyncio.get_running_loop().time() - started
 
     assert elapsed < 0.25
@@ -938,20 +974,21 @@ async def test_capabilities_never_waits_for_a_blocked_extension() -> None:
 
 async def test_ui_probe_timeout_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
 
     class Silent:
         async def send_json(self, _: dict[str, Any]) -> None:
             return None
 
-    module["bridge"].ws = Silent()
+    runtime.bridge.ws = Silent()
     # `bridge.routes_bridge` is import-cached across `load_bridge()` calls (like
     # `bridge.routes_openai`, see R59a): a bare assignment here would leak
     # UI_TIMEOUT=0.01 into every later test in this process.
     monkeypatch.setitem(
-        module["bridge_routes"].bridge_capabilities.__globals__, "UI_TIMEOUT", 0.01
+        runtime.bridge_routes.bridge_capabilities.__globals__, "UI_TIMEOUT", 0.01
     )
     with pytest.raises(HTTPException) as caught:
-        await module["bridge_routes"].bridge_capabilities(probe=True, fresh=True)
+        await runtime.bridge_routes.bridge_capabilities(probe=True, fresh=True)
 
     assert caught.value.status_code == 504
     assert isinstance(caught.value.detail, dict)
@@ -960,7 +997,8 @@ async def test_ui_probe_timeout_is_typed(monkeypatch: pytest.MonkeyPatch) -> Non
 
 async def test_websocket_without_pairing_token_is_rejected() -> None:
     module = load_bridge()
-    module["websocket_endpoint"].__globals__["WS_TOKEN"] = "required-secret"
+    runtime = _runtime(module)
+    runtime.websocket_endpoint.__globals__["WS_TOKEN"] = "required-secret"
 
     class UnauthenticatedSocket:
         def __init__(self) -> None:
@@ -975,7 +1013,7 @@ async def test_websocket_without_pairing_token_is_rejected() -> None:
             self.closed = (code, reason)
 
     socket = UnauthenticatedSocket()
-    await module["websocket_endpoint"](socket)
+    await runtime.websocket_endpoint(socket)
 
     assert socket.accepted is False
     assert socket.closed == (4401, "authentication required")
@@ -983,7 +1021,11 @@ async def test_websocket_without_pairing_token_is_rejected() -> None:
 
 async def test_duplicate_websocket_event_is_dispatched_once() -> None:
     module = load_bridge()
-    bridge = module["Bridge"]()
+    # `Bridge` isn't statically importable from here (mypy can't resolve the
+    # `chatgpt-bridge` package outside its own sys.path insertion): reach it
+    # through the already-cached `bridge.routes_openai` globals instead, same
+    # technique `_bridge_globals`/`_openai_globals` already rely on.
+    bridge = _openai_globals(module)["Bridge"]()
     queue = bridge.open_channel("run-1")
     packet = {"id": "run-1", "type": "chunk", "text": "x", "event_id": "event-1"}
 
@@ -998,11 +1040,12 @@ async def test_bridge_logs_neither_prompt_nor_idempotency_secret(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     module = load_bridge()
+    runtime = _runtime(module)
     isolated_registry(module, tmp_path)
-    module["bridge"].ws = FakeExtension(module)
+    runtime.bridge.ws = FakeExtension(module)
     caplog.set_level(logging.INFO, logger="chatgpt_bridge")
 
-    await module["bridge_routes"].create_bridge_run(
+    await runtime.bridge_routes.create_bridge_run(
         _bridge_globals(module)["BridgeRunRequest"](input="TOP-SECRET-PROMPT"),
         request_with_key("TOP-SECRET-IDEMPOTENCY-KEY"),
     )
@@ -1070,6 +1113,7 @@ async def test_idle_timeout_does_not_send_abort_to_extension() -> None:
     - récupération DOM possible via /recovery/visible
     """
     module = load_bridge()
+    runtime = _runtime(module)
 
     # Extension muette : elle reçoit le prompt mais ne redispatche jamais rien,
     # ce qui reproduit exactement la disparition des paquets côté extension.
@@ -1085,7 +1129,7 @@ async def test_idle_timeout_does_not_send_abort_to_extension() -> None:
             self.closed = (code, reason)
 
     silent = SilentExtension()
-    module["bridge"].ws = silent
+    runtime.bridge.ws = silent
 
     openai_globals = _openai_globals(module)
     chat_request = openai_globals["ChatRequest"](
@@ -1105,7 +1149,7 @@ async def test_idle_timeout_does_not_send_abort_to_extension() -> None:
     try:
         with pytest.raises(Exception) as caught:
             async for _ in run_generation(
-                module["bridge"], module["run_registry"], "timeout-test", chat_request, http_req
+                runtime.bridge, runtime.registry, "timeout-test", chat_request, http_req
             ):
                 pass
     finally:
@@ -1139,7 +1183,7 @@ class HeartbeatingExtension:
         interval: float,
         done_after: float | None = None,
     ) -> None:
-        self.module = module
+        self.runtime = _runtime(module)
         self.interval = interval
         self.done_after = done_after
         self.sent: list[dict[str, Any]] = []
@@ -1160,7 +1204,7 @@ class HeartbeatingExtension:
                 self.done_after is not None
                 and asyncio.get_running_loop().time() - started >= self.done_after
             ):
-                self.module["bridge"].dispatch(
+                self.runtime.bridge.dispatch(
                     {
                         "type": "done",
                         "id": request_id,
@@ -1178,7 +1222,7 @@ class HeartbeatingExtension:
                 )
                 return
             self.beats += 1
-            self.module["bridge"].dispatch(
+            self.runtime.bridge.dispatch(
                 {
                     "type": "heartbeat",
                     "id": request_id,
@@ -1210,7 +1254,8 @@ async def _generate(
     idle_timeout: float,
 ) -> tuple[list[str], Exception | None, float]:
     """Exécute une génération complète avec des échéances accélérées."""
-    module["bridge"].ws = extension
+    runtime = _runtime(module)
+    runtime.bridge.ws = extension
     openai_globals = _openai_globals(module)
     chat_request = openai_globals["ChatRequest"](
         messages=[{"role": "user", "content": "recherche"}]
@@ -1233,7 +1278,7 @@ async def _generate(
     started = asyncio.get_running_loop().time()
     try:
         async for text in run_generation(
-            module["bridge"], module["run_registry"], request_id, chat_request, http_req
+            runtime.bridge, runtime.registry, request_id, chat_request, http_req
         ):
             chunks.append(text)
     except Exception as exc:

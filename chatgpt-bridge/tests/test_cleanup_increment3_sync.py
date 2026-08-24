@@ -178,15 +178,17 @@ class TestIncrement3Integration:
         assert "handleCleanupConversation" in content
         assert "cleanup_conversation" in content
 
-    def test_server_py_imports(self):
-        """Verify server.py has all necessary imports."""
-        from server import CleanupWorker, ConversationSweeper, bridge, run_registry
+    def test_server_py_is_a_thin_launcher(self):
+        """server.py exposes only `app`/`bridge_application`; the composition
+        root lives in `bridge.app.BridgeApplication` (R60)."""
+        import server
 
-        # Verify they exist
-        assert CleanupWorker is not None
-        assert ConversationSweeper is not None
-        assert bridge is not None
-        assert run_registry is not None
+        assert server.app is server.bridge_application.app
+        assert server.bridge_application.bridge is not None
+        assert server.bridge_application.registry is not None
+        assert server.bridge_application.openai_routes is not None
+        assert server.bridge_application.bridge_routes is not None
+        assert server.bridge_application.conversation_routes is not None
 
 
 class TestContentJsDeleteConversation:
