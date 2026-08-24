@@ -1048,7 +1048,9 @@ async def test_idle_timeout_does_not_send_abort_to_extension() -> None:
     module["run_generation"].__globals__["IDLE_TIMEOUT"] = 0.1
     try:
         with pytest.raises(Exception) as caught:
-            async for _ in module["run_generation"]("timeout-test", chat_request, http_req):
+            async for _ in module["run_generation"](
+                module["bridge"], module["run_registry"], "timeout-test", chat_request, http_req
+            ):
                 pass
     finally:
         module["run_generation"].__globals__["IDLE_TIMEOUT"] = old_idle
@@ -1170,7 +1172,9 @@ async def _generate(
     failure: Exception | None = None
     started = asyncio.get_running_loop().time()
     try:
-        async for text in module["run_generation"](request_id, chat_request, http_req):
+        async for text in module["run_generation"](
+            module["bridge"], module["run_registry"], request_id, chat_request, http_req
+        ):
             chunks.append(text)
     except Exception as exc:
         # Le test inspecte lui-même le type et le code de l'échec.
