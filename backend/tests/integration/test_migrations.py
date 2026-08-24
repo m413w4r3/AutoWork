@@ -52,7 +52,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql.schema import Table
 
-from cti_app.infrastructure.database.models import model_execution, schema  # noqa: F401
+from cti_app.infrastructure.database.models import discovery, model_execution, schema  # noqa: F401
 from cti_app.infrastructure.database.models.base import Base
 from tests.integration.conftest import _alembic_config
 

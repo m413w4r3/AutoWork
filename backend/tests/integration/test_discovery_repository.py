@@ -293,7 +293,7 @@ async def test_discovery_batch_missing_contributions_meta_fails(
     migrated_postgres_url: str,
 ) -> None:
     """Missing contributions_meta must cause KeyError."""
-    from cti_app.infrastructure.database.models.schema import DiscoveryBatchRow
+    from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
     from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
 
     # Manually construct a row with missing contributions_meta
@@ -338,7 +338,7 @@ async def test_discovery_batch_missing_parser_version_fails(
     migrated_postgres_url: str,
 ) -> None:
     """Missing parser_version must cause KeyError."""
-    from cti_app.infrastructure.database.models.schema import DiscoveryBatchRow
+    from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
     from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
 
     row = DiscoveryBatchRow(
@@ -384,7 +384,7 @@ async def test_discovery_batch_candidate_without_contribution_metadata_fails(
     """Candidate without matching contribution metadata must cause KeyError."""
     from uuid import uuid4 as make_uuid
 
-    from cti_app.infrastructure.database.models.schema import DiscoveryBatchRow
+    from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
     from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
 
     candidate_id = make_uuid()
@@ -459,7 +459,7 @@ async def test_discovery_batch_contribution_meta_missing_accepted_at_fails(
     """Contribution metadata without the accepted_at key must cause KeyError."""
     from uuid import uuid4 as make_uuid
 
-    from cti_app.infrastructure.database.models.schema import DiscoveryBatchRow
+    from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
     from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
 
     candidate_id = make_uuid()
@@ -540,7 +540,7 @@ async def test_discovery_batch_contribution_meta_missing_human_note_fails(
     """Contribution metadata without the human_note key must cause KeyError."""
     from uuid import uuid4 as make_uuid
 
-    from cti_app.infrastructure.database.models.schema import DiscoveryBatchRow
+    from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
     from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
 
     candidate_id = make_uuid()

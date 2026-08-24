@@ -26,7 +26,7 @@ from cti_app.domain.discovery import (
     SourceRole,
     SourceVerificationStatus,
 )
-from cti_app.infrastructure.database.models.schema import DiscoveryBatchRow
+from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
 
 
 class SqlAlchemyDiscoveryBatchRepository:

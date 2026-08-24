@@ -4,10 +4,7 @@ Provenance (RF-P3 / R09).
 These are the foundational entities referenced by every other bounded
 context (subjects, blobs, source documents, samples, provenance events).
 This module owns their SqlAlchemy repositories and the row/domain mappers
-exclusive to them. Generic infrastructure primitives live in
-:mod:`cti_app.infrastructure.database.repositories._shared`; none of the
-mappers below need them today (no UUID/datetime coercion — the ORM rows
-already carry native types).
+exclusive to them.
 """
 
 from collections.abc import Sequence
