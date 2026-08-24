@@ -52,7 +52,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql.schema import Table
 
-from cti_app.infrastructure.database.models import Base
+from cti_app.infrastructure.database.models.schema import Base
 from tests.integration.conftest import _alembic_config
 
 pytestmark = pytest.mark.integration

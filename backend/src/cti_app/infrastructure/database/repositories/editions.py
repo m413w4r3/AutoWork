@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
-from cti_app.infrastructure.database.models import (
+from cti_app.infrastructure.database.models.schema import (
     BriefDraftRow,
     BriefEvidencePackRow,
     ClaimRow,

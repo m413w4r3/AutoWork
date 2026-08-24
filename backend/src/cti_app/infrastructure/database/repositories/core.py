@@ -20,7 +20,7 @@ from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.errors import EntityNotFoundError
-from cti_app.infrastructure.database.models import (
+from cti_app.infrastructure.database.models.schema import (
     BlobRow,
     BriefEvidencePackRow,
     DerivedArtifactRow,

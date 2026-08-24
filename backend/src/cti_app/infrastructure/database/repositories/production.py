@@ -12,7 +12,7 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     SubjectProductionRun,
 )
-from cti_app.infrastructure.database.models import (
+from cti_app.infrastructure.database.models.schema import (
     EditionProductionBatchItemRow,
     EditionProductionBatchRow,
     ProductionArtifactRow,

@@ -22,7 +22,7 @@ from cti_app.domain.discovery_cumulative import (
     SubjectContribution,
     SubjectMergeEvent,
 )
-from cti_app.infrastructure.database.models import (
+from cti_app.infrastructure.database.models.schema import (
     DiscoveryIntakeRow,
     DiscoveryMergeRunRow,
     DiscoverySnapshotRow,

@@ -17,7 +17,7 @@ from cti_app.domain.model_conversations import (
     ModelConversationTurn,
 )
 from cti_app.domain.model_runs import ModelProvider
-from cti_app.infrastructure.database.models import (
+from cti_app.infrastructure.database.models.schema import (
     ConversationLifecycleRow,
     ModelConversationRow,
     ModelConversationTurnRow,
