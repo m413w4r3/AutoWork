@@ -17,11 +17,8 @@ from cti_app.domain.editorial import (
     HumanDecision,
     HumanDecisionType,
 )
-from cti_app.infrastructure.database.models.schema import (
-    EditionRow,
-    EditorialGroupRow,
-    HumanDecisionRow,
-)
+from cti_app.infrastructure.database.models.editions import EditionRow
+from cti_app.infrastructure.database.models.editorial import EditorialGroupRow, HumanDecisionRow
 
 
 class SqlAlchemyEditorialGroupRepository:

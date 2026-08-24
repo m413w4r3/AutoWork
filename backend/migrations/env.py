@@ -8,7 +8,10 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from cti_app.infrastructure.database.models import (  # noqa: F401
     collection,
+    core,
     discovery,
+    editions,
+    editorial,
     model_execution,
     schema,
 )

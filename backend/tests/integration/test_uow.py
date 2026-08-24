@@ -32,14 +32,9 @@ from cti_app.domain.model_runs import (
     ModelRunStatus,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
-from cti_app.infrastructure.database.models.schema import (
-    EditionAuditEventRow,
-    EditionRow,
-    JobEventRow,
-    JobRow,
-    ProvenanceEventRow,
-    SubjectRow,
-)
+from cti_app.infrastructure.database.models.core import ProvenanceEventRow, SubjectRow
+from cti_app.infrastructure.database.models.editions import EditionAuditEventRow, EditionRow
+from cti_app.infrastructure.database.models.schema import JobEventRow, JobRow
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 

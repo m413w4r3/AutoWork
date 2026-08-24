@@ -127,11 +127,6 @@ const MOTS_PLUS_MODELES = /plus de mod|autres mod|more models|legacy models/;
 const POLL_MS = 120;
 const APPEAR_TIMEOUT_MS = 30000; // délai d'apparition de la bulle de réponse
 const UPLOAD_TIMEOUT_MS = 120000; // upload des pièces jointes
-// const SETTLE_MS = 2000; // stabilité exigée quand un signal de fin est confirmé
-// const SETTLE_UNKNOWN_MS = 8000; // stabilité exigée quand aucun signal n'est reconnu
-// const EMPTY_FINAL_SETTLE_MS = 10000; // fin fiable sans corps final
-// const NO_MARKDOWN_FALLBACK_MS = 25000; // au-delà, on lit le tour entier faute de mieux
-// const HEARTBEAT_INTERVAL_MS = 20000; // réarme l'idle timeout sans transmettre le texte
 
 const SETTLE_MS = 2000; // fin UI confirmée
 const SETTLE_UNKNOWN_MS = 15000; // pas de signal UI fiable : prudence

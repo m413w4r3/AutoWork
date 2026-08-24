@@ -21,18 +21,18 @@ from cti_app.infrastructure.database.models.collection import (
     DerivedArtifactRow,
     SourceCollectionRow,
 )
-from cti_app.infrastructure.database.models.model_execution import (
-    ModelConversationTurnRow,
-    ModelRunRow,
-)
-from cti_app.infrastructure.database.models.schema import (
+from cti_app.infrastructure.database.models.core import (
     BlobRow,
-    BriefEvidencePackRow,
     ProvenanceEventRow,
     SampleRow,
     SourceDocumentRow,
     SubjectRow,
 )
+from cti_app.infrastructure.database.models.model_execution import (
+    ModelConversationTurnRow,
+    ModelRunRow,
+)
+from cti_app.infrastructure.database.models.schema import BriefEvidencePackRow
 
 
 class SqlAlchemyBlobRepository:

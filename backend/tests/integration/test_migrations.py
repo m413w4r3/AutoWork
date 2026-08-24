@@ -54,7 +54,10 @@ from sqlalchemy.sql.schema import Table
 
 from cti_app.infrastructure.database.models import (  # noqa: F401
     collection,
+    core,
     discovery,
+    editions,
+    editorial,
     model_execution,
     schema,
 )

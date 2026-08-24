@@ -17,7 +17,7 @@ from cti_app.domain.editorial import (
     HumanDecision,
     HumanDecisionType,
 )
-from cti_app.infrastructure.database.models.schema import HumanDecisionRow
+from cti_app.infrastructure.database.models.editorial import HumanDecisionRow
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 

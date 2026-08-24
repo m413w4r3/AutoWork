@@ -15,7 +15,10 @@ from cti_app.infrastructure.database.models.collection import (
     RejectedModelProposalRow,
     SourceCollectionRow,
 )
+from cti_app.infrastructure.database.models.core import ProvenanceEventRow
 from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
+from cti_app.infrastructure.database.models.editions import EditionAuditEventRow, EditionRow
+from cti_app.infrastructure.database.models.editorial import EditorialGroupRow, HumanDecisionRow
 from cti_app.infrastructure.database.models.model_execution import (
     ModelConversationRow,
     ModelConversationTurnRow,
@@ -25,16 +28,11 @@ from cti_app.infrastructure.database.models.model_execution import (
 from cti_app.infrastructure.database.models.schema import (
     BriefDraftRow,
     BriefEvidencePackRow,
-    EditionAuditEventRow,
     EditionProductionBatchItemRow,
     EditionProductionBatchRow,
-    EditionRow,
-    EditorialGroupRow,
-    HumanDecisionRow,
     JobEventRow,
     JobRow,
     ProductionArtifactRow,
-    ProvenanceEventRow,
     SubjectProductionRunRow,
 )
 
