@@ -16,8 +16,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from bridge.lifecycle import CleanupWorker, ConversationSweeper
 from bridge.registry import RunRegistry
-from server import CleanupWorker, ConversationSweeper
 
 
 class TestIncrement3Integration:
