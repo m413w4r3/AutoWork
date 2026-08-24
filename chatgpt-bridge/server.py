@@ -39,10 +39,6 @@ from bridge.contracts import (
     MODELES_NEUTRES,
     BridgeRunRequest,
     ChatRequest,
-    CleanupFailureRequest,
-    CleanupStartResponse,
-    ConversationLifecycleResponse,
-    ConversationReleaseRequest,
     ResponseRequest,
     RunControls,
     UiState,
@@ -63,13 +59,12 @@ from bridge.generation import (
 from bridge.lifecycle import (
     CleanupWorker,
     ConversationSweeper,
-    TERMINAL_IDENTITY_ERROR_CODES,
 )
 from bridge.registry import RunRegistry
+from bridge.routes_conversations import ConversationRoutes
 from bridge.transport import Bridge
 from bridge.ui import (
     UiUnavailable,
-    _ui_roundtrip,
     apply_controls,
     cached_probe,
     fetch_ui_state,
@@ -288,6 +283,14 @@ async def require_key(cred: Optional[HTTPAuthorizationCredentials] = Depends(_be
                 "retryable": False,
             },
         )
+
+
+conversation_routes = ConversationRoutes(
+    bridge=bridge,
+    registry=run_registry,
+    auth_dependency=require_key,
+)
+app.include_router(conversation_routes.router)
 
 
 # --------------------------------------------------------------------------- #
@@ -655,214 +658,6 @@ async def create_bridge_run(req: BridgeRunRequest, http_req: Request):
             "status": current["state"],
         }
     return await asyncio.shield(task)
-
-
-@app.delete("/v1/bridge/conversations/{conversation_id}", dependencies=[Depends(require_key)])
-async def archive_bridge_conversation(conversation_id: uuid.UUID):
-    if not bridge.online:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "bridge_extension_disconnected",
-                "message": "Extension Chrome non connectée.",
-                "retryable": True,
-            },
-        )
-    packet = await _ui_roundtrip(
-        bridge,
-        {"type": "conversation_archive", "conversation_id": str(conversation_id)}
-    )
-    return {"archived": packet.get("ok") is True, "conversation_id": str(conversation_id)}
-
-
-@app.post(
-    "/v1/conversations/{conversation_id}/release",
-    dependencies=[Depends(require_key)],
-)
-async def release_conversation(
-    conversation_id: str,
-    req: ConversationReleaseRequest,
-) -> ConversationLifecycleResponse:
-    """Release a conversation with an explicit outcome.
-
-    Only the application client can decide when a conversation is no longer needed
-    and what the outcome of that release is. The bridge applies the lifecycle policy
-    only after this explicit signal.
-
-    Outcome can be: success, failure, needs_review, or cancelled.
-    Only 'success' may trigger automatic cleanup based on the conversation's policy.
-    """
-    try:
-        result = run_registry.release_conversation(conversation_id, req.outcome)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-
-    return ConversationLifecycleResponse(
-        conversation_id=result["id"],
-        policy=result["policy"],
-        status=result["status"],
-        release_outcome=result["release_outcome"],
-        created_at=result["created_at"],
-        updated_at=result["updated_at"],
-        released_at=result["released_at"],
-        deleted_at=result["deleted_at"],
-        cleanup_attempt_count=result["cleanup_attempt_count"],
-        last_cleanup_attempt_at=result["last_cleanup_attempt_at"],
-        last_cleanup_error_code=result["last_cleanup_error_code"],
-        version=result["version"],
-    )
-
-
-@app.get(
-    "/v1/conversations/{conversation_id}/lifecycle",
-    dependencies=[Depends(require_key)],
-)
-async def get_conversation_lifecycle(
-    conversation_id: str,
-) -> ConversationLifecycleResponse:
-    """Retrieve the current lifecycle status of a conversation.
-
-    This allows clients to query the current state, released_at timestamp,
-    release outcome, cleanup status, and retry information.
-    """
-    result = run_registry.get_conversation_lifecycle(conversation_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    return ConversationLifecycleResponse(
-        conversation_id=result["id"],
-        policy=result["policy"],
-        status=result["status"],
-        release_outcome=result["release_outcome"],
-        created_at=result["created_at"],
-        updated_at=result["updated_at"],
-        released_at=result["released_at"],
-        deleted_at=result["deleted_at"],
-        cleanup_attempt_count=result["cleanup_attempt_count"],
-        last_cleanup_attempt_at=result["last_cleanup_attempt_at"],
-        last_cleanup_error_code=result["last_cleanup_error_code"],
-        version=result["version"],
-    )
-
-
-@app.post(
-    "/v1/conversations/{conversation_id}/cleanup/start",
-    dependencies=[Depends(require_key)],
-)
-async def start_conversation_cleanup(
-    conversation_id: str,
-) -> CleanupStartResponse:
-    """Initiate cleanup of a DELETE_PENDING conversation.
-
-    This transitions the conversation from DELETE_PENDING to DELETING state
-    and triggers the extension to open and delete the conversation via UI.
-
-    Idempotent: calling again on DELETING or DELETED returns current state.
-
-    Fail-closed: a CLEANUP_FAILED conversation whose last error is a terminal
-    identity error (locator_mismatch/locator_invalid) is refused with 409 and
-    left unchanged. No heuristic re-resolution and no override are permitted.
-    """
-    current = run_registry.get_conversation_lifecycle(conversation_id)
-    if current is None:
-        raise HTTPException(status_code=404, detail=f"Conversation not found: {conversation_id}")
-
-    if current["status"] == "cleanup_failed" and current.get(
-        "last_cleanup_error_code"
-    ) in TERMINAL_IDENTITY_ERROR_CODES:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "cleanup_terminal_identity_error",
-                "message": (
-                    "Cleanup cannot be retried: last failure was a terminal "
-                    f"identity error ({current.get('last_cleanup_error_code')})."
-                ),
-                "retryable": False,
-            },
-        )
-
-    try:
-        result = run_registry.start_cleanup(conversation_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-
-    return CleanupStartResponse(
-        conversation_id=result["id"],
-        status=result["status"],
-        cleanup_attempt_count=result["cleanup_attempt_count"],
-    )
-
-
-@app.post(
-    "/v1/conversations/{conversation_id}/cleanup/complete",
-    dependencies=[Depends(require_key)],
-)
-async def mark_conversation_deleted(
-    conversation_id: str,
-) -> ConversationLifecycleResponse:
-    """Mark a conversation as successfully deleted.
-
-    Called by the extension after successfully deleting via UI.
-    Idempotent: calling on already-DELETED returns current state.
-    """
-    try:
-        result = run_registry.mark_conversation_deleted(conversation_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-
-    return ConversationLifecycleResponse(
-        conversation_id=result["id"],
-        policy=result["policy"],
-        status=result["status"],
-        release_outcome=result["release_outcome"],
-        created_at=result["created_at"],
-        updated_at=result["updated_at"],
-        released_at=result["released_at"],
-        deleted_at=result["deleted_at"],
-        cleanup_attempt_count=result["cleanup_attempt_count"],
-        last_cleanup_attempt_at=result["last_cleanup_attempt_at"],
-        last_cleanup_error_code=result["last_cleanup_error_code"],
-        version=result["version"],
-    )
-
-
-@app.post(
-    "/v1/conversations/{conversation_id}/cleanup/fail",
-    dependencies=[Depends(require_key)],
-)
-async def mark_conversation_cleanup_failed(
-    conversation_id: str,
-    req: CleanupFailureRequest,
-) -> ConversationLifecycleResponse:
-    """Report cleanup failure and mark conversation CLEANUP_FAILED for retry.
-
-    The cleanup sweeper will retry up to 3 times with exponential backoff.
-    Idempotent: calling again increments attempt count.
-    """
-    try:
-        result = run_registry.mark_cleanup_failed(
-            conversation_id,
-            error_code=req.error_code,
-            error_message=req.error_message,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-
-    return ConversationLifecycleResponse(
-        conversation_id=result["id"],
-        policy=result["policy"],
-        status=result["status"],
-        release_outcome=result["release_outcome"],
-        created_at=result["created_at"],
-        updated_at=result["updated_at"],
-        released_at=result["released_at"],
-        deleted_at=result["deleted_at"],
-        cleanup_attempt_count=result["cleanup_attempt_count"],
-        last_cleanup_attempt_at=result["last_cleanup_attempt_at"],
-        last_cleanup_error_code=result["last_cleanup_error_code"],
-        version=result["version"],
-    )
 
 
 @app.get("/v1/bridge/runs/{response_id}", dependencies=[Depends(require_key)])

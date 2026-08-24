@@ -487,11 +487,12 @@ class TestR54cTransientRetry:
         assert conv["last_cleanup_error_code"] == "locator_invalid"
 
     @pytest.mark.asyncio
-    async def test_endpoint_refuses_locator_mismatch_with_409(self, registry, monkeypatch):
+    async def test_endpoint_refuses_locator_mismatch_with_409(self, registry):
         """Critical test 3: POST /cleanup/start rejects a terminal identity
         CLEANUP_FAILED with 409 and leaves state unchanged."""
-        import server
         from fastapi import HTTPException
+
+        from bridge.routes_conversations import ConversationRoutes
 
         conv_id = str(uuid4())
         registry.create_conversation(conv_id, "https://chatgpt.com/c/endpoint-mismatch", "delete_on_success")
@@ -499,13 +500,51 @@ class TestR54cTransientRetry:
         registry.start_cleanup(conv_id)
         registry.mark_cleanup_failed(conv_id, "locator_mismatch", "URL mismatch")
 
-        monkeypatch.setattr(server, "run_registry", registry)
+        async def noop_auth() -> None:
+            return None
+
+        routes = ConversationRoutes(
+            bridge=MagicMock(),
+            registry=registry,
+            auth_dependency=noop_auth,
+        )
 
         with pytest.raises(HTTPException) as exc_info:
-            await server.start_conversation_cleanup(conv_id)
+            await routes.start_conversation_cleanup(conv_id)
 
         assert exc_info.value.status_code == 409
 
         conv = registry.get_conversation_lifecycle(conv_id)
         assert conv["status"] == "cleanup_failed"
         assert conv["last_cleanup_error_code"] == "locator_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_endpoint_refuses_locator_invalid_with_409(self, registry):
+        """Critical test 3b: same principle for locator_invalid."""
+        from fastapi import HTTPException
+
+        from bridge.routes_conversations import ConversationRoutes
+
+        conv_id = str(uuid4())
+        registry.create_conversation(conv_id, "https://chatgpt.com/c/endpoint-invalid", "delete_on_success")
+        registry.release_conversation(conv_id, "success")
+        registry.start_cleanup(conv_id)
+        registry.mark_cleanup_failed(conv_id, "locator_invalid", "Missing external_locator")
+
+        async def noop_auth() -> None:
+            return None
+
+        routes = ConversationRoutes(
+            bridge=MagicMock(),
+            registry=registry,
+            auth_dependency=noop_auth,
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await routes.start_conversation_cleanup(conv_id)
+
+        assert exc_info.value.status_code == 409
+
+        conv = registry.get_conversation_lifecycle(conv_id)
+        assert conv["status"] == "cleanup_failed"
+        assert conv["last_cleanup_error_code"] == "locator_invalid"
