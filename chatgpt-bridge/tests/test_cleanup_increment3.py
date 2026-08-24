@@ -27,6 +27,24 @@ from server import CleanupWorker, ConversationSweeper
 pytestmark = pytest.mark.asyncio
 
 
+class _ScriptedBridge:
+    """Fake bridge whose .request() answers are scripted call-by-call.
+
+    Used where we must NOT mock CleanupWorker itself (R54c critical test 1):
+    the worker's real control flow runs, only the network edge is faked.
+    """
+
+    def __init__(self, responses: list[dict]):
+        self._responses = list(responses)
+        self.calls: list[dict] = []
+
+    async def request(self, message: dict, timeout: int | None = None) -> dict:
+        self.calls.append(message)
+        if not self._responses:
+            raise AssertionError("_ScriptedBridge: no more scripted responses")
+        return self._responses.pop(0)
+
+
 @pytest.fixture
 def temp_db():
     """Temporary SQLite database for testing."""
@@ -371,3 +389,123 @@ class TestCleanupIntegration:
             await sweeper.sweep()
 
             assert mock_worker.process_cleanup_task.call_count == 2
+
+
+class TestR54cTransientRetry:
+    """R54c: transient CLEANUP_FAILED must be really retryable, terminal
+    identity failures (locator_mismatch/locator_invalid) never must be —
+    through no code path (worker direct, sweeper, HTTP endpoint)."""
+
+    @pytest.mark.asyncio
+    async def test_real_retry_of_transient_cleanup_failure_reaches_deleted(self, registry):
+        """Critical test 1: real retry, no CleanupWorker mocking.
+
+        This must fail on the pre-fix code (process_cleanup_task rejects
+        CLEANUP_FAILED outright) and pass after the fix.
+        """
+        conv_id = str(uuid4())
+        registry.create_conversation(conv_id, "https://chatgpt.com/c/transient", "delete_on_success")
+        registry.release_conversation(conv_id, "success")
+        conv = registry.get_conversation_lifecycle(conv_id)
+        assert conv["status"] == "delete_pending"
+
+        # First attempt fails with a real transient error.
+        bridge = _ScriptedBridge(
+            [
+                {
+                    "success": False,
+                    "verified_deleted": False,
+                    "error_code": "conversation_menu_not_found",
+                    "error_message": "Menu button not found",
+                    "steps_completed": ["locator_verified"],
+                },
+            ]
+        )
+        worker = CleanupWorker(registry, bridge)
+        first = await worker.process_cleanup_task(conv_id)
+        assert first is False
+
+        conv = registry.get_conversation_lifecycle(conv_id)
+        assert conv["status"] == "cleanup_failed"
+        assert conv["last_cleanup_error_code"] == "conversation_menu_not_found"
+
+        # Retry succeeds: verified deletion.
+        bridge._responses.append(
+            {
+                "success": True,
+                "verified_deleted": True,
+                "steps_completed": ["locator_verified", "menu_opened", "deletion_verified"],
+            }
+        )
+
+        sweeper = ConversationSweeper(registry, worker)  # real CleanupWorker, not a mock
+        calls_before_retry = len(bridge.calls)
+        await sweeper.retry_failed()
+
+        conv = registry.get_conversation_lifecycle(conv_id)
+        assert conv["status"] == "deleted"
+        assert len(bridge.calls) - calls_before_retry == 1
+
+    @pytest.mark.asyncio
+    async def test_worker_direct_refuses_locator_mismatch(self, registry):
+        """Critical test 2a: worker refuses a terminal identity failure directly."""
+        conv_id = str(uuid4())
+        registry.create_conversation(conv_id, "https://chatgpt.com/c/mismatch-direct", "delete_on_success")
+        registry.release_conversation(conv_id, "success")
+        registry.start_cleanup(conv_id)
+        registry.mark_cleanup_failed(conv_id, "locator_mismatch", "URL mismatch")
+
+        bridge = _ScriptedBridge([])
+        worker = CleanupWorker(registry, bridge)
+
+        result = await worker.process_cleanup_task(conv_id)
+
+        assert result is False
+        assert bridge.calls == []
+        conv = registry.get_conversation_lifecycle(conv_id)
+        assert conv["status"] == "cleanup_failed"
+        assert conv["last_cleanup_error_code"] == "locator_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_worker_direct_refuses_locator_invalid(self, registry):
+        """Critical test 2b: same principle for locator_invalid."""
+        conv_id = str(uuid4())
+        registry.create_conversation(conv_id, "https://chatgpt.com/c/invalid-direct", "delete_on_success")
+        registry.release_conversation(conv_id, "success")
+        registry.start_cleanup(conv_id)
+        registry.mark_cleanup_failed(conv_id, "locator_invalid", "Missing external_locator")
+
+        bridge = _ScriptedBridge([])
+        worker = CleanupWorker(registry, bridge)
+
+        result = await worker.process_cleanup_task(conv_id)
+
+        assert result is False
+        assert bridge.calls == []
+        conv = registry.get_conversation_lifecycle(conv_id)
+        assert conv["status"] == "cleanup_failed"
+        assert conv["last_cleanup_error_code"] == "locator_invalid"
+
+    @pytest.mark.asyncio
+    async def test_endpoint_refuses_locator_mismatch_with_409(self, registry, monkeypatch):
+        """Critical test 3: POST /cleanup/start rejects a terminal identity
+        CLEANUP_FAILED with 409 and leaves state unchanged."""
+        import server
+        from fastapi import HTTPException
+
+        conv_id = str(uuid4())
+        registry.create_conversation(conv_id, "https://chatgpt.com/c/endpoint-mismatch", "delete_on_success")
+        registry.release_conversation(conv_id, "success")
+        registry.start_cleanup(conv_id)
+        registry.mark_cleanup_failed(conv_id, "locator_mismatch", "URL mismatch")
+
+        monkeypatch.setattr(server, "run_registry", registry)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await server.start_conversation_cleanup(conv_id)
+
+        assert exc_info.value.status_code == 409
+
+        conv = registry.get_conversation_lifecycle(conv_id)
+        assert conv["status"] == "cleanup_failed"
+        assert conv["last_cleanup_error_code"] == "locator_mismatch"

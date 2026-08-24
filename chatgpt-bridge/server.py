@@ -95,8 +95,15 @@ def _bridge_response_request(req: BridgeRunRequest) -> ResponseRequest:
 # Cleanup Automation — Incrément 3
 # --------------------------------------------------------------------------- #
 
+# Erreurs d'identité terminales (fail-closed) : un mismatch/absence de
+# external_locator ne doit jamais être retenté automatiquement, par aucun
+# chemin (sweeper, worker direct, endpoint HTTP).
+# Voir chatgpt-bridge/AGENTS.md — "Destructive actions — fail closed".
+_TERMINAL_IDENTITY_ERROR_CODES = frozenset({"locator_mismatch", "locator_invalid"})
+
+
 class CleanupWorker:
-    """Traite les conversations DELETE_PENDING en supprimant via l'UI."""
+    """Traite les conversations DELETE_PENDING (et CLEANUP_FAILED retryables) via l'UI."""
 
     def __init__(self, registry: RunRegistry, bridge: "Bridge"):
         self.registry = registry
@@ -107,7 +114,7 @@ class CleanupWorker:
         """
         Exécute le cleanup d'une conversation:
         1. Récupère l'état de la conversation
-        2. Valide le status (DELETE_PENDING)
+        2. Valide le status (DELETE_PENDING ou CLEANUP_FAILED retryable)
         3. Marque comme DELETING
         4. Envoie une requête à l'extension
         5. Attend la réponse
@@ -123,9 +130,23 @@ class CleanupWorker:
                 self.logger.warning(f"Conversation {conversation_id} not found")
                 return False
 
-            if conv["status"] != "delete_pending":
+            if conv["status"] not in ("delete_pending", "cleanup_failed"):
                 self.logger.warning(
-                    f"Conversation {conversation_id} not in DELETE_PENDING, status={conv['status']}"
+                    f"Conversation {conversation_id} not in DELETE_PENDING/CLEANUP_FAILED, "
+                    f"status={conv['status']}"
+                )
+                return False
+
+            # Fail-closed : un CLEANUP_FAILED avec erreur d'identité terminale
+            # (locator_mismatch/locator_invalid) n'est jamais retenté, même en
+            # appelant le worker directement. Aucune requête Bridge, aucun
+            # start_cleanup, aucun changement de status.
+            if conv["status"] == "cleanup_failed" and conv.get(
+                "last_cleanup_error_code"
+            ) in _TERMINAL_IDENTITY_ERROR_CODES:
+                self.logger.warning(
+                    f"Refusing retry for {conversation_id}: terminal identity error "
+                    f"({conv.get('last_cleanup_error_code')})"
                 )
                 return False
 
@@ -211,12 +232,6 @@ class CleanupWorker:
                 "error_message": str(e),
                 "verified_deleted": False,
             }
-
-
-# Erreurs d'identité terminales (fail-closed) : un mismatch/absence de
-# external_locator ne doit jamais être retenté automatiquement.
-# Voir chatgpt-bridge/AGENTS.md — "Destructive actions — fail closed".
-_TERMINAL_IDENTITY_ERROR_CODES = frozenset({"locator_mismatch", "locator_invalid"})
 
 
 class ConversationSweeper:
@@ -1678,7 +1693,30 @@ async def start_conversation_cleanup(
     and triggers the extension to open and delete the conversation via UI.
 
     Idempotent: calling again on DELETING or DELETED returns current state.
+
+    Fail-closed: a CLEANUP_FAILED conversation whose last error is a terminal
+    identity error (locator_mismatch/locator_invalid) is refused with 409 and
+    left unchanged. No heuristic re-resolution and no override are permitted.
     """
+    current = run_registry.get_conversation_lifecycle(conversation_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail=f"Conversation not found: {conversation_id}")
+
+    if current["status"] == "cleanup_failed" and current.get(
+        "last_cleanup_error_code"
+    ) in _TERMINAL_IDENTITY_ERROR_CODES:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "cleanup_terminal_identity_error",
+                "message": (
+                    "Cleanup cannot be retried: last failure was a terminal "
+                    f"identity error ({current.get('last_cleanup_error_code')})."
+                ),
+                "retryable": False,
+            },
+        )
+
     try:
         result = run_registry.start_cleanup(conversation_id)
     except ValueError as exc:
