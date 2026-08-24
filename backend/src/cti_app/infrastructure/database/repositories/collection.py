@@ -25,7 +25,7 @@ from cti_app.domain.discovery import (
     SourceRelationshipStatus,
     SourceRole,
 )
-from cti_app.infrastructure.database.models.schema import (
+from cti_app.infrastructure.database.models.collection import (
     ClaimRow,
     CollectionAttemptRow,
     CollectionPolicySnapshotRow,

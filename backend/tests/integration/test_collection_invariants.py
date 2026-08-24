@@ -6,7 +6,7 @@ from sqlalchemy.exc import DBAPIError
 
 from cti_app.domain.collection import SourceCollection
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
-from cti_app.infrastructure.database.models.schema import SourceCollectionRow
+from cti_app.infrastructure.database.models.collection import SourceCollectionRow
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from tests.collection_support import InMemoryCollectionUnitOfWorkFactory

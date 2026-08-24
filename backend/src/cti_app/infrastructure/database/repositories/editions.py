@@ -8,6 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
+from cti_app.infrastructure.database.models.collection import (
+    ClaimRow,
+    CollectionAttemptRow,
+    IndicatorRow,
+    RejectedModelProposalRow,
+    SourceCollectionRow,
+)
 from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
 from cti_app.infrastructure.database.models.model_execution import (
     ModelConversationRow,
@@ -18,21 +25,16 @@ from cti_app.infrastructure.database.models.model_execution import (
 from cti_app.infrastructure.database.models.schema import (
     BriefDraftRow,
     BriefEvidencePackRow,
-    ClaimRow,
-    CollectionAttemptRow,
     EditionAuditEventRow,
     EditionProductionBatchItemRow,
     EditionProductionBatchRow,
     EditionRow,
     EditorialGroupRow,
     HumanDecisionRow,
-    IndicatorRow,
     JobEventRow,
     JobRow,
     ProductionArtifactRow,
     ProvenanceEventRow,
-    RejectedModelProposalRow,
-    SourceCollectionRow,
     SubjectProductionRunRow,
 )
 
