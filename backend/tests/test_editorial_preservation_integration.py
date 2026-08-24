@@ -20,9 +20,11 @@ from cti_app.domain.briefs import (
     AmendmentKind,
     AmendmentStatus,
     BriefAmendment,
+    BriefBlock,
     BriefDraft,
     BriefDraftStatus,
     BriefEvidencePack,
+    BriefSentence,
     EvidencePackScope,
 )
 from cti_app.domain.discovery_cumulative import (
@@ -47,7 +49,7 @@ class TestPublishedBriefWithNewContributions:
             edition_id=edition_id,
             group_id=group_id,
             version=1,
-            content_hash="original" + "0" * 56,
+            content_hash="0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5",
             object_hashes=(),
             sources=(),
             claims=(),
@@ -70,7 +72,17 @@ class TestPublishedBriefWithNewContributions:
             pack_hash=published_pack.content_hash,
             version=1,
             title="Original Brief",
-            blocks=(),
+            blocks=(
+                BriefBlock(
+                    sentences=(
+                        BriefSentence(
+                            text="This is the original brief content.",
+                            factual=False,
+                            claim_ids=(),
+                        ),
+                    ),
+                ),
+            ),
             limits=(),
             source_ids=(),
             model_run_id=uuid4(),
@@ -86,7 +98,7 @@ class TestPublishedBriefWithNewContributions:
             merge_run_id=uuid4(),
             planner_kind=DiscoveryPlannerKind.HEURISTIC,
             subjects=(),
-            snapshot_hash="snapshot_v2" + "0" * 53,
+            snapshot_hash="755123e3de5e16fa15aaddb863aec3ebda3df52f9dc743948943e17839269194",
         )
 
         # Detect new contributions
@@ -155,7 +167,8 @@ class TestPublishedBriefWithNewContributions:
         # Published brief with typo
         original_brief_id = uuid4()
         original_pack_id = uuid4()
-        original_pack_hash = "wrong" + "0" * 59
+        original_pack_hash = "8810ad581e59f2bc3928b261707a71308f7e139eb04820366dc4d5c18d980225"
+        original_contribution_id = uuid4()
 
         # Correction amendment (redactional)
         corrected = BriefAmendment(
@@ -167,12 +180,13 @@ class TestPublishedBriefWithNewContributions:
             kind=AmendmentKind.CORRECTION,
             status=AmendmentStatus.DRAFT,
             evidence_pack_id=original_pack_id,  # Same evidence
-            contribution_ids=(),  # No new contributions
+            contribution_ids=(original_contribution_id,),  # Same contribution, no new content
             revision_reason="Fixed typo in paragraph 2",
         )
 
         # Original pack hash unchanged
-        assert original_pack_hash == "wrong" + "0" * 59
+        expected_hash = "8810ad581e59f2bc3928b261707a71308f7e139eb04820366dc4d5c18d980225"
+        assert original_pack_hash == expected_hash
         # Amendment references it but doesn't modify it
         assert corrected.evidence_pack_id == original_pack_id
 

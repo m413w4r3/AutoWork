@@ -11,7 +11,7 @@ Tests the complete flow:
 
 from uuid import uuid4
 
-from cti_app.domain.briefs import BriefDraft, BriefDraftStatus
+from cti_app.domain.briefs import BriefBlock, BriefDraft, BriefDraftStatus, BriefSentence
 from cti_app.domain.discovery_cumulative import (
     DiscoveryIdentityStatus,
     DiscoveryPlannerKind,
@@ -39,7 +39,7 @@ class TestReplayEditionWorkflow:
             merge_run_id=uuid4(),
             planner_kind=DiscoveryPlannerKind.HEURISTIC,
             subjects=(),
-            snapshot_hash="operational" + "0" * 54,
+            snapshot_hash="d5e4f7f12f0e53151a465a339a63be9d1ec2e354f82f1c3847c54705ab2d2074",
             lineage=DiscoverySnapshotLineage.OPERATIONAL,
             is_active=True,
         )
@@ -53,7 +53,7 @@ class TestReplayEditionWorkflow:
             merge_run_id=uuid4(),
             planner_kind=DiscoveryPlannerKind.CHATGPT,  # Different planner
             subjects=(),
-            snapshot_hash="replay" + "0" * 59,
+            snapshot_hash="ac203c9843b5bd8c883e07039ff82820c94422010be6108bb82403ca25376a22",
             lineage=DiscoverySnapshotLineage.REPLAY,  # Different lineage
             is_active=False,  # Not active yet
             replay_run_id=uuid4(),
@@ -138,10 +138,20 @@ class TestReplayEditionWorkflow:
             edition_id=uuid4(),
             group_id=uuid4(),
             pack_id=pack_id,
-            pack_hash="pack_v1" + "0" * 57,
+            pack_hash="3b801c017997f32bdf89cffd898e3547cf339babb8425ed3c9c945c084fa70de",
             version=1,
             title="Published Brief v1",
-            blocks=(),
+            blocks=(
+                BriefBlock(
+                    sentences=(
+                        BriefSentence(
+                            text="This is the published brief content.",
+                            factual=False,
+                            claim_ids=(),
+                        ),
+                    ),
+                ),
+            ),
             limits=(),
             source_ids=(),
             model_run_id=uuid4(),

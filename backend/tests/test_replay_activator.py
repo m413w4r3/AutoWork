@@ -38,7 +38,7 @@ class TestReplayActivator:
             merge_run_id=uuid4(),
             planner_kind=DiscoveryPlannerKind.HEURISTIC,
             subjects=(),
-            snapshot_hash="replay" + "0" * 59,
+            snapshot_hash="ac203c9843b5bd8c883e07039ff82820c94422010be6108bb82403ca25376a22",
             lineage=DiscoverySnapshotLineage.REPLAY,
         )
 
@@ -79,7 +79,7 @@ class TestReplayActivator:
             merge_run_id=uuid4(),
             planner_kind=DiscoveryPlannerKind.HEURISTIC,
             subjects=(),
-            snapshot_hash="replay" + "0" * 59,
+            snapshot_hash="ac203c9843b5bd8c883e07039ff82820c94422010be6108bb82403ca25376a22",
             lineage=DiscoverySnapshotLineage.REPLAY,
         )
 
@@ -129,7 +129,7 @@ class TestReplayActivator:
             merge_run_id=uuid4(),
             planner_kind=DiscoveryPlannerKind.HEURISTIC,
             subjects=(),
-            snapshot_hash="replay" + "0" * 59,
+            snapshot_hash="ac203c9843b5bd8c883e07039ff82820c94422010be6108bb82403ca25376a22",
             lineage=DiscoverySnapshotLineage.REPLAY,
         )
 
