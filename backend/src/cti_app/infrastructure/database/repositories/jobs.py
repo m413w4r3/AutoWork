@@ -13,7 +13,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics, JobStatus
-from cti_app.infrastructure.database.models.schema import JobEventRow, JobRow
+from cti_app.infrastructure.database.models.jobs import JobEventRow, JobRow
 
 
 class SqlAlchemyJobRepository:

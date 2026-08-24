@@ -12,7 +12,7 @@ from cti_app.domain.briefs import (
     BriefSentence,
     EvidencePackScope,
 )
-from cti_app.infrastructure.database.models.schema import (
+from cti_app.infrastructure.database.models.briefs import (
     BriefDraftRow,
     BriefEvidencePackRow,
 )

@@ -53,12 +53,15 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql.schema import Table
 
 from cti_app.infrastructure.database.models import (  # noqa: F401
+    briefs,
     collection,
     core,
     discovery,
     editions,
     editorial,
+    jobs,
     model_execution,
+    production,
     schema,
 )
 from cti_app.infrastructure.database.models.base import Base
