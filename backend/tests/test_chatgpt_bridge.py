@@ -355,41 +355,60 @@ def test_requested_model_is_a_label_and_only_ui_model_drives_the_interface() -> 
     assert label.web_search is False
 
 
-def _stub_controls(module: dict[str, Any], applied: dict[str, Any], state: Any) -> None:
-    async def apply_controls(_: Any) -> tuple[dict[str, Any], Any]:
-        outcome = module["ControlOutcome"]
+def _stub_controls(
+    monkeypatch: pytest.MonkeyPatch, module: dict[str, Any], applied: dict[str, Any], state: Any
+) -> None:
+    # `prepare_run`/`apply_controls` now live in the (import-cached) `bridge.ui`
+    # module, unlike the rest of `module`, which `runpy` re-executes fresh per
+    # `load_bridge()` call. `monkeypatch` undoes the patch after the test so it
+    # cannot leak into later tests sharing that cached module.
+    async def apply_controls(
+        _bridge: Any, _controls: Any, _conversation: Any = None
+    ) -> tuple[dict[str, Any], Any]:
+        outcome = module["prepare_run"].__globals__["ControlOutcome"]
         return {name: outcome.model_validate(value) for name, value in applied.items()}, state
 
-    module["prepare_run"].__globals__["apply_controls"] = apply_controls
+    monkeypatch.setitem(module["prepare_run"].__globals__, "apply_controls", apply_controls)
 
 
-async def test_unverified_model_refuses_the_run_but_web_search_falls_back_to_the_prompt() -> None:
+async def test_unverified_model_refuses_the_run_but_web_search_falls_back_to_the_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = load_bridge()
     controls = module["RunControls"]
+    bridge = module["bridge"]
 
     _stub_controls(
+        monkeypatch,
         module,
         {"model": {"requested": "GPT-5 Thinking", "ok": False, "reason": "absent du sélecteur"}},
         None,
     )
     with pytest.raises(HTTPException, match="non appliqué"):
-        await module["prepare_run"](controls(model="GPT-5 Thinking"), allow_unverified_model=False)
+        await module["prepare_run"](
+            bridge, controls(model="GPT-5 Thinking"), allow_unverified_model=False
+        )
 
     tolerated = await module["prepare_run"](
-        controls(model="GPT-5 Thinking"), allow_unverified_model=True
+        bridge, controls(model="GPT-5 Thinking"), allow_unverified_model=True
     )
     assert tolerated.model_source == "unknown"
 
     _stub_controls(
+        monkeypatch,
         module,
         {"web_search": {"requested": True, "ok": False, "reason": "bouton introuvable"}},
         None,
     )
-    fallback = await module["prepare_run"](controls(web_search=True), allow_unverified_model=False)
+    fallback = await module["prepare_run"](
+        bridge, controls(web_search=True), allow_unverified_model=False
+    )
     assert fallback.web_search_mode == "prompt_instructed"
 
 
-async def test_verified_ui_state_names_the_model_and_the_native_search_tool() -> None:
+async def test_verified_ui_state_names_the_model_and_the_native_search_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = load_bridge()
     state = module["UiState"].model_validate(
         {
@@ -397,10 +416,15 @@ async def test_verified_ui_state_names_the_model_and_the_native_search_tool() ->
             "web_search": {"supported": True, "enabled": True, "verified": True},
         }
     )
-    _stub_controls(module, {"web_search": {"requested": True, "ok": True, "verified": True}}, state)
+    _stub_controls(
+        monkeypatch,
+        module,
+        {"web_search": {"requested": True, "ok": True, "verified": True}},
+        state,
+    )
 
     report = await module["prepare_run"](
-        module["RunControls"](web_search=True), allow_unverified_model=False
+        module["bridge"], module["RunControls"](web_search=True), allow_unverified_model=False
     )
     body = module["_response_body"](
         "resp_x",

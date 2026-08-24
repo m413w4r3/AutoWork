@@ -37,7 +37,6 @@ from bridge.config import (
     RUN_RETENTION_SECONDS,
     SHUTDOWN_GRACE_SECONDS,
     TOTAL_TIMEOUT,
-    UI_PROBE_TTL,
     UI_SNAPSHOT_STALE,
     UI_TIMEOUT,
     WS_TOKEN,
@@ -50,11 +49,9 @@ from bridge.contracts import (
     ChatRequest,
     CleanupFailureRequest,
     CleanupStartResponse,
-    ControlOutcome,
     ConversationLifecycleResponse,
     ConversationReleaseRequest,
     FileAttachment,
-    Outcomes,
     ResponseRequest,
     RunControls,
     RunReport,
@@ -67,6 +64,16 @@ from bridge.lifecycle import (
 )
 from bridge.registry import RunRegistry
 from bridge.transport import Bridge
+from bridge.ui import (
+    UiUnavailable,
+    _ui_roundtrip,
+    apply_controls,
+    cached_probe,
+    fetch_ui_state,
+    invalidate_probe_cache,
+    prepare_run,
+    probed_ui_state,
+)
 
 logger = logging.getLogger("chatgpt_bridge")
 
@@ -799,157 +806,6 @@ class _BackgroundRequest:
         return False
 
 
-# --------------------------------------------------------------------------- #
-# Lecture et pilotage de l'interface ChatGPT
-#
-# Le content script n'annonce un réglage appliqué qu'après l'avoir relu dans le
-# DOM. Le serveur ne fait donc que transporter ce verdict : il n'infère jamais
-# qu'un contrôle a pris parce que la commande est partie.
-# --------------------------------------------------------------------------- #
-class UiUnavailable(RuntimeError):
-    """L'état de l'interface n'a pas pu être obtenu (extension absente, onglet muet…)."""
-
-
-async def _ui_roundtrip(payload: dict) -> dict:
-    if not bridge.online:
-        raise UiUnavailable("extension non connectée")
-    try:
-        packet = await bridge.request(payload, UI_TIMEOUT)
-    except asyncio.TimeoutError as exc:
-        raise UiUnavailable(f"aucune réponse de l'extension après {UI_TIMEOUT:.0f}s") from exc
-    except Exception as exc:  # noqa: BLE001 - socket fermé, encodage refusé…
-        raise UiUnavailable(f"{type(exc).__name__}: {exc}") from exc
-    if packet.get("type") == "error":  # injecté par `_fail_after_grace`
-        raise UiUnavailable(str(packet.get("message") or "extension déconnectée"))
-    if packet.get("error"):
-        raise UiUnavailable(str(packet["error"]))
-    return packet
-
-
-def _ui_state_of(packet: dict) -> Optional[UiState]:
-    state = packet.get("state")
-    return UiState.model_validate(state) if isinstance(state, dict) else None
-
-
-async def fetch_ui_state(
-    probe: bool = False, conversation: Optional[BridgeConversationTarget] = None
-) -> UiState:
-    """Lit l'état de l'UI. `probe` ouvre les menus pour énumérer les choix."""
-    state = _ui_state_of(
-        await _ui_roundtrip(
-            {
-                "type": "ui_state",
-                "probe": probe,
-                "conversation": conversation.model_dump(mode="json") if conversation else None,
-            }
-        )
-    )
-    if state is None:
-        raise UiUnavailable("l'extension n'a renvoyé aucun état")
-    bridge.last_ui_state = state
-    bridge.last_ui_at = time.time()
-    return state
-
-
-# Dernière sonde : ouvrir les menus se voit à l'écran, on ne le refait pas à
-# chaque appel de /v1/models.
-_probe_cache: Dict[str, Any] = {"at": 0.0, "state": None}
-
-
-async def probed_ui_state(fresh: bool = False) -> UiState:
-    cached: Optional[UiState] = _probe_cache["state"]
-    if not fresh and cached is not None and time.monotonic() - _probe_cache["at"] < UI_PROBE_TTL:
-        return cached
-    # La sonde manipule l'UI : elle ne doit jamais s'exécuter pendant une génération.
-    async with bridge.slot:
-        state = await fetch_ui_state(probe=True)
-    _probe_cache.update(at=time.monotonic(), state=state)
-    return state
-
-
-async def apply_controls(
-    controls: RunControls, conversation: Optional[BridgeConversationTarget] = None
-) -> tuple[Outcomes, Optional[UiState]]:
-    wanted = controls.wanted()
-    if not wanted:
-        return {}, await fetch_ui_state(conversation=conversation)
-    packet = await _ui_roundtrip(
-        {
-            "type": "ui_control",
-            "controls": wanted,
-            "conversation": conversation.model_dump(mode="json") if conversation else None,
-        }
-    )
-    outcomes = {
-        name: ControlOutcome.model_validate(value)
-        for name, value in (packet.get("applied") or {}).items()
-    }
-    return outcomes, _ui_state_of(packet)
-
-
-def _web_search_mode(controls: RunControls, outcomes: Outcomes) -> str:
-    """Comment la recherche web est réellement obtenue pour ce run."""
-    outcome = outcomes.get("web_search")
-    applied = outcome is not None and outcome.ok
-    if controls.web_search is True:
-        # L'instruction dans le prompt reste le repli : elle demande à ChatGPT
-        # de chercher, sans garantie que l'outil soit actif.
-        return "ui_tool" if applied else "prompt_instructed"
-    if controls.web_search is False:
-        return "off" if applied else "off_unverified"
-    return "untouched"
-
-
-async def prepare_run(
-    controls: RunControls,
-    *,
-    allow_unverified_model: bool,
-    conversation: Optional[BridgeConversationTarget] = None,
-) -> RunReport:
-    """Applique les contrôles avant la génération, à l'intérieur du slot.
-
-    Un contrôle explicitement demandé et non vérifié fait échouer le run : dans
-    une chaîne CTI, un run attribué au mauvais modèle est pire qu'un run manquant.
-    """
-    try:
-        outcomes, state = (
-            await apply_controls(controls, conversation)
-            if conversation is not None
-            else await apply_controls(controls)
-        )
-    except UiUnavailable as exc:
-        # Modèle et profil sont des exigences : sans pilotage de l'UI, le run
-        # n'a pas lieu. La recherche web, elle, a un repli par le prompt, et
-        # l'état seul n'est qu'un bonus d'observabilité.
-        if controls.model or controls.profile:
-            raise HTTPException(
-                status_code=502, detail=f"Contrôles d'interface inapplicables : {exc}"
-            ) from exc
-        outcomes, state = {}, None
-
-    for nom, demande in (("profile", controls.profile), ("model", controls.model)):
-        outcome = outcomes.get(nom)
-        if outcome is None or outcome.ok:
-            continue
-        if nom == "model" and allow_unverified_model:
-            continue
-        raise HTTPException(
-            status_code=409,
-            detail=f"Réglage « {nom} » = « {demande} » non appliqué dans l'UI : {outcome.reason}",
-        )
-
-    if any(o.changed for o in outcomes.values()):
-        _probe_cache.update(at=0.0, state=None)  # la sonde en cache est périmée
-
-    observed = state.model.selected if state and state.model.verified else None
-    return RunReport(
-        model_observed=observed,
-        model_source="ui_observed" if observed else "unknown",
-        web_search_mode=_web_search_mode(controls, outcomes),
-        controls=outcomes,
-    )
-
-
 def _response_chat_request(req: ResponseRequest) -> ChatRequest:
     messages = _response_messages(req.input)
     if req.bridge_recovery:
@@ -1104,6 +960,7 @@ async def _execute_background_response(
     try:
         async with bridge.slot:
             report = await prepare_run(
+                bridge,
                 controls,
                 allow_unverified_model=allow_unverified_model,
                 conversation=req.conversation,
@@ -1192,6 +1049,7 @@ async def _create_response(
             int((time.monotonic() - queued_at) * 1000),
         )
         report = await prepare_run(
+            bridge,
             controls,
             allow_unverified_model=allow_unverified_model,
             conversation=req.conversation,
@@ -1428,6 +1286,7 @@ async def archive_bridge_conversation(conversation_id: uuid.UUID):
             },
         )
     packet = await _ui_roundtrip(
+        bridge,
         {"type": "conversation_archive", "conversation_id": str(conversation_id)}
     )
     return {"archived": packet.get("ok") is True, "conversation_id": str(conversation_id)}
@@ -1711,7 +1570,7 @@ async def bridge_ui_state(probe: bool = False, fresh: bool = False):
     à l'écran, et la génération en cours est attendue avant de le faire.
     """
     try:
-        state = await (probed_ui_state(fresh) if probe else fetch_ui_state())
+        state = await (probed_ui_state(bridge, fresh) if probe else fetch_ui_state(bridge))
     except UiUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return state.model_dump()
@@ -1724,11 +1583,11 @@ async def bridge_ui_controls(controls: RunControls):
         raise HTTPException(status_code=422, detail="Aucun contrôle demandé")
     async with bridge.slot:
         try:
-            outcomes, state = await apply_controls(controls)
+            outcomes, state = await apply_controls(bridge, controls)
         except UiUnavailable as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
     # La sonde en cache décrit un état désormais périmé.
-    _probe_cache.update(at=0.0, state=None)
+    invalidate_probe_cache()
     return {
         "ok": all(o.ok for o in outcomes.values()),
         "applied": {name: o.model_dump() for name, o in outcomes.items()},
@@ -1745,7 +1604,7 @@ async def bridge_capabilities(probe: bool = False, fresh: bool = False):
     """
     if probe:
         try:
-            state = await probed_ui_state(fresh)
+            state = await probed_ui_state(bridge, fresh)
         except UiUnavailable as exc:
             code = "bridge_ui_timeout" if "après" in str(exc) else "bridge_extension_disconnected"
             if code == "bridge_ui_timeout":
@@ -1858,13 +1717,6 @@ async def chat_completions(req: ChatRequest, http_req: Request):
     return completion_body(cid, req.model, created, "".join(parts), prompt_tokens)
 
 
-def _cached_probe() -> Optional[UiState]:
-    state: Optional[UiState] = _probe_cache["state"]
-    if state is None or time.monotonic() - _probe_cache["at"] >= UI_PROBE_TTL:
-        return None
-    return state
-
-
 @app.get("/v1/models", dependencies=[Depends(require_key)])
 async def list_models(probe: bool = False):
     """Modèles du sélecteur ChatGPT quand ils sont connus, liste factice sinon.
@@ -1876,11 +1728,11 @@ async def list_models(probe: bool = False):
     state = None
     if probe:
         try:
-            state = await probed_ui_state()
+            state = await probed_ui_state(bridge)
         except UiUnavailable:
             state = None
     else:
-        state = _cached_probe()
+        state = cached_probe()
 
     disponibles = (state.model.available if state else None) or []
     # La liste des modèles bouge rarement, la sélection change à chaque run :
@@ -1888,7 +1740,7 @@ async def list_models(probe: bool = False):
     selection = state.model.selected_id if state else None
     if disponibles:
         try:
-            selection = (await fetch_ui_state()).model.selected_id or selection
+            selection = (await fetch_ui_state(bridge)).model.selected_id or selection
         except UiUnavailable:
             pass
 
