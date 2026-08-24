@@ -28,240 +28,44 @@ from urllib.parse import parse_qsl, unquote_to_bytes, urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, model_validator
 
-HOST = os.getenv("BRIDGE_HOST", "127.0.0.1")
-PORT = int(os.getenv("BRIDGE_PORT", "8001"))
-# Si défini, les clients doivent envoyer  Authorization: Bearer <clé>
-API_KEY = os.getenv("BRIDGE_API_KEY")
-# Délai max sans le moindre paquet depuis l'extension avant d'abandonner.
-IDLE_TIMEOUT = float(os.getenv("BRIDGE_IDLE_TIMEOUT", "120"))
-# Délai max pour une génération complète. Une recherche approfondie ChatGPT
-# dépasse couramment le quart d'heure : cette borne protège d'une génération
-# réellement bloquée, elle ne doit pas arbitrer la durée normale d'une recherche.
-TOTAL_TIMEOUT = float(os.getenv("BRIDGE_TOTAL_TIMEOUT", "3600"))
-KEEPALIVE_INTERVAL = 20.0  # garde le service worker MV3 en vie
-# Délai laissé à l'extension pour se reconnecter sans perdre la requête en cours.
-RECONNECT_GRACE = float(os.getenv("BRIDGE_RECONNECT_GRACE", "20"))
-# Délai max d'un aller-retour de lecture/pilotage de l'interface ChatGPT.
-UI_TIMEOUT = float(os.getenv("BRIDGE_UI_TIMEOUT", "30"))
-# Durée de validité d'une sonde des menus (elle les ouvre à l'écran : on évite
-# de la refaire à chaque appel de /v1/models).
-UI_PROBE_TTL = float(os.getenv("BRIDGE_UI_PROBE_TTL", "60"))
-UI_SNAPSHOT_STALE = float(os.getenv("BRIDGE_UI_SNAPSHOT_STALE", "120"))
-WS_TOKEN = os.getenv("BRIDGE_WS_TOKEN")
-RUN_DB_PATH = Path(
-    os.getenv("BRIDGE_RUN_DB", str(Path(__file__).with_name("data") / "bridge-runs.sqlite3"))
+from bridge.config import (
+    API_KEY,
+    HOST,
+    IDLE_TIMEOUT,
+    KEEPALIVE_INTERVAL,
+    PORT,
+    RECONNECT_GRACE,
+    RUN_CLEANUP_LIMIT,
+    RUN_DB_PATH,
+    RUN_RETENTION_SECONDS,
+    SHUTDOWN_GRACE_SECONDS,
+    TOTAL_TIMEOUT,
+    UI_PROBE_TTL,
+    UI_SNAPSHOT_STALE,
+    UI_TIMEOUT,
+    WS_TOKEN,
 )
-RUN_RETENTION_SECONDS = float(os.getenv("BRIDGE_RUN_RETENTION_SECONDS", str(7 * 86400)))
-RUN_CLEANUP_LIMIT = int(os.getenv("BRIDGE_RUN_CLEANUP_LIMIT", "100"))
-SHUTDOWN_GRACE_SECONDS = max(0.0, float(os.getenv("BRIDGE_SHUTDOWN_GRACE_SECONDS", "20")))
+from bridge.contracts import (
+    MODELES_NEUTRES,
+    BridgeConversationTarget,
+    BridgeRunRequest,
+    ChatMessage,
+    ChatRequest,
+    CleanupFailureRequest,
+    CleanupStartResponse,
+    ControlOutcome,
+    ConversationLifecycleResponse,
+    ConversationReleaseRequest,
+    FileAttachment,
+    Outcomes,
+    ResponseRequest,
+    RunControls,
+    RunReport,
+    UiState,
+)
 
 logger = logging.getLogger("chatgpt_bridge")
-
-
-# --------------------------------------------------------------------------- #
-# Modèles de requête (sous-ensemble utile de l'API OpenAI)
-# --------------------------------------------------------------------------- #
-class ChatMessage(BaseModel):
-    role: str = "user"
-    # str, ou liste de blocs multimodaux [{"type": "text", "text": "..."}]
-    content: Any = ""
-    name: Optional[str] = None
-
-
-class FileAttachment(BaseModel):
-    """Pièce jointe déposée dans le composer avant l'envoi du prompt."""
-
-    name: str
-    mime: str = "application/octet-stream"
-    data: str = Field(description="Contenu du fichier encodé en base64")
-
-
-class BridgeConversationTarget(BaseModel):
-    """Cible applicative explicite ; le locator reste opaque après validation d'origine."""
-
-    mode: str
-    id: uuid.UUID
-    external_locator: Optional[str] = None
-
-    @model_validator(mode="after")
-    def validate_target(self):
-        if self.mode not in {"fresh", "continue"}:
-            raise ValueError("conversation.mode doit valoir fresh ou continue")
-        if self.mode == "fresh" and self.external_locator is not None:
-            raise ValueError("fresh interdit un locator préexistant")
-        if self.mode == "continue" and not self.external_locator:
-            raise ValueError("continue exige external_locator")
-        if self.external_locator:
-            parsed = urlsplit(self.external_locator)
-            if (
-                parsed.scheme != "https"
-                or parsed.hostname not in {"chatgpt.com", "chat.openai.com"}
-                or parsed.username
-                or parsed.password
-                or parsed.port not in {None, 443}
-                or parsed.fragment
-                or parsed.path in {"", "/"}
-            ):
-                raise ValueError("locator hors des origines ChatGPT autorisées")
-        return self
-
-
-class ChatRequest(BaseModel):
-    model: str = "chatgpt-web"
-    messages: List[ChatMessage]
-    stream: bool = False
-    # Extension maison : ouvre un nouveau chat avant d'envoyer le prompt.
-    new_chat: bool = Field(default=False, description="Repart d'une conversation vierge")
-    files: List[FileAttachment] = Field(default_factory=list, description="Pièces jointes")
-
-    # Les paramètres OpenAI sans équivalent dans l'UI web sont acceptés puis ignorés.
-    model_config = {"extra": "allow"}
-
-
-class ResponseRequest(BaseModel):
-    """Sous-ensemble Responses API supporté par le bridge local.
-
-    Le bridge traduit ces champs vers l'UI ChatGPT. Il ne prétend pas fournir
-    les garanties natives du service OpenAI : le client doit revalider les
-    sorties structurées et conserver ses propres ModelRun.
-    """
-
-    model: str = "chatgpt-web"
-    input: Any
-    tools: List[dict] = Field(default_factory=list)
-    include: List[str] = Field(default_factory=list)
-    text: Optional[dict] = None
-    background: bool = False
-    stream: bool = False
-    conversation: Optional[BridgeConversationTarget] = None
-    bridge_recovery: bool = False
-
-    model_config = {"extra": "allow"}
-
-
-# Modèle « demandé » qui signifie en réalité « ne touche pas au sélecteur de
-# l'UI » : ces identifiants ne désignent aucun modèle réel de l'interface.
-MODELES_NEUTRES = {"", "chatgpt-web", "auto", "default"}
-
-
-class BridgeRunRequest(BaseModel):
-    """Contrat natif du bridge, distinct des garanties de Responses API."""
-
-    # Étiquette de traçabilité de l'appelant (nom de profil applicatif, modèle
-    # d'API…). Elle ne pilote rien : l'UI ChatGPT ne connaît pas ces noms.
-    requested_model: str = "chatgpt-web"
-    input: Any
-    web_search: bool = False
-    response_format: Optional[dict] = None
-    reasoning_effort: Optional[str] = None
-    background: bool = False
-    # Entrée du sélecteur de modèle de l'UI à appliquer et vérifier, elle.
-    ui_model: Optional[str] = None
-    # Profil / espace de travail ChatGPT à sélectionner avant la génération.
-    profile: Optional[str] = None
-    # Par défaut, un modèle demandé mais non vérifié fait échouer le run : mieux
-    # vaut une erreur qu'un run attribué au mauvais modèle dans la traçabilité CTI.
-    allow_unverified_model: bool = False
-    # Identité stable fournie par l'application. L'en-tête HTTP équivalent est
-    # prioritaire, mais les deux doivent concorder lorsqu'ils sont présents.
-    request_id: Optional[str] = Field(default=None, min_length=1, max_length=255)
-    conversation: Optional[BridgeConversationTarget] = None
-    recovery: bool = False
-
-
-class RunControls(BaseModel):
-    """Réglages d'interface à appliquer avant une génération.
-
-    `None` signifie « laisse tel quel » ; c'est distinct de `False`, qui exige
-    au contraire de désactiver le réglage.
-    """
-
-    model: Optional[str] = None
-    profile: Optional[str] = None
-    web_search: Optional[bool] = None
-
-    def wanted(self) -> dict:
-        return {k: v for k, v in self.model_dump().items() if v is not None}
-
-
-class ConversationReleaseRequest(BaseModel):
-    """Explicit release of a conversation with an outcome.
-
-    Only the client decides when a conversation is no longer needed,
-    and the outcome of that release.
-    """
-
-    outcome: str = Field(..., pattern="^(success|failure|needs_review|cancelled)$")
-
-
-class ConversationLifecycleResponse(BaseModel):
-    """Current lifecycle status of a conversation."""
-
-    conversation_id: str
-    policy: str
-    status: str
-    release_outcome: Optional[str] = None
-    created_at: float
-    updated_at: float
-    released_at: Optional[float] = None
-    deleted_at: Optional[float] = None
-    cleanup_attempt_count: int
-    last_cleanup_attempt_at: Optional[float] = None
-    last_cleanup_error_code: Optional[str] = None
-    version: int
-
-
-class ControlOutcome(BaseModel):
-    """Résultat d'un contrôle, tel que le content script l'a *relu* dans le DOM."""
-
-    requested: Any = None
-    applied: Any = None
-    verified: bool = False
-    ok: bool = False
-    changed: bool = False
-    reason: Optional[str] = None
-
-    model_config = {"extra": "allow"}
-
-
-# Résultats de contrôles, indexés par nom de réglage (« model », « web_search »…).
-Outcomes = Dict[str, ControlOutcome]
-
-
-class UiPickerState(BaseModel):
-    """Sélecteur à déclencheur (modèle, profil)."""
-
-    supported: bool = False
-    selected: Optional[str] = None
-    selected_id: Optional[str] = None
-    verified: bool = False
-    available: Optional[List[dict]] = None
-    reason: Optional[str] = None
-
-
-class UiWebSearchState(BaseModel):
-    # `supported: None` = indéterminé sans ouvrir le menu d'outils (sonde).
-    supported: Optional[bool] = None
-    enabled: Optional[bool] = None
-    verified: bool = False
-    via: Optional[str] = None
-    reason: Optional[str] = None
-
-
-class UiState(BaseModel):
-    """État pilotable de l'onglet ChatGPT, observé par le content script."""
-
-    observed_at: Optional[float] = None
-    url: Optional[str] = None
-    content_script_version: Optional[str] = None
-    probed: bool = False
-    model: UiPickerState = Field(default_factory=UiPickerState)
-    profile: UiPickerState = Field(default_factory=UiPickerState)
-    web_search: UiWebSearchState = Field(default_factory=UiWebSearchState)
-
-    model_config = {"extra": "allow"}
 
 
 def _bridge_controls(req: BridgeRunRequest) -> RunControls:
@@ -1720,19 +1524,6 @@ class UiUnavailable(RuntimeError):
     """L'état de l'interface n'a pas pu être obtenu (extension absente, onglet muet…)."""
 
 
-class RunReport(BaseModel):
-    """Ce que le bridge a réellement obtenu de l'UI pour un run donné."""
-
-    model_observed: Optional[str] = None
-    model_source: str = "unknown"
-    web_search_mode: str = "untouched"
-    controls: Outcomes = Field(default_factory=dict)
-
-    # `model_*` est un espace de noms réservé par pydantic ; ici ce sont bien
-    # des champs de données, pas de la configuration.
-    model_config = {"protected_namespaces": ()}
-
-
 async def _ui_roundtrip(payload: dict) -> dict:
     if not bridge.online:
         raise UiUnavailable("extension non connectée")
@@ -2426,18 +2217,6 @@ async def get_conversation_lifecycle(
     )
 
 
-class CleanupStartRequest(BaseModel):
-    """Request to start cleanup of a DELETE_PENDING conversation."""
-    pass
-
-
-class CleanupStartResponse(BaseModel):
-    """Response after initiating cleanup."""
-    conversation_id: str
-    status: str  # Should be DELETING if cleanup started
-    cleanup_attempt_count: int
-
-
 @app.post(
     "/v1/conversations/{conversation_id}/cleanup/start",
     dependencies=[Depends(require_key)],
@@ -2495,12 +2274,6 @@ async def mark_conversation_deleted(
         last_cleanup_error_code=result["last_cleanup_error_code"],
         version=result["version"],
     )
-
-
-class CleanupFailureRequest(BaseModel):
-    """Report cleanup failure for retry handling."""
-    error_code: str = Field(..., pattern="^[a-z_]+$", max_length=64)
-    error_message: Optional[str] = None
 
 
 @app.post(
