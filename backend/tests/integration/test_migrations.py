@@ -62,7 +62,6 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     jobs,
     model_execution,
     production,
-    schema,
 )
 from cti_app.infrastructure.database.models.base import Base
 from tests.integration.conftest import _alembic_config
