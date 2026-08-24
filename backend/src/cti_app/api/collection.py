@@ -9,10 +9,12 @@ from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.collection import (
-    CollectionItemNotFoundError,
-    CollectionNotAllowedError,
     SubjectCollectionService,
     collection_idempotency_key,
+)
+from cti_app.application.collection_errors import (
+    CollectionItemNotFoundError,
+    CollectionNotAllowedError,
 )
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobService

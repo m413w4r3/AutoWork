@@ -13,6 +13,10 @@ from pydantic import ConfigDict, Field
 
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.collection_errors import (
+    CollectionItemNotFoundError,
+    CollectionNotAllowedError,
+)
 from cti_app.application.http_collection import (
     CollectedResponse,
     CollectionError,
@@ -95,14 +99,6 @@ class CollectionSummary:
             self.failed_retryable += 1
         elif state is CollectionState.FAILED_TERMINAL:
             self.failed_terminal += 1
-
-
-class CollectionNotAllowedError(ValueError):
-    pass
-
-
-class CollectionItemNotFoundError(LookupError):
-    pass
 
 
 class SubjectCollectionParameters(JobParameters):
