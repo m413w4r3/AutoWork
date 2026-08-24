@@ -43,6 +43,8 @@ Database ORM model organization by bounded context.
 
 ## Verification
 
+Run from the `backend/` directory:
+
 ```bash
 # No schema.py
 test ! -e src/cti_app/infrastructure/database/models/schema.py
@@ -51,5 +53,6 @@ test ! -e src/cti_app/infrastructure/database/models/schema.py
 rg -n 'models\.schema' src tests migrations
 
 # All metadata tables registered (migration test is the authoritative oracle)
-cd backend && TEST_POSTGRES_ADMIN_DSN=postgres://user:pass@localhost/db uv run pytest tests/integration/test_migrations.py -q
+: "${TEST_POSTGRES_ADMIN_DSN:?set TEST_POSTGRES_ADMIN_DSN to the local test PostgreSQL admin DSN}"
+uv run pytest tests/integration/test_migrations.py -q
 ```

@@ -352,10 +352,11 @@ class TestCleanupIntegration:
         # Create a new registry instance (simulating restart)
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "restart.db"
-            # Copy the database
+            # Checkpoint WAL before copying to ensure all data is flushed
             import shutil
 
-            shutil.copy(registry.db_path, db_path)
+            registry.checkpoint_and_close()
+            shutil.copy(registry.path, db_path)
 
             recovered_registry = RunRegistry(db_path)
             pending = recovered_registry.get_all_delete_pending()
