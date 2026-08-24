@@ -9,6 +9,7 @@ from cti_app.api.briefs import router as briefs_router
 from cti_app.api.collection import router as collection_router
 from cti_app.api.discovery import router as discovery_router
 from cti_app.api.discovery_merge import merge_runs_router
+from cti_app.api.discovery_recovery import router as discovery_recovery_router
 from cti_app.api.editions import router as editions_router
 from cti_app.api.editorial import router as editorial_router
 from cti_app.api.health import router as health_router
@@ -278,6 +279,7 @@ def create_app() -> FastAPI:
     application.include_router(health_router)
     application.include_router(editions_router)
     application.include_router(discovery_router)
+    application.include_router(discovery_recovery_router)
     application.include_router(merge_runs_router)
     application.include_router(editorial_router)
     application.include_router(jobs_router)

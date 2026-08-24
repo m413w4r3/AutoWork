@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.discovery import router as discovery_router
+from cti_app.api.discovery_recovery import router as discovery_recovery_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.editions import EditionService
@@ -104,6 +105,7 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
     application = FastAPI()
     application.add_middleware(CorrelationIdMiddleware)
     application.include_router(discovery_router)
+    application.include_router(discovery_recovery_router)
     application.include_router(jobs_router)
     application.state.edition_service = edition_service
     application.state.discovery_service = discovery
@@ -203,6 +205,7 @@ async def test_manual_recovery_previews_then_resumes_the_original_job() -> None:
     registry = create_job_registry(gateway, discovery)
     application = FastAPI()
     application.include_router(discovery_router)
+    application.include_router(discovery_recovery_router)
     application.include_router(jobs_router)
     application.state.edition_service = edition_service
     application.state.discovery_service = discovery
@@ -293,6 +296,7 @@ async def _recovery_application() -> tuple[
     registry = create_job_registry(gateway, discovery)
     application = FastAPI()
     application.include_router(discovery_router)
+    application.include_router(discovery_recovery_router)
     application.include_router(jobs_router)
     application.state.edition_service = edition_service
     application.state.discovery_service = discovery
