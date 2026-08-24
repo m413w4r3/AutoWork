@@ -705,9 +705,17 @@ def load_cache(model: str) -> dict[str, np.ndarray]:
 
 
 def save_cache(model: str, cache: dict[str, np.ndarray]) -> None:
-    if not cache:
-        return
     directory = cache_dir(model)
+
+    if not cache:
+        # Nettoie les fichiers cache obsolètes de manière idempotente.
+        # Ne supprime jamais le dossier cache d'un autre modèle.
+        for filename in ("vectors.npy", "keys.json", "meta.json"):
+            cache_file = directory / filename
+            with contextlib.suppress(FileNotFoundError):
+                cache_file.unlink()
+        return
+
     directory.mkdir(parents=True, exist_ok=True)
     keys = sorted(cache)
     matrix = np.stack([cache[key] for key in keys]).astype(np.float32)

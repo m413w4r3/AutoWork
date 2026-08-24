@@ -110,3 +110,78 @@ def test_lexical_build_does_not_pretend_dense_is_ready(tmp_path: Path) -> None:
     lexical_query = run_ctx(repo, "query", "distinctive owner", "--lexical-only", "--paths-only")
     assert lexical_query.returncode == 0, lexical_query.stderr
     assert "src/old_owner.py" in lexical_query.stdout.splitlines()
+
+
+def test_empty_cache_file_cleanup(tmp_path: Path) -> None:
+    """R66a: Vérifier que save_cache({}) supprime les fichiers cache obsolètes."""
+    repo = init_repo(tmp_path)
+    (repo / "src" / "old_owner.py").write_text(OLD_OWNER_SOURCE)
+    git_snapshot(repo)
+
+    # Lance un build lexical pour initialiser l'index.
+    build = run_ctx(repo, "build", "--lexical-only")
+    assert build.returncode == 0, build.stderr
+
+    # Crée un script de test qui s'exécute dans le contexte du repo.
+    test_script = repo / ".test_cache_cleanup.py"
+    test_script.write_text(
+        f'''
+import json
+import sys
+from pathlib import Path
+import numpy as np
+
+sys.path.insert(0, {repr(str(CTX_SCRIPT.parent))})
+from ctx import cache_dir, load_cache, save_cache
+
+model = "test-model-empty-cleanup"
+
+# Crée un cache avec du dummy data.
+dummy_vectors = {{
+    "old_key_1": np.random.randn(768).astype(np.float32),
+    "old_key_2": np.random.randn(768).astype(np.float32),
+}}
+
+# Sauvegarde le cache.
+save_cache(model, dummy_vectors)
+
+# Vérifie que les fichiers existent.
+cache_dir_path = cache_dir(model)
+vec_path = cache_dir_path / "vectors.npy"
+key_path = cache_dir_path / "keys.json"
+meta_path = cache_dir_path / "meta.json"
+
+assert vec_path.exists(), f"vectors.npy should exist at {{vec_path}}"
+assert key_path.exists(), f"keys.json should exist at {{key_path}}"
+assert meta_path.exists(), f"meta.json should exist at {{meta_path}}"
+
+# Vérifie que load_cache retrouve les données.
+loaded = load_cache(model)
+assert len(loaded) == 2, f"should have 2 vectors, got {{len(loaded)}}"
+
+# Appelle save_cache avec un cache vide.
+save_cache(model, {{}})
+
+# Vérifie que les fichiers ont disparu.
+assert not vec_path.exists(), "vectors.npy should be removed"
+assert not key_path.exists(), "keys.json should be removed"
+assert not meta_path.exists(), "meta.json should be removed"
+
+# Vérifie que load_cache retourne une dict vide.
+loaded_empty = load_cache(model)
+assert loaded_empty == {{}}, f"load_cache should return empty dict, got {{loaded_empty}}"
+
+print("OK")
+'''
+    )
+
+    result = subprocess.run(
+        ["uv", "run", "--python", "3.12", "--with", "openai", "--with", "numpy", str(test_script)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, f"test script failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    assert "OK" in result.stdout, f"test script did not print OK. stdout: {result.stdout}"
