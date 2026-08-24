@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover - fallback Windows
 
 # --------------------------------------------------------------------------- config
 
-INDEX_SCHEMA = 2
+INDEX_SCHEMA = 3
 EMBED_SCHEMA = 2
 
 DEFAULT_MODEL = "Qwen3-Embedding-8B-ChapsVision"
@@ -757,6 +757,12 @@ def write_index(chunks: list[Chunk], model: str, signature: str, cache: dict[str
 
     used_vectors = [cache[c.key] for c in chunks if c.key in cache]
     dim = int(used_vectors[0].shape[0]) if used_vectors else 0
+    # source/chunk freshness (repo_signature, via index_stale) et complétude
+    # dense (dense_complete) sont deux axes indépendants : un build
+    # lexical-only laisse le premier à jour sans jamais prétendre que le
+    # second l'est.
+    unique_keys = {c.key for c in chunks}
+    dense_complete = unique_keys.issubset(cache.keys())
     atomic_write_text(
         manifest_path(),
         json.dumps(
@@ -768,6 +774,7 @@ def write_index(chunks: list[Chunk], model: str, signature: str, cache: dict[str
                 "chunks": len(chunks),
                 "unique_texts": len({c.key for c in chunks}),
                 "cached_vectors": len(cache),
+                "dense_complete": dense_complete,
                 "files": len({c.path for c in chunks}),
                 "repo_signature": signature,
                 "built_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -778,20 +785,26 @@ def write_index(chunks: list[Chunk], model: str, signature: str, cache: dict[str
     )
 
 
-def do_build(model: str, *, full: bool = False, quiet: bool = False) -> dict[str, object]:
+def do_build(
+    model: str, *, full: bool = False, quiet: bool = False, lexical_only: bool = False
+) -> dict[str, object]:
     with build_lock():
         chunks, texts, signature, _ = build_chunks()
         cache = {} if full else load_cache(model)
         missing = [key for key in texts if key not in cache]
 
         if not quiet:
+            note = " (lexical-only, pas d'appel embedding)" if lexical_only else ""
             print(
                 f"{len(chunks)} chunks / {len(texts)} textes uniques — "
-                f"{len(missing)} à encoder, {len(texts) - len(missing)} en cache.",
+                f"{len(missing)} à encoder, {len(texts) - len(missing)} en cache{note}.",
                 file=sys.stderr,
             )
 
-        if missing:
+        # lexical_only : jamais de client OpenAI, jamais d'appel réseau. Les
+        # vecteurs déjà en cache restent utilisables tels quels ; ceux qui
+        # manquent restent manquants (dense_complete=False dans le manifest).
+        if missing and not lexical_only:
             client = make_client()
             vectors = embed(client, model, [texts[key] for key in missing], quiet=quiet)
             for key, vector in zip(missing, vectors, strict=True):
@@ -816,6 +829,7 @@ def do_build(model: str, *, full: bool = False, quiet: bool = False) -> dict[str
             "missing": len(missing),
             "dim": dim,
             "signature": signature,
+            "lexical_only": lexical_only,
         }
 
 
@@ -1047,7 +1061,7 @@ def rank_chunks(
 
 def cmd_build(args: argparse.Namespace) -> int:
     try:
-        do_build(args.model, full=args.full, quiet=args.quiet)
+        do_build(args.model, full=args.full, quiet=args.quiet, lexical_only=args.lexical_only)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -1057,21 +1071,42 @@ def cmd_build(args: argparse.Namespace) -> int:
 def maybe_refresh(args: argparse.Namespace) -> None:
     if not args.refresh:
         return
+    lexical_only = bool(getattr(args, "lexical_only", False))
+
     try:
         manifest = load_manifest()
         stale, _ = index_stale(manifest)
-        if manifest.get("model") != args.model:
-            stale = True
     except RuntimeError:
+        manifest = None
         stale = True
-    if stale:
+
+    if lexical_only:
+        # Fallback autonome : jamais de client d'embedding, même si le
+        # manifest existant a été construit avec un autre modèle ou si les
+        # vecteurs denses sont incomplets — seule la fraîcheur des sources
+        # (chunks/lexique) déclenche un rebuild ici.
+        if stale:
+            do_build(args.model, full=False, quiet=True, lexical_only=True)
+        return
+
+    if manifest is not None and manifest.get("model") != args.model:
+        stale = True
+    dense_complete = bool(manifest.get("dense_complete", False)) if manifest is not None else False
+    if stale or not dense_complete:
         do_build(args.model, full=False, quiet=True)
 
 
 def cmd_query(args: argparse.Namespace) -> int:
     try:
         maybe_refresh(args)
-        chunks, matrix, _ = load_index(args.model)
+        if args.lexical_only:
+            # Le scoring lexical n'utilise jamais la matrice dense (voir
+            # rank_chunks) : ne pas exiger des vecteurs complets/présents
+            # pour rester utilisable sans credentials d'embedding.
+            chunks = load_chunks()
+            matrix = np.empty((0, 0), dtype=np.float32)
+        else:
+            chunks, matrix, _ = load_index(args.model)
 
         ranked = rank_chunks(
             chunks,
@@ -1138,9 +1173,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 1
 
     stale, reason = index_stale(manifest)
+    dense_complete = bool(manifest.get("dense_complete", False))
     result = dict(manifest)
     result["stale"] = stale
     result["status"] = reason
+    # Deux axes distincts : fraîcheur des sources/chunks (utile seule en
+    # lexical-only) vs complétude des vecteurs denses. Un build lexical-only
+    # récent est "source index: current" même si "dense embeddings:
+    # incomplete".
+    result["source_index"] = "stale" if stale else "current"
+    result["dense_embeddings"] = "complete" if dense_complete else "incomplete"
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 1 if stale else 0
 
@@ -1191,11 +1233,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     cache = load_cache(str(manifest.get("model", args.model)))
     missing = sum(1 for chunk in chunks if chunk.key not in cache)
     if missing:
-        problems.append(f"{missing} chunks sans vecteur")
+        # Incomplétude dense : n'implique pas que l'index source/lexical est
+        # obsolète (ex. build --lexical-only sans credentials).
+        problems.append(f"dense embeddings incomplete: {missing} chunks sans vecteur")
 
     stale, reason = index_stale(manifest)
     if stale:
-        problems.append(reason)
+        problems.append(f"source index stale: {reason}")
 
     total, uncovered, examples = coverage_report()
     if uncovered:
@@ -1229,6 +1273,11 @@ def main() -> int:
     build = sub.add_parser("build", help="Construit / met à jour l'index.")
     build.add_argument("--full", action="store_true", help="Ignore le cache du modèle.")
     build.add_argument("--quiet", action="store_true", help="N'écrit rien si tout va bien.")
+    build.add_argument(
+        "--lexical-only",
+        action="store_true",
+        help="construit/rafraîchit les chunks sans appeler le service d'embedding",
+    )
     build.set_defaults(func=cmd_build)
 
     query = sub.add_parser("query", help="Recherche hybride dans l'index.")

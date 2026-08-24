@@ -1,6 +1,6 @@
 .PHONY: up down clean up-clean status logs bridge-status bridge-logs bridge-soak \
 	restart-bridge model-run-diagnostics diagnostics dev stop test test-integration \
-	lint format typecheck ctx ctx-status ctx-doctor
+	lint format typecheck ctx ctx-lexical ctx-status ctx-doctor
 
 UV ?= uv
 PNPM ?= pnpm
@@ -91,6 +91,11 @@ format:
 
 ctx:
 	$(UV) run scripts/ctx/ctx.py build
+
+# Fallback sans credentials d'embedding : construit/rafraîchit uniquement
+# les chunks + l'index lexical, sans appeler le service d'embedding.
+ctx-lexical:
+	$(UV) run scripts/ctx/ctx.py build --lexical-only
 
 ctx-status:
 	$(UV) run scripts/ctx/ctx.py status

@@ -31,6 +31,13 @@ If results are insufficient:
 1. Reformulate the query once using known domain identifiers.
 2. Then use targeted `rg -n` inside the most likely subtree.
 
+If the embedding service is not available:
+
+    uv run scripts/ctx/ctx.py query "<task description>" -k 8 --lexical-only
+
+This fallback stays auto-refreshing (it rebuilds the lexical index itself
+when sources changed) and needs no embedding credentials.
+
 Do not start with repository-wide `grep`, `find`, `tree`, or bulk file reads.
 The index is a locator, not a source of truth: inspect real code before edits.
 
