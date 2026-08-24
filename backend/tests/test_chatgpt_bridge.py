@@ -26,6 +26,17 @@ def load_bridge() -> dict[str, Any]:
         sys.path = old_sys_path
 
 
+def _openai_globals(module: dict[str, Any]) -> dict[str, Any]:
+    """Module namespace of `bridge.routes_openai`, reached via the `OpenAIRoutes`
+    instance the server wires up (R59a). `bridge.generation`/`bridge.ui` are
+    import-cached, so anything pulled from here shares state with the rest of
+    the bridge across `load_bridge()` calls, same as `module[...]` did before
+    these endpoints moved out of `server.py`.
+    """
+    globals_: dict[str, Any] = module["openai_routes"].create_response_internal.__globals__
+    return globals_
+
+
 def test_extension_reserves_request_before_real_send_click() -> None:
     root = Path(__file__).parents[2] / "chatgpt-bridge" / "extension"
     background = (root / "background.js").read_text()
@@ -164,12 +175,17 @@ def isolated_registry(module: dict[str, Any], tmp_path: Path) -> None:
     registry = module["RunRegistry"](tmp_path / "runs.sqlite3")
     module["create_bridge_run"].__globals__["run_registry"] = registry
     module["retrieve_bridge_run"].__globals__["run_registry"] = registry
+    # `OpenAIRoutes`/`ConversationRoutes` captured the original `run_registry` as
+    # an instance attribute at construction time (R58/R59a): swapping the
+    # module global above doesn't reach them, so the instances need patching too.
+    module["openai_routes"].registry = registry
+    module["conversation_routes"].registry = registry
 
 
 def test_responses_facade_translates_web_search_and_rejects_binary_blocks() -> None:
     module = load_bridge()
     response_request = module["ResponseRequest"]
-    translate = module["_response_chat_request"]
+    translate = _openai_globals(module)["_response_chat_request"]
 
     translated = translate(
         response_request(
@@ -216,7 +232,9 @@ def test_recovery_message_is_forwarded_exactly_without_discovery_preamble() -> N
         },
     )
 
-    chat_request = module["_response_chat_request"](module["_bridge_response_request"](request))
+    chat_request = _openai_globals(module)["_response_chat_request"](
+        module["_bridge_response_request"](request)
+    )
 
     assert len(chat_request.messages) == 1
     assert chat_request.messages[0].role == "user"
@@ -224,13 +242,22 @@ def test_recovery_message_is_forwarded_exactly_without_discovery_preamble() -> N
     assert chat_request.new_chat is False
 
 
-async def test_responses_facade_completes_background_request_without_network() -> None:
+async def test_responses_facade_completes_background_request_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = load_bridge()
 
     async def fake_generation(*_: object, **__: object) -> AsyncIterator[str]:
         yield "résultat simulé"
 
-    module["_execute_background_response"].__globals__["run_generation"] = fake_generation
+    # `bridge.routes_openai` is import-cached across `load_bridge()` calls, so a
+    # bare assignment here would leak `fake_generation` into every later test in
+    # this process. `monkeypatch` reverts it when this test ends.
+    monkeypatch.setitem(
+        module["openai_routes"]._execute_background_response.__globals__,
+        "run_generation",
+        fake_generation,
+    )
     module["bridge"].ws = object()
     request = module["ResponseRequest"](
         input="Recherche autorisée",
@@ -239,9 +266,9 @@ async def test_responses_facade_completes_background_request_without_network() -
     )
     http_request = Request({"type": "http", "method": "POST", "path": "/v1/responses"})
 
-    queued = await module["create_response"](request, http_request)
-    await module["background_tasks"][queued["id"]]
-    completed = await module["retrieve_response"](queued["id"])
+    queued = await module["openai_routes"].create_response(request, http_request)
+    await module["openai_routes"].background_tasks[queued["id"]]
+    completed = await module["openai_routes"].retrieve_response(queued["id"])
 
     assert queued["status"] == "queued"
     assert completed["status"] == "completed"
@@ -282,10 +309,9 @@ def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation() ->
         },
     )
 
-    assert module["_response_chat_request"](module["_bridge_response_request"](fresh)).new_chat
-    assert not module["_response_chat_request"](
-        module["_bridge_response_request"](continued)
-    ).new_chat
+    translate = _openai_globals(module)["_response_chat_request"]
+    assert translate(module["_bridge_response_request"](fresh)).new_chat
+    assert not translate(module["_bridge_response_request"](continued)).new_chat
     with pytest.raises(ValidationError):
         module["BridgeRunRequest"](
             input="attaque SSRF",
@@ -358,17 +384,19 @@ def test_requested_model_is_a_label_and_only_ui_model_drives_the_interface() -> 
 def _stub_controls(
     monkeypatch: pytest.MonkeyPatch, module: dict[str, Any], applied: dict[str, Any], state: Any
 ) -> None:
-    # `prepare_run`/`apply_controls` now live in the (import-cached) `bridge.ui`
+    # `prepare_run`/`apply_controls` live in the (import-cached) `bridge.ui`
     # module, unlike the rest of `module`, which `runpy` re-executes fresh per
     # `load_bridge()` call. `monkeypatch` undoes the patch after the test so it
     # cannot leak into later tests sharing that cached module.
+    ui_globals = _openai_globals(module)["prepare_run"].__globals__
+
     async def apply_controls(
         _bridge: Any, _controls: Any, _conversation: Any = None
     ) -> tuple[dict[str, Any], Any]:
-        outcome = module["prepare_run"].__globals__["ControlOutcome"]
+        outcome = ui_globals["ControlOutcome"]
         return {name: outcome.model_validate(value) for name, value in applied.items()}, state
 
-    monkeypatch.setitem(module["prepare_run"].__globals__, "apply_controls", apply_controls)
+    monkeypatch.setitem(ui_globals, "apply_controls", apply_controls)
 
 
 async def test_unverified_model_refuses_the_run_but_web_search_falls_back_to_the_prompt(
@@ -377,6 +405,7 @@ async def test_unverified_model_refuses_the_run_but_web_search_falls_back_to_the
     module = load_bridge()
     controls = module["RunControls"]
     bridge = module["bridge"]
+    prepare_run = _openai_globals(module)["prepare_run"]
 
     _stub_controls(
         monkeypatch,
@@ -385,11 +414,11 @@ async def test_unverified_model_refuses_the_run_but_web_search_falls_back_to_the
         None,
     )
     with pytest.raises(HTTPException, match="non appliqué"):
-        await module["prepare_run"](
+        await prepare_run(
             bridge, controls(model="GPT-5 Thinking"), allow_unverified_model=False
         )
 
-    tolerated = await module["prepare_run"](
+    tolerated = await prepare_run(
         bridge, controls(model="GPT-5 Thinking"), allow_unverified_model=True
     )
     assert tolerated.model_source == "unknown"
@@ -400,7 +429,7 @@ async def test_unverified_model_refuses_the_run_but_web_search_falls_back_to_the
         {"web_search": {"requested": True, "ok": False, "reason": "bouton introuvable"}},
         None,
     )
-    fallback = await module["prepare_run"](
+    fallback = await prepare_run(
         bridge, controls(web_search=True), allow_unverified_model=False
     )
     assert fallback.web_search_mode == "prompt_instructed"
@@ -423,10 +452,11 @@ async def test_verified_ui_state_names_the_model_and_the_native_search_tool(
         state,
     )
 
-    report = await module["prepare_run"](
+    openai_globals = _openai_globals(module)
+    report = await openai_globals["prepare_run"](
         module["bridge"], module["RunControls"](web_search=True), allow_unverified_model=False
     )
-    body = module["_response_body"](
+    body = openai_globals["_response_body"](
         "resp_x",
         module["ResponseRequest"](input="x", tools=[{"type": "web_search"}]),
         status="completed",
@@ -439,7 +469,7 @@ async def test_verified_ui_state_names_the_model_and_the_native_search_tool(
     assert body["metadata"]["model_source"] == "ui_observed"
     # Le message visible reste métier et ne décrit pas l'implémentation de l'outil.
     prompt = (
-        module["_response_chat_request"](
+        openai_globals["_response_chat_request"](
             module["ResponseRequest"](input="x", tools=[{"type": "web_search"}]),
         )
         .messages[0]
@@ -1033,7 +1063,8 @@ async def test_idle_timeout_does_not_send_abort_to_extension() -> None:
     silent = SilentExtension()
     module["bridge"].ws = silent
 
-    chat_request = module["ChatRequest"](
+    openai_globals = _openai_globals(module)
+    chat_request = openai_globals["ChatRequest"](
         messages=[{"role": "user", "content": "test"}],
     )
 
@@ -1044,16 +1075,17 @@ async def test_idle_timeout_does_not_send_abort_to_extension() -> None:
     http_req = request_with_key("timeout-test")
     http_req._receive = never_disconnects
 
-    old_idle = module["run_generation"].__globals__["IDLE_TIMEOUT"]
-    module["run_generation"].__globals__["IDLE_TIMEOUT"] = 0.1
+    run_generation = openai_globals["run_generation"]
+    old_idle = run_generation.__globals__["IDLE_TIMEOUT"]
+    run_generation.__globals__["IDLE_TIMEOUT"] = 0.1
     try:
         with pytest.raises(Exception) as caught:
-            async for _ in module["run_generation"](
+            async for _ in run_generation(
                 module["bridge"], module["run_registry"], "timeout-test", chat_request, http_req
             ):
                 pass
     finally:
-        module["run_generation"].__globals__["IDLE_TIMEOUT"] = old_idle
+        run_generation.__globals__["IDLE_TIMEOUT"] = old_idle
 
     assert "aucune donnée de l'extension depuis" in str(caught.value)
 
@@ -1155,7 +1187,10 @@ async def _generate(
 ) -> tuple[list[str], Exception | None, float]:
     """Exécute une génération complète avec des échéances accélérées."""
     module["bridge"].ws = extension
-    chat_request = module["ChatRequest"](messages=[{"role": "user", "content": "recherche"}])
+    openai_globals = _openai_globals(module)
+    chat_request = openai_globals["ChatRequest"](
+        messages=[{"role": "user", "content": "recherche"}]
+    )
 
     async def never_disconnects() -> dict[str, Any]:
         await asyncio.Event().wait()
@@ -1164,7 +1199,8 @@ async def _generate(
     http_req = request_with_key(request_id)
     http_req._receive = never_disconnects
 
-    globals_ = module["run_generation"].__globals__
+    run_generation = openai_globals["run_generation"]
+    globals_ = run_generation.__globals__
     previous = (globals_["TOTAL_TIMEOUT"], globals_["IDLE_TIMEOUT"])
     globals_["TOTAL_TIMEOUT"] = total_timeout
     globals_["IDLE_TIMEOUT"] = idle_timeout
@@ -1172,7 +1208,7 @@ async def _generate(
     failure: Exception | None = None
     started = asyncio.get_running_loop().time()
     try:
-        async for text in module["run_generation"](
+        async for text in run_generation(
             module["bridge"], module["run_registry"], request_id, chat_request, http_req
         ):
             chunks.append(text)
@@ -1200,7 +1236,7 @@ async def test_live_generation_reaching_the_total_deadline_is_never_called_idle(
         module, extension, "total-timeout", total_timeout=0.5, idle_timeout=0.15
     )
 
-    assert isinstance(failure, module["UpstreamError"])
+    assert isinstance(failure, _openai_globals(module)["UpstreamError"])
     assert failure.code == "bridge_total_timeout"
     assert "génération non terminée après" in str(failure)
     assert "aucune donnée de l'extension" not in str(failure)
@@ -1227,7 +1263,7 @@ async def test_silent_extension_is_reported_as_idle_well_before_the_total_deadli
         module, SilentExtension(), "idle-timeout", total_timeout=2.0, idle_timeout=0.2
     )
 
-    assert isinstance(failure, module["UpstreamError"])
+    assert isinstance(failure, _openai_globals(module)["UpstreamError"])
     assert failure.code == "bridge_idle_timeout"
     assert "aucune donnée de l'extension depuis" in str(failure)
     assert elapsed < 1.0
