@@ -11,7 +11,9 @@ clients lancés directement sur l’hôte. Dans Compose, `backend` et `worker`
 utilisent obligatoirement `http://chatgpt-bridge:8001/v1`.
 
 ```
-[ton script]  ──POST 127.0.0.1:8001/v1/chat/completions──>  [server.py (FastAPI)]
+[ton script]  ──POST 127.0.0.1:8001/v1/chat/completions──>  [server.py launcher]
+                                                                   ▼
+                                                         [bridge/app.py (FastAPI)]
                                                                    ▲
                                                           WebSocket │ /ws
                                                                    ▼

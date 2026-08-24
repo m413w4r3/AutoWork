@@ -47,8 +47,8 @@ class OpenAIRoutes:
     """Propriétaire des quatre endpoints compatibles OpenAI.
 
     Ne détient aucun état métier propre au delà du cache local des réponses de
-    fond : `bridge` et `registry` sont les mêmes instances partagées que le
-    reste de server.py, `router` est l'APIRouter à monter sur l'application
+    fond : `bridge` et `registry` sont des instances injectées par
+    BridgeApplication, `router` est l'APIRouter à monter sur l'application
     FastAPI.
     """
 

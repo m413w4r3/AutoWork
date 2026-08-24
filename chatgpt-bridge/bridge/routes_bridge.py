@@ -46,7 +46,7 @@ class BridgeRoutes:
 
     Dépend de `OpenAIRoutes` (pour déléguer la génération synchrone à
     `create_response_internal`), jamais l'inverse. `bridge` et `registry` sont
-    les mêmes instances partagées que le reste de server.py.
+    des instances injectées par BridgeApplication.
     """
 
     def __init__(
@@ -247,8 +247,6 @@ class BridgeRoutes:
                 )
                 return body
             except asyncio.CancelledError:
-                # `_shutdown_error` reste dans server.py (R60) : ce corps littéral
-                # est son seul et unique appelant, déplacé à l'identique.
                 stored = {
                     "status_code": 503,
                     "body": {

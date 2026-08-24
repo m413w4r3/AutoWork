@@ -25,8 +25,8 @@ from bridge.ui import _ui_roundtrip
 class ConversationRoutes:
     """Propriétaire des six endpoints conversation.
 
-    Ne détient aucun état métier propre : `bridge` et `registry` sont les mêmes
-    instances partagées que le reste de server.py, `router` est l'APIRouter à
+    Ne détient aucun état métier propre : `bridge` et `registry` sont des
+    instances injectées par BridgeApplication, `router` est l'APIRouter à
     monter sur l'application FastAPI.
     """
 
@@ -236,7 +236,8 @@ class ConversationRoutes:
     ) -> ConversationLifecycleResponse:
         """Report cleanup failure and mark conversation CLEANUP_FAILED for retry.
 
-        The cleanup sweeper will retry up to 3 times with exponential backoff.
+        Transient cleanup failures may be retried while cleanup_attempt_count < 3;
+        terminal identity errors are never retried.
         Idempotent: calling again increments attempt count.
         """
         try:
