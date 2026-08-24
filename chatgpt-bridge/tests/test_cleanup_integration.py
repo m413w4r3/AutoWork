@@ -1,5 +1,5 @@
 """
-Synchronous validation tests for Increment 3
+Structural validation tests for the cleanup automation components.
 
 These tests verify that the Cleanup UI Automation components
 can be imported and have the correct structure.
@@ -20,8 +20,8 @@ from bridge.lifecycle import CleanupWorker, ConversationSweeper
 from bridge.registry import RunRegistry
 
 
-class TestIncrement3Integration:
-    """Verify Increment 3 components exist and are properly structured."""
+class TestCleanupComponentsIntegration:
+    """Verify cleanup automation components exist and are properly structured."""
 
     def test_cleanup_worker_exists(self):
         """CleanupWorker class exists and has required methods."""

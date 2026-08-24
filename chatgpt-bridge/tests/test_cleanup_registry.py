@@ -1,5 +1,5 @@
 """
-Tests for Increment 2: Cleanup UI Automation
+Tests for the cleanup registry state machine.
 
 Tests the state transitions and cleanup automation without actual UI execution.
 """

@@ -1,5 +1,5 @@
 """
-Tests for Increment 3: Cleanup UI Automation + Worker + Sweeper
+Tests for the CleanupWorker and ConversationSweeper.
 
 Tests the complete cleanup flow:
 1. deleteConversation() in content.js
