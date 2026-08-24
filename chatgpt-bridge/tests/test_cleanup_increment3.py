@@ -218,6 +218,62 @@ class TestConversationSweeper:
         mock_worker.process_cleanup_task.assert_called_once_with(conv_id)
 
     @pytest.mark.asyncio
+    async def test_retry_failed_never_retries_locator_mismatch(self, registry):
+        """Fail-closed: locator_mismatch is a terminal identity error, never auto-retried."""
+        conv_id = str(uuid4())
+        registry.create_conversation(conv_id, "https://chatgpt.com/c/mismatch-retry", "delete_on_success")
+        registry.release_conversation(conv_id, "success")
+
+        mock_bridge = AsyncMock()
+        mock_bridge.request = AsyncMock(
+            return_value={
+                "success": False,
+                "verified_deleted": False,
+                "error_code": "locator_mismatch",
+                "error_message": "URL mismatch",
+                "steps_completed": [],
+            }
+        )
+        worker = CleanupWorker(registry, mock_bridge)
+        result = await worker.process_cleanup_task(conv_id)
+
+        assert result is False
+        conv = registry.get_conversation_lifecycle(conv_id)
+        assert conv["status"] == "cleanup_failed"
+        assert conv["last_cleanup_error_code"] == "locator_mismatch"
+
+        mock_worker = AsyncMock()
+        sweeper = ConversationSweeper(registry, mock_worker)
+        await sweeper.retry_failed()
+
+        mock_worker.process_cleanup_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_failed_never_retries_locator_invalid(self, registry):
+        """Fail-closed: locator_invalid is a terminal identity error, never auto-retried."""
+        conv_id = str(uuid4())
+        registry.create_conversation(conv_id, "https://chatgpt.com/c/invalid-retry", "delete_on_success")
+        registry.release_conversation(conv_id, "success")
+
+        mock_bridge = AsyncMock()
+        worker = CleanupWorker(registry, mock_bridge)
+
+        # Force la conversation en état DELETE_PENDING sans external_locator exploitable
+        # en simulant l'échec worker "locator_invalid" directement via mark_cleanup_failed,
+        # comme le fait process_cleanup_task quand external_locator est absent.
+        registry.mark_cleanup_failed(conv_id, "locator_invalid", "Missing external_locator")
+
+        conv = registry.get_conversation_lifecycle(conv_id)
+        assert conv["status"] == "cleanup_failed"
+        assert conv["last_cleanup_error_code"] == "locator_invalid"
+
+        mock_worker = AsyncMock()
+        sweeper = ConversationSweeper(registry, mock_worker)
+        await sweeper.retry_failed()
+
+        mock_worker.process_cleanup_task.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_retry_failed_respects_max_attempts(self, registry):
         """Sweeper doesn't retry if max attempts reached."""
         conv_id = str(uuid4())

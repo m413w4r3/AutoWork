@@ -840,6 +840,12 @@ class CleanupWorker:
             }
 
 
+# Erreurs d'identité terminales (fail-closed) : un mismatch/absence de
+# external_locator ne doit jamais être retenté automatiquement.
+# Voir chatgpt-bridge/AGENTS.md — "Destructive actions — fail closed".
+_TERMINAL_IDENTITY_ERROR_CODES = frozenset({"locator_mismatch", "locator_invalid"})
+
+
 class ConversationSweeper:
     """Reprend les cleanups après un restart."""
 
@@ -868,7 +874,15 @@ class ConversationSweeper:
         for conv_id in failed:
             try:
                 conv = self.registry.get_conversation_lifecycle(conv_id)
-                if conv and conv.get("cleanup_attempt_count", 0) < 3:
+                if not conv:
+                    continue
+                error_code = conv.get("last_cleanup_error_code")
+                if error_code in _TERMINAL_IDENTITY_ERROR_CODES:
+                    self.logger.warning(
+                        f"Not retrying {conv_id}: terminal identity error ({error_code})"
+                    )
+                    continue
+                if conv.get("cleanup_attempt_count", 0) < 3:
                     await self.worker.process_cleanup_task(conv_id)
             except Exception as e:
                 self.logger.error(f"Retry error for {conv_id}: {e}", exc_info=True)

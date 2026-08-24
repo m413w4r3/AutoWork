@@ -23,8 +23,8 @@ Database ORM model organization by bounded context.
 
 1. **Direct imports**: Import Row classes directly from their owner module
    ```python
-   from cti_app.infrastructure.database.models.core import Blob, Subject
-   from cti_app.infrastructure.database.models.jobs import Job
+   from cti_app.infrastructure.database.models.core import BlobRow, SubjectRow
+   from cti_app.infrastructure.database.models.jobs import JobRow
    ```
 
 2. **No re-exports**: `__init__.py` remains empty (docstring only)
@@ -50,6 +50,6 @@ test ! -e src/cti_app/infrastructure/database/models/schema.py
 # No models.schema references
 rg -n 'models\.schema' src tests migrations
 
-# All metadata tables registered
-uv run python -c "from cti_app.infrastructure.database.models.base import Base; print(list(Base.metadata.tables.keys()))"
+# All metadata tables registered (migration test is the authoritative oracle)
+cd backend && TEST_POSTGRES_ADMIN_DSN=postgres://user:pass@localhost/db uv run pytest tests/integration/test_migrations.py -q
 ```
