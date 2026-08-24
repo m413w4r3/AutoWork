@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from cti_app.api.collection import router
 from cti_app.application.collection import SubjectCollectionService, register_collection_jobs
+from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.http_collection import (
     PinnedHttpRequest,
     RawHttpResponse,
@@ -47,11 +48,13 @@ class Transport:
 async def test_api_and_synchronous_worker_collect_selected_subject(tmp_path: Path) -> None:
     collection_uow = InMemoryCollectionUnitOfWorkFactory()
     subject = selected_subject(collection_uow, ("https://one.example/report",))
+    blob_store = FilesystemBlobStore(tmp_path / "blobs")
     service = SubjectCollectionService(
         collection_uow,
         SafeHttpCollector(Transport(), Resolver()),
-        FilesystemBlobStore(tmp_path / "blobs"),
+        blob_store,
     )
+    review_service = CollectionReviewService(collection_uow, blob_store)
     jobs_uow = InMemoryJobUnitOfWorkFactory()
     registry = JobRegistry()
     register_collection_jobs(registry, service)
@@ -60,6 +63,7 @@ async def test_api_and_synchronous_worker_collect_selected_subject(tmp_path: Pat
     app = FastAPI()
     app.include_router(router)
     app.state.collection_service = service
+    app.state.collection_review_service = review_service
     app.state.job_service = job_service
     app.state.job_dispatcher = dispatcher
     app.state.identity_provider = LocalIdentityProvider()
@@ -111,11 +115,13 @@ async def test_retry_endpoint_processes_only_requested_source(tmp_path: Path) ->
             RawHttpResponse(200, {"content-type": "text/html"}, HTML),
         ]
     )
+    blob_store = FilesystemBlobStore(tmp_path / "blobs")
     service = SubjectCollectionService(
         collection_uow,
         SafeHttpCollector(transport, Resolver()),
-        FilesystemBlobStore(tmp_path / "blobs"),
+        blob_store,
     )
+    review_service = CollectionReviewService(collection_uow, blob_store)
     jobs_uow = InMemoryJobUnitOfWorkFactory()
     registry = JobRegistry()
     register_collection_jobs(registry, service)
@@ -123,6 +129,7 @@ async def test_retry_endpoint_processes_only_requested_source(tmp_path: Path) ->
     app = FastAPI()
     app.include_router(router)
     app.state.collection_service = service
+    app.state.collection_review_service = review_service
     app.state.job_service = job_service
     app.state.job_dispatcher = SynchronousJobDispatcher(JobExecutor(jobs_uow, registry))
     app.state.identity_provider = LocalIdentityProvider()

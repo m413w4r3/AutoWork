@@ -16,6 +16,7 @@ from cti_app.application.collection_errors import (
     CollectionItemNotFoundError,
     CollectionNotAllowedError,
 )
+from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobService
 from cti_app.application.production_verification import project_review_status
@@ -128,7 +129,7 @@ class RelationshipRequest(BaseModel):
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def launch_collection(subject_id: UUID, request: Request) -> CollectionLaunchView:
-    collection, jobs, dispatcher = _runtime(request)
+    collection, _review, jobs, dispatcher = _runtime(request)
     actor_id = await _actor_id(request)
     try:
         sources = await collection.initialize(subject_id)
@@ -170,7 +171,7 @@ async def launch_collection(subject_id: UUID, request: Request) -> CollectionLau
 async def retry_source(
     subject_id: UUID, collection_id: UUID, request: Request
 ) -> CollectionLaunchView:
-    collection, jobs, dispatcher = _runtime(request)
+    collection, _review, jobs, dispatcher = _runtime(request)
     sources = await collection.list_sources(subject_id)
     source = next((item for item in sources if item.id == collection_id), None)
     if source is None:
@@ -211,13 +212,13 @@ async def retry_source(
 
 @router.get("/{subject_id}/workbench", response_model=WorkbenchView)
 async def get_workbench(subject_id: UUID, request: Request) -> WorkbenchView:
-    service, _, _ = _runtime(request)
+    service, review, _, _ = _runtime(request)
     if not await service.subject_exists(subject_id):
         raise HTTPException(status_code=404, detail="Subject not found")
     sources = await service.list_sources(subject_id)
-    claims, indicators = await service.list_evidence(subject_id)
+    claims, indicators = await review.list_evidence(subject_id)
     if sources:
-        decisions = await service.decisions(sources[0].edition_id)
+        decisions = await review.decisions(sources[0].edition_id)
     else:
         decisions = []
     source_views: list[SourceView] = []
@@ -232,7 +233,7 @@ async def get_workbench(subject_id: UUID, request: Request) -> WorkbenchView:
     for claim in claims:
         text = text_cache.get(claim.derived_artifact_id)
         if text is None:
-            text = await service.extracted_text(claim.derived_artifact_id)
+            text = await review.extracted_text(claim.derived_artifact_id)
             text_cache[claim.derived_artifact_id] = text
         claim_views.append(_claim_view(claim, text, decisions))
     return WorkbenchView(
@@ -247,13 +248,13 @@ async def get_workbench(subject_id: UUID, request: Request) -> WorkbenchView:
 async def decide_claim(
     subject_id: UUID, claim_id: UUID, payload: ReviewRequest, request: Request
 ) -> ClaimView:
-    service, _, _ = _runtime(request)
+    _service, review, _, _ = _runtime(request)
     decision_type = HumanDecisionType(f"claim_{payload.action}")
     try:
-        claim = await service.get_claim(claim_id)
+        claim = await review.get_claim(claim_id)
         if claim.subject_id != subject_id:
             raise CollectionItemNotFoundError(str(claim_id))
-        await service.decide_claim(
+        await review.decide_claim(
             claim_id,
             decision_type,
             actor_id=await _actor_id(request),
@@ -262,8 +263,8 @@ async def decide_claim(
         )
     except CollectionItemNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Claim not found") from exc
-    decisions = await service.decisions(claim.edition_id)
-    text = await service.extracted_text(claim.derived_artifact_id)
+    decisions = await review.decisions(claim.edition_id)
+    text = await review.extracted_text(claim.derived_artifact_id)
     return _claim_view(claim, text, decisions)
 
 
@@ -271,20 +272,20 @@ async def decide_claim(
 async def decide_indicator(
     subject_id: UUID, indicator_id: UUID, payload: ReviewRequest, request: Request
 ) -> IndicatorView:
-    service, _, _ = _runtime(request)
-    claims, indicators = await service.list_evidence(subject_id)
+    _service, review, _, _ = _runtime(request)
+    claims, indicators = await review.list_evidence(subject_id)
     del claims
     indicator = next((item for item in indicators if item.id == indicator_id), None)
     if indicator is None:
         raise HTTPException(status_code=404, detail="Indicator not found")
-    await service.decide_indicator(
+    await review.decide_indicator(
         indicator_id,
         HumanDecisionType(f"indicator_{payload.action}"),
         actor_id=await _actor_id(request),
         correlation_id=get_correlation_id(),
         corrected_value=payload.corrected_value,
     )
-    return _indicator_view(indicator, await service.decisions(indicator.edition_id))
+    return _indicator_view(indicator, await review.decisions(indicator.edition_id))
 
 
 @router.post("/{subject_id}/sources/{collection_id}/relationship", response_model=SourceView)
@@ -294,7 +295,7 @@ async def decide_relationship(
     payload: RelationshipRequest,
     request: Request,
 ) -> SourceView:
-    service, _, _ = _runtime(request)
+    service, review, _, _ = _runtime(request)
     source_for_subject = next(
         (item for item in await service.list_sources(subject_id) if item.id == collection_id),
         None,
@@ -302,7 +303,7 @@ async def decide_relationship(
     if source_for_subject is None:
         raise HTTPException(status_code=404, detail="Source collection not found")
     try:
-        source = await service.decide_relationship(
+        source = await review.decide_relationship(
             collection_id,
             payload.role,
             actor_id=await _actor_id(request),
@@ -317,7 +318,7 @@ async def decide_relationship(
 
 @router.get("/{subject_id}/sources/{collection_id}/download")
 async def download_source(subject_id: UUID, collection_id: UUID, request: Request) -> Response:
-    service, _, _ = _runtime(request)
+    service, _review, _, _ = _runtime(request)
     try:
         document, content = await service.download_source(subject_id, collection_id)
     except CollectionItemNotFoundError as exc:
@@ -342,9 +343,17 @@ async def download_source(subject_id: UUID, collection_id: UUID, request: Reques
     )
 
 
-def _runtime(request: Request) -> tuple[SubjectCollectionService, JobService, JobDispatcher]:
+def _runtime(
+    request: Request,
+) -> tuple[
+    SubjectCollectionService,
+    CollectionReviewService,
+    JobService,
+    JobDispatcher,
+]:
     return (
         request.app.state.collection_service,
+        request.app.state.collection_review_service,
         request.app.state.job_service,
         request.app.state.job_dispatcher,
     )

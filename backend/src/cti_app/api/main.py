@@ -18,6 +18,7 @@ from cti_app.api.production import router as production_router
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
+from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
 from cti_app.application.discovery.cumulative.contracts import ReconcileDiscoveryParameters
@@ -190,6 +191,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         workspace_materializer=SubjectWorkspaceMaterializer(blob_store),
         workspace_root=settings.subject_workspace_root,
     )
+    collection_review_service = CollectionReviewService(
+        uow_factory,
+        blob_store,
+    )
     brief_service = BriefService(uow_factory, blob_store, model_gateway)
     model_conversation_service = ModelConversationService(
         uow_factory,
@@ -239,6 +244,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.manual_source_edit_service = manual_source_edit_service
     app.state.editorial_service = editorial_service
     app.state.collection_service = collection_service
+    app.state.collection_review_service = collection_review_service
     app.state.brief_service = brief_service
     app.state.subject_production_service = subject_production_service
     app.state.edition_production_service = edition_production_service

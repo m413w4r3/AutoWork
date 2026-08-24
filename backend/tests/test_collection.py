@@ -16,6 +16,7 @@ from cti_app.application.collection import (
     SubjectCollectionService,
     collection_idempotency_key,
 )
+from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.http_collection import (
     CollectionPolicy,
     PinnedHttpRequest,
@@ -306,7 +307,8 @@ async def test_selected_collection_does_not_create_evidence(tmp_path: Path) -> N
     source = (await app.initialize(subject.id))[0]
 
     assert await app.archive_one(source.id, uuid4()) is CollectionState.ARCHIVED
-    assert await app.list_evidence(subject.id) == ([], [])
+    review = CollectionReviewService(factory, FilesystemBlobStore(tmp_path / "blobs"))
+    assert await review.list_evidence(subject.id) == ([], [])
     assert not factory.artifacts
     assert not factory.claims
     assert not factory.indicators
