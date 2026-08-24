@@ -205,7 +205,12 @@ describe("renderDiscoveryMarkdown", () => {
     const base = baseSource;
     const merged = candidate({
       sources: [
-        { ...base, id: "source-real", local_ref: "P1", title: "Vrai porteur des IOC" },
+        {
+          ...base,
+          id: "source-real",
+          local_ref: "P1",
+          title: "Vrai porteur des IOC",
+        },
         {
           ...base,
           id: "source-decoy",
@@ -237,7 +242,9 @@ describe("renderDiscoveryMarkdown", () => {
 
     expect(publications).toHaveLength(2);
     expect(publications[0]).toContain("title: Vrai porteur des IOC");
-    expect(publications[0]).toContain("visible_iocs: only-for-real-source.example");
+    expect(publications[0]).toContain(
+      "visible_iocs: only-for-real-source.example",
+    );
     expect(publications[1]).toContain("title: Ne doit recevoir aucun IOC");
     expect(publications[1]).toContain("visible_iocs: none");
   });

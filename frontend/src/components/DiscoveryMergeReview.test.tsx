@@ -377,7 +377,9 @@ it("ne signale plus le bridge occupé une fois le job en attente de décision hu
     vi.fn((input: RequestInfo | URL) => {
       const url = urlOf(input);
       if (url.includes("/api/jobs?"))
-        return Response.json([runningReconcileJob({ status: "waiting_human" })]);
+        return Response.json([
+          runningReconcileJob({ status: "waiting_human" }),
+        ]);
       if (url.endsWith(runId)) return Response.json(pendingRun);
       return Response.json([pendingRun]);
     }),

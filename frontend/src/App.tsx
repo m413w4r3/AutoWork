@@ -16,10 +16,8 @@ import { EditorialBoard } from "./components/EditorialBoard";
 import { SubjectWorkbench } from "./components/SubjectWorkbench";
 import { ProductionArtifactView } from "./components/ProductionArtifactView";
 import { ErrorMessage } from "./components/ErrorMessage";
-import {
-  DiscoveryPanel,
-  discoveryJobStorageKey,
-} from "./features/discovery/DiscoveryPanel";
+import { DiscoveryPanel } from "./features/discovery/DiscoveryPanel";
+import { discoveryJobStorageKey } from "./features/discovery/discoveryStorage";
 
 const statusLabels: Record<EditionStatus, string> = {
   draft: "Brouillon",
@@ -77,7 +75,9 @@ export function App() {
       {artifact ? (
         <ProductionArtifactView
           subjectId={artifact[1]!}
-          stage={artifact[2] as "references" | "extraction" | "synthesis" | "brief"}
+          stage={
+            artifact[2] as "references" | "extraction" | "synthesis" | "brief"
+          }
           onClose={() => window.history.back()}
         />
       ) : subject ? (

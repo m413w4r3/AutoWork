@@ -34,11 +34,16 @@ export function renderDiscoveryMarkdown(candidates: CandidateTopic[]): string {
   return ["# SUJETS CANDIDATS", "", ...blocks].join("\n").trimEnd() + "\n";
 }
 
-function renderSubjectBlock(candidate: CandidateTopic, subjectRef: string): string {
+function renderSubjectBlock(
+  candidate: CandidateTopic,
+  subjectRef: string,
+): string {
   const lines: string[] = [`## SUBJECT ${subjectRef}`, ""];
   lines.push(`title: ${oneLine(candidate.title)}`);
   lines.push(`presentation: ${oneLine(candidate.summary)}`);
-  lines.push(`actor_or_campaign: ${oneLine(candidate.actor_or_campaign || "unknown")}`);
+  lines.push(
+    `actor_or_campaign: ${oneLine(candidate.actor_or_campaign || "unknown")}`,
+  );
   lines.push(`technical_potential: ${candidate.technical_potential}`);
   lines.push(
     `technical_potential_reason: ${oneLine(candidate.technical_potential_reason)}`,
@@ -49,9 +54,12 @@ function renderSubjectBlock(candidate: CandidateTopic, subjectRef: string): stri
   lines.push(
     `uncertainties: ${candidate.uncertainties.length ? candidate.uncertainties.join("; ") : "unknown"}`,
   );
-  if (candidate.actors.length) lines.push(`actors: ${candidate.actors.join(", ")}`);
-  if (candidate.campaigns.length) lines.push(`campaigns: ${candidate.campaigns.join(", ")}`);
-  if (candidate.malware.length) lines.push(`malware: ${candidate.malware.join(", ")}`);
+  if (candidate.actors.length)
+    lines.push(`actors: ${candidate.actors.join(", ")}`);
+  if (candidate.campaigns.length)
+    lines.push(`campaigns: ${candidate.campaigns.join(", ")}`);
+  if (candidate.malware.length)
+    lines.push(`malware: ${candidate.malware.join(", ")}`);
   lines.push("");
 
   // Provisional IOCs reference publications by SourceCandidate.id
@@ -72,11 +80,15 @@ function renderSubjectBlock(candidate: CandidateTopic, subjectRef: string): stri
   let publicationOrdinal = 1;
   for (const source of candidate.sources) {
     const iocs = iocsBySourceId.get(source.id) ?? [];
-    lines.push(...renderPublicationBlock(`P${publicationOrdinal}`, source, iocs));
+    lines.push(
+      ...renderPublicationBlock(`P${publicationOrdinal}`, source, iocs),
+    );
     publicationOrdinal += 1;
   }
   for (const incomplete of candidate.incomplete_sources) {
-    lines.push(...renderIncompletePublicationBlock(`P${publicationOrdinal}`, incomplete));
+    lines.push(
+      ...renderIncompletePublicationBlock(`P${publicationOrdinal}`, incomplete),
+    );
     publicationOrdinal += 1;
   }
 
@@ -108,7 +120,9 @@ function renderPublicationBlock(
   source: SourceCandidate,
   iocs: ProvisionalDiscoveryIoc[],
 ): string[] {
-  const visibleTypes = Array.from(new Set(iocs.map((ioc) => ioc.proposed_type)));
+  const visibleTypes = Array.from(
+    new Set(iocs.map((ioc) => ioc.proposed_type)),
+  );
   return [
     `### PUBLICATION ${publicationRef}`,
     "",

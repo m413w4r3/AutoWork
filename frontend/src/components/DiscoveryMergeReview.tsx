@@ -195,7 +195,9 @@ function MergeGroupCard({
     <article className="merge-group-card">
       <div className="merge-group-card__heading">
         <h4>Groupe {group.group_index + 1}</h4>
-        <span className={`merge-group-kind is-${isNewSubject ? "new" : "merge"}`}>
+        <span
+          className={`merge-group-kind is-${isNewSubject ? "new" : "merge"}`}
+        >
           {isNewSubject ? "nouveau sujet" : "fusion proposée"}
         </span>
         {group.confidence ? (
@@ -362,7 +364,8 @@ export function DiscoveryMergeReview({
     queryFn: () => listJobs("edition", editionId, RECONCILE_JOB_KIND),
     refetchInterval: ({ state }) => {
       const latest = state.data?.[0];
-      return latest && (latest.status === "queued" || latest.status === "running")
+      return latest &&
+        (latest.status === "queued" || latest.status === "running")
         ? 3_000
         : 8_000;
     },
@@ -373,7 +376,8 @@ export function DiscoveryMergeReview({
   // "still busy" is what pinned this banner up forever and blocked new
   // searches even once there was nothing left running.
   const reconciling =
-    latestReconcileJob?.status === "queued" || latestReconcileJob?.status === "running";
+    latestReconcileJob?.status === "queued" ||
+    latestReconcileJob?.status === "running";
   useEffect(() => {
     onReconciling?.(reconciling);
   }, [reconciling, onReconciling]);
@@ -418,11 +422,14 @@ export function DiscoveryMergeReview({
     <section className="merge-review merge-review__job" aria-live="polite">
       <h4>Fusion en cours de génération</h4>
       <p>
-        ChatGPT évalue si la dernière contribution recoupe des sujets déjà
-        dans l’édition. Aucune autre recherche ne peut utiliser le bridge tant
-        que cette évaluation n’est pas terminée.
+        ChatGPT évalue si la dernière contribution recoupe des sujets déjà dans
+        l’édition. Aucune autre recherche ne peut utiliser le bridge tant que
+        cette évaluation n’est pas terminée.
       </p>
-      <JobStatusCard jobId={latestReconcileJob!.id} onTerminal={refreshMergeState} />
+      <JobStatusCard
+        jobId={latestReconcileJob.id}
+        onTerminal={refreshMergeState}
+      />
     </section>
   ) : null;
 

@@ -21,7 +21,12 @@ export function BriefDraftEditor({
   const [isEditing, setIsEditing] = useState(false);
   const [editContent, setEditContent] = useState("");
 
-  const { data: draft, isLoading, error, refetch } = useQuery({
+  const {
+    data: draft,
+    isLoading,
+    error,
+    refetch,
+  } = useQuery({
     queryKey: ["brief-draft", subjectId],
     queryFn: () => getBriefDraft(subjectId),
     enabled: isAvailable,

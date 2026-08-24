@@ -423,7 +423,10 @@ describe("App éditions", () => {
               : input instanceof URL
                 ? input.href
                 : input.url;
-          if (url.includes("/incomplete-sources/") && init?.method === "PATCH") {
+          if (
+            url.includes("/incomplete-sources/") &&
+            init?.method === "PATCH"
+          ) {
             return Response.json({
               source: {
                 id: "5b02f2c6-7a8e-4c0f-9f8e-3a2b4e6f1d90",
@@ -538,9 +541,7 @@ describe("App éditions", () => {
     expect(screen.getByText(/URL absente/)).toBeInTheDocument();
     const urlInput = screen.getByPlaceholderText("https://...");
     await user.type(urlInput, "https://vendor.example/recovered");
-    await user.click(
-      screen.getByRole("button", { name: "Associer le lien" }),
-    );
+    await user.click(screen.getByRole("button", { name: "Associer le lien" }));
     await waitFor(() => {
       expect(
         fetchMock.mock.calls.some(([input, init]) => {
@@ -555,7 +556,8 @@ describe("App éditions", () => {
               "/incomplete-sources/5b02f2c6-7a8e-4c0f-9f8e-3a2b4e6f1d90",
             ) &&
             init?.method === "PATCH" &&
-            init?.body === JSON.stringify({ url: "https://vendor.example/recovered" })
+            init?.body ===
+              JSON.stringify({ url: "https://vendor.example/recovered" })
           );
         }),
       ).toBe(true);

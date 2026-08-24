@@ -27,6 +27,7 @@ import {
   type JobStatus,
   type JobView,
 } from "../../api/jobs";
+import { discoveryJobStorageKey } from "./discoveryStorage";
 
 function IncompleteSourceUrlForm({
   onSubmit,
@@ -70,10 +71,6 @@ function IncompleteSourceUrlForm({
       ) : null}
     </form>
   );
-}
-
-export function discoveryJobStorageKey(editionId: string) {
-  return `cti-discovery-job:${editionId}`;
 }
 
 export function DiscoveryPanel({
