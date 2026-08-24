@@ -50,3 +50,23 @@ Run the narrowest existing bridge test covering the modified behavior.
 
 Use broader bridge lifecycle/soak checks only when the change affects lifecycle,
 cleanup, or browser integration.
+
+## Verification
+
+Run the Python gate:
+
+```bash
+uv run \
+  --python 3.12 \
+  --with-requirements requirements-test.txt \
+  python -m pytest tests/ -q --tb=short
+```
+
+Run the JavaScript gate:
+
+```bash
+node --test \
+  tests/completion.test.js \
+  tests/content-dom.test.js \
+  tests/final-output.test.js
+```
