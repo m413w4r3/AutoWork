@@ -112,6 +112,110 @@ def test_lexical_build_does_not_pretend_dense_is_ready(tmp_path: Path) -> None:
     assert "src/old_owner.py" in lexical_query.stdout.splitlines()
 
 
+def test_exact_symbol_beats_narrative_test_mention(tmp_path: Path) -> None:
+    """R68: un symbole source exact doit battre une mention narrative du même
+    concept dans un test, même quand le test couvre plus de tokens de la
+    requête que le symbole.
+    """
+    repo = init_repo(tmp_path)
+    (repo / "src").mkdir(exist_ok=True)
+    (repo / "tests").mkdir(exist_ok=True)
+
+    (repo / "src" / "write_path.py").write_text(
+        "def stage_and_flush_pending() -> None:\n"
+        "    \"\"\"Move a queued record onto the write path, then push it out"
+        " immediately.\"\"\"\n"
+        "    return None\n"
+    )
+    (repo / "tests" / "test_flow_details.py").write_text(
+        "def test_flow_details() -> None:\n"
+        "    \"\"\"Stage a pending ledger entry, then flush it: full stage,"
+        " pending, ledger, entry, flush cycle end to end.\"\"\"\n"
+        "    assert True\n"
+    )
+    git_snapshot(repo)
+
+    build = run_ctx(repo, "build", "--lexical-only")
+    assert build.returncode == 0, build.stderr
+
+    query = run_ctx(
+        repo, "query", "stage flush pending ledger entry", "--lexical-only", "--paths-only", "-k", "2"
+    )
+    assert query.returncode == 0, query.stderr
+    paths = query.stdout.splitlines()
+    assert paths, "expected at least one result"
+    assert paths[0] == "src/write_path.py", paths
+
+
+def test_source_implementation_beats_adr_narrative(tmp_path: Path) -> None:
+    """R68: une implémentation source doit battre un ADR/document qui répète
+    les mêmes mots sans implémenter le comportement.
+    """
+    repo = init_repo(tmp_path)
+    (repo / "src").mkdir(exist_ok=True)
+    (repo / "docs" / "adr").mkdir(parents=True)
+
+    (repo / "src" / "thermal_control.py").write_text(
+        "def stabilize_pressure_valve() -> None:\n"
+        "    \"\"\"Adjust the driver output so downstream load remains"
+        " steady.\"\"\"\n"
+        "    return None\n"
+    )
+    (repo / "docs" / "adr" / "0002-hardware-choice.md").write_text(
+        "# Context\n\n"
+        "We evaluated several approaches for regulator behavior under"
+        " load.\n\n"
+        "## Decision\n\n"
+        "The system must stabilize the pressure valve whenever inlet flow"
+        " spikes; this note documents why we chose to stabilize the"
+        " pressure valve at the driver level, keeping the pressure valve"
+        " logic out of hardware.\n"
+    )
+    git_snapshot(repo)
+
+    build = run_ctx(repo, "build", "--lexical-only")
+    assert build.returncode == 0, build.stderr
+
+    query = run_ctx(
+        repo, "query", "stabilize pressure valve", "--lexical-only", "--paths-only", "-k", "2"
+    )
+    assert query.returncode == 0, query.stderr
+    paths = query.stdout.splitlines()
+    assert paths, "expected at least one result"
+    assert paths[0] == "src/thermal_control.py", paths
+
+
+def test_explicit_test_oriented_query_still_returns_test(tmp_path: Path) -> None:
+    """R68: une requête explicitement orientée test doit encore retrouver le
+    test concerné — le ranking field-aware ne doit pas éliminer les tests.
+    """
+    repo = init_repo(tmp_path)
+    (repo / "src").mkdir(exist_ok=True)
+    (repo / "tests").mkdir(exist_ok=True)
+
+    (repo / "src" / "unrelated_module.py").write_text(
+        "def unrelated_helper() -> None:\n"
+        "    \"\"\"Does something else entirely.\"\"\"\n"
+        "    return None\n"
+    )
+    (repo / "tests" / "test_flow_details.py").write_text(
+        "def test_flow_details() -> None:\n"
+        "    \"\"\"Covers the flow details edge case behavior.\"\"\"\n"
+        "    assert True\n"
+    )
+    git_snapshot(repo)
+
+    build = run_ctx(repo, "build", "--lexical-only")
+    assert build.returncode == 0, build.stderr
+
+    query = run_ctx(
+        repo, "query", "test flow details behavior", "--lexical-only", "--paths-only", "-k", "2"
+    )
+    assert query.returncode == 0, query.stderr
+    paths = query.stdout.splitlines()
+    assert "tests/test_flow_details.py" in paths, paths
+
+
 def test_empty_cache_file_cleanup(tmp_path: Path) -> None:
     """R66a: Vérifier que save_cache({}) supprime les fichiers cache obsolètes."""
     repo = init_repo(tmp_path)

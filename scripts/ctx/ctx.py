@@ -82,6 +82,21 @@ DENSE_WEIGHT = 0.68
 LEXICAL_WEIGHT = 0.27
 META_WEIGHT = 0.05
 
+# ctx.py est un locator de CODE : un token de requête qui matche le symbole
+# ou le chemin d'un chunk est un signal bien plus fort que la même occurrence
+# noyée dans le corps — un test ou un ADR répète souvent le vocabulaire d'un
+# comportement sans l'implémenter. Poids par champ, générique (aucune règle
+# par requête/fichier), appliqué dans lexical_scores().
+FIELD_WEIGHT_SYMBOL = 3.0
+FIELD_WEIGHT_PATH = 2.0
+FIELD_WEIGHT_BODY = 1.0
+
+# En mode --lexical-only, il n'y a pas de score dense pour porter la
+# pertinence sémantique : le score meta (bonus symbole/chemin, déjà
+# field-aware) doit peser davantage qu'en mode hybride.
+LEXICAL_ONLY_LEXICAL_WEIGHT = 0.75
+LEXICAL_ONLY_META_WEIGHT = 0.25
+
 INCLUDE_SUFFIXES = {
     ".py", ".pyi",
     ".ts", ".tsx", ".js", ".jsx",
@@ -938,12 +953,30 @@ def lexical_scores(chunks: list[Chunk], text: str) -> np.ndarray:
         term: math.log(1.0 + (n - df.get(term, 0) + 0.5) / (df.get(term, 0) + 0.5))
         for term in qset
     }
-    denom = sum(idf.values()) or 1.0
+    # Normalise par le poids de champ maximal : un chunk dont tous les termes
+    # matchés vivent dans le symbole atteint le plafond 1.0 ; la même
+    # couverture uniquement dans le corps (occurrence narrative dans un test,
+    # une doc, un ADR) plafonne à FIELD_WEIGHT_BODY / FIELD_WEIGHT_SYMBOL.
+    # Générique : aucune référence à une requête ou un fichier particulier.
+    denom = (sum(idf.values()) or 1.0) * FIELD_WEIGHT_SYMBOL
 
     scores = np.zeros(len(chunks), dtype=np.float32)
-    for i, terms in enumerate(doc_sets):
-        matched = qset & terms
-        scores[i] = float(sum(idf[t] for t in matched) / denom)
+    for i, chunk in enumerate(chunks):
+        matched = qset & doc_sets[i]
+        if not matched:
+            continue
+        symbol_tokens = set(split_identifier(chunk.symbol))
+        path_tokens = set(split_identifier(chunk.path))
+        total = 0.0
+        for term in matched:
+            if term in symbol_tokens:
+                weight = FIELD_WEIGHT_SYMBOL
+            elif term in path_tokens:
+                weight = FIELD_WEIGHT_PATH
+            else:
+                weight = FIELD_WEIGHT_BODY
+            total += idf[term] * weight
+        scores[i] = float(total / denom)
     return scores
 
 
@@ -1032,7 +1065,7 @@ def rank_chunks(
 
     if lexical_only:
         dense = np.zeros(len(chunks), dtype=np.float32)
-        scores = 0.90 * lexical + 0.10 * meta
+        scores = LEXICAL_ONLY_LEXICAL_WEIGHT * lexical + LEXICAL_ONLY_META_WEIGHT * meta
     else:
         query_text = text
         if not no_instruct:
