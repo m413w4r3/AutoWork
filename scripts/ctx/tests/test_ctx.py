@@ -492,3 +492,318 @@ def test_benchmark_exit_code_reflects_thresholds() -> None:
     payload = json.loads(checked.stdout)
     all_pass = all(payload["verdicts"].values())
     assert checked.returncode == (0 if all_pass else 1)
+
+
+# --------------------------------------------------------------------------- R75 : unités du scorer
+#
+# Ces tests exercent directement les primitives de ranking de ctx.py
+# (`lexical_scores`, `meta_scores`, `rank_chunks`, `path_role`) sur des
+# `Chunk` SYNTHÉTIQUES. Ils ne dépendent d'aucun fichier d'AutoWork, d'aucune
+# requête du benchmark R67 et d'aucun index construit : ils décrivent des
+# propriétés générales du scorer, valables pour n'importe quel dépôt.
+#
+# ctx.py déclare ses dépendances en PEP 723 ; on exécute donc ces assertions
+# via `uv run --with numpy --with openai`, comme `test_empty_cache_file_cleanup`.
+
+SCORER_PRELUDE = '''
+import sys
+sys.path.insert(0, {ctx_dir!r})
+import numpy as np
+import ctx
+
+
+def chunk(path, symbol, body, kind="function", start=1, end=20):
+    """Construit un Chunk synthétique avec le même lexique qu'un vrai build."""
+    return ctx.Chunk(
+        path=path,
+        start=start,
+        end=end,
+        symbol=symbol,
+        kind=kind,
+        key=path + symbol,
+        terms=ctx.lexical_terms(path, symbol, body),
+    )
+
+
+def rank(chunks, query):
+    """Ordre lexical-only : renvoie les chunks du meilleur au moins bon."""
+    ranked = ctx.rank_chunks(
+        chunks,
+        np.empty((0, 0), dtype=np.float32),
+        query,
+        model="unused",
+        lexical_only=True,
+        no_instruct=True,
+    )
+    return [item.chunk for item in ranked]
+'''
+
+
+def run_scorer(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
+    """Exécute des assertions de scoring dans un interpréteur ayant numpy."""
+    script = tmp_path / "scorer_case.py"
+    script.write_text(
+        SCORER_PRELUDE.format(ctx_dir=str(CTX_SCRIPT.parent)) + body + '\nprint("OK")\n'
+    )
+    return subprocess.run(
+        ["uv", "run", "--python", "3.12", "--with", "openai", "--with", "numpy", str(script)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def assert_scorer_ok(tmp_path: Path, body: str) -> None:
+    result = run_scorer(tmp_path, body)
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert "OK" in result.stdout, result.stdout
+
+
+def test_path_role_uses_generic_conventions_not_repo_prefixes(tmp_path: Path) -> None:
+    """Le rôle d'un fichier vient de conventions universelles, pas d'une liste
+    de préfixes propres à un dépôt : le même classement doit valoir pour des
+    arborescences arbitraires.
+    """
+    assert_scorer_ok(
+        tmp_path,
+        '''
+# Tests : répertoire dédié OU convention de nommage, à n'importe quelle profondeur.
+for path in (
+    "tests/test_thing.py",
+    "any/nested/tests/helpers.py",
+    "pkg/__tests__/widget.ts",
+    "svc/spec/behaviour.rb",
+    "web/e2e/checkout.spec.ts",
+    "pkg/test_widget.py",
+    "pkg/widget_test.go",
+    "web/widget.test.tsx",
+    "pkg/conftest.py",
+):
+    assert ctx.path_role(path) == "test", path
+
+for path in ("docs/guide.md", "README.md", "notes/adr/0001-choice.md", "docs/deep/topic.rst"):
+    assert ctx.path_role(path) == "doc", path
+
+for path in ("db/migrations/0001_init.py", "alembic/versions/abc.py"):
+    assert ctx.path_role(path) == "migration", path
+
+for path in ("src/service.py", "lib/widget.ts", "cmd/main.go", "app/models.py"):
+    assert ctx.path_role(path) == "source", path
+
+# Le code source garde le prior maximal ; les artefacts descriptifs perdent
+# les égalités sans être exclus.
+assert ctx.path_prior("src/service.py") == 1.0
+assert ctx.path_prior("tests/test_service.py") < 1.0
+assert ctx.path_prior("docs/guide.md") < ctx.path_prior("tests/test_service.py")
+assert 0.0 < ctx.path_prior("db/migrations/0001_init.py") < 1.0
+''',
+    )
+
+
+def test_focused_symbol_beats_prose_symbol_covering_same_concepts(tmp_path: Path) -> None:
+    """Un symbole dont la requête est l'essentiel bat un nom-phrase qui ne fait
+    que la mentionner. `release_conversation` et
+    `test_release_conversation_success_with_keep_policy` couvrent les mêmes
+    concepts ; seul le premier est un locator.
+    """
+    assert_scorer_ok(
+        tmp_path,
+        '''
+implementation = chunk(
+    "src/routes_conversations.py",
+    "ConversationRoutes.release_conversation",
+    "def release_conversation(self, handle):\\n    return self.registry.release(handle)\\n",
+)
+prose = chunk(
+    "src/describe.py",  # même rôle "source" : on isole l'effet du symbole
+    "check_release_conversation_success_with_keep_policy_and_retry",
+    "def check_release_conversation_success_with_keep_policy_and_retry():\\n    pass\\n",
+)
+order = rank([prose, implementation], "release conversation")
+assert order[0] is implementation, [c.symbol for c in order]
+''',
+    )
+
+
+def test_long_chunk_does_not_win_by_vocabulary_accumulation(tmp_path: Path) -> None:
+    """Le lexique d'un chunk est un set : sans normalisation de longueur, un
+    chunk long matche mécaniquement plus de termes qu'un chunk court sans être
+    plus pertinent. Un gros module fourre-tout ne doit pas battre la fonction
+    qui porte réellement le concept.
+    """
+    assert_scorer_ok(
+        tmp_path,
+        '''
+filler = " ".join("filler%d unrelated%d noise%d" % (i, i, i) for i in range(200))
+
+# Contient TOUS les termes de la requête, noyés dans un vocabulaire énorme.
+grab_bag = chunk(
+    "src/kitchen_sink.py",
+    "<module>",
+    "quota throttle budget enforcement " + filler,
+    kind="module",
+    start=1,
+    end=110,
+)
+# N'en contient qu'une partie, mais c'est son sujet.
+focused = chunk(
+    "src/limits.py",
+    "enforce_quota_throttle",
+    "def enforce_quota_throttle(budget):\\n    return budget\\n",
+)
+order = rank([grab_bag, focused], "quota throttle budget enforcement")
+assert order[0] is focused, [c.symbol for c in order]
+''',
+    )
+
+
+def test_path_concept_plus_symbol_entity_beats_generic_word_match(tmp_path: Path) -> None:
+    """Un chunk dont le CHEMIN porte un concept demandé ("repository") et dont
+    le SYMBOLE porte l'entité demandée doit battre un chunk qui ne matche qu'un
+    mot générique de la requête.
+    """
+    assert_scorer_ok(
+        tmp_path,
+        '''
+owner = chunk(
+    "src/infrastructure/database/repositories/model_conversations.py",
+    "SqlAlchemyModelConversationRepository",
+    "class SqlAlchemyModelConversationRepository:\\n    def save(self, row):\\n        ...\\n",
+    kind="class",
+)
+generic = chunk(
+    "src/util/helpers.py",
+    "load_state",
+    "def load_state(payload):\\n    # generic state handling\\n    return payload\\n",
+)
+order = rank([generic, owner], "persist and reload model conversation state database repository")
+assert order[0] is owner, [c.path for c in order]
+''',
+    )
+
+
+def test_generic_one_token_symbol_gets_no_citation_bonus(tmp_path: Path) -> None:
+    """`symbol in query` vise le cas "la requête cite ce symbole". Un nom d'un
+    seul token générique (Extension, Config...) qui se trouve être un sous-mot
+    de la requête n'est pas une citation : sans garde-fou, le symbole le moins
+    discriminant du dépôt rafle le plus gros bonus meta.
+    """
+    assert_scorer_ok(
+        tmp_path,
+        '''
+query = "browser extension server request conversation routing"
+
+generic = chunk("src/soak.py", "Extension", "class Extension:\\n    pass\\n", kind="class")
+meta = ctx.meta_scores([generic], query)[0]
+# Sans le garde-fou, ce seul chunk encaissait le bonus de citation (0.55).
+assert meta < 0.55, meta
+
+# Une vraie citation multi-token garde son bonus.
+real = chunk(
+    "src/routing.py",
+    "conversation_routing",
+    "def conversation_routing():\\n    pass\\n",
+)
+assert ctx.meta_scores([real], query)[0] > meta
+''',
+    )
+
+
+def test_exact_symbol_match_stays_strongly_prioritised(tmp_path: Path) -> None:
+    """Garantie non négociable : chercher un identifiant exact doit ramener sa
+    définition en tête, y compris face à des chunks qui le mentionnent.
+    """
+    assert_scorer_ok(
+        tmp_path,
+        '''
+definition = chunk(
+    "src/policy.py",
+    "ConversationPolicy",
+    "class ConversationPolicy:\\n    keep = True\\n",
+    kind="class",
+)
+mention = chunk(
+    "src/consumer.py",
+    "build_pipeline",
+    "def build_pipeline():\\n    # uses ConversationPolicy under the hood\\n"
+    "    return ConversationPolicy()\\n",
+)
+doc = chunk("docs/policies.md", "Conversation policy", "The ConversationPolicy decides retention.\\n", kind="doc")
+
+order = rank([mention, doc, definition], "ConversationPolicy")
+assert order[0] is definition, [c.symbol for c in order]
+''',
+    )
+
+
+def test_doc_and_migration_do_not_outrank_relevant_source(tmp_path: Path) -> None:
+    """Docs et migrations restent indexées et retournables, mais ne battent pas
+    arbitrairement le code source qui implémente le comportement demandé.
+    """
+    assert_scorer_ok(
+        tmp_path,
+        '''
+source = chunk(
+    "src/thermal.py",
+    "stabilize_pressure_valve",
+    "def stabilize_pressure_valve():\\n    return adjust_driver_output()\\n",
+)
+adr = chunk(
+    "docs/adr/0002-hardware.md",
+    "Stabilize the pressure valve at the driver level",
+    "We chose to stabilize the pressure valve at the driver level; the pressure"
+    " valve logic stays out of hardware.\\n",
+    kind="doc",
+)
+migration = chunk(
+    "db/migrations/0007_pressure_valve.py",
+    "upgrade",
+    "def upgrade():\\n    op.add_column('valve', sa.Column('stabilize_pressure', sa.Boolean))\\n",
+)
+
+order = rank([adr, migration, source], "stabilize pressure valve")
+assert order[0] is source, [c.path for c in order]
+
+# ...mais ils restent présents dans le classement, pas filtrés.
+assert set(c.path for c in order) == {"src/thermal.py", "docs/adr/0002-hardware.md", "db/migrations/0007_pressure_valve.py"}
+''',
+    )
+
+
+def test_scorer_works_with_zero_embeddings(tmp_path: Path) -> None:
+    """Lexical-only reste fonctionnel avec zéro embedding : `rank_chunks` ne
+    doit jamais toucher la matrice dense, même vide.
+    """
+    assert_scorer_ok(
+        tmp_path,
+        '''
+chunks = [
+    chunk("src/a.py", "alpha_handler", "def alpha_handler():\\n    pass\\n"),
+    chunk("src/b.py", "beta_handler", "def beta_handler():\\n    pass\\n"),
+]
+ranked = ctx.rank_chunks(
+    chunks,
+    np.empty((0, 0), dtype=np.float32),
+    "alpha handler",
+    model="unused",
+    lexical_only=True,
+    no_instruct=True,
+)
+assert len(ranked) == 2
+assert all(item.dense == 0.0 for item in ranked)
+assert ranked[0].chunk.symbol == "alpha_handler"
+assert ranked[0].score > 0.0
+
+# Une requête sans terme exploitable ne doit pas exploser.
+empty = ctx.rank_chunks(
+    chunks,
+    np.empty((0, 0), dtype=np.float32),
+    "   ",
+    model="unused",
+    lexical_only=True,
+    no_instruct=True,
+)
+assert len(empty) == 2
+''',
+    )

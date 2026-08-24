@@ -43,7 +43,7 @@ import tempfile
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterator
 
 import numpy as np
@@ -91,6 +91,29 @@ FIELD_WEIGHT_SYMBOL = 3.0
 FIELD_WEIGHT_PATH = 2.0
 FIELD_WEIGHT_BODY = 1.0
 
+# Le lexique d'un chunk est un *set* : un chunk long matche mécaniquement plus
+# de termes de requête qu'un chunk court, sans être plus pertinent (un module
+# de 110 lignes finit par contenir tout le vocabulaire du domaine). Sans
+# normalisation, la taille du chunk est un biais pur. Normalisation de
+# longueur façon BM25, appliquée au seul champ *body* : symbole et chemin sont
+# des champs courts et structurés, qui ne subissent pas ce biais.
+LENGTH_NORM_B = 0.75
+
+# Un symbole est un *locator*, pas une description. `release_conversation`
+# et `test_release_conversation_success_with_keep_policy` couvrent les mêmes
+# concepts, mais le second est une phrase en anglais sérialisée en
+# identifiant : la requête n'y occupe qu'une petite fraction du nom. On pondère
+# donc le champ symbole par la *précision* du match (fraction du nom couverte
+# par la requête), amortie par une racine pour rester tolérante aux noms
+# composés légitimes (SqlAlchemyModelConversationRepository).
+SYMBOL_FOCUS_EXPONENT = 0.5
+
+# Le bonus "la requête cite ce symbole" ne doit pas se déclencher pour un nom
+# générique d'un seul token (`Extension`, `Config`, `Run`...) qui se trouve
+# être un sous-mot de la requête : ce n'est pas une citation, c'est une
+# collision de vocabulaire.
+MIN_SYMBOL_TOKENS_FOR_CITATION = 2
+
 # En mode --lexical-only, il n'y a pas de score dense pour porter la
 # pertinence sémantique : le score meta (bonus symbole/chemin, déjà
 # field-aware) doit peser davantage qu'en mode hybride.
@@ -128,17 +151,24 @@ EXCLUDE_BASENAMES = {
     "uv.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "poetry.lock",
 }
 
-# Certains fichiers historiques sont utiles, mais doivent perdre face au code actif.
-PATH_PRIORS: tuple[tuple[str, float], ...] = (
-    ("backend/src/", 1.00),
-    ("frontend/src/", 1.00),
-    ("chatgpt-bridge/", 1.00),
-    ("backend/tests/", 0.94),
-    ("frontend/e2e/", 0.92),
-    ("docs/adr/", 0.93),
-    ("docs/", 0.88),
-    ("backend/migrations/versions/", 0.78),
-)
+# Rôle d'un fichier, déduit de conventions de nommage universelles plutôt que
+# d'une liste de préfixes propres à un dépôt. Un test, un ADR ou une migration
+# *décrivent* un comportement : leur nom de fichier et leurs noms de symboles
+# reprennent le vocabulaire de la fonctionnalité, souvent plus littéralement
+# que le code qui l'implémente. Ils restent indexés et retournables — ils
+# perdent seulement les égalités face au code source correspondant.
+TEST_DIR_PARTS = {"test", "tests", "__tests__", "spec", "specs", "e2e", "testing", "fixtures"}
+DOC_DIR_PARTS = {"doc", "docs", "adr", "adrs", "rfc", "documentation", "examples"}
+MIGRATION_DIR_PARTS = {"migration", "migrations", "alembic", "versions"}
+TEST_STEM = re.compile(r"(?:^test[_-]|[_-]test$|\.test$|\.spec$|^conftest$)", re.IGNORECASE)
+DOC_SUFFIXES = {".md", ".txt", ".rst"}
+
+ROLE_PRIORS: dict[str, float] = {
+    "source": 1.00,
+    "test": 0.75,
+    "doc": 0.65,
+    "migration": 0.55,
+}
 
 HEADING = re.compile(r"^#{1,4}\s+(.+?)\s*$")
 TS_DECL = re.compile(
@@ -933,11 +963,28 @@ def load_index(model: str) -> tuple[list[Chunk], np.ndarray, dict[str, object]]:
 # --------------------------------------------------------------------------- ranking
 
 
+def path_role(path: str) -> str:
+    """Classe un chemin en source/test/doc/migration, sans règle propre au dépôt.
+
+    N'utilise que des conventions partagées par l'écosystème (répertoire
+    ``tests/``, préfixe ``test_``, suffixe ``.spec``, dossier ``migrations/``,
+    extension ``.md``...), donc transposable à n'importe quel projet.
+    """
+    posix = PurePosixPath(path)
+    dir_parts = {part.casefold() for part in posix.parts[:-1]}
+    stem = posix.stem
+
+    if dir_parts & TEST_DIR_PARTS or TEST_STEM.search(stem):
+        return "test"
+    if dir_parts & MIGRATION_DIR_PARTS:
+        return "migration"
+    if posix.suffix.casefold() in DOC_SUFFIXES or dir_parts & DOC_DIR_PARTS:
+        return "doc"
+    return "source"
+
+
 def path_prior(path: str) -> float:
-    for prefix, prior in PATH_PRIORS:
-        if path.startswith(prefix):
-            return prior
-    return 0.90
+    return ROLE_PRIORS[path_role(path)]
 
 
 def lexical_scores(chunks: list[Chunk], text: str) -> np.ndarray:
@@ -960,6 +1007,10 @@ def lexical_scores(chunks: list[Chunk], text: str) -> np.ndarray:
     # Générique : aucune référence à une requête ou un fichier particulier.
     denom = (sum(idf.values()) or 1.0) * FIELD_WEIGHT_SYMBOL
 
+    # Longueur moyenne du lexique, pour la normalisation BM25 du champ body.
+    avg_len = (sum(len(terms) for terms in doc_sets) / len(doc_sets)) if doc_sets else 1.0
+    avg_len = max(avg_len, 1.0)
+
     scores = np.zeros(len(chunks), dtype=np.float32)
     for i, chunk in enumerate(chunks):
         matched = qset & doc_sets[i]
@@ -967,15 +1018,34 @@ def lexical_scores(chunks: list[Chunk], text: str) -> np.ndarray:
             continue
         symbol_tokens = set(split_identifier(chunk.symbol))
         path_tokens = set(split_identifier(chunk.path))
-        total = 0.0
-        for term in matched:
-            if term in symbol_tokens:
-                weight = FIELD_WEIGHT_SYMBOL
-            elif term in path_tokens:
-                weight = FIELD_WEIGHT_PATH
-            else:
-                weight = FIELD_WEIGHT_BODY
-            total += idf[term] * weight
+
+        # Un terme est attribué à un seul champ, le plus fort qui le contient.
+        in_symbol = matched & symbol_tokens
+        in_path = (matched & path_tokens) - in_symbol
+        in_body = matched - in_symbol - in_path
+
+        # Précision du symbole : quelle fraction du nom la requête couvre-t-elle ?
+        # Un nom-phrase (test, heading de doc) dilue la requête et perd contre un
+        # identifiant dont la requête est l'essentiel.
+        symbol_focus = 1.0
+        if symbol_tokens:
+            symbol_focus = (len(in_symbol) / len(symbol_tokens)) ** SYMBOL_FOCUS_EXPONENT
+
+        # Longueur du body : un chunk long ne devient pas pertinent en accumulant
+        # passivement du vocabulaire.
+        # Plafonné à 1.0 : on corrige le biais d'accumulation des chunks longs,
+        # on ne récompense pas la brièveté (sinon un titre de doc de 3 lignes,
+        # dont le lexique tient en 15 termes, devient imbattable).
+        length_norm = min(
+            1.0,
+            1.0 / (1.0 - LENGTH_NORM_B + LENGTH_NORM_B * len(doc_sets[i]) / avg_len),
+        )
+
+        total = (
+            FIELD_WEIGHT_SYMBOL * symbol_focus * sum(idf[t] for t in in_symbol)
+            + FIELD_WEIGHT_PATH * sum(idf[t] for t in in_path)
+            + FIELD_WEIGHT_BODY * length_norm * sum(idf[t] for t in in_body)
+        )
         scores[i] = float(total / denom)
     return scores
 
@@ -992,7 +1062,12 @@ def meta_scores(chunks: list[Chunk], text: str) -> np.ndarray:
         path_tokens = set(split_identifier(chunk.path))
 
         score = 0.0
-        if q and (q in symbol or symbol in q):
+        # `symbol in q` vise le cas "la requête cite ce symbole". Un nom d'un
+        # seul token (Extension, Config, Run) qui se trouve être un sous-mot de
+        # la requête n'est pas une citation : sans ce garde-fou, le symbole le
+        # moins discriminant du dépôt rafle le plus gros bonus meta.
+        cited = symbol in q and len(symbol_tokens) >= MIN_SYMBOL_TOKENS_FOR_CITATION
+        if q and (q in symbol or cited):
             score += 0.55
         if q and q in path:
             score += 0.35
