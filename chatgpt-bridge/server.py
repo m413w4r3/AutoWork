@@ -321,38 +321,29 @@ class RunRegistry:
             table_sql = db.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='bridge_runs'"
             ).fetchone()[0]
-            if "needs_review" not in table_sql:
-                db.execute("ALTER TABLE bridge_runs RENAME TO bridge_runs_legacy")
-                db.execute(
-                    """
-                    CREATE TABLE bridge_runs (
-                        idempotency_key TEXT PRIMARY KEY,
-                        request_hash TEXT NOT NULL,
-                        bridge_run_id TEXT NOT NULL UNIQUE,
-                        state TEXT NOT NULL CHECK(
-                            state IN ('queued','running','completed','failed','needs_review')
-                        ),
-                        created_at REAL NOT NULL,
-                        updated_at REAL NOT NULL,
-                        response_json TEXT,
-                        error_json TEXT,
-                        conversation_json TEXT,
-                        preview_json TEXT
-                    )
-                    """
-                )
-                db.execute(
-                    "INSERT INTO bridge_runs "
-                    "(idempotency_key,request_hash,bridge_run_id,state,created_at,updated_at,"
-                    "response_json,error_json) SELECT idempotency_key,request_hash,bridge_run_id,"
-                    "state,created_at,updated_at,response_json,error_json FROM bridge_runs_legacy"
-                )
-                db.execute("DROP TABLE bridge_runs_legacy")
             columns = {row[1] for row in db.execute("PRAGMA table_info(bridge_runs)")}
-            if "conversation_json" not in columns:
-                db.execute("ALTER TABLE bridge_runs ADD COLUMN conversation_json TEXT")
-            if "preview_json" not in columns:
-                db.execute("ALTER TABLE bridge_runs ADD COLUMN preview_json TEXT")
+            required_columns = {
+                "idempotency_key",
+                "request_hash",
+                "bridge_run_id",
+                "state",
+                "created_at",
+                "updated_at",
+                "response_json",
+                "error_json",
+                "conversation_json",
+                "preview_json",
+            }
+            if "needs_review" not in table_sql or not required_columns.issubset(columns):
+                raise RuntimeError(
+                    "bridge_runs table schema is incompatible with the current "
+                    "code. This bridge no longer migrates historical SQLite "
+                    "schemas. Reset the run registry by deleting only "
+                    "bridge-runs.sqlite3, bridge-runs.sqlite3-wal and "
+                    "bridge-runs.sqlite3-shm inside bridge_data (never delete "
+                    "other bridge_data contents, in particular the ChatGPT "
+                    "browser/auth state), then restart the bridge."
+                )
 
             # Table for tracking conversation lifecycle and cleanup
             db.execute(
