@@ -37,6 +37,15 @@ def _openai_globals(module: dict[str, Any]) -> dict[str, Any]:
     return globals_
 
 
+def _bridge_globals(module: dict[str, Any]) -> dict[str, Any]:
+    """Module namespace of `bridge.routes_bridge`, reached via the `BridgeRoutes`
+    instance the server wires up (R59b). Import-cached across `load_bridge()`
+    calls just like `bridge.routes_openai` — see `_openai_globals`.
+    """
+    globals_: dict[str, Any] = module["bridge_routes"].create_bridge_run.__globals__
+    return globals_
+
+
 def test_extension_reserves_request_before_real_send_click() -> None:
     root = Path(__file__).parents[2] / "chatgpt-bridge" / "extension"
     background = (root / "background.js").read_text()
@@ -173,19 +182,22 @@ def request_with_key(key: str) -> Request:
 
 def isolated_registry(module: dict[str, Any], tmp_path: Path) -> None:
     registry = module["RunRegistry"](tmp_path / "runs.sqlite3")
-    module["create_bridge_run"].__globals__["run_registry"] = registry
-    module["retrieve_bridge_run"].__globals__["run_registry"] = registry
-    # `OpenAIRoutes`/`ConversationRoutes` captured the original `run_registry` as
-    # an instance attribute at construction time (R58/R59a): swapping the
-    # module global above doesn't reach them, so the instances need patching too.
+    # `create_bridge_run`/`retrieve_bridge_run` no longer read a `run_registry`
+    # global (R59b: they read `self.registry`, bound once at construction) — every
+    # real owner of a registry reference needs patching directly, including the
+    # `module["run_registry"]` entry itself, since later test code still reads it
+    # for direct `run_generation` calls.
+    module["run_registry"] = registry
     module["openai_routes"].registry = registry
+    module["bridge_routes"].registry = registry
     module["conversation_routes"].registry = registry
 
 
 def test_responses_facade_translates_web_search_and_rejects_binary_blocks() -> None:
     module = load_bridge()
-    response_request = module["ResponseRequest"]
-    translate = _openai_globals(module)["_response_chat_request"]
+    openai_globals = _openai_globals(module)
+    response_request = openai_globals["ResponseRequest"]
+    translate = openai_globals["_response_chat_request"]
 
     translated = translate(
         response_request(
@@ -222,7 +234,7 @@ def test_recovery_message_is_forwarded_exactly_without_discovery_preamble() -> N
         "la mission initiale et fournis directement le rapport Markdown demandé, sans "
         "recommencer toute la recherche."
     )
-    request = module["BridgeRunRequest"](
+    request = _bridge_globals(module)["BridgeRunRequest"](
         input=message,
         recovery=True,
         conversation={
@@ -233,7 +245,7 @@ def test_recovery_message_is_forwarded_exactly_without_discovery_preamble() -> N
     )
 
     chat_request = _openai_globals(module)["_response_chat_request"](
-        module["_bridge_response_request"](request)
+        module["bridge_routes"]._bridge_response_request(request)
     )
 
     assert len(chat_request.messages) == 1
@@ -259,7 +271,7 @@ async def test_responses_facade_completes_background_request_without_network(
         fake_generation,
     )
     module["bridge"].ws = object()
-    request = module["ResponseRequest"](
+    request = _openai_globals(module)["ResponseRequest"](
         input="Recherche autorisée",
         tools=[{"type": "web_search"}],
         background=True,
@@ -278,7 +290,7 @@ async def test_responses_facade_completes_background_request_without_network(
 
 def test_native_bridge_contract_reports_honest_capabilities() -> None:
     module = load_bridge()
-    request = module["BridgeRunRequest"](
+    request = _bridge_globals(module)["BridgeRunRequest"](
         requested_model="premium-profile",
         input="Recherche autorisée",
         web_search=True,
@@ -286,7 +298,7 @@ def test_native_bridge_contract_reports_honest_capabilities() -> None:
         background=True,
     )
 
-    translated = module["_bridge_response_request"](request)
+    translated = module["bridge_routes"]._bridge_response_request(request)
 
     assert translated.model == "premium-profile"
     assert translated.tools == [{"type": "web_search"}]
@@ -296,11 +308,11 @@ def test_native_bridge_contract_reports_honest_capabilities() -> None:
 def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation() -> None:
     module = load_bridge()
     conversation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-    fresh = module["BridgeRunRequest"](
+    fresh = _bridge_globals(module)["BridgeRunRequest"](
         input="A1",
         conversation={"mode": "fresh", "id": conversation_id, "external_locator": None},
     )
-    continued = module["BridgeRunRequest"](
+    continued = _bridge_globals(module)["BridgeRunRequest"](
         input="A2",
         conversation={
             "mode": "continue",
@@ -310,10 +322,10 @@ def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation() ->
     )
 
     translate = _openai_globals(module)["_response_chat_request"]
-    assert translate(module["_bridge_response_request"](fresh)).new_chat
-    assert not translate(module["_bridge_response_request"](continued)).new_chat
+    assert translate(module["bridge_routes"]._bridge_response_request(fresh)).new_chat
+    assert not translate(module["bridge_routes"]._bridge_response_request(continued)).new_chat
     with pytest.raises(ValidationError):
-        module["BridgeRunRequest"](
+        _bridge_globals(module)["BridgeRunRequest"](
             input="attaque SSRF",
             conversation={
                 "mode": "continue",
@@ -322,7 +334,7 @@ def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation() ->
             },
         )
     with pytest.raises(ValidationError):
-        module["BridgeRunRequest"](
+        _bridge_globals(module)["BridgeRunRequest"](
             input="continuation sans cible",
             conversation={"mode": "continue", "id": conversation_id},
         )
@@ -337,8 +349,8 @@ async def test_fake_extension_routes_a_b_a_and_retry_clicks_once(tmp_path: Path)
     conversation_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 
     async def send(key: str, conversation: dict[str, object]) -> dict[str, Any]:
-        result = await module["create_bridge_run"](
-            module["BridgeRunRequest"](input=key, conversation=conversation),
+        result = await module["bridge_routes"].create_bridge_run(
+            _bridge_globals(module)["BridgeRunRequest"](input=key, conversation=conversation),
             request_with_key(key),
         )
         assert isinstance(result, dict)
@@ -365,13 +377,14 @@ async def test_fake_extension_routes_a_b_a_and_retry_clicks_once(tmp_path: Path)
 
 def test_requested_model_is_a_label_and_only_ui_model_drives_the_interface() -> None:
     module = load_bridge()
-    build = module["BridgeRunRequest"]
+    build = _bridge_globals(module)["BridgeRunRequest"]
+    bridge_controls = module["bridge_routes"]._bridge_controls
 
-    label = module["_bridge_controls"](build(requested_model="premium-profile", input="x"))
-    driving = module["_bridge_controls"](
+    label = bridge_controls(build(requested_model="premium-profile", input="x"))
+    driving = bridge_controls(
         build(requested_model="premium-profile", ui_model="GPT-5 Thinking", input="x")
     )
-    neutral = module["_bridge_controls"](build(ui_model="chatgpt-web", input="x"))
+    neutral = bridge_controls(build(ui_model="chatgpt-web", input="x"))
 
     assert label.model is None
     assert driving.model == "GPT-5 Thinking"
@@ -403,9 +416,10 @@ async def test_unverified_model_refuses_the_run_but_web_search_falls_back_to_the
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_bridge()
-    controls = module["RunControls"]
+    openai_globals = _openai_globals(module)
+    controls = openai_globals["RunControls"]
     bridge = module["bridge"]
-    prepare_run = _openai_globals(module)["prepare_run"]
+    prepare_run = openai_globals["prepare_run"]
 
     _stub_controls(
         monkeypatch,
@@ -439,7 +453,8 @@ async def test_verified_ui_state_names_the_model_and_the_native_search_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = load_bridge()
-    state = module["UiState"].model_validate(
+    openai_globals = _openai_globals(module)
+    state = openai_globals["prepare_run"].__globals__["UiState"].model_validate(
         {
             "model": {"supported": True, "selected": "GPT-5 Thinking", "verified": True},
             "web_search": {"supported": True, "enabled": True, "verified": True},
@@ -452,13 +467,14 @@ async def test_verified_ui_state_names_the_model_and_the_native_search_tool(
         state,
     )
 
-    openai_globals = _openai_globals(module)
     report = await openai_globals["prepare_run"](
-        module["bridge"], module["RunControls"](web_search=True), allow_unverified_model=False
+        module["bridge"],
+        openai_globals["RunControls"](web_search=True),
+        allow_unverified_model=False,
     )
     body = openai_globals["_response_body"](
         "resp_x",
-        module["ResponseRequest"](input="x", tools=[{"type": "web_search"}]),
+        openai_globals["ResponseRequest"](input="x", tools=[{"type": "web_search"}]),
         status="completed",
         output_text="ok",
         run=report,
@@ -470,7 +486,7 @@ async def test_verified_ui_state_names_the_model_and_the_native_search_tool(
     # Le message visible reste métier et ne décrit pas l'implémentation de l'outil.
     prompt = (
         openai_globals["_response_chat_request"](
-            module["ResponseRequest"](input="x", tools=[{"type": "web_search"}]),
+            openai_globals["ResponseRequest"](input="x", tools=[{"type": "web_search"}]),
         )
         .messages[0]
         .content
@@ -483,7 +499,7 @@ async def test_capabilities_degrade_visibly_without_a_connected_extension() -> N
     module = load_bridge()
     module["bridge"].ws = None
 
-    caps = await module["bridge_capabilities"]()
+    caps = await module["bridge_routes"].bridge_capabilities()
 
     assert caps["streaming"] == "final_delta_only"
     assert caps["web_search"] == "prompt_instructed"
@@ -553,14 +569,14 @@ async def test_three_http_retries_with_same_key_submit_one_prompt_and_replay_res
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module, prompt_delay=0.02)
     module["bridge"].ws = extension
-    req = module["BridgeRunRequest"](input="secret prompt")
+    req = _bridge_globals(module)["BridgeRunRequest"](input="secret prompt")
 
     first, second, third = await asyncio.gather(
-        module["create_bridge_run"](req, request_with_key("business-1")),
-        module["create_bridge_run"](req, request_with_key("business-1")),
-        module["create_bridge_run"](req, request_with_key("business-1")),
+        module["bridge_routes"].create_bridge_run(req, request_with_key("business-1")),
+        module["bridge_routes"].create_bridge_run(req, request_with_key("business-1")),
+        module["bridge_routes"].create_bridge_run(req, request_with_key("business-1")),
     )
-    replay = await module["create_bridge_run"](req, request_with_key("business-1"))
+    replay = await module["bridge_routes"].create_bridge_run(req, request_with_key("business-1"))
 
     assert first["id"] == second["id"] == third["id"] == replay["id"]
     assert extension.prompt_count == 1
@@ -607,12 +623,13 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
 
     extension = ControlledExtension(module)
     module["bridge"].ws = extension
-    request = module["BridgeRunRequest"](input="durable", background=True)
+    request = _bridge_globals(module)["BridgeRunRequest"](input="durable", background=True)
 
-    accepted = await module["create_bridge_run"](request, request_with_key("durable-background"))
-    replay = await module["create_bridge_run"](request, request_with_key("durable-background"))
+    create_bridge_run = module["bridge_routes"].create_bridge_run
+    accepted = await create_bridge_run(request, request_with_key("durable-background"))
+    replay = await create_bridge_run(request, request_with_key("durable-background"))
     await generation_started.wait()
-    running = await module["retrieve_bridge_run"](accepted["id"])
+    running = await module["bridge_routes"].retrieve_bridge_run(accepted["id"])
 
     assert accepted["status"] in {"queued", "running"}
     assert replay["id"] == accepted["id"]
@@ -620,8 +637,8 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
     assert extension.prompt_count == 1
 
     release_generation.set()
-    await module["idempotent_tasks"][accepted["id"]]
-    completed = await module["retrieve_bridge_run"](accepted["id"])
+    await module["bridge_routes"].idempotent_tasks[accepted["id"]]
+    completed = await module["bridge_routes"].retrieve_bridge_run(accepted["id"])
 
     assert completed["status"] == "completed"
     assert completed["output_text"] == "snapshot final unique"
@@ -699,38 +716,38 @@ async def test_conversation_binding_precedes_incomplete_and_survives_restart(
 
     extension = IncompleteExtension(module)
     module["bridge"].ws = extension
-    request = module["BridgeRunRequest"](
+    request = _bridge_globals(module)["BridgeRunRequest"](
         input="mission",
         background=True,
         conversation={"mode": "fresh", "id": conversation_id},
     )
-    accepted = await module["create_bridge_run"](request, request_with_key("incomplete-bound"))
+    accepted = await module["bridge_routes"].create_bridge_run(
+        request, request_with_key("incomplete-bound")
+    )
     await bound.wait()
 
-    persisted = (
-        module["create_bridge_run"].__globals__["run_registry"].get_by_run_id(accepted["id"])
-    )
+    persisted = module["bridge_routes"].registry.get_by_run_id(accepted["id"])
     assert persisted is not None
     binding = json.loads(persisted["conversation_json"])
     assert binding["external_locator"] == locator
     assert binding["assistant_turns_before"] == 2
 
     release.set()
-    await module["idempotent_tasks"][accepted["id"]]
-    needs_review = await module["retrieve_bridge_run"](accepted["id"])
+    await module["bridge_routes"].idempotent_tasks[accepted["id"]]
+    needs_review = await module["bridge_routes"].retrieve_bridge_run(accepted["id"])
     assert needs_review["status"] == "needs_review"
     assert needs_review["error"]["code"] == "no_final_answer"
 
     restarted = module["RunRegistry"](database)
-    module["preview_visible_recovery"].__globals__["run_registry"] = restarted
-    preview = await module["preview_visible_recovery"](accepted["id"])
+    module["bridge_routes"].registry = restarted
+    preview = await module["bridge_routes"].preview_visible_recovery(accepted["id"])
     assert preview["turn_id"] == "assistant-later"
     assert preview["text"].startswith("## SUBJECT S1")
     assert extension.prompt_count == 1
 
     extension.wrong_conversation = True
     with pytest.raises(HTTPException) as mismatched:
-        await module["preview_visible_recovery"](accepted["id"])
+        await module["bridge_routes"].preview_visible_recovery(accepted["id"])
     assert mismatched.value.status_code == 409
     assert extension.prompt_count == 1
 
@@ -774,8 +791,8 @@ async def test_done_snapshot_replaces_rewritten_legacy_chunks(tmp_path: Path) ->
     extension = RewritingExtension(module)
     module["bridge"].ws = extension
 
-    result = await module["create_bridge_run"](
-        module["BridgeRunRequest"](input="rewrite"),
+    result = await module["bridge_routes"].create_bridge_run(
+        _bridge_globals(module)["BridgeRunRequest"](input="rewrite"),
         request_with_key("rewrite-final"),
     )
 
@@ -806,8 +823,8 @@ async def test_done_rejects_incoherent_output_chars(tmp_path: Path) -> None:
     module["bridge"].ws = InvalidLengthExtension(module)
 
     with pytest.raises(HTTPException) as caught:
-        await module["create_bridge_run"](
-            module["BridgeRunRequest"](input="bad length"),
+        await module["bridge_routes"].create_bridge_run(
+            _bridge_globals(module)["BridgeRunRequest"](input="bad length"),
             request_with_key("bad-length"),
         )
     assert caught.value.status_code == 502
@@ -819,16 +836,17 @@ async def test_cancelled_http_wait_then_retry_joins_original_run(tmp_path: Path)
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module, prompt_delay=0.05)
     module["bridge"].ws = extension
-    req = module["BridgeRunRequest"](input="expensive prompt")
+    req = _bridge_globals(module)["BridgeRunRequest"](input="expensive prompt")
+    create_bridge_run = module["bridge_routes"].create_bridge_run
 
     abandoned = asyncio.create_task(
-        module["create_bridge_run"](req, request_with_key("business-timeout"))
+        create_bridge_run(req, request_with_key("business-timeout"))
     )
     await asyncio.sleep(0.01)
     abandoned.cancel()
     with pytest.raises(asyncio.CancelledError):
         await abandoned
-    replay = await module["create_bridge_run"](req, request_with_key("business-timeout"))
+    replay = await create_bridge_run(req, request_with_key("business-timeout"))
 
     assert replay["status"] == "completed"
     assert extension.prompt_count == 1
@@ -839,9 +857,10 @@ async def test_shutdown_during_run_fails_safe_without_second_prompt(tmp_path: Pa
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module, prompt_delay=60)
     module["bridge"].ws = extension
-    req = module["BridgeRunRequest"](input="expensive prompt")
+    req = _bridge_globals(module)["BridgeRunRequest"](input="expensive prompt")
+    create_bridge_run = module["bridge_routes"].create_bridge_run
 
-    active = asyncio.create_task(module["create_bridge_run"](req, request_with_key("sigterm-run")))
+    active = asyncio.create_task(create_bridge_run(req, request_with_key("sigterm-run")))
     for _ in range(100):
         if extension.prompt_count:
             break
@@ -859,7 +878,7 @@ async def test_shutdown_during_run_fails_safe_without_second_prompt(tmp_path: Pa
     module["bridge"].closing = False
     replacement = FakeExtension(module)
     module["bridge"].ws = replacement
-    replay = await module["create_bridge_run"](req, request_with_key("sigterm-run"))
+    replay = await create_bridge_run(req, request_with_key("sigterm-run"))
 
     assert replay.status_code == 503
     assert json.loads(replay.body)["error"]["code"] == "bridge_server_error"
@@ -871,13 +890,13 @@ async def test_same_key_different_payload_conflicts(tmp_path: Path) -> None:
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module)
     module["bridge"].ws = extension
-    await module["create_bridge_run"](
-        module["BridgeRunRequest"](input="one"), request_with_key("conflict")
+    await module["bridge_routes"].create_bridge_run(
+        _bridge_globals(module)["BridgeRunRequest"](input="one"), request_with_key("conflict")
     )
 
     with pytest.raises(HTTPException) as caught:
-        await module["create_bridge_run"](
-            module["BridgeRunRequest"](input="two"), request_with_key("conflict")
+        await module["bridge_routes"].create_bridge_run(
+            _bridge_globals(module)["BridgeRunRequest"](input="two"), request_with_key("conflict")
         )
     assert caught.value.status_code == 409
     assert isinstance(caught.value.detail, dict)
@@ -890,12 +909,12 @@ async def test_completed_run_survives_registry_restart_without_ui(tmp_path: Path
     isolated_registry(module, tmp_path)
     extension = FakeExtension(module)
     module["bridge"].ws = extension
-    req = module["BridgeRunRequest"](input="once")
-    first = await module["create_bridge_run"](req, request_with_key("restart"))
+    req = _bridge_globals(module)["BridgeRunRequest"](input="once")
+    first = await module["bridge_routes"].create_bridge_run(req, request_with_key("restart"))
 
-    module["create_bridge_run"].__globals__["run_registry"] = module["RunRegistry"](database)
+    module["bridge_routes"].registry = module["RunRegistry"](database)
     module["bridge"].ws = None
-    replay = await module["create_bridge_run"](req, request_with_key("restart"))
+    replay = await module["bridge_routes"].create_bridge_run(req, request_with_key("restart"))
 
     assert replay["id"] == first["id"]
     assert extension.prompt_count == 1
@@ -910,14 +929,14 @@ async def test_capabilities_never_waits_for_a_blocked_extension() -> None:
 
     module["bridge"].ws = Blocked()
     started = asyncio.get_running_loop().time()
-    caps = await module["bridge_capabilities"]()
+    caps = await module["bridge_routes"].bridge_capabilities()
     elapsed = asyncio.get_running_loop().time() - started
 
     assert elapsed < 0.25
     assert caps["extension_connected"] is True
 
 
-async def test_ui_probe_timeout_is_typed() -> None:
+async def test_ui_probe_timeout_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
     module = load_bridge()
 
     class Silent:
@@ -925,9 +944,14 @@ async def test_ui_probe_timeout_is_typed() -> None:
             return None
 
     module["bridge"].ws = Silent()
-    module["bridge_capabilities"].__globals__["UI_TIMEOUT"] = 0.01
+    # `bridge.routes_bridge` is import-cached across `load_bridge()` calls (like
+    # `bridge.routes_openai`, see R59a): a bare assignment here would leak
+    # UI_TIMEOUT=0.01 into every later test in this process.
+    monkeypatch.setitem(
+        module["bridge_routes"].bridge_capabilities.__globals__, "UI_TIMEOUT", 0.01
+    )
     with pytest.raises(HTTPException) as caught:
-        await module["bridge_capabilities"](probe=True, fresh=True)
+        await module["bridge_routes"].bridge_capabilities(probe=True, fresh=True)
 
     assert caught.value.status_code == 504
     assert isinstance(caught.value.detail, dict)
@@ -978,8 +1002,8 @@ async def test_bridge_logs_neither_prompt_nor_idempotency_secret(
     module["bridge"].ws = FakeExtension(module)
     caplog.set_level(logging.INFO, logger="chatgpt_bridge")
 
-    await module["create_bridge_run"](
-        module["BridgeRunRequest"](input="TOP-SECRET-PROMPT"),
+    await module["bridge_routes"].create_bridge_run(
+        _bridge_globals(module)["BridgeRunRequest"](input="TOP-SECRET-PROMPT"),
         request_with_key("TOP-SECRET-IDEMPOTENCY-KEY"),
     )
 
