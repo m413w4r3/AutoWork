@@ -42,10 +42,11 @@ Architecture final. Each change must read directly its owner — never start wit
 
 ### bridge/ui.py
 - State machine, controls application, UI cache.
-- Private state: `_probe_cache`, `_live_progress` confined here.
+- Private state: `_probe_cache` confined here.
 
 ### bridge/generation.py
 - Parsing, final-only generation, timeouts, metadata.
+- Private state: `_live_progress` confined here.
 - **Invariants documented**:
   - done snapshot = authoritative output
   - heartbeat = liveness, never user content
@@ -115,7 +116,9 @@ Deletion requires **all of**:
 - Do **not** retry deletion.
 - Do **not** search heuristically for a replacement.
 - Do **not** override via endpoint.
-- Conversation is never replaced; run is marked terminal and must be manually released.
+- Cleanup attempt is marked terminal; no automatic retry occurs. The conversation
+  has already been released; the client must handle the blocked cleanup via manual
+  intervention or application-level escalation.
 
 ## Untrusted content
 
