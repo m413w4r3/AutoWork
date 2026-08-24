@@ -6,7 +6,8 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from cti_app.infrastructure.database.models.schema import Base
+from cti_app.infrastructure.database.models import model_execution, schema  # noqa: F401
+from cti_app.infrastructure.database.models.base import Base
 
 config = context.config
 if config.config_file_name is not None:

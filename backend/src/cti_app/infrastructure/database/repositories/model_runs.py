@@ -11,7 +11,7 @@ from cti_app.domain.model_runs import (
     ModelRunStatus,
     ModelUsage,
 )
-from cti_app.infrastructure.database.models.schema import (
+from cti_app.infrastructure.database.models.model_execution import (
     ModelOutputRejectionRow,
     ModelRunRow,
 )
