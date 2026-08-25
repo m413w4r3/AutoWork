@@ -811,9 +811,6 @@ def validate_synthesis(
     for code, pattern, detail in checks:
         for match in pattern.finditer(body):
             reject(code, detail, match.span())
-            if code == "raw_url":
-                # Kept as a read-compatible diagnostic code for existing QA clients.
-                result.errors.append("url_outside_corpus")
 
     if isinstance(known_indicators, TechnicalExtraction):
         extraction = known_indicators

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 import logging
 import random
@@ -48,11 +47,7 @@ class ChatCompletionsTransport(Protocol):
 async def _create_with_idempotency(
     transport: ResponsesTransport, payload: dict[str, Any], key: str | None
 ) -> dict[str, Any]:
-    # Compatibilité avec les doubles historiques ; les transports réels du
-    # bridge exposent toujours le paramètre et portent la garantie réseau.
-    if "idempotency_key" in inspect.signature(transport.create).parameters:
-        return await transport.create(payload, idempotency_key=key)
-    return await transport.create(payload)
+    return await transport.create(payload, idempotency_key=key)
 
 
 class HttpResponsesTransport:

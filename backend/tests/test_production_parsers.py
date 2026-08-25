@@ -350,7 +350,7 @@ def test_url_outside_corpus_is_rejected() -> None:
     result = validate_synthesis("Voir https://elsewhere.example/page [S1].", _corpus(), set())
 
     assert not result.usable
-    assert any("url_outside_corpus" in e for e in result.errors)
+    assert any("raw_url" in e for e in result.errors)
 
 
 def test_indicator_absent_from_corpus_is_rejected() -> None:

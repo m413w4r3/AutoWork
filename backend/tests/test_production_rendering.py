@@ -146,7 +146,6 @@ def test_brief_contains_the_real_content_and_no_placeholder() -> None:
     assert "Le groupe agit depuis 2020 [1]." in brief
     assert "malicious.example.com" in brief
     assert "https://a.example/one" in brief
-    # The placeholders the scaffold used to emit.
     assert "mots)" not in brief
     assert "identifiées" not in brief
     assert "[S1]" not in brief and "[S2]" not in brief
