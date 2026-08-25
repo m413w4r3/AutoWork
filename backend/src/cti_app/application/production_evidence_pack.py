@@ -62,6 +62,9 @@ class ProductionEvidencePack:
     parser_versions: Mapping[str, str]
     error_code: str | None = None
     error_message: str | None = None
+    # Kept outside the model prompt/hash payload.  This is the original,
+    # persisted derived text used to prove a literal independently of Q2.
+    original_derived_texts: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def needs_review(self) -> bool:
@@ -101,10 +104,7 @@ def build_production_evidence_pack(
             or collection.origin_kind is SourceOriginKind.REFERENCED_EVIDENCE
         ):
             continue
-        if (
-            collection.source_document_id == item.document.id
-            and source_map.get(item.document.id)
-        ):
+        if collection.source_document_id == item.document.id and source_map.get(item.document.id):
             publications[item.document.id] = item
 
     publication_collection_ids = {item.collection.id for item in publications.values()}
@@ -185,7 +185,14 @@ def build_production_evidence_pack(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    return ProductionEvidencePack("ready", pack_hash, tuple(chunks), parser_versions)
+    original_derived_texts = {str(item.document.id): item.text for item in selected}
+    return ProductionEvidencePack(
+        "ready",
+        pack_hash,
+        tuple(chunks),
+        parser_versions,
+        original_derived_texts=original_derived_texts,
+    )
 
 
 def _archived(collection: SourceCollection) -> bool:

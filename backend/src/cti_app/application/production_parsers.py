@@ -111,6 +111,7 @@ class IndicatorStatus(StrEnum):
     CONFIRMED_IOC = "confirmed_ioc"
     CONTEXTUAL = "contextual"
     EXCLUDED = "excluded"
+    NOT_APPLICABLE = "not_applicable"
 
 
 class IndicatorProvenance(StrEnum):

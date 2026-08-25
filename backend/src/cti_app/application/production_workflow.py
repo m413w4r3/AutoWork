@@ -18,6 +18,10 @@ from cti_app.application.model_conversations import (
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_verification import (
+    Q2ProposalSubmission,
+    verify_q2_proposals,
+)
 from cti_app.application.production_context import build_subject_production_context
 from cti_app.application.production_evidence_pack import (
     ArchivedCorpusDocument,
@@ -35,7 +39,6 @@ from cti_app.application.production_ioc_candidates import (
 from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
     DisplayPolicy,
-    ExtractionItem,
     IndicatorStatus,
     ParsedEvent,
     ParseResult,
@@ -43,7 +46,6 @@ from cti_app.application.production_parsers import (
     ReferenceReport,
     TechnicalExtraction,
     parse_reference_report,
-    q2_chunk_to_extraction,
     reference_report_from_json,
     reference_report_to_json,
     technical_extraction_from_json,
@@ -789,7 +791,7 @@ class ProductionWorkflowOrchestrator:
                         "completed_chunk_ids": [],
                         "failed_chunk_ids": [],
                     }
-                parsed_items: list[ExtractionItem] = []
+                q2_submissions: list[Q2ProposalSubmission] = []
                 parsed_warnings: list[str] = []
                 raw_parts: list[str] = []
                 turn_id = None
@@ -817,16 +819,7 @@ class ProductionWorkflowOrchestrator:
                         model_output = cast(Q2ChunkOutput, execution.structured_output)
                         chunk_raw = execution.output_text or model_output.model_dump_json()
                         chunk_turn_id = None
-                        chunk_result = q2_chunk_to_extraction(
-                            model_output,
-                            chunk_text=chunk.text,
-                            source_ids=chunk.source_ids,
-                            source_document_id=str(chunk.source_document_id),
-                            chunk_id=chunk.chunk_id,
-                            model_run_id=(
-                                str(self._last_model_run_id) if self._last_model_run_id else None
-                            ),
-                        )
+                        chunk_result = model_output
                     except Exception as exc:
                         failed_chunk_ids.append(chunk.chunk_id)
                         chunk_failures[chunk.chunk_id] = str(exc)
@@ -842,21 +835,22 @@ class ProductionWorkflowOrchestrator:
                         ),
                         "turn_id": str(chunk_turn_id) if chunk_turn_id else None,
                     }
-                    if (
-                        chunk_result is None
-                        or not chunk_result.usable
-                        or chunk_result.value is None
-                    ):
+                    if chunk_result is None:
                         failed_chunk_ids.append(chunk.chunk_id)
-                        chunk_failures[chunk.chunk_id] = (
-                            "no response"
-                            if chunk_result is None
-                            else "; ".join(chunk_result.errors)
-                        )
+                        chunk_failures[chunk.chunk_id] = "no response"
                         continue
                     completed_chunk_ids.append(chunk.chunk_id)
-                    parsed_items.extend(chunk_result.value.items)
-                    parsed_warnings.extend(chunk_result.warnings)
+                    q2_submissions.append(
+                        Q2ProposalSubmission(
+                            output=chunk_result,
+                            source_document_id=str(chunk.source_document_id),
+                            chunk_id=chunk.chunk_id,
+                            source_ids=chunk.source_ids,
+                            model_run_id=(
+                                str(self._last_model_run_id) if self._last_model_run_id else None
+                            ),
+                        )
+                    )
                     raw_parts.append(chunk_raw)
                     turn_id = chunk_turn_id
                 if failed_chunk_ids:
@@ -881,9 +875,14 @@ class ProductionWorkflowOrchestrator:
                         "chunk_failures": chunk_failures,
                         "chunk_provenance": chunk_provenance,
                     }
+                verification = verify_q2_proposals(q2_submissions, evidence_pack)
                 parsed = ParseResult(
-                    value=TechnicalExtraction(tuple(self._merge_q2_items(parsed_items))),
-                    warnings=parsed_warnings,
+                    value=verification.canonical,
+                    warnings=[
+                        *parsed_warnings,
+                        *verification.warnings,
+                        *(f"q2_rejected:{item.reason_code}" for item in verification.rejected),
+                    ],
                 )
                 raw = "\n\n".join(raw_parts)
             except Exception as e:
@@ -943,6 +942,16 @@ class ProductionWorkflowOrchestrator:
                     "completed_chunk_ids": completed_chunk_ids,
                     "failed_chunk_ids": failed_chunk_ids,
                     "chunk_provenance": chunk_provenance,
+                    "q2_proposal_diagnostics": [
+                        {
+                            "status": item.status.value,
+                            "proposal_index": item.proposal_index,
+                            "source_document_id": item.source_document_id,
+                            "chunk_id": item.chunk_id,
+                            "reason_code": item.reason_code,
+                        }
+                        for item in verification.diagnostics
+                    ],
                     **q2_diagnostics,
                     "source_derived_candidates": candidate_pack.source_derived_candidates,
                     "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,
