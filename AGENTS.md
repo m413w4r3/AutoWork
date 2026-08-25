@@ -20,7 +20,7 @@ areas.
 
 Use the locator before broad repository exploration:
 
-    python3 scripts/ctx/ctx.py query "<task description>" -k 8
+    uv run scripts/ctx/ctx.py query "<task description>" -k 8
 
 Read the returned ranges first, adding only small surrounding context when
 needed.

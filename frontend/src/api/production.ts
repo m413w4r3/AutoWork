@@ -78,7 +78,37 @@ export interface ArtifactResponse {
   metadata: Record<string, unknown>;
   /** Publication Markdown is downloadable, not the BRIEF preview source. */
   rendered_content: string | null;
-  canonical_content: BriefDocumentV1 | Record<string, unknown> | null;
+  canonical_content:
+    BriefDocumentV1 | ExtractionDocumentV2 | Record<string, unknown> | null;
+}
+
+export interface ExtractionItemV2 {
+  id: string;
+  category: string;
+  value: string;
+  context: string;
+  artifact_type: string | null;
+  semantic_type: string;
+  indicator_status:
+    "confirmed_ioc" | "contextual" | "excluded" | "not_applicable";
+  provenance: string;
+  display_policy: "ioc_section" | "body_only" | "both" | "hidden";
+  normalized_value: string | null;
+  evidence_quote: string | null;
+  source_document_ids: string[];
+  chunk_ids: string[];
+  model_run_ids: string[];
+  attack_id: string | null;
+  reference_ids: string[];
+  source_ids: string[];
+  supported: boolean;
+}
+
+export interface ExtractionDocumentV2 {
+  schema_version: "2";
+  parser_version: string;
+  items: ExtractionItemV2[];
+  uncertainties: string[];
 }
 
 export type RichSpanKind =

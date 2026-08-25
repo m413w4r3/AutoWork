@@ -60,6 +60,15 @@ function stageArtifactHref(subjectId: string, stage: string): string {
 }
 
 function issueCopy(status: string, errorCode: string | null): string {
+  if (errorCode === "q2_chunk_coverage_failed") {
+    return "Couverture des segments incomplète — certains éléments n’ont pas été vérifiés.";
+  }
+  if (errorCode === "model_needs_review") {
+    return "Le modèle demande une revue avant poursuite.";
+  }
+  if (errorCode === "synthesis_validation_failed") {
+    return "Validation de synthèse échouée — consultez les détails de l’étape.";
+  }
   if (errorCode && CONVERSATION_ERROR_CODES.has(errorCode)) {
     return "Intervention requise — la conversation ChatGPT n’a pas pu être finalisée.";
   }
@@ -134,7 +143,7 @@ export function SubjectProduction({
         ) : null}
         <p>
           AutoWork collecte et analyse les sources, puis ChatGPT établit les
-          références, l’analyse technique, qualifie les indicateurs et rédige la
+          références, l’analyse technique, vérifie les indicateurs et rédige la
           synthèse.
         </p>
         {startMutation.error ? (
@@ -224,14 +233,10 @@ export function SubjectProduction({
           Voir la synthèse
         </a>
         {status.references_conversation_id ? (
-          <a href={`/subjects/${subjectId}#conversations`}>
-            Voir la recherche
-          </a>
+          <a href={`/subjects/${subjectId}#conversations`}>Voir la recherche</a>
         ) : null}
         {status.synthesis_conversation_id ? (
-          <a href={`/subjects/${subjectId}#conversations`}>
-            Voir la synthèse
-          </a>
+          <a href={`/subjects/${subjectId}#conversations`}>Voir la synthèse</a>
         ) : null}
         {status.status === "ready" ? (
           <a href={`/subjects/${subjectId}/production/artifacts/brief`}>
@@ -262,7 +267,8 @@ export function SubjectProduction({
           </p>
           <p>Code : {issueCode ?? "inconnu"}</p>
           {issueIsConversation &&
-          (status.references_conversation_id || status.synthesis_conversation_id) ? (
+          (status.references_conversation_id ||
+            status.synthesis_conversation_id) ? (
             <a href={`/subjects/${subjectId}#conversations`}>
               Voir la conversation
             </a>

@@ -1,7 +1,12 @@
 import { ApiError } from "./editions";
 
 export type ConversationPurpose =
-  "discovery" | "analyst_assistance" | "pivot_research" | "subject_research" | "drafting" | "critic";
+  | "discovery"
+  | "analyst_assistance"
+  | "pivot_research"
+  | "subject_research"
+  | "drafting"
+  | "critic";
 
 export interface ModelConversation {
   id: string;

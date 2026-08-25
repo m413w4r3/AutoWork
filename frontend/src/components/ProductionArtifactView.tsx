@@ -6,6 +6,8 @@ import {
   getBriefArtifact,
   type ArtifactResponse,
   type BriefDocumentV1,
+  type ExtractionDocumentV2,
+  type ExtractionItemV2,
   type RichSpan,
 } from "../api/production";
 
@@ -56,6 +58,17 @@ function isBriefDocument(value: unknown): value is BriefDocumentV1 {
   );
 }
 
+function isExtractionDocument(value: unknown): value is ExtractionDocumentV2 {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "schema_version" in value &&
+    value.schema_version === "2" &&
+    "items" in value &&
+    Array.isArray(value.items)
+  );
+}
+
 function RichText({ spans }: { spans: RichSpan[] }) {
   return spans.map((span, index) => {
     if (span.kind === "citation") {
@@ -85,6 +98,262 @@ const IOC_LABELS: Record<string, string> = {
   url: "URL",
   hash: "Fichiers",
 };
+
+const NETWORK_IOC_TYPES = new Set(["domain", "ip", "url", "email", "hash"]);
+const FILE_CVE_TYPES = new Set(["filename", "filepath", "cve"]);
+const RULE_TYPES = new Set(["yara_rule", "sigma_rule", "suricata_rule"]);
+
+const TYPE_LABELS: Record<string, string> = {
+  domain: "domaine",
+  ip: "adresse IP",
+  url: "URL",
+  email: "adresse e-mail",
+  hash: "hachage",
+  filename: "fichier",
+  filepath: "chemin de fichier",
+  cve: "CVE",
+  yara_rule: "règle YARA",
+  sigma_rule: "règle Sigma",
+  suricata_rule: "règle Suricata",
+};
+
+const ITEM_STATUS_LABELS: Record<string, string> = {
+  confirmed_ioc: "IOC confirmé",
+  contextual: "contextuel",
+  excluded: "exclu",
+  not_applicable: "hors périmètre",
+};
+
+interface GroupedExtractionItem extends ExtractionItemV2 {
+  evidence_quotes: string[];
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function groupExtractionItems(
+  items: ExtractionItemV2[],
+): GroupedExtractionItem[] {
+  const grouped = new Map<string, GroupedExtractionItem>();
+  for (const item of items.filter(
+    (entry) => entry.display_policy !== "hidden",
+  )) {
+    const identity = `${item.artifact_type ?? item.semantic_type}:${item.normalized_value ?? item.value.toLocaleLowerCase()}`;
+    const existing = grouped.get(identity);
+    if (!existing) {
+      grouped.set(identity, {
+        ...item,
+        evidence_quotes: item.evidence_quote ? [item.evidence_quote] : [],
+      });
+      continue;
+    }
+    const sameStatus = existing.indicator_status === item.indicator_status;
+    grouped.set(identity, {
+      ...existing,
+      indicator_status: sameStatus ? existing.indicator_status : "contextual",
+      source_document_ids: unique([
+        ...existing.source_document_ids,
+        ...item.source_document_ids,
+      ]),
+      chunk_ids: unique([...existing.chunk_ids, ...item.chunk_ids]),
+      source_ids: unique([...existing.source_ids, ...item.source_ids]),
+      reference_ids: unique([...existing.reference_ids, ...item.reference_ids]),
+      evidence_quotes: unique([
+        ...existing.evidence_quotes,
+        ...(item.evidence_quote ? [item.evidence_quote] : []),
+      ]),
+    });
+  }
+  return [...grouped.values()];
+}
+
+function itemType(item: ExtractionItemV2): string {
+  return item.artifact_type ?? item.semantic_type ?? item.category;
+}
+
+function EvidenceItem({ item }: { item: GroupedExtractionItem }) {
+  const type = itemType(item);
+  return (
+    <li className="extraction-item">
+      <code>{item.value}</code>
+      <dl>
+        <div>
+          <dt>Type</dt>
+          <dd>{TYPE_LABELS[type] ?? type}</dd>
+        </div>
+        <div>
+          <dt>Statut</dt>
+          <dd>
+            {ITEM_STATUS_LABELS[item.indicator_status] ?? item.indicator_status}
+          </dd>
+        </div>
+        <div>
+          <dt>S#</dt>
+          <dd>{item.source_ids.join(", ") || "—"}</dd>
+        </div>
+        <div>
+          <dt>Document</dt>
+          <dd>{item.source_document_ids.join(", ") || "—"}</dd>
+        </div>
+        <div>
+          <dt>Preuves</dt>
+          <dd>{item.evidence_quotes.length || item.chunk_ids.length}</dd>
+        </div>
+      </dl>
+      {item.evidence_quotes.map((quote) => (
+        <blockquote key={quote}>{quote}</blockquote>
+      ))}
+    </li>
+  );
+}
+
+function ExtractionSection({
+  title,
+  items,
+}: {
+  title: string;
+  items: GroupedExtractionItem[];
+}) {
+  if (items.length === 0) return null;
+  return (
+    <section className="extraction-section">
+      <h3>{title}</h3>
+      <ul className="extraction-items">
+        {items.map((item) => (
+          <EvidenceItem
+            key={`${itemType(item)}:${item.normalized_value ?? item.value}`}
+            item={item}
+          />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+interface RejectedProposal {
+  proposal_index: number;
+  proposal_kind: string;
+  artifact_type: string | null;
+  source_document_id: string;
+  chunk_id: string;
+  reason_code: string | null;
+}
+
+function rejectedProposals(
+  metadata: Record<string, unknown>,
+): RejectedProposal[] {
+  const verification = metadata.deterministic_verification;
+  if (typeof verification !== "object" || verification === null) return [];
+  const diagnostics = (verification as Record<string, unknown>)
+    .q2_proposal_diagnostics;
+  if (!Array.isArray(diagnostics)) return [];
+  return diagnostics.filter(
+    (entry): entry is RejectedProposal =>
+      typeof entry === "object" &&
+      entry !== null &&
+      (entry as Record<string, unknown>).status === "rejected" &&
+      typeof (entry as Record<string, unknown>).proposal_index === "number" &&
+      typeof (entry as Record<string, unknown>).proposal_kind === "string" &&
+      typeof (entry as Record<string, unknown>).source_document_id ===
+        "string" &&
+      typeof (entry as Record<string, unknown>).chunk_id === "string",
+  );
+}
+
+function ExtractionPreview({
+  document,
+  metadata,
+}: {
+  document: ExtractionDocumentV2;
+  metadata: Record<string, unknown>;
+}) {
+  const items = groupExtractionItems(document.items);
+  const confirmedIocs = items.filter(
+    (item) =>
+      item.indicator_status === "confirmed_ioc" &&
+      NETWORK_IOC_TYPES.has(item.artifact_type ?? ""),
+  );
+  const filesAndCves = items.filter((item) =>
+    FILE_CVE_TYPES.has(item.artifact_type ?? ""),
+  );
+  const rules = items.filter((item) =>
+    RULE_TYPES.has(item.artifact_type ?? ""),
+  );
+  const contextual = items.filter(
+    (item) =>
+      !confirmedIocs.includes(item) &&
+      !filesAndCves.includes(item) &&
+      !rules.includes(item),
+  );
+  const rejected = rejectedProposals(metadata);
+
+  return (
+    <article className="extraction-preview">
+      <ExtractionSection title="IOC confirmés" items={confirmedIocs} />
+      <ExtractionSection title="Éléments contextuels" items={contextual} />
+      <ExtractionSection title="Fichiers / CVE" items={filesAndCves} />
+      <ExtractionSection title="Règles de détection" items={rules} />
+      {document.uncertainties.length > 0 && (
+        <section className="extraction-section">
+          <h3>Points à vérifier</h3>
+          <ul>
+            {document.uncertainties.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+      {rejected.length > 0 && (
+        <details className="extraction-diagnostics">
+          <summary>
+            Diagnostic — {rejected.length} proposition(s) rejetée(s)
+          </summary>
+          <ul>
+            {rejected.map((proposal) => (
+              <li key={`${proposal.proposal_index}:${proposal.chunk_id}`}>
+                <strong>Proposition {proposal.proposal_index}</strong> — valeur
+                non conservée
+                <dl>
+                  <div>
+                    <dt>Type</dt>
+                    <dd>
+                      {TYPE_LABELS[proposal.artifact_type ?? ""] ??
+                        proposal.artifact_type ??
+                        proposal.proposal_kind}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Statut</dt>
+                    <dd>REJECTED</dd>
+                  </div>
+                  <div>
+                    <dt>S#</dt>
+                    <dd>—</dd>
+                  </div>
+                  <div>
+                    <dt>Document</dt>
+                    <dd>{proposal.source_document_id}</dd>
+                  </div>
+                  <div>
+                    <dt>Preuves</dt>
+                    <dd>1 segment ({proposal.chunk_id})</dd>
+                  </div>
+                  {proposal.reason_code && (
+                    <div>
+                      <dt>Motif</dt>
+                      <dd>{proposal.reason_code}</dd>
+                    </div>
+                  )}
+                </dl>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </article>
+  );
+}
 
 function BriefPreview({ document }: { document: BriefDocumentV1 }) {
   const visibleGroups = document.indicators.filter(
@@ -199,18 +468,28 @@ export function ProductionArtifactView({
         )}
       </div>
 
-      {artifact.metadata && Object.keys(artifact.metadata).length > 0 && (
-        <div className="artifact-metadata">
-          <details>
-            <summary>Métadonnées</summary>
-            <pre>{JSON.stringify(artifact.metadata, null, 2)}</pre>
-          </details>
-        </div>
-      )}
+      {stage !== "extraction" &&
+        artifact.metadata &&
+        Object.keys(artifact.metadata).length > 0 && (
+          <div className="artifact-metadata">
+            <details>
+              <summary>Métadonnées</summary>
+              <pre>{JSON.stringify(artifact.metadata, null, 2)}</pre>
+            </details>
+          </div>
+        )}
 
       {stage === "brief" && isBriefDocument(artifact.canonical_content) && (
         <BriefPreview document={artifact.canonical_content} />
       )}
+
+      {stage === "extraction" &&
+        isExtractionDocument(artifact.canonical_content) && (
+          <ExtractionPreview
+            document={artifact.canonical_content}
+            metadata={artifact.metadata}
+          />
+        )}
 
       {stage === "brief" && artifact.rendered_content && (
         <p>
@@ -224,22 +503,26 @@ export function ProductionArtifactView({
         </p>
       )}
 
-      {stage !== "brief" && artifact.rendered_content && (
-        <div className="artifact-content">
-          <div className="rendered-markdown">
-            <pre>{artifact.rendered_content}</pre>
+      {stage !== "brief" &&
+        stage !== "extraction" &&
+        artifact.rendered_content && (
+          <div className="artifact-content">
+            <div className="rendered-markdown">
+              <pre>{artifact.rendered_content}</pre>
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {stage !== "brief" && artifact.canonical_content && (
-        <div className="artifact-canonical">
-          <details>
-            <summary>Contenu canonique</summary>
-            <pre>{JSON.stringify(artifact.canonical_content, null, 2)}</pre>
-          </details>
-        </div>
-      )}
+      {stage !== "brief" &&
+        stage !== "extraction" &&
+        artifact.canonical_content && (
+          <div className="artifact-canonical">
+            <details>
+              <summary>Contenu canonique</summary>
+              <pre>{JSON.stringify(artifact.canonical_content, null, 2)}</pre>
+            </details>
+          </div>
+        )}
 
       {!artifact.rendered_content && !artifact.canonical_content && (
         <p>Aucun contenu à afficher.</p>
