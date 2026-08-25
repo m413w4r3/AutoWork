@@ -17,12 +17,6 @@ class BriefDraftStatus(StrEnum):
     PROMOTED = "promoted"
 
 
-class EvidencePackScope(StrEnum):
-    """Scope of evidence in a pack: full subject history or delta updates."""
-    FULL = "full"
-    DELTA = "delta"
-
-
 @dataclass(frozen=True, slots=True)
 class BriefEvidencePack:
     subject_id: UUID
@@ -38,14 +32,6 @@ class BriefEvidencePack:
     uncertainties: tuple[dict[str, Any], ...]
     human_decisions: tuple[dict[str, Any], ...]
     blob_id: UUID
-    # Incrément 3: préservation éditoriale. Optionnels, comme les colonnes que
-    # la migration 0021 a ajoutées : les packs gelés avant cet incrément n'ont
-    # pas de snapshot d'origine, et le gel courant ne le renseigne pas encore.
-    built_from_snapshot_id: UUID | None = None
-    built_from_snapshot_version: int | None = None
-    covered_contribution_ids: tuple[UUID, ...] = ()
-    scope: EvidencePackScope = EvidencePackScope.FULL
-    base_pack_id: UUID | None = None
     id: UUID = field(default_factory=uuid4)
     created_by: str = "system"
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -53,20 +39,12 @@ class BriefEvidencePack:
     def __post_init__(self) -> None:
         if self.version < 1:
             raise ValueError("Evidence pack version must be positive")
-        if (self.built_from_snapshot_id is None) != (self.built_from_snapshot_version is None):
-            raise ValueError("A snapshot origin needs both its id and its version")
-        if self.built_from_snapshot_version is not None and self.built_from_snapshot_version < 1:
-            raise ValueError("Snapshot version must be positive")
         if not re.fullmatch(r"[0-9a-f]{64}", self.content_hash):
             raise ValueError("Evidence pack hash must be a lowercase SHA-256")
         if not self.created_by.strip():
             raise ValueError("Evidence pack creator is required")
         if any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in self.object_hashes):
             raise ValueError("Every evidence object must have a SHA-256")
-        if self.scope == EvidencePackScope.DELTA and self.base_pack_id is None:
-            raise ValueError("A DELTA pack must reference its base pack")
-        if self.scope == EvidencePackScope.FULL and self.base_pack_id is not None:
-            raise ValueError("A FULL pack must not reference a base pack")
 
 
 @dataclass(frozen=True, slots=True)

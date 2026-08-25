@@ -74,9 +74,6 @@ class EditorialGroupRow(Base):
     needs_source_expansion: Mapped[bool] = mapped_column(Boolean, nullable=False)
     grouping_confidence: Mapped[str] = mapped_column(String(32), nullable=False)
     grouping_justification: Mapped[str] = mapped_column(Text, nullable=False)
-    potential_historical_group_id: Mapped[UUID | None] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("editorial_groups.id", ondelete="RESTRICT")
-    )
     editorial_type: Mapped[str | None] = mapped_column(String(32))
     subject_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT")

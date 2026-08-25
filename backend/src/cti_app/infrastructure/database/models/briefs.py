@@ -56,29 +56,6 @@ class BriefEvidencePackRow(Base):
     )
     created_by: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    built_from_snapshot_id: Mapped[UUID | None] = mapped_column(
-        Uuid(as_uuid=True),
-        ForeignKey(
-            "discovery_snapshots.id",
-            name="fk_brief_evidence_packs_snapshot",
-            ondelete="RESTRICT",
-        ),
-        nullable=True,
-    )
-    built_from_snapshot_version: Mapped[int | None] = mapped_column(nullable=True)
-    covered_contribution_ids: Mapped[list[str]] = mapped_column(
-        JSONB, nullable=False, default=list
-    )
-    scope: Mapped[str] = mapped_column(String(10), nullable=False, default="full")
-    base_pack_id: Mapped[UUID | None] = mapped_column(
-        Uuid(as_uuid=True),
-        ForeignKey(
-            "brief_evidence_packs.id",
-            name="fk_brief_evidence_packs_base",
-            ondelete="RESTRICT",
-        ),
-        nullable=True,
-    )
 
 
 class BriefDraftRow(Base):

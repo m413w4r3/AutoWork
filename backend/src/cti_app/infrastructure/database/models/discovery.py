@@ -150,7 +150,6 @@ class DiscoverySubjectIdentityRow(Base):
         Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
     )
     origin_key: Mapped[str] = mapped_column(Text, nullable=False)
-    cross_edition_lineage_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     created_by_merge_run_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("discovery_merge_runs.id", ondelete="RESTRICT"),
@@ -166,16 +165,16 @@ class DiscoverySubjectIdentityRow(Base):
 class DiscoverySnapshotRow(Base):
     __tablename__ = "discovery_snapshots"
     __table_args__ = (
-        UniqueConstraint("edition_id", "lineage", "version", name="uq_discovery_snapshots_version"),
-        UniqueConstraint("intake_id", "lineage", name="uq_discovery_snapshots_intake"),
+        UniqueConstraint("edition_id", "version", name="uq_discovery_snapshots_version"),
+        UniqueConstraint("intake_id", name="uq_discovery_snapshots_intake"),
         UniqueConstraint("merge_run_id", name="uq_discovery_snapshots_merge_run"),
         CheckConstraint("version > 0", name="ck_discovery_snapshots_version"),
-        Index("ix_discovery_snapshots_edition", "edition_id", "lineage", "version"),
+        Index("ix_discovery_snapshots_edition", "edition_id", "version"),
         Index(
             "uq_discovery_snapshots_active_operational",
             "edition_id",
             unique=True,
-            postgresql_where=text("is_active AND lineage = 'operational'"),
+            postgresql_where=text("is_active"),
         ),
     )
 
@@ -196,8 +195,6 @@ class DiscoverySnapshotRow(Base):
         nullable=False,
     )
     planner_kind: Mapped[str] = mapped_column(String(32), nullable=False)
-    lineage: Mapped[str] = mapped_column(String(16), nullable=False)
-    replay_run_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     subjects: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False)

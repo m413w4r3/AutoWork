@@ -15,7 +15,6 @@ from cti_app.domain.discovery_cumulative import (
     DiscoveryMergeRun,
     DiscoveryPlannerKind,
     DiscoverySnapshot,
-    DiscoverySnapshotLineage,
     DiscoverySubject,
     DiscoverySubjectIdentity,
     MergeValidationStatus,
@@ -272,10 +271,7 @@ class SqlAlchemyDiscoverySnapshotRepository:
 
     async def get_for_intake(self, intake_id: UUID) -> DiscoverySnapshot | None:
         row = await self._session.scalar(
-            select(DiscoverySnapshotRow).where(
-                DiscoverySnapshotRow.intake_id == intake_id,
-                DiscoverySnapshotRow.lineage == DiscoverySnapshotLineage.OPERATIONAL.value,
-            )
+            select(DiscoverySnapshotRow).where(DiscoverySnapshotRow.intake_id == intake_id)
         )
         return _discovery_snapshot_from_row(row) if row else None
 
@@ -283,7 +279,6 @@ class SqlAlchemyDiscoverySnapshotRepository:
         row = await self._session.scalar(
             select(DiscoverySnapshotRow).where(
                 DiscoverySnapshotRow.edition_id == edition_id,
-                DiscoverySnapshotRow.lineage == DiscoverySnapshotLineage.OPERATIONAL.value,
                 DiscoverySnapshotRow.is_active.is_(True),
             )
         )
@@ -300,7 +295,6 @@ class SqlAlchemyDiscoverySnapshotRepository:
             select(DiscoverySnapshotRow)
             .where(
                 DiscoverySnapshotRow.edition_id == edition_id,
-                DiscoverySnapshotRow.lineage == DiscoverySnapshotLineage.OPERATIONAL.value,
                 DiscoverySnapshotRow.is_active.is_(True),
             )
             .with_for_update()
@@ -435,7 +429,6 @@ def _discovery_identity_values(identity: DiscoverySubjectIdentity) -> dict[str, 
         "id": identity.id,
         "edition_id": identity.edition_id,
         "origin_key": identity.origin_key,
-        "cross_edition_lineage_id": identity.cross_edition_lineage_id,
         "created_by_merge_run_id": identity.created_by_merge_run_id,
         "status": identity.status.value,
         "merged_into_id": identity.merged_into_id,
@@ -450,7 +443,6 @@ def _discovery_identity_from_row(
         id=row.id,
         edition_id=row.edition_id,
         origin_key=row.origin_key,
-        cross_edition_lineage_id=row.cross_edition_lineage_id,
         created_by_merge_run_id=row.created_by_merge_run_id,
         status=DiscoveryIdentityStatus(row.status),
         merged_into_id=row.merged_into_id,
@@ -467,8 +459,6 @@ def _discovery_snapshot_values(snapshot: DiscoverySnapshot) -> dict[str, object]
         "intake_id": snapshot.intake_id,
         "merge_run_id": snapshot.merge_run_id,
         "planner_kind": snapshot.planner_kind.value,
-        "lineage": snapshot.lineage.value,
-        "replay_run_id": snapshot.replay_run_id,
         "subjects": [
             {
                 "subject_id": str(subject.subject_id),
@@ -496,8 +486,6 @@ def _discovery_snapshot_from_row(row: DiscoverySnapshotRow) -> DiscoverySnapshot
         intake_id=row.intake_id,
         merge_run_id=row.merge_run_id,
         planner_kind=DiscoveryPlannerKind(row.planner_kind),
-        lineage=DiscoverySnapshotLineage(row.lineage),
-        replay_run_id=row.replay_run_id,
         subjects=tuple(
             DiscoverySubject(
                 subject_id=UUID(value["subject_id"]),

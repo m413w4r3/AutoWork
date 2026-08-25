@@ -53,13 +53,6 @@ class HumanDecisionType(StrEnum):
     BRIEF_PROMOTE = "brief_promote"
 
 
-# Incrément 3: Préservation éditoriale
-class EditorialUpdateDecisionAction(StrEnum):
-    """Action on an editorial artifact regarding new contributions."""
-    DISMISS = "dismiss"
-    RESTORE = "restore"
-
-
 @dataclass(frozen=True, slots=True)
 class CandidateReference:
     batch_id: UUID
@@ -115,7 +108,6 @@ class EditorialGroup:
     grouping_confidence: GroupingConfidence
     grouping_justification: str
     id: UUID = field(default_factory=uuid4)
-    potential_historical_group_id: UUID | None = None
     status: EditorialGroupStatus = EditorialGroupStatus.PROPOSED
     editorial_type: EditorialType | None = None
     subject_id: UUID | None = None
@@ -205,25 +197,3 @@ class HumanDecision:
     def __post_init__(self) -> None:
         if not self.group_ids or not self.actor_id.strip() or not self.correlation_id.strip():
             raise ValueError("Human decision requires groups, actor and correlation")
-
-
-@dataclass(frozen=True, slots=True)
-class EditorialUpdateDecision:
-    """Log entry for dismissing or restoring UPDATE_AVAILABLE signal (Incrément 3).
-
-    Append-only log: never modified or deleted. State is computed by folding the log
-    by (artifact_id, contribution_id), last decision wins.
-    """
-    edition_id: UUID
-    artifact_id: UUID
-    action: EditorialUpdateDecisionAction
-    contribution_ids: tuple[UUID, ...]
-    actor_id: str
-    reason: str
-    supersedes_decision_id: UUID | None = None
-    id: UUID = field(default_factory=uuid4)
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-
-    def __post_init__(self) -> None:
-        if not self.contribution_ids or not self.actor_id.strip() or not self.reason.strip():
-            raise ValueError("Update decision requires contributions, actor and reason")

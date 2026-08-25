@@ -10,7 +10,6 @@ from cti_app.domain.briefs import (
     BriefDraftStatus,
     BriefEvidencePack,
     BriefSentence,
-    EvidencePackScope,
 )
 from cti_app.infrastructure.database.models.briefs import (
     BriefDraftRow,
@@ -105,11 +104,6 @@ def _brief_pack_values(pack: BriefEvidencePack) -> dict[str, object]:
         "blob_id": pack.blob_id,
         "created_by": pack.created_by,
         "created_at": pack.created_at,
-        "built_from_snapshot_id": pack.built_from_snapshot_id,
-        "built_from_snapshot_version": pack.built_from_snapshot_version,
-        "covered_contribution_ids": [str(value) for value in pack.covered_contribution_ids],
-        "scope": pack.scope.value,
-        "base_pack_id": pack.base_pack_id,
     }
 
 
@@ -131,11 +125,6 @@ def _brief_pack_from_row(row: BriefEvidencePackRow) -> BriefEvidencePack:
         blob_id=row.blob_id,
         created_by=row.created_by,
         created_at=row.created_at,
-        built_from_snapshot_id=row.built_from_snapshot_id,
-        built_from_snapshot_version=row.built_from_snapshot_version,
-        covered_contribution_ids=tuple(UUID(value) for value in row.covered_contribution_ids or ()),
-        scope=EvidencePackScope(row.scope or "full"),
-        base_pack_id=row.base_pack_id,
     )
 
 

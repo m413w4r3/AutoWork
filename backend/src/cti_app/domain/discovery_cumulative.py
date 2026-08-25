@@ -31,11 +31,6 @@ class DiscoveryPlannerKind(StrEnum):
     HUMAN = "human"
 
 
-class DiscoverySnapshotLineage(StrEnum):
-    OPERATIONAL = "operational"
-    REPLAY = "replay"
-
-
 class MergeValidationStatus(StrEnum):
     VALID = "valid"
     REPAIRED = "repaired"
@@ -90,7 +85,6 @@ class DiscoverySubjectIdentity:
     origin_key: str
     created_by_merge_run_id: UUID
     id: UUID
-    cross_edition_lineage_id: UUID | None = None
     status: DiscoveryIdentityStatus = DiscoveryIdentityStatus.ACTIVE
     merged_into_id: UUID | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -176,8 +170,6 @@ class DiscoverySnapshot:
     planner_kind: DiscoveryPlannerKind
     subjects: tuple[DiscoverySubject, ...]
     snapshot_hash: str
-    lineage: DiscoverySnapshotLineage = DiscoverySnapshotLineage.OPERATIONAL
-    replay_run_id: UUID | None = None
     is_active: bool = False
     id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))

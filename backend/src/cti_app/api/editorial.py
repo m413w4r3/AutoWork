@@ -314,11 +314,6 @@ def _board_view(board: EditorialBoard) -> EditorialBoardView:
 
 
 def _group_view(group: EditorialGroup, board: EditorialBoard) -> EditorialGroupView:
-    historical = (
-        board.historical_groups.get(group.potential_historical_group_id)
-        if group.potential_historical_group_id
-        else None
-    )
     candidates = [
         candidate
         for reference in group.candidate_references
@@ -449,16 +444,7 @@ def _group_view(group: EditorialGroup, board: EditorialBoard) -> EditorialGroupV
         needs_source_expansion=group.needs_source_expansion,
         grouping_confidence=group.grouping_confidence,
         grouping_justification=group.grouping_justification,
-        historical_comparison=(
-            HistoricalComparisonView(
-                group_id=historical.id,
-                title=historical.title,
-                editorial_type=historical.editorial_type,
-                subject_id=historical.subject_id,
-            )
-            if historical
-            else None
-        ),
+        historical_comparison=None,
         version=group.version,
     )
 

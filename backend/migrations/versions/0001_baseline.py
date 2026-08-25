@@ -814,7 +814,6 @@ def _create_discovery_subject_identities() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("edition_id", sa.Uuid(), nullable=False),
         sa.Column("origin_key", sa.Text(), nullable=False),
-        sa.Column("cross_edition_lineage_id", sa.Uuid(), nullable=True),
         sa.Column("created_by_merge_run_id", sa.Uuid(), nullable=False),
         sa.Column("status", sa.String(length=16), nullable=False),
         sa.Column("merged_into_id", sa.Uuid(), nullable=True),
@@ -852,8 +851,6 @@ def _create_discovery_snapshots() -> None:
         sa.Column("intake_id", sa.Uuid(), nullable=False),
         sa.Column("merge_run_id", sa.Uuid(), nullable=False),
         sa.Column("planner_kind", sa.String(length=32), nullable=False),
-        sa.Column("lineage", sa.String(length=16), nullable=False),
-        sa.Column("replay_run_id", sa.Uuid(), nullable=True),
         sa.Column("subjects", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("snapshot_hash", sa.String(length=64), nullable=False),
         sa.Column("is_active", sa.Boolean(), nullable=False),
@@ -866,23 +863,21 @@ def _create_discovery_snapshots() -> None:
         sa.ForeignKeyConstraint(["intake_id"], ["discovery_intakes.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["merge_run_id"], ["discovery_merge_runs.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "edition_id", "lineage", "version", name="uq_discovery_snapshots_version"
-        ),
-        sa.UniqueConstraint("intake_id", "lineage", name="uq_discovery_snapshots_intake"),
+        sa.UniqueConstraint("edition_id", "version", name="uq_discovery_snapshots_version"),
+        sa.UniqueConstraint("intake_id", name="uq_discovery_snapshots_intake"),
         sa.UniqueConstraint("merge_run_id", name="uq_discovery_snapshots_merge_run"),
     )
     op.create_index(
         "ix_discovery_snapshots_edition",
         "discovery_snapshots",
-        ["edition_id", "lineage", "version"],
+        ["edition_id", "version"],
     )
     op.create_index(
         "uq_discovery_snapshots_active_operational",
         "discovery_snapshots",
         ["edition_id"],
         unique=True,
-        postgresql_where=sa.text("is_active AND lineage = 'operational'"),
+        postgresql_where=sa.text("is_active"),
     )
 
 
@@ -899,7 +894,6 @@ def _create_editorial_groups() -> None:
         sa.Column("needs_source_expansion", sa.Boolean(), nullable=False),
         sa.Column("grouping_confidence", sa.String(length=32), nullable=False),
         sa.Column("grouping_justification", sa.Text(), nullable=False),
-        sa.Column("potential_historical_group_id", sa.Uuid(), nullable=True),
         sa.Column("editorial_type", sa.String(length=32), nullable=True),
         sa.Column("subject_id", sa.Uuid(), nullable=True),
         sa.Column("payload", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
@@ -931,11 +925,6 @@ def _create_editorial_groups() -> None:
         sa.CheckConstraint("version > 0", name="ck_editorial_groups_version"),
         sa.CheckConstraint("jsonb_typeof(payload) = 'object'", name="ck_editorial_payload_object"),
         sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["potential_historical_group_id"],
-            ["editorial_groups.id"],
-            ondelete="RESTRICT",
-        ),
         sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
             ["discovery_subject_id"],
@@ -1464,18 +1453,6 @@ def _create_brief_evidence_packs() -> None:
         sa.Column("blob_id", sa.Uuid(), nullable=False),
         sa.Column("created_by", sa.String(255), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("built_from_snapshot_id", sa.Uuid(), nullable=True),
-        sa.Column("built_from_snapshot_version", sa.Integer(), nullable=True),
-        sa.Column(
-            "covered_contribution_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False
-        ),
-        sa.Column(
-            "scope",
-            sa.String(length=10),
-            nullable=False,
-            server_default=sa.text("'full'::character varying"),
-        ),
-        sa.Column("base_pack_id", sa.Uuid(), nullable=True),
         sa.CheckConstraint("version > 0", name="ck_brief_evidence_packs_version"),
         sa.CheckConstraint(
             "char_length(content_hash) = 64 AND content_hash ~ '^[0-9a-f]{64}$'",
@@ -1485,18 +1462,6 @@ def _create_brief_evidence_packs() -> None:
         sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["group_id"], ["editorial_groups.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["blob_id"], ["blobs.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(
-            ["built_from_snapshot_id"],
-            ["discovery_snapshots.id"],
-            name="fk_brief_evidence_packs_snapshot",
-            ondelete="RESTRICT",
-        ),
-        sa.ForeignKeyConstraint(
-            ["base_pack_id"],
-            ["brief_evidence_packs.id"],
-            name="fk_brief_evidence_packs_base",
-            ondelete="RESTRICT",
-        ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("subject_id", "version", name="uq_brief_evidence_packs_version"),
         sa.UniqueConstraint(

@@ -81,11 +81,6 @@ class SqlAlchemyEditionRepository:
 
     async def delete(self, edition_id: UUID, expected_version: int) -> bool:
         """Delete the edition aggregate in dependency order in one transaction."""
-        group_ids = list(
-            await self._session.scalars(
-                select(EditorialGroupRow.id).where(EditorialGroupRow.edition_id == edition_id)
-            )
-        )
         batch_rows = list(
             (
                 await self._session.execute(
@@ -215,12 +210,6 @@ class SqlAlchemyEditionRepository:
         await self._session.execute(
             delete(HumanDecisionRow).where(HumanDecisionRow.edition_id == edition_id)
         )
-        if group_ids:
-            await self._session.execute(
-                update(EditorialGroupRow)
-                .where(EditorialGroupRow.potential_historical_group_id.in_(group_ids))
-                .values(potential_historical_group_id=None)
-            )
         await self._session.execute(
             delete(EditorialGroupRow).where(EditorialGroupRow.edition_id == edition_id)
         )
