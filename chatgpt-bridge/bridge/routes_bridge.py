@@ -1,11 +1,6 @@
-"""Routes natives du bridge : runs idempotents, recovery, UI, capabilities, métriques.
+"""Routes natives du bridge: runs idempotents, recovery, UI, capabilities, métriques.
 
-Extrait de server.py (R59b). Aucun changement de placement de verrou, de
-sémantique d'idempotence, ou d'état admissible pour la recovery visible : ce
-module ne fait que déplacer les sept endpoints existants (et leurs trois
-helpers privés) sous un propriétaire explicite, `BridgeRoutes`.
-`idempotent_tasks` / `bridge_metrics` deviennent état d'instance au lieu de
-globals module.
+Encapsule les endpoints natifs du bridge sous un propriétaire explicite.
 """
 
 import asyncio

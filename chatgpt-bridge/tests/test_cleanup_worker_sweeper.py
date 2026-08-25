@@ -30,8 +30,8 @@ pytestmark = pytest.mark.asyncio
 class _ScriptedBridge:
     """Fake bridge whose .request() answers are scripted call-by-call.
 
-    Used where we must NOT mock CleanupWorker itself (R54c critical test 1):
-    the worker's real control flow runs, only the network edge is faked.
+    Used where we must NOT mock CleanupWorker itself: the worker's real control
+    flow runs, only the network edge is faked.
     """
 
     def __init__(self, responses: list[dict]):
@@ -391,18 +391,14 @@ class TestCleanupIntegration:
             assert mock_worker.process_cleanup_task.call_count == 2
 
 
-class TestR54cTransientRetry:
-    """R54c: transient CLEANUP_FAILED must be really retryable, terminal
-    identity failures (locator_mismatch/locator_invalid) never must be —
-    through no code path (worker direct, sweeper, HTTP endpoint)."""
+class TestTransientRetry:
+    """Transient CLEANUP_FAILED must be really retryable; terminal identity
+    failures (locator_mismatch/locator_invalid) never must be — through no code
+    path (worker direct, sweeper, HTTP endpoint)."""
 
     @pytest.mark.asyncio
     async def test_real_retry_of_transient_cleanup_failure_reaches_deleted(self, registry):
-        """Critical test 1: real retry, no CleanupWorker mocking.
-
-        This must fail on the pre-fix code (process_cleanup_task rejects
-        CLEANUP_FAILED outright) and pass after the fix.
-        """
+        """Verify transient failures are retried without CleanupWorker mocking."""
         conv_id = str(uuid4())
         registry.create_conversation(conv_id, "https://chatgpt.com/c/transient", "delete_on_success")
         registry.release_conversation(conv_id, "success")

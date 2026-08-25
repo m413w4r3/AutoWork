@@ -1,10 +1,6 @@
-"""Routes OpenAI : responses, chat completions, models.
+"""Routes OpenAI: responses, chat completions, models.
 
-Extrait de server.py (R59a). Aucun changement d'API, de placement de verrou ou
-de sémantique background : ce module ne fait que déplacer les quatre endpoints
-existants (et leurs deux helpers privés) sous un propriétaire explicite,
-`OpenAIRoutes`. `background_responses` / `background_tasks` deviennent état
-d'instance au lieu de globals module.
+Encapsule les endpoints OpenAI sous un propriétaire explicite.
 """
 
 import asyncio

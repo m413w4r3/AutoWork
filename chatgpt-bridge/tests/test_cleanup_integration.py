@@ -180,7 +180,7 @@ class TestCleanupComponentsIntegration:
 
     def test_server_py_is_a_thin_launcher(self):
         """server.py exposes only `app`/`bridge_application`; the composition
-        root lives in `bridge.app.BridgeApplication` (R60)."""
+        root lives in `bridge.app.BridgeApplication`."""
         import server
 
         assert server.app is server.bridge_application.app

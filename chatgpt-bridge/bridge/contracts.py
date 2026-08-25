@@ -1,4 +1,4 @@
-"""Modèles/types de contrat du bridge (MOVE-ONLY depuis server.py)."""
+"""Modèles et types de contrat du bridge."""
 
 import uuid
 from typing import Any, Dict, List, Optional

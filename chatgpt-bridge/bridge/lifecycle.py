@@ -1,4 +1,4 @@
-"""Lifecycle de cleanup : CleanupWorker, ConversationSweeper (MOVE-ONLY depuis server.py)."""
+"""Cleanup lifecycle: CleanupWorker, ConversationSweeper."""
 
 import asyncio
 import logging

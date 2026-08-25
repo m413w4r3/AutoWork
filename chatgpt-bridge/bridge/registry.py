@@ -1,4 +1,4 @@
-"""RunRegistry : journal SQLite du bridge (MOVE-ONLY depuis server.py)."""
+"""RunRegistry: SQLite journal for the bridge."""
 
 import json
 import logging

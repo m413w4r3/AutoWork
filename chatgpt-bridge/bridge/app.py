@@ -1,10 +1,6 @@
 """Composition root FastAPI du bridge.
 
-Extrait de server.py (R60). Aucun changement de logique métier, de
-génération, de lifecycle ou de route : ce module ne fait que déplacer la
-construction de l'application FastAPI et son état serveur sous un
-propriétaire explicite, `BridgeApplication`. `server.py` devient un simple
-launcher exécutable.
+Propriétaire unique de l'application FastAPI et de son état serveur.
 """
 
 import asyncio

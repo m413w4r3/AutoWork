@@ -1,4 +1,4 @@
-"""Paramètres environnementaux du bridge (MOVE-ONLY depuis server.py)."""
+"""Paramètres environnementaux du bridge."""
 
 import os
 from pathlib import Path

@@ -164,12 +164,6 @@ class TestReplayEditionWorkflow:
         # But brief still points to V1 pack/snapshot
         assert published_brief.pack_id == pack_id  # Unchanged
 
-        # In real implementation, would verify:
-        # - Brief.snapshot_id still points to V1
-        # - Brief.evidence_pack_id still points to V1 pack
-        # - UI queries resolve subject_id through current identity
-        # - Historical lineage preserved
-
     def test_replay_comparison_report(self) -> None:
         """Generate comparison report for replay vs operational."""
         # Create mappings representing different outcomes

@@ -1,4 +1,4 @@
-"""Parsing des entrées, génération finale et formatage Responses (MOVE-ONLY depuis server.py)."""
+"""Parsing des entrées, génération finale et formatage Responses."""
 
 import asyncio
 import base64

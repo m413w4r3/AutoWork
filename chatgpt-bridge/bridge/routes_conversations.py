@@ -1,8 +1,6 @@
-"""Routes conversation : archive UI, release, lifecycle, cleanup start/complete/fail.
+"""Routes conversation: archive UI, release, lifecycle, cleanup start/complete/fail.
 
-Extrait de server.py (R58). Aucun changement d'API, de lifecycle ou de policy
-destructive : ce module ne fait que déplacer les six endpoints existants sous
-un propriétaire explicite, `ConversationRoutes`.
+Encapsule les endpoints conversation sous un propriétaire explicite.
 """
 
 import uuid

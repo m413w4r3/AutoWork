@@ -27,7 +27,7 @@ def load_bridge() -> dict[str, Any]:
 
 
 def _runtime(module: dict[str, Any]) -> Any:
-    """The `BridgeApplication` composition root `server.py` wires up (R60).
+    """The `BridgeApplication` composition root `server.py` wires up.
 
     `server.py` is now a thin launcher: the single owner of `bridge`,
     `registry`, and the three route families is `bridge_application`, not a
@@ -198,7 +198,7 @@ def isolated_registry(module: dict[str, Any], tmp_path: Path) -> None:
     # same technique `_bridge_globals`/`_openai_globals` already rely on.
     registry = _bridge_globals(module)["RunRegistry"](tmp_path / "runs.sqlite3")
     # `create_bridge_run`/`retrieve_bridge_run` no longer read a `run_registry`
-    # global (R59b: they read `self.registry`, bound once at construction) — every
+    # global (they read `self.registry`, bound once at construction) — every
     # real owner of a registry reference needs patching directly. `runtime.registry`
     # is the default one `BridgeApplication` constructs; it isn't read by the
     # routes themselves, but later test code still reads it for direct
@@ -982,7 +982,7 @@ async def test_ui_probe_timeout_is_typed(monkeypatch: pytest.MonkeyPatch) -> Non
 
     runtime.bridge.ws = Silent()
     # `bridge.routes_bridge` is import-cached across `load_bridge()` calls (like
-    # `bridge.routes_openai`, see R59a): a bare assignment here would leak
+    # `bridge.routes_openai`): a bare assignment here would leak
     # UI_TIMEOUT=0.01 into every later test in this process.
     monkeypatch.setitem(
         runtime.bridge_routes.bridge_capabilities.__globals__, "UI_TIMEOUT", 0.01

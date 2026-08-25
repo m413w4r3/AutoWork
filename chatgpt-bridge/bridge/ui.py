@@ -1,4 +1,4 @@
-"""Lecture/pilotage de l'interface ChatGPT (MOVE-ONLY depuis server.py)."""
+"""Lecture et pilotage de l'interface ChatGPT."""
 
 import asyncio
 import time
