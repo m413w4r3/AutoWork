@@ -1,5 +1,5 @@
 """
-Tests for RunRegistry's fresh-schema-only initialization (R51).
+Tests for RunRegistry's fresh-schema-only initialization.
 
 RunRegistry no longer carries historical SQLite migration shims: a new,
 empty database path must produce the final canonical schema directly, with

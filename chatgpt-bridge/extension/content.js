@@ -1396,7 +1396,7 @@ async function captureLaterResponse(msg) {
 }
 
 // --------------------------------------------------------------------------- //
-// Suppression automatique de conversation (Cleanup UI Automation — Incrément 3)
+// Conversation cleanup
 // --------------------------------------------------------------------------- //
 
 /**

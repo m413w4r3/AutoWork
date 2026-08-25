@@ -95,7 +95,7 @@ class BridgeApplication:
         self.app.add_exception_handler(HTTPException, self.openai_error)
 
     # ----------------------------------------------------------------- #
-    # Cleanup Automation — Incrément 3
+    # Conversation cleanup
     # ----------------------------------------------------------------- #
 
     async def keepalive_loop(self) -> None:

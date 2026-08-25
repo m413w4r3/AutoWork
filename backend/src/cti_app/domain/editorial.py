@@ -126,7 +126,8 @@ class EditorialGroup:
             self.needs_source_verification = True
 
     def add_candidates(self, references: tuple[CandidateReference, ...]) -> None:
-        # Allow enrichment of both PROPOSED and SELECTED groups (P2: enrichment of selected groups)
+        # SELECTED groups can still gain candidates: selection fixes the group's
+        # identity, not its final membership, which editors continue to refine.
         if self.status not in (EditorialGroupStatus.PROPOSED, EditorialGroupStatus.SELECTED):
             raise ValueError("Only proposed or selected groups can be enriched")
         self.candidate_references = tuple(dict.fromkeys((*self.candidate_references, *references)))

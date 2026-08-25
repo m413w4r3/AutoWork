@@ -44,12 +44,6 @@ class ChatCompletionsTransport(Protocol):
     async def create(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
-async def _create_with_idempotency(
-    transport: ResponsesTransport, payload: dict[str, Any], key: str | None
-) -> dict[str, Any]:
-    return await transport.create(payload, idempotency_key=key)
-
-
 class HttpResponsesTransport:
     def __init__(
         self,
@@ -415,7 +409,7 @@ class OpenAIResearchAdapter:
             payload["include"] = ["web_search_call.action.sources"]
         payload.update(_allowed_parameters(request.parameters, _RESPONSES_PARAMETERS))
         return _responses_result(
-            await _create_with_idempotency(self._transport, payload, request.request_id),
+            await self._transport.create(payload, idempotency_key=request.request_id),
             self.provider,
         )
 
@@ -471,7 +465,7 @@ class OpenAIStructuredAdapter:
             payload["bridge_ui_model"] = request.conversation.requested_model
         payload.update(_allowed_parameters(request.parameters, _RESPONSES_PARAMETERS))
         return _responses_result(
-            await _create_with_idempotency(self._transport, payload, request.request_id),
+            await self._transport.create(payload, idempotency_key=request.request_id),
             self.provider,
             output_schema=(
                 None if request.metadata.get("defer_validation") is True else output_schema

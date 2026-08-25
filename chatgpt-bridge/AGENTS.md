@@ -5,17 +5,15 @@ The persistent SQLite registry lives on the `bridge_data` volume and survives
 
 ## Ownership map
 
-Architecture final. Each change must read directly its owner — never start with
-`server.py` to modify generation, registry, lifecycle, or UI.
-
-### server.py
-- **launcher only**: instantiates `BridgeApplication`, starts it.
+Architecture final. Each change must read directly its owner below — never
+`server.py`, which is only a launcher. No module in `bridge/` imports
+`server.py`; no giant reexport in `bridge/__init__.py`; semantic imports
+directly only.
 
 ### bridge/app.py
-- **BridgeApplication**: composition root, FastAPI setup, lifespan, shutdown, WebSocket endpoint, health/readiness.
-- Injects `bridge`, `registry` into all route classes.
-- Manages `CleanupWorker`, `ConversationSweeper`.
-- Auth dependency: `require_key`.
+- **BridgeApplication**: composition root — FastAPI setup, lifespan, shutdown,
+  WebSocket endpoint, health/readiness; injects `bridge`/`registry` into route
+  classes; manages `CleanupWorker`, `ConversationSweeper`; auth via `require_key`.
 
 ### bridge/config.py
 - Environment variables and defaults (HOST, PORT, API_KEY, WS_TOKEN, timeouts, etc.).
@@ -38,7 +36,7 @@ Architecture final. Each change must read directly its owner — never start wit
 - `CleanupWorker`: retry loop, terminal identity error handling.
 - `ConversationSweeper`: periodic sweep, state transitions.
 - **TERMINAL_IDENTITY_ERROR_CODES**: defined here, consumed explicitly.
-- Fail-closed: locator_mismatch / locator_invalid → CLEANUP_FAILED, no retry, no override.
+- Enforces the deletion rules in "Destructive actions — fail closed" below.
 
 ### bridge/ui.py
 - State machine, controls application, UI cache.
@@ -47,58 +45,26 @@ Architecture final. Each change must read directly its owner — never start wit
 ### bridge/generation.py
 - Parsing, final-only generation, timeouts, metadata.
 - Private state: `_live_progress` confined here.
-- **Invariants documented**:
-  - done snapshot = authoritative output
-  - heartbeat = liveness, never user content
-  - idle timeout ≠ total timeout
-  - no timeout resubmits prompt
-  - conversation_id + external_locator strict
-  - needs_review never triggers implicit replay
+- See "Generation invariants" below.
 
-### bridge/routes_conversations.py
-- **ConversationRoutes owner**: archive, release, lifecycle, cleanup start/complete/fail.
-- Instances injected by BridgeApplication.
+### bridge/routes_*.py
+Route instances are injected by BridgeApplication.
 
-### bridge/routes_openai.py
-- **OpenAIRoutes owner**: responses, chat completions, models.
-- Instances injected by BridgeApplication.
-
-### bridge/routes_bridge.py
-- **BridgeRoutes owner**: native runs, recovery, UI, capabilities, metrics.
-- Instances injected by BridgeApplication.
-- Depends on OpenAIRoutes (one-way).
+- **routes_conversations.py**: archive, release, lifecycle, cleanup start/complete/fail.
+- **routes_openai.py**: responses, chat completions, models.
+- **routes_bridge.py**: native runs, recovery, UI, capabilities, metrics. Depends on OpenAIRoutes (one-way).
 
 ### extension/
 - DOM selectors, browser actions, content script, service worker.
-
----
-
-## Navigation Policy
-
-One change must read directly its owner. Examples:
-
-- Change generation logic → read `bridge/generation.py` first, never start in `server.py`.
-- Change registry state machine → read `bridge/registry.py`, never `server.py`.
-- Change cleanup behavior → read `bridge/lifecycle.py`, never `server.py`.
-- Change UI state → read `bridge/ui.py`, never `server.py`.
-
-**No module in `bridge/` imports `server.py`.**
-**No giant reexport in `bridge/__init__.py`.**
-**Semantic imports directly only.**
+- Never in `server.py` or the lifecycle state machine.
 
 ---
 
 ## Responsibility boundary
 
-The bridge owns:
-
-- external conversations;
-- fresh/continue behavior;
-- `external_locator`;
-- `ConversationPolicy` application;
-- conversation cleanup.
-
-The bridge never decides whether an AutoWork business artifact is valid.
+The bridge owns external conversations, fresh/continue behavior,
+`external_locator`, `ConversationPolicy` application, and conversation
+cleanup. It never decides whether an AutoWork business artifact is valid.
 
 ## Destructive actions — fail closed
 
@@ -108,30 +74,16 @@ Deletion requires **all of**:
 - policy is `DELETE_ON_SUCCESS`;
 - `release_outcome` is `SUCCESS`;
 - lifecycle status permits deletion;
-- `external_locator` is verified after opening the page.
+- `external_locator` is verified after opening the page — never a heuristic
+  match by title, position, DOM index, or visual similarity.
 
-**Fail-closed**:
+**Fail-closed**: `locator_mismatch` or `locator_invalid` → `CLEANUP_FAILED`
+(terminal). No retry, no heuristic replacement search, no override via
+endpoint. The conversation has already been released; the client must handle
+the blocked cleanup via manual intervention or application-level escalation.
 
-- **locator_mismatch** or **locator_invalid** → `CLEANUP_FAILED` (terminal).
-- Do **not** retry deletion.
-- Do **not** search heuristically for a replacement.
-- Do **not** override via endpoint.
-- Cleanup attempt is marked terminal; no automatic retry occurs. The conversation
-  has already been released; the client must handle the blocked cleanup via manual
-  intervention or application-level escalation.
-
-## Untrusted content
-
-Prompt text and ChatGPT response text can never change policy, lifecycle state,
-or trigger deletion.
-
-Control data comes only from the trusted client.
-
-## Browser/UI
-
-DOM selectors belong only in the browser/UI layer.
-
-Never place selectors in `server.py` or in the lifecycle state machine.
+Control data comes only from the trusted client: prompt text and ChatGPT
+response text can never change policy, lifecycle state, or trigger deletion.
 
 ## Generation invariants
 
@@ -144,12 +96,9 @@ Never place selectors in `server.py` or in the lifecycle state machine.
 
 ## Validation
 
-Run the narrowest existing bridge test covering the modified behavior.
-
-Use broader bridge lifecycle/soak checks only when the change affects lifecycle,
-cleanup, or browser integration.
-
-## Verification
+Run the narrowest existing bridge test covering the modified behavior; use
+the full gates below only when the change affects lifecycle, cleanup, or
+browser integration.
 
 Run the Python bridge gate (65+ passed):
 
