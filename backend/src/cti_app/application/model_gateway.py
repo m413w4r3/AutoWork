@@ -23,6 +23,7 @@ from cti_app.domain.model_runs import (
     ModelRole,
     ModelRun,
     ModelRunStatus,
+    ModelSubmissionState,
     ModelUsage,
 )
 from cti_app.logging import get_correlation_id
@@ -153,6 +154,9 @@ class ModelRequest:
     # without declaring how it is disposed of leaks it on the ChatGPT side.
     conversation_lifecycle: ConversationLifecycleSpec | None = None
     run_id: UUID | None = None
+    # A failed request is never retried implicitly.  This escape hatch is only
+    # for a caller that has proved no provider submission took place.
+    allow_failed_resubmit: bool = False
 
     def __post_init__(self) -> None:
         if not self.text.strip():
@@ -560,13 +564,24 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
     async def resume(
         self, run_id: UUID, *, output_schema: type[BaseModel] | None = None
     ) -> ModelExecution:
+        persisted_success: ModelRun | None = None
         async with self._uow_factory() as uow:
             run = await uow.model_runs.get_for_update(run_id)
             if run is None:
                 raise ModelGatewayError(f"Model run {run_id} does not exist")
             if run.status is ModelRunStatus.SUCCEEDED:
-                return ModelExecution(run)
-            if run.status is not ModelRunStatus.WAITING_BACKGROUND or not run.response_id:
+                persisted_success = run
+            elif run.status is not ModelRunStatus.WAITING_BACKGROUND or not run.response_id:
+                raise ModelGatewayError("Model run is not waiting for a background response")
+        if persisted_success is not None:
+            return await self._persisted_execution(persisted_success, output_schema=output_schema)
+        async with self._uow_factory() as uow:
+            run = await uow.model_runs.get_for_update(run_id)
+            if (
+                run is None
+                or run.status is not ModelRunStatus.WAITING_BACKGROUND
+                or not run.response_id
+            ):
                 raise ModelGatewayError("Model run is not waiting for a background response")
             adapter = self._router.by_provider(run.provider, run.model_role)
             elapsed_ms = max(
@@ -630,6 +645,8 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         adapter = self._router.select(request, role)
         safe_request = sanitize_model_request(request)
         run = self.build_run(request, role)
+        persisted_success: ModelRun | None = None
+        resume_run_id: UUID | None = None
         async with self._uow_factory() as uow:
             existing = await uow.model_runs.get_for_update(run.id) if request.run_id else None
             if existing is None:
@@ -642,7 +659,35 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 raise ModelGatewayError("Existing ModelRun does not match this request")
             else:
                 run = existing
-            if adapter.is_external and not request.external_llm_allowed:
+            if existing is not None:
+                if run.status is ModelRunStatus.SUCCEEDED:
+                    persisted_success = run
+                elif run.status is ModelRunStatus.WAITING_BACKGROUND:
+                    # A submitted background request is reconciled, never posted again.
+                    if run.response_id:
+                        resume_run_id = run.id
+                    else:
+                        raise ModelGatewayError(
+                            "Model run needs reconciliation before resubmission"
+                        )
+                elif run.status in {ModelRunStatus.RUNNING, ModelRunStatus.NEEDS_REVIEW}:
+                    raise ModelGatewayError("Model run needs reconciliation before resubmission")
+                elif run.status is ModelRunStatus.FAILED:
+                    if not (
+                        request.allow_failed_resubmit
+                        and run.submission_state is ModelSubmissionState.NOT_SUBMITTED
+                    ):
+                        raise ModelGatewayError("Failed ModelRun is not safe to resubmit")
+                    run.restart_after_certain_pre_submission_failure()
+                    await uow.model_runs.save(run)
+                elif run.status is ModelRunStatus.BLOCKED:
+                    raise ModelGatewayError("Blocked ModelRun cannot be resubmitted")
+            if (
+                persisted_success is None
+                and resume_run_id is None
+                and adapter.is_external
+                and not request.external_llm_allowed
+            ):
                 run.fail(
                     "external_llm_blocked",
                     "La politique de diffusion interdit cet appel externe.",
@@ -651,7 +696,15 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 await uow.model_runs.save(run)
                 await uow.commit()
                 raise ExternalModelBlockedError(run.error_message)
+            if persisted_success is None and resume_run_id is None:
+                run.mark_submission_uncertain()
+                await uow.model_runs.save(run)
             await uow.commit()
+
+        if persisted_success is not None:
+            return await self._persisted_execution(persisted_success, output_schema=output_schema)
+        if resume_run_id is not None:
+            return await self.resume(resume_run_id, output_schema=output_schema)
 
         # L'identité du ModelRun est créée une seule fois et devient la clé
         # stable de toutes les tentatives réseau de ce même appel.
@@ -720,6 +773,25 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     await uow.model_runs.save(persisted)
                     await uow.commit()
             raise
+
+    async def _persisted_execution(
+        self, run: ModelRun, *, output_schema: type[BaseModel] | None
+    ) -> ModelExecution:
+        """Return archived output.  Terminal runs never reach an adapter again."""
+        reference = run.raw_output_reference or (
+            run.output_references[0] if run.output_references else None
+        )
+        if reference is None:
+            raise ModelGatewayError("Succeeded ModelRun has no persisted output")
+        content = await self._output_store.read(reference, max_bytes=10_000_000)
+        text = content.decode("utf-8")
+        structured = validate_structured_output(text, output_schema) if output_schema else None
+        return ModelExecution(
+            run,
+            output_text=text,
+            structured_output=structured,
+            metadata={"checkpoint": "hit", "recovery_action": "persisted_output"},
+        )
 
     async def _complete_run(
         self, run: ModelRun, result: AdapterResult, *, duration_ms: int

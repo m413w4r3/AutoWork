@@ -4,6 +4,7 @@ import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from io import BytesIO
+from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel
@@ -397,6 +398,8 @@ class ModelConversationService:
         prompt_template_version: str,
         correlation_id: str,
         web_search: bool = False,
+        run_id: UUID | None = None,
+        parameters: dict[str, Any] | None = None,
     ) -> ModelExecution:
         """Run a stateless, schema-constrained extraction model request."""
         request = ModelRequest(
@@ -412,8 +415,9 @@ class ModelConversationService:
                 "primary_evidence": True,
                 "correlation_id": correlation_id,
             },
+            parameters=parameters or {},
             web_search=web_search,
-            run_id=uuid4(),
+            run_id=run_id or uuid4(),
         )
         execution = await self._gateway.extract(request, output_schema)
         if execution.run.status is not ModelRunStatus.SUCCEEDED:

@@ -29,6 +29,13 @@ class ModelRunStatus(StrEnum):
     BLOCKED = "blocked"
 
 
+class ModelSubmissionState(StrEnum):
+    """What is known about delivery of the logical request to its provider."""
+
+    NOT_SUBMITTED = "not_submitted"
+    SUBMITTED_OR_UNKNOWN = "submitted_or_unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class ModelUsage:
     input_tokens: int = 0
@@ -66,6 +73,7 @@ class ModelRun:
     duration_ms: int | None = None
     usage: ModelUsage | None = None
     status: ModelRunStatus = ModelRunStatus.RUNNING
+    submission_state: ModelSubmissionState = ModelSubmissionState.NOT_SUBMITTED
     response_id: str | None = None
     output_references: tuple[str, ...] = ()
     error_code: str | None = None
@@ -254,6 +262,28 @@ class ModelRun:
         }
         self.finished_at = timestamp
         self.updated_at = timestamp
+
+    def restart_after_certain_pre_submission_failure(
+        self, *, now: datetime | None = None
+    ) -> None:
+        """Allow explicit retry only when caller proved provider saw no request."""
+        if self.status is not ModelRunStatus.FAILED:
+            raise ValueError("Only failed ModelRuns can restart")
+        if self.submission_state is not ModelSubmissionState.NOT_SUBMITTED:
+            raise ValueError("ModelRun failure is not proven pre-submission")
+        timestamp = now or datetime.now(UTC)
+        self.status = ModelRunStatus.RUNNING
+        self.error_code = None
+        self.error_message = None
+        self.finished_at = None
+        self.updated_at = timestamp
+
+    def mark_submission_uncertain(self, *, now: datetime | None = None) -> None:
+        """Persist before contacting a provider without server-side deduplication."""
+        if self.status is not ModelRunStatus.RUNNING:
+            raise ValueError("Only running ModelRuns can be submitted")
+        self.submission_state = ModelSubmissionState.SUBMITTED_OR_UNKNOWN
+        self.updated_at = now or datetime.now(UTC)
 
     def _require_active(self) -> None:
         if self.status not in {ModelRunStatus.RUNNING, ModelRunStatus.WAITING_BACKGROUND}:

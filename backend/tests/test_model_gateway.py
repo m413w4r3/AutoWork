@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -12,16 +12,19 @@ from cti_app.application.jobs import (
     create_job_registry,
 )
 from cti_app.application.model_gateway import (
+    AdapterResult,
+    AdapterResultStatus,
     BinaryModelInputError,
     ExternalModelBlockedError,
     ModelGateway,
+    ModelGatewayError,
     ModelRequest,
     ModelRouter,
     ModelRoutingHint,
     sanitize_model_request,
 )
 from cti_app.domain.jobs import JobStatus
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
+from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus, ModelUsage
 from cti_app.integrations.models import (
     BridgeTransportError,
     FakeModelAdapter,
@@ -88,11 +91,52 @@ class FixedChatTransport:
         }
 
 
+class FailingChatTransport:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        del payload
+        self.calls += 1
+        raise ModelGatewayError("Qwen outcome is unknown")
+
+
+class NeedsReviewAdapter:
+    provider = ModelProvider.OPENAI
+    requested_model = "chatgpt-web"
+    is_external = True
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def invoke(
+        self, request: Any, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del request, role, output_schema
+        self.calls += 1
+        return AdapterResult(
+            status=AdapterResultStatus.NEEDS_REVIEW,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            usage=ModelUsage(),
+            metadata={"reason": "uncertain"},
+        )
+
+    async def resume(
+        self, response_id: str, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del response_id, role, output_schema
+        raise AssertionError("not used")
+
+
 def request(
     *,
     external_llm_allowed: bool,
     background: bool = False,
     routing_hint: ModelRoutingHint = ModelRoutingHint.WEB_RESEARCH,
+    run_id: UUID | None = None,
+    provider: ModelProvider | None = None,
 ) -> ModelRequest:
     return ModelRequest(
         text="Analyse token=super-secret /home/analyst/private/report.txt",
@@ -109,6 +153,8 @@ def request(
         },
         parameters={"reasoning": {"effort": "high"}},
         background=background,
+        run_id=run_id,
+        provider=provider,
     )
 
 
@@ -231,6 +277,109 @@ def test_binary_values_are_rejected_by_typed_request() -> None:
             routing_hint=ModelRoutingHint.BULK_EXTRACTION,
             metadata={"payload": b"MZ"},
         )
+
+
+async def test_succeeded_run_reloads_persisted_output_without_network_call() -> None:
+    fake = FakeModelAdapter()
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=FakeModelAdapter(),
+            openai_structured=FakeModelAdapter(),
+            qwen=FakeModelAdapter(),
+            fake=fake,
+        ),
+        model_uow,
+        InMemoryModelOutputStore(),
+    )
+    run_id = uuid4()
+    model_request = request(
+        external_llm_allowed=False,
+        routing_hint=ModelRoutingHint.STANDARD_DRAFT,
+        provider=ModelProvider.FAKE,
+        run_id=run_id,
+    )
+
+    first = await gateway.draft(model_request)
+    second = await gateway.draft(model_request)
+
+    assert first.run.id == second.run.id == run_id
+    assert second.output_text == first.output_text
+    assert len(fake.calls) == 1
+    assert second.metadata["checkpoint"] == "hit"
+
+
+async def test_needs_review_run_is_never_resubmitted() -> None:
+    adapter = NeedsReviewAdapter()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=adapter,
+            openai_structured=adapter,
+            qwen=FakeModelAdapter(),
+            fake=FakeModelAdapter(),
+        ),
+        InMemoryModelRunUnitOfWorkFactory(),
+        InMemoryModelOutputStore(),
+    )
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    first = await gateway.research(model_request)
+    with pytest.raises(ModelGatewayError, match="reconciliation"):
+        await gateway.research(model_request)
+
+    assert first.run.status is ModelRunStatus.NEEDS_REVIEW
+    assert adapter.calls == 1
+
+
+async def test_qwen_unknown_failure_is_not_resubmitted() -> None:
+    transport = FailingChatTransport()
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=FakeModelAdapter(),
+            openai_structured=FakeModelAdapter(),
+            qwen=QwenAdapter(transport, model="Qwen3-32B", is_external=False),
+            fake=FakeModelAdapter(),
+        ),
+        model_uow,
+        InMemoryModelOutputStore(),
+    )
+    model_request = request(
+        external_llm_allowed=False,
+        routing_hint=ModelRoutingHint.STANDARD_DRAFT,
+        run_id=uuid4(),
+    )
+    assert model_request.run_id is not None
+
+    with pytest.raises(ModelGatewayError, match="Qwen outcome"):
+        await gateway.draft(model_request)
+    with pytest.raises(ModelGatewayError, match="not safe"):
+        await gateway.draft(model_request)
+
+    run = model_uow.state[model_request.run_id]
+    assert run.status is ModelRunStatus.FAILED
+    assert run.submission_state.value == "submitted_or_unknown"
+    assert transport.calls == 1
+
+
+async def test_bridge_recovery_output_is_adopted_and_reused() -> None:
+    gateway, model_uow, _ = gateway_with_transport(FailingResponsesTransport())
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+    assert model_request.run_id is not None
+
+    with pytest.raises(BridgeTransportError):
+        await gateway.research(model_request)
+    recovered = await gateway.adopt_recovery_output(
+        model_request.run_id,
+        b"Recovered bridge answer",
+        provenance="visible_recovery",
+        actor_id="reviewer",
+    )
+    execution = await gateway.research(model_request)
+
+    assert recovered.status is ModelRunStatus.SUCCEEDED
+    assert execution.output_text == "Recovered bridge answer"
+    assert model_uow.state[model_request.run_id].status is ModelRunStatus.SUCCEEDED
 
 
 async def test_background_openai_response_is_resumed_by_job_polling() -> None:

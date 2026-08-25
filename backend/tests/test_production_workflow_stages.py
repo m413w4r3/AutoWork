@@ -37,6 +37,7 @@ from cti_app.application.source_evidence_processing import (
 )
 from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.model_conversations import ConversationMode, ConversationPurpose
+from cti_app.domain.model_runs import ModelProvider, ModelRunStatus
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -81,6 +82,8 @@ class _FakeConversations:
         self.created: list[UUID] = []
         self.create_requests: list[dict[str, Any]] = []
         self.structured_calls: list[dict[str, Any]] = []
+        self.structured_submissions: list[dict[str, Any]] = []
+        self._structured_by_run_id: dict[UUID, Any] = {}
         self.turn_requests: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> Any:
@@ -124,7 +127,13 @@ class _FakeConversations:
 
     async def extract_structured(self, **kwargs: Any) -> Any:
         self.structured_calls.append(kwargs)
+        run_id = kwargs.get("run_id")
+        if isinstance(run_id, UUID) and run_id in self._structured_by_run_id:
+            return self._structured_by_run_id[run_id]
         answer = self._answers.pop(0)
+        if answer == "__CRASH__":
+            raise KeyboardInterrupt("simulated worker crash")
+        self.structured_submissions.append(kwargs)
         schema = kwargs["output_schema"]
         if answer == PERFECT_Q2:
             message = kwargs["message"]
@@ -159,15 +168,31 @@ class _FakeConversations:
                 }
             )
         output = schema.model_validate_json(answer)
-        return type(
+        execution = type(
             "Execution",
             (),
             {
-                "run": type("Run", (), {"id": uuid4()})(),
+                "run": type(
+                    "Run",
+                    (),
+                    {
+                        "id": run_id or uuid4(),
+                        "provider": ModelProvider.FAKE,
+                        "requested_model": "fake",
+                        "actual_model_version": "fake",
+                        "duration_ms": 0,
+                        "status": ModelRunStatus.SUCCEEDED,
+                        "error_details": None,
+                    },
+                )(),
                 "output_text": answer,
                 "structured_output": output,
+                "metadata": {"checkpoint": "miss"},
             },
         )()
+        if isinstance(run_id, UUID):
+            self._structured_by_run_id[run_id] = execution
+        return execution
 
 
 class _Blobs:
@@ -772,6 +797,45 @@ async def test_three_q2_chunks_with_one_loss_produce_no_canonical_extraction(
         ProductionArtifactStage.REFERENCES
     ]
     assert len(conversations.created) == 1
+
+
+async def test_q2_retry_after_crash_reuses_ten_completed_chunk_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator, uow, conversations = _build(
+        [PERFECT_Q1, *([PERFECT_Q2] * 10), "__CRASH__", *([PERFECT_Q2] * 10)]
+    )
+    chunks = tuple(
+        EvidenceChunk(
+            source_document_id=uuid4(),
+            parent_source_ids=(),
+            source_ids=(f"S{index}",),
+            title=f"chunk {index}",
+            origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
+            chunk_id=f"q2-chunk-{index}",
+            text="archived evidence 1",
+            sha256=f"{index:064x}",
+        )
+        for index in range(1, 21)
+    )
+
+    async def fake_pack(*args: Any, **kwargs: Any) -> ProductionEvidencePack:
+        return ProductionEvidencePack("ready", "twenty-chunk-pack", chunks, {})
+
+    monkeypatch.setattr(orchestrator, "_build_production_evidence_pack", fake_pack)
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+    await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.REFERENCES)
+    uow.run.current_stage = SubjectProductionStage.EXTRACTION
+
+    with pytest.raises(KeyboardInterrupt, match="simulated worker crash"):
+        await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.EXTRACTION)
+    result = await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.EXTRACTION)
+
+    assert result["status"] == "success", result
+    assert len(conversations.structured_submissions) == 20
+    submitted_ids = [call["run_id"] for call in conversations.structured_submissions]
+    assert len(set(submitted_ids)) == 20
+    assert len(conversations.structured_calls) == 31
 
 
 async def test_deterministic_evidence_processing_runs_before_q2() -> None:

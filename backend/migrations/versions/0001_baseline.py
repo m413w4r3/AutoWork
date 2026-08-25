@@ -612,6 +612,7 @@ def _create_model_runs() -> None:
         sa.Column("duration_ms", sa.BigInteger(), nullable=True),
         sa.Column("usage", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
         sa.Column("status", sa.String(length=32), nullable=False),
+        sa.Column("submission_state", sa.String(length=32), nullable=False),
         sa.Column("response_id", sa.String(length=255), nullable=True),
         sa.Column("output_references", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("error_code", sa.String(length=64), nullable=True),
@@ -663,6 +664,10 @@ def _create_model_runs() -> None:
             "status IN ('running','waiting_background','needs_review','succeeded','failed',"
             "'blocked')",
             name="ck_model_runs_status",
+        ),
+        sa.CheckConstraint(
+            "submission_state IN ('not_submitted','submitted_or_unknown')",
+            name="ck_model_runs_submission_state",
         ),
         sa.CheckConstraint(
             "duration_ms IS NULL OR duration_ms >= 0", name="ck_model_runs_duration"

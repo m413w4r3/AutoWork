@@ -9,6 +9,7 @@ from cti_app.domain.model_runs import (
     ModelRole,
     ModelRun,
     ModelRunStatus,
+    ModelSubmissionState,
     ModelUsage,
 )
 from cti_app.infrastructure.database.models.model_execution import (
@@ -98,6 +99,7 @@ def _model_run_values(run: ModelRun) -> dict[str, object]:
         "duration_ms": run.duration_ms,
         "usage": run.usage.snapshot() if run.usage else None,
         "status": run.status.value,
+        "submission_state": run.submission_state.value,
         "response_id": run.response_id,
         "output_references": list(run.output_references),
         "error_code": run.error_code,
@@ -149,6 +151,7 @@ def _model_run_from_row(row: ModelRunRow) -> ModelRun:
             else None
         ),
         status=ModelRunStatus(row.status),
+        submission_state=ModelSubmissionState(row.submission_state),
         response_id=row.response_id,
         output_references=tuple(row.output_references),
         error_code=row.error_code,

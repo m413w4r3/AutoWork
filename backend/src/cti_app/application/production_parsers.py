@@ -221,6 +221,10 @@ class Q2ChunkOutput(BaseModel):
     uncertainties: list[str] = Field(default_factory=list)
 
 
+# Bump whenever Q2ChunkOutput contract changes.  Checkpoints validate against it.
+Q2_SCHEMA_VERSION = "1"
+
+
 # --- Shared lexing ---------------------------------------------------------
 
 _FENCE = re.compile(r"^\s*```[^\n]*\n(?P<body>.*?)\n\s*```\s*$", re.DOTALL)

@@ -7,7 +7,7 @@ import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.collection import ReferencedEvidence, SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
@@ -29,6 +29,7 @@ from cti_app.application.production_evidence_pack import (
     build_production_evidence_pack,
 )
 from cti_app.application.production_parsers import (
+    Q2_SCHEMA_VERSION,
     IndicatorStatus,
     ParsedEvent,
     ParseResult,
@@ -77,6 +78,10 @@ if TYPE_CHECKING:
 
 # Collection states that count as "the source is available for analysis".
 _ARCHIVED_STATES = {"archived", "extracted", "completed"}
+
+# Version routing decision separately from prompt/schema: changing provider policy
+# must produce a distinct persisted Q2 checkpoint.
+Q2_ROUTING_POLICY_VERSION = "1"
 
 
 # Bridge and network hiccups are worth retrying; anything else is a dead end
@@ -734,6 +739,8 @@ class ProductionWorkflowOrchestrator:
                 "references_hash": references.input_hash,
                 "stage": "extraction",
                 "prompt_version": EXTRACTION_PROMPT_VERSION,
+                "q2_schema_version": Q2_SCHEMA_VERSION,
+                "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
                 "evidence_pack_hash": evidence_pack.pack_hash,
             }
             input_hash = compute_input_hash(input_data)
@@ -782,6 +789,13 @@ class ProductionWorkflowOrchestrator:
                 chunk_failures: dict[str, str] = {}
                 chunk_provenance: dict[str, dict[str, str | None]] = {}
                 for chunk in evidence_pack.chunks:
+                    logical_request_id = _q2_logical_request_id(
+                        run_id=run.id,
+                        subject_id=run.subject_id,
+                        evidence_pack_hash=evidence_pack.pack_hash,
+                        chunk_sha256=chunk.sha256,
+                    )
+                    model_run_id = uuid5(NAMESPACE_URL, logical_request_id)
                     chunk_prompt = (
                         prompt
                         + "\n\nCorpus Q2 — segment borné, uniquement données archivées.\n"
@@ -800,6 +814,15 @@ class ProductionWorkflowOrchestrator:
                             prompt_template_version=EXTRACTION_PROMPT_VERSION,
                             correlation_id=self._correlation_id,
                             web_search=False,
+                            run_id=model_run_id,
+                            parameters={
+                                "logical_request_id": logical_request_id,
+                                "q2_schema_version": Q2_SCHEMA_VERSION,
+                                "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+                                "chunk_sha256": chunk.sha256,
+                                "production_run_id": str(run.id),
+                                "subject_id": str(run.subject_id),
+                            },
                         )
                         self._last_model_run_id = execution.run.id
                         model_output = cast(Q2ChunkOutput, execution.structured_output)
@@ -809,17 +832,28 @@ class ProductionWorkflowOrchestrator:
                     except Exception as exc:
                         failed_chunk_ids.append(chunk.chunk_id)
                         chunk_failures[chunk.chunk_id] = str(exc)
+                        chunk_provenance[chunk.chunk_id] = {
+                            "logical_request_id": logical_request_id,
+                            "model_run_id": str(model_run_id),
+                            "checkpoint": "miss",
+                            "recovery_action": "none",
+                            "status": "failed",
+                        }
                         continue
                     chunk_provenance[chunk.chunk_id] = {
-                        "logical_request_id": (
-                            f"extraction-{run.id}-v{EXTRACTION_PROMPT_VERSION}-{chunk.chunk_id}"
-                        ),
-                        "model_run_id": (
-                            str(self._last_model_run_id)
-                            if self._last_model_run_id is not None
-                            else None
-                        ),
+                        "logical_request_id": logical_request_id,
+                        "model_run_id": str(execution.run.id),
                         "turn_id": str(chunk_turn_id) if chunk_turn_id else None,
+                        "checkpoint": getattr(execution, "metadata", {}).get("checkpoint", "miss"),
+                        "provider": execution.run.provider.value,
+                        "requested_model": execution.run.requested_model,
+                        "actual_model": execution.run.actual_model_version,
+                        "attempt": str((execution.run.error_details or {}).get("attempts", 1)),
+                        "recovery_action": getattr(execution, "metadata", {}).get(
+                            "recovery_action", "new_submission"
+                        ),
+                        "duration_ms": str(execution.run.duration_ms or 0),
+                        "status": execution.run.status.value,
                     }
                     if chunk_result is None:
                         failed_chunk_ids.append(chunk.chunk_id)
@@ -1415,3 +1449,22 @@ def _q2_chunk_source_context(chunk: Any) -> str:
     if chunk.origin_kind.value == "referenced_evidence":
         lines.append("- evidence référencée: oui")
     return "\n".join(lines)
+
+
+def _q2_logical_request_id(
+    *, run_id: UUID, subject_id: UUID, evidence_pack_hash: str, chunk_sha256: str
+) -> str:
+    """Stable Q2 checkpoint identity.  Every semantic input/policy version participates."""
+    return "q2:" + json.dumps(
+        {
+            "production_run_id": str(run_id),
+            "subject_id": str(subject_id),
+            "evidence_pack_hash": evidence_pack_hash,
+            "chunk_sha256": chunk_sha256,
+            "q2_schema_version": Q2_SCHEMA_VERSION,
+            "prompt_version": EXTRACTION_PROMPT_VERSION,
+            "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
