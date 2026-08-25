@@ -72,6 +72,7 @@ class _FakeConversations:
         self._turns: dict[UUID, list[_Turn]] = {}
         self._turns_by_idempotency_key: dict[str, _Turn] = {}
         self.created: list[UUID] = []
+        self.structured_calls: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> Any:
         conversation_id = uuid4()
@@ -101,6 +102,53 @@ class _FakeConversations:
             type("Content", (), {"turn": t, "output_text": t.text})()
             for t in self._turns.get(conversation_id, [])
         ]
+
+    async def extract_structured(self, **kwargs: Any) -> Any:
+        self.structured_calls.append(kwargs)
+        answer = self._answers.pop(0)
+        schema = kwargs["output_schema"]
+        if answer == PERFECT_Q2:
+            message = kwargs["message"]
+            literal = next(
+                (
+                    value
+                    for value in (
+                        "198.51.100.10",
+                        "203.0.113.7",
+                        "archived evidence 1",
+                        "archived evidence 2",
+                        "archived evidence 3",
+                    )
+                    if value in message
+                ),
+                None,
+            )
+            if literal is None:
+                raise AssertionError("Q2 request must contain only an evidence chunk")
+            answer = json.dumps(
+                {
+                    "facts": [
+                        {
+                            "category": "other_technical",
+                            "value": literal,
+                            "context": "archive evidence",
+                            "evidence_quote": literal,
+                        }
+                    ],
+                    "artifacts": [],
+                    "uncertainties": [],
+                }
+            )
+        output = schema.model_validate_json(answer)
+        return type(
+            "Execution",
+            (),
+            {
+                "run": type("Run", (), {"id": uuid4()})(),
+                "output_text": answer,
+                "structured_output": output,
+            },
+        )()
 
 
 class _Blobs:
@@ -397,7 +445,7 @@ def _build(
                     "external_llm_allowed": True,
                     "source_document_id": document_id,
                     "derived_artifact_id": artifact_id,
-                        "origin_kind": SourceOriginKind.REFERENCE_RESEARCH,
+                    "origin_kind": SourceOriginKind.REFERENCE_RESEARCH,
                     "parent_source_collection_id": None,
                 },
             )()
@@ -497,9 +545,7 @@ async def test_repair_version_creates_a_new_logical_repair_turn() -> None:
         )
         assert result is not None and result.usable
 
-    assert {
-        call[2] for call in conversations.calls if "format-repair" in call[2]
-    } == {
+    assert {call[2] for call in conversations.calls if "format-repair" in call[2]} == {
         f"references-format-repair-{uow.run.id}-v1",
         f"references-format-repair-{uow.run.id}-v2",
     }
@@ -563,7 +609,7 @@ async def test_references_stage_stores_a_readable_report() -> None:
     assert conversations.calls[0][1] is ConversationMode.FRESH
 
 
-async def test_extraction_uses_independent_stateless_conversations_per_q2_chunk() -> None:
+async def test_extraction_uses_stateless_structured_output_per_q2_chunk() -> None:
     orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2, PERFECT_Q2])
     uow.run.current_stage = SubjectProductionStage.REFERENCES
     await orchestrator.execute_stage(
@@ -576,29 +622,24 @@ async def test_extraction_uses_independent_stateless_conversations_per_q2_chunk(
     )
 
     assert result["status"] == "success", result
-    assert result["supported_items"] == 3
+    assert result["supported_items"] == 2
     assert result["candidate_pack_hash"]
     artifact = uow.production_artifacts.items[-1]
     diagnostics = artifact.metadata["deterministic_verification"]
     assert diagnostics["candidate_pack_hash"] == result["candidate_pack_hash"]
     assert diagnostics["initial_candidate_pack_hash"] == result["initial_candidate_pack_hash"]
 
-    # Q1 and every Q2 chunk use independent fresh conversations.
-    assert len(conversations.created) == 3
-    assert [mode for _, mode, _, _ in conversations.calls] == [
-        ConversationMode.FRESH,
-        ConversationMode.FRESH,
-        ConversationMode.FRESH,
-    ]
-    assert len({cid for cid, _, _, _ in conversations.calls}) == 3
+    # Q1 alone opens a conversation. Q2 calls native structured output.
+    assert len(conversations.created) == 1
+    assert [mode for _, mode, _, _ in conversations.calls] == [ConversationMode.FRESH]
+    assert len(conversations.structured_calls) == 2
+    assert all(len(call["evidence_pack_hash"]) == 64 for call in conversations.structured_calls)
 
 
 async def test_three_q2_chunks_with_one_loss_produce_no_canonical_extraction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    orchestrator, uow, conversations = _build(
-        [PERFECT_Q1, PERFECT_Q2, BROKEN_Q1, BROKEN_Q1, PERFECT_Q2]
-    )
+    orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2, BROKEN_Q1, PERFECT_Q2])
     chunks = tuple(
         EvidenceChunk(
             source_document_id=uuid4(),
@@ -608,7 +649,7 @@ async def test_three_q2_chunks_with_one_loss_produce_no_canonical_extraction(
             origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
             chunk_id=f"q2-chunk-{index}",
             text=f"archived evidence {index}",
-            sha256=f"hash-{index}",
+            sha256=f"{index:064x}",
         )
         for index in range(1, 4)
     )
@@ -630,7 +671,7 @@ async def test_three_q2_chunks_with_one_loss_produce_no_canonical_extraction(
     assert [artifact.stage for artifact in uow.production_artifacts.items] == [
         ProductionArtifactStage.REFERENCES
     ]
-    assert len(conversations.created) == 4
+    assert len(conversations.created) == 1
 
 
 async def test_deterministic_evidence_processing_runs_before_q2() -> None:
@@ -817,6 +858,7 @@ async def test_event_without_any_archived_source_sends_the_run_to_review() -> No
     uow.source_collections.items.clear()
     uow.source_documents.items.clear()
     uow.derived_artifacts.items.clear()
+
     async def add_nothing(subject_id: Any, sources: Any) -> list[Any]:
         return []
 

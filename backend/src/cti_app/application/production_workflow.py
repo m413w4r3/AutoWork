@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 from cti_app.application.collection import ReferencedEvidence, SupplementalSource
@@ -35,13 +35,15 @@ from cti_app.application.production_ioc_candidates import (
 from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
     DisplayPolicy,
+    ExtractionItem,
     IndicatorStatus,
     ParsedEvent,
     ParseResult,
+    Q2ChunkOutput,
     ReferenceReport,
     TechnicalExtraction,
     parse_reference_report,
-    parse_technical_extraction,
+    q2_chunk_to_extraction,
     reference_report_from_json,
     reference_report_to_json,
     technical_extraction_from_json,
@@ -49,7 +51,6 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.production_prompts import (
-    EXTRACTION_FORMAT_REPAIR_VERSION,
     EXTRACTION_PROMPT_VERSION,
     REFERENCES_FORMAT_REPAIR_VERSION,
     REFERENCES_PROMPT_VERSION,
@@ -788,9 +789,8 @@ class ProductionWorkflowOrchestrator:
                         "completed_chunk_ids": [],
                         "failed_chunk_ids": [],
                     }
-                parsed_items = []
+                parsed_items: list[ExtractionItem] = []
                 parsed_warnings: list[str] = []
-                repair_actions: list[str] = []
                 raw_parts: list[str] = []
                 turn_id = None
                 completed_chunk_ids: list[str] = []
@@ -801,27 +801,31 @@ class ProductionWorkflowOrchestrator:
                     chunk_prompt = (
                         prompt
                         + "\n\nCorpus Q2 — segment borné, uniquement données archivées.\n"
-                        + f"chunk_id: {chunk.chunk_id}\n"
-                        + f"source_ids: {', '.join(chunk.source_ids) or 'none'}\n"
                         + chunk.text
                     )
                     try:
-                        chunk_conversation = await self._open_conversation(run, subject_title)
-                        chunk_result, chunk_raw, chunk_turn_id = (
-                            await self._ask_with_format_repair(
-                                run=run,
-                                conversation_id=chunk_conversation.id,
-                                stage="extraction",
-                                prompt=chunk_prompt,
-                                prompt_version=EXTRACTION_PROMPT_VERSION,
-                                repair_version=EXTRACTION_FORMAT_REPAIR_VERSION,
-                                mode=ConversationMode.FRESH,
-                                repair_mode=ConversationMode.FRESH,
-                                request_identity=chunk.chunk_id,
-                                parse=lambda text: parse_technical_extraction(text, report),
-                                external_llm_allowed=policy_allows,
-                                web_search=False,
-                            )
+                        execution = await self._model_service.extract_structured(
+                            message=chunk_prompt,
+                            evidence_pack_hash=chunk.sha256,
+                            output_schema=Q2ChunkOutput,
+                            external_llm_allowed=policy_allows,
+                            prompt_template_id="production-q2-extraction",
+                            prompt_template_version=EXTRACTION_PROMPT_VERSION,
+                            correlation_id=self._correlation_id,
+                        )
+                        self._last_model_run_id = execution.run.id
+                        model_output = cast(Q2ChunkOutput, execution.structured_output)
+                        chunk_raw = execution.output_text or model_output.model_dump_json()
+                        chunk_turn_id = None
+                        chunk_result = q2_chunk_to_extraction(
+                            model_output,
+                            chunk_text=chunk.text,
+                            source_ids=chunk.source_ids,
+                            source_document_id=str(chunk.source_document_id),
+                            chunk_id=chunk.chunk_id,
+                            model_run_id=(
+                                str(self._last_model_run_id) if self._last_model_run_id else None
+                            ),
                         )
                     except Exception as exc:
                         failed_chunk_ids.append(chunk.chunk_id)
@@ -829,8 +833,7 @@ class ProductionWorkflowOrchestrator:
                         continue
                     chunk_provenance[chunk.chunk_id] = {
                         "logical_request_id": (
-                            f"extraction-{run.id}-v{EXTRACTION_PROMPT_VERSION}-"
-                            f"{chunk.chunk_id}"
+                            f"extraction-{run.id}-v{EXTRACTION_PROMPT_VERSION}-{chunk.chunk_id}"
                         ),
                         "model_run_id": (
                             str(self._last_model_run_id)
@@ -854,7 +857,6 @@ class ProductionWorkflowOrchestrator:
                     completed_chunk_ids.append(chunk.chunk_id)
                     parsed_items.extend(chunk_result.value.items)
                     parsed_warnings.extend(chunk_result.warnings)
-                    repair_actions.extend(chunk_result.repair_actions)
                     raw_parts.append(chunk_raw)
                     turn_id = chunk_turn_id
                 if failed_chunk_ids:
@@ -882,7 +884,6 @@ class ProductionWorkflowOrchestrator:
                 parsed = ParseResult(
                     value=TechnicalExtraction(tuple(self._merge_q2_items(parsed_items))),
                     warnings=parsed_warnings,
-                    repair_actions=repair_actions,
                 )
                 raw = "\n\n".join(raw_parts)
             except Exception as e:
@@ -931,7 +932,6 @@ class ProductionWorkflowOrchestrator:
                 verification_diagnostics={
                     "candidate_total": candidate_pack.total_candidates,
                     "status_totals": status_totals,
-                    "repair_actions": parsed.repair_actions,
                     "candidate_pack_hash": candidate_pack.pack_hash,
                     "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
                     "evidence_pack_hash": evidence_pack.pack_hash,
@@ -1273,9 +1273,14 @@ class ProductionWorkflowOrchestrator:
                 context=context,
                 reference_ids=tuple(sorted(set(previous.reference_ids + item.reference_ids))),
                 source_ids=tuple(sorted(set(previous.source_ids + item.source_ids))),
+                source_document_ids=tuple(
+                    sorted(set(previous.source_document_ids + item.source_document_ids))
+                ),
+                chunk_ids=tuple(sorted(set(previous.chunk_ids + item.chunk_ids))),
+                model_run_ids=tuple(sorted(set(previous.model_run_ids + item.model_run_ids))),
                 supported=previous.supported or item.supported,
             )
-        return tuple(merged.values())
+        return tuple(merged[key] for key in sorted(merged, key=str))
 
     async def _execute_synthesis_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
         if not self._model_service:

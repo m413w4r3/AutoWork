@@ -19,6 +19,9 @@ class ArtifactType(StrEnum):
     FILEPATH = "filepath"
     FILENAME = "filename"
     CVE = "cve"
+    YARA_RULE = "yara_rule"
+    SIGMA_RULE = "sigma_rule"
+    SURICATA_RULE = "suricata_rule"
     OTHER = "other"
 
 
@@ -134,9 +137,7 @@ class BriefDocumentV1:
             synthesis=tuple(rich(item) for item in payload.get("synthesis", [])),
             indicators=tuple(group(item) for item in payload.get("indicators", [])),
             sources=tuple(
-                PublicationSource(
-                    source_id=item["source_id"], canonical_url=item["canonical_url"]
-                )
+                PublicationSource(source_id=item["source_id"], canonical_url=item["canonical_url"])
                 for item in payload.get("sources", [])
             ),
             uncertainties=tuple(payload.get("uncertainties", [])),

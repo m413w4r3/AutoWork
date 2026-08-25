@@ -16,7 +16,9 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.discovery_report_parser import extract_http_urls
 from cti_app.application.production_normalization import (
@@ -90,84 +92,6 @@ class ReferenceReport:
 
 # --- Technical extraction (Q2) ---------------------------------------------
 
-EXTRACTION_CATEGORIES = (
-    "actors",
-    "campaigns",
-    "victimology",
-    "infection_chain",
-    "malware",
-    "tools",
-    "ttps",
-    "cves",
-    "protocols",
-    "network_artifacts",
-    "infrastructure",
-    "files",
-    "commands",
-    "persistence",
-    "detections",
-    "other_technical",
-)
-
-# Heading aliases, French and English, singular and plural.
-_CATEGORY_ALIASES: dict[str, str] = {
-    "actors": "actors",
-    "actor": "actors",
-    "acteurs": "actors",
-    "acteur": "actors",
-    "campaigns": "campaigns",
-    "campaign": "campaigns",
-    "campagnes": "campaigns",
-    "campagne": "campaigns",
-    "victimology": "victimology",
-    "victimologie": "victimology",
-    "victimes": "victimology",
-    "infection chain": "infection_chain",
-    "infection_chain": "infection_chain",
-    "chaine d infection": "infection_chain",
-    "chaine dinfection": "infection_chain",
-    "chaine d'infection": "infection_chain",
-    "malware": "malware",
-    "malwares": "malware",
-    "maliciels": "malware",
-    "tools": "tools",
-    "tool": "tools",
-    "outils": "tools",
-    "outil": "tools",
-    "ttp": "ttps",
-    "ttps": "ttps",
-    "techniques": "ttps",
-    "cve": "cves",
-    "cves": "cves",
-    "protocols": "protocols",
-    "protocol": "protocols",
-    "protocoles": "protocols",
-    "protocole": "protocols",
-    "network artifacts": "network_artifacts",
-    "network_artifacts": "network_artifacts",
-    "artefacts reseau": "network_artifacts",
-    "artefacts réseau": "network_artifacts",
-    "infrastructure": "infrastructure",
-    "infrastructures": "infrastructure",
-    "files": "files",
-    "file": "files",
-    "fichiers": "files",
-    "fichier": "files",
-    "commands": "commands",
-    "command": "commands",
-    "commandes": "commands",
-    "commande": "commands",
-    "persistence": "persistence",
-    "persistance": "persistence",
-    "detections": "detections",
-    "detection": "detections",
-    "detections et regles": "detections",
-    "other technical": "other_technical",
-    "other_technical": "other_technical",
-    "autres elements techniques": "other_technical",
-    "autres": "other_technical",
-}
-
 
 class SemanticType(StrEnum):
     ACTOR = "actor"
@@ -218,6 +142,10 @@ class ExtractionItem:
     provenance: IndicatorProvenance = IndicatorProvenance.SOURCE
     display_policy: DisplayPolicy = DisplayPolicy.BODY_ONLY
     normalized_value: str | None = None
+    evidence_quote: str = ""
+    source_document_ids: tuple[str, ...] = ()
+    chunk_ids: tuple[str, ...] = ()
+    model_run_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -227,6 +155,68 @@ class TechnicalExtraction:
 
     def supported_items(self) -> tuple[ExtractionItem, ...]:
         return tuple(item for item in self.items if item.supported)
+
+
+class Q2FactProposal(BaseModel):
+    """One source-literal CTI fact proposed by Q2.
+
+    IDs and provenance are assigned by orchestration, never accepted from model
+    output.  Source text remains untrusted data and is only used as evidence.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: Literal[
+        "actors",
+        "campaigns",
+        "malware",
+        "tools",
+        "infection_chain",
+        "ttps",
+        "victimology",
+        "protocols",
+        "infrastructure",
+        "files",
+        "commands",
+        "persistence",
+        "detections",
+        "other_technical",
+    ]
+    value: str = Field(min_length=1, max_length=4000)
+    context: str = Field(min_length=1, max_length=4000)
+    evidence_quote: str = Field(min_length=1, max_length=8000)
+
+
+class Q2ArtifactProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    value: str = Field(min_length=1, max_length=4000)
+    artifact_type: Literal[
+        "domain",
+        "ip",
+        "url",
+        "email",
+        "hash",
+        "filename",
+        "filepath",
+        "cve",
+        "yara_rule",
+        "sigma_rule",
+        "suricata_rule",
+    ]
+    indicator_status: Literal["confirmed_ioc", "contextual", "excluded", "not_applicable"]
+    context: str = Field(min_length=1, max_length=4000)
+    evidence_quote: str = Field(min_length=1, max_length=8000)
+
+
+class Q2ChunkOutput(BaseModel):
+    """Strict Q2 contract; deliberately contains no internal identifiers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    facts: list[Q2FactProposal] = Field(default_factory=list)
+    artifacts: list[Q2ArtifactProposal] = Field(default_factory=list)
+    uncertainties: list[str] = Field(default_factory=list)
 
 
 # --- Shared lexing ---------------------------------------------------------
@@ -257,8 +247,6 @@ _HEADING_WORDS = frozenset(
         "element",
         "entree",
     }
-    # Q2 category headings arrive bare as well.
-    | set(_CATEGORY_ALIASES)
 )
 _FIELD = re.compile(r"^\s{0,3}(?P<key>[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 _-]{0,40}?)\s*[:=]\s*(?P<value>.*)$")
 _BULLET = re.compile(r"^\s*[-*•]\s+(?P<text>.+?)\s*$")
@@ -372,9 +360,7 @@ def _parse_date(value: str) -> date | None:
     return None
 
 
-def _enum_value[T: StrEnum](
-    raw: str | None, enum_type: type[T], default: T | None
-) -> T | None:
+def _enum_value[T: StrEnum](raw: str | None, enum_type: type[T], default: T | None) -> T | None:
     if not raw:
         return default
     try:
@@ -603,11 +589,6 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
     return result
 
 
-# --- Q2 --------------------------------------------------------------------
-
-_Q2_ITEM_BLOCKS = {"item": "item", "element": "item", "entree": "item"}
-
-
 def _editorial_title(body: str) -> str | None:
     for line in body.splitlines():
         match = _FIELD.match(line)
@@ -616,135 +597,88 @@ def _editorial_title(body: str) -> str | None:
     return None
 
 
-def parse_technical_extraction(
-    text: str, reference_report: ReferenceReport
+def q2_chunk_to_extraction(
+    output: Q2ChunkOutput,
+    *,
+    chunk_text: str,
+    source_ids: tuple[str, ...],
+    source_document_id: str,
+    chunk_id: str,
+    model_run_id: str | None,
 ) -> ParseResult[TechnicalExtraction]:
-    """Parse the Q2 CTI extraction.
-
-    Any reference or source the report does not define is stripped. An item that
-    ends up with no evidence at all is kept but marked unsupported, so it can be
-    shown for review without ever reaching the brief.
-    """
+    """Validate literal Q2 proposals and attach provenance deterministically."""
     result: ParseResult[TechnicalExtraction] = ParseResult()
-    body = normalize_text(text)
-    if not body:
-        result.errors.append("empty_response")
-        return result
-
-    known_sources = reference_report.source_ids()
-    known_events = {event.local_id for event in reference_report.events}
-
     items: list[ExtractionItem] = []
-    category: str | None = None
-    current: _Block | None = None
-    auto_item = 0
-
-    def flush() -> None:
-        nonlocal current, auto_item
-        if current is None or category is None:
-            current = None
-            return
-        values = _fields(current.lines)
-        value = (values.get("value") or values.get("valeur") or "").strip()
-        if not value:
-            result.dropped_blocks.append(current.raw())
-            result.warnings.append("item_without_value_dropped")
-            current = None
-            return
-
-        auto_item += 1
-        local_id = current.local_id or f"I{auto_item}"
-        if current.local_id is None:
-            result.warnings.append("item_id_generated")
-
-        raw_refs = values.get("references") or values.get("refs") or values.get("reference") or ""
-        raw_srcs = values.get("sources") or values.get("source") or ""
-        refs = tuple(t for t in _reference_tokens(raw_refs) if t in known_events)
-        srcs = tuple(t for t in _reference_tokens(raw_srcs) if t in known_sources)
-        if len(refs) < len(_reference_tokens(raw_refs)) or len(srcs) < len(
-            _reference_tokens(raw_srcs)
-        ):
-            result.warnings.append("item_unknown_reference_removed")
-
-        artifact_raw = values.get("artifact-type") or values.get("artifacttype")
-        if artifact_raw is None:
-            # Read migration for persisted/model V1 payloads. Its presence does
-            # not promote the item to an IOC: the cautious V2 defaults remain.
-            artifact_raw = values.get("type")
-        artifact_type = _enum_value(artifact_raw, ArtifactType, None)
-        semantic_type = _enum_value(values.get("semantic-type"), SemanticType, SemanticType.OTHER)
-        indicator_status = _enum_value(
-            values.get("indicator-status"), IndicatorStatus, IndicatorStatus.CONTEXTUAL
-        )
-        provenance = _enum_value(
-            values.get("provenance"), IndicatorProvenance, IndicatorProvenance.SOURCE
-        )
-        display_policy = _enum_value(
-            values.get("display-policy"), DisplayPolicy, DisplayPolicy.BODY_ONLY
-        )
+    proposals: list[Q2FactProposal | Q2ArtifactProposal] = [
+        *output.facts,
+        *output.artifacts,
+    ]
+    for index, proposal in enumerate(proposals, start=1):
+        if proposal.value not in chunk_text or proposal.value not in proposal.evidence_quote:
+            result.warnings.append("q2_nonliteral_proposal_dropped")
+            continue
+        if proposal.evidence_quote not in chunk_text:
+            result.warnings.append("q2_quote_not_in_chunk_dropped")
+            continue
+        if isinstance(proposal, Q2FactProposal):
+            items.append(
+                ExtractionItem(
+                    local_id=f"Q2F{index}",
+                    category=proposal.category,
+                    value=proposal.value,
+                    context=proposal.context,
+                    artifact_type=None,
+                    attack_id=None,
+                    reference_ids=(),
+                    source_ids=source_ids,
+                    supported=bool(source_ids),
+                    evidence_quote=proposal.evidence_quote,
+                    source_document_ids=(source_document_id,),
+                    chunk_ids=(chunk_id,),
+                    model_run_ids=(model_run_id,) if model_run_id else (),
+                )
+            )
+            continue
+        artifact_type = ArtifactType(proposal.artifact_type)
         normalized_value = None
-        if artifact_type is not None:
-            try:
-                normalized_value = normalize_indicator_value(value, artifact_type)
-            except ValueError:
-                result.warnings.append("invalid_artifact_value")
-
+        try:
+            normalized_value = normalize_indicator_value(proposal.value, artifact_type)
+        except ValueError:
+            result.warnings.append("invalid_artifact_value")
+        status = (
+            IndicatorStatus(proposal.indicator_status)
+            if proposal.indicator_status != "not_applicable"
+            else IndicatorStatus.CONTEXTUAL
+        )
         items.append(
             ExtractionItem(
-                local_id=local_id,
-                category=category,
-                value=value,
-                context=(values.get("context") or values.get("contexte") or "").strip(),
+                local_id=f"Q2A{index}",
+                category="network_artifacts",
+                value=proposal.value,
+                context=proposal.context,
                 artifact_type=artifact_type,
-                attack_id=(values.get("attack-id") or values.get("attackid") or "").strip() or None,
-                reference_ids=refs,
-                source_ids=srcs,
-                supported=bool(refs or srcs),
-                semantic_type=semantic_type or SemanticType.OTHER,
-                indicator_status=indicator_status or IndicatorStatus.CONTEXTUAL,
-                provenance=provenance or IndicatorProvenance.SOURCE,
-                display_policy=display_policy or DisplayPolicy.BODY_ONLY,
+                attack_id=None,
+                reference_ids=(),
+                source_ids=source_ids,
+                supported=bool(source_ids),
+                semantic_type=SemanticType.INDICATOR,
+                indicator_status=status,
+                display_policy=(
+                    DisplayPolicy.IOC_SECTION
+                    if status is IndicatorStatus.CONFIRMED_IOC
+                    else DisplayPolicy.BODY_ONLY
+                ),
                 normalized_value=normalized_value,
+                evidence_quote=proposal.evidence_quote,
+                source_document_ids=(source_document_id,),
+                chunk_ids=(chunk_id,),
+                model_run_ids=(model_run_id,) if model_run_id else (),
             )
         )
-        current = None
-
-    for line in body.split("\n"):
-        heading = _heading_text(line)
-        if heading is not None:
-            folded = _fold(heading)
-            if _match_keyword(folded, _Q2_ITEM_BLOCKS) is not None:
-                flush()
-                token = re.search(r"\b([A-Za-z]{1,3})\s*[-_]?\s*(\d{1,3})\b", heading)
-                local_id = f"{token.group(1).upper()}{int(token.group(2))}" if token else None
-                current = _Block(kind="item", local_id=local_id)
-                continue
-            flush()
-            mapped = _CATEGORY_ALIASES.get(folded)
-            if mapped is not None:
-                category = mapped
-            elif folded.startswith(("uncertainties", "incertitudes")):
-                category = None
-            elif folded.startswith("extraction"):
-                category = None
-            else:
-                category = None
-                result.warnings.append("unknown_extraction_section")
-            continue
-        if current is not None:
-            current.lines.append(line)
-    flush()
-
     if not items:
         result.errors.append("no_usable_item")
         return result
-
-    result.value = TechnicalExtraction(
-        items=tuple(items),
-        uncertainties=_collect_uncertainties(body),
-    )
-    if not result.value.supported_items():
-        result.warnings.append("no_supported_item")
+    result.value = TechnicalExtraction(tuple(items), tuple(output.uncertainties))
     return result
 
 
@@ -756,6 +690,7 @@ class SynthesisViolation:
     code: str
     detail: str
     span: tuple[int, int] | None = None
+
 
 # Only kinds with a low false-positive rate in French prose. Bare IPv4 is
 # deliberately excluded: version numbers such as "4.2.1.3" match it.
@@ -954,6 +889,10 @@ def technical_extraction_to_json(extraction: TechnicalExtraction) -> dict[str, A
                 "provenance": item.provenance.value,
                 "display_policy": item.display_policy.value,
                 "normalized_value": item.normalized_value,
+                "evidence_quote": item.evidence_quote,
+                "source_document_ids": list(item.source_document_ids),
+                "chunk_ids": list(item.chunk_ids),
+                "model_run_ids": list(item.model_run_ids),
                 "attack_id": item.attack_id,
                 "reference_ids": list(item.reference_ids),
                 "source_ids": list(item.source_ids),
@@ -986,9 +925,7 @@ def technical_extraction_from_json(payload: dict[str, Any]) -> TechnicalExtracti
             reference_ids=tuple(item.get("reference_ids", [])),
             source_ids=tuple(item.get("source_ids", [])),
             supported=bool(item.get("supported", False)),
-            semantic_type=_enum_value(
-                item.get("semantic_type"), SemanticType, SemanticType.OTHER
-            )
+            semantic_type=_enum_value(item.get("semantic_type"), SemanticType, SemanticType.OTHER)
             or SemanticType.OTHER,
             indicator_status=_enum_value(
                 item.get("indicator_status"), IndicatorStatus, IndicatorStatus.CONTEXTUAL
@@ -1003,6 +940,10 @@ def technical_extraction_from_json(payload: dict[str, Any]) -> TechnicalExtracti
             )
             or DisplayPolicy.BODY_ONLY,
             normalized_value=normalized,
+            evidence_quote=item.get("evidence_quote", ""),
+            source_document_ids=tuple(item.get("source_document_ids", [])),
+            chunk_ids=tuple(item.get("chunk_ids", [])),
+            model_run_ids=tuple(item.get("model_run_ids", [])),
         )
 
     return TechnicalExtraction(
