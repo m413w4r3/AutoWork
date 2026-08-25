@@ -47,7 +47,6 @@ class _ScriptedBridge:
 
 @pytest.fixture
 def temp_db():
-    """Temporary SQLite database for testing."""
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
         yield db_path
@@ -55,21 +54,16 @@ def temp_db():
 
 @pytest.fixture
 def registry(temp_db):
-    """Fresh RunRegistry for each test."""
     return RunRegistry(temp_db)
 
 
 class TestCleanupWorker:
-    """Test CleanupWorker automation."""
-
     @pytest.mark.asyncio
     async def test_cleanup_success(self, registry):
-        """Successful cleanup workflow."""
         conv_id = str(uuid4())
         registry.create_conversation(conv_id, "https://chatgpt.com/c/test123", "delete_on_success")
         registry.release_conversation(conv_id, "success")
 
-        # Mock the bridge
         mock_bridge = AsyncMock()
         mock_bridge.request = AsyncMock(
             return_value={
@@ -88,12 +82,10 @@ class TestCleanupWorker:
 
     @pytest.mark.asyncio
     async def test_cleanup_failure_retryable(self, registry):
-        """Cleanup failure marks as CLEANUP_FAILED for retry."""
         conv_id = str(uuid4())
         registry.create_conversation(conv_id, "https://chatgpt.com/c/test456", "delete_on_success")
         registry.release_conversation(conv_id, "success")
 
-        # Mock the bridge returning a failure
         mock_bridge = AsyncMock()
         mock_bridge.request = AsyncMock(
             return_value={
@@ -116,7 +108,6 @@ class TestCleanupWorker:
 
     @pytest.mark.asyncio
     async def test_cleanup_timeout(self, registry):
-        """Cleanup timeout is handled gracefully."""
         conv_id = str(uuid4())
         registry.create_conversation(conv_id, "https://chatgpt.com/c/timeout", "delete_on_success")
         registry.release_conversation(conv_id, "success")
@@ -134,7 +125,6 @@ class TestCleanupWorker:
 
     @pytest.mark.asyncio
     async def test_cleanup_locator_mismatch_fails_closed(self, registry):
-        """Locator mismatch causes cleanup to fail (fail-closed)."""
         conv_id = str(uuid4())
         registry.create_conversation(conv_id, "https://chatgpt.com/c/mismatch", "delete_on_success")
         registry.release_conversation(conv_id, "success")
@@ -159,7 +149,6 @@ class TestCleanupWorker:
 
     @pytest.mark.asyncio
     async def test_cleanup_idempotent_on_already_deleted(self, registry):
-        """Cleanup on already-deleted conversation is idempotent."""
         conv_id = str(uuid4())
         registry.create_conversation(conv_id, "https://chatgpt.com/c/deleted", "delete_on_success")
         registry.release_conversation(conv_id, "success")
@@ -170,17 +159,14 @@ class TestCleanupWorker:
         worker = CleanupWorker(registry, mock_bridge)
         result = await worker.process_cleanup_task(conv_id)
 
-        # Should return False because not in DELETE_PENDING anymore
+        # Not in DELETE_PENDING/CLEANUP_FAILED anymore, so refused before any bridge call.
         assert result is False
         mock_bridge.request.assert_not_called()
 
 
 class TestConversationSweeper:
-    """Test ConversationSweeper recovery."""
-
     @pytest.mark.asyncio
     async def test_sweep_delete_pending(self, registry):
-        """Sweeper processes all DELETE_PENDING conversations."""
         conv_ids = [str(uuid4()) for _ in range(3)]
         for conv_id in conv_ids:
             registry.create_conversation(conv_id, f"https://chatgpt.com/c/{conv_id[:8]}", "delete_on_success")
@@ -188,7 +174,6 @@ class TestConversationSweeper:
 
         assert len(registry.get_all_delete_pending()) == 3
 
-        # Mock the worker
         mock_worker = AsyncMock()
         mock_worker.process_cleanup_task = AsyncMock(return_value=True)
 
@@ -199,14 +184,13 @@ class TestConversationSweeper:
 
     @pytest.mark.asyncio
     async def test_sweep_continues_on_error(self, registry):
-        """Sweeper continues processing even if one fails."""
         conv_ids = [str(uuid4()) for _ in range(3)]
         for i, conv_id in enumerate(conv_ids):
             registry.create_conversation(conv_id, f"https://chatgpt.com/c/{i}", "delete_on_success")
             registry.release_conversation(conv_id, "success")
 
         mock_worker = AsyncMock()
-        # Second call raises an error, others succeed
+        # Middle call raises; sweep must not abort on it.
         mock_worker.process_cleanup_task = AsyncMock(
             side_effect=[True, Exception("test error"), True]
         )
@@ -214,12 +198,10 @@ class TestConversationSweeper:
         sweeper = ConversationSweeper(registry, mock_worker)
         await sweeper.sweep()
 
-        # Should have attempted all 3 despite one error
         assert mock_worker.process_cleanup_task.call_count == 3
 
     @pytest.mark.asyncio
     async def test_retry_failed_cleanup(self, registry):
-        """Sweeper retries CLEANUP_FAILED conversations."""
         conv_id = str(uuid4())
         registry.create_conversation(conv_id, "https://chatgpt.com/c/retry", "delete_on_success")
         registry.release_conversation(conv_id, "success")
@@ -294,12 +276,10 @@ class TestConversationSweeper:
 
     @pytest.mark.asyncio
     async def test_retry_failed_respects_max_attempts(self, registry):
-        """Sweeper doesn't retry if max attempts reached."""
         conv_id = str(uuid4())
         registry.create_conversation(conv_id, "https://chatgpt.com/c/max", "delete_on_success")
         registry.release_conversation(conv_id, "success")
 
-        # Simulate 3 failed attempts
         for _ in range(3):
             registry.start_cleanup(conv_id)
             registry.mark_cleanup_failed(conv_id, "error", "Test")
@@ -311,26 +291,21 @@ class TestConversationSweeper:
         sweeper = ConversationSweeper(registry, mock_worker)
         await sweeper.retry_failed()
 
-        # Should not retry because max attempts reached
+        # cleanup_attempt_count == 3 already hit the retry ceiling (< 3 in retry_failed).
         mock_worker.process_cleanup_task.assert_not_called()
 
 
 class TestCleanupIntegration:
-    """Integration tests for the complete cleanup flow."""
-
     @pytest.mark.asyncio
     async def test_complete_cleanup_flow(self, registry):
-        """Test the complete flow: DELETE_PENDING → DELETING → DELETED."""
         conv_id = str(uuid4())
         locator = "https://chatgpt.com/c/complete"
         registry.create_conversation(conv_id, locator, "delete_on_success")
         registry.release_conversation(conv_id, "success")
 
-        # Verify DELETE_PENDING
         conv = registry.get_conversation_lifecycle(conv_id)
         assert conv["status"] == "delete_pending"
 
-        # Mock successful cleanup
         mock_bridge = AsyncMock()
         mock_bridge.request = AsyncMock(
             return_value={
@@ -353,7 +328,6 @@ class TestCleanupIntegration:
 
         assert result is True
 
-        # Verify DELETED
         conv = registry.get_conversation_lifecycle(conv_id)
         assert conv["status"] == "deleted"
         assert conv["deleted_at"] is not None
@@ -361,27 +335,23 @@ class TestCleanupIntegration:
 
     @pytest.mark.asyncio
     async def test_restart_recovery_workflow(self, registry):
-        """Test that sweeper recovers DELETE_PENDING after restart."""
-        # Simulate state before "crash"
         conv_ids = [str(uuid4()) for _ in range(2)]
         for conv_id in conv_ids:
             registry.create_conversation(conv_id, f"https://chatgpt.com/c/{conv_id[:8]}", "delete_on_success")
             registry.release_conversation(conv_id, "success")
 
-        # Create a new registry instance (simulating restart)
+        # New RunRegistry instance over a copy of the DB, simulating a process restart.
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "restart.db"
-            # Checkpoint WAL before copying to ensure all data is flushed
             import shutil
 
-            registry.checkpoint_and_close()
+            registry.checkpoint_and_close()  # flush WAL before copying the file
             shutil.copy(registry.path, db_path)
 
             recovered_registry = RunRegistry(db_path)
             pending = recovered_registry.get_all_delete_pending()
-            assert len(pending) == 2  # Both conversations should still be DELETE_PENDING
+            assert len(pending) == 2
 
-            # Now sweeper processes them
             mock_worker = AsyncMock()
             mock_worker.process_cleanup_task = AsyncMock(return_value=True)
 

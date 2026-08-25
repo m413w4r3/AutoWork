@@ -19,8 +19,6 @@ from cti_app.domain.production import (
 
 
 class SubjectProductionService:
-    """Orchestrates production of a single subject."""
-
     def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
 
@@ -37,7 +35,6 @@ class SubjectProductionService:
         yield one logical run and one logical job.
         """
         async with self._uow_factory() as uow:
-            # Check if active run already exists for this subject
             existing = await uow.subject_production_runs.get_current_for_subject(subject_id)
             if existing and existing.status in (
                 SubjectProductionStatus.QUEUED,
@@ -45,7 +42,6 @@ class SubjectProductionService:
             ):
                 return existing, False
 
-            # Get next run number
             all_runs = await uow.subject_production_runs.list_for_edition(edition_id)
             subject_runs = [r for r in all_runs if r.subject_id == subject_id]
             next_run_number = len(subject_runs) + 1
@@ -61,7 +57,6 @@ class SubjectProductionService:
             return run, True
 
     async def start_run(self, run_id: UUID) -> SubjectProductionRun:
-        """Start a production run (move from QUEUED to RUNNING)."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:
@@ -73,7 +68,6 @@ class SubjectProductionService:
             return run
 
     async def advance_stage(self, run_id: UUID) -> SubjectProductionRun:
-        """Advance to next production stage."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:
@@ -102,7 +96,6 @@ class SubjectProductionService:
         code: str,
         message: str,
     ) -> SubjectProductionRun:
-        """Mark run as needing human review."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:
@@ -119,7 +112,6 @@ class SubjectProductionService:
         code: str,
         message: str,
     ) -> SubjectProductionRun:
-        """Mark run as failed (terminal error)."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:
@@ -131,7 +123,6 @@ class SubjectProductionService:
             return run
 
     async def cancel_run(self, run_id: UUID) -> SubjectProductionRun:
-        """Cancel a production run."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:
@@ -152,8 +143,6 @@ _TERMINAL_STATUSES = {
 
 
 class EditionProductionService:
-    """Orchestrates batch production for an entire edition."""
-
     def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
 
@@ -168,7 +157,6 @@ class EditionProductionService:
         Idempotent: returns existing active batch if one exists.
         """
         async with self._uow_factory() as uow:
-            # Check for existing active batch
             existing = await uow.edition_production_batches.get_active_for_edition(edition_id)
             if existing and existing.profile == profile:
                 return existing
@@ -180,7 +168,6 @@ class EditionProductionService:
             )
             await uow.edition_production_batches.add(batch)
 
-            # Create production runs for each subject and batch items
             items = []
             for position, subject_id in enumerate(subject_ids, start=1):
                 run = SubjectProductionRun(
@@ -205,7 +192,6 @@ class EditionProductionService:
     async def get_batch(self, batch_id_or_edition_id: UUID) -> EditionProductionBatch | None:
         """Get a production batch by ID or get active batch for edition."""
         async with self._uow_factory() as uow:
-            # Try to get by ID first
             batch = await uow.edition_production_batches.get(batch_id_or_edition_id)
             if batch:
                 return batch
@@ -247,7 +233,6 @@ class EditionProductionService:
         return None
 
     async def start_next(self, batch_id: UUID) -> SubjectProductionRun | None:
-        """Start the next subject of a batch, if any."""
         async with self._uow_factory() as uow:
             batch = await uow.edition_production_batches.get_for_update(batch_id)
             if not batch:

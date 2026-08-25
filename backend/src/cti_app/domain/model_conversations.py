@@ -41,21 +41,15 @@ class ConversationMode(StrEnum):
 
 
 class ConversationPolicy(StrEnum):
-    """Lifecycle policy for a conversation after successful completion.
+    """First-order control data, not metadata: every conversation must set it explicitly."""
 
-    This is a first-order control data, not metadata. Every new conversation
-    must define its policy explicitly.
-    """
     KEEP = "keep"
     DELETE_ON_SUCCESS = "delete_on_success"
 
 
 class ConversationReleaseOutcome(StrEnum):
-    """Outcome of an explicit conversation release by the client.
+    """Only SUCCESS may trigger cleanup per policy; other outcomes preserve for recovery."""
 
-    Only SUCCESS may trigger automatic cleanup according to policy.
-    All other outcomes preserve the conversation for potential recovery.
-    """
     SUCCESS = "success"
     FAILURE = "failure"
     NEEDS_REVIEW = "needs_review"
@@ -246,11 +240,9 @@ class ModelConversationTurn:
 
 @dataclass(slots=True, kw_only=True)
 class ConversationLifecycle:
-    """Lifecycle policy and status of a conversation.
+    """Separate concern from ConversationContext (usage: fresh/continue). Policy is
+    immutable once set at fresh time."""
 
-    This is a separate concern from ConversationContext (usage: fresh/continue).
-    The policy is immutable once set at fresh time.
-    """
     policy: ConversationPolicy
     status: ConversationLifecycleStatus = ConversationLifecycleStatus.ACTIVE
     released_at: datetime | None = None
@@ -276,11 +268,7 @@ class ConversationLifecycle:
         outcome: ConversationReleaseOutcome,
         now: datetime | None = None,
     ) -> None:
-        """Release the conversation with an explicit outcome.
-
-        The decision to release belongs to the workflow client, not the bridge.
-        Only SUCCESS may trigger automatic cleanup according to policy.
-        """
+        """The decision to release belongs to the workflow client, not the bridge."""
         if self.status != ConversationLifecycleStatus.ACTIVE:
             # Idempotence: releasing again is a no-op
             return
@@ -291,7 +279,6 @@ class ConversationLifecycle:
         self.updated_at = timestamp
         self.version += 1
 
-        # State machine transition based on outcome and policy
         if outcome == ConversationReleaseOutcome.SUCCESS:
             if self.policy == ConversationPolicy.DELETE_ON_SUCCESS:
                 self.status = ConversationLifecycleStatus.DELETE_PENDING
@@ -313,7 +300,6 @@ class ConversationLifecycle:
     )
 
     def start_cleanup(self, *, now: datetime | None = None) -> None:
-        """Transition to DELETING state (cleanup in progress)."""
         if self.status not in {
             ConversationLifecycleStatus.DELETE_PENDING,
             ConversationLifecycleStatus.CLEANUP_FAILED,
@@ -332,7 +318,6 @@ class ConversationLifecycle:
         error_code: str,
         now: datetime | None = None,
     ) -> None:
-        """Mark cleanup attempt as failed (retryable)."""
         if self.status not in self._RETRYABLE_CLEANUP_STATES:
             # Idempotence: ignore if not in cleanup states
             return
@@ -346,7 +331,6 @@ class ConversationLifecycle:
         self.version += 1
 
     def mark_deleted(self, *, now: datetime | None = None) -> None:
-        """Mark as deleted after successful cleanup."""
         if self.status not in self._RETRYABLE_CLEANUP_STATES:
             # Idempotence: ignore if not in cleanup states
             return

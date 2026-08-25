@@ -23,7 +23,6 @@ def _events(root: Path) -> list[dict[str, object]]:
 
 
 def test_disabled_by_default_and_silent(tmp_path: Path) -> None:
-    """No configured root means no trail, and no error either."""
     log = DiagnosticsLog.from_env(None)
 
     assert log.enabled is False

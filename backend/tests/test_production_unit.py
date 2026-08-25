@@ -22,10 +22,7 @@ from cti_app.domain.production import (
 
 
 class TestSubjectProductionRunStates:
-    """Test subject production run state transitions."""
-
     def test_create_run_initial_state(self) -> None:
-        """Test run creation creates QUEUED status."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
@@ -38,7 +35,6 @@ class TestSubjectProductionRunStates:
         assert run.finished_at is None
 
     def test_start_run_transitions_to_running(self) -> None:
-        """Test start_running transitions to RUNNING."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
@@ -51,7 +47,6 @@ class TestSubjectProductionRunStates:
         assert run.started_at is not None
 
     def test_advance_stage_moves_through_pipeline(self) -> None:
-        """Test advancing through production stages."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
@@ -60,24 +55,19 @@ class TestSubjectProductionRunStates:
 
         assert run.current_stage is SubjectProductionStage.SOURCES
 
-        # SOURCES -> REFERENCES
         run.advance_stage(now=datetime.now(UTC))
         assert run.current_stage is SubjectProductionStage.REFERENCES  # type: ignore[comparison-overlap]
 
-        # REFERENCES -> EXTRACTION
         run.advance_stage(now=datetime.now(UTC))
         assert run.current_stage is SubjectProductionStage.EXTRACTION
 
-        # EXTRACTION -> SYNTHESIS
         run.advance_stage(now=datetime.now(UTC))
         assert run.current_stage is SubjectProductionStage.SYNTHESIS
 
-        # SYNTHESIS -> ASSEMBLY
         run.advance_stage(now=datetime.now(UTC))
         assert run.current_stage is SubjectProductionStage.ASSEMBLY
 
     def test_mark_ready_terminates_run(self) -> None:
-        """Test mark_ready transitions to READY terminal state."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
@@ -91,7 +81,6 @@ class TestSubjectProductionRunStates:
         assert run.finished_at is not None
 
     def test_mark_needs_review_allows_recovery(self) -> None:
-        """Test mark_needs_review allows retry flows."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
@@ -112,7 +101,6 @@ class TestSubjectProductionRunStates:
         assert run.finished_at is not None
 
     def test_mark_failed_terminal_state(self) -> None:
-        """Test mark_failed creates terminal error state."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
@@ -131,7 +119,6 @@ class TestSubjectProductionRunStates:
         assert run.finished_at is not None
 
     def test_mark_cancelled_by_user(self) -> None:
-        """Test mark_cancelled allows user cancellation."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
@@ -145,7 +132,6 @@ class TestSubjectProductionRunStates:
         assert run.finished_at is not None
 
     def test_cannot_transition_from_terminal_state(self) -> None:
-        """Test cannot transition from terminal states."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
@@ -155,16 +141,12 @@ class TestSubjectProductionRunStates:
         run.start_running(now=datetime.now(UTC))
         run.mark_ready(now=datetime.now(UTC))
 
-        # READY is terminal, cannot start again
         with pytest.raises(ValueError):
             run.start_running(now=datetime.now(UTC))
 
 
 class TestEditionProductionBatch:
-    """Test batch production state and progression."""
-
     def test_create_batch_queued_status(self) -> None:
-        """Test batch creation creates QUEUED status."""
         edition_id = uuid4()
 
         batch = EditionProductionBatch(
@@ -180,7 +162,6 @@ class TestEditionProductionBatch:
         assert batch.started_at is None
 
     def test_batch_start_transitions_to_running(self) -> None:
-        """Test batch start transitions to running."""
         edition_id = uuid4()
 
         batch = EditionProductionBatch(
@@ -196,7 +177,6 @@ class TestEditionProductionBatch:
         assert batch.started_at is not None
 
     def test_batch_finish_marks_complete(self) -> None:
-        """Test batch finish marks as complete."""
         batch = EditionProductionBatch(
             id=uuid4(),
             edition_id=uuid4(),
@@ -211,7 +191,6 @@ class TestEditionProductionBatch:
         assert batch.finished_at is not None
 
     def test_batch_finish_with_issues(self) -> None:
-        """Test batch can finish with issues."""
         batch = EditionProductionBatch(
             id=uuid4(),
             edition_id=uuid4(),
@@ -227,10 +206,7 @@ class TestEditionProductionBatch:
 
 
 class TestProductionProfileVariants:
-    """Test different production profiles."""
-
     def test_brief_auto_profile(self) -> None:
-        """Test BRIEF_AUTO profile configuration."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
@@ -240,7 +216,6 @@ class TestProductionProfileVariants:
         assert run.profile == ProductionProfile.BRIEF_AUTO
 
     def test_major_assisted_profile(self) -> None:
-        """Test MAJOR_ASSISTED profile configuration."""
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
@@ -251,10 +226,7 @@ class TestProductionProfileVariants:
 
 
 class TestProductionArtifactValidation:
-    """Test artifact validation rules."""
-
     def test_artifact_version_must_be_positive(self) -> None:
-        """Test version >= 1 constraint."""
         from cti_app.domain.production import ProductionArtifact
 
         with pytest.raises(ValueError, match="version must be >= 1"):
@@ -262,12 +234,11 @@ class TestProductionArtifactValidation:
                 production_run_id=uuid4(),
                 subject_id=uuid4(),
                 stage=ProductionArtifactStage.REFERENCES,
-                version=0,  # Invalid
+                version=0,
                 input_hash="a" * 64,
             )
 
     def test_artifact_input_hash_validation(self) -> None:
-        """Test SHA-256 hash format validation."""
         from cti_app.domain.production import ProductionArtifact
 
         with pytest.raises(ValueError, match="input_hash must be lowercase SHA-256"):
@@ -276,14 +247,13 @@ class TestProductionArtifactValidation:
                 subject_id=uuid4(),
                 stage=ProductionArtifactStage.REFERENCES,
                 version=1,
-                input_hash="invalid",  # Too short and wrong format
+                input_hash="invalid",
             )
 
     def test_artifact_with_valid_sha256(self) -> None:
-        """Test artifact creation with valid SHA-256."""
         from cti_app.domain.production import ProductionArtifact
 
-        valid_hash = "a" * 64  # 64 hex chars
+        valid_hash = "a" * 64
 
         artifact = ProductionArtifact(
             production_run_id=uuid4(),
@@ -297,10 +267,7 @@ class TestProductionArtifactValidation:
 
 
 class TestBatchSequentialProcessing:
-    """Test batch processes subjects one at a time."""
-
     def test_batch_item_creation(self) -> None:
-        """Test batch items creation."""
         batch_id = uuid4()
         subject_ids = [uuid4() for _ in range(3)]
 
@@ -310,7 +277,7 @@ class TestBatchSequentialProcessing:
                 batch_id=batch_id,
                 subject_id=sid,
                 production_run_id=uuid4(),
-                position=i + 1,  # position >= 1
+                position=i + 1,
             )
             for i, sid in enumerate(subject_ids)
         ]

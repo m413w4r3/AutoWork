@@ -285,8 +285,8 @@ class SqlAlchemyDiscoverySnapshotRepository:
         return _discovery_snapshot_from_row(row) if row else None
 
     async def get_active_for_update(self, edition_id: UUID) -> DiscoverySnapshot | None:
-        # Serializes reconciliation even when the edition has no snapshot yet,
-        # where a row-level lock alone cannot protect concurrent bootstraps.
+        # Advisory lock: serializes reconciliation even pre-first-snapshot, when
+        # there's no row yet for a row-level lock to protect concurrent bootstraps.
         await self._session.execute(
             text("SELECT pg_advisory_xact_lock(hashtext(:edition_id))"),
             {"edition_id": str(edition_id)},

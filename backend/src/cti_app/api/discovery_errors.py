@@ -34,8 +34,7 @@ def _raise_api_error(exc: Exception) -> NoReturn:
             status_code=409,
             detail={"code": "recovery_unavailable", "message": str(exc)},
         ) from exc
-    # Checked before ValueError so that a subclass added later cannot silently
-    # be reported as a malformed request.
+    # Must precede ValueError check: a later subclass must not fall through as malformed request.
     if isinstance(exc, DiscoverySnapshotStaleError):
         raise HTTPException(
             status_code=409,

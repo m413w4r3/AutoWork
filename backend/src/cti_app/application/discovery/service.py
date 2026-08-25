@@ -64,7 +64,6 @@ def _wrap_candidates_as_contributions(
     candidates: list[CandidateTopic],
     status: ContributionStatus = ContributionStatus.PENDING,
 ) -> list[DiscoveryContribution]:
-    """Wrap candidate topics into contributions with temporal tracking."""
     now = datetime.now(UTC)
     return [
         DiscoveryContribution(
@@ -137,7 +136,6 @@ class DiscoveryService:
         research_run_id = uuid5(NAMESPACE_URL, f"cti-discovery-model-run:{request_hash}")
         fresh_conversation_id = uuid5(NAMESPACE_URL, f"cti-discovery-conversation:{request_hash}")
 
-        # Create and persist the conversation lifecycle (DELETE_ON_SUCCESS policy)
         conversation_lifecycle = ConversationLifecycle(
             id=fresh_conversation_id,
             policy=ConversationPolicy.DELETE_ON_SUCCESS,
@@ -208,7 +206,6 @@ class DiscoveryService:
                 batch = existing
             await uow.commit()
 
-        # Release the conversation lifecycle with SUCCESS after batch commit
         async with self._uow_factory() as uow:
             lifecycle = await uow.conversation_lifecycles.get(fresh_conversation_id)
             if lifecycle is not None:
@@ -326,11 +323,7 @@ class DiscoveryService:
         parameters: DiscoverEditionParameters,
         markdown: str,
     ) -> dict[str, Any]:
-        """Prévisualiser l'import d'une réponse ChatGPT Markdown existante.
-
-        Aucune persistance au preview : permet à l'utilisateur de vérifier
-        le contenu avant de confirmer.
-        """
+        """Preview only: no persistence, so the caller can confirm content before import."""
         digest = hashlib.sha256(markdown.encode()).hexdigest()
         manual_run_id = uuid5(
             NAMESPACE_URL,
@@ -346,19 +339,7 @@ class DiscoveryService:
         expected_sha256: str,
         actor_id: str,
     ) -> tuple[DiscoveryBatch, bool, UUID | None]:
-        """Importer une réponse ChatGPT Markdown en tant que contribution autonome.
-
-        Étapes:
-        1. Refaire preview et vérifier expected_sha256
-        2. Calculer manual_run_id et manual_request_hash
-        3. Vérifier si un batch avec ce request_hash existe → retourner (batch, reused=True)
-        4. Créer/obtenir le ModelRun synthétique manual-import
-        5. Parser le rapport
-        6. Enregistrer les diagnostics parser
-        7. Transformer en DiscoveryBatch
-        8. Déclencher la réconciliation cumulative (job asynchrone).
-        9. Retourner (batch, reused=False, reconciliation_job_id)
-        """
+        """Import a standalone ChatGPT Markdown report as a self-contained contribution."""
         if self._output_archive is None:
             raise ModelGatewayError("Model output archive is unavailable")
 
@@ -371,12 +352,10 @@ class DiscoveryService:
             f"manual-import:v1:{parameters.edition_id}:{digest}".encode()
         ).hexdigest()
 
-        # 1. Refaire preview et vérifier expected_sha256
         preview = self._recovery.preview_report(parameters, manual_run_id, markdown)
         if preview["sha256"] != expected_sha256:
             raise ValueError("Import preview no longer matches the confirmed report")
 
-        # 2. Vérifier si un batch avec ce request_hash existe (idempotence)
         async with self._uow_factory() as uow:
             existing_batch = await uow.discovery_batches.get_by_request_hash(
                 parameters.edition_id, manual_request_hash
@@ -384,7 +363,6 @@ class DiscoveryService:
             if existing_batch is not None:
                 return existing_batch, True, None
 
-        # 3. Créer le ModelRun synthétique manual-import
         await self._output_archive.create_manual_research_output(
             manual_run_id,
             markdown.encode(),
@@ -394,7 +372,6 @@ class DiscoveryService:
             actor_id=actor_id,
         )
 
-        # 4. Parser le rapport
         parsed = parse_discovery_report(
             markdown,
             visible_citations=[],
@@ -406,10 +383,8 @@ class DiscoveryService:
             research_model_run_id=manual_run_id,
         )
 
-        # 5. Enregistrer les diagnostics parser, comme pour une recherche ChatGPT.
         await self._record_parser_diagnostics(manual_run_id, parsed)
 
-        # 6. Transformer en DiscoveryBatch
         batch = _parsed_to_domain_batch(
             parameters,
             manual_request_hash,
@@ -425,8 +400,8 @@ class DiscoveryService:
             source_mode=DiscoverySourceMode.MANUAL_IMPORT,
         )
 
-        # 7. Ajouter et committer. Une insertion concurrente du même Markdown
-        # partage le même request_hash : on adopte le batch canonique.
+        # Une insertion concurrente du même Markdown partage le même request_hash :
+        # on adopte le batch canonique.
         async with self._uow_factory() as uow:
             inserted = await uow.discovery_batches.add_if_absent(batch)
             if not inserted:
@@ -439,11 +414,10 @@ class DiscoveryService:
                 return existing, True, None
             await uow.commit()
 
-        # 8. Regrouper éditorialement la nouvelle contribution. Ceci ne fait que
-        # soumettre et dispatcher un job de réconciliation ASYNCHRONE : la
-        # consolidation (fusion en sujets) n'est pas terminée quand cet appel
-        # revient. Le job id est renvoyé pour que l'appelant puisse suivre son
-        # achèvement au lieu de rafraîchir l'état trop tôt.
+        # Ceci ne fait que soumettre et dispatcher un job de réconciliation
+        # ASYNCHRONE : la consolidation (fusion en sujets) n'est pas terminée
+        # quand cet appel revient. Le job id est renvoyé pour que l'appelant
+        # puisse suivre son achèvement au lieu de rafraîchir l'état trop tôt.
         reconciliation_job_id: UUID | None = None
         if self._after_persisted_batch is not None:
             job = await self._after_persisted_batch(

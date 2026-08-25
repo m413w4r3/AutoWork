@@ -225,11 +225,9 @@ def test_empty_cache_file_cleanup(tmp_path: Path) -> None:
     (repo / "src" / "old_owner.py").write_text(OLD_OWNER_SOURCE)
     git_snapshot(repo)
 
-    # Lance un build lexical pour initialiser l'index.
     build = run_ctx(repo, "build", "--lexical-only")
     assert build.returncode == 0, build.stderr
 
-    # Crée un script de test qui s'exécute dans le contexte du repo.
     test_script = repo / ".test_cache_cleanup.py"
     test_script.write_text(
         f'''
@@ -243,16 +241,13 @@ from ctx import cache_dir, load_cache, save_cache
 
 model = "test-model-empty-cleanup"
 
-# Crée un cache avec du dummy data.
 dummy_vectors = {{
     "old_key_1": np.random.randn(768).astype(np.float32),
     "old_key_2": np.random.randn(768).astype(np.float32),
 }}
 
-# Sauvegarde le cache.
 save_cache(model, dummy_vectors)
 
-# Vérifie que les fichiers existent.
 cache_dir_path = cache_dir(model)
 vec_path = cache_dir_path / "vectors.npy"
 key_path = cache_dir_path / "keys.json"
@@ -262,19 +257,15 @@ assert vec_path.exists(), f"vectors.npy should exist at {{vec_path}}"
 assert key_path.exists(), f"keys.json should exist at {{key_path}}"
 assert meta_path.exists(), f"meta.json should exist at {{meta_path}}"
 
-# Vérifie que load_cache retrouve les données.
 loaded = load_cache(model)
 assert len(loaded) == 2, f"should have 2 vectors, got {{len(loaded)}}"
 
-# Appelle save_cache avec un cache vide.
 save_cache(model, {{}})
 
-# Vérifie que les fichiers ont disparu.
 assert not vec_path.exists(), "vectors.npy should be removed"
 assert not key_path.exists(), "keys.json should be removed"
 assert not meta_path.exists(), "meta.json should be removed"
 
-# Vérifie que load_cache retourne une dict vide.
 loaded_empty = load_cache(model)
 assert loaded_empty == {{}}, f"load_cache should return empty dict, got {{loaded_empty}}"
 

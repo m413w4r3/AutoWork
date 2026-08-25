@@ -406,7 +406,6 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 == (str(source_model_run_id) if source_model_run_id else None)
             ):
                 return existing
-            # Vérifier que le ModelRun peut être adopté avec cette provenance
             allowed = {ModelRunStatus.NEEDS_REVIEW}
             if provenance in {"manual_import", "visible_recovery"}:
                 allowed |= {
@@ -455,20 +454,12 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         evidence_pack_hash: str,
         actor_id: str,
     ) -> ModelRun:
-        """Créer un ModelRun synthétique pour un import manuel de Markdown.
-
-        Le run n'est pas un véritable appel API : c'est un enregistrement
-        du contenu fourni par l'utilisateur, avec marquage manuel_import.
-
-        Calcule le SHA et crée le run directement en SUCCEEDED.
-        """
+        """Not a real API call: records user-supplied Markdown as a ModelRun marked manual_import."""
         digest = hashlib.sha256(content).hexdigest()
 
         async with self._uow_factory() as uow:
-            # Vérifier s'il existe déjà un run avec ce run_id
             existing = await uow.model_runs.get(run_id)
             if existing is not None:
-                # Vérifier que c'est le même contenu
                 if (
                     existing.raw_output_sha256 == digest
                     and existing.status is ModelRunStatus.SUCCEEDED
@@ -476,16 +467,13 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     recovery = (existing.error_details or {}).get("recovery")
                     if isinstance(recovery, dict) and recovery.get("provenance") == "manual_import":
                         return existing
-                # Collision : un run différent existe déjà
                 raise ModelGatewayError(f"Model run {run_id} already exists with different content")
 
-        # Archiver le contenu
         reference = await self._output_store.store(
             content, mime_type="text/markdown; charset=utf-8"
         )
 
-        # Créer le run synthétique, puis le clôturer via le domaine plutôt que
-        # de renseigner une dizaine de champs terminaux depuis le gateway.
+        # Close via domain methods rather than setting a dozen terminal fields here.
         async with self._uow_factory() as uow:
             run = ModelRun(
                 id=run_id,
@@ -495,7 +483,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 actual_model_version="manual-import",
                 prompt_template_id="manual-import",
                 prompt_template_version="1.0",
-                # Aucun prompt n'a été soumis : sha256 de la chaîne vide.
+                # No prompt was submitted: hash of the empty string.
                 authorized_input_hash=hashlib.sha256(b"").hexdigest(),
                 evidence_pack_hash=evidence_pack_hash,
                 parameters={},

@@ -125,12 +125,8 @@ async def list_jobs(
     aggregate_id: UUID = Query(),
     kind: str | None = Query(default=None, min_length=1, max_length=128),
 ) -> list[JobView]:
-    """Jobs for one aggregate, most recent first.
-
-    Used by the frontend to surface a background job (e.g. the ChatGPT-backed
-    merge reconciliation) that isn't otherwise addressable by id — the caller
-    only knows the edition it belongs to, not the job it produced.
-    """
+    # Lets the frontend find a background job (e.g. ChatGPT-backed merge reconciliation)
+    # that isn't otherwise addressable by id — caller only knows the aggregate, not the job.
     service, _ = _runtime(request)
     jobs = await service.list_for_aggregate(aggregate_type, aggregate_id, kind=kind)
     return [_job_view(job) for job in jobs]

@@ -14,7 +14,6 @@ def wrap_candidates_in_contributions(
     candidates: list[CandidateTopic],
     status: ContributionStatus = ContributionStatus.PENDING,
 ) -> list[DiscoveryContribution]:
-    """Helper to convert candidates to contributions for testing."""
     now = datetime.now(UTC)
     return [
         DiscoveryContribution(

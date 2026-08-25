@@ -344,9 +344,7 @@ async def test_recovery_of_cancelled_job_returns_original_job() -> None:
     assert confirmed.status_code == 202
 
     returned_job_id = confirmed.json()["job_id"]
-    # Without the structuring pipeline, the same job is returned
     assert returned_job_id == job_id
-    # The original job status remains cancelled
     assert original.json()["status"] == "cancelled"
 
 

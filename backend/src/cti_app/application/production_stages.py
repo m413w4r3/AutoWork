@@ -62,8 +62,6 @@ class _ArtifactPayloadMixin:
 
 
 class ReferenceResearchService(_ArtifactPayloadMixin):
-    """Manages reference research stage."""
-
     def __init__(
         self,
         uow_factory: ProductionUnitOfWorkFactory,
@@ -85,10 +83,6 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
         period_end: str,
         existing_sources_text: str = "",
     ) -> dict[str, Any]:
-        """Prepare input for references research stage.
-
-        Returns prompt and input hash for model execution.
-        """
         prompt = ProductionPromptTemplates.get_references_prompt(
             subject_title=subject_title,
             subject_description=subject_description,
@@ -125,9 +119,7 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
         conversation_turn_id: UUID | None = None,
         warnings: list[str] | None = None,
     ) -> ProductionArtifact:
-        """Store references research result as artifact."""
         async with self._uow_factory() as uow:
-            # Get current version
             current = await uow.production_artifacts.get_current(
                 run_id, ProductionArtifactStage.REFERENCES.value
             )
@@ -157,7 +149,6 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
             )
             await uow.production_artifacts.append(artifact)
 
-            # Mark extraction/synthesis/brief as stale
             await uow.production_artifacts.mark_downstream_stale(
                 run_id, ProductionArtifactStage.REFERENCES.value
             )
@@ -167,8 +158,6 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
 
 
 class ExtractionService(_ArtifactPayloadMixin):
-    """Manages technical CTI extraction stage."""
-
     def __init__(
         self,
         uow_factory: ProductionUnitOfWorkFactory,
@@ -184,11 +173,6 @@ class ExtractionService(_ArtifactPayloadMixin):
         subject_title: str,
         references_artifact: ProductionArtifact,
     ) -> dict[str, Any]:
-        """Prepare input for CTI extraction stage.
-
-        Uses references artifact as context.
-        Returns prompt and input hash.
-        """
         prompt = ProductionPromptTemplates.get_extraction_prompt(
             subject_title=subject_title,
         )
@@ -218,14 +202,12 @@ class ExtractionService(_ArtifactPayloadMixin):
         conversation_turn_id: UUID | None = None,
         warnings: list[str] | None = None,
     ) -> ProductionArtifact:
-        """Store extraction result as artifact."""
         async with self._uow_factory() as uow:
             current = await uow.production_artifacts.get_current(
                 run_id, ProductionArtifactStage.EXTRACTION.value
             )
             version = (current.version + 1) if current else 1
 
-            # Count extracted elements
             element_counts = {
                 category: len(items)
                 for category, items in canonical_json.items()
@@ -255,7 +237,6 @@ class ExtractionService(_ArtifactPayloadMixin):
             )
             await uow.production_artifacts.append(artifact)
 
-            # Mark synthesis/brief as stale
             await uow.production_artifacts.mark_downstream_stale(
                 run_id, ProductionArtifactStage.EXTRACTION.value
             )
@@ -265,8 +246,6 @@ class ExtractionService(_ArtifactPayloadMixin):
 
 
 class SynthesisService(_ArtifactPayloadMixin):
-    """Manages technical synthesis stage."""
-
     def __init__(
         self,
         uow_factory: ProductionUnitOfWorkFactory,
@@ -282,11 +261,6 @@ class SynthesisService(_ArtifactPayloadMixin):
         subject_title: str,
         extraction_artifact: ProductionArtifact,
     ) -> dict[str, Any]:
-        """Prepare input for technical synthesis stage.
-
-        Uses extraction artifact as context.
-        Returns prompt and input hash.
-        """
         prompt = ProductionPromptTemplates.get_synthesis_prompt(
             subject_title=subject_title,
         )
@@ -315,14 +289,12 @@ class SynthesisService(_ArtifactPayloadMixin):
         model_run_id: UUID | None = None,
         conversation_turn_id: UUID | None = None,
     ) -> ProductionArtifact:
-        """Store synthesis result as artifact."""
         async with self._uow_factory() as uow:
             current = await uow.production_artifacts.get_current(
                 run_id, ProductionArtifactStage.SYNTHESIS.value
             )
             version = (current.version + 1) if current else 1
 
-            # Extract word count and reference count
             word_count = len(markdown_content.split())
             reference_count = markdown_content.count("[S")
 
@@ -348,7 +320,6 @@ class SynthesisService(_ArtifactPayloadMixin):
             )
             await uow.production_artifacts.append(artifact)
 
-            # Mark brief as stale
             await uow.production_artifacts.mark_downstream_stale(
                 run_id, ProductionArtifactStage.SYNTHESIS.value
             )

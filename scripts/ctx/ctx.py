@@ -863,7 +863,6 @@ def do_build(
             for key, vector in zip(missing, vectors, strict=True):
                 cache[key] = vector
 
-        # Prune orphaned vectors: keep only embeddings for current texts
         wanted = set(texts)
         cache = {key: vector for key, vector in cache.items() if key in wanted}
 

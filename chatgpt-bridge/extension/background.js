@@ -192,25 +192,15 @@ async function handleRecoveryCapture(msg) {
   }
 }
 
-/**
- * Automatisation UI : suppression d'une conversation via l'extension.
- *
- * Flux :
- * 1. Résoudre le tab via le locator de la conversation
- * 2. Envoyer la requête de cleanup au content script
- * 3. Relayer la réponse au serveur
- */
 async function handleCleanupConversation(msg) {
   let tab;
   try {
-    // Résoudre le tab correspondant au locator de la conversation
     tab = await resolveConversationTab({
       mode: "continue",
       id: msg.conversation_id,
       external_locator: msg.external_locator,
     });
 
-    // Envoyer la requête au content script
     const result = await sendToTab(tab.id, {
       type: "delete_conversation",
       id: msg.id,
@@ -219,7 +209,6 @@ async function handleCleanupConversation(msg) {
       timeout: msg.timeout || 30000,
     });
 
-    // Relayer le résultat au serveur
     send({
       type: "cleanup_conversation",
       id: msg.id,

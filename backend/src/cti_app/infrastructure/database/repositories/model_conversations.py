@@ -158,7 +158,6 @@ class SqlAlchemyConversationLifecycleRepository:
             raise LookupError(f"Conversation lifecycle {lifecycle.id} not found or stale version")
 
     async def list_delete_pending(self) -> Sequence[ConversationLifecycle]:
-        """List all lifecycles waiting for cleanup."""
         rows = await self._session.scalars(
             select(ConversationLifecycleRow)
             .where(
@@ -170,7 +169,6 @@ class SqlAlchemyConversationLifecycleRepository:
         return [_conversation_lifecycle_from_row(row) for row in rows]
 
     async def list_cleanup_failed(self) -> Sequence[ConversationLifecycle]:
-        """List all lifecycles with failed cleanup attempts."""
         rows = await self._session.scalars(
             select(ConversationLifecycleRow)
             .where(
@@ -281,7 +279,7 @@ def _model_conversation_turn_from_row(
 def _conversation_lifecycle_values(lifecycle: ConversationLifecycle) -> dict[str, object]:
     return {
         "id": lifecycle.id,
-        "conversation_id": lifecycle.id,  # Use lifecycle ID as conversation_id for now
+        "conversation_id": lifecycle.id,  # TODO: lifecycle.id doubles as conversation_id
         "policy": lifecycle.policy.value,
         "status": lifecycle.status.value,
         "release_outcome": lifecycle.release_outcome.value if lifecycle.release_outcome else None,

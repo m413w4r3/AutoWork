@@ -94,8 +94,6 @@ class BriefDocumentV1:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> BriefDocumentV1:
-        """Reconstruct a brief from its canonical payload."""
-
         def rich(items: list[dict[str, Any]]) -> RichText:
             return tuple(
                 RichSpan(

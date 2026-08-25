@@ -196,7 +196,6 @@ async def test_discovery_batch_round_trip_and_source_status(
 async def test_discovery_batch_contributions_metadata_preserved(
     migrated_postgres_url: str,
 ) -> None:
-    """Verify contributions metadata is preserved in round-trip."""
     from cti_app.domain.discovery import ContributionStatus, DiscoveryContribution
 
     engine = create_postgres_engine(migrated_postgres_url)
@@ -292,11 +291,9 @@ async def test_discovery_batch_contributions_metadata_preserved(
 async def test_discovery_batch_missing_contributions_meta_fails(
     migrated_postgres_url: str,
 ) -> None:
-    """Missing contributions_meta must cause KeyError."""
     from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
     from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
 
-    # Manually construct a row with missing contributions_meta
     row = DiscoveryBatchRow(
         id=uuid4(),
         edition_id=uuid4(),
@@ -337,7 +334,6 @@ async def test_discovery_batch_missing_contributions_meta_fails(
 async def test_discovery_batch_missing_parser_version_fails(
     migrated_postgres_url: str,
 ) -> None:
-    """Missing parser_version must cause KeyError."""
     from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
     from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
 
@@ -381,7 +377,6 @@ async def test_discovery_batch_missing_parser_version_fails(
 async def test_discovery_batch_candidate_without_contribution_metadata_fails(
     migrated_postgres_url: str,
 ) -> None:
-    """Candidate without matching contribution metadata must cause KeyError."""
     from uuid import uuid4 as make_uuid
 
     from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
@@ -456,7 +451,6 @@ async def test_discovery_batch_candidate_without_contribution_metadata_fails(
 async def test_discovery_batch_contribution_meta_missing_accepted_at_fails(
     migrated_postgres_url: str,
 ) -> None:
-    """Contribution metadata without the accepted_at key must cause KeyError."""
     from uuid import uuid4 as make_uuid
 
     from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
@@ -537,7 +531,6 @@ async def test_discovery_batch_contribution_meta_missing_accepted_at_fails(
 async def test_discovery_batch_contribution_meta_missing_human_note_fails(
     migrated_postgres_url: str,
 ) -> None:
-    """Contribution metadata without the human_note key must cause KeyError."""
     from uuid import uuid4 as make_uuid
 
     from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow

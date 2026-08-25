@@ -83,16 +83,10 @@ def test_only_analyst_assistance_and_pivot_research_can_continue() -> None:
         discovery.start_turn(mode=ConversationMode.CONTINUE)
 
 
-# Test A: Regression for conversation_lifecycle contract in ModelRequest
 def test_model_request_lifecycle_contract() -> None:
-    """Test that ModelRequest enforces lifecycle policy for fresh conversations.
-
-    This test protects against regression where fresh conversations without an
-    explicit lifecycle policy would raise ValueError.
-    """
+    """Regression: fresh conversations without an explicit lifecycle policy must raise ValueError."""
     conversation_id = uuid4()
 
-    # Stateless request without conversation should be valid
     request = ModelRequest(
         text="Extract data",
         prompt_template_id="test",
@@ -104,7 +98,6 @@ def test_model_request_lifecycle_contract() -> None:
     assert request.conversation is None
     assert request.conversation_lifecycle is None
 
-    # Fresh conversation WITHOUT lifecycle should raise ValueError
     fresh_context = ConversationContext(mode="fresh", id=conversation_id)
     with pytest.raises(ValueError, match="A fresh conversation requires an explicit"):
         ModelRequest(
@@ -117,7 +110,6 @@ def test_model_request_lifecycle_contract() -> None:
             conversation=fresh_context,
         )
 
-    # Fresh conversation WITH lifecycle should be valid
     fresh_with_lifecycle = ModelRequest(
         text="Analyze data",
         prompt_template_id="test",
@@ -131,7 +123,6 @@ def test_model_request_lifecycle_contract() -> None:
     assert fresh_with_lifecycle.conversation == fresh_context
     assert fresh_with_lifecycle.conversation_lifecycle is not None
 
-    # Continue conversation WITHOUT new lifecycle should be valid (reuses existing)
     continue_context = ConversationContext(
         mode="continue",
         id=conversation_id,

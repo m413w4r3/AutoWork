@@ -49,7 +49,6 @@ class ProductionStageParameters(JobParameters):
 
 
 def stage_job_kind(stage: SubjectProductionStage) -> str:
-    """Job kind that executes a given stage."""
     if stage is SubjectProductionStage.ASSEMBLY:
         return "production.subject.assemble"
     return f"production.subject.{stage.value}"
@@ -83,12 +82,8 @@ class ProductionStageChain:
         correlation_id: str,
         actor_id: str = "system",
     ) -> UUID | None:
-        """Queue the job for `stage`.
-
-        The idempotency key is derived from the run and stage, so a retried or
-        duplicated handler never enqueues the same stage — and never re-sends
-        the same prompt — twice.
-        """
+        """Idempotency key is derived from run+stage: a retried/duplicated handler
+        never enqueues the same stage, or re-sends the same prompt, twice."""
         if self._jobs is None or self._dispatcher is None:
             return None
         parameters = ProductionStageParameters(run_id=run_id, expected_stage=stage.value)
@@ -224,7 +219,6 @@ def register_production_jobs(
             await advance_batch(parameters.run_id, correlation_id)
             return f"production-stage://{parameters.run_id}/{stage.value}"
 
-        # Otherwise advance the run and queue the next stage.
         async with uow_factory() as uow:
             advancing = await uow.subject_production_runs.get_for_update(parameters.run_id)
             if advancing is None or advancing.status is not SubjectProductionStatus.RUNNING:

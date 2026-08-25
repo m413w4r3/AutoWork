@@ -1,8 +1,3 @@
-/**
- * Brief Draft Editor
- * Allows users to view and edit brief drafts before final assembly
- */
-
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useState } from "react";
 import { saveBriefDraft, getBriefDraft } from "../api/production";
@@ -59,7 +54,7 @@ export function BriefDraftEditor({
   }
 
   if (error && !draft) {
-    return null; // No draft yet, that's ok
+    return null;
   }
 
   return (

@@ -275,7 +275,6 @@ functional description. Return only French prose.
         period_end: str,
         existing_sources_text: str,
     ) -> str:
-        """Generate references research prompt."""
         return cls.REFERENCES_RESEARCH_V2.format(
             subject_title=subject_title,
             subject_description=subject_description,
@@ -292,7 +291,6 @@ functional description. Return only French prose.
         cls,
         subject_title: str,
     ) -> str:
-        """Generate CTI extraction prompt."""
         return cls.TECHNICAL_EXTRACTION_V2.format(
             subject_title=subject_title,
         )
@@ -324,7 +322,6 @@ sources: S1"""
 
     @classmethod
     def get_format_repair_prompt(cls, *, stage: str, problems: Sequence[str]) -> str:
-        """Ask the model to restructure its previous answer, nothing else."""
         listed = "\n".join(f"- {problem}" for problem in problems) or "- structure illisible"
         if stage == "synthesis":
             return cls.SYNTHESIS_REPAIR_V2.format(problems=listed)
@@ -338,7 +335,6 @@ sources: S1"""
         cls,
         subject_title: str,
     ) -> str:
-        """Generate technical synthesis prompt."""
         return cls.TECHNICAL_SYNTHESIS_V2.format(
             subject_title=subject_title,
         )

@@ -70,7 +70,6 @@ class RunRegistry:
                     "browser/auth state), then restart the bridge."
                 )
 
-            # Table for tracking conversation lifecycle and cleanup
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bridge_conversations (
@@ -221,7 +220,6 @@ class RunRegistry:
         external_locator: Optional[str],
         policy: str,
     ) -> None:
-        """Register a new conversation with its lifecycle policy."""
         now = time.time()
         with self._lock, self._connect() as db:
             db.execute(
@@ -234,14 +232,9 @@ class RunRegistry:
             )
 
     def release_conversation(self, conversation_id: str, outcome: str) -> dict[str, Any]:
-        """Release a conversation with an explicit outcome.
-
-        Returns the updated lifecycle state.
-        Only SUCCESS may trigger cleanup based on policy.
-        """
+        """Only SUCCESS may trigger cleanup, and only per the conversation's policy."""
         now = time.time()
         with self._lock, self._connect() as db:
-            # Get current state
             row = db.execute(
                 "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
             ).fetchone()
@@ -250,20 +243,18 @@ class RunRegistry:
 
             current = dict(row)
 
-            # Idempotence: if already released, return current state
+            # Idempotent: already-released conversations return their current state as-is.
             if current["status"] != "active":
                 return current
 
-            # Determine next state based on outcome and policy
             if outcome == "success":
                 next_status = (
                     "delete_pending" if current["policy"] == "delete_on_success" else "retained"
                 )
             else:
-                # FAILURE, NEEDS_REVIEW, CANCELLED all preserve conversation
+                # FAILURE, NEEDS_REVIEW, CANCELLED all preserve the conversation.
                 next_status = "retained"
 
-            # Update state
             db.execute(
                 """
                 UPDATE bridge_conversations
@@ -273,14 +264,12 @@ class RunRegistry:
                 (next_status, outcome, now, now, conversation_id),
             )
 
-            # Return updated state
             result = db.execute(
                 "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
             ).fetchone()
             return dict(result)
 
     def get_conversation_lifecycle(self, conversation_id: str) -> dict[str, Any] | None:
-        """Retrieve the current lifecycle state of a conversation."""
         with self._lock, self._connect() as db:
             row = db.execute(
                 "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
@@ -288,12 +277,7 @@ class RunRegistry:
         return dict(row) if row else None
 
     def start_cleanup(self, conversation_id: str) -> dict[str, Any]:
-        """Transition a DELETE_PENDING or CLEANUP_FAILED conversation to DELETING state.
-
-        Allows starting cleanup from DELETE_PENDING (initial attempt) or
-        CLEANUP_FAILED (retry). Idempotent on DELETING/DELETED.
-        Returns the updated conversation state.
-        """
+        """DELETE_PENDING or CLEANUP_FAILED -> DELETING. Idempotent on DELETING/DELETED."""
         now = time.time()
         with self._lock, self._connect() as db:
             row = db.execute(
@@ -305,7 +289,6 @@ class RunRegistry:
             conversation = dict(row)
             current_status = conversation["status"]
 
-            # Transition from DELETE_PENDING or CLEANUP_FAILED
             if current_status in ("delete_pending", "cleanup_failed"):
                 db.execute(
                     """
@@ -320,17 +303,13 @@ class RunRegistry:
                     f"Cannot start cleanup from status {current_status}"
                 )
 
-            # Return updated state
             result = db.execute(
                 "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
             ).fetchone()
             return dict(result)
 
     def mark_conversation_deleted(self, conversation_id: str) -> dict[str, Any]:
-        """Mark a conversation as successfully deleted.
-
-        Transitions from DELETING to DELETED. Idempotent on DELETED.
-        """
+        """DELETING -> DELETED. Idempotent on DELETED."""
         now = time.time()
         with self._lock, self._connect() as db:
             row = db.execute(
@@ -342,7 +321,6 @@ class RunRegistry:
             conversation = dict(row)
             current_status = conversation["status"]
 
-            # Only transition from DELETING; idempotent for DELETED
             if current_status == "deleting":
                 db.execute(
                     """
@@ -354,15 +332,12 @@ class RunRegistry:
                     ("deleted", now, now, now, conversation_id),
                 )
             elif current_status == "deleted":
-                # Idempotent: already deleted, no-op
                 pass
             else:
-                # Cannot mark deleted from other states
                 raise ValueError(
                     f"Cannot mark deleted from status {current_status}"
                 )
 
-            # Return updated state
             result = db.execute(
                 "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
             ).fetchone()
@@ -374,11 +349,7 @@ class RunRegistry:
         error_code: str,
         error_message: str | None = None,
     ) -> dict[str, Any]:
-        """Mark cleanup attempt as failed (retryable).
-
-        Transitions from DELETE_PENDING or DELETING to CLEANUP_FAILED.
-        Idempotent: calling again increments attempt count.
-        """
+        """DELETE_PENDING or DELETING -> CLEANUP_FAILED. Idempotent: increments attempt count."""
         now = time.time()
         with self._lock, self._connect() as db:
             row = db.execute(
@@ -390,7 +361,6 @@ class RunRegistry:
             conversation = dict(row)
             current_status = conversation["status"]
 
-            # Transition from cleanup states or ignore if already in cleanup_failed
             if current_status in ("delete_pending", "deleting", "cleanup_failed"):
                 db.execute(
                     """
@@ -406,14 +376,12 @@ class RunRegistry:
                     f"Cannot mark cleanup failed from status {current_status}"
                 )
 
-            # Return updated state
             result = db.execute(
                 "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
             ).fetchone()
             return dict(result)
 
     def get_all_delete_pending(self) -> list[str]:
-        """Récupère tous les IDs de conversations en DELETE_PENDING."""
         with self._lock, self._connect() as db:
             rows = db.execute(
                 "SELECT id FROM bridge_conversations WHERE status=?", ("delete_pending",)
@@ -421,7 +389,6 @@ class RunRegistry:
             return [row[0] for row in rows]
 
     def get_all_cleanup_failed(self) -> list[str]:
-        """Récupère tous les IDs de conversations en CLEANUP_FAILED."""
         with self._lock, self._connect() as db:
             rows = db.execute(
                 "SELECT id FROM bridge_conversations WHERE status=?", ("cleanup_failed",)

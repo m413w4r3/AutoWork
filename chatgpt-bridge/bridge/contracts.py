@@ -12,8 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 # --------------------------------------------------------------------------- #
 class ChatMessage(BaseModel):
     role: str = "user"
-    # str, ou liste de blocs multimodaux [{"type": "text", "text": "..."}]
-    content: Any = ""
+    content: Any = ""  # str, ou liste de blocs multimodaux OpenAI [{"type": "text", "text": "..."}]
     name: Optional[str] = None
 
 
@@ -59,12 +58,10 @@ class ChatRequest(BaseModel):
     model: str = "chatgpt-web"
     messages: List[ChatMessage]
     stream: bool = False
-    # Extension maison : ouvre un nouveau chat avant d'envoyer le prompt.
     new_chat: bool = Field(default=False, description="Repart d'une conversation vierge")
     files: List[FileAttachment] = Field(default_factory=list, description="Pièces jointes")
 
-    # Les paramètres OpenAI sans équivalent dans l'UI web sont acceptés puis ignorés.
-    model_config = {"extra": "allow"}
+    model_config = {"extra": "allow"}  # params OpenAI sans équivalent UI: acceptés, ignorés
 
 
 class ResponseRequest(BaseModel):
@@ -134,18 +131,12 @@ class RunControls(BaseModel):
 
 
 class ConversationReleaseRequest(BaseModel):
-    """Explicit release of a conversation with an outcome.
-
-    Only the client decides when a conversation is no longer needed,
-    and the outcome of that release.
-    """
+    """Only the client decides a conversation is done, and with what outcome."""
 
     outcome: str = Field(..., pattern="^(success|failure|needs_review|cancelled)$")
 
 
 class ConversationLifecycleResponse(BaseModel):
-    """Current lifecycle status of a conversation."""
-
     conversation_id: str
     policy: str
     status: str
@@ -225,18 +216,15 @@ class RunReport(BaseModel):
 
 
 class CleanupStartRequest(BaseModel):
-    """Request to start cleanup of a DELETE_PENDING conversation."""
     pass
 
 
 class CleanupStartResponse(BaseModel):
-    """Response after initiating cleanup."""
     conversation_id: str
-    status: str  # Should be DELETING if cleanup started
+    status: str
     cleanup_attempt_count: int
 
 
 class CleanupFailureRequest(BaseModel):
-    """Report cleanup failure for retry handling."""
     error_code: str = Field(..., pattern="^[a-z_]+$", max_length=64)
     error_message: Optional[str] = None

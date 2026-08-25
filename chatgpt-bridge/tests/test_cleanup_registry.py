@@ -21,7 +21,6 @@ from bridge.registry import RunRegistry
 
 @pytest.fixture
 def temp_db():
-    """Temporary SQLite database for testing."""
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test.db"
         yield db_path
@@ -29,24 +28,19 @@ def temp_db():
 
 @pytest.fixture
 def registry(temp_db):
-    """Fresh RunRegistry for each test."""
     return RunRegistry(temp_db)
 
 
 class TestCleanupStateTransitions:
-    """Test state machine transitions for cleanup."""
-
     def test_start_cleanup_from_delete_pending(self, registry):
         """DELETE_PENDING → DELETING transition."""
         conv_id = str(uuid4())
         registry.create_conversation(conv_id, "https://chatgpt.com/c/test", "delete_on_success")
         registry.release_conversation(conv_id, "success")
 
-        # Should be in DELETE_PENDING
         state = registry.get_conversation_lifecycle(conv_id)
         assert state["status"] == "delete_pending"
 
-        # Start cleanup
         result = registry.start_cleanup(conv_id)
         assert result["status"] == "deleting"
         assert result["version"] == 3  # created (1), released (2), deleting (3)
@@ -58,7 +52,6 @@ class TestCleanupStateTransitions:
         registry.release_conversation(conv_id, "success")
         registry.start_cleanup(conv_id)
 
-        # Call again
         result = registry.start_cleanup(conv_id)
         assert result["status"] == "deleting"
 
@@ -69,7 +62,6 @@ class TestCleanupStateTransitions:
         registry.release_conversation(conv_id, "success")
         registry.start_cleanup(conv_id)
 
-        # Mark as deleted
         result = registry.mark_conversation_deleted(conv_id)
         assert result["status"] == "deleted"
         assert result["deleted_at"] is not None
@@ -83,7 +75,6 @@ class TestCleanupStateTransitions:
         registry.start_cleanup(conv_id)
         registry.mark_conversation_deleted(conv_id)
 
-        # Call again
         result = registry.mark_conversation_deleted(conv_id)
         assert result["status"] == "deleted"
         assert result["cleanup_attempt_count"] == 1  # No increment on idempotent call
@@ -95,7 +86,6 @@ class TestCleanupStateTransitions:
         registry.release_conversation(conv_id, "success")
         registry.start_cleanup(conv_id)
 
-        # Mark cleanup failed
         result = registry.mark_cleanup_failed(
             conv_id,
             error_code="delete_button_not_found",
@@ -112,15 +102,12 @@ class TestCleanupStateTransitions:
         registry.release_conversation(conv_id, "success")
         registry.start_cleanup(conv_id)
 
-        # First failure
         registry.mark_cleanup_failed(conv_id, error_code="timeout")
 
-        # Retry: start cleanup again
         result = registry.start_cleanup(conv_id)
         assert result["status"] == "deleting"
         assert result["cleanup_attempt_count"] == 1
 
-        # Mark deleted on retry
         result = registry.mark_conversation_deleted(conv_id)
         assert result["status"] == "deleted"
         assert result["cleanup_attempt_count"] == 2  # Incremented on success
@@ -131,11 +118,9 @@ class TestCleanupStateTransitions:
         registry.create_conversation(conv_id, "https://chatgpt.com/c/test", "keep")
         registry.release_conversation(conv_id, "success")
 
-        # Should be RETAINED, not DELETE_PENDING
         state = registry.get_conversation_lifecycle(conv_id)
         assert state["status"] == "retained"
 
-        # start_cleanup should fail
         with pytest.raises(ValueError, match="Cannot start cleanup"):
             registry.start_cleanup(conv_id)
 
@@ -145,7 +130,6 @@ class TestCleanupStateTransitions:
         registry.create_conversation(conv_id, "https://chatgpt.com/c/test", "delete_on_success")
         registry.release_conversation(conv_id, "failure")
 
-        # Should be RETAINED despite DELETE_ON_SUCCESS policy
         state = registry.get_conversation_lifecycle(conv_id)
         assert state["status"] == "retained"
 
@@ -157,19 +141,16 @@ class TestCleanupStateTransitions:
 
         assert registry.get_conversation_lifecycle(conv_id)["cleanup_attempt_count"] == 0
 
-        # Attempt 1: fail
         registry.start_cleanup(conv_id)
         registry.mark_cleanup_failed(conv_id, error_code="timeout")
         state = registry.get_conversation_lifecycle(conv_id)
         assert state["cleanup_attempt_count"] == 1
 
-        # Attempt 2: fail
         registry.start_cleanup(conv_id)
         registry.mark_cleanup_failed(conv_id, error_code="timeout")
         state = registry.get_conversation_lifecycle(conv_id)
         assert state["cleanup_attempt_count"] == 2
 
-        # Attempt 3: success
         registry.start_cleanup(conv_id)
         registry.mark_conversation_deleted(conv_id)
         state = registry.get_conversation_lifecycle(conv_id)
@@ -178,8 +159,6 @@ class TestCleanupStateTransitions:
 
 
 class TestCleanupErrorScenarios:
-    """Test error handling in cleanup state transitions."""
-
     def test_start_cleanup_on_retained_fails(self, registry):
         """start_cleanup on RETAINED conversation fails."""
         conv_id = str(uuid4())
@@ -199,7 +178,6 @@ class TestCleanupErrorScenarios:
         conv_id = str(uuid4())
         registry.create_conversation(conv_id, "https://chatgpt.com/c/test", "delete_on_success")
 
-        # Still ACTIVE, should fail
         with pytest.raises(ValueError):
             registry.mark_conversation_deleted(conv_id)
 
@@ -219,8 +197,6 @@ class TestCleanupErrorScenarios:
 
 
 class TestCleanupInvariants:
-    """Test critical invariants from spec."""
-
     def test_invariant_only_success_triggers_cleanup(self, registry):
         """Only SUCCESS outcome can lead to cleanup states."""
         for outcome in ["failure", "needs_review", "cancelled"]:
@@ -248,14 +224,11 @@ class TestCleanupInvariants:
         registry.create_conversation(conv_id, "https://chatgpt.com/c/test", "delete_on_success")
         registry.release_conversation(conv_id, "success")
         registry.start_cleanup(conv_id)
-
-        # Record failure
         registry.mark_cleanup_failed(conv_id, error_code="timeout")
 
-        # Query status
         state = registry.get_conversation_lifecycle(conv_id)
-        assert state["release_outcome"] == "success"  # Original outcome unchanged
-        assert state["status"] == "cleanup_failed"  # But cleanup failed
+        assert state["release_outcome"] == "success"
+        assert state["status"] == "cleanup_failed"
 
     def test_invariant_release_idempotent(self, registry):
         """Calling release twice is idempotent."""

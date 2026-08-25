@@ -1,8 +1,3 @@
-/**
- * Production Artifact Viewer
- * Displays references, extraction, synthesis, or brief artifacts
- */
-
 import { useQuery } from "@tanstack/react-query";
 import {
   getReferencesArtifact,
@@ -232,7 +227,6 @@ export function ProductionArtifactView({
       {stage !== "brief" && artifact.rendered_content && (
         <div className="artifact-content">
           <div className="rendered-markdown">
-            {/* Render as HTML/Markdown - would need a markdown parser */}
             <pre>{artifact.rendered_content}</pre>
           </div>
         </div>

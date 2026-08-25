@@ -153,7 +153,6 @@ class SqlAlchemyProductionArtifactRepository:
         return [_production_artifact_from_row(row) for row in result.scalars()]
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
-        # Get stage ordering
         stages = [
             ProductionArtifactStage.REFERENCES.value,
             ProductionArtifactStage.EXTRACTION.value,

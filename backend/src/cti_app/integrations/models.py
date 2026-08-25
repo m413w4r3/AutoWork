@@ -719,7 +719,6 @@ def _responses_result(
             actual_model_version=requested_model,
             response_id=response_id,
             usage=_usage(raw.get("usage")),
-            # metadata={"background_status": status},
             metadata={
                 "background_status": status,
                 "bridge_progress": (

@@ -1,5 +1,3 @@
-"""API endpoints for subject production workflow."""
-
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
@@ -40,35 +38,17 @@ router = APIRouter(prefix="/api", tags=["production"])
 _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 
 
-# Request Models
-
-
 class StartSubjectProductionRequest(BaseModel):
-    """Body for starting a single subject production.
-
-    The edition is resolved from the subject's editorial group, so callers only
-    need to know the subject id.
-    """
-
+    # Edition is resolved from the subject's editorial group, so no edition_id here.
     profile: ProductionProfile = ProductionProfile.BRIEF_AUTO
 
 
 class StartEditionProductionRequest(BaseModel):
-    """Body for starting a batch production.
-
-    When ``subject_ids`` is omitted, every selected brief of the edition is
-    produced. When provided, only those subjects are produced.
-    """
-
+    # subject_ids omitted -> every selected brief of the edition is produced; else only these.
     subject_ids: list[UUID] | None = None
 
 
-# Response Models
-
-
 class StageStatus(BaseModel):
-    """Status of a production stage."""
-
     status: str  # pending, running, succeeded, needs_review, failed
     version: int | None = None
     error_code: str | None = None
@@ -76,8 +56,6 @@ class StageStatus(BaseModel):
 
 
 class ProductionStatus(BaseModel):
-    """Complete production status for a subject."""
-
     subject_id: str
     title: str
     editorial_type: str
@@ -96,8 +74,7 @@ class ProductionStatus(BaseModel):
 
 
 class BatchItemDetail(BaseModel):
-    """One subject inside a batch, so the UI can show 1/23 with names."""
-
+    # Lets the UI show "1/23" with names.
     position: int
     subject_id: str
     title: str
@@ -107,8 +84,6 @@ class BatchItemDetail(BaseModel):
 
 
 class BatchStatus(BaseModel):
-    """Batch production status."""
-
     batch_id: str
     edition_id: str
     profile: str
@@ -179,15 +154,8 @@ async def start_subject_production(
     body: StartSubjectProductionRequest | None = None,
     user: str = "system",
 ) -> dict[str, Any]:
-    """Start production of a subject.
-
-    Profile options:
-    - brief_auto: Full automatic production pipeline
-    - major_assisted: Not yet implemented
-
-    The edition is resolved from the subject's editorial group.
-    Returns the production run.
-    """
+    # brief_auto: full automatic pipeline. major_assisted: not yet implemented.
+    # Edition is resolved from the subject's editorial group.
     payload = body or StartSubjectProductionRequest()
     profile = payload.profile
 
@@ -265,15 +233,10 @@ async def get_subject_production(
     subject_id: UUID,
     request: Request,
 ) -> ProductionStatus:
-    """Get complete production status for a subject.
-
-    Returns 404 when the subject has no production run yet — that is the
-    signal the UI uses to offer "start production".
-    """
+    # 404 here is the signal the UI uses to offer "start production".
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
-        # Get current run
         run = await uow.subject_production_runs.get_current_for_subject(subject_id)
         if not run:
             raise HTTPException(
@@ -319,11 +282,6 @@ async def retry_references(
     subject_id: UUID,
     request: Request,
 ) -> dict[str, Any]:
-    """Retry references generation for a subject.
-
-    Archives the old conversation and creates a new one.
-    Automatically regenerates extraction and synthesis.
-    """
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
@@ -340,9 +298,7 @@ async def retry_references(
                 detail=f"Can only retry from READY status, current is {run.status.value}",
             )
 
-        # Archive old conversation (implementation would go here)
-        # Create new conversation
-        # Reset to SOURCES stage
+        # TODO: archive old conversation and create a new one; currently only resets stage.
         run.current_stage = SubjectProductionStage.SOURCES
         run.conversation_id = None
         await uow.subject_production_runs.save(run)
@@ -360,11 +316,7 @@ async def retry_synthesis(
     subject_id: UUID,
     request: Request,
 ) -> dict[str, Any]:
-    """Retry synthesis generation for a subject.
-
-    Uses the same conversation and references/extraction.
-    Only regenerates synthesis and brief.
-    """
+    # Reuses the existing conversation and references/extraction; regenerates only synthesis+brief.
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
@@ -381,11 +333,9 @@ async def retry_synthesis(
                 detail=f"Can only retry from READY status, current is {run.status.value}",
             )
 
-        # Reset to SYNTHESIS stage
         run.current_stage = SubjectProductionStage.SYNTHESIS
         await uow.subject_production_runs.save(run)
 
-        # Mark brief as stale
         await uow.production_artifacts.mark_downstream_stale(
             run.id, SubjectProductionStage.SYNTHESIS.value
         )
@@ -404,7 +354,6 @@ async def cancel_production(
     subject_id: UUID,
     request: Request,
 ) -> dict[str, Any]:
-    """Cancel production for a subject."""
     uow_factory, _, _ = _runtime(request)
     service = SubjectProductionService(uow_factory)
 
@@ -463,31 +412,25 @@ async def _artifact_view(
 
 @router.get("/subjects/{subject_id}/production/artifacts/references")
 async def get_references_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
-    """Get the current references artifact for a subject."""
     return await _artifact_view(request, subject_id, "references")
 
 
 @router.get("/subjects/{subject_id}/production/artifacts/extraction")
 async def get_extraction_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
-    """Get the current extraction artifact for a subject."""
     return await _artifact_view(request, subject_id, "extraction")
 
 
 @router.get("/subjects/{subject_id}/production/artifacts/synthesis")
 async def get_synthesis_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
-    """Get the current synthesis artifact for a subject."""
     return await _artifact_view(request, subject_id, "synthesis")
 
 
 @router.get("/subjects/{subject_id}/production/artifacts/brief")
 async def get_brief_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
-    """Get the current brief artifact for a subject."""
     return await _artifact_view(request, subject_id, "brief")
 
 
 class SaveBriefDraftRequest(BaseModel):
-    """Request to save a brief draft."""
-
     content: str
 
 
@@ -497,10 +440,6 @@ async def save_brief_draft(
     request: Request,
     body: SaveBriefDraftRequest,
 ) -> dict[str, Any]:
-    """Save a draft version of the brief before final assembly.
-
-    The draft is stored as metadata in the brief artifact for later retrieval.
-    """
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
@@ -543,10 +482,6 @@ async def save_brief_draft(
 
 @router.get("/subjects/{subject_id}/production/brief/draft")
 async def get_brief_draft(subject_id: UUID, request: Request) -> dict[str, Any]:
-    """Get the current draft version of the brief.
-
-    Returns the draft content stored in the brief artifact metadata.
-    """
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
@@ -573,9 +508,6 @@ async def get_brief_draft(subject_id: UUID, request: Request) -> dict[str, Any]:
         }
 
 
-# Edition Production Endpoints
-
-
 @router.post("/editions/{edition_id}/production/briefs")
 async def start_edition_brief_production(
     edition_id: UUID,
@@ -583,19 +515,12 @@ async def start_edition_brief_production(
     body: StartEditionProductionRequest | None = None,
     user: str = "system",
 ) -> BatchStatus:
-    """Start batch production of selected briefs in an edition.
-
-    Without a body (or with ``subject_ids: null``) every selected brief is
-    produced. With ``subject_ids`` only that subset is produced.
-
-    Idempotent: returns existing active batch if one exists.
-    """
+    # Idempotent: returns the existing active batch if one exists.
     payload = body or StartEditionProductionRequest()
     uow_factory, jobs, dispatcher = _runtime(request)
     service = EditionProductionService(uow_factory)
 
     async with uow_factory() as uow:
-        # Check if active batch exists
         active_batch = await uow.edition_production_batches.get_active_for_edition(edition_id)
         if active_batch:
             items = await uow.edition_production_batch_items.list_for_batch(active_batch.id)
@@ -616,7 +541,6 @@ async def start_edition_brief_production(
                 else None,
             )
 
-        # Determine which subjects to produce
         groups = await uow.editorial_groups.list_for_edition(edition_id)
         eligible_order = _eligible_brief_subject_ids(groups)
 
@@ -645,8 +569,8 @@ async def start_edition_brief_production(
             subject_ids=subject_ids,
         )
 
-        # create_batch already created a run per subject and linked the batch
-        # items to them; start_next promotes the first one to RUNNING.
+        # create_batch already made a run per subject and linked items to them;
+        # start_next promotes the first one to RUNNING.
         first_run = await service.start_next(batch.id)
         if first_run is not None:
             parameters = ProductionStageParameters(
@@ -691,11 +615,7 @@ async def get_edition_brief_production(
     edition_id: UUID,
     request: Request,
 ) -> BatchStatus:
-    """Get the status of batch production for an edition.
-
-    Returns 404 when no batch exists yet — that is the signal the UI uses to
-    offer "produce all briefs".
-    """
+    # 404 here is the signal the UI uses to offer "produce all briefs".
     uow_factory, _, _ = _runtime(request)
     service = EditionProductionService(uow_factory)
 
@@ -707,10 +627,8 @@ async def get_edition_brief_production(
                 detail=f"No batch found for edition {edition_id}",
             )
 
-        # Get batch items
         items = await uow.edition_production_batch_items.list_for_batch(batch.id)
 
-        # Count statuses
         completed = 0
         needs_review = 0
         failed = 0
@@ -771,7 +689,6 @@ async def cancel_edition_batch(
     batch_id: UUID,
     request: Request,
 ) -> dict[str, Any]:
-    """Cancel a batch production for an edition."""
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:

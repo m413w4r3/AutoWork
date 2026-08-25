@@ -1,7 +1,3 @@
-/**
- * Shared fetch stubs for component tests.
- */
-
 type FetchHandler = (
   input: RequestInfo | URL,
   init?: RequestInit,

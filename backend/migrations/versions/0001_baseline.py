@@ -4,19 +4,13 @@ Revision ID: 0001_baseline
 Revises:
 Create Date: 2026-08-22
 
-This migration creates the complete current schema on an empty database.
-It is the only migration in the chain: there is no prior revision to build
-on, no legacy dataset to backfill, and no compatibility mode to support.
+Only migration in the chain (no prior revision, no legacy data, no compat mode).
 
-A few columns use inconsistent types by design (unnamed vs. named
-constraints, JSON vs. JSONB, uuid[] vs. JSONB in different tables). These
-are intentional properties of the current schema, not bugs to fix without
-a dedicated migration.
+Some columns use inconsistent types by design (unnamed vs named constraints,
+JSON vs JSONB, uuid[] vs JSONB across tables) — intentional, not bugs.
 
-Tables are created in an order chosen to satisfy foreign keys directly
-wherever possible. Three foreign keys are genuinely circular (each side
-needs the other table to exist first) and are therefore added via a
-deferred ``ALTER TABLE`` after both sides exist:
+Table creation order satisfies FKs directly except three genuinely circular
+pairs, added via deferred ``ALTER TABLE`` after both sides exist:
 
 - ``source_collections.latest_attempt_id`` <-> ``collection_attempts.collection_id``
 - ``discovery_merge_runs.parent_snapshot_id`` <-> ``discovery_snapshots.merge_run_id``

@@ -58,8 +58,6 @@ class RecoveryPreviewView(BaseModel):
 
 
 class DiscoveryImportRequest(BaseModel):
-    """Import d'une réponse ChatGPT existante (Markdown)."""
-
     model_config = ConfigDict(extra="forbid")
 
     markdown: str = Field(min_length=1, max_length=10_000_000)
@@ -73,25 +71,18 @@ class DiscoveryImportRequest(BaseModel):
 
 
 class DiscoveryImportConfirmation(DiscoveryImportRequest):
-    """Confirmation d'import avec hash de vérification."""
-
     expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class DiscoveryImportConfirmView(BaseModel):
-    """Résultat de l'import d'une réponse ChatGPT."""
-
     batch_id: UUID
     reused: bool
     source_mode: Literal["manual_import"]
     subject_count: int
     publication_count: int
-    # Consolidation into subjects happens in an async job dispatched right
-    # after this call returns. None when reused=True (already consolidated
-    # by an earlier confirm of the same content). The caller should poll
-    # this job and only refresh the discovery state once it is terminal —
-    # refreshing immediately races the job and can show 0 consolidated
-    # subjects for a report that only contributed one candidate.
+    # Consolidation runs async after this call returns; None when reused=True (already
+    # consolidated by an earlier confirm). Poll this job and refresh only once terminal —
+    # refreshing immediately races it and can show 0 consolidated subjects.
     reconciliation_job_id: UUID | None = None
 
 
@@ -241,10 +232,7 @@ async def request_completion_recovery(
 async def preview_discovery_import(
     edition_id: UUID, payload: DiscoveryImportRequest, request: Request
 ) -> RecoveryPreviewView:
-    """Prévisualiser l'import d'une réponse ChatGPT Markdown existante.
-
-    Ne persiste rien : permet à l'utilisateur de vérifier avant de confirmer.
-    """
+    # Persists nothing; lets the caller verify before confirming.
     service: DiscoveryService = request.app.state.discovery_service
     try:
         edition = await request.app.state.edition_service.get(edition_id)
@@ -271,10 +259,7 @@ async def preview_discovery_import(
 async def confirm_discovery_import(
     edition_id: UUID, payload: DiscoveryImportConfirmation, request: Request
 ) -> DiscoveryImportConfirmView:
-    """Confirmer et archiver l'import d'une réponse ChatGPT Markdown.
-
-    Crée un ModelRun synthétique et un DiscoveryBatch source_mode=manual_import.
-    """
+    # Creates a synthetic ModelRun and a DiscoveryBatch with source_mode=manual_import.
     service: DiscoveryService = request.app.state.discovery_service
     provider: IdentityProvider = request.app.state.identity_provider
     try:
@@ -354,12 +339,6 @@ async def _continue_after_recovery(
     actor_id: str,
     request: Request,
 ) -> Job:
-    """Poursuit le traitement après une récupération (visible ou manuelle).
-
-    Règles :
-    - WAITING_HUMAN : reprendre le job existant ;
-    - autre statut : retourner le job tel quel.
-    """
     jobs: JobService = request.app.state.job_service
     dispatcher: JobDispatcher = request.app.state.job_dispatcher
 

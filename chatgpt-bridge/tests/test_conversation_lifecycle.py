@@ -13,10 +13,8 @@ import pytest
 
 
 def test_bridge_conversations_table_created(tmp_path: Path) -> None:
-    """Test that bridge_conversations table is created on initialization."""
     db_path = tmp_path / "test.sqlite3"
 
-    # Simulate RunRegistry initialization
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path)
     db.row_factory = sqlite3.Row
@@ -47,7 +45,6 @@ def test_bridge_conversations_table_created(tmp_path: Path) -> None:
         """
     )
 
-    # Verify table exists
     tables = db.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='bridge_conversations'"
     ).fetchone()
@@ -56,7 +53,6 @@ def test_bridge_conversations_table_created(tmp_path: Path) -> None:
 
 
 def test_create_conversation_stores_in_db(tmp_path: Path) -> None:
-    """Test creating a conversation stores it in SQLite."""
     db_path = tmp_path / "test.sqlite3"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path)
@@ -83,7 +79,6 @@ def test_create_conversation_stores_in_db(tmp_path: Path) -> None:
         """
     )
 
-    # Simulate create_conversation
     conversation_id = str(uuid4())
     external_locator = "https://chatgpt.com/c/abc123"
     policy = "delete_on_success"
@@ -99,7 +94,6 @@ def test_create_conversation_stores_in_db(tmp_path: Path) -> None:
     )
     db.commit()
 
-    # Verify it was stored
     row = db.execute(
         "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
     ).fetchone()
@@ -112,7 +106,6 @@ def test_create_conversation_stores_in_db(tmp_path: Path) -> None:
 
 
 def test_release_conversation_success_with_delete_on_success(tmp_path: Path) -> None:
-    """Test releasing a conversation with SUCCESS → DELETE_PENDING."""
     db_path = tmp_path / "test.sqlite3"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path)
@@ -142,7 +135,6 @@ def test_release_conversation_success_with_delete_on_success(tmp_path: Path) -> 
     conversation_id = str(uuid4())
     now = time.time()
 
-    # Create conversation
     db.execute(
         """
         INSERT INTO bridge_conversations
@@ -152,7 +144,6 @@ def test_release_conversation_success_with_delete_on_success(tmp_path: Path) -> 
         (conversation_id, "https://chatgpt.com/c/abc", "delete_on_success", now, now),
     )
 
-    # Release with SUCCESS
     db.execute(
         """
         UPDATE bridge_conversations
@@ -163,7 +154,6 @@ def test_release_conversation_success_with_delete_on_success(tmp_path: Path) -> 
     )
     db.commit()
 
-    # Verify state
     row = db.execute(
         "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
     ).fetchone()
@@ -175,7 +165,6 @@ def test_release_conversation_success_with_delete_on_success(tmp_path: Path) -> 
 
 
 def test_release_conversation_success_with_keep_policy(tmp_path: Path) -> None:
-    """Test releasing a conversation with SUCCESS + KEEP → RETAINED."""
     db_path = tmp_path / "test.sqlite3"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path)
@@ -205,7 +194,6 @@ def test_release_conversation_success_with_keep_policy(tmp_path: Path) -> None:
     conversation_id = str(uuid4())
     now = time.time()
 
-    # Create conversation with KEEP policy
     db.execute(
         """
         INSERT INTO bridge_conversations
@@ -215,7 +203,6 @@ def test_release_conversation_success_with_keep_policy(tmp_path: Path) -> None:
         (conversation_id, "https://chatgpt.com/c/abc", "keep", now, now),
     )
 
-    # Release with SUCCESS
     db.execute(
         """
         UPDATE bridge_conversations
@@ -226,7 +213,6 @@ def test_release_conversation_success_with_keep_policy(tmp_path: Path) -> None:
     )
     db.commit()
 
-    # Verify state
     row = db.execute(
         "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
     ).fetchone()
@@ -237,7 +223,6 @@ def test_release_conversation_success_with_keep_policy(tmp_path: Path) -> None:
 
 
 def test_release_conversation_failure_preserves(tmp_path: Path) -> None:
-    """Test releasing with FAILURE always preserves conversation."""
     db_path = tmp_path / "test.sqlite3"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path)
@@ -276,7 +261,6 @@ def test_release_conversation_failure_preserves(tmp_path: Path) -> None:
         (conversation_id, None, "delete_on_success", now, now),
     )
 
-    # Release with FAILURE
     db.execute(
         """
         UPDATE bridge_conversations
@@ -290,14 +274,13 @@ def test_release_conversation_failure_preserves(tmp_path: Path) -> None:
     row = db.execute(
         "SELECT * FROM bridge_conversations WHERE id=?", (conversation_id,)
     ).fetchone()
-    # Even though policy was DELETE_ON_SUCCESS, FAILURE preserves
+    # DELETE_ON_SUCCESS policy does not apply on FAILURE: conversation is preserved.
     assert row["status"] == "retained"
     assert row["release_outcome"] == "failure"
     db.close()
 
 
 def test_cleanup_failure_increments_attempt_count(tmp_path: Path) -> None:
-    """Test that cleanup failures increment the attempt count."""
     db_path = tmp_path / "test.sqlite3"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path)
@@ -336,7 +319,6 @@ def test_cleanup_failure_increments_attempt_count(tmp_path: Path) -> None:
         (conversation_id, "https://chatgpt.com/c/abc", "delete_on_success", now, now),
     )
 
-    # Mark cleanup failed (first attempt)
     db.execute(
         """
         UPDATE bridge_conversations
@@ -358,7 +340,6 @@ def test_cleanup_failure_increments_attempt_count(tmp_path: Path) -> None:
 
 
 def test_mark_deleted_stores_timestamp(tmp_path: Path) -> None:
-    """Test that mark_deleted() records the deletion timestamp."""
     db_path = tmp_path / "test.sqlite3"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path)
@@ -398,7 +379,6 @@ def test_mark_deleted_stores_timestamp(tmp_path: Path) -> None:
         (conversation_id, "https://chatgpt.com/c/abc", "delete_on_success", created_at, created_at),
     )
 
-    # Mark deleted
     db.execute(
         """
         UPDATE bridge_conversations

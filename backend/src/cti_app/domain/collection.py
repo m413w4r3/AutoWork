@@ -68,8 +68,6 @@ class IndicatorKind(StrEnum):
 
 
 class SourceOriginKind(StrEnum):
-    """How a source came to be attached to a subject."""
-
     DISCOVERY = "discovery"
     REFERENCE_RESEARCH = "reference_research"
     MANUAL = "manual"

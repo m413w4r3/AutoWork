@@ -229,12 +229,9 @@ class ModelRun:
         actor_id: str,
         now: datetime | None = None,
     ) -> None:
-        """Clôture un run synthétique représentant un Markdown fourni par un humain.
-
-        Aucun modèle n'a été appelé : l'usage est marqué estimé et la provenance
-        est conservée dans ``error_details["recovery"]`` — nom historique, format
-        attendu par ``_has_recovery_provenance``.
-        """
+        """No model was called; usage is marked estimated. Provenance is stored under
+        error_details["recovery"] (legacy key name, format expected by
+        _has_recovery_provenance)."""
         if self.status is not ModelRunStatus.RUNNING:
             raise ValueError("A manual import can only complete a running run")
         timestamp = now or datetime.now(UTC)

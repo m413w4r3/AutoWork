@@ -240,14 +240,11 @@ def _provisional_ioc_payload(ioc: ProvisionalDiscoveryIoc) -> dict[str, object]:
 
 def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
     payload = row.payload
-    # Load candidates from payload
     candidates = [_candidate_from_payload(item) for item in payload["candidates"]]
 
-    # Load contribution metadata
     contributions_meta = payload["contributions_meta"]
     contrib_map = {UUID(m["candidate_id"]): m for m in contributions_meta}
 
-    # Reconstruct contributions from metadata
     contributions = []
     for candidate in candidates:
         meta = contrib_map[candidate.id]

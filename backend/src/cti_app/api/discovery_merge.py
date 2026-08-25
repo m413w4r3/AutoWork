@@ -37,8 +37,7 @@ class MergeRunView(BaseModel):
     warnings: list[str]
     plan: dict[str, object] | None
     projected_diff: list[dict[str, object]]
-    # Only populated on the single-run read: resolving handles costs a snapshot
-    # and a batch load, which the list view does not need.
+    # Populated only on single-run read (costs a snapshot + batch load); list view omits it.
     handle_labels: dict[str, MergeHandleLabelView] = Field(default_factory=dict)
     supersedes_merge_run_id: UUID | None
     created_at: datetime
@@ -152,8 +151,7 @@ def _merge_run_view(run: DiscoveryMergeRun) -> MergeRunView:
                         "incoming_candidate_handles": group.get("incoming_candidate_handles", []),
                         "disposition": group.get("disposition"),
                         "flags": group.get("flags", []),
-                        # A reviewer cannot accept or reject a grouping without
-                        # seeing why the planner proposed it.
+                        # Needed so a reviewer can judge why the planner proposed this grouping.
                         "confidence": group.get("confidence"),
                         "rationale": group.get("rationale", ""),
                         "evidence": group.get("evidence", {}),

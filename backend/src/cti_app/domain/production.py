@@ -10,15 +10,11 @@ from uuid import UUID, uuid4
 
 
 class ProductionProfile(StrEnum):
-    """Production workflow profile."""
-
     BRIEF_AUTO = "brief_auto"
     MAJOR_ASSISTED = "major_assisted"
 
 
 class SubjectProductionStatus(StrEnum):
-    """Status of a subject production run."""
-
     QUEUED = "queued"
     RUNNING = "running"
     READY = "ready"
@@ -28,8 +24,6 @@ class SubjectProductionStatus(StrEnum):
 
 
 class SubjectProductionStage(StrEnum):
-    """Stages of subject production."""
-
     SOURCES = "sources"
     REFERENCES = "references"
     EXTRACTION = "extraction"
@@ -38,8 +32,6 @@ class SubjectProductionStage(StrEnum):
 
 
 class ProductionArtifactStage(StrEnum):
-    """Stages that produce artifacts."""
-
     REFERENCES = "references"
     EXTRACTION = "extraction"
     SYNTHESIS = "synthesis"
@@ -47,8 +39,6 @@ class ProductionArtifactStage(StrEnum):
 
 
 class ProductionArtifactStatus(StrEnum):
-    """Status of a production artifact."""
-
     VERIFIED = "verified"
     STALE = "stale"
     NEEDS_REVIEW = "needs_review"
@@ -56,8 +46,6 @@ class ProductionArtifactStatus(StrEnum):
 
 @dataclass(slots=True, kw_only=True)
 class SubjectProductionRun:
-    """A single production run for a subject."""
-
     subject_id: UUID
     edition_id: UUID
     profile: ProductionProfile
@@ -83,7 +71,6 @@ class SubjectProductionRun:
             raise ValueError("run_number and version must be >= 1")
 
     def start_running(self, *, now: datetime | None = None) -> None:
-        """Mark run as starting execution."""
         if self.status is not SubjectProductionStatus.QUEUED:
             raise ValueError("Can only start from QUEUED status")
         self.status = SubjectProductionStatus.RUNNING
@@ -94,7 +81,6 @@ class SubjectProductionRun:
         self.version += 1
 
     def advance_stage(self, *, now: datetime | None = None) -> None:
-        """Advance to next stage."""
         stages = list(SubjectProductionStage)
         current_idx = stages.index(self.current_stage)
         if current_idx < len(stages) - 1:
@@ -103,7 +89,7 @@ class SubjectProductionRun:
         self.version += 1
 
     def mark_ready(self, *, now: datetime | None = None) -> None:
-        """Mark run as ready (assembly complete + QA passed)."""
+        """READY implies assembly complete and QA passed."""
         if self.status is SubjectProductionStatus.READY:
             return
         self.status = SubjectProductionStatus.READY
@@ -119,7 +105,6 @@ class SubjectProductionRun:
         details: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> None:
-        """Mark run as needing review."""
         self.status = SubjectProductionStatus.NEEDS_REVIEW
         self.error_code = code[:64]
         self.error_message = " ".join(message.replace("\x00", "").split())[:500]
@@ -136,7 +121,6 @@ class SubjectProductionRun:
         details: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> None:
-        """Mark run as failed."""
         self.status = SubjectProductionStatus.FAILED
         self.error_code = code[:64]
         self.error_message = " ".join(message.replace("\x00", "").split())[:500]
@@ -146,7 +130,6 @@ class SubjectProductionRun:
         self.version += 1
 
     def mark_cancelled(self, *, now: datetime | None = None) -> None:
-        """Mark run as cancelled."""
         self.status = SubjectProductionStatus.CANCELLED
         self.finished_at = now or datetime.now(UTC)
         self.updated_at = self.finished_at
@@ -181,8 +164,6 @@ class ProductionArtifact:
 
 @dataclass(slots=True, kw_only=True)
 class EditionProductionBatch:
-    """Batch of production runs for an edition."""
-
     edition_id: UUID
     profile: ProductionProfile
     status: str  # queued, running, completed, completed_with_issues, cancelled
@@ -204,7 +185,6 @@ class EditionProductionBatch:
             raise ValueError(f"Invalid status: {self.status}")
 
     def start(self, *, now: datetime | None = None) -> None:
-        """Mark batch as running."""
         if self.status != "queued":
             raise ValueError("Can only start from queued status")
         self.status = "running"
@@ -212,7 +192,6 @@ class EditionProductionBatch:
         self.version += 1
 
     def finish(self, *, completed_with_issues: bool = False, now: datetime | None = None) -> None:
-        """Mark batch as completed."""
         if self.status != "running":
             raise ValueError("Can only finish from running status")
         self.status = "completed_with_issues" if completed_with_issues else "completed"
@@ -220,7 +199,6 @@ class EditionProductionBatch:
         self.version += 1
 
     def cancel(self, *, now: datetime | None = None) -> None:
-        """Mark batch as cancelled."""
         self.status = "cancelled"
         self.finished_at = now or datetime.now(UTC)
         self.version += 1
@@ -228,8 +206,6 @@ class EditionProductionBatch:
 
 @dataclass(slots=True, kw_only=True)
 class EditionProductionBatchItem:
-    """Item in a production batch."""
-
     batch_id: UUID
     subject_id: UUID
     production_run_id: UUID

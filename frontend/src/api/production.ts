@@ -1,9 +1,5 @@
 import { ApiError } from "./editions";
 
-/**
- * Frontend API client for subject production workflow
- */
-
 export interface StageStatus {
   status:
     | "pending"
@@ -145,9 +141,6 @@ export async function getSubjectProduction(
   return requestOrNull(`/api/subjects/${subjectId}/production`);
 }
 
-/**
- * Retry references generation
- */
 export async function retryReferences(
   subjectId: string,
 ): Promise<{ status: string }> {
@@ -156,9 +149,6 @@ export async function retryReferences(
   });
 }
 
-/**
- * Retry synthesis generation
- */
 export async function retrySynthesis(
   subjectId: string,
 ): Promise<{ status: string }> {
@@ -167,9 +157,6 @@ export async function retrySynthesis(
   });
 }
 
-/**
- * Cancel subject production
- */
 export async function cancelSubjectProduction(
   subjectId: string,
 ): Promise<{ status: string }> {
@@ -178,45 +165,30 @@ export async function cancelSubjectProduction(
   });
 }
 
-/**
- * Get references artifact
- */
 export async function getReferencesArtifact(
   subjectId: string,
 ): Promise<ArtifactResponse> {
   return request(`/api/subjects/${subjectId}/production/artifacts/references`);
 }
 
-/**
- * Get extraction artifact
- */
 export async function getExtractionArtifact(
   subjectId: string,
 ): Promise<ArtifactResponse> {
   return request(`/api/subjects/${subjectId}/production/artifacts/extraction`);
 }
 
-/**
- * Get synthesis artifact
- */
 export async function getSynthesisArtifact(
   subjectId: string,
 ): Promise<ArtifactResponse> {
   return request(`/api/subjects/${subjectId}/production/artifacts/synthesis`);
 }
 
-/**
- * Get brief artifact
- */
 export async function getBriefArtifact(
   subjectId: string,
 ): Promise<ArtifactResponse> {
   return request(`/api/subjects/${subjectId}/production/artifacts/brief`);
 }
 
-/**
- * Save a draft version of the brief
- */
 export async function saveBriefDraft(
   subjectId: string,
   content: string,
@@ -228,9 +200,6 @@ export async function saveBriefDraft(
   });
 }
 
-/**
- * Get the current brief draft
- */
 export async function getBriefDraft(subjectId: string): Promise<{
   content: string;
   saved_at: string;

@@ -1,8 +1,3 @@
-/**
- * Subject Production Component
- * Displays production status and controls for a subject
- */
-
 import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   getSubjectProduction,
@@ -44,7 +39,6 @@ export function SubjectProduction({
   subjectId,
   onClose,
 }: SubjectProductionProps) {
-  // Fetch production status
   const {
     data: status,
     isLoading,
@@ -61,7 +55,6 @@ export function SubjectProduction({
     },
   });
 
-  // Mutations
   const retryReferencesMutation = useMutation({
     mutationFn: () => retryReferences(subjectId),
     onSuccess: () => refetch(),

@@ -246,8 +246,6 @@ class CandidateTopic:
 
 @dataclass(slots=True)
 class DiscoveryContribution:
-    """One CandidateTopic with contribution metadata for temporal tracking."""
-
     candidate: CandidateTopic
     status: ContributionStatus
     created_at: datetime

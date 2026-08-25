@@ -113,19 +113,14 @@ class ProvisionalIocView(BaseModel):
     proposed_type: DiscoveryIocType
     status: Literal["provisional_visible"]
     publication_refs: list[str]
-    # `publication_refs` alone is ambiguous once several research batches are
-    # consolidated: local_ref (e.g. "P3") is only unique within its own
-    # batch, so two different sources in a merged candidate can share the
-    # same ref. `publication_ids` pairs each relation with the surviving
-    # SourceCandidate.id (stable across merges via remap_ioc_publication_ids)
-    # so a consumer can attach IOCs to the correct source unambiguously.
+    # local_ref (e.g. "P3") is unique only within its own batch, so it collides across
+    # merged candidates; publication_ids pairs each relation with the surviving
+    # SourceCandidate.id (stable across merges via remap_ioc_publication_ids) instead.
     publication_ids: list[UUID]
     warnings: list[str]
 
 
 class CandidateReferenceView(BaseModel):
-    """Reference to a candidate in a batch, used for consolidation tracking."""
-
     batch_id: UUID
     candidate_id: UUID
 
@@ -193,7 +188,6 @@ class CandidateView(BaseModel):
     selectable: bool
     valid_publication_count: int
     incomplete_publication_count: int
-    # Provenance du sujet cumulatif.
     member_references: list[CandidateReferenceView] = Field(default_factory=list)
     contribution_count: int = Field(
         default=1, description="Number of batches contributing to this candidate"
@@ -332,8 +326,7 @@ async def read_candidates(
     )
     snapshot = await cumulative.active_snapshot(edition_id) if cumulative is not None else None
     if snapshot is not None:
-        # Nominal path: this is a read-only projection of the already materialized
-        # cumulative state. No consolidation or merge occurs in this GET.
+        # Read-only projection of already-materialized state; no consolidation/merge here.
         consolidated = []
         for subject in snapshot.subjects:
             candidate = deepcopy(subject.candidate)
@@ -348,20 +341,17 @@ async def read_candidates(
     else:
         consolidated = []
 
-    # Track raw stats before filtering
     raw_batch_count = len(active_batches)
     raw_candidate_count = sum(len(batch.candidates) for batch in active_batches)
     unique_publication_count = sum(len(cand.sources) for cand in consolidated)
     total_duplicate_count = sum(cand.duplicate_publication_count for cand in consolidated)
 
-    # Apply filters to consolidated candidates
     filtered: list[
         tuple[CandidateTopic, list[CandidateReferenceView], int, int, tuple[str, ...]]
     ] = []
     for cand in consolidated:
         candidate = cand.representative
 
-        # Search filter
         if search:
             needle = search.casefold()
             if (
@@ -370,16 +360,13 @@ async def read_candidates(
             ):
                 continue
 
-        # Technical potential filter
         if candidate.technical_potential < min_technical_potential:
             continue
 
-        # Source status filter
         if source_status is not None:
             if not any(source.verification_status is source_status for source in candidate.sources):
                 continue
 
-        # Add to filtered list
         filtered.append(
             (
                 candidate,
@@ -393,7 +380,6 @@ async def read_candidates(
             )
         )
 
-    # Sort
     key = {
         "newest": lambda item: (item[0].event_date or date.min, item[0].title.casefold()),
         "technical": lambda item: (item[0].technical_potential, item[0].title.casefold()),
@@ -402,7 +388,6 @@ async def read_candidates(
     }[sort]
     ordered = sorted(filtered, key=key, reverse=sort != "title")
 
-    # Build candidate views
     candidate_views = [
         _candidate_view(candidate, references, contribution_count, dup_count, merge_warnings)
         for candidate, references, contribution_count, dup_count, merge_warnings in ordered
@@ -525,12 +510,8 @@ def _discovery_parameters_from_edition(
     exclusions: list[str] | None = None,
     research_nonce: UUID | None = None,
 ) -> DiscoverEditionParameters:
-    """Construit les paramètres de découverte à partir d'une édition.
-
-    Point unique utilisé par le lancement d'une recherche, le retraitement et
-    les deux endpoints d'import, pour que le périmètre (pays, période, langues,
-    profil de sources) soit identique quel que soit le chemin emprunté.
-    """
+    # Single source of truth shared by launch, retry and both import endpoints so the scope
+    # (country, period, languages, source profile) stays identical across all entry points.
     aliases = list(dict.fromkeys([edition.country, edition.country_code, *(country_aliases or [])]))
     return DiscoverEditionParameters(
         edition_id=edition.id,
@@ -557,20 +538,11 @@ def _candidate_view(
     duplicate_publication_count: int = 0,
     merge_warnings: Sequence[str] | None = None,
 ) -> CandidateView:
-    """Build a CandidateView with consolidation tracking.
-
-    Args:
-        candidate: The representative candidate
-        member_references: All member candidates of the cluster, oldest contribution first
-        contribution_count: Number of batches contributing to this candidate
-        duplicate_publication_count: Number of duplicate URLs merged
-        merge_warnings: Metadata conflict warnings
-    """
+    # member_references, when given, lists cluster members oldest contribution first.
     type_counts: dict[str, int] = {}
     for ioc in candidate.provisional_iocs:
         type_counts[ioc.proposed_type.value] = type_counts.get(ioc.proposed_type.value, 0) + 1
 
-    # Use first member reference's batch_id if available, else candidate's own id
     batch_id = member_references[0].batch_id if member_references else candidate.id
 
     return CandidateView(
@@ -611,7 +583,6 @@ def _candidate_view(
         selectable=candidate.selectable,
         valid_publication_count=len(candidate.sources),
         incomplete_publication_count=len(candidate.incomplete_sources),
-        # Consolidation tracking
         member_references=member_references or [],
         contribution_count=contribution_count,
         duplicate_publication_count=duplicate_publication_count,

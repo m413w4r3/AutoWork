@@ -1,7 +1,3 @@
-/**
- * One stage of the production pipeline, as a compact status chip.
- */
-
 interface ProductionStageCardProps {
   stage: string;
   status: string;

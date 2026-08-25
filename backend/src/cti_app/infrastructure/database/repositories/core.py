@@ -1,11 +1,6 @@
-"""Repositories for the core aggregates: Blob, Subject, SourceDocument, Sample,
-Provenance (RF-P3 / R09).
-
-These are the foundational entities referenced by every other bounded
-context (subjects, blobs, source documents, samples, provenance events).
-This module owns their SqlAlchemy repositories and the row/domain mappers
-exclusive to them.
-"""
+"""RF-P3/R09: repositories for Blob, Subject, SourceDocument, Sample, Provenance —
+foundational entities every other bounded context references. Owns the only
+row/domain mappers for these rows."""
 
 from collections.abc import Sequence
 from uuid import UUID

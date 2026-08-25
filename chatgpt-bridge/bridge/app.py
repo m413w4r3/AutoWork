@@ -162,17 +162,15 @@ class BridgeApplication:
         self.registry.recover_interrupted()
         self.registry.cleanup()
 
-        # Initialiser le cleanup worker et le sweeper
         self.cleanup_worker = CleanupWorker(self.registry, self.bridge)
         self.conversation_sweeper = ConversationSweeper(self.registry, self.cleanup_worker)
 
-        # Lancer le sweep initial (reprendre après restart)
+        # Reprend les DELETE_PENDING laissés par un arrêt précédent.
         try:
             await self.conversation_sweeper.sweep()
         except Exception as e:
             logger.error(f"Initial cleanup sweep failed: {e}", exc_info=True)
 
-        # Lancer la tâche de retry périodique
         sweep_task = asyncio.create_task(self._periodic_cleanup_retry(self.conversation_sweeper))
 
         configuration = self._configuration_state()
@@ -195,10 +193,9 @@ class BridgeApplication:
             await self.shutdown_bridge()
 
     async def _periodic_cleanup_retry(self, sweeper: ConversationSweeper):
-        """Retry périodique des CLEANUP_FAILED."""
         while True:
             try:
-                await asyncio.sleep(300)  # Chaque 5 minutes
+                await asyncio.sleep(300)
                 await sweeper.retry_failed()
             except asyncio.CancelledError:
                 break

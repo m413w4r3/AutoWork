@@ -51,10 +51,8 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
         </div>
       </div>
 
-      {/* Main workflow: SubjectProduction */}
       <SubjectProduction subjectId={subjectId} />
 
-      {/* Advanced features */}
       <details className="advanced-workbench">
         <summary>Sources brutes & Outils avancés</summary>
         <p className="verification-warning" role="note">

@@ -41,7 +41,6 @@ _KNOWN_TOPIC_FIELDS = {
     "technical_potential_reason",
     "artifacts",
     "uncertainties",
-    # NEW — Patch 2: structured entity fields
     "actors",
     "campaigns",
     "malware",
@@ -262,27 +261,18 @@ def _parse_current(
 
 
 def _extract_structured_list(value: str) -> tuple[str, ...]:
-    """Extract items from a structured list field (YAML-like format).
-
-    Handles:
-    - bullet lists: "- item1\\n- item2"
-    - comma/semicolon separated: "item1, item2; item3"
-    - multiline YAML
-    """
     if not value:
         return ()
     items: list[str] = []
     for line in value.splitlines():
-        # Remove bullet points and leading whitespace
         cleaned = re.sub(r"^\s*[-*]\s+", "", line).strip()
         if cleaned:
-            # Split by common separators
             parts = re.split(r"[,;|]", cleaned)
             for part in parts:
                 part = part.strip()
                 if part and _normalize_enum(part) not in {"none", "unknown"}:
                     items.append(part)
-    return tuple(dict.fromkeys(items))  # Deduplicate while preserving order
+    return tuple(dict.fromkeys(items))
 
 
 def _parse_fields(lines: list[str]) -> tuple[dict[str, str], list[str]]:
@@ -340,12 +330,10 @@ def _candidate(
     ) or ("unknown",)
     uncertainties = tuple(_split_list(fields.get("uncertainties", "")))
 
-    # NEW — Patch 2: Extract structured entities if present
     actors = _extract_structured_list(fields.get("actors", ""))
     campaigns = _extract_structured_list(fields.get("campaigns", ""))
     malware = _extract_structured_list(fields.get("malware", ""))
 
-    # Fallback: if no structured actors, use actor_or_campaign
     if not actors and actor.casefold() != "unknown":
         actors = (actor,)
 

@@ -404,7 +404,6 @@ def test_real_chatgpt_answer_is_parsed() -> None:
     assert first.publisher == "Recorded Future / Insikt Group"
     assert first.published_at == date(2026, 7, 1)
     assert first.role is SourceRole.PRIMARY
-    # The event keeps all three sources.
     assert len(result.value.events[0].source_ids) == 3
 
 
@@ -448,7 +447,6 @@ def test_answer_delivered_by_the_bridge_is_parsed() -> None:
 
     assert len(report.events) == 6
     assert report.events[0].event_date == date(2026, 3, 7)
-    # An event may rest on several sources.
     assert report.events[4].source_ids == ("S1", "S2")
     assert len(report.uncertainties) == 4
 

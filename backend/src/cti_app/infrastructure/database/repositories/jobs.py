@@ -1,8 +1,4 @@
-"""Repositories for the Jobs bounded context (R10).
-
-This module owns the SqlAlchemy repositories for Job and JobEvent aggregates,
-along with their exclusive row/domain mappers and helper functions.
-"""
+"""R10: Jobs bounded context repositories (Job, JobEvent)."""
 
 from collections.abc import Sequence
 from datetime import datetime

@@ -129,10 +129,7 @@ class ProductionWorkflowOrchestrator:
         context: JobExecutionContext | None = None,
         correlation_id: str = "-",
     ) -> dict[str, Any]:
-        """Execute a single production stage.
-
-        Idempotent: if stage is already complete, returns cached result.
-        """
+        """Idempotent: if stage is already complete, returns cached result."""
         self._correlation_id = correlation_id
 
         # Read the run without locking it. A stage spans a full model
@@ -175,11 +172,8 @@ class ProductionWorkflowOrchestrator:
     def _handle_stage_exception(
         self, run: SubjectProductionRun, stage: str, exc: Exception
     ) -> dict[str, Any]:
-        """Record exception traceback in diagnostics and return error result.
-
-        Ensures the original exception's full traceback is preserved for debugging
-        while still returning a safe error result to the stage caller.
-        """
+        """Preserves the original exception's traceback in diagnostics before
+        converting it to a safe error result for the caller."""
         self._diagnostics.record_failure(
             event="stage.exception",
             run_id=run.id,
@@ -418,7 +412,6 @@ class ProductionWorkflowOrchestrator:
     async def _open_conversation(
         self, run: SubjectProductionRun, subject_title: str
     ) -> ModelConversation:
-        """Open the dedicated ChatGPT conversation for this subject."""
         assert self._model_service is not None
         return await self._model_service.create(
             provider=ModelProvider.OPENAI,
@@ -434,11 +427,8 @@ class ProductionWorkflowOrchestrator:
     async def _execute_sources_stage(
         self, run: SubjectProductionRun, context: JobExecutionContext | None = None
     ) -> dict[str, Any]:
-        """Execute the sources stage (no LLM).
-
-        Pulls the publications retained at discovery, deduplicates them by
-        canonical URL, downloads and archives them into the subject workspace.
-        """
+        """No LLM. Pulls publications retained at discovery, dedupes by canonical
+        URL, downloads and archives them into the subject workspace."""
         if self._collection_service is None:
             return {
                 "stage": "sources",
@@ -484,10 +474,6 @@ class ProductionWorkflowOrchestrator:
     async def _execute_references_stage(
         self, run: SubjectProductionRun, context: JobExecutionContext | None = None
     ) -> dict[str, Any]:
-        """Execute references research stage.
-
-        Calls LLM to conduct web research and build timeline.
-        """
         if not self._model_service:
             return {
                 "stage": "references",
@@ -510,7 +496,6 @@ class ProductionWorkflowOrchestrator:
                     "error": "Diffusion policy forbids sending this subject to an external model",
                 }
 
-            # Prepare input for hashing
             input_data = {
                 "subject_id": str(run.subject_id),
                 "title": subject_title,
@@ -521,7 +506,6 @@ class ProductionWorkflowOrchestrator:
             }
             input_hash = compute_input_hash(input_data)
 
-            # Check if we already have artifact with same hash
             existing = await uow.production_artifacts.get_current(run.id, "references")
             if existing and existing.input_hash == input_hash:
                 return {
@@ -622,10 +606,6 @@ class ProductionWorkflowOrchestrator:
             }
 
     async def _execute_extraction_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
-        """Execute CTI extraction stage.
-
-        Calls LLM to extract technical intelligence from references.
-        """
         if not self._model_service:
             return {
                 "stage": "extraction",
@@ -634,7 +614,6 @@ class ProductionWorkflowOrchestrator:
             }
 
         async with self._uow_factory() as uow:
-            # Get references artifact
             references = await uow.production_artifacts.get_current(run.id, "references")
             if not references:
                 return {
@@ -643,7 +622,6 @@ class ProductionWorkflowOrchestrator:
                     "error": "References artifact not found",
                 }
 
-            # Prepare input for hashing
             input_data = {
                 "subject_id": str(run.subject_id),
                 "references_version": references.version,
@@ -680,7 +658,6 @@ class ProductionWorkflowOrchestrator:
                     "error": "Reference report content is not readable",
                 }
 
-            # Check if we already have artifact with same hash
             existing = await uow.production_artifacts.get_current(run.id, "extraction")
             if existing and existing.input_hash == input_hash:
                 return {
@@ -694,7 +671,6 @@ class ProductionWorkflowOrchestrator:
                 subject_title=subject_title,
             )
 
-            # Call LLM (continue mode, same conversation)
             try:
                 parsed, raw, turn_id = await self._ask_with_format_repair(
                     run=run,
@@ -747,10 +723,6 @@ class ProductionWorkflowOrchestrator:
             }
 
     async def _execute_synthesis_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
-        """Execute technical synthesis stage.
-
-        Calls LLM to write French technical summary.
-        """
         if not self._model_service:
             return {
                 "stage": "synthesis",
@@ -759,7 +731,6 @@ class ProductionWorkflowOrchestrator:
             }
 
         async with self._uow_factory() as uow:
-            # Get extraction artifact
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
             references = await uow.production_artifacts.get_current(run.id, "references")
             if not extraction:
@@ -775,7 +746,6 @@ class ProductionWorkflowOrchestrator:
                     "error": "References artifact not found",
                 }
 
-            # Prepare input for hashing
             input_data = {
                 "subject_id": str(run.subject_id),
                 "extraction_version": extraction.version,
@@ -805,7 +775,6 @@ class ProductionWorkflowOrchestrator:
                     "error": "Diffusion policy forbids sending this subject to an external model",
                 }
 
-            # Check if we already have artifact with same hash
             existing = await uow.production_artifacts.get_current(run.id, "synthesis")
             if existing and existing.input_hash == input_hash:
                 return {
@@ -889,12 +858,8 @@ class ProductionWorkflowOrchestrator:
                 return self._handle_stage_exception(run, "synthesis", e)
 
     async def _execute_assembly_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
-        """Execute brief assembly stage (deterministic).
-
-        No LLM call - pure rendering from artifacts.
-        """
+        """Deterministic: pure rendering from artifacts, no LLM call."""
         async with self._uow_factory() as uow:
-            # Get all artifacts
             references = await uow.production_artifacts.get_current(run.id, "references")
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
             synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
@@ -935,7 +900,6 @@ class ProductionWorkflowOrchestrator:
             )
 
             if qa_result["passed"]:
-                # Mark run as READY
                 run.mark_ready(now=datetime.now(UTC))
                 await uow.subject_production_runs.save(run)
                 await uow.commit()
@@ -947,7 +911,6 @@ class ProductionWorkflowOrchestrator:
                     "qa": qa_result,
                 }
             else:
-                # Mark run as NEEDS_REVIEW
                 run.mark_needs_review(
                     code="qa_failed",
                     message="; ".join(qa_result["errors"]),
@@ -964,10 +927,7 @@ class ProductionWorkflowOrchestrator:
                 }
 
     async def retry_references(self, run_id: UUID) -> dict[str, Any]:
-        """Retry reference research stage.
-
-        Archives old conversation, creates new one, regenerates pipeline.
-        """
+        """Archives the old conversation, opens a new one, resets the run to SOURCES."""
         if not self._model_service:
             return {
                 "action": "retry_references",
@@ -998,11 +958,9 @@ class ProductionWorkflowOrchestrator:
             conversation = await self._open_conversation(run, subject_title)
             run.conversation_id = conversation.id
 
-            # Reset to SOURCES stage
             run.current_stage = SubjectProductionStage.SOURCES
             run.status = SubjectProductionStatus.QUEUED
 
-            # Mark downstream artifacts stale
             await uow.production_artifacts.mark_downstream_stale(
                 run_id, SubjectProductionStage.REFERENCES
             )
@@ -1017,10 +975,7 @@ class ProductionWorkflowOrchestrator:
         }
 
     async def retry_synthesis(self, run_id: UUID) -> dict[str, Any]:
-        """Retry synthesis stage only.
-
-        Keeps same conversation and references/extraction.
-        """
+        """Keeps the same conversation and references/extraction artifacts."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:
@@ -1030,7 +985,6 @@ class ProductionWorkflowOrchestrator:
                     "error": f"Run {run_id} not found",
                 }
 
-            # Verify run is in correct state
             if run.status not in {
                 SubjectProductionStatus.READY,
                 SubjectProductionStatus.NEEDS_REVIEW,
@@ -1041,11 +995,9 @@ class ProductionWorkflowOrchestrator:
                     "error": f"Run is in {run.status.value} state, cannot retry",
                 }
 
-            # Set stage to SYNTHESIS
             run.current_stage = SubjectProductionStage.SYNTHESIS
             run.status = SubjectProductionStatus.RUNNING
 
-            # Mark brief stale
             await uow.production_artifacts.mark_downstream_stale(
                 run_id, SubjectProductionStage.SYNTHESIS
             )

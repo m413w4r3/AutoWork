@@ -100,18 +100,15 @@ const SELECTORS = {
     "button[aria-label='More']",
     "button[aria-label='Options']",
   ],
-  // Entrée "Delete" dans le menu ouvert.
   deleteMenuItem: [
     "button[data-testid='delete-conversation-button']",
     "[role='menuitem']:contains('Delete')",
     "div[role='menuitem']:contains('Delete')",
   ],
-  // Dialog de confirmation du delete.
   confirmDeleteDialog: [
     "div[role='dialog']",
     "[role='alertdialog']",
   ],
-  // Bouton "Delete" pour confirmer la suppression.
   confirmDeleteButton: [
     "button[data-testid='delete-conversation-confirm-button']",
     "button[class*='btn-danger']",
@@ -1133,24 +1130,6 @@ async function streamAnswer(job, locator, before) {
         turn_locator: turnLocator(turn),
       };
     }
-    //if (stable && finished !== false && full.length > 0) {
-      //const verificationRoot = answerRoot(turn, true);
-      //const verification = verificationRoot
-        //? readAnswer(verificationRoot, false)
-        //: null;
-      //const citationsIdentical =
-        //verification &&
-        //JSON.stringify(verification.visible_citations) ===
-          //JSON.stringify(snapshot.visible_citations);
-      //if (verification && verification.text === full && citationsIdentical) {
-        //output.observe(verification.text);
-        //finalSerialized = verification;
-        //finalCompletion = completion;
-        //break;
-      //}
-      //vu = verification ? verification.text : "";
-      //stableSince = null;
-    //}
     if (stable && finished !== false && full.length > 0) {
       const verificationRoot = answerRoot(turn, true);
       const verification = verificationRoot
@@ -1349,9 +1328,6 @@ async function captureLaterResponse(msg) {
   const later = turns.slice(expected);
   for (let index = later.length - 1; index >= 0; index -= 1) {
     const turn = later[index];
-    //const completion = completionState(turn);
-    //if (completion.finished !== true) continue;
-    //const root = answerRoot(turn, true);
     const completion = completionState(turn);
 
     // On refuse seulement une réponse explicitement encore active.
@@ -1399,34 +1375,6 @@ async function captureLaterResponse(msg) {
 // Conversation cleanup
 // --------------------------------------------------------------------------- //
 
-/**
- * Automatise la suppression d'une conversation ChatGPT via l'interface.
- *
- * Processus :
- * 1. Vérifier que l'URL courante correspond au locator
- * 2. Localiser et cliquer le bouton du menu conversation
- * 3. Attendre l'ouverture du menu
- * 4. Trouver et cliquer l'entrée "Delete"
- * 5. Attendre la dialog de confirmation
- * 6. Cliquer le bouton "Delete" de confirmation
- * 7. Vérifier que la conversation a été supprimée
- *
- * @param {string} conversationId - UUID de la conversation à supprimer
- * @param {string} externalLocator - URL de la conversation (ChatGPT.com)
- * @param {Object} options - Configuration
- * @param {number} options.menuTimeout - Timeout d'ouverture du menu (ms, défaut 5000)
- * @param {number} options.dialogTimeout - Timeout de la dialog (ms, défaut 5000)
- * @param {number} options.verifyTimeout - Timeout de vérification (ms, défaut 10000)
- *
- * @returns {Promise<{
- *   success: boolean,
- *   conversation_id: string,
- *   verified_deleted: boolean,
- *   error_code?: string,
- *   error_message?: string,
- *   steps_completed: string[]
- * }>}
- */
 async function deleteConversation(conversationId, externalLocator, options = {}) {
   const menuTimeout = options.menuTimeout || 5000;
   const dialogTimeout = options.dialogTimeout || 5000;
@@ -1434,7 +1382,6 @@ async function deleteConversation(conversationId, externalLocator, options = {})
   const steps = [];
 
   try {
-    // Étape 1 : Vérifier le locator
     const currentUrl = window.location.href;
     if (currentUrl !== externalLocator) {
       return {
@@ -1448,7 +1395,6 @@ async function deleteConversation(conversationId, externalLocator, options = {})
     }
     steps.push("locator_verified");
 
-    // Étape 2 : Localiser le bouton du menu conversation
     const menuButton = $(SELECTORS.conversationOptionsButton);
     if (!menuButton) {
       return {
@@ -1462,7 +1408,6 @@ async function deleteConversation(conversationId, externalLocator, options = {})
     }
     steps.push("found_menu_button");
 
-    // Étape 3 : Ouvrir le menu
     menuButton.click();
     let menuElement = null;
     try {
@@ -1493,7 +1438,6 @@ async function deleteConversation(conversationId, externalLocator, options = {})
     }
     steps.push("menu_opened");
 
-    // Étape 4 : Trouver l'entrée "Delete" dans le menu
     let deleteItem = null;
     for (const sel of SELECTORS.deleteMenuItem) {
       if (sel.includes("contains")) {
@@ -1525,11 +1469,9 @@ async function deleteConversation(conversationId, externalLocator, options = {})
     }
     steps.push("found_delete_item");
 
-    // Étape 5 : Cliquer sur "Delete"
     deleteItem.click();
-    await sleep(200); // Attendre l'animation du menu
+    await sleep(200);
 
-    // Étape 6 : Attendre la dialog de confirmation
     let confirmDialog = null;
     try {
       confirmDialog = await waitFor(
@@ -1557,7 +1499,6 @@ async function deleteConversation(conversationId, externalLocator, options = {})
     }
     steps.push("confirm_dialog_opened");
 
-    // Étape 7 : Trouver et cliquer le bouton "Delete" de confirmation
     let confirmButton = null;
     for (const sel of SELECTORS.confirmDeleteButton) {
       confirmButton = confirmDialog.querySelector(sel);
@@ -1576,20 +1517,17 @@ async function deleteConversation(conversationId, externalLocator, options = {})
     }
     steps.push("found_confirm_button");
 
-    // Cliquer le bouton de confirmation
     confirmButton.click();
     steps.push("clicked_confirm");
 
-    // Étape 8 : Vérifier que la conversation a été supprimée
     let verifiedDeleted = false;
     try {
-      // La dialog doit disparaître
       await waitFor(
         () => {
           for (const sel of SELECTORS.confirmDeleteDialog) {
             const dialog = document.querySelector(sel);
             if (!dialog || dialog.offsetParent === null) {
-              return true; // Dialog fermée = succès potentiel
+              return true;
             }
           }
           return null;
@@ -1638,7 +1576,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg?.type === "delete_conversation") {
-    // Automatisation UI : suppression de conversation
     deleteConversation(msg.conversation_id, msg.external_locator, {
       menuTimeout: msg.timeout ? msg.timeout * 0.3 : 5000,
       dialogTimeout: msg.timeout ? msg.timeout * 0.3 : 5000,

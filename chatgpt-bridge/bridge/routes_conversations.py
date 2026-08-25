@@ -96,15 +96,7 @@ class ConversationRoutes:
         conversation_id: str,
         req: ConversationReleaseRequest,
     ) -> ConversationLifecycleResponse:
-        """Release a conversation with an explicit outcome.
-
-        Only the application client can decide when a conversation is no longer needed
-        and what the outcome of that release is. The bridge applies the lifecycle policy
-        only after this explicit signal.
-
-        Outcome can be: success, failure, needs_review, or cancelled.
-        Only 'success' may trigger automatic cleanup based on the conversation's policy.
-        """
+        """Only 'success' may trigger automatic cleanup, per the conversation's policy."""
         try:
             result = self.registry.release_conversation(conversation_id, req.outcome)
         except ValueError as exc:
@@ -129,11 +121,6 @@ class ConversationRoutes:
         self,
         conversation_id: str,
     ) -> ConversationLifecycleResponse:
-        """Retrieve the current lifecycle status of a conversation.
-
-        This allows clients to query the current state, released_at timestamp,
-        release outcome, cleanup status, and retry information.
-        """
         result = self.registry.get_conversation_lifecycle(conversation_id)
         if result is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -157,16 +144,10 @@ class ConversationRoutes:
         self,
         conversation_id: str,
     ) -> CleanupStartResponse:
-        """Initiate cleanup of a DELETE_PENDING conversation.
+        """DELETE_PENDING -> DELETING, triggers UI deletion. Idempotent on DELETING/DELETED.
 
-        This transitions the conversation from DELETE_PENDING to DELETING state
-        and triggers the extension to open and delete the conversation via UI.
-
-        Idempotent: calling again on DELETING or DELETED returns current state.
-
-        Fail-closed: a CLEANUP_FAILED conversation whose last error is a terminal
-        identity error (locator_mismatch/locator_invalid) is refused with 409 and
-        left unchanged. No heuristic re-resolution and no override are permitted.
+        Fail-closed: CLEANUP_FAILED with a terminal identity error
+        (locator_mismatch/locator_invalid) is refused with 409, unchanged. No override.
         """
         current = self.registry.get_conversation_lifecycle(conversation_id)
         if current is None:
@@ -202,11 +183,7 @@ class ConversationRoutes:
         self,
         conversation_id: str,
     ) -> ConversationLifecycleResponse:
-        """Mark a conversation as successfully deleted.
-
-        Called by the extension after successfully deleting via UI.
-        Idempotent: calling on already-DELETED returns current state.
-        """
+        """Called by the extension after successfully deleting via UI. Idempotent on DELETED."""
         try:
             result = self.registry.mark_conversation_deleted(conversation_id)
         except ValueError as exc:
@@ -232,11 +209,8 @@ class ConversationRoutes:
         conversation_id: str,
         req: CleanupFailureRequest,
     ) -> ConversationLifecycleResponse:
-        """Report cleanup failure and mark conversation CLEANUP_FAILED for retry.
-
-        Transient cleanup failures may be retried while cleanup_attempt_count < 3;
-        terminal identity errors are never retried.
-        Idempotent: calling again increments attempt count.
+        """Transient failures retry while cleanup_attempt_count < 3; terminal identity
+        errors never retry. Idempotent: increments attempt count.
         """
         try:
             result = self.registry.mark_cleanup_failed(

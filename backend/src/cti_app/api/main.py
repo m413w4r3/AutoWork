@@ -138,9 +138,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             return await job_service.get(exc.existing_job_id)
 
     async def replan_discovery_intake(parameters: ReconcileDiscoveryParameters) -> object:
-        # The parent snapshot is part of the key: the first reconciliation of this
-        # intake already claimed the bare one, and this is a different attempt
-        # against a state that has moved on since.
+        # Parent snapshot is part of the key: the bare key was already claimed by this
+        # intake's first reconciliation, so a retry against a moved-on state needs a new one.
         parent = parameters.expected_parent_snapshot_id
         key = f"reconcile-discovery:{parameters.intake_id}:{parent or 'root'}"
         try:
@@ -204,7 +203,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         retention_days=settings.model_conversation_retention_days,
     )
 
-    # Production services
     subject_production_service = SubjectProductionService(uow_factory)
     edition_production_service = EditionProductionService(uow_factory)
     workflow_orchestrator = ProductionWorkflowOrchestrator(
@@ -231,8 +229,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.production_artifact_store = production_artifact_store
     job_service = JobService(uow_factory, registry)
     job_dispatcher = DramatiqJobDispatcher()
-    # The registry must exist before the service that consumes it, so the
-    # production stage chain is bound once both are available.
+    # Registry must exist before the service consuming it, so bind only once both are ready.
     production_chain.bind(job_service, job_dispatcher)
     app.state.job_service = job_service
     app.state.job_dispatcher = job_dispatcher
@@ -261,9 +258,8 @@ def create_app() -> FastAPI:
     request_failures = DiagnosticsLog.from_env(settings.diagnostics_log_root)
 
     def record_request_failure(request: Request, error: BaseException) -> None:
-        # Keyed by correlation id rather than a domain id: at this level the
-        # request is all we know, and it is what the browser can be traced back
-        # through. The endpoint's own event, when there is one, carries the rest.
+        # Keyed by correlation id, not a domain id: at this level that's all we know, and
+        # it's what the browser traces back through. The endpoint's own event carries the rest.
         request_failures.record_failure(
             event="http.request_failed",
             run_id=uuid5(NAMESPACE_URL, f"http-request:{get_correlation_id()}"),

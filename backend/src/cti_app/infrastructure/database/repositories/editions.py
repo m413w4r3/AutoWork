@@ -80,7 +80,7 @@ class SqlAlchemyEditionRepository:
         return result.scalar_one_or_none() is not None
 
     async def delete(self, edition_id: UUID, expected_version: int) -> bool:
-        """Delete the edition aggregate in dependency order in one transaction."""
+        # Single transaction, strict FK dependency order.
         batch_rows = list(
             (
                 await self._session.execute(
@@ -133,8 +133,7 @@ class SqlAlchemyEditionRepository:
             *(row.discovery_model_run_id for row in batch_rows),
         }
 
-        # Production artifacts reference conversation turns and model runs, so
-        # they have to go before those are deleted below.
+        # Production artifacts FK-reference conversation turns/model runs deleted below.
         production_run_ids = list(
             await self._session.scalars(
                 select(SubjectProductionRunRow.id).where(
@@ -170,7 +169,7 @@ class SqlAlchemyEditionRepository:
             delete(SubjectProductionRunRow).where(SubjectProductionRunRow.edition_id == edition_id)
         )
 
-        # Break the two explicit parent/head cycles before deleting their children.
+        # Null the two explicit parent/head FK cycles before deleting their children.
         if conversation_ids:
             await self._session.execute(
                 update(ModelConversationRow)
@@ -239,8 +238,8 @@ class SqlAlchemyEditionRepository:
             )
         )
 
-        # Model runs have no edition column. Remove only runs reached from this
-        # aggregate which no surviving record still references.
+        # ModelRun has no edition_id; delete only runs reachable from this edition
+        # that no surviving row still references.
         if model_run_ids:
             referenced_run_ids = set(
                 await self._session.scalars(

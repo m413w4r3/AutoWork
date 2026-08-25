@@ -540,19 +540,16 @@ async def test_standalone_import_calls_after_persisted_batch_callback_on_new() -
     adapter = TransientResearchAdapter()
     gateway, _model_uow, _ = gateway_for_adapter(adapter)
 
-    # Mock job object to return from the callback
     class MockReconciliationJob:
         def __init__(self, job_id: UUID) -> None:
             self.id = job_id
 
-    # Track callback invocations
     callback_invocations: list[dict[str, object]] = []
     expected_job_id = uuid4()
 
     async def fake_after_persisted_batch(
         batch: object, input_mode: DiscoveryInputMode, actor_id: str
     ) -> object:
-        """Fake callback that records calls and returns a mock job object."""
         callback_invocations.append(
             {"batch": batch, "input_mode": input_mode, "actor_id": actor_id}
         )
@@ -569,10 +566,8 @@ async def test_standalone_import_calls_after_persisted_batch_callback_on_new() -
     markdown = research_markdown_fixture()
     preview = await discovery.preview_standalone_import(params, markdown)
 
-    # Preview must not trigger the callback.
     assert len(callback_invocations) == 0
 
-    # First import: creates a new batch and triggers callback exactly once
     actor_id = "analyst:test-R27a"
     batch1, reused1, job_id1 = await discovery.import_standalone_report(
         params, markdown, expected_sha256=preview["sha256"], actor_id=actor_id
@@ -585,7 +580,6 @@ async def test_standalone_import_calls_after_persisted_batch_callback_on_new() -
     assert callback_invocations[0]["batch"] is batch1
     assert job_id1 == expected_job_id
 
-    # Re-import: idempotent operation, returns existing batch, callback NOT called again
     batch2, reused2, job_id2 = await discovery.import_standalone_report(
         params, markdown, expected_sha256=preview["sha256"], actor_id=actor_id
     )
@@ -593,6 +587,5 @@ async def test_standalone_import_calls_after_persisted_batch_callback_on_new() -
     assert reused2 is True
     assert job_id2 is None
     assert batch2.id == batch1.id
-    # Callback still called exactly once (no new invocation)
     assert len(callback_invocations) == 1
     assert adapter.calls == []

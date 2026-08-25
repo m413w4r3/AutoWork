@@ -87,7 +87,6 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
       : [],
   );
 
-  // Production queue for batch brief generation
   const productionQueue = (
     <div className="production-queue-section">
       <ProductionQueue

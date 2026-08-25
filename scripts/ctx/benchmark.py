@@ -3,38 +3,26 @@
 # requires-python = ">=3.12"
 # dependencies = ["numpy>=1.26", "openai>=1.60"]
 # ///
-"""Runner reproductible pour le benchmark de navigation ctx.py (R88).
+"""Benchmark runner for ctx.py navigation (R88).
 
-Rejoue les requêtes de ``refacto_baseLine/ctx_benchmark.json`` contre
-l'index ctx.py courant et calcule, MÉCANIQUEMENT (aucun rang codé en dur),
-les métriques :
+Replays queries from ``refacto_baseLine/ctx_benchmark.json`` against the
+current ctx.py index, computing first_relevant_rank, top3, top8,
+files_before_first_hit, lines_before_first_hit and their aggregates —
+mechanically, no hardcoded ranks. Implements no search engine itself: calls
+ctx.py's own ``load_chunks``/``rank_chunks``/``select_results``/``maybe_refresh``
+with the same params as ``ctx.py query``.
 
-    first_relevant_rank, top3, top8, files_before_first_hit,
-    lines_before_first_hit
+Ground truth lives only in refacto_baseLine/ctx_benchmark.json, which is
+excluded from the ctx.py index (EXCLUDE_PREFIXES) — keeping it out of this
+file prevents this indexable script from leaking expected answers into the
+corpus being benchmarked.
 
-et leurs agrégats (hit rates, médianes/moyennes).
+Examples:
 
-Ce script n'implémente AUCUN moteur de recherche : il importe les
-primitives existantes de ``scripts/ctx/ctx.py`` (``load_chunks``,
-``rank_chunks``, ``select_results``, ``maybe_refresh``) et ne fait que les
-appeler avec les mêmes paramètres que la CLI ``ctx.py query``.
-
-La ground truth (requêtes + fichiers "owner" attendus) N'EST PAS dans ce
-fichier : elle vit dans ``refacto_baseLine/ctx_benchmark.json``, un chemin
-déjà exclu de l'index ctx.py (``EXCLUDE_PREFIXES`` dans ctx.py). La garder
-hors de ce runner évite que scripts/ctx/benchmark.py — lui-même indexable —
-n'injecte la réponse attendue dans le corpus que le benchmark évalue.
-Le classement, les rangs et les métriques sont recalculés à chaque
-exécution contre l'index courant.
-
-Exemples :
-
-    # Index lexical frais, puis benchmark en lexical-only :
     env -u BASE_URL -u EMBEDDING_API_KEY \\
         uv run scripts/ctx/ctx.py build --lexical-only
     uv run scripts/ctx/benchmark.py --lexical-only
 
-    # Résumé JSON, sans vérifier les seuils :
     uv run scripts/ctx/benchmark.py --lexical-only --json --no-check
 """
 
@@ -50,13 +38,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import ctx  # noqa: E402  (après sys.path.insert, cf. import local du module)
-
-# --------------------------------------------------------------------------- ground truth (données externes)
-#
-# Chargée depuis refacto_baseLine/ctx_benchmark.json (exclu de l'index ctx.py)
-# pour ne pas fuiter les queries/owners attendus dans le corpus indexé.
-# Ne pas dupliquer ces données ici : modifier le fichier JSON, pas ce runner.
+import ctx  # noqa: E402
 
 DEFAULT_GROUND_TRUTH_PATH = Path(__file__).resolve().parents[2] / "refacto_baseLine" / "ctx_benchmark.json"
 
@@ -100,7 +82,7 @@ def run_query(
     no_instruct: bool,
     refresh: bool,
 ) -> list[ctx.Ranked]:
-    """Appelle les primitives ctx.py existantes exactement comme `ctx.py query`."""
+    """Mirrors `ctx.py query`'s call sequence exactly."""
     args = SimpleNamespace(
         model=model,
         text=text,
@@ -161,8 +143,7 @@ def score_query(spec: dict[str, object], picked: list[ctx.Ranked]) -> QueryResul
             hit_seen = True
             break
     if not hit_seen:
-        # MISS : nombre de fichiers distincts / lignes cumulées sur tout le
-        # top-k retourné (le top8 par défaut de la spec R67).
+        # MISS: count over the full returned top-k (top8 default per spec R67).
         files_before_first_hit = len(seen_files)
         lines_before_first_hit = sum(item.chunk.end - item.chunk.start + 1 for item in picked)
 

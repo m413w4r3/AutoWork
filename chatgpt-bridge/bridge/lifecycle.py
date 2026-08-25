@@ -23,20 +23,7 @@ class CleanupWorker:
         self.logger = logging.getLogger("cleanup_worker")
 
     async def process_cleanup_task(self, conversation_id: str) -> bool:
-        """
-        Exécute le cleanup d'une conversation:
-        1. Récupère l'état de la conversation
-        2. Valide le status (DELETE_PENDING ou CLEANUP_FAILED retryable)
-        3. Marque comme DELETING
-        4. Envoie une requête à l'extension
-        5. Attend la réponse
-        6. Marque comme DELETED ou CLEANUP_FAILED
-
-        @param conversation_id: UUID de la conversation
-        @return: True si succès, False sinon
-        """
         try:
-            # 1. Charger la conversation
             conv = self.registry.get_conversation_lifecycle(conversation_id)
             if not conv:
                 self.logger.warning(f"Conversation {conversation_id} not found")
@@ -62,7 +49,6 @@ class CleanupWorker:
                 )
                 return False
 
-            # 2. Vérifier le locator
             if not conv.get("external_locator"):
                 self.logger.warning(f"Conversation {conversation_id} missing external_locator")
                 self.registry.mark_cleanup_failed(
@@ -70,17 +56,14 @@ class CleanupWorker:
                 )
                 return False
 
-            # 3. Marquer comme DELETING
             self.registry.start_cleanup(conversation_id)
 
-            # 4. Envoyer au worker
             result = await self._send_cleanup_request(
                 conversation_id=conversation_id,
                 external_locator=conv["external_locator"],
                 timeout=30,
             )
 
-            # 5. Traiter le résultat
             if result["success"] and result.get("verified_deleted"):
                 self.registry.mark_conversation_deleted(conversation_id)
                 self.logger.info(
@@ -115,7 +98,6 @@ class CleanupWorker:
     async def _send_cleanup_request(
         self, conversation_id: str, external_locator: str, timeout: int
     ) -> dict:
-        """Envoie la requête de cleanup à l'extension via WebSocket."""
         message = {
             "type": "cleanup_conversation",
             "id": str(uuid.uuid4()),
@@ -124,7 +106,6 @@ class CleanupWorker:
             "timeout": timeout,
         }
 
-        # Utiliser le mécanisme d'aller-retour du bridge
         try:
             response = await self.bridge.request(message, timeout=timeout + 10)
             return response
@@ -155,7 +136,6 @@ class ConversationSweeper:
         self.logger = logging.getLogger("conversation_sweeper")
 
     async def sweep(self):
-        """Trouve et traite DELETE_PENDING après restart."""
         pending = self.registry.get_all_delete_pending()
         self.logger.info(f"Sweeping {len(pending)} DELETE_PENDING conversations")
 
@@ -164,10 +144,9 @@ class ConversationSweeper:
                 await self.worker.process_cleanup_task(conv_id)
             except Exception as e:
                 self.logger.error(f"Sweep error for {conv_id}: {e}", exc_info=True)
-            await asyncio.sleep(0.5)  # Petit délai entre les tentatives
+            await asyncio.sleep(0.5)
 
     async def retry_failed(self):
-        """Retry les CLEANUP_FAILED."""
         failed = self.registry.get_all_cleanup_failed()
         self.logger.info(f"Retrying {len(failed)} CLEANUP_FAILED conversations")
 
