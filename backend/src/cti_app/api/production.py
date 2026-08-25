@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from cti_app.application.jobs import JobDispatcher, JobService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_jobs import (
+    PRODUCTION_STAGE_MAX_ATTEMPTS,
     ProductionStageParameters,
     production_stage_idempotency_key,
 )
@@ -175,7 +176,9 @@ async def _create_and_start_run(
         return run, None
 
     if created or run.status is SubjectProductionStatus.QUEUED:
-        await service.start_run(run.id)
+        # start_run persists and returns the RUNNING run; keep that object,
+        # not the stale QUEUED one create_run returned.
+        run = await service.start_run(run.id)
 
     # The idempotency key makes a concurrent duplicate POST reuse this job.
     parameters = ProductionStageParameters(
@@ -189,7 +192,7 @@ async def _create_and_start_run(
         idempotency_key=production_stage_idempotency_key(run, SubjectProductionStage.SOURCES),
         correlation_id=get_correlation_id(),
         input_parameters=parameters.model_dump(mode="json"),
-        max_attempts=1,
+        max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
         actor_id=user,
     )
     await dispatcher.dispatch(job.id)
@@ -407,7 +410,7 @@ async def retry_synthesis(
         idempotency_key=production_stage_idempotency_key(run, SubjectProductionStage.SYNTHESIS),
         correlation_id=get_correlation_id(),
         input_parameters=parameters.model_dump(mode="json"),
-        max_attempts=3,
+        max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
         actor_id=user,
     )
     await dispatcher.dispatch(job.id)
@@ -662,7 +665,7 @@ async def start_edition_brief_production(
                 idempotency_key=f"production-sources-{first_run.id}",
                 correlation_id=get_correlation_id(),
                 input_parameters=parameters.model_dump(mode="json"),
-                max_attempts=1,
+                max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
                 actor_id=user,
             )
             await dispatcher.dispatch(job.id)

@@ -226,14 +226,15 @@ class ProductionWorkflowOrchestrator:
         parse: Callable[[str], Any],
         external_llm_allowed: bool,
         web_search: bool = False,
-        repair_mode: ConversationMode = ConversationMode.CONTINUE,
         request_identity: str | None = None,
     ) -> tuple[Any | None, str, UUID | None]:
         """Ask the model, and give it exactly one chance to fix its formatting.
 
-        The repair turn never researches again: it restates the same answer in
-        the expected structure. Returns the parse result, the raw text used, and
-        the turn id it came from.
+        Used by Q1 (references) and Q4 (synthesis): both draft FRESH with web
+        search, then repair CONTINUE without web search — the repair turn
+        never researches again, it restates the same answer in the expected
+        structure. Returns the parse result, the raw text used, and the turn
+        id it came from.
         """
         assert self._model_service is not None
         identity = f"-{request_identity}" if request_identity else ""
@@ -270,12 +271,6 @@ class ProductionWorkflowOrchestrator:
         repair_prompt = ProductionPromptTemplates.get_format_repair_prompt(
             stage=stage, problems=result.errors
         )
-        # Q2 repairs are deliberately fresh/stateless.  A fresh transport has
-        # no previous answer to reformat, so carry only this request's raw
-        # answer in its repair prompt.  This never exposes Q1 or another Q2
-        # chunk, while preserving a usable one-shot repair path.
-        if repair_mode is ConversationMode.FRESH:
-            repair_prompt += f"\n\nAnswer to reformat:\n{raw}"
         repair_idempotency_key = (
             f"{stage}-format-repair-{run.id}-v{prompt_version}{identity}-rv{repair_version}"
             if request_identity
@@ -284,7 +279,7 @@ class ProductionWorkflowOrchestrator:
         repair_turn = await self._model_service.add_turn(
             conversation_id=conversation_id,
             message=repair_prompt,
-            mode=repair_mode,
+            mode=ConversationMode.CONTINUE,
             external_llm_allowed=external_llm_allowed,
             web_search=False,
             idempotency_key=repair_idempotency_key,
@@ -948,6 +943,10 @@ class ProductionWorkflowOrchestrator:
                 conversation_turn_id=turn_id,
                 warnings=parsed.warnings,
                 verification_diagnostics={
+                    # Also carried in this artifact's input_hash; repeated here
+                    # so a manual run inspection doesn't have to decode the hash.
+                    "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
+                    "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
                     "status_totals": status_totals,
                     "evidence_pack_hash": evidence_pack.pack_hash,
                     "evidence_pack_chunk_ids": list(evidence_pack.chunk_ids),

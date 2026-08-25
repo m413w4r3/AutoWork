@@ -7,6 +7,7 @@ offer a start button based on a 404, so these endpoints must answer 404 — neve
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 from uuid import UUID, uuid4
@@ -89,7 +90,12 @@ class _Runs:
         return self.items.get(run_id)
 
     async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
-        return self.items.get(run_id)
+        # A real SQL repository reloads a distinct object on every fetch;
+        # returning the exact same reference here would let a caller that
+        # merely mutates in place look correct by accident. `replace` detaches
+        # the returned object so only an explicit `save` makes a change stick.
+        run = self.items.get(run_id)
+        return dataclasses.replace(run) if run is not None else None
 
     async def save(self, run: SubjectProductionRun) -> None:
         self.items[run.id] = run
@@ -271,6 +277,30 @@ async def test_start_subject_production_needs_no_edition_id(api: AsyncClient, uo
     assert response.json()["edition_id"] == str(edition_id)
 
 
+async def test_start_subject_production_returns_the_run_actually_started(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    """The response must reflect the run start_run() persisted, not the
+    QUEUED object create_run() handed back before it was started -- the fake
+    repository detaches objects on every fetch, like the real SQL one does,
+    so this only passes if the API keeps the object start_run() returns."""
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+
+    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "running"
+    assert body["stage"] == "sources"
+
+    jobs = production_app.state.job_service
+    sources_jobs = [job for job in jobs.submitted if job["kind"] == "production.subject.sources"]
+    assert len(sources_jobs) == 1
+    assert sources_jobs[0]["max_attempts"] == 3
+
+
 async def test_start_subject_production_rejects_non_selected_subject(
     api: AsyncClient, uow: _Uow
 ) -> None:
@@ -315,6 +345,22 @@ async def test_start_edition_briefs_honours_subject_selection(api: AsyncClient, 
 
     produced = {item.subject_id for item in uow.edition_production_batch_items.items}
     assert produced == {subjects[0], subjects[2]}
+
+
+async def test_start_edition_briefs_submits_sources_job_with_standard_retry_policy(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+
+    response = await api.post(f"/api/editions/{edition_id}/production/briefs", json={})
+
+    assert response.status_code == 200, response.text
+    jobs = production_app.state.job_service
+    sources_jobs = [job for job in jobs.submitted if job["kind"] == "production.subject.sources"]
+    assert len(sources_jobs) == 1
+    assert sources_jobs[0]["max_attempts"] == 3
 
 
 async def test_start_edition_briefs_rejects_unselected_subject(api: AsyncClient, uow: _Uow) -> None:
@@ -442,10 +488,16 @@ async def test_retry_references_from_ready_creates_a_new_run(
     assert new_run.status is SubjectProductionStatus.RUNNING
     assert new_run.references_conversation_id is None
 
+    # The response itself must reflect RUNNING, not the QUEUED object
+    # create_run() returned before start_run() persisted a new one.
+    assert body["status"] == "running"
+    assert body["stage"] == "sources"
+
     jobs = production_app.state.job_service
     sources_jobs = [job for job in jobs.submitted if job["kind"] == "production.subject.sources"]
     assert len(sources_jobs) == 1
     assert sources_jobs[0]["idempotency_key"] == f"production-sources-{new_run.id}"
+    assert sources_jobs[0]["max_attempts"] == 3
 
 
 async def test_retry_references_rejects_non_ready_status(api: AsyncClient, uow: _Uow) -> None:
@@ -536,6 +588,7 @@ async def test_retry_synthesis_from_ready_dispatches_job_and_bumps_generation(
     jobs = production_app.state.job_service
     assert [job["kind"] for job in jobs.submitted] == ["production.subject.synthesis"]
     assert jobs.submitted[0]["idempotency_key"] == f"production-synthesis-{run.id}-generation-2"
+    assert jobs.submitted[0]["max_attempts"] == 3
 
 
 async def test_retry_synthesis_rejects_non_ready_status(api: AsyncClient, uow: _Uow) -> None:

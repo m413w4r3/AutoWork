@@ -8,7 +8,6 @@ REFERENCES_PROMPT_VERSION = "2"
 EXTRACTION_PROMPT_VERSION = "6"
 SYNTHESIS_PROMPT_VERSION = "4"
 REFERENCES_FORMAT_REPAIR_VERSION = "1"
-EXTRACTION_FORMAT_REPAIR_VERSION = "1"
 SYNTHESIS_FORMAT_REPAIR_VERSION = "2"
 
 
@@ -212,14 +211,11 @@ text: <event>
         listed = "\n".join(f"- {problem}" for problem in problems) or "- structure illisible"
         if stage == "synthesis":
             return cls.SYNTHESIS_REPAIR_V2.format(problems=listed)
-        # For references and extraction stages, use the standard repair template
-        # with minimal structure reference for consistency.
-        if stage == "references":
-            structure = cls._REFERENCES_STRUCTURE
-        else:
-            # Generic extraction guidance without legacy Markdown format
-            structure = "Return strict JSON conforming to the extraction schema."
-        return cls.FORMAT_REPAIR_V1.format(problems=listed, expected_structure=structure)
+        # references is the only other stage still using format repair; Q2
+        # extraction went through native structured output instead.
+        return cls.FORMAT_REPAIR_V1.format(
+            problems=listed, expected_structure=cls._REFERENCES_STRUCTURE
+        )
 
     @classmethod
     def get_synthesis_prompt(

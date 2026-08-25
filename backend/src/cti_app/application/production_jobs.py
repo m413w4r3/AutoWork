@@ -29,6 +29,10 @@ from cti_app.domain.production import (
     SubjectProductionStatus,
 )
 
+# Every automatic production stage job — SOURCES from the API, and every
+# chained stage submitted by ProductionStageChain — shares this retry policy.
+PRODUCTION_STAGE_MAX_ATTEMPTS = 3
+
 _TERMINAL_STATUSES = {
     SubjectProductionStatus.READY,
     SubjectProductionStatus.NEEDS_REVIEW,
@@ -112,7 +116,7 @@ class ProductionStageChain:
             idempotency_key=production_stage_idempotency_key(run, stage),
             correlation_id=correlation_id,
             input_parameters=parameters.model_dump(mode="json"),
-            max_attempts=3,
+            max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
             actor_id=actor_id,
         )
         await self._dispatcher.dispatch(job.id)

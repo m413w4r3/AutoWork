@@ -409,6 +409,8 @@ class JobExecutor:
                 job_kind=job.kind,
                 aggregate_id=str(job.aggregate_id),
                 attempt=job.attempt,
+                max_attempts=job.max_attempts,
+                idempotency_key=job.idempotency_key,
                 transient=exc.transient,
                 public_message=exc.public_message,
             )
@@ -432,6 +434,8 @@ class JobExecutor:
                 job_kind=job.kind,
                 aggregate_id=str(job.aggregate_id),
                 attempt=job.attempt,
+                max_attempts=job.max_attempts,
+                idempotency_key=job.idempotency_key,
             )
             return await self._fail(job_id, INTERNAL_ERROR_CODE, INTERNAL_ERROR_MESSAGE)
         finally:

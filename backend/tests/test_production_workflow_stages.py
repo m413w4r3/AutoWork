@@ -600,39 +600,6 @@ async def test_repair_version_creates_a_new_logical_repair_turn() -> None:
     }
 
 
-async def test_q2_repairs_have_distinct_chunk_idempotency_keys() -> None:
-    orchestrator, uow, conversations = _build([BROKEN_Q1, PERFECT_Q1, BROKEN_Q1, PERFECT_Q1])
-    conversation_id = (await conversations.create()).id
-
-    for chunk_id in ("chunk-a", "chunk-b"):
-        result, _, _ = await orchestrator._ask_with_format_repair(
-            run=uow.run,
-            conversation_id=conversation_id,
-            stage="extraction",
-            prompt="chunk prompt",
-            prompt_version="4",
-            repair_version="1",
-            mode=ConversationMode.FRESH,
-            repair_mode=ConversationMode.FRESH,
-            request_identity=chunk_id,
-            parse=lambda value: parse_reference_report(value, date.today()),
-            external_llm_allowed=True,
-        )
-        assert result is not None and result.usable
-
-    repair_keys = [key for _, _, key, _ in conversations.calls if "format-repair" in key]
-    assert len(repair_keys) == 2
-    assert len(set(repair_keys)) == 2
-    assert all(
-        f"-v4-{chunk}-rv1" in key
-        for chunk, key in zip(("chunk-a", "chunk-b"), repair_keys, strict=True)
-    )
-    repair_messages = [
-        message for _, _, key, message in conversations.calls if "format-repair" in key
-    ]
-    assert all("Answer to reformat:\n" + BROKEN_Q1 in message for message in repair_messages)
-
-
 async def test_references_stage_stores_a_readable_report() -> None:
     orchestrator, uow, conversations = _build([PERFECT_Q1])
     uow.run.current_stage = SubjectProductionStage.REFERENCES
