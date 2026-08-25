@@ -269,19 +269,6 @@ export async function getEditionBriefProduction(
   return requestOrNull(`/api/editions/${editionId}/production/briefs`);
 }
 
-/**
- * Cancel batch production
- */
-export async function cancelEditionBatch(
-  editionId: string,
-  batchId: string,
-): Promise<{ status: string }> {
-  return request(
-    `/api/editions/${editionId}/production/briefs/${batchId}/cancel`,
-    { method: "POST" },
-  );
-}
-
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (response.ok) return (await response.json()) as T;

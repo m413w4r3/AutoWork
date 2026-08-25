@@ -116,26 +116,6 @@ export function splitEditorialGroup(
   });
 }
 
-export function rejectEditorialGroup(
-  editionId: string,
-  groupId: string,
-  reason: string,
-): Promise<EditorialBoardResult> {
-  return mutate(editionId, `/${encodeURIComponent(groupId)}/reject`, {
-    reason,
-  });
-}
-
-export function selectEditorialGroup(
-  editionId: string,
-  groupId: string,
-  editorialType: EditorialType,
-): Promise<EditorialBoardResult> {
-  return mutate(editionId, `/${encodeURIComponent(groupId)}/select`, {
-    editorial_type: editorialType,
-  });
-}
-
 export function confirmEditorialDecisions(
   editionId: string,
   decisions: Array<{

@@ -74,17 +74,6 @@ export function createEdition(payload: EditionFields): Promise<Edition> {
   });
 }
 
-export function updateEdition(
-  edition: Edition,
-  fields: EditionFields,
-): Promise<Edition> {
-  return request<Edition>(`/api/editions/${encodeURIComponent(edition.id)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...fields, version: edition.version }),
-  });
-}
-
 export function transitionEdition(
   edition: Edition,
   targetStatus: EditionStatus,
