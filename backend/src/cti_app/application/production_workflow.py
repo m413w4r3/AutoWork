@@ -28,6 +28,8 @@ from cti_app.application.production_ioc_qualification import (
     IOC_QUALIFICATION_PROMPT_VERSION,
     IocQualification,
     QualificationParseResult,
+    QualificationStatus,
+    effective_qualification_statuses,
     merge_qualified_candidates,
     parse_ioc_qualifications,
 )
@@ -219,6 +221,7 @@ class ProductionWorkflowOrchestrator:
         mode: ConversationMode,
         parse: Callable[[str], Any],
         external_llm_allowed: bool,
+        repair_context: str = "",
     ) -> tuple[Any | None, str, UUID | None]:
         """Ask the model, and give it exactly one chance to fix its formatting.
 
@@ -255,7 +258,7 @@ class ProductionWorkflowOrchestrator:
             return result, raw, turn.id
 
         repair_prompt = ProductionPromptTemplates.get_format_repair_prompt(
-            stage=stage, problems=result.errors
+            stage=stage, problems=result.errors, candidates=repair_context
         )
         repair_turn = await self._model_service.add_turn(
             conversation_id=conversation_id,
@@ -281,7 +284,13 @@ class ProductionWorkflowOrchestrator:
 
         repaired = parse(repaired_raw)
         self._log_parse(run, f"{stage}-repair", repaired)
-        repaired.repair_actions.append(f"{stage}_format_repair")
+        repaired.repair_actions.append(
+            "ioc_qualification_format_repair"
+            if stage.startswith("ioc-qualification-")
+            else f"{stage}_format_repair"
+        )
+        if stage.startswith("ioc-qualification-"):
+            repaired.warnings.append("ioc_qualification_format_repair_applied")
         repaired.warnings.extend(result.errors)
         return repaired, repaired_raw, repair_turn.id
 
@@ -734,6 +743,7 @@ class ProductionWorkflowOrchestrator:
 
             qualifications: list[IocQualification] = []
             qualification_warnings: list[str] = []
+            qualification_repair_actions: list[str] = []
             for batch in candidate_pack.batches:
                 candidate_text = self._format_ioc_candidates(batch.candidates)
                 qualification_prompt = ProductionPromptTemplates.get_ioc_qualification_prompt(
@@ -758,6 +768,7 @@ class ProductionWorkflowOrchestrator:
                         mode=ConversationMode.CONTINUE,
                         parse=parse_batch,
                         external_llm_allowed=policy_allows,
+                        repair_context=candidate_text,
                     )
                 except Exception as e:
                     return self._handle_stage_exception(run, "extraction", e)
@@ -780,6 +791,8 @@ class ProductionWorkflowOrchestrator:
                     }
                 qualifications.extend(parsed_qualification.qualifications)
                 qualification_warnings.extend(parsed_qualification.errors)
+                qualification_warnings.extend(parsed_qualification.warnings)
+                qualification_repair_actions.extend(parsed_qualification.repair_actions)
 
             subject_title, _ = await self._subject_context(uow, run.subject_id)
             prompt = ProductionPromptTemplates.get_extraction_prompt(
@@ -822,6 +835,9 @@ class ProductionWorkflowOrchestrator:
                 extraction, tuple(qualifications), candidate_pack.candidates
             )
             assert extraction is not None
+            effective_statuses = effective_qualification_statuses(
+                tuple(qualifications), candidate_pack.candidates
+            )
             artifact = await self._extraction.store_extraction_result(
                 run_id=run.id,
                 subject_id=run.subject_id,
@@ -835,10 +851,15 @@ class ProductionWorkflowOrchestrator:
                     "batch_count": len(candidate_pack.batches),
                     "qualified_total": len(qualifications),
                     "confirmed_total": sum(
-                        q.status.value == "confirmed_ioc" for q in qualifications
+                        s is QualificationStatus.CONFIRMED_IOC for s in effective_statuses
                     ),
-                    "contextual_total": sum(q.status.value == "contextual" for q in qualifications),
-                    "excluded_total": sum(q.status.value == "excluded" for q in qualifications),
+                    "contextual_total": sum(
+                        s is QualificationStatus.CONTEXTUAL for s in effective_statuses
+                    ),
+                    "excluded_total": sum(
+                        s is QualificationStatus.EXCLUDED for s in effective_statuses
+                    ),
+                    "repair_actions": qualification_repair_actions + parsed.repair_actions,
                     "missing_candidate_ids": [],
                     "unknown_candidate_ids": [],
                     "candidate_pack_hash": candidate_pack.pack_hash,
@@ -857,13 +878,19 @@ class ProductionWorkflowOrchestrator:
                 "items_count": len(extraction.items),
                 "supported_items": len(extraction.supported_items()),
                 "warnings": parsed.warnings + qualification_warnings,
-                "repair_actions": parsed.repair_actions,
+                "repair_actions": qualification_repair_actions + parsed.repair_actions,
                 "candidate_total": candidate_pack.total_candidates,
                 "batch_count": len(candidate_pack.batches),
                 "qualified_total": len(qualifications),
-                "confirmed_total": sum(q.status.value == "confirmed_ioc" for q in qualifications),
-                "contextual_total": sum(q.status.value == "contextual" for q in qualifications),
-                "excluded_total": sum(q.status.value == "excluded" for q in qualifications),
+                "confirmed_total": sum(
+                    s is QualificationStatus.CONFIRMED_IOC for s in effective_statuses
+                ),
+                "contextual_total": sum(
+                    s is QualificationStatus.CONTEXTUAL for s in effective_statuses
+                ),
+                "excluded_total": sum(
+                    s is QualificationStatus.EXCLUDED for s in effective_statuses
+                ),
                 "candidate_pack_hash": candidate_pack.pack_hash,
                 "source_derived_candidates": candidate_pack.source_derived_candidates,
                 "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,

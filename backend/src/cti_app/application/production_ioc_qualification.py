@@ -160,6 +160,20 @@ def merge_qualified_candidates(
     return TechnicalExtraction(items=tuple(items), uncertainties=extraction.uncertainties)
 
 
+def effective_qualification_statuses(
+    qualifications: tuple[IocQualification, ...], candidates: tuple[IocCandidate, ...]
+) -> tuple[QualificationStatus, ...]:
+    """Return statuses after applying the source-backed invariant."""
+    by_id = {qualification.candidate_id: qualification.status for qualification in qualifications}
+    statuses: list[QualificationStatus] = []
+    for candidate in candidates:
+        status = by_id[candidate.candidate_id]
+        if not candidate.source_backed and status is QualificationStatus.CONFIRMED_IOC:
+            status = QualificationStatus.CONTEXTUAL
+        statuses.append(status)
+    return tuple(statuses)
+
+
 def _status_policy(status: QualificationStatus) -> tuple[IndicatorStatus, DisplayPolicy]:
     if status is QualificationStatus.CONFIRMED_IOC:
         return IndicatorStatus.CONFIRMED_IOC, DisplayPolicy.IOC_SECTION
