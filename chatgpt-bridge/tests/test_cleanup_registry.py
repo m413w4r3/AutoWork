@@ -4,15 +4,12 @@ Tests for the cleanup registry state machine.
 Tests the state transitions and cleanup automation without actual UI execution.
 """
 
-import sqlite3
+import sys
 import tempfile
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
-
-# Import test helper
-import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 

@@ -100,20 +100,14 @@ Run the narrowest existing bridge test covering the modified behavior; use
 the full gates below only when the change affects lifecycle, cleanup, or
 browser integration.
 
-Run the Python bridge gate (65+ passed):
+Run the Python bridge gate (90+ passed — includes route/transport/generation
+tests previously duplicated under `backend/tests/test_chatgpt_bridge.py`):
 
 ```bash
 uv run \
   --python 3.12 \
   --with-requirements requirements-test.txt \
   python -m pytest tests/ -q --tb=short
-```
-
-Run the backend bridge integration gate (33+ passed):
-
-```bash
-cd ../backend
-uv run pytest tests/test_chatgpt_bridge.py -q --tb=short
 ```
 
 Run the JavaScript gate (3+ passed):
