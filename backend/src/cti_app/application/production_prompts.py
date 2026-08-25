@@ -15,7 +15,7 @@ SYNTHESIS_FORMAT_REPAIR_VERSION = "2"
 class ProductionPromptTemplates:
     """Versioned prompt templates for subject production."""
 
-    REFERENCES_RESEARCH_V1 = """You are a threat intelligence research assistant. Your task is to conduct web research and build a chronological reference timeline for the following subject:
+    REFERENCES_RESEARCH_V2 = """You are a threat intelligence research assistant. Your task is to conduct web research and build a chronological reference timeline for the following subject:
 
 **Subject**: {subject_title}
 
@@ -46,6 +46,8 @@ class ProductionPromptTemplates:
 
 # REFERENCES
 
+editorial-title: <titre français au format [Acteur principal] Titre, ou [Brève] Titre>
+
 ## SOURCE S1
 
 title: <title>
@@ -64,67 +66,12 @@ text: <one chronological event, in French>
 - <uncertainty, or omit the section>
 
 Rules:
+- Produce the editorial title during this references step.
 - One `## SOURCE` block per publication, numbered S1, S2, ...
 - One `## EVENT` block per dated event, numbered R1, R2, ...
 - Every event must cite at least one source id you defined above.
 - Never cite a source id you did not define.
 - No date after the research date.
-"""
-
-    REFERENCES_RESEARCH_V2 = REFERENCES_RESEARCH_V1.replace(
-        "# REFERENCES",
-        "# REFERENCES\n\neditorial-title: <titre français au format [Acteur principal] Titre, ou [Brève] Titre>",
-    ).replace(
-        "- One `## SOURCE` block per publication",
-        "- Produce the editorial title during this references step.\n- One `## SOURCE` block per publication",
-    )
-
-    TECHNICAL_EXTRACTION_V1 = """You are a CTI analysis assistant. Extract the technical intelligence contained in the references you produced in this conversation.
-
-**Subject**: {subject_title}
-
-**Rules**:
-1. Use ONLY the references and sources established earlier in this conversation.
-2. Never invent an indicator, a hash, a domain or a CVE.
-3. Every item must cite the events (R#) and/or sources (S#) that support it.
-4. Omit a category entirely, or write `none`, when the subject has nothing for it.
-
-**Output format** — plain Markdown, no code fence, no JSON:
-
-# EXTRACTION CTI
-
-## ACTORS
-### ITEM A1
-value: <value>
-context: <short context, in French>
-references: R1
-sources: S1
-
-## TTP
-### ITEM T1
-value: <technique name>
-attack-id: T1566.001
-context: <context>
-references: R1
-sources: S1
-
-## NETWORK ARTIFACTS
-### ITEM N1
-type: domain|ip|url|hash|email
-value: <value>
-context: <context>
-references: R1
-sources: S1
-
-## PERSISTENCE
-none
-
-# UNCERTAINTIES
-- <uncertainty>
-
-Available categories: ACTORS, CAMPAIGNS, VICTIMOLOGY, INFECTION CHAIN, MALWARE,
-TOOLS, TTP, CVE, PROTOCOLS, NETWORK ARTIFACTS, INFRASTRUCTURE, FILES, COMMANDS,
-PERSISTENCE, DETECTIONS, OTHER TECHNICAL.
 """
 
     TECHNICAL_EXTRACTION_V3 = """You are a CTI analysis assistant. Extract structured technical intelligence from supplied corpus chunk.
@@ -169,47 +116,6 @@ Strict rules:
 
 Expected structure:
 {expected_structure}
-"""
-
-    TECHNICAL_SYNTHESIS_V1 = """You are a technical writer for threat intelligence reports. Your task is to synthesize research into a comprehensive technical briefing.
-
-**Subject**: {subject_title}
-
-**Available Data**:
-- Reference timeline (provided above)
-- Technical extraction (provided above)
-- Supporting IOC indicators
-
-**Writing Guidelines**:
-1. Write in French, without internal section headings
-2. Use ONLY information from the references and extraction
-3. DO NOT add new sources or conduct research
-4. DO NOT add new IOC or assertions not in extraction
-5. Mark source references with [S1], [S2], etc. using source IDs
-6. Each factual claim must have source attribution
-7. Group paragraphs by topic when logical, but keep structure simple
-
-**Content Order (if material available)**:
-1. Brief presentation of the activity
-2. Threat actor / attribution / context
-3. Victimology (targets)
-4. Infection chain / operational flow
-5. Malware and tools
-6. Technical protocols, network, infrastructure
-7. Other technical elements
-8. Limitations and uncertainties (if needed)
-
-**Rules**:
-- No empty sections
-- No invented paragraphs to fill structure
-- [S#] markers must refer to actual sources
-- No external URLs not in the source bundle
-- Technical assertions must match extracted IOCs
-
-**Output**: Return markdown text (no heading, no code blocks). Include [S#] markers for each source reference.
-
-Example of good synthesis:
-Le groupe Exemple réalise depuis 2020 des attaques ciblées contre le secteur financier [S1]. Les campagnes utilisent des emails de phishing contenant des pièces jointes malveillantes [S2]. La chaîne d'infection commence par un document Office piégé [S1], suivi du téléchargement du malware AwesomeMalware [S3] via C2 situé sur infrastructure Telia [S2]. Les IOC associés incluent l'adresse 192.0.2.1 [S1] et le domaine malicious.example.com [S3].
 """
 
     TECHNICAL_SYNTHESIS_V4 = """You are a senior CTI technical writer. Write concise sourced French CTI prose.
@@ -301,31 +207,18 @@ text: <event>
 # UNCERTAINTIES
 - <uncertainty, or omit the section>"""
 
-    _EXTRACTION_STRUCTURE = """# EXTRACTION CTI
-
-## NETWORK ARTIFACTS
-### ITEM N1
-value: <value>
-semantic-type: indicator
-artifact-type: <ip|domain|url|hash|email|filepath|filename|cve|none>
-indicator-status: <confirmed_ioc|contextual|excluded>
-provenance: <source|derived|analyst>
-display-policy: <ioc_section|body_only|both|hidden>
-context: <context>
-references: R1
-sources: S1
-
-# UNCERTAINTIES
-- <uncertainty, or omit the section>"""
-
     @classmethod
     def get_format_repair_prompt(cls, *, stage: str, problems: Sequence[str]) -> str:
         listed = "\n".join(f"- {problem}" for problem in problems) or "- structure illisible"
         if stage == "synthesis":
             return cls.SYNTHESIS_REPAIR_V2.format(problems=listed)
-        structure = (
-            cls._REFERENCES_STRUCTURE if stage == "references" else cls._EXTRACTION_STRUCTURE
-        )
+        # For references and extraction stages, use the standard repair template
+        # with minimal structure reference for consistency.
+        if stage == "references":
+            structure = cls._REFERENCES_STRUCTURE
+        else:
+            # Generic extraction guidance without legacy Markdown format
+            structure = "Return strict JSON conforming to the extraction schema."
         return cls.FORMAT_REPAIR_V1.format(problems=listed, expected_structure=structure)
 
     @classmethod

@@ -142,9 +142,9 @@ export function SubjectProduction({
           </p>
         ) : null}
         <p>
-          AutoWork collecte et analyse les sources, puis ChatGPT établit les
-          références, l’analyse technique, vérifie les indicateurs et rédige la
-          synthèse.
+          AutoWork collecte et archive les sources ; ChatGPT établit les
+          références ; l’extraction technique structurée est vérifiée
+          automatiquement ; ChatGPT rédige ensuite la synthèse.
         </p>
         {startMutation.error ? (
           <p className="error-message" role="alert">

@@ -305,13 +305,14 @@ def _validate_hostname(raw: str) -> None:
     if len(hostname) > 253 or "/" in hostname or "\\" in hostname or hostname.count(".") < 1:
         raise ValueError("invalid hostname")
     labels = hostname.split(".")
-    if any(not _LABEL.fullmatch(label) for label in labels):
+    # DNS standard: each label must not exceed 63 characters
+    if any(not _LABEL.fullmatch(label) or len(label) > 63 for label in labels):
         raise ValueError("invalid hostname")
     if labels[-1] not in IANA_TLDS:
         raise ValueError("unknown public suffix")
     # File extensions and glued prose commonly pass label syntax; require a
     # plausible registrable label, never an extension-looking final label.
-    if labels[-1] in {"exe", "php", "txt", "pdf"} or any(len(label) > 50 for label in labels):
+    if labels[-1] in {"exe", "php", "txt", "pdf"}:
         raise ValueError("file or prose fragment")
 
 

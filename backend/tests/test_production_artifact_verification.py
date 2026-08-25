@@ -82,6 +82,7 @@ def _artifact(
         ("a" * 40, "hash"),
         ("b" * 64, "hash"),
         ("c" * 128, "hash"),
+        (("a" * 63) + ".example.com", "domain"),  # Valid DNS label at 63-char limit
     ],
 )
 def test_accepts_valid_artifacts(value: str, kind: str) -> None:

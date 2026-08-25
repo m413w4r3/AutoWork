@@ -96,7 +96,8 @@ const IOC_LABELS: Record<string, string> = {
   ip: "Adresses IP",
   domain: "Noms de domaine",
   url: "URL",
-  hash: "Fichiers",
+  email: "Adresses e-mail",
+  hash: "Hachages",
 };
 
 const NETWORK_IOC_TYPES = new Set(["domain", "ip", "url", "email", "hash"]);
