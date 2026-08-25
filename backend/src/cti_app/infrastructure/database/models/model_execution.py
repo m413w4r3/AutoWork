@@ -27,7 +27,7 @@ MODEL_RUN_STATUS_VALUES_SQL = (
 CONVERSATION_TRANSPORT_VALUES_SQL = "'chatgpt_bridge', 'openai_responses', 'application_managed'"
 CONVERSATION_PURPOSE_VALUES_SQL = (
     "'discovery', 'analyst_assistance', 'pivot_research', "
-    "'drafting', 'critic', 'subject_production'"
+    "'drafting', 'critic', 'subject_research'"
 )
 CONVERSATION_STATUS_VALUES_SQL = (
     "'pending', 'ready', 'busy', 'needs_review', 'unavailable', 'archived'"

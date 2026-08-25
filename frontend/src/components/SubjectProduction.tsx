@@ -223,9 +223,14 @@ export function SubjectProduction({
         <a href={`/subjects/${subjectId}/production/artifacts/synthesis`}>
           Voir la synthèse
         </a>
-        {status.conversation_id ? (
+        {status.references_conversation_id ? (
           <a href={`/subjects/${subjectId}#conversations`}>
-            Voir la conversation
+            Voir la recherche
+          </a>
+        ) : null}
+        {status.synthesis_conversation_id ? (
+          <a href={`/subjects/${subjectId}#conversations`}>
+            Voir la synthèse
           </a>
         ) : null}
         {status.status === "ready" ? (
@@ -256,7 +261,8 @@ export function SubjectProduction({
             {issueCopy(status.status, issueCode)}
           </p>
           <p>Code : {issueCode ?? "inconnu"}</p>
-          {issueIsConversation && status.conversation_id ? (
+          {issueIsConversation &&
+          (status.references_conversation_id || status.synthesis_conversation_id) ? (
             <a href={`/subjects/${subjectId}#conversations`}>
               Voir la conversation
             </a>

@@ -28,7 +28,8 @@ function runningStatus(overrides: Record<string, unknown> = {}) {
     current_stage: "references",
     progress_current: 1,
     progress_total: 5,
-    conversation_id: "c-1",
+    references_conversation_id: "c-1",
+    synthesis_conversation_id: null,
     run_id: "r-1",
     created_at: "2026-08-10T10:00:00Z",
     started_at: "2026-08-10T10:00:00Z",
@@ -130,7 +131,7 @@ describe("SubjectProduction", () => {
       screen.getByRole("link", { name: "Voir les références" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("link", { name: "Voir la conversation" }),
+      screen.getByRole("link", { name: "Voir la recherche" }),
     ).toBeInTheDocument();
   });
 

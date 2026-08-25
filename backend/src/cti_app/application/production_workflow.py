@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -453,14 +454,18 @@ class ProductionWorkflowOrchestrator:
         return None
 
     async def _open_conversation(
-        self, run: SubjectProductionRun, subject_title: str
+        self, run: SubjectProductionRun, subject_title: str, purpose: ConversationPurpose
     ) -> ModelConversation:
         assert self._model_service is not None
         return await self._model_service.create(
             provider=ModelProvider.OPENAI,
             transport=ConversationTransport.CHATGPT_BRIDGE,
-            purpose=ConversationPurpose.SUBJECT_PRODUCTION,
-            title=f"Production — {subject_title}",
+            purpose=purpose,
+            title=(
+                f"Production research — {subject_title}"
+                if purpose is ConversationPurpose.SUBJECT_RESEARCH
+                else f"Production synthesis — {subject_title}"
+            ),
             edition_id=run.edition_id,
             subject_id=run.subject_id,
             expected_profile=None,
@@ -557,13 +562,15 @@ class ProductionWorkflowOrchestrator:
                     "artifact_id": str(existing.id),
                 }
 
-            # One dedicated conversation per subject.
-            if not run.conversation_id:
-                conversation = await self._open_conversation(run, subject_title)
-                run.conversation_id = conversation.id
+            # Q1 has its own research conversation; Q2 remains stateless.
+            if not run.references_conversation_id:
+                conversation = await self._open_conversation(
+                    run, subject_title, ConversationPurpose.SUBJECT_RESEARCH
+                )
+                run.references_conversation_id = conversation.id
                 persisted = await uow.subject_production_runs.get_for_update(run.id)
                 if persisted is not None:
-                    persisted.conversation_id = conversation.id
+                    persisted.references_conversation_id = conversation.id
                     await uow.subject_production_runs.save(persisted)
                     await uow.commit()
 
@@ -581,7 +588,7 @@ class ProductionWorkflowOrchestrator:
             try:
                 parsed, raw, turn_id = await self._ask_with_format_repair(
                     run=run,
-                    conversation_id=run.conversation_id,
+                    conversation_id=run.references_conversation_id,
                     stage="references",
                     prompt=prompt,
                     prompt_version=REFERENCES_PROMPT_VERSION,
@@ -731,14 +738,6 @@ class ProductionWorkflowOrchestrator:
             }
             input_hash = compute_input_hash(input_data)
 
-            conversation_id = run.conversation_id
-            if conversation_id is None:
-                return {
-                    "stage": "extraction",
-                    "status": "error",
-                    "error": "No conversation opened for this run",
-                }
-
             research_date = run.research_date or datetime.now(UTC).date()
             ctx = await build_subject_production_context(uow, run.subject_id, research_date)
             policy_allows = ctx.external_llm_allowed
@@ -800,6 +799,7 @@ class ProductionWorkflowOrchestrator:
                             prompt_template_id="production-q2-extraction",
                             prompt_template_version=EXTRACTION_PROMPT_VERSION,
                             correlation_id=self._correlation_id,
+                            web_search=False,
                         )
                         self._last_model_run_id = execution.run.id
                         model_output = cast(Q2ChunkOutput, execution.structured_output)
@@ -1011,6 +1011,83 @@ class ProductionWorkflowOrchestrator:
             )
         return build_production_evidence_pack(report, items, children)
 
+    @staticmethod
+    def _build_synthesis_evidence_pack(report: ReferenceReport, extraction: Any) -> dict[str, Any]:
+        """Deterministic Q4 input, stripped of operational/internal evidence.
+
+        Q4 must write from the verified Q1/Q2 results, not from raw collection
+        material.  In particular, never expose source URLs, chunk/model IDs, or
+        items explicitly kept out of publication.
+        """
+        items: list[dict[str, Any]] = []
+        for item in extraction.items:
+            if (
+                not item.supported
+                or item.indicator_status is IndicatorStatus.EXCLUDED
+                or item.display_policy.value == "hidden"
+            ):
+                continue
+            published: dict[str, Any] = {
+                "category": item.category,
+                "context": item.context,
+                "source_ids": sorted(item.source_ids),
+                "indicator_status": item.indicator_status.value,
+                "display_policy": item.display_policy.value,
+                "artifact_type": item.artifact_type.value if item.artifact_type else None,
+            }
+            # Precise indicators are publishable in prose only with BOTH.
+            if item.artifact_type is None or item.display_policy.value == "both":
+                published["value"] = item.value
+            items.append(published)
+
+        return {
+            "version": "1",
+            "reference_report": {
+                "sources": [
+                    {
+                        "id": source.local_id,
+                        "title": source.title,
+                        "publisher": source.publisher,
+                        "published_at": (
+                            source.published_at.isoformat() if source.published_at else None
+                        ),
+                    }
+                    for source in sorted(report.sources, key=lambda source: source.local_id)
+                ],
+                "events": [
+                    {
+                        "date": event.event_date.isoformat() if event.event_date else None,
+                        "source_ids": sorted(event.source_ids),
+                        "text": re.sub(
+                            r"\b(?:https?|hxxps?)://\S+",
+                            "[URL omitted]",
+                            event.text,
+                            flags=re.IGNORECASE,
+                        ),
+                    }
+                    for event in sorted(
+                        report.events,
+                        key=lambda event: (
+                            event.event_date.isoformat() if event.event_date else "",
+                            event.local_id,
+                        ),
+                    )
+                ],
+                "uncertainties": sorted(report.uncertainties),
+            },
+            "technical_extraction": {
+                "items": sorted(
+                    items,
+                    key=lambda item: (
+                        item["category"],
+                        item.get("value", ""),
+                        item["context"],
+                    ),
+                ),
+                "uncertainties": sorted(extraction.uncertainties),
+            },
+        }
+
     async def _execute_synthesis_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
         if not self._model_service:
             return {
@@ -1035,22 +1112,6 @@ class ProductionWorkflowOrchestrator:
                     "error": "References artifact not found",
                 }
 
-            input_data = {
-                "subject_id": str(run.subject_id),
-                "extraction_version": extraction.version,
-                "stage": "synthesis",
-                "prompt_version": SYNTHESIS_PROMPT_VERSION,
-            }
-            input_hash = compute_input_hash(input_data)
-
-            conversation_id = run.conversation_id
-            if conversation_id is None:
-                return {
-                    "stage": "synthesis",
-                    "status": "error",
-                    "error": "No conversation opened for this run",
-                }
-
             synthesis_research_date = run.research_date or datetime.now(UTC).date()
             synthesis_ctx = await build_subject_production_context(
                 uow, run.subject_id, synthesis_research_date
@@ -1062,14 +1123,6 @@ class ProductionWorkflowOrchestrator:
                     "status": "needs_review",
                     "error_code": "external_llm_blocked",
                     "error": "Diffusion policy forbids sending this subject to an external model",
-                }
-
-            existing = await uow.production_artifacts.get_current(run.id, "synthesis")
-            if existing and existing.input_hash == input_hash:
-                return {
-                    "stage": "synthesis",
-                    "status": "cached",
-                    "artifact_id": str(existing.id),
                 }
 
             report = await self._load_reference_report(references)
@@ -1088,10 +1141,49 @@ class ProductionWorkflowOrchestrator:
                 await self._artifact_store.read_json(extraction.canonical_blob_id)
             )
             subject_title, _ = await self._subject_context(uow, run.subject_id)
+            synthesis_pack = self._build_synthesis_evidence_pack(report, extraction_payload)
+            synthesis_pack_hash = compute_input_hash(synthesis_pack)
+            input_hash = compute_input_hash(
+                {
+                    "subject_id": str(run.subject_id),
+                    "references_version": references.version,
+                    "references_hash": references.input_hash,
+                    "reference_report_hash": compute_input_hash(reference_report_to_json(report)),
+                    "extraction_version": extraction.version,
+                    "extraction_hash": extraction.input_hash,
+                    "technical_extraction_hash": compute_input_hash(
+                        technical_extraction_to_json(extraction_payload)
+                    ),
+                    "synthesis_evidence_pack_version": "1",
+                    "synthesis_evidence_pack_hash": synthesis_pack_hash,
+                    "prompt_version": SYNTHESIS_PROMPT_VERSION,
+                    "web_policy_version": "q4-web-non-authoritative-v1",
+                    "model_routing_policy": "openai-drafting-v1",
+                    "stage": "synthesis",
+                }
+            )
+            existing = await uow.production_artifacts.get_current(run.id, "synthesis")
+            if existing and existing.input_hash == input_hash:
+                return {
+                    "stage": "synthesis",
+                    "status": "cached",
+                    "artifact_id": str(existing.id),
+                }
+
+            if run.synthesis_conversation_id is None:
+                conversation = await self._open_conversation(
+                    run, subject_title, ConversationPurpose.DRAFTING
+                )
+                run.synthesis_conversation_id = conversation.id
+                persisted = await uow.subject_production_runs.get_for_update(run.id)
+                if persisted is not None:
+                    persisted.synthesis_conversation_id = conversation.id
+                    await uow.subject_production_runs.save(persisted)
+                    await uow.commit()
             prompt = ProductionPromptTemplates.get_synthesis_prompt(
                 subject_title=subject_title,
-                technical_extraction=json.dumps(
-                    technical_extraction_to_json(extraction_payload),
+                synthesis_evidence_pack=json.dumps(
+                    synthesis_pack,
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
@@ -1100,15 +1192,15 @@ class ProductionWorkflowOrchestrator:
             try:
                 parsed, output_text, turn_id = await self._ask_with_format_repair(
                     run=run,
-                    conversation_id=conversation_id,
+                    conversation_id=run.synthesis_conversation_id,
                     stage="synthesis",
                     prompt=prompt,
                     prompt_version=SYNTHESIS_PROMPT_VERSION,
                     repair_version=SYNTHESIS_FORMAT_REPAIR_VERSION,
-                    mode=ConversationMode.CONTINUE,
+                    mode=ConversationMode.FRESH,
                     parse=lambda text: validate_synthesis(text, report, extraction_payload),
                     external_llm_allowed=synthesis_policy_allows,
-                    web_search=False,
+                    web_search=True,
                 )
                 if parsed is None:
                     return {
@@ -1243,16 +1335,18 @@ class ProductionWorkflowOrchestrator:
             subject_title, _ = await self._subject_context(uow, run.subject_id)
 
             # Archive the old conversation; a failure here must not block the retry.
-            if run.conversation_id:
+            if run.references_conversation_id:
                 try:
                     await self._model_service.archive(
-                        run.conversation_id, context_subject_id=run.subject_id
+                        run.references_conversation_id, context_subject_id=run.subject_id
                     )
                 except Exception:
                     pass
 
-            conversation = await self._open_conversation(run, subject_title)
-            run.conversation_id = conversation.id
+            conversation = await self._open_conversation(
+                run, subject_title, ConversationPurpose.SUBJECT_RESEARCH
+            )
+            run.references_conversation_id = conversation.id
 
             run.current_stage = SubjectProductionStage.SOURCES
             run.status = SubjectProductionStatus.QUEUED

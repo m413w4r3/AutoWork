@@ -26,7 +26,8 @@ export interface ProductionStatus {
   current_stage: string;
   progress_current: number;
   progress_total: number;
-  conversation_id: string | null;
+  references_conversation_id: string | null;
+  synthesis_conversation_id: string | null;
   run_id: string;
   created_at: string;
   started_at: string | null;

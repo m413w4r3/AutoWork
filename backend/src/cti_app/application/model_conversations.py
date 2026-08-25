@@ -396,6 +396,7 @@ class ModelConversationService:
         prompt_template_id: str,
         prompt_template_version: str,
         correlation_id: str,
+        web_search: bool = False,
     ) -> ModelExecution:
         """Run a stateless, schema-constrained extraction model request."""
         request = ModelRequest(
@@ -411,7 +412,7 @@ class ModelConversationService:
                 "primary_evidence": True,
                 "correlation_id": correlation_id,
             },
-            web_search=False,
+            web_search=web_search,
             run_id=uuid4(),
         )
         execution = await self._gateway.extract(request, output_schema)
@@ -508,7 +509,6 @@ def _role(purpose: ConversationPurpose) -> ModelRole:
 
 
 def _routing_hint(purpose: ConversationPurpose) -> ModelRoutingHint:
-
     if purpose is ConversationPurpose.CRITIC:
         return ModelRoutingHint.CRITIQUE
     if purpose is ConversationPurpose.DRAFTING:

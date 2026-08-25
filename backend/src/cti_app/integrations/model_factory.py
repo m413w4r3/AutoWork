@@ -38,9 +38,7 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
     openai_structured = OpenAIStructuredAdapter(
         bridge_transport, model=settings.openai_structured_model
     )
-    openai_drafting = OpenAIStructuredAdapter(
-        bridge_transport, model=settings.openai_drafting_model
-    )
+    openai_drafting = OpenAIResearchAdapter(bridge_transport, model=settings.openai_drafting_model)
     openai_critic = OpenAIResearchAdapter(bridge_transport, model=settings.openai_critic_model)
     qwen = QwenAdapter(
         qwen_transport,

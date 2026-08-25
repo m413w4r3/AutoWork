@@ -133,8 +133,9 @@ export function AnalysisConversations({ subjectId }: { subjectId: string }) {
           >
             <option value="analyst_assistance">Assistance analyste</option>
             <option value="pivot_research">Recherche de pivots</option>
+            <option value="subject_research">Recherche production</option>
             <option value="discovery">Découverte (fresh uniquement)</option>
-            <option value="drafting">Rédaction (fresh uniquement)</option>
+            <option value="drafting">Rédaction</option>
             <option value="critic">Critique (fresh uniquement)</option>
           </select>
         </label>

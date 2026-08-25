@@ -73,7 +73,7 @@ def test_authorized_hash_binds_the_explicit_web_search_choice() -> None:
     )
 
 
-def test_only_analyst_assistance_and_pivot_research_can_continue() -> None:
+def test_research_and_drafting_scopes_can_continue() -> None:
     analyst = ModelConversation(
         provider=ModelProvider.OPENAI,
         transport=ConversationTransport.CHATGPT_BRIDGE,
@@ -85,6 +85,30 @@ def test_only_analyst_assistance_and_pivot_research_can_continue() -> None:
     )
     analyst.start_turn(mode=ConversationMode.CONTINUE)
     assert analyst.status is ConversationStatus.BUSY
+
+    drafting = ModelConversation(
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.DRAFTING,
+        title="Synthèse",
+        external_locator="https://chatgpt.com/opaque/s",
+        head_turn_id=uuid4(),
+        status=ConversationStatus.READY,
+    )
+    drafting.start_turn(mode=ConversationMode.CONTINUE)
+    assert drafting.status is ConversationStatus.BUSY
+
+    research = ModelConversation(
+        provider=ModelProvider.OPENAI,
+        transport=ConversationTransport.CHATGPT_BRIDGE,
+        purpose=ConversationPurpose.SUBJECT_RESEARCH,
+        title="Recherche",
+        external_locator="https://chatgpt.com/opaque/r",
+        head_turn_id=uuid4(),
+        status=ConversationStatus.READY,
+    )
+    research.start_turn(mode=ConversationMode.CONTINUE)
+    assert research.status is ConversationStatus.BUSY
 
     discovery = ModelConversation(
         provider=ModelProvider.OPENAI,

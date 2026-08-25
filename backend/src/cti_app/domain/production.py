@@ -51,7 +51,8 @@ class SubjectProductionRun:
     profile: ProductionProfile
     status: SubjectProductionStatus = SubjectProductionStatus.QUEUED
     current_stage: SubjectProductionStage = SubjectProductionStage.SOURCES
-    conversation_id: UUID | None = None
+    references_conversation_id: UUID | None = None
+    synthesis_conversation_id: UUID | None = None
     run_number: int = 1
     # Frozen when the run starts: a retry after midnight must not shift the
     # boundary used to reject impossible publication dates.

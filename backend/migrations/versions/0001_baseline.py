@@ -1547,8 +1547,8 @@ def _create_model_conversations() -> None:
             name="ck_model_conversations_transport",
         ),
         sa.CheckConstraint(
-            "purpose IN ('discovery','analyst_assistance','pivot_research','drafting',"
-            "'critic','subject_production')",
+            "purpose IN ('discovery','analyst_assistance','pivot_research','subject_research',"
+            "'drafting','critic')",
             name="ck_model_conversations_purpose",
         ),
         sa.CheckConstraint(
@@ -1662,7 +1662,8 @@ def _create_subject_production_runs() -> None:
         sa.Column("profile", sa.String(32), nullable=False),
         sa.Column("status", sa.String(32), nullable=False),
         sa.Column("current_stage", sa.String(32), nullable=False),
-        sa.Column("conversation_id", sa.Uuid(), nullable=True),
+        sa.Column("references_conversation_id", sa.Uuid(), nullable=True),
+        sa.Column("synthesis_conversation_id", sa.Uuid(), nullable=True),
         sa.Column("run_number", sa.Integer(), nullable=False),
         sa.Column("error_code", sa.String(64), nullable=True),
         sa.Column("error_message", sa.String(500), nullable=True),
@@ -1697,7 +1698,10 @@ def _create_subject_production_runs() -> None:
         sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
-            ["conversation_id"], ["model_conversations.id"], ondelete="SET NULL"
+            ["references_conversation_id"], ["model_conversations.id"], ondelete="SET NULL"
+        ),
+        sa.ForeignKeyConstraint(
+            ["synthesis_conversation_id"], ["model_conversations.id"], ondelete="SET NULL"
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("subject_id", "run_number", name="uq_subject_run_number"),

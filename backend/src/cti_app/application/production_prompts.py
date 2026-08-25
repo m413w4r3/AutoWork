@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 REFERENCES_PROMPT_VERSION = "2"
 EXTRACTION_PROMPT_VERSION = "6"
-SYNTHESIS_PROMPT_VERSION = "3"
+SYNTHESIS_PROMPT_VERSION = "4"
 REFERENCES_FORMAT_REPAIR_VERSION = "1"
 EXTRACTION_FORMAT_REPAIR_VERSION = "1"
 SYNTHESIS_FORMAT_REPAIR_VERSION = "2"
@@ -212,17 +212,19 @@ Example of good synthesis:
 Le groupe Exemple réalise depuis 2020 des attaques ciblées contre le secteur financier [S1]. Les campagnes utilisent des emails de phishing contenant des pièces jointes malveillantes [S2]. La chaîne d'infection commence par un document Office piégé [S1], suivi du téléchargement du malware AwesomeMalware [S3] via C2 situé sur infrastructure Telia [S2]. Les IOC associés incluent l'adresse 192.0.2.1 [S1] et le domaine malicious.example.com [S3].
 """
 
-    TECHNICAL_SYNTHESIS_V3 = """You are a technical writer for threat intelligence reports. Write a sourced French technical synthesis for:
+    TECHNICAL_SYNTHESIS_V4 = """You are a senior CTI technical writer. Write concise sourced French CTI prose.
 
 **Subject**: {subject_title}
 
-Use only the reference timeline and the canonical TechnicalExtraction below.
-Do not research, add a source, an IOC or a factual assertion.
-Keep internal [S#] source markers on factual claims.
+You may use web search to clarify terminology and public background. Web results are
+non-authoritative working context. Final text MUST contain only factual claims supported
+by supplied SynthesisEvidencePack. Never add a source, IOC, date, attribution, victim,
+malware relationship, capability, or factual assertion solely from web research. If web
+conflicts with canonical data, canonical data wins. Use only supplied [S#] markers.
 
-<technical-extraction-canonical>
-{technical_extraction}
-</technical-extraction-canonical>
+<synthesis-evidence-pack>
+{synthesis_evidence_pack}
+</synthesis-evidence-pack>
 
 Strict publication rules:
 - Produce no Markdown title or heading.
@@ -330,9 +332,9 @@ sources: S1
     def get_synthesis_prompt(
         cls,
         subject_title: str,
-        technical_extraction: str = "not available",
+        synthesis_evidence_pack: str = "{}",
     ) -> str:
-        return cls.TECHNICAL_SYNTHESIS_V3.format(
+        return cls.TECHNICAL_SYNTHESIS_V4.format(
             subject_title=subject_title,
-            technical_extraction=technical_extraction,
+            synthesis_evidence_pack=synthesis_evidence_pack,
         )

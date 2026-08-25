@@ -21,6 +21,10 @@ from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_evidence_pack import EvidenceChunk, ProductionEvidencePack
 from cti_app.application.production_parsers import (
+    DisplayPolicy,
+    ExtractionItem,
+    IndicatorStatus,
+    TechnicalExtraction,
     parse_reference_report,
     reference_report_from_json,
 )
@@ -32,7 +36,7 @@ from cti_app.application.source_evidence_processing import (
     SourceEvidenceProcessingService,
 )
 from cti_app.domain.collection import CollectionState, SourceOriginKind
-from cti_app.domain.model_conversations import ConversationMode
+from cti_app.domain.model_conversations import ConversationMode, ConversationPurpose
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -40,6 +44,7 @@ from cti_app.domain.production import (
     SubjectProductionRun,
     SubjectProductionStage,
 )
+from cti_app.domain.publication import ArtifactType
 from tests.test_production_parsers import PERFECT_Q1, PERFECT_Q2
 
 
@@ -74,11 +79,14 @@ class _FakeConversations:
         self._turns: dict[UUID, list[_Turn]] = {}
         self._turns_by_idempotency_key: dict[str, _Turn] = {}
         self.created: list[UUID] = []
+        self.create_requests: list[dict[str, Any]] = []
         self.structured_calls: list[dict[str, Any]] = []
+        self.turn_requests: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> Any:
         conversation_id = uuid4()
         self.created.append(conversation_id)
+        self.create_requests.append(kwargs)
         self._turns[conversation_id] = []
         return type("Conversation", (), {"id": conversation_id})()
 
@@ -92,6 +100,15 @@ class _FakeConversations:
         **kwargs: Any,
     ) -> _Turn:
         self.calls.append((conversation_id, mode, idempotency_key, message))
+        self.turn_requests.append(
+            {
+                "conversation_id": conversation_id,
+                "mode": mode,
+                "idempotency_key": idempotency_key,
+                "message": message,
+                **kwargs,
+            }
+        )
         if existing := self._turns_by_idempotency_key.get(idempotency_key):
             return existing
         turn = _Turn(id=uuid4(), text=self._answers.pop(0))
@@ -637,6 +654,86 @@ async def test_extraction_uses_stateless_structured_output_per_q2_chunk() -> Non
     assert [mode for _, mode, _, _ in conversations.calls] == [ConversationMode.FRESH]
     assert len(conversations.structured_calls) == 2
     assert all(len(call["evidence_pack_hash"]) == 64 for call in conversations.structured_calls)
+
+
+def test_synthesis_evidence_pack_omits_internal_and_non_publishable_data() -> None:
+    report = parse_reference_report(PERFECT_Q1, date(2026, 8, 1)).value
+    assert report is not None
+    extraction = TechnicalExtraction(
+        items=(
+            ExtractionItem(
+                local_id="keep",
+                category="malware",
+                value="ExampleRAT",
+                context="outil observé",
+                artifact_type=None,
+                attack_id=None,
+                reference_ids=(),
+                source_ids=("S1",),
+                supported=True,
+            ),
+            ExtractionItem(
+                local_id="excluded",
+                category="infrastructure",
+                value="never.example",
+                context="faux positif",
+                artifact_type=ArtifactType.DOMAIN,
+                attack_id=None,
+                reference_ids=(),
+                source_ids=("S1",),
+                supported=True,
+                indicator_status=IndicatorStatus.EXCLUDED,
+                display_policy=DisplayPolicy.HIDDEN,
+                chunk_ids=("internal-chunk",),
+                model_run_ids=("internal-model",),
+            ),
+        )
+    )
+
+    pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(report, extraction)
+    serialized = json.dumps(pack, sort_keys=True)
+
+    assert "https://" not in serialized
+    assert "never.example" not in serialized
+    assert "internal-chunk" not in serialized
+    assert "internal-model" not in serialized
+    assert pack["technical_extraction"]["items"][0]["value"] == "ExampleRAT"
+
+
+async def test_synthesis_has_its_own_drafting_scope_and_local_repair() -> None:
+    valid_synthesis = "Premiere observation de la campagne [S1]."
+    orchestrator, uow, conversations = _build(
+        [PERFECT_Q1, PERFECT_Q2, PERFECT_Q2, "## titre interdit", valid_synthesis]
+    )
+
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+    await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.REFERENCES)
+    uow.run.current_stage = SubjectProductionStage.EXTRACTION
+    await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.EXTRACTION)
+    uow.run.current_stage = SubjectProductionStage.SYNTHESIS
+    result = await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.SYNTHESIS)
+
+    assert result["status"] == "success", result
+    assert uow.run.references_conversation_id is not None
+    assert uow.run.synthesis_conversation_id is not None
+    assert uow.run.references_conversation_id != uow.run.synthesis_conversation_id
+    assert [request["purpose"] for request in conversations.create_requests] == [
+        ConversationPurpose.SUBJECT_RESEARCH,
+        ConversationPurpose.DRAFTING,
+    ]
+    assert len(conversations.structured_calls) == 2
+    assert all(call["web_search"] is False for call in conversations.structured_calls)
+
+    q1, q4, q4_repair = conversations.turn_requests
+    assert q1["web_search"] is True
+    assert q4["conversation_id"] == uow.run.synthesis_conversation_id
+    assert q4["mode"] is ConversationMode.FRESH
+    assert q4["web_search"] is True
+    assert "synthesis-evidence-pack" in q4["message"]
+    assert "https://" not in q4["message"]
+    assert q4_repair["conversation_id"] == uow.run.synthesis_conversation_id
+    assert q4_repair["mode"] is ConversationMode.CONTINUE
+    assert q4_repair["web_search"] is False
 
 
 async def test_three_q2_chunks_with_one_loss_produce_no_canonical_extraction(

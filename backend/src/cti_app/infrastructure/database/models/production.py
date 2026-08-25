@@ -50,7 +50,10 @@ class SubjectProductionRunRow(Base):
     profile: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     current_stage: Mapped[str] = mapped_column(String(32), nullable=False)
-    conversation_id: Mapped[UUID | None] = mapped_column(
+    references_conversation_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("model_conversations.id", ondelete="SET NULL")
+    )
+    synthesis_conversation_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("model_conversations.id", ondelete="SET NULL")
     )
     run_number: Mapped[int] = mapped_column(nullable=False)

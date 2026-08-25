@@ -188,7 +188,7 @@ class ExtractionService(_ArtifactPayloadMixin):
         return {
             "prompt": prompt,
             "input_hash": input_hash,
-            "mode": "continue",
+            "mode": "fresh",
         }
 
     async def store_extraction_result(

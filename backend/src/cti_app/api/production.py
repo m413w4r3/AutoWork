@@ -63,7 +63,8 @@ class ProductionStatus(BaseModel):
     current_stage: str
     progress_current: int
     progress_total: int
-    conversation_id: str | None = None
+    references_conversation_id: str | None = None
+    synthesis_conversation_id: str | None = None
     run_id: str
     created_at: str
     started_at: str | None = None
@@ -267,7 +268,16 @@ async def get_subject_production(
             current_stage=run.current_stage.value,
             progress_current=completed_stages,
             progress_total=len(stages),
-            conversation_id=str(run.conversation_id) if run.conversation_id else None,
+            references_conversation_id=(
+                str(run.references_conversation_id)
+                if run.references_conversation_id
+                else None
+            ),
+            synthesis_conversation_id=(
+                str(run.synthesis_conversation_id)
+                if run.synthesis_conversation_id
+                else None
+            ),
             run_id=str(run.id),
             created_at=run.created_at.isoformat(),
             started_at=run.started_at.isoformat() if run.started_at else None,
@@ -298,9 +308,9 @@ async def retry_references(
                 detail=f"Can only retry from READY status, current is {run.status.value}",
             )
 
-        # TODO: archive old conversation and create a new one; currently only resets stage.
+        # The workflow archives and replaces the Q1 research conversation.
         run.current_stage = SubjectProductionStage.SOURCES
-        run.conversation_id = None
+        run.references_conversation_id = None
         await uow.subject_production_runs.save(run)
         await uow.commit()
 

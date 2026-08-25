@@ -248,11 +248,26 @@ def test_unknown_source_marker_is_rejected() -> None:
     assert any("unknown_source_marker" in e for e in result.errors)
 
 
+def test_factual_paragraph_without_source_marker_is_rejected() -> None:
+    result = validate_synthesis("Analyse factuelle sans citation.", _corpus(), set())
+
+    assert not result.usable
+    assert "uncited_factual_paragraph" in result.errors
+
+
 def test_url_outside_corpus_is_rejected() -> None:
     result = validate_synthesis("Voir https://elsewhere.example/page [S1].", _corpus(), set())
 
     assert not result.usable
     assert any("raw_url" in e for e in result.errors)
+
+
+@pytest.mark.parametrize("label", ("EXCLUDED", "hidden"))
+def test_internal_publication_labels_are_rejected(label: str) -> None:
+    result = validate_synthesis(f"Élément {label} [S1].", _corpus(), set())
+
+    assert not result.usable
+    assert "internal_display_label" in result.errors
 
 
 def test_indicator_absent_from_corpus_is_rejected() -> None:

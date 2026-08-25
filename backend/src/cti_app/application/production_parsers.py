@@ -643,6 +643,15 @@ def validate_synthesis(
     if unknown:
         reject("unknown_source_marker", ",".join(unknown))
 
+    # The Q4 prose is a publication-ready account of the evidence pack.  A
+    # paragraph without a corpus marker cannot be traced back to that pack.
+    offset = 0
+    for paragraph in re.split(r"\n\s*\n", body):
+        start = body.find(paragraph, offset)
+        offset = start + len(paragraph)
+        if paragraph.strip() and not _reference_tokens(paragraph):
+            reject("uncited_factual_paragraph", paragraph.strip(), (start, offset))
+
     checks = (
         ("heading", re.compile(r"(?m)^\s{0,3}#{1,6}\s+.+"), "Markdown heading"),
         ("code_fence", re.compile(r"```"), "Code fence"),
@@ -659,6 +668,11 @@ def validate_synthesis(
         ),
         ("raw_url", re.compile(r"\b(?:https?|hxxps?)://\S+", re.IGNORECASE), "Raw URL"),
         ("bold", re.compile(r"\*\*"), "Bold marker"),
+        (
+            "internal_display_label",
+            re.compile(r"\b(?:excluded|hidden)\b", re.IGNORECASE),
+            "Internal publication label",
+        ),
     )
     for code, pattern, detail in checks:
         for match in pattern.finditer(body):

@@ -32,7 +32,8 @@ class TestSubjectProductionRun:
         assert run.status == SubjectProductionStatus.QUEUED
         assert run.current_stage is SubjectProductionStage.SOURCES
         assert run.run_number == 1
-        assert run.conversation_id is None
+        assert run.references_conversation_id is None
+        assert run.synthesis_conversation_id is None
 
     def test_run_state_transitions(self) -> None:
         subject_id = uuid4()
