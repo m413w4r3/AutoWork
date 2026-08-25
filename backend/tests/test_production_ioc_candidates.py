@@ -11,6 +11,7 @@ from cti_app.application.production_ioc_candidates import (
 )
 from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.production_parsers import ParsedSource, ReferenceReport
+from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
     DerivedArtifact,
@@ -240,7 +241,7 @@ def test_input_order_does_not_change_canonical_result():
     assert forward == reverse
 
 
-def test_q2_literal_is_recovered_from_archived_text_with_sourced_evidence():
+def test_q2_literal_is_recovered_from_archived_text_with_sourced_evidence() -> None:
     row = _records("ignored.example")
     collection = replace(row[1], derived_artifact_id=row[3].id)
     literal = Q2LiteralCandidate(
@@ -262,9 +263,19 @@ def test_q2_literal_is_recovered_from_archived_text_with_sourced_evidence():
     assert candidate.source_ids == ("S1",)
     assert candidate.evidence[0].original_value == "evil.example"
     assert candidate.q2_contexts == ("C2 cité par le rapport.",)
+    initial = build_candidate_pack((), collections=(), reference_report=_report("https://news.test/a"))
+    diagnostics = ProductionWorkflowOrchestrator._q2_literal_diagnostics(
+        (literal,), initial, pack
+    )
+    assert diagnostics == {
+        "q2_literal_total": 1,
+        "q2_literal_matched_candidates": 0,
+        "q2_literal_recovered_from_source": 1,
+        "q2_literal_unresolved": 0,
+    }
 
 
-def test_unresolved_q2_literal_is_retained_without_source_backing():
+def test_unresolved_q2_literal_is_retained_without_source_backing() -> None:
     literal = Q2LiteralCandidate(
         artifact_type=ArtifactType.DOMAIN,
         raw_value="missing.example",
@@ -276,6 +287,40 @@ def test_unresolved_q2_literal_is_retained_without_source_backing():
     )
     assert not pack.candidates[0].source_backed
     assert any("q2_literal_unresolved" in warning for warning in pack.warnings)
+    initial = build_candidate_pack((), collections=(), reference_report=_report("https://news.test/a"))
+    diagnostics = ProductionWorkflowOrchestrator._q2_literal_diagnostics(
+        (literal,), initial, pack
+    )
+    assert diagnostics["q2_literal_unresolved"] == 1
+
+
+def test_q2_literal_already_in_initial_pack_is_matched() -> None:
+    row = _records("evil.example")
+    literal = Q2LiteralCandidate(
+        artifact_type=ArtifactType.DOMAIN,
+        raw_value="evil[.]example",
+        normalized_value="evil.example",
+        context="C2",
+    )
+    initial = build_candidate_pack(
+        (row[0],),
+        collections=(row[1],),
+        source_documents=(row[2],),
+        artifacts=(row[3],),
+        reference_report=_report("https://news.test/a"),
+    )
+    final = build_candidate_pack(
+        (row[0],),
+        collections=(row[1],),
+        source_documents=(row[2],),
+        artifacts=(row[3],),
+        reference_report=_report("https://news.test/a"),
+        q2_literals=(literal,),
+    )
+    diagnostics = ProductionWorkflowOrchestrator._q2_literal_diagnostics(
+        (literal,), initial, final
+    )
+    assert diagnostics["q2_literal_matched_candidates"] == 1
 
 
 def _provisional(value: str, publication_id: UUID, kind=DiscoveryIocType.DOMAIN):

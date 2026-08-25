@@ -22,6 +22,7 @@ from cti_app.application.production_parsers import (
     parse_reference_report,
     reference_report_from_json,
 )
+from cti_app.application.production_prompts import REFERENCES_PROMPT_VERSION
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.source_evidence_processing import (
     ReferencedEvidenceLink,
@@ -285,6 +286,8 @@ async def test_retry_reuses_the_same_logical_model_turn() -> None:
             conversation_id=conversation_id,
             stage="references",
             prompt="same prompt",
+            prompt_version="1",
+            repair_version="1",
             mode=ConversationMode.FRESH,
             parse=lambda value: parse_reference_report(value, date.today()),
             external_llm_allowed=True,
@@ -294,6 +297,61 @@ async def test_retry_reuses_the_same_logical_model_turn() -> None:
     assert len(conversations.calls) == 2
     assert {call[2] for call in conversations.calls} == {f"references-{run.id}-v1"}
     assert len(conversations._turns[conversation_id]) == 1
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ("references", "extraction", "ioc-qualification-pack-0-2", "synthesis"),
+)
+async def test_prompt_version_creates_a_new_logical_turn(stage: str) -> None:
+    orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q1])
+    conversation_id = (await conversations.create()).id
+
+    for prompt_version in ("1", "2"):
+        result, _, _ = await orchestrator._ask_with_format_repair(
+            run=uow.run,
+            conversation_id=conversation_id,
+            stage=stage,
+            prompt="same prompt",
+            prompt_version=prompt_version,
+            repair_version="1",
+            mode=ConversationMode.FRESH,
+            parse=lambda value: parse_reference_report(value, date.today()),
+            external_llm_allowed=True,
+        )
+        assert result is not None
+
+    assert {call[2] for call in conversations.calls} == {
+        f"{stage}-{uow.run.id}-v1",
+        f"{stage}-{uow.run.id}-v2",
+    }
+    assert len(conversations._turns[conversation_id]) == 2
+
+
+async def test_repair_version_creates_a_new_logical_repair_turn() -> None:
+    orchestrator, uow, conversations = _build([BROKEN_Q1, PERFECT_Q1, PERFECT_Q1])
+    conversation_id = (await conversations.create()).id
+
+    for repair_version in ("1", "2"):
+        result, _, _ = await orchestrator._ask_with_format_repair(
+            run=uow.run,
+            conversation_id=conversation_id,
+            stage="references",
+            prompt="same prompt",
+            prompt_version="1",
+            repair_version=repair_version,
+            mode=ConversationMode.FRESH,
+            parse=lambda value: parse_reference_report(value, date.today()),
+            external_llm_allowed=True,
+        )
+        assert result is not None and result.usable
+
+    assert {
+        call[2] for call in conversations.calls if "format-repair" in call[2]
+    } == {
+        f"references-format-repair-{uow.run.id}-v1",
+        f"references-format-repair-{uow.run.id}-v2",
+    }
 
 
 async def test_references_stage_stores_a_readable_report() -> None:
@@ -335,6 +393,11 @@ async def test_extraction_reuses_the_same_conversation_and_the_q1_corpus() -> No
 
     assert result["status"] == "success", result
     assert result["supported_items"] == 3
+    assert result["candidate_pack_hash"]
+    artifact = uow.production_artifacts.items[-1]
+    diagnostics = artifact.metadata["ioc_qualification"]
+    assert diagnostics["candidate_pack_hash"] == result["candidate_pack_hash"]
+    assert diagnostics["initial_candidate_pack_hash"] == result["initial_candidate_pack_hash"]
 
     # One conversation, Q1 fresh then Q2 continue.
     assert len(conversations.created) == 1
@@ -452,7 +515,7 @@ async def test_badly_formatted_answer_triggers_one_repair_turn() -> None:
 
     keys = [key for _, _, key, _ in conversations.calls]
     assert keys == [
-        f"references-{uow.run.id}-v1",
+        f"references-{uow.run.id}-v{REFERENCES_PROMPT_VERSION}",
         f"references-format-repair-{uow.run.id}-v1",
     ]
     # The repair must not be another search.

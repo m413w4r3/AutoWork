@@ -52,8 +52,12 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.production_prompts import (
+    EXTRACTION_FORMAT_REPAIR_VERSION,
     EXTRACTION_PROMPT_VERSION,
+    IOC_QUALIFICATION_FORMAT_REPAIR_VERSION,
+    REFERENCES_FORMAT_REPAIR_VERSION,
     REFERENCES_PROMPT_VERSION,
+    SYNTHESIS_FORMAT_REPAIR_VERSION,
     SYNTHESIS_PROMPT_VERSION,
     ProductionPromptTemplates,
 )
@@ -220,6 +224,8 @@ class ProductionWorkflowOrchestrator:
         conversation_id: UUID,
         stage: str,
         prompt: str,
+        prompt_version: str,
+        repair_version: str,
         mode: ConversationMode,
         parse: Callable[[str], Any],
         external_llm_allowed: bool,
@@ -232,12 +238,13 @@ class ProductionWorkflowOrchestrator:
         the turn id it came from.
         """
         assert self._model_service is not None
+        idempotency_key = f"{stage}-{run.id}-v{prompt_version}"
         turn = await self._model_service.add_turn(
             conversation_id=conversation_id,
             message=prompt,
             mode=mode,
             external_llm_allowed=external_llm_allowed,
-            idempotency_key=f"{stage}-{run.id}-v1",
+            idempotency_key=idempotency_key,
             correlation_id=self._correlation_id,
             context_subject_id=run.subject_id,
         )
@@ -249,7 +256,7 @@ class ProductionWorkflowOrchestrator:
             correlation_id=self._correlation_id,
             prompt=prompt,
             answer=raw,
-            idempotency_key=f"{stage}-{run.id}-v1",
+            idempotency_key=idempotency_key,
         )
         if not raw:
             return None, "", turn.id
@@ -262,12 +269,13 @@ class ProductionWorkflowOrchestrator:
         repair_prompt = ProductionPromptTemplates.get_format_repair_prompt(
             stage=stage, problems=result.errors, candidates=repair_context
         )
+        repair_idempotency_key = f"{stage}-format-repair-{run.id}-v{repair_version}"
         repair_turn = await self._model_service.add_turn(
             conversation_id=conversation_id,
             message=repair_prompt,
             mode=ConversationMode.CONTINUE,
             external_llm_allowed=external_llm_allowed,
-            idempotency_key=f"{stage}-format-repair-{run.id}-v1",
+            idempotency_key=repair_idempotency_key,
             correlation_id=self._correlation_id,
             context_subject_id=run.subject_id,
         )
@@ -279,7 +287,7 @@ class ProductionWorkflowOrchestrator:
             correlation_id=self._correlation_id,
             prompt=repair_prompt,
             answer=repaired_raw,
-            idempotency_key=f"{stage}-format-repair-{run.id}-v1",
+            idempotency_key=repair_idempotency_key,
         )
         if not repaired_raw:
             return result, raw, turn.id
@@ -577,6 +585,8 @@ class ProductionWorkflowOrchestrator:
                     conversation_id=run.conversation_id,
                     stage="references",
                     prompt=prompt,
+                    prompt_version=REFERENCES_PROMPT_VERSION,
+                    repair_version=REFERENCES_FORMAT_REPAIR_VERSION,
                     mode=ConversationMode.FRESH,
                     parse=lambda text: parse_reference_report(text, research_date),
                     external_llm_allowed=ctx.external_llm_allowed,
@@ -757,6 +767,8 @@ class ProductionWorkflowOrchestrator:
                     conversation_id=conversation_id,
                     stage="extraction",
                     prompt=prompt,
+                    prompt_version=EXTRACTION_PROMPT_VERSION,
+                    repair_version=EXTRACTION_FORMAT_REPAIR_VERSION,
                     mode=ConversationMode.CONTINUE,
                     parse=lambda text: parse_technical_extraction(text, report),
                     external_llm_allowed=policy_allows,
@@ -780,8 +792,12 @@ class ProductionWorkflowOrchestrator:
                     "warnings": parsed.warnings,
                 }
 
+            q2_literals = self._q2_literals(parsed.value)
             candidate_pack = await self._build_ioc_candidate_pack(
                 uow, run.subject_id, report, extraction=parsed.value
+            )
+            q2_diagnostics = self._q2_literal_diagnostics(
+                q2_literals, initial_candidate_pack, candidate_pack
             )
             qualifications: list[IocQualification] = []
             qualification_warnings: list[str] = []
@@ -807,6 +823,8 @@ class ProductionWorkflowOrchestrator:
                         conversation_id=conversation_id,
                         stage=stage,
                         prompt=qualification_prompt,
+                        prompt_version=IOC_QUALIFICATION_PROMPT_VERSION,
+                        repair_version=IOC_QUALIFICATION_FORMAT_REPAIR_VERSION,
                         mode=ConversationMode.CONTINUE,
                         parse=parse_batch,
                         external_llm_allowed=policy_allows,
@@ -871,6 +889,8 @@ class ProductionWorkflowOrchestrator:
                     "missing_candidate_ids": [],
                     "unknown_candidate_ids": [],
                     "candidate_pack_hash": candidate_pack.pack_hash,
+                    "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
+                    **q2_diagnostics,
                     "source_derived_candidates": candidate_pack.source_derived_candidates,
                     "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,
                     "discovery_only_candidates": candidate_pack.discovery_only_candidates,
@@ -900,6 +920,8 @@ class ProductionWorkflowOrchestrator:
                     s is QualificationStatus.EXCLUDED for s in effective_statuses
                 ),
                 "candidate_pack_hash": candidate_pack.pack_hash,
+                "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
+                **q2_diagnostics,
                 "source_derived_candidates": candidate_pack.source_derived_candidates,
                 "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,
                 "discovery_only_candidates": candidate_pack.discovery_only_candidates,
@@ -1056,6 +1078,35 @@ class ProductionWorkflowOrchestrator:
         )
 
     @staticmethod
+    def _q2_literal_diagnostics(
+        literals: tuple[Q2LiteralCandidate, ...],
+        initial_pack: IocCandidatePack,
+        final_pack: IocCandidatePack,
+    ) -> dict[str, int]:
+        initial_keys = {
+            (candidate.artifact_type, candidate.normalized_value)
+            for candidate in initial_pack.candidates
+        }
+        final_candidates = {
+            (candidate.artifact_type, candidate.normalized_value): candidate
+            for candidate in final_pack.candidates
+        }
+        matched = 0
+        recovered = 0
+        for literal in literals:
+            key = (literal.artifact_type, literal.normalized_value)
+            if key in initial_keys:
+                matched += 1
+            elif (candidate := final_candidates.get(key)) is not None and candidate.source_backed:
+                recovered += 1
+        return {
+            "q2_literal_total": len(literals),
+            "q2_literal_matched_candidates": matched,
+            "q2_literal_recovered_from_source": recovered,
+            "q2_literal_unresolved": len(literals) - matched - recovered,
+        }
+
+    @staticmethod
     def _format_ioc_candidates(candidates: tuple[IocCandidate, ...]) -> str:
         blocks = []
         for candidate in candidates:
@@ -1200,6 +1251,8 @@ class ProductionWorkflowOrchestrator:
                     conversation_id=conversation_id,
                     stage="synthesis",
                     prompt=prompt,
+                    prompt_version=SYNTHESIS_PROMPT_VERSION,
+                    repair_version=SYNTHESIS_FORMAT_REPAIR_VERSION,
                     mode=ConversationMode.CONTINUE,
                     parse=lambda text: validate_synthesis(text, report, extraction_payload),
                     external_llm_allowed=synthesis_policy_allows,
