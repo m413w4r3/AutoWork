@@ -5,6 +5,7 @@ import {
   retrySynthesis,
   cancelSubjectProduction,
   startSubjectProduction,
+  shouldPollProduction,
 } from "../api/production";
 import type { StageStatus } from "../api/production";
 import { ProductionStageCard } from "./ProductionStageCard";
@@ -24,6 +25,24 @@ const STATUS_LABELS: Record<string, string> = {
   cancelled: "annulée",
 };
 
+const STAGE_LABELS: Record<string, string> = {
+  sources: "Sources",
+  references: "Références",
+  extraction: "Extraction CTI",
+  synthesis: "Synthèse",
+  assembly: "Brève",
+};
+
+const CONVERSATION_ERROR_CODES = new Set([
+  "bridge_server_error",
+  "bridge_timeout",
+  "bridge_ui_timeout",
+  "conversation_unavailable",
+  "conversation_locator_invalid",
+  "conversation_profile_mismatch",
+  "conversation_busy",
+]);
+
 function stageDetail(
   stage: string,
   entry: StageStatus | undefined,
@@ -32,7 +51,21 @@ function stageDetail(
   if (stage === "sources" && entry.archived_sources !== undefined) {
     return `${entry.archived_sources} archivée(s)`;
   }
+  if (stage === "extraction") return entry.detail;
   return undefined;
+}
+
+function stageArtifactHref(subjectId: string, stage: string): string {
+  return `/subjects/${subjectId}/production/artifacts/${stage}`;
+}
+
+function issueCopy(status: string, errorCode: string | null): string {
+  if (errorCode && CONVERSATION_ERROR_CODES.has(errorCode)) {
+    return "Intervention requise — la conversation ChatGPT n’a pas pu être finalisée.";
+  }
+  return status === "needs_review"
+    ? "Intervention requise — vérifiez cette étape avant de poursuivre."
+    : "Échec de l’étape — consultez ses détails.";
 }
 
 export function SubjectProduction({
@@ -50,8 +83,7 @@ export function SubjectProduction({
     // Only poll while a run is actually in flight; a finished or absent run
     // has nothing left to watch.
     refetchInterval: (query) => {
-      const runStatus = query.state.data?.status;
-      return runStatus === "queued" || runStatus === "running" ? 2000 : false;
+      return shouldPollProduction(query.state.data?.status) ? 2000 : false;
     },
   });
 
@@ -87,11 +119,8 @@ export function SubjectProduction({
       </p>
     );
 
-  // No run yet, or the last one ended without a brief: either way the only
-  // way forward is to (re)start production, so offer it.
-  const restartable =
-    !status || status.status === "cancelled" || status.status === "failed";
-  const previousError = status?.stages?.[status.current_stage]?.error_code;
+  // A failed run remains visible: its failed stage and recovery path matter.
+  const restartable = !status || status.status === "cancelled";
 
   if (restartable) {
     return (
@@ -100,13 +129,13 @@ export function SubjectProduction({
         {status ? (
           <p className="production-counters">
             La production précédente s’est terminée en{" "}
-            <strong>{STATUS_LABELS[status.status] ?? status.status}</strong>
-            {previousError ? ` (${previousError})` : ""}.
+            <strong>{STATUS_LABELS[status.status] ?? status.status}</strong>.
           </p>
         ) : null}
         <p>
-          Les sources seront collectées, puis ChatGPT effectuera la recherche
-          des références, l’extraction CTI et la synthèse.
+          AutoWork collecte et analyse les sources, puis ChatGPT établit les
+          références, l’analyse technique, qualifie les indicateurs et rédige la
+          synthèse.
         </p>
         {startMutation.error ? (
           <p className="error-message" role="alert">
@@ -140,6 +169,12 @@ export function SubjectProduction({
 
   // Tolerate a response without per-stage detail rather than crashing the page.
   const stages: Partial<Record<string, StageStatus>> = status.stages ?? {};
+  const issueStage = stages[status.current_stage];
+  const issueCode = issueStage?.error_code ?? null;
+  const showIssue =
+    status.status === "needs_review" || status.status === "failed";
+  const issueIsConversation =
+    issueCode !== null && CONVERSATION_ERROR_CODES.has(issueCode);
   const completedStages = stageList.filter(
     (stage) => stages[stage]?.status === "succeeded",
   ).length;
@@ -211,12 +246,26 @@ export function SubjectProduction({
         </div>
       )}
 
-      {(status.status === "needs_review" || status.status === "failed") && (
-        <p className="error-message" role="alert">
-          {status.status === "needs_review" ? "Revue nécessaire" : "Échec"} —{" "}
-          {stages[status.current_stage]?.error_code ?? "inconnu"} :{" "}
-          {stages[status.current_stage]?.error_message ?? ""}
-        </p>
+      {showIssue && (
+        <div className="error-message" role="alert">
+          <p>
+            <strong>
+              {STAGE_LABELS[status.current_stage] ?? status.current_stage}
+            </strong>
+            {" — "}
+            {issueCopy(status.status, issueCode)}
+          </p>
+          <p>Code : {issueCode ?? "inconnu"}</p>
+          {issueIsConversation && status.conversation_id ? (
+            <a href={`/subjects/${subjectId}#conversations`}>
+              Voir la conversation
+            </a>
+          ) : (
+            <a href={stageArtifactHref(subjectId, status.current_stage)}>
+              Voir les détails de l’étape
+            </a>
+          )}
+        </div>
       )}
 
       {status.status === "ready" && (

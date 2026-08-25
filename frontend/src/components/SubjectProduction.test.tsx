@@ -3,6 +3,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { shouldPollProduction } from "../api/production";
 import { SubjectProduction } from "./SubjectProduction";
 
 const SUBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -112,7 +113,7 @@ describe("SubjectProduction", () => {
     expect(body).not.toHaveProperty("edition_id");
   });
 
-  it("affiche le vrai titre, les compteurs d'étape et les liens de détail", async () => {
+  it("affiche le vrai titre, les compteurs d’étape et les liens de détail", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(Response.json(runningStatus())),
@@ -130,6 +131,39 @@ describe("SubjectProduction", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: "Voir la conversation" }),
+    ).toBeInTheDocument();
+  });
+
+  it("affiche détail court pendant extraction", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json(
+          runningStatus({
+            current_stage: "extraction",
+            stages: {
+              ...runningStatus().stages,
+              references: {
+                ...runningStatus().stages.references,
+                status: "succeeded",
+              },
+              extraction: {
+                status: "running",
+                version: null,
+                error_code: null,
+                error_message: null,
+                detail: "Qualification de 83 IOC",
+              },
+            },
+          }),
+        ),
+      ),
+    );
+
+    renderProduction();
+
+    expect(
+      await screen.findByText(/Qualification de 83 IOC/),
     ).toBeInTheDocument();
   });
 
@@ -171,16 +205,17 @@ describe("SubjectProduction", () => {
     ).toBeInTheDocument();
   });
 
-  it("permet de relancer après un échec, en rappelant la cause", async () => {
+  it("affiche immédiatement échec extraction sans faux état en cours", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
         Response.json(
           runningStatus({
             status: "failed",
+            current_stage: "extraction",
             stages: {
               ...runningStatus().stages,
-              references: {
+              extraction: {
                 status: "failed",
                 version: null,
                 error_code: "bridge_timeout",
@@ -194,9 +229,90 @@ describe("SubjectProduction", () => {
 
     renderProduction();
 
-    expect(
-      await screen.findByRole("button", { name: "Relancer la production" }),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Extraction CTI",
+    );
     expect(screen.getByText(/bridge_timeout/)).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "la conversation ChatGPT n’a pas pu être finalisée",
+    );
+    expect(
+      screen.queryByRole("button", { name: "Relancer la production" }),
+    ).toBeNull();
+    expect(screen.getByText("3. Extraction CTI").closest("li")).toHaveClass(
+      "is-failed",
+    );
+  });
+
+  it("affiche needs_review extraction, code et détail de l’étape", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json(
+          runningStatus({
+            status: "needs_review",
+            current_stage: "extraction",
+            stages: {
+              ...runningStatus().stages,
+              extraction: {
+                status: "needs_review",
+                version: null,
+                error_code: "extraction_format_unusable",
+                error_message: "internal parser detail",
+              },
+            },
+          }),
+        ),
+      ),
+    );
+
+    renderProduction();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Extraction CTI");
+    expect(alert).toHaveTextContent("extraction_format_unusable");
+    expect(alert).not.toHaveTextContent("internal parser detail");
+    expect(
+      screen.getByRole("link", { name: "Voir les détails de l’étape" }),
+    ).toHaveAttribute(
+      "href",
+      `/subjects/${SUBJECT_ID}/production/artifacts/extraction`,
+    );
+  });
+
+  it("conserve affichage normal quand brève prête", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json(
+          runningStatus({
+            status: "ready",
+            current_stage: "assembly",
+            stages: Object.fromEntries(
+              Object.entries(runningStatus().stages).map(([stage, entry]) => [
+                stage,
+                { ...entry, status: "succeeded" },
+              ]),
+            ),
+          }),
+        ),
+      ),
+    );
+
+    renderProduction();
+
+    expect(await screen.findByRole("link", { name: "Aperçu" })).toHaveAttribute(
+      "href",
+      `/subjects/${SUBJECT_ID}/production/artifacts/brief`,
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("arrête polling seulement quand run terminal", () => {
+    expect(shouldPollProduction("queued")).toBe(true);
+    expect(shouldPollProduction("running")).toBe(true);
+    expect(shouldPollProduction("needs_review")).toBe(false);
+    expect(shouldPollProduction("failed")).toBe(false);
+    expect(shouldPollProduction("ready")).toBe(false);
   });
 });

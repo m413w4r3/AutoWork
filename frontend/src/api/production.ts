@@ -11,6 +11,8 @@ export interface StageStatus {
   version: number | null;
   error_code: string | null;
   error_message: string | null;
+  /** Short user-facing progress detail, when the pipeline exposes one. */
+  detail?: string;
   /** Only on the sources stage. */
   archived_sources?: number;
 }
@@ -32,6 +34,12 @@ export interface ProductionStatus {
   /** Parser recoveries worth showing, never blocking. */
   warnings: string[];
   stages: Record<string, StageStatus>;
+}
+
+export function shouldPollProduction(
+  status: ProductionStatus["status"] | undefined,
+): boolean {
+  return status === "queued" || status === "running";
 }
 
 export interface BatchItemDetail {
