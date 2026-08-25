@@ -728,6 +728,18 @@ async def test_property_10_no_q3_stage_exists_or_runs() -> None:
 # =============================================================================
 # Property 11 -- retrying extraction after one failed + one succeeded chunk
 # does not resubmit the already-succeeded chunk.
+#
+# This exercises `_FakeConversations`' OWN run_id-keyed idempotency, not the
+# real `ModelGateway`'s resubmission policy: the fake never persists a FAILED
+# ModelRun when `schema.model_validate_json()` raises, so on the second pass
+# it happily lets S2 be retried with a fresh canned answer. The real gateway
+# does not guarantee that -- a chunk whose provider response failed schema
+# validation is persisted FAILED with `submission_state ==
+# SUBMITTED_OR_UNKNOWN`, and `ModelGateway._execute` refuses to resubmit any
+# FAILED run unless the caller both sets `allow_failed_resubmit=True` (the
+# production Q2 loop never does) and the run's `submission_state` is
+# `NOT_SUBMITTED`. See `test_production_e2e_olalampo_gateway_integration.py`
+# for that real policy, exercised against the real gateway.
 # =============================================================================
 
 
@@ -789,7 +801,8 @@ async def test_property_11_retry_does_not_resubmit_succeeded_chunk(
     # Only the previously-failed chunk (S2) was actually resubmitted with a
     # fresh answer; S1's checkpoint was reused with zero new network/model
     # call (a cache hit still increments structured_calls, never
-    # structured_submissions).
+    # structured_submissions). This is `_FakeConversations`' idempotency, not
+    # a guarantee the real gateway makes -- see the class-level comment above.
     assert len(conversations.structured_submissions) == 3
     assert len(conversations.structured_calls) == 4
     s1_submissions = [
