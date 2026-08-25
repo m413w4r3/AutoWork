@@ -236,6 +236,15 @@ class SourceCollection:
         self.state = CollectionState.EXTRACTED
         self._touch()
 
+    def set_current_derived_artifact(self, artifact_id: UUID) -> None:
+        if self.state is CollectionState.ARCHIVED:
+            self.extracted(artifact_id)
+            return
+        if self.state not in {CollectionState.EXTRACTED, CollectionState.COMPLETED}:
+            raise ValueError("Only archived or extracted sources may replace their artifact")
+        self.derived_artifact_id = artifact_id
+        self._touch()
+
     def complete(self) -> None:
         if self.state is not CollectionState.EXTRACTED:
             raise ValueError("Only an extracted source can be completed")

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.extraction import ParsedLink
+from cti_app.application.extraction import PARSER_VERSION, ParsedLink
+from cti_app.application.production_parsers import parse_reference_report
+from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.source_evidence_processing import (
     SourceEvidenceProcessingService,
     select_technical_links,
@@ -100,6 +104,49 @@ async def test_archived_source_becomes_extracted_with_artifact_and_indicators(
     assert cached.sources_processed == 0
     assert len(factory.artifacts) == 1
     assert len(factory.indicators) == result.indicator_occurrences
+
+
+async def test_stale_parser_artifact_is_reprocessed_and_becomes_current(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    processor, collections = await _archived_sources(
+        factory, tmp_path, b"<html><body>evil.example 198.51.100.10</body></html>"
+    )
+    collection = collections[0]
+    await processor.process_subject(collection.subject_id)
+    original_artifact_id = factory.collections[collection.id].derived_artifact_id
+    assert original_artifact_id is not None
+    factory.artifacts[original_artifact_id] = replace(
+        factory.artifacts[original_artifact_id], parser_version="obsolete-parser"
+    )
+    original_indicator_ids = set(factory.indicators)
+
+    result = await processor.process_subject(collection.subject_id)
+
+    current = factory.collections[collection.id].derived_artifact_id
+    assert result.sources_processed == 1
+    assert result.sources_cached == 0
+    assert current is not None and current != original_artifact_id
+    assert factory.artifacts[original_artifact_id].parser_version == "obsolete-parser"
+    assert factory.artifacts[current].parser_version == PARSER_VERSION
+    assert original_indicator_ids < set(factory.indicators)
+
+    report_result = parse_reference_report(
+        "## SOURCE S1\ntitle: Source\nurl: https://source-0.example/report\nrole: primary"
+        "\n\n## EVENT R1\ndate: 2026-08-25\nsources: S1\ntext: Evidence processed.",
+        date(2026, 8, 25),
+    )
+    assert report_result.value is not None
+    workflow = object.__new__(ProductionWorkflowOrchestrator)
+    workflow._source_evidence_processor = None
+    async with factory() as uow:
+        pack = await workflow._build_ioc_candidate_pack(
+            uow, collection.subject_id, report_result.value
+        )
+    assert {
+        evidence.derived_artifact_id
+        for candidate in pack.candidates
+        for evidence in candidate.evidence
+    } == {current}
 
 
 async def test_one_unparseable_archived_source_does_not_rollback_others(tmp_path: Path) -> None:

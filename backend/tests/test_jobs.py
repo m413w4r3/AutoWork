@@ -50,7 +50,7 @@ async def test_submission_is_idempotent() -> None:
     assert len(factory.state) == 1
 
 
-async def test_synchronous_dispatcher_retries_only_transient_errors() -> None:
+async def test_synchronous_dispatcher_retries_transient_bridge_timeout() -> None:
     factory = InMemoryJobUnitOfWorkFactory()
     registry = JobRegistry()
     calls = 0
@@ -61,7 +61,7 @@ async def test_synchronous_dispatcher_retries_only_transient_errors() -> None:
         calls += 1
         if calls < 3:
             raise JobHandlerError(
-                "temporary_unavailable", "Service temporairement indisponible", transient=True
+                "bridge_timeout", "Le bridge a expiré.", transient=True
             )
         return "memory://result"
 

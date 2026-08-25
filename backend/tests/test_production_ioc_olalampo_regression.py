@@ -172,6 +172,58 @@ def _qualification_text(pack: Any) -> str:
     return "\n\n".join(blocks)
 
 
+def test_linked_evidence_metric_excludes_normal_s1_occurrences() -> None:
+    subject_id, edition_id, group_id = uuid4(), uuid4(), uuid4()
+    root = _persisted_source(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        group_id=group_id,
+        url=ROOT_URL,
+        content="",
+        mime=DetectedMimeType.HTML,
+    )
+    annex = _persisted_source(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        group_id=group_id,
+        url=ANNEX_URL,
+        content="",
+        mime=DetectedMimeType.JSON,
+        parent=root[0],
+    )
+    root_indicators = extract_indicators(
+        " ".join(f"root-{number}.example" for number in range(10)),
+        subject_id=subject_id,
+        edition_id=edition_id,
+        group_id=group_id,
+        source_document_id=root[1].id,
+        artifact_id=root[2].id,
+    )
+    annex_indicators = extract_indicators(
+        "annex-one.example annex-two.example",
+        subject_id=subject_id,
+        edition_id=edition_id,
+        group_id=group_id,
+        source_document_id=annex[1].id,
+        artifact_id=annex[2].id,
+    )
+    assert len(root_indicators) == 10
+    assert len(annex_indicators) == 2
+    report_result = parse_reference_report(Q1, RESEARCH_DATE)
+    assert report_result.value is not None
+
+    pack = build_candidate_pack(
+        (*root_indicators, *annex_indicators),
+        collections=(root[0], annex[0]),
+        source_documents=(root[1], annex[1]),
+        artifacts=(root[2], annex[2]),
+        reference_report=report_result.value,
+    )
+
+    assert pack.total_evidence_occurrences == 12
+    assert pack.linked_evidence_occurrences == 2
+
+
 def test_operation_olalampo_ioc_loss_is_recovered_end_to_end() -> None:
     subject_id, edition_id, group_id = uuid4(), uuid4(), uuid4()
     root = _persisted_source(
@@ -329,7 +381,7 @@ def test_operation_olalampo_ioc_loss_is_recovered_end_to_end() -> None:
         "confirmed_total": 13,
         "contextual_total": 2,
         "excluded_total": 1,
-        "linked_evidence_count": 17,
+        "linked_evidence_count": 3,
         "unmapped_source_count": 0,
     }
 

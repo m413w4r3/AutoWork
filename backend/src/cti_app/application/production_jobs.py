@@ -95,7 +95,7 @@ class ProductionStageChain:
             idempotency_key=f"production-{stage.value}-{run_id}",
             correlation_id=correlation_id,
             input_parameters=parameters.model_dump(mode="json"),
-            max_attempts=1,
+            max_attempts=3,
             actor_id=actor_id,
         )
         await self._dispatcher.dispatch(job.id)

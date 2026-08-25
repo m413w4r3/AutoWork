@@ -114,10 +114,12 @@ class _Job:
 class _Jobs:
     def __init__(self) -> None:
         self.submitted: list[_Job] = []
+        self.submission_options: list[dict[str, Any]] = []
 
-    async def submit(self, *, kind: str, idempotency_key: str, **_: Any) -> _Job:
+    async def submit(self, *, kind: str, idempotency_key: str, **options: Any) -> _Job:
         job = _Job(kind, idempotency_key)
         self.submitted.append(job)
+        self.submission_options.append(options)
         return job
 
 
@@ -237,6 +239,7 @@ async def test_next_stage_job_is_idempotent_per_run_and_stage(
     )
 
     assert jobs.submitted[0].idempotency_key == f"production-references-{run.id}"
+    assert jobs.submission_options[0]["max_attempts"] == 3
 
 
 async def test_assembly_stage_queues_no_further_stage(

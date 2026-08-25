@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from cti_app.application.collection import ReferencedEvidence, SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
@@ -652,6 +652,10 @@ class ProductionWorkflowOrchestrator:
             links = await self._source_evidence_processor.select_referenced_evidence(run.subject_id)
             referenced_evidence["selected"] = len(links)
             if self._collection_service is not None and links:
+                if context is None:
+                    raise RuntimeError(
+                        "Extraction with referenced evidence requires a persisted job context"
+                    )
                 children = await self._collection_service.add_referenced_evidence(
                     run.subject_id,
                     tuple(
@@ -664,11 +668,10 @@ class ProductionWorkflowOrchestrator:
                     ),
                 )
                 referenced_evidence["added"] = len(children)
-                job_id = context.job_id if context is not None else uuid4()
                 for child in children:
                     await self._collection_service.archive_one(
                         child.id,
-                        job_id,
+                        context.job_id,
                         context=context,
                     )
             evidence_processing = await self._source_evidence_processor.process_subject(
@@ -920,14 +923,17 @@ class ProductionWorkflowOrchestrator:
         repositories = ("indicators", "source_collections", "source_documents", "derived_artifacts")
         if not all(hasattr(uow, name) for name in repositories):
             return build_candidate_pack((), collections=(), reference_report=report)
-        indicators = await uow.indicators.list_for_subject(subject_id)
         collections = await uow.source_collections.list_for_subject(subject_id)
         documents = await uow.source_documents.list_for_subject(subject_id)
-        artifact_ids = {indicator.derived_artifact_id for indicator in indicators}
-        artifact_ids.update(
+        artifact_ids = {
             collection.derived_artifact_id
             for collection in collections
             if collection.derived_artifact_id is not None
+        }
+        indicators = tuple(
+            indicator
+            for indicator in await uow.indicators.list_for_subject(subject_id)
+            if indicator.derived_artifact_id in artifact_ids
         )
         artifacts_list = []
         for artifact_id in sorted(artifact_ids, key=str):

@@ -41,7 +41,6 @@ from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import ProductionStageChain
-from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.source_evidence_processing import SourceEvidenceProcessingService
 from cti_app.application.subject_production import (
     EditionProductionService,
@@ -211,11 +210,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory,
         BlobCatalogService(blob_store, uow_factory),
     )
-    workflow_orchestrator = ProductionWorkflowOrchestrator(
-        uow_factory,
-        model_service=model_conversation_service,
-        source_evidence_processor=source_evidence_processor,
-    )
     production_chain = ProductionStageChain()
     registry = create_job_registry(
         model_gateway,
@@ -252,7 +246,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.brief_service = brief_service
     app.state.subject_production_service = subject_production_service
     app.state.edition_production_service = edition_production_service
-    app.state.workflow_orchestrator = workflow_orchestrator
     yield
     await readiness.close()
     await job_engine.dispose()

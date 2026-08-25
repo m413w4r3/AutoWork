@@ -17,7 +17,7 @@ from cti_app.application.extraction import (
     extract_indicators,
     parse_document,
 )
-from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.domain.collection import (
     CollectionState,
     DerivedArtifact,
@@ -276,10 +276,14 @@ class SourceEvidenceProcessingService:
             collection = await uow.source_collections.get(collection_id)
             if collection is None:
                 raise _ProcessingError("collection_not_found", "Source collection no longer exists")
-            cached = self._cached_outcome(collection)
+            cached = await self._cached_outcome(uow, collection)
             if cached is not None:
                 return cached
-            if collection.state is not CollectionState.ARCHIVED:
+            if collection.state not in {
+                CollectionState.ARCHIVED,
+                CollectionState.EXTRACTED,
+                CollectionState.COMPLETED,
+            }:
                 raise _ProcessingError(
                     "collection_not_archived",
                     f"Source collection is {collection.state.value}, not ARCHIVED",
@@ -341,10 +345,14 @@ class SourceEvidenceProcessingService:
             locked_collection = await uow.source_collections.get_for_update(collection_id)
             if locked_collection is None:
                 raise _ProcessingError("collection_not_found", "Source collection no longer exists")
-            cached = self._cached_outcome(locked_collection)
+            cached = await self._cached_outcome(uow, locked_collection)
             if cached is not None:
                 return cached
-            if locked_collection.state is not CollectionState.ARCHIVED:
+            if locked_collection.state not in {
+                CollectionState.ARCHIVED,
+                CollectionState.EXTRACTED,
+                CollectionState.COMPLETED,
+            }:
                 raise _ProcessingError(
                     "collection_state_changed",
                     f"Source collection changed to {locked_collection.state.value}",
@@ -356,7 +364,7 @@ class SourceEvidenceProcessingService:
 
             await uow.derived_artifacts.append(artifact)
             await uow.indicators.append_many(indicators)
-            locked_collection.extracted(artifact.id)
+            locked_collection.set_current_derived_artifact(artifact.id)
             await uow.source_collections.save(locked_collection)
             await uow.commit()
 
@@ -367,10 +375,14 @@ class SourceEvidenceProcessingService:
         )
 
     @staticmethod
-    def _cached_outcome(collection: SourceCollection) -> SourceEvidenceProcessingOutcome | None:
+    async def _cached_outcome(
+        uow: UnitOfWork, collection: SourceCollection
+    ) -> SourceEvidenceProcessingOutcome | None:
         if (
             collection.state in {CollectionState.EXTRACTED, CollectionState.COMPLETED}
             and collection.derived_artifact_id is not None
         ):
-            return SourceEvidenceProcessingOutcome(collection.id, "cached")
+            artifact = await uow.derived_artifacts.get(collection.derived_artifact_id)
+            if artifact is not None and artifact.parser_version == PARSER_VERSION:
+                return SourceEvidenceProcessingOutcome(collection.id, "cached")
         return None

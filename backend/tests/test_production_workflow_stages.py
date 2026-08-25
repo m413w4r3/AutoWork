@@ -18,7 +18,10 @@ import pytest
 
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_parsers import reference_report_from_json
+from cti_app.application.production_parsers import (
+    parse_reference_report,
+    reference_report_from_json,
+)
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.source_evidence_processing import (
     ReferencedEvidenceLink,
@@ -65,6 +68,7 @@ class _FakeConversations:
         self._answers = answers
         self.calls: list[tuple[UUID, ConversationMode, str, str]] = []
         self._turns: dict[UUID, list[_Turn]] = {}
+        self._turns_by_idempotency_key: dict[str, _Turn] = {}
         self.created: list[UUID] = []
 
     async def create(self, **kwargs: Any) -> Any:
@@ -83,7 +87,10 @@ class _FakeConversations:
         **kwargs: Any,
     ) -> _Turn:
         self.calls.append((conversation_id, mode, idempotency_key, message))
+        if existing := self._turns_by_idempotency_key.get(idempotency_key):
+            return existing
         turn = _Turn(id=uuid4(), text=self._answers.pop(0))
+        self._turns_by_idempotency_key[idempotency_key] = turn
         self._turns.setdefault(conversation_id, []).append(turn)
         return turn
 
@@ -267,6 +274,28 @@ def _build(
     return orchestrator, uow, conversations
 
 
+async def test_retry_reuses_the_same_logical_model_turn() -> None:
+    orchestrator, uow, conversations = _build([PERFECT_Q1])
+    conversation_id = (await conversations.create()).id
+    run = uow.subject_production_runs.run
+
+    for _ in range(2):
+        result, _, _ = await orchestrator._ask_with_format_repair(
+            run=run,
+            conversation_id=conversation_id,
+            stage="references",
+            prompt="same prompt",
+            mode=ConversationMode.FRESH,
+            parse=lambda value: parse_reference_report(value, date.today()),
+            external_llm_allowed=True,
+        )
+        assert result is not None
+
+    assert len(conversations.calls) == 2
+    assert {call[2] for call in conversations.calls} == {f"references-{run.id}-v1"}
+    assert len(conversations._turns[conversation_id]) == 1
+
+
 async def test_references_stage_stores_a_readable_report() -> None:
     orchestrator, uow, conversations = _build([PERFECT_Q1])
     uow.run.current_stage = SubjectProductionStage.REFERENCES
@@ -388,6 +417,26 @@ async def test_linked_evidence_is_archived_before_deterministic_extraction() -> 
 
     assert result["status"] == "success"
     assert result["referenced_evidence"] == {"selected": 1, "added": 1}
+
+
+async def test_linked_evidence_requires_persisted_job_context() -> None:
+    class _Processor:
+        async def select_referenced_evidence(
+            self, subject_id: UUID
+        ) -> tuple[ReferencedEvidenceLink, ...]:
+            return (ReferencedEvidenceLink(uuid4(), "https://evidence.example/iocs.json", "IOCs"),)
+
+    processor = _Processor()
+    orchestrator, uow, _ = _build([PERFECT_Q1, PERFECT_Q2], processor=processor)
+    collection_service = cast(_CollectionService, orchestrator._collection_service)
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+    await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.REFERENCES)
+    uow.run.current_stage = SubjectProductionStage.EXTRACTION
+
+    with pytest.raises(RuntimeError, match="persisted job context"):
+        await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.EXTRACTION)
+
+    assert collection_service.archived == []
 
 
 async def test_badly_formatted_answer_triggers_one_repair_turn() -> None:

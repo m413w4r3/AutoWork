@@ -23,6 +23,7 @@ from cti_app.domain.collection import (
     Indicator,
     IndicatorKind,
     SourceCollection,
+    SourceOriginKind,
 )
 from cti_app.domain.discovery import (
     DiscoveryIocType,
@@ -79,6 +80,7 @@ class IocCandidateEvidence:
     span_start: int
     span_end: int
     snippet: str | None
+    is_referenced_evidence: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +148,7 @@ class _Occurrence:
     artifact_type: ArtifactType
     source_ids: tuple[str, ...]
     snippet: str | None
+    is_referenced_evidence: bool
 
 
 _KIND_TO_ARTIFACT: Final = {
@@ -192,6 +195,14 @@ def build_candidate_pack(
         raise ValueError("Batch limits must be positive")
 
     source_lookup = source_ids_by_document(collections, source_documents, reference_report)
+    referenced_document_ids = {
+        collection.source_document_id
+        for collection in collections
+        if (
+            collection.origin_kind is SourceOriginKind.REFERENCED_EVIDENCE
+            and collection.source_document_id is not None
+        )
+    }
     artifact_texts = artifact_texts or {}
     artifact_versions = tuple(sorted({a.parser_version for a in artifacts}))
     warnings: list[str] = []
@@ -256,7 +267,15 @@ def build_candidate_pack(
                 f"{CandidateWarningCode.TEXT_NOT_AVAILABLE.value}: "
                 f"artifact={indicator.derived_artifact_id}"
             )
-        groups[key].append(_Occurrence(indicator, artifact_type, source_ids, snippet))
+        groups[key].append(
+            _Occurrence(
+                indicator,
+                artifact_type,
+                source_ids,
+                snippet,
+                indicator.source_document_id in referenced_document_ids,
+            )
+        )
 
     source_derived_candidates = tuple(
         _candidate_for(key, occurrences)
@@ -479,7 +498,9 @@ def build_candidate_pack(
         total_evidence_occurrences=total_occurrences,
         sources_mapped=len(mapped_source_ids),
         sources_unmapped=len(unmapped_documents - mapped_documents),
-        linked_evidence_occurrences=sum(1 for occurrence in occurrences if occurrence.source_ids),
+        linked_evidence_occurrences=sum(
+            1 for occurrence in occurrences if occurrence.is_referenced_evidence
+        ),
         warnings=tuple(sorted(set(warnings))),
         pack_hash=pack_hash,
         source_derived_candidates=len(source_derived_candidates),
@@ -572,6 +593,7 @@ def _candidate_for(
                 span_start=o.indicator.span.start,
                 span_end=o.indicator.span.end,
                 snippet=o.snippet,
+                is_referenced_evidence=o.is_referenced_evidence,
             )
             for o in ordered
         ),
