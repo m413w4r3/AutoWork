@@ -160,6 +160,11 @@ class SourceEvidenceProcessingService:
         self._uow_factory = uow_factory
         self._blob_catalog = blob_catalog
 
+    async def read_derived_text(self, blob_id: UUID) -> str:
+        """Read a persisted derived-text snapshot for downstream deterministic work."""
+        raw = await self._blob_catalog.read(blob_id, max_bytes=MAX_DECODED_DOCUMENT_BYTES)
+        return raw.decode("utf-8", errors="replace")
+
     async def process_subject(self, subject_id: UUID) -> SourceEvidenceProcessingResult:
         async with self._uow_factory() as uow:
             collections = await uow.source_collections.list_for_subject(subject_id)

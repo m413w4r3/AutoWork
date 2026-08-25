@@ -201,6 +201,7 @@ class ExtractionService(_ArtifactPayloadMixin):
         model_run_id: UUID | None = None,
         conversation_turn_id: UUID | None = None,
         warnings: list[str] | None = None,
+        ioc_diagnostics: dict[str, Any] | None = None,
     ) -> ProductionArtifact:
         async with self._uow_factory() as uow:
             current = await uow.production_artifacts.get_current(
@@ -233,6 +234,7 @@ class ExtractionService(_ArtifactPayloadMixin):
                     "warnings": warnings or [],
                     "parser_version": canonical_json.get("parser_version"),
                     "generated_at": datetime.now(UTC).isoformat(),
+                    "ioc_qualification": ioc_diagnostics or {},
                 },
             )
             await uow.production_artifacts.append(artifact)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
@@ -14,10 +15,28 @@ from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_context import build_subject_production_context
+from cti_app.application.production_ioc_candidates import (
+    IocCandidate,
+    IocCandidateBatch,
+    IocCandidatePack,
+    build_candidate_pack,
+)
+from cti_app.application.production_ioc_qualification import (
+    IOC_QUALIFICATION_PARSER_VERSION,
+    IOC_QUALIFICATION_PROMPT_VERSION,
+    IocQualification,
+    QualificationParseResult,
+    merge_qualified_candidates,
+    parse_ioc_qualifications,
+)
+from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
+    DisplayPolicy,
+    IndicatorStatus,
     ParsedEvent,
     ParseResult,
     ReferenceReport,
+    TechnicalExtraction,
     parse_reference_report,
     parse_technical_extraction,
     reference_report_from_json,
@@ -53,6 +72,7 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
+from cti_app.domain.publication import ArtifactType
 
 if TYPE_CHECKING:
     from cti_app.application.collection import SubjectCollectionService
@@ -195,9 +215,9 @@ class ProductionWorkflowOrchestrator:
         stage: str,
         prompt: str,
         mode: ConversationMode,
-        parse: Callable[[str], ParseResult[Any]],
+        parse: Callable[[str], Any],
         external_llm_allowed: bool,
-    ) -> tuple[ParseResult[Any] | None, str, UUID | None]:
+    ) -> tuple[Any | None, str, UUID | None]:
         """Ask the model, and give it exactly one chance to fix its formatting.
 
         The repair turn never researches again: it restates the same answer in
@@ -660,11 +680,24 @@ class ProductionWorkflowOrchestrator:
                     "error": "References artifact not found",
                 }
 
+            report = await self._load_reference_report(references)
+            if report is None:
+                return {
+                    "stage": "extraction",
+                    "status": "terminal_error",
+                    "error_code": "references_payload_missing",
+                    "error": "Reference report content is not readable",
+                }
+            candidate_pack = await self._build_ioc_candidate_pack(uow, run.subject_id, report)
             input_data = {
                 "subject_id": str(run.subject_id),
                 "references_version": references.version,
+                "references_hash": references.input_hash,
                 "stage": "extraction",
                 "prompt_version": EXTRACTION_PROMPT_VERSION,
+                "candidate_pack_hash": candidate_pack.pack_hash,
+                "ioc_qualification_prompt_version": IOC_QUALIFICATION_PROMPT_VERSION,
+                "ioc_qualification_parser_version": IOC_QUALIFICATION_PARSER_VERSION,
             }
             input_hash = compute_input_hash(input_data)
 
@@ -687,15 +720,6 @@ class ProductionWorkflowOrchestrator:
                     "error": "Diffusion policy forbids sending this subject to an external model",
                 }
 
-            report = await self._load_reference_report(references)
-            if report is None:
-                return {
-                    "stage": "extraction",
-                    "status": "terminal_error",
-                    "error_code": "references_payload_missing",
-                    "error": "Reference report content is not readable",
-                }
-
             existing = await uow.production_artifacts.get_current(run.id, "extraction")
             if existing and existing.input_hash == input_hash:
                 return {
@@ -707,6 +731,52 @@ class ProductionWorkflowOrchestrator:
                     ),
                     "referenced_evidence": referenced_evidence,
                 }
+
+            qualifications: list[IocQualification] = []
+            qualification_warnings: list[str] = []
+            for batch in candidate_pack.batches:
+                candidate_text = self._format_ioc_candidates(batch.candidates)
+                qualification_prompt = ProductionPromptTemplates.get_ioc_qualification_prompt(
+                    candidate_text
+                )
+                stage = (
+                    f"ioc-qualification-{candidate_pack.pack_hash}-"
+                    f"{batch.ordinal}-{IOC_QUALIFICATION_PROMPT_VERSION}"
+                )
+
+                def parse_batch(
+                    text: str, current_batch: IocCandidateBatch = batch
+                ) -> QualificationParseResult:
+                    return parse_ioc_qualifications(text, current_batch)
+
+                try:
+                    parsed_qualification, _, _ = await self._ask_with_format_repair(
+                        run=run, conversation_id=conversation_id, stage=stage,
+                        prompt=qualification_prompt, mode=ConversationMode.CONTINUE,
+                        parse=parse_batch,
+                        external_llm_allowed=policy_allows,
+                    )
+                except Exception as e:
+                    return self._handle_stage_exception(run, "extraction", e)
+                if parsed_qualification is None or not parsed_qualification.usable:
+                    result = parsed_qualification
+                    return {
+                        "stage": "extraction", "status": "needs_review",
+                        "error_code": "ioc_candidate_coverage_incomplete",
+                        "error": (
+                            "; ".join(result.errors)
+                            if result else "No qualification response"
+                        ),
+                        "missing_candidate_ids": (
+                            list(result.missing_candidate_ids) if result else []
+                        ),
+                        "unknown_candidate_ids": (
+                            list(result.unknown_candidate_ids) if result else []
+                        ),
+                        "candidate_pack_hash": candidate_pack.pack_hash,
+                    }
+                qualifications.extend(parsed_qualification.qualifications)
+                qualification_warnings.extend(parsed_qualification.errors)
 
             subject_title, _ = await self._subject_context(uow, run.subject_id)
             prompt = ProductionPromptTemplates.get_extraction_prompt(
@@ -742,7 +812,12 @@ class ProductionWorkflowOrchestrator:
                     "warnings": parsed.warnings,
                 }
 
-            extraction = parsed.value
+            extraction = self._suppress_unbacked_q2_literals(
+                parsed.value, candidate_pack.candidates
+            )
+            extraction = merge_qualified_candidates(
+                extraction, tuple(qualifications), candidate_pack.candidates
+            )
             assert extraction is not None
             artifact = await self._extraction.store_extraction_result(
                 run_id=run.id,
@@ -751,7 +826,24 @@ class ProductionWorkflowOrchestrator:
                 raw_result=raw,
                 canonical_json=technical_extraction_to_json(extraction),
                 conversation_turn_id=turn_id,
-                warnings=parsed.warnings,
+                warnings=parsed.warnings + qualification_warnings,
+                ioc_diagnostics={
+                    "candidate_total": candidate_pack.total_candidates,
+                    "batch_count": len(candidate_pack.batches),
+                    "qualified_total": len(qualifications),
+                    "confirmed_total": sum(
+                        q.status.value == "confirmed_ioc" for q in qualifications
+                    ),
+                    "contextual_total": sum(
+                        q.status.value == "contextual" for q in qualifications
+                    ),
+                    "excluded_total": sum(
+                        q.status.value == "excluded" for q in qualifications
+                    ),
+                    "missing_candidate_ids": [],
+                    "unknown_candidate_ids": [],
+                    "candidate_pack_hash": candidate_pack.pack_hash,
+                },
             )
 
             return {
@@ -760,13 +852,104 @@ class ProductionWorkflowOrchestrator:
                 "artifact_id": str(artifact.id),
                 "items_count": len(extraction.items),
                 "supported_items": len(extraction.supported_items()),
-                "warnings": parsed.warnings,
+                "warnings": parsed.warnings + qualification_warnings,
                 "repair_actions": parsed.repair_actions,
+                "candidate_total": candidate_pack.total_candidates,
+                "batch_count": len(candidate_pack.batches),
+                "qualified_total": len(qualifications),
+                "confirmed_total": sum(q.status.value == "confirmed_ioc" for q in qualifications),
+                "contextual_total": sum(q.status.value == "contextual" for q in qualifications),
+                "excluded_total": sum(q.status.value == "excluded" for q in qualifications),
+                "candidate_pack_hash": candidate_pack.pack_hash,
                 "source_evidence_processing": (
                     evidence_processing.as_dict() if evidence_processing is not None else None
                 ),
                 "referenced_evidence": referenced_evidence,
             }
+
+    async def _build_ioc_candidate_pack(
+        self, uow: UnitOfWork, subject_id: UUID, report: ReferenceReport
+    ) -> IocCandidatePack:
+        """Load persisted evidence snapshots and build the pack before cache lookup."""
+        # Lightweight test UoWs intentionally omit these repositories.
+        repositories = (
+            "indicators", "source_collections", "source_documents", "derived_artifacts"
+        )
+        if not all(hasattr(uow, name) for name in repositories):
+            return build_candidate_pack((), collections=(), reference_report=report)
+        indicators = await uow.indicators.list_for_subject(subject_id)
+        collections = await uow.source_collections.list_for_subject(subject_id)
+        documents = await uow.source_documents.list_for_subject(subject_id)
+        artifact_ids = {indicator.derived_artifact_id for indicator in indicators}
+        artifacts_list = []
+        for artifact_id in sorted(artifact_ids, key=str):
+            artifact = await uow.derived_artifacts.get(artifact_id)
+            if artifact is not None:
+                artifacts_list.append(artifact)
+        artifacts = tuple(artifacts_list)
+        texts: dict[UUID, str] = {}
+        if self._source_evidence_processor is not None:
+            for artifact in artifacts:
+                try:
+                    texts[artifact.id] = await self._source_evidence_processor.read_derived_text(
+                        artifact.text_blob_id
+                    )
+                except Exception:
+                    continue
+        return build_candidate_pack(
+            indicators,
+            collections=collections,
+            source_documents=documents,
+            artifacts=artifacts,
+            reference_report=report,
+            artifact_texts=texts,
+        )
+
+    @staticmethod
+    def _format_ioc_candidates(candidates: tuple[IocCandidate, ...]) -> str:
+        blocks = []
+        for candidate in candidates:
+            evidence = "\n".join(
+                f"- sources: {', '.join(item.source_ids)}\n"
+                f"  snippet: {item.snippet or '[unavailable]'}"
+                for item in candidate.evidence
+            )
+            blocks.append(
+                f"candidate-id: {candidate.candidate_id}\n"
+                f"artifact-type: {candidate.artifact_type.value}\n"
+                f"preferred-original-value: {candidate.preferred_original_value}\n"
+                f"source-ids: {', '.join(candidate.source_ids)}\nevidence:\n{evidence}"
+            )
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _suppress_unbacked_q2_literals(
+        extraction: TechnicalExtraction, candidates: tuple[IocCandidate, ...]
+    ) -> TechnicalExtraction:
+        known = {(candidate.artifact_type, candidate.normalized_value) for candidate in candidates}
+        literal_types = {
+            ArtifactType.IP,
+            ArtifactType.DOMAIN,
+            ArtifactType.URL,
+            ArtifactType.HASH,
+            ArtifactType.EMAIL,
+        }
+        items = []
+        for item in extraction.items:
+            if item.artifact_type not in literal_types:
+                items.append(item)
+                continue
+            try:
+                key = (item.artifact_type, canonical_indicator_key(item.value, item.artifact_type))
+            except ValueError:
+                key = None
+            if key not in known:
+                items.append(replace(item, indicator_status=IndicatorStatus.EXCLUDED,
+                                     display_policy=DisplayPolicy.HIDDEN,
+                                     context=("unbacked_ioc_literal: " + item.context).strip()))
+            else:
+                items.append(item)
+        return replace(extraction, items=tuple(items))
 
     async def _execute_synthesis_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
         if not self._model_service:
