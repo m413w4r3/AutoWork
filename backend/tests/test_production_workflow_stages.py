@@ -20,7 +20,10 @@ from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_parsers import reference_report_from_json
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
-from cti_app.application.source_evidence_processing import SourceEvidenceProcessingResult
+from cti_app.application.source_evidence_processing import (
+    ReferencedEvidenceLink,
+    SourceEvidenceProcessingResult,
+)
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.model_conversations import ConversationMode
 from cti_app.domain.production import (
@@ -165,6 +168,7 @@ class _CollectionService:
         self._collections = collections
         self.added: list[Any] = []
         self.collected = 0
+        self.archived: list[UUID] = []
 
     async def add_supplemental_sources(self, subject_id: UUID, sources: Any) -> list[Any]:
         for source in sources:
@@ -189,6 +193,16 @@ class _CollectionService:
 
     async def collect_subject(self, subject_id: UUID, job_id: UUID, context: Any) -> None:
         self.collected += 1
+
+    async def add_referenced_evidence(self, subject_id: UUID, resources: Any) -> list[Any]:
+        del subject_id
+        children = [type("Collection", (), {"id": uuid4()})() for _ in resources]
+        self.added.extend(resources)
+        return children
+
+    async def archive_one(self, collection_id: UUID, job_id: UUID, *, context: Any) -> None:
+        del job_id, context
+        self.archived.append(collection_id)
 
 
 class _Runs:
@@ -316,6 +330,10 @@ async def test_deterministic_evidence_processing_runs_before_q2() -> None:
             self.calls.append(subject_id)
             return SourceEvidenceProcessingResult(1, 1, 0, 0, 2, ())
 
+        async def select_referenced_evidence(self, subject_id: UUID) -> tuple[object, ...]:
+            assert subject_id
+            return ()
+
     processor = _Processor()
     orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2], processor=processor)
     processor.conversations = conversations
@@ -338,6 +356,38 @@ async def test_deterministic_evidence_processing_runs_before_q2() -> None:
         "indicator_occurrences": 2,
         "outcomes": [],
     }
+
+
+async def test_linked_evidence_is_archived_before_deterministic_extraction() -> None:
+    class _Processor:
+        def __init__(self) -> None:
+            self.archived: list[UUID] | None = None
+
+        async def select_referenced_evidence(
+            self, subject_id: UUID
+        ) -> tuple[ReferencedEvidenceLink, ...]:
+            return (ReferencedEvidenceLink(uuid4(), "https://evidence.example/iocs.json", "IOCs"),)
+
+        async def process_subject(self, subject_id: UUID) -> SourceEvidenceProcessingResult:
+            assert self.archived is not None and len(self.archived) == 1
+            return SourceEvidenceProcessingResult(1, 1, 0, 0, 0, ())
+
+    processor = _Processor()
+    orchestrator, uow, _ = _build([PERFECT_Q1, PERFECT_Q2], processor=processor)
+    collection_service = cast(_CollectionService, orchestrator._collection_service)
+    processor.archived = collection_service.archived
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+    await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.REFERENCES)
+
+    uow.run.current_stage = SubjectProductionStage.EXTRACTION
+    result = await orchestrator.execute_stage(
+        uow.run.id,
+        SubjectProductionStage.EXTRACTION,
+        context=_JobContext(),
+    )
+
+    assert result["status"] == "success"
+    assert result["referenced_evidence"] == {"selected": 1, "added": 1}
 
 
 async def test_badly_formatted_answer_triggers_one_repair_turn() -> None:

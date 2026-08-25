@@ -65,6 +65,15 @@ class SupplementalSource:
     role: SourceRole = SourceRole.UNKNOWN
 
 
+@dataclass(frozen=True, slots=True)
+class ReferencedEvidence:
+    """A deterministic technical resource linked by an archived publication."""
+
+    parent_source_collection_id: UUID
+    url: str
+    anchor_text: str = ""
+
+
 @dataclass(slots=True)
 class CollectionSummary:
     total: int = 0
@@ -225,6 +234,69 @@ class SubjectCollectionService:
                 )
                 if await uow.source_collections.add_if_absent(collection):
                     added.append(collection)
+            await uow.commit()
+        return added
+
+    async def add_referenced_evidence(
+        self,
+        subject_id: UUID,
+        resources: Sequence[ReferencedEvidence],
+    ) -> list[SourceCollection]:
+        """Attach bounded, first-level technical resources without making S# sources.
+
+        The subject/canonical URL uniqueness constraint makes this safe to run
+        repeatedly and also reuses a URL that is already a real publication.
+        """
+        added: list[SourceCollection] = []
+        async with self._uow_factory() as uow:
+            all_collections = list(await uow.source_collections.list_for_subject(subject_id))
+            by_id = {item.id: item for item in all_collections}
+            existing_children = sum(
+                item.origin_kind is SourceOriginKind.REFERENCED_EVIDENCE
+                for item in all_collections
+            )
+            per_parent: dict[UUID, int] = {}
+            for item in all_collections:
+                if item.parent_source_collection_id is not None:
+                    per_parent[item.parent_source_collection_id] = (
+                        per_parent.get(item.parent_source_collection_id, 0) + 1
+                    )
+            for resource in resources:
+                if existing_children >= 20:
+                    break
+                parent = by_id.get(resource.parent_source_collection_id)
+                if (
+                    parent is None
+                    or parent.origin_kind is SourceOriginKind.REFERENCED_EVIDENCE
+                    or per_parent.get(parent.id, 0) >= 8
+                ):
+                    continue
+                try:
+                    canonical = canonicalize_http_url(resource.url)
+                except ValueError:
+                    continue
+                if await uow.source_collections.get_by_canonical_url(subject_id, canonical):
+                    continue
+                child = SourceCollection(
+                    subject_id=parent.subject_id,
+                    edition_id=parent.edition_id,
+                    group_id=parent.group_id,
+                    requested_url=canonical,
+                    canonical_url=canonical,
+                    origin_kind=SourceOriginKind.REFERENCED_EVIDENCE,
+                    parent_source_collection_id=parent.id,
+                    proposed_role=SourceRole.UNKNOWN,
+                    title=resource.anchor_text or None,
+                    source_tlp=parent.source_tlp,
+                    sensitivity=parent.sensitivity,
+                    external_llm_allowed=parent.external_llm_allowed,
+                    do_not_submit=parent.do_not_submit,
+                    relationship_evidence="deterministic:referenced_evidence_link",
+                )
+                if await uow.source_collections.add_if_absent(child):
+                    added.append(child)
+                    existing_children += 1
+                    per_parent[parent.id] = per_parent.get(parent.id, 0) + 1
             await uow.commit()
         return added
 

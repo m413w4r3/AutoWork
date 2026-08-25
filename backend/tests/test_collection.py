@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.collection import (
+    ReferencedEvidence,
     SubjectCollectionService,
     collection_idempotency_key,
 )
@@ -25,7 +26,7 @@ from cti_app.application.http_collection import (
 )
 from cti_app.application.jobs import JobCancelledError, JobExecutionContext, JobHandlerError
 from cti_app.domain.classification import TLP
-from cti_app.domain.collection import CollectionState
+from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.discovery import CandidateTopic, DiscoveryBatch, SourceCandidate, SourceRole
 from cti_app.domain.editions import Edition
 from cti_app.domain.editorial import (
@@ -755,3 +756,56 @@ def test_collection_idempotency_key_matches_historical_format() -> None:
     key = collection_idempotency_key(subject_id, snapshot_id, 3)
 
     assert key == f"source.collect:{subject_id}:all:{snapshot_id}:3"
+
+
+async def test_referenced_evidence_is_bounded_inherited_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(
+        factory,
+        (
+            "https://one.example/report",
+            "https://two.example/report",
+            "https://three.example/report",
+        ),
+    )
+    app = service(factory, Transport([]), tmp_path / "blobs")
+    parents = await app.initialize(subject.id)
+
+    resources = tuple(
+        ReferencedEvidence(
+            parent_source_collection_id=parent.id,
+            url=f"https://resources.example/{parent.id}/{number}.json",
+            anchor_text=f"IOC {number}",
+        )
+        for parent in parents
+        for number in range(8)
+    )
+
+    reused = await app.add_referenced_evidence(
+        subject.id,
+        (
+            ReferencedEvidence(
+                parent_source_collection_id=parents[0].id,
+                url=parents[1].canonical_url,
+                anchor_text="already a publication",
+            ),
+        ),
+    )
+    assert reused == []
+
+    added = await app.add_referenced_evidence(subject.id, resources)
+
+    assert len(added) == 20
+    assert all(item.origin_kind is SourceOriginKind.REFERENCED_EVIDENCE for item in added)
+    assert all(item.parent_source_collection_id is not None for item in added)
+    assert all(item.source_tlp is TLP.AMBER for item in added)
+    assert all(item.sensitivity == "internal" for item in added)
+    assert all(not item.external_llm_allowed for item in added)
+    assert all(not item.do_not_submit for item in added)
+    assert [
+        sum(item.parent_source_collection_id == parent.id for item in added) for parent in parents
+    ] == [8, 8, 4]
+
+    assert await app.add_referenced_evidence(subject.id, resources) == []

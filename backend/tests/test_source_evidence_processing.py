@@ -4,11 +4,51 @@ from pathlib import Path
 from uuid import uuid4
 
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.source_evidence_processing import SourceEvidenceProcessingService
-from cti_app.domain.collection import CollectionState
+from cti_app.application.extraction import ParsedLink
+from cti_app.application.source_evidence_processing import (
+    SourceEvidenceProcessingService,
+    select_technical_links,
+)
+from cti_app.domain.collection import CollectionState, SourceCollection, SourceOriginKind
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.collection_support import InMemoryCollectionUnitOfWorkFactory
 from tests.test_collection import Transport, response, selected_subject, service
+
+
+def test_select_technical_links_resolves_only_safe_first_level_resources() -> None:
+    selected = select_technical_links(
+        "https://reports.example/advisory/index.html",
+        (
+            ParsedLink("iocs.json", "IOC download"),
+            ParsedLink("https://cdn.example/report.pdf", "PDF"),
+            ParsedLink("mailto:analyst@example", "contact"),
+            ParsedLink("javascript:alert(1)", "download"),
+            ParsedLink("data:text/plain,indicator", "download"),
+            ParsedLink("#technical-annex", "annex"),
+            ParsedLink("/advisory/index.html#again", "self"),
+            ParsedLink("/login", "download"),
+            ParsedLink("/assets/logo.png", "download"),
+            ParsedLink("/privacy", "IOC list"),
+            ParsedLink("/news", "read more"),
+        ),
+    )
+
+    assert selected == (
+        ("https://cdn.example/report.pdf", "PDF"),
+        ("https://reports.example/advisory/iocs.json", "IOC download"),
+    )
+
+
+def test_select_technical_links_applies_a_deterministic_parent_cap() -> None:
+    selected = select_technical_links(
+        "https://reports.example/advisory",
+        tuple(ParsedLink(f"/files/{number:02}.json", "IOC") for number in range(12)),
+    )
+
+    assert len(selected) == 8
+    assert [url for url, _ in selected] == [
+        f"https://reports.example/files/{number:02}.json" for number in range(8)
+    ]
 
 
 async def _archived_sources(
@@ -84,3 +124,33 @@ async def test_one_unparseable_archived_source_does_not_rollback_others(tmp_path
     assert factory.collections[collections[0].id].state is CollectionState.EXTRACTED
     assert factory.collections[invalid.id].state is CollectionState.ARCHIVED
     assert len(factory.artifacts) == 1
+
+
+async def test_referenced_evidence_selection_never_traverses_a_child(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    processor, collections = await _archived_sources(
+        factory,
+        tmp_path,
+        b'<html><a href="/root-iocs.json">root IOC</a></html>',
+    )
+    parent = collections[0]
+    child = SourceCollection(
+        subject_id=parent.subject_id,
+        edition_id=parent.edition_id,
+        group_id=parent.group_id,
+        requested_url="https://source-0.example/child.html",
+        canonical_url="https://source-0.example/child.html",
+        proposed_role=parent.proposed_role,
+        origin_kind=SourceOriginKind.REFERENCED_EVIDENCE,
+        parent_source_collection_id=parent.id,
+        state=CollectionState.ARCHIVED,
+        source_document_id=parent.source_document_id,
+        decoded_blob_id=parent.decoded_blob_id,
+    )
+    factory.collections[child.id] = child
+
+    selected = await processor.select_referenced_evidence(parent.subject_id)
+
+    assert [(item.parent_source_collection_id, item.url) for item in selected] == [
+        (parent.id, "https://source-0.example/root-iocs.json")
+    ]

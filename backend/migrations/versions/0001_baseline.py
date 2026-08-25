@@ -1138,6 +1138,7 @@ def _create_source_collections() -> None:
         sa.Column("group_id", sa.Uuid(), nullable=False),
         sa.Column("batch_id", sa.Uuid(), nullable=True),
         sa.Column("source_candidate_id", sa.Uuid(), nullable=True),
+        sa.Column("parent_source_collection_id", sa.Uuid(), nullable=True),
         sa.Column("requested_url", sa.Text(), nullable=False),
         sa.Column("proposed_role", sa.String(length=32), nullable=False),
         sa.Column("relationship_status", sa.String(length=32), nullable=False),
@@ -1186,13 +1187,20 @@ def _create_source_collections() -> None:
             name="ck_source_collections_verified_evidence",
         ),
         sa.CheckConstraint(
-            "origin_kind IN ('discovery', 'reference_research', 'manual')",
+            "origin_kind IN ('discovery', 'reference_research', 'referenced_evidence', 'manual')",
             name="ck_source_collections_origin_kind",
+        ),
+        sa.CheckConstraint(
+            "(origin_kind = 'referenced_evidence') = (parent_source_collection_id IS NOT NULL)",
+            name="ck_source_collections_referenced_parent",
         ),
         sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["group_id"], ["editorial_groups.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["batch_id"], ["discovery_batches.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(
+            ["parent_source_collection_id"], ["source_collections.id"], ondelete="RESTRICT"
+        ),
         sa.ForeignKeyConstraint(
             ["source_document_id"], ["source_documents.id"], ondelete="RESTRICT"
         ),

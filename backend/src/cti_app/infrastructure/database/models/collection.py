@@ -34,7 +34,7 @@ CLAIM_KIND_VALUES_SQL = (
     "'infection_chain', 'ttp', 'victimology'"
 )
 INDICATOR_KIND_VALUES_SQL = "'hash', 'domain', 'ip', 'url', 'cve', 'attack_id', 'email'"
-SOURCE_ORIGIN_KIND_VALUES_SQL = "'discovery', 'reference_research', 'manual'"
+SOURCE_ORIGIN_KIND_VALUES_SQL = "'discovery', 'reference_research', 'referenced_evidence', 'manual'"
 
 
 class SourceCollectionRow(Base):
@@ -49,6 +49,10 @@ class SourceCollectionRow(Base):
         CheckConstraint(
             f"origin_kind IN ({SOURCE_ORIGIN_KIND_VALUES_SQL})",
             name="ck_source_collections_origin_kind",
+        ),
+        CheckConstraint(
+            "(origin_kind = 'referenced_evidence') = (parent_source_collection_id IS NOT NULL)",
+            name="ck_source_collections_referenced_parent",
         ),
         CheckConstraint(
             f"state IN ({COLLECTION_STATE_VALUES_SQL})", name="ck_source_collections_state"
@@ -85,6 +89,9 @@ class SourceCollectionRow(Base):
         Uuid(as_uuid=True), ForeignKey("discovery_batches.id", ondelete="RESTRICT")
     )
     source_candidate_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    parent_source_collection_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("source_collections.id", ondelete="RESTRICT")
+    )
     origin_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     requested_url: Mapped[str] = mapped_column(Text, nullable=False)
     canonical_url: Mapped[str] = mapped_column(Text, nullable=False)

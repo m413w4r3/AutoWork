@@ -85,7 +85,13 @@ class InMemorySourceCollectionRepository:
     async def add_if_absent(self, collection: SourceCollection) -> bool:
         if any(
             item.subject_id == collection.subject_id
-            and item.source_candidate_id == collection.source_candidate_id
+            and (
+                item.canonical_url == collection.canonical_url
+                or (
+                    collection.source_candidate_id is not None
+                    and item.source_candidate_id == collection.source_candidate_id
+                )
+            )
             for item in self._collections.values()
         ):
             return False
@@ -107,6 +113,19 @@ class InMemorySourceCollectionRepository:
                 item
                 for item in self._collections.values()
                 if item.subject_id == subject_id and item.source_candidate_id == source_candidate_id
+            ),
+            None,
+        )
+        return deepcopy(value) if value else None
+
+    async def get_by_canonical_url(
+        self, subject_id: UUID, canonical_url: str
+    ) -> SourceCollection | None:
+        value = next(
+            (
+                item
+                for item in self._collections.values()
+                if item.subject_id == subject_id and item.canonical_url == canonical_url
             ),
             None,
         )

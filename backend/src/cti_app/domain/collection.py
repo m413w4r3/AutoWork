@@ -70,6 +70,7 @@ class IndicatorKind(StrEnum):
 class SourceOriginKind(StrEnum):
     DISCOVERY = "discovery"
     REFERENCE_RESEARCH = "reference_research"
+    REFERENCED_EVIDENCE = "referenced_evidence"
     MANUAL = "manual"
 
 
@@ -109,6 +110,7 @@ class SourceCollection:
     # makes a subject hold one collection per publication.
     canonical_url: str = ""
     origin_kind: SourceOriginKind = SourceOriginKind.DISCOVERY
+    parent_source_collection_id: UUID | None = None
     # A reference-research source has no DiscoveryBatch candidate to read its
     # metadata from, so the collection carries its own snapshot.
     batch_id: UUID | None = None
@@ -152,6 +154,16 @@ class SourceCollection:
             raise ValueError(
                 "A verified relationship requires deterministic evidence or a human decision"
             )
+        if (
+            self.origin_kind is SourceOriginKind.REFERENCED_EVIDENCE
+            and self.parent_source_collection_id is None
+        ):
+            raise ValueError("Referenced evidence requires a parent source collection")
+        if (
+            self.origin_kind is not SourceOriginKind.REFERENCED_EVIDENCE
+            and self.parent_source_collection_id is not None
+        ):
+            raise ValueError("Only referenced evidence may have a parent source collection")
 
     def claim_fetch(
         self,

@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from cti_app.application.collection import SupplementalSource
+from cti_app.application.collection import ReferencedEvidence, SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.model_conversations import ModelConversationService
@@ -155,7 +155,7 @@ class ProductionWorkflowOrchestrator:
         elif expected_stage == SubjectProductionStage.REFERENCES:
             result = await self._execute_references_stage(run, context)
         elif expected_stage == SubjectProductionStage.EXTRACTION:
-            result = await self._execute_extraction_stage(run)
+            result = await self._execute_extraction_stage(run, context)
         elif expected_stage == SubjectProductionStage.SYNTHESIS:
             result = await self._execute_synthesis_stage(run)
         elif expected_stage == SubjectProductionStage.ASSEMBLY:
@@ -608,9 +608,38 @@ class ProductionWorkflowOrchestrator:
                 "repair_actions": parsed.repair_actions,
             }
 
-    async def _execute_extraction_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
+    async def _execute_extraction_stage(
+        self,
+        run: SubjectProductionRun,
+        context: JobExecutionContext | None,
+    ) -> dict[str, Any]:
+        referenced_evidence = {"selected": 0, "added": 0}
         evidence_processing = None
         if self._source_evidence_processor is not None:
+            links = await self._source_evidence_processor.select_referenced_evidence(
+                run.subject_id
+            )
+            referenced_evidence["selected"] = len(links)
+            if self._collection_service is not None and links:
+                children = await self._collection_service.add_referenced_evidence(
+                    run.subject_id,
+                    tuple(
+                        ReferencedEvidence(
+                            parent_source_collection_id=link.parent_source_collection_id,
+                            url=link.url,
+                            anchor_text=link.anchor_text,
+                        )
+                        for link in links
+                    ),
+                )
+                referenced_evidence["added"] = len(children)
+                job_id = context.job_id if context is not None else uuid4()
+                for child in children:
+                    await self._collection_service.archive_one(
+                        child.id,
+                        job_id,
+                        context=context,
+                    )
             evidence_processing = await self._source_evidence_processor.process_subject(
                 run.subject_id
             )
@@ -676,6 +705,7 @@ class ProductionWorkflowOrchestrator:
                     "source_evidence_processing": (
                         evidence_processing.as_dict() if evidence_processing is not None else None
                     ),
+                    "referenced_evidence": referenced_evidence,
                 }
 
             subject_title, _ = await self._subject_context(uow, run.subject_id)
@@ -735,6 +765,7 @@ class ProductionWorkflowOrchestrator:
                 "source_evidence_processing": (
                     evidence_processing.as_dict() if evidence_processing is not None else None
                 ),
+                "referenced_evidence": referenced_evidence,
             }
 
     async def _execute_synthesis_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
