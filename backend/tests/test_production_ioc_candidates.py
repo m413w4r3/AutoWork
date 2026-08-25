@@ -1,0 +1,170 @@
+from dataclasses import replace
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
+
+import pytest
+
+from cti_app.application.production_ioc_candidates import build_candidate_pack
+from cti_app.application.production_parsers import ParsedSource, ReferenceReport
+from cti_app.domain.classification import TLP
+from cti_app.domain.collection import (
+    DerivedArtifact,
+    Indicator,
+    IndicatorKind,
+    SourceCollection,
+    SourceOriginKind,
+    SourceSpan,
+)
+from cti_app.domain.discovery import SourceRole
+from cti_app.domain.entities import SourceDocument
+
+NOW = datetime(2025, 1, 1, tzinfo=UTC)
+
+
+def _records(
+    value: str,
+    *,
+    kind: IndicatorKind = IndicatorKind.DOMAIN,
+    source_url: str = "https://news.test/a",
+    parent=None,
+):
+    subject_id, edition_id, group_id = uuid4(), uuid4(), uuid4()
+    collection_id = uuid4()
+    document_id, artifact_id = uuid4(), uuid4()
+    collection = SourceCollection(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        group_id=group_id,
+        requested_url=source_url,
+        canonical_url=source_url,
+        proposed_role=SourceRole.PRIMARY,
+        origin_kind=SourceOriginKind.REFERENCED_EVIDENCE if parent else SourceOriginKind.DISCOVERY,
+        parent_source_collection_id=parent,
+        id=collection_id,
+        source_document_id=document_id,
+    )
+    document = SourceDocument(
+        subject_id=subject_id,
+        blob_id=uuid4(),
+        original_name="source.txt",
+        origin="test",
+        acquired_at=NOW,
+        license_restriction=None,
+        tlp=TLP.CLEAR,
+        do_not_submit=False,
+        external_llm_allowed=True,
+        source_collection_id=collection_id,
+        final_url=source_url,
+        id=document_id,
+    )
+    artifact = DerivedArtifact(
+        source_document_id=document_id,
+        text_blob_id=uuid4(),
+        parser_name="test-parser",
+        parser_version="test-parser-v1",
+        text_length=200,
+        publication_metadata={},
+        id=artifact_id,
+    )
+    indicator = Indicator(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        group_id=group_id,
+        source_document_id=document_id,
+        derived_artifact_id=artifact_id,
+        kind=kind,
+        original_value=value,
+        normalized_value=value,
+        span=SourceSpan(10, 10 + len(value)),
+    )
+    return indicator, collection, document, artifact
+
+
+def _report(*urls: str) -> ReferenceReport:
+    return ReferenceReport(
+        sources=tuple(
+            ParsedSource(f"S{i}", "title", url, url, None, None, SourceRole.PRIMARY)
+            for i, url in enumerate(urls, 1)
+        ),
+        events=(),
+    )
+
+
+def _pack(rows, report, texts=True, **kwargs):
+    indicators = [row[0] for row in rows]
+    collections = [row[1] for row in rows]
+    documents = [row[2] for row in rows]
+    artifacts = [row[3] for row in rows]
+    artifact_texts = (
+        {row[3].id: "x" * 10 + row[0].original_value + " x" * 100 for row in rows} if texts else {}
+    )
+    return build_candidate_pack(
+        indicators,
+        collections=collections,
+        source_documents=documents,
+        artifacts=artifacts,
+        reference_report=report,
+        artifact_texts=artifact_texts,
+        **kwargs,
+    )
+
+
+def test_same_source_two_occurrences_are_one_candidate_with_two_evidence():
+    first = _records("evil[.]example")
+    second = (
+        replace(first[0], original_value="evil.example", span=SourceSpan(30, 42), id=uuid4()),
+        *first[1:],
+    )
+    pack = _pack([first, second], _report("https://news.test/a"))
+    assert len(pack.candidates) == 1
+    assert len(pack.candidates[0].evidence) == 2
+    assert pack.candidates[0].source_ids == ("S1",)
+
+
+def test_same_ioc_in_two_sources_and_child_map_to_s_numbers():
+    first = _records("evil.example", source_url="https://news.test/a")
+    second = _records("evil[.]example", source_url="https://tech.test/ioc")
+    third = _records("evil.example", source_url="https://tech.test/child", parent=first[1].id)
+    # The child points to the parent's publication for source mapping.
+    third = (third[0], third[1], replace(third[2], final_url="https://tech.test/child"), third[3])
+    pack = _pack([first, second, third], _report("https://news.test/a", "https://tech.test/ioc"))
+    assert pack.candidates[0].source_ids == ("S1", "S2")
+
+
+def test_unmappable_source_warns_without_fabricated_source():
+    row = _records("evil.example")
+    pack = _pack([row], _report("https://other.test/report"))
+    assert pack.candidates[0].source_ids == ()
+    assert any("source_not_mapped" in warning for warning in pack.warnings)
+
+
+@pytest.mark.parametrize("kind", [IndicatorKind.CVE, IndicatorKind.ATTACK_ID])
+def test_general_cti_types_are_excluded(kind):
+    row = _records("CVE-2025-0001" if kind is IndicatorKind.CVE else "T1059", kind=kind)
+    assert _pack([row], _report("https://news.test/a")).candidates == ()
+
+
+def test_candidate_and_pack_hash_are_canonical_and_evidence_changes_hash():
+    one = _records("evil.example")
+    two = (replace(one[0], id=UUID("00000000-0000-0000-0000-000000000001")), *one[1:])
+    # Input order does not affect the canonical result when records are fixed.
+    first = _pack([one], _report("https://news.test/a"))
+    second = _pack([one], _report("https://news.test/a"))
+    assert first.pack_hash == second.pack_hash
+    assert first.candidates[0].candidate_id == second.candidates[0].candidate_id
+    changed = _pack([two], _report("https://news.test/a"))
+    assert changed.pack_hash != first.pack_hash
+
+
+def test_batching_is_stable_and_bounded_by_candidate_count():
+    rows = [_records(f"host-{i}.example") for i in range(5)]
+    pack = _pack(rows[::-1], _report("https://news.test/a"), max_candidates_per_batch=2)
+    assert [len(batch.candidates) for batch in pack.batches] == [2, 2, 1]
+    assert [batch.ordinal for batch in pack.batches] == [0, 1, 2]
+
+
+def test_input_order_does_not_change_canonical_result():
+    rows = [_records("z.example"), _records("a.example"), _records("m.example")]
+    forward = _pack(rows, _report("https://news.test/a"))
+    reverse = _pack(rows[::-1], _report("https://news.test/a"))
+    assert forward == reverse
