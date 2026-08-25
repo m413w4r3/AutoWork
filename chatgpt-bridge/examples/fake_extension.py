@@ -208,10 +208,22 @@ async def main() -> None:
                     for f in files
                 )
                 reponse = f"Écho ({len(msg['prompt'])} caractères){joints}\n\n```python\nprint('bloc de code')\n```"
-                for word in reponse.split(" "):
+                # Le protocole actuel ne transmet aucun contenu avant `done` :
+                # seul un heartbeat périodique prouve que la génération avance.
+                for _ in range(3):
                     await ws.send(
                         json.dumps(
-                            {"type": "chunk", "id": msg["id"], "text": word + " "}
+                            {
+                                "type": "heartbeat",
+                                "id": msg["id"],
+                                "progress": {
+                                    "phase": "streaming",
+                                    "output_chars": len(reponse),
+                                    "stable_for_ms": 0,
+                                    "completion_signal": "streaming",
+                                    "completion_confidence": "low",
+                                },
+                            }
                         )
                     )
                     await asyncio.sleep(0.03)
@@ -220,6 +232,17 @@ async def main() -> None:
                         {
                             "type": "done",
                             "id": msg["id"],
+                            "text": reponse,
+                            "metadata": {
+                                "visible_citations": [],
+                                "serializer_version": "simulateur",
+                                "completion_signal": "unknown",
+                                "completion_confidence": "low",
+                                "stable_for_ms": 0,
+                                "output_chars": len(reponse),
+                                "visible_citation_count": 0,
+                                "content_script_version": "simulateur",
+                            },
                             "conversation": conversation_result,
                         }
                     )

@@ -70,16 +70,21 @@ async def main() -> None:
                     await socket.send(
                         json.dumps(
                             {
-                                "type": "chunk",
+                                "type": "done",
                                 "id": message["id"],
-                                "text": "ok",
                                 "event_id": "compose:1",
+                                "text": "ok",
+                                "metadata": {
+                                    "visible_citations": [],
+                                    "serializer_version": "compose-smoke",
+                                    "completion_signal": "unknown",
+                                    "completion_confidence": "low",
+                                    "stable_for_ms": 0,
+                                    "output_chars": len("ok"),
+                                    "visible_citation_count": 0,
+                                    "content_script_version": "compose-smoke",
+                                },
                             }
-                        )
-                    )
-                    await socket.send(
-                        json.dumps(
-                            {"type": "done", "id": message["id"], "event_id": "compose:2"}
                         )
                     )
 

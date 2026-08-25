@@ -491,7 +491,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (
     [
       "ack",
-      "chunk",
       "heartbeat",
       "conversation_bound",
       "incomplete",

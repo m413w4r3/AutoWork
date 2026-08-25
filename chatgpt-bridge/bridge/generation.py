@@ -259,7 +259,6 @@ async def run_generation(
             }
         )
         generation_announced = False
-        legacy_chunks: List[str] = []
 
         def expired(code: str, now: float) -> UpstreamError:
             """Journalise le dernier état connu, puis nomme l'échéance atteinte.
@@ -328,23 +327,7 @@ async def run_generation(
             last_packet_at = time.monotonic()
 
             kind = packet.get("type")
-            if kind == "chunk":
-                # Compatibilité avec les anciennes extensions. Les morceaux ne
-                # sont jamais produits avant `done` : le DOM ChatGPT n'est pas
-                # append-only et un snapshot final doit pouvoir les remplacer.
-                if not generation_announced:
-                    logger.info("bridge_run_phase bridge_run_id=%s phase=generation", request_id)
-                    generation_announced = True
-                text = packet.get("text", "")
-                if isinstance(text, str) and text:
-                    legacy_chunks.append(text)
-            # elif kind == "heartbeat":
-                # # Recevoir le paquet suffit à réarmer l'attente IDLE_TIMEOUT.
-                # # Le heartbeat ne contribue jamais au contenu de la réponse.
-                # if not generation_announced:
-                    # logger.info("bridge_run_phase bridge_run_id=%s phase=generation", request_id)
-                    # generation_announced = True
-            elif kind == "heartbeat":
+            if kind == "heartbeat":
                 if not generation_announced:
                     logger.info(
                         "bridge_run_phase bridge_run_id=%s phase=generation",
@@ -387,10 +370,6 @@ async def run_generation(
                     request_id,
                     conversation.id,
                 )
-            # elif kind == "incomplete":
-                # reason = str(packet.get("reason", "no_final_answer"))
-                # if reason != "no_final_answer":
-                    # reason = "no_final_answer"
             elif kind == "incomplete":
                 reason = str(packet.get("reason", "no_final_answer"))
                 if reason not in {
@@ -424,8 +403,6 @@ async def run_generation(
                 raise NeedsReviewError(reason, details)
             elif kind == "done":
                 final_text = packet.get("text")
-                if final_text is None:
-                    final_text = "".join(legacy_chunks)
                 if not isinstance(final_text, str):
                     raise UpstreamError("snapshot final absent ou invalide")
                 reported_metadata = packet.get("metadata")
