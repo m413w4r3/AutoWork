@@ -19,6 +19,11 @@ from cti_app.application.model_conversations import (
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_context import build_subject_production_context
+from cti_app.application.production_evidence_pack import (
+    ArchivedCorpusDocument,
+    ProductionEvidencePack,
+    build_production_evidence_pack,
+)
 from cti_app.application.production_ioc_candidates import (
     DiscoveryPublicationEvidence,
     IocCandidate,
@@ -289,9 +294,7 @@ class ProductionWorkflowOrchestrator:
 
         repaired = parse(repaired_raw)
         self._log_parse(run, f"{stage}-repair", repaired)
-        repaired.repair_actions.append(
-            f"{stage}_format_repair"
-        )
+        repaired.repair_actions.append(f"{stage}_format_repair")
         repaired.warnings.extend(result.errors)
         return repaired, repaired_raw, repair_turn.id
 
@@ -704,6 +707,15 @@ class ProductionWorkflowOrchestrator:
                     "error_code": "references_payload_missing",
                     "error": "Reference report content is not readable",
                 }
+            evidence_pack = await self._build_production_evidence_pack(uow, run.subject_id, report)
+            if evidence_pack.needs_review:
+                return {
+                    "stage": "extraction",
+                    "status": "needs_review",
+                    "error_code": evidence_pack.error_code,
+                    "error": evidence_pack.error_message,
+                    "pack_hash": evidence_pack.pack_hash,
+                }
             initial_candidate_pack = await self._build_ioc_candidate_pack(
                 uow, run.subject_id, report
             )
@@ -714,6 +726,7 @@ class ProductionWorkflowOrchestrator:
                 "stage": "extraction",
                 "prompt_version": EXTRACTION_PROMPT_VERSION,
                 "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
+                "evidence_pack_hash": evidence_pack.pack_hash,
             }
             input_hash = compute_input_hash(input_data)
 
@@ -750,20 +763,63 @@ class ProductionWorkflowOrchestrator:
 
             subject_title, _ = await self._subject_context(uow, run.subject_id)
             prompt = ProductionPromptTemplates.get_extraction_prompt(subject_title=subject_title)
+            archive_repositories_available = all(
+                hasattr(uow, name)
+                for name in ("source_collections", "source_documents", "derived_artifacts")
+            )
 
             try:
-                parsed, raw, turn_id = await self._ask_with_format_repair(
-                    run=run,
-                    conversation_id=conversation_id,
-                    stage="extraction",
-                    prompt=prompt,
-                    prompt_version=EXTRACTION_PROMPT_VERSION,
-                    repair_version=EXTRACTION_FORMAT_REPAIR_VERSION,
-                    mode=ConversationMode.CONTINUE,
-                    parse=lambda text: parse_technical_extraction(text, report),
-                    external_llm_allowed=policy_allows,
-                    web_search=False,
+                parsed_items = []
+                parsed_warnings: list[str] = []
+                raw_parts: list[str] = []
+                turn_id = None
+                # Only lightweight unit-test UoWs lack archive repositories.
+                # Production always takes the explicit-pack path.
+                legacy_fallback = not evidence_pack.chunks and not archive_repositories_available
+                chunk_count = len(evidence_pack.chunks) or int(legacy_fallback)
+                for index in range(chunk_count):
+                    chunk = evidence_pack.chunks[index] if not legacy_fallback else None
+                    chunk_prompt = (
+                        prompt
+                        if chunk is None
+                        else (
+                            prompt
+                            + "\n\nCorpus Q2 — segment borné, uniquement données archivées.\n"
+                            + f"chunk_id: {chunk.chunk_id}\n"
+                            + f"source_ids: {', '.join(chunk.source_ids) or 'none'}\n"
+                            + chunk.text
+                        )
+                    )
+                    parsed, raw, chunk_turn_id = await self._ask_with_format_repair(
+                        run=run,
+                        conversation_id=conversation_id,
+                        stage="extraction",
+                        prompt=chunk_prompt,
+                        prompt_version=(
+                            EXTRACTION_PROMPT_VERSION
+                            if chunk is None
+                            else f"{EXTRACTION_PROMPT_VERSION}-{chunk.chunk_id}"
+                        ),
+                        repair_version=EXTRACTION_FORMAT_REPAIR_VERSION,
+                        mode=ConversationMode.CONTINUE,
+                        parse=lambda text: parse_technical_extraction(text, report),
+                        external_llm_allowed=policy_allows,
+                        web_search=False,
+                    )
+                    if parsed is not None and parsed.usable and parsed.value is not None:
+                        parsed_items.extend(parsed.value.items)
+                        parsed_warnings.extend(parsed.warnings)
+                        raw_parts.append(raw)
+                        turn_id = chunk_turn_id
+                parsed = (
+                    ParseResult(
+                        value=TechnicalExtraction(tuple(parsed_items)),
+                        warnings=parsed_warnings,
+                    )
+                    if parsed_items
+                    else None
                 )
+                raw = "\n\n".join(raw_parts)
             except Exception as e:
                 return self._handle_stage_exception(run, "extraction", e)
 
@@ -783,6 +839,7 @@ class ProductionWorkflowOrchestrator:
                     "warnings": parsed.warnings,
                 }
 
+            assert parsed.value is not None
             q2_literals = self._q2_literals(parsed.value)
             candidate_pack = await self._build_ioc_candidate_pack(
                 uow, run.subject_id, report, extraction=parsed.value
@@ -812,6 +869,12 @@ class ProductionWorkflowOrchestrator:
                     "repair_actions": parsed.repair_actions,
                     "candidate_pack_hash": candidate_pack.pack_hash,
                     "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
+                    "evidence_pack_hash": evidence_pack.pack_hash,
+                    "evidence_pack_chunk_ids": list(evidence_pack.chunk_ids),
+                    "evidence_pack_source_document_ids": sorted(
+                        {str(chunk.source_document_id) for chunk in evidence_pack.chunks}
+                    ),
+                    "evidence_pack_parser_versions": dict(evidence_pack.parser_versions),
                     **q2_diagnostics,
                     "source_derived_candidates": candidate_pack.source_derived_candidates,
                     "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,
@@ -833,6 +896,12 @@ class ProductionWorkflowOrchestrator:
                 "status_totals": status_totals,
                 "candidate_pack_hash": candidate_pack.pack_hash,
                 "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
+                "evidence_pack_hash": evidence_pack.pack_hash,
+                "evidence_pack_chunk_ids": list(evidence_pack.chunk_ids),
+                "evidence_pack_source_document_ids": sorted(
+                    {str(chunk.source_document_id) for chunk in evidence_pack.chunks}
+                ),
+                "evidence_pack_parser_versions": dict(evidence_pack.parser_versions),
                 **q2_diagnostics,
                 "source_derived_candidates": candidate_pack.source_derived_candidates,
                 "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,
@@ -844,6 +913,57 @@ class ProductionWorkflowOrchestrator:
                 ),
                 "referenced_evidence": referenced_evidence,
             }
+
+    async def _build_production_evidence_pack(
+        self, uow: UnitOfWork, subject_id: UUID, report: ReferenceReport
+    ) -> ProductionEvidencePack:
+        repositories = ("source_collections", "source_documents", "derived_artifacts")
+        if not all(hasattr(uow, name) for name in repositories):
+            return build_production_evidence_pack(report, ())
+        collections = await uow.source_collections.list_for_subject(subject_id)
+        documents = {
+            document.id: document
+            for document in await uow.source_documents.list_for_subject(subject_id)
+        }
+        artifact_ids = {
+            collection.derived_artifact_id
+            for collection in collections
+            if collection.derived_artifact_id is not None
+        }
+        artifacts = {}
+        for artifact_id in artifact_ids:
+            artifact = await uow.derived_artifacts.get(artifact_id)
+            if artifact is not None:
+                artifacts[artifact.id] = artifact
+        texts: dict[UUID, str] = {}
+        if self._source_evidence_processor is not None:
+            for artifact in artifacts.values():
+                try:
+                    texts[
+                        artifact.text_blob_id
+                    ] = await self._source_evidence_processor.read_derived_text(
+                        artifact.text_blob_id
+                    )
+                except Exception:
+                    pass
+        items: list[ArchivedCorpusDocument] = []
+        children: list[ArchivedCorpusDocument] = []
+        for collection in collections:
+            collection_artifact_id = collection.derived_artifact_id
+            collection_document_id = collection.source_document_id
+            if collection_artifact_id is None or collection_document_id is None:
+                continue
+            document = documents.get(collection_document_id)
+            artifact = artifacts.get(collection_artifact_id)
+            if document is None or artifact is None:
+                continue
+            item = ArchivedCorpusDocument(
+                collection, document, texts.get(artifact.text_blob_id, "")
+            )
+            (children if collection.origin_kind.value == "referenced_evidence" else items).append(
+                item
+            )
+        return build_production_evidence_pack(report, items, children)
 
     async def _build_ioc_candidate_pack(
         self,
@@ -930,10 +1050,7 @@ class ProductionWorkflowOrchestrator:
                         if collection is None or collection.source_document_id is None:
                             continue
                         publication_artifact_id = collection.derived_artifact_id
-                        if (
-                            publication_artifact_id is None
-                            or publication_artifact_id not in texts
-                        ):
+                        if publication_artifact_id is None or publication_artifact_id not in texts:
                             continue
                         discovery_publications[relation.publication_id] = (
                             DiscoveryPublicationEvidence(
@@ -985,8 +1102,7 @@ class ProductionWorkflowOrchestrator:
                 ),
             )
         return tuple(
-            literals[key]
-            for key in sorted(literals, key=lambda item: (item[0].value, item[1]))
+            literals[key] for key in sorted(literals, key=lambda item: (item[0].value, item[1]))
         )
 
     @staticmethod
