@@ -60,13 +60,6 @@ class EditorialUpdateDecisionAction(StrEnum):
     RESTORE = "restore"
 
 
-class EditorialImpactLevel(StrEnum):
-    """Impact level of new contributions on an existing artifact."""
-    NO_CHANGE = "no_change"
-    NEW_EVIDENCE = "new_evidence"
-    MATERIAL_UPDATE = "material_update"
-
-
 @dataclass(frozen=True, slots=True)
 class CandidateReference:
     batch_id: UUID

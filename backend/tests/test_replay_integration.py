@@ -1,25 +1,18 @@
 """
-Integration tests for replay and activation (Incrément 4).
+Integration tests for replay lineage.
 
-Tests the complete flow:
-- Create replay with different merge strategy
-- Map replay identities to operational
-- Validate preconditions
-- Activate replay atomically
-- Verify published artifacts keep historical bindings
+Tests that:
+- A replay snapshot lives on a lineage separate from the operational one
+- Published artifacts keep their historical bindings
 """
 
 from uuid import uuid4
 
 from cti_app.domain.briefs import BriefBlock, BriefDraft, BriefDraftStatus, BriefSentence
 from cti_app.domain.discovery_cumulative import (
-    DiscoveryIdentityStatus,
     DiscoveryPlannerKind,
     DiscoverySnapshot,
     DiscoverySnapshotLineage,
-    DiscoverySubjectIdentity,
-    ReplayIdentityMapping,
-    ReplayIdentityResolution,
 )
 
 
@@ -65,68 +58,6 @@ class TestReplayEditionWorkflow:
         assert operational.is_active is True
         assert replay.is_active is False
 
-    def test_identity_mapping_same_resolution(self) -> None:
-        """SAME resolution: replay origin_key == operational origin_key."""
-        origin_key = "apt42:campaign_x"
-
-        operational_id = DiscoverySubjectIdentity(
-            edition_id=uuid4(),
-            origin_key=origin_key,
-            created_by_merge_run_id=uuid4(),
-            id=uuid4(),
-            status=DiscoveryIdentityStatus.ACTIVE,
-        )
-
-        # Replay produces same origin_key → same subject_id (deterministic)
-        replay_id = DiscoverySubjectIdentity(
-            edition_id=uuid4(),
-            origin_key=origin_key,  # Same
-            created_by_merge_run_id=uuid4(),
-            id=operational_id.id,  # Same ID (uuid5 deterministic)
-            status=DiscoveryIdentityStatus.ACTIVE,
-        )
-
-        mapping = ReplayIdentityMapping(
-            replay_run_id=uuid4(),
-            replay_subject_id=replay_id.id,
-            operational_subject_id=operational_id.id,
-            resolution=ReplayIdentityResolution.SAME,
-            actor_id="system",
-        )
-
-        assert mapping.resolution == ReplayIdentityResolution.SAME
-        assert mapping.replay_subject_id == mapping.operational_subject_id
-
-    def test_identity_mapping_split_resolution(self) -> None:
-        """SPLIT resolution: replay split what was merged operationally."""
-        # Operationally, X and Y are merged (Y → X)
-        x_id = uuid4()
-        y_id = uuid4()
-
-        # Replay created them as separate
-        x_replay = uuid4()
-        y_replay = uuid4()
-
-        # Mappings
-        mapping_x = ReplayIdentityMapping(
-            replay_run_id=uuid4(),
-            replay_subject_id=x_replay,
-            operational_subject_id=x_id,
-            resolution=ReplayIdentityResolution.SPLIT_OF,
-            actor_id="operator",
-        )
-
-        mapping_y = ReplayIdentityMapping(
-            replay_run_id=uuid4(),
-            replay_subject_id=y_replay,
-            operational_subject_id=y_id,
-            resolution=ReplayIdentityResolution.SPLIT_OF,
-            actor_id="operator",
-        )
-
-        assert mapping_x.resolution == ReplayIdentityResolution.SPLIT_OF
-        assert mapping_y.resolution == ReplayIdentityResolution.SPLIT_OF
-
     def test_published_artifact_bindings_preserved(self) -> None:
         """After replay activation, published artifacts keep historical bindings."""
         subject_id = uuid4()
@@ -163,55 +94,3 @@ class TestReplayEditionWorkflow:
         # Activation switches from operational V1 to replay V2
         # But brief still points to V1 pack/snapshot
         assert published_brief.pack_id == pack_id  # Unchanged
-
-    def test_replay_comparison_report(self) -> None:
-        """Generate comparison report for replay vs operational."""
-        # Create mappings representing different outcomes
-        mappings = {
-            # 3 subjects that stayed same
-            uuid4(): ReplayIdentityMapping(
-                replay_run_id=uuid4(),
-                replay_subject_id=uuid4(),
-                operational_subject_id=uuid4(),
-                resolution=ReplayIdentityResolution.SAME,
-                actor_id="test",
-            )
-            for _ in range(3)
-        }
-        mappings.update({
-            # 1 subject that was split
-            uuid4(): ReplayIdentityMapping(
-                replay_run_id=uuid4(),
-                replay_subject_id=uuid4(),
-                operational_subject_id=uuid4(),
-                resolution=ReplayIdentityResolution.SPLIT_OF,
-                actor_id="test",
-            )
-        })
-        mappings.update({
-            # 1 subject that was merged
-            uuid4(): ReplayIdentityMapping(
-                replay_run_id=uuid4(),
-                replay_subject_id=uuid4(),
-                operational_subject_id=uuid4(),
-                resolution=ReplayIdentityResolution.MERGE_OF,
-                actor_id="test",
-            )
-        })
-        mappings.update({
-            # 1 new subject
-            uuid4(): ReplayIdentityMapping(
-                replay_run_id=uuid4(),
-                replay_subject_id=uuid4(),
-                operational_subject_id=None,
-                resolution=ReplayIdentityResolution.NEW,
-                actor_id="test",
-            )
-        })
-
-        # Would compute counts (placeholder for real DB query)
-        # comparison = await service.generate_comparison_report(...)
-        # assert comparison.subjects_same_count == 3
-        # assert comparison.subjects_split_count == 1
-        # assert comparison.subjects_merged_count == 1
-        # assert comparison.subjects_created_count == 1

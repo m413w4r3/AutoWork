@@ -23,21 +23,6 @@ class EvidencePackScope(StrEnum):
     DELTA = "delta"
 
 
-class AmendmentKind(StrEnum):
-    """Type of amendment to published content."""
-    UPDATE = "update"
-    CORRECTION = "correction"
-    CLARIFICATION = "clarification"
-
-
-class AmendmentStatus(StrEnum):
-    """Lifecycle status of an amendment."""
-    DRAFT = "draft"
-    CHANGES_REQUESTED = "changes_requested"
-    APPROVED = "approved"
-    PUBLISHED = "published"
-
-
 @dataclass(frozen=True, slots=True)
 class BriefEvidencePack:
     subject_id: UUID
@@ -136,36 +121,6 @@ class BriefDraft:
             raise ValueError("A brief must contain one to three paragraphs")
         if not re.fullmatch(r"[0-9a-f]{64}", self.pack_hash):
             raise ValueError("Draft evidence pack hash must be a lowercase SHA-256")
-
-
-@dataclass(frozen=True, slots=True)
-class BriefAmendment:
-    """Amendment to a published brief: update, correction, or clarification (Incrément 3)."""
-    subject_id: UUID
-    edition_id: UUID
-    parent_artifact_id: UUID  # The artifact being amended (can be another amendment)
-    root_artifact_id: UUID  # The original artifact in the chain
-    trigger_snapshot_id: UUID  # Snapshot that triggered the amendment
-    kind: AmendmentKind
-    status: AmendmentStatus
-    evidence_pack_id: UUID  # Pack DELTA with only new contributions
-    contribution_ids: tuple[UUID, ...]  # Contributions addressed by this amendment
-    draft_id: UUID | None = None
-    revision_reason: str | None = None  # For redactional revisions
-    published_at: datetime | None = None
-    id: UUID = field(default_factory=uuid4)
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-
-    def __post_init__(self) -> None:
-        if self.parent_artifact_id == self.root_artifact_id:
-            # This is the first amendment to the original
-            pass
-        if self.status == AmendmentStatus.PUBLISHED and self.published_at is None:
-            raise ValueError("A published amendment must have a published_at timestamp")
-        if self.kind == AmendmentKind.CORRECTION and not self.revision_reason:
-            raise ValueError("A correction amendment must have a revision reason")
-        if not self.contribution_ids:
-            raise ValueError("An amendment must address at least one contribution")
 
 
 def canonical_json(value: object) -> bytes:
