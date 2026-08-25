@@ -24,6 +24,7 @@ from cti_app.application.source_evidence_processing import SourceEvidenceProcess
 from cti_app.application.subject_production import EditionProductionService
 from cti_app.domain.production import (
     ProductionProfile,
+    SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
 )
@@ -55,6 +56,22 @@ def stage_job_kind(stage: SubjectProductionStage) -> str:
     return f"production.subject.{stage.value}"
 
 
+# SYNTHESIS and its downstream ASSEMBLY are the only stages a retry can
+# re-enter on an existing run (Q1/Q2 stay put): their idempotency key must
+# carry the run's synthesis_generation, or a synthesis retry's ASSEMBLY job
+# collides with the previous generation's already-terminal one.
+_GENERATION_SCOPED_STAGES = {SubjectProductionStage.SYNTHESIS, SubjectProductionStage.ASSEMBLY}
+
+
+def production_stage_idempotency_key(
+    run: SubjectProductionRun, stage: SubjectProductionStage
+) -> str:
+    key = f"production-{stage.value}-{run.id}"
+    if stage in _GENERATION_SCOPED_STAGES:
+        key = f"{key}-generation-{run.synthesis_generation}"
+    return key
+
+
 class ProductionStageChain:
     """Submits the job for the next stage of a run.
 
@@ -77,22 +94,22 @@ class ProductionStageChain:
     async def submit(
         self,
         *,
-        run_id: UUID,
-        subject_id: UUID,
+        run: SubjectProductionRun,
         stage: SubjectProductionStage,
         correlation_id: str,
         actor_id: str = "system",
     ) -> UUID | None:
-        """Idempotency key is derived from run+stage: a retried/duplicated handler
-        never enqueues the same stage, or re-sends the same prompt, twice."""
+        """Idempotency key is derived from run+stage (+ synthesis_generation for
+        SYNTHESIS/ASSEMBLY): a retried/duplicated handler never enqueues the
+        same stage, or re-sends the same prompt, twice."""
         if self._jobs is None or self._dispatcher is None:
             return None
-        parameters = ProductionStageParameters(run_id=run_id, expected_stage=stage.value)
+        parameters = ProductionStageParameters(run_id=run.id, expected_stage=stage.value)
         job = await self._jobs.submit(
             kind=stage_job_kind(stage),
             aggregate_type="subject",
-            aggregate_id=subject_id,
-            idempotency_key=f"production-{stage.value}-{run_id}",
+            aggregate_id=run.subject_id,
+            idempotency_key=production_stage_idempotency_key(run, stage),
             correlation_id=correlation_id,
             input_parameters=parameters.model_dump(mode="json"),
             max_attempts=3,
@@ -135,8 +152,7 @@ def register_production_jobs(
         if started is None:
             return
         await stage_chain.submit(
-            run_id=started.id,
-            subject_id=started.subject_id,
+            run=started,
             stage=SubjectProductionStage.SOURCES,
             correlation_id=correlation_id,
         )
@@ -245,11 +261,9 @@ def register_production_jobs(
             await uow.subject_production_runs.save(advancing)
             await uow.commit()
             next_stage = advancing.current_stage
-            subject_id = advancing.subject_id
 
         job_id = await stage_chain.submit(
-            run_id=parameters.run_id,
-            subject_id=subject_id,
+            run=advancing,
             stage=next_stage,
             correlation_id=correlation_id,
         )
@@ -274,6 +288,7 @@ __all__ = [
     "ProductionProfile",
     "ProductionStageChain",
     "ProductionStageParameters",
+    "production_stage_idempotency_key",
     "register_production_jobs",
     "stage_job_kind",
 ]

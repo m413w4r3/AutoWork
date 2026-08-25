@@ -33,6 +33,7 @@ class SubjectProductionRunRow(Base):
         UniqueConstraint("subject_id", "run_number", name="uq_subject_run_number"),
         CheckConstraint("version >= 1", name="ck_run_version"),
         CheckConstraint("run_number >= 1", name="ck_run_number"),
+        CheckConstraint("synthesis_generation >= 1", name="ck_run_synthesis_generation"),
         CheckConstraint(f"status IN ({PRODUCTION_STATUS_VALUES_SQL})", name="ck_run_status"),
         CheckConstraint(f"current_stage IN ({PRODUCTION_STAGE_VALUES_SQL})", name="ck_run_stage"),
         CheckConstraint(f"profile IN ({PRODUCTION_PROFILE_VALUES_SQL})", name="ck_run_profile"),
@@ -57,6 +58,7 @@ class SubjectProductionRunRow(Base):
         Uuid(as_uuid=True), ForeignKey("model_conversations.id", ondelete="SET NULL")
     )
     run_number: Mapped[int] = mapped_column(nullable=False)
+    synthesis_generation: Mapped[int] = mapped_column(nullable=False, server_default="1")
     research_date: Mapped[date | None] = mapped_column(Date)
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(String(500))

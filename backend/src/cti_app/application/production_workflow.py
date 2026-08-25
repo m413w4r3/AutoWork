@@ -1194,6 +1194,7 @@ class ProductionWorkflowOrchestrator:
                     "web_policy_version": "q4-web-non-authoritative-v1",
                     "model_routing_policy": "openai-drafting-v1",
                     "stage": "synthesis",
+                    "synthesis_generation": run.synthesis_generation,
                 }
             )
             existing = await uow.production_artifacts.get_current(run.id, "synthesis")
@@ -1235,6 +1236,9 @@ class ProductionWorkflowOrchestrator:
                     parse=lambda text: validate_synthesis(text, report, extraction_payload),
                     external_llm_allowed=synthesis_policy_allows,
                     web_search=True,
+                    # A synthesis retry bumps this: it must never replay the
+                    # previous, already-SUCCEEDED Q4 turn.
+                    request_identity=f"generation-{run.synthesis_generation}",
                 )
                 if parsed is None:
                     return {
@@ -1347,94 +1351,6 @@ class ProductionWorkflowOrchestrator:
                     "run_status": SubjectProductionStatus.NEEDS_REVIEW.value,
                     "qa": qa_result,
                 }
-
-    async def retry_references(self, run_id: UUID) -> dict[str, Any]:
-        """Archives the old conversation, opens a new one, resets the run to SOURCES."""
-        if not self._model_service:
-            return {
-                "action": "retry_references",
-                "status": "error",
-                "error": "ModelConversationService not configured",
-            }
-
-        async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get_for_update(run_id)
-            if not run:
-                return {
-                    "action": "retry_references",
-                    "status": "error",
-                    "error": f"Run {run_id} not found",
-                }
-
-            subject_title, _ = await self._subject_context(uow, run.subject_id)
-
-            # Archive the old conversation; a failure here must not block the retry.
-            if run.references_conversation_id:
-                try:
-                    await self._model_service.archive(
-                        run.references_conversation_id, context_subject_id=run.subject_id
-                    )
-                except Exception:
-                    pass
-
-            conversation = await self._open_conversation(
-                run, subject_title, ConversationPurpose.SUBJECT_RESEARCH
-            )
-            run.references_conversation_id = conversation.id
-
-            run.current_stage = SubjectProductionStage.SOURCES
-            run.status = SubjectProductionStatus.QUEUED
-
-            await uow.production_artifacts.mark_downstream_stale(
-                run_id, SubjectProductionStage.REFERENCES
-            )
-
-            await uow.subject_production_runs.save(run)
-            await uow.commit()
-
-        return {
-            "action": "retry_references",
-            "status": "success",
-            "new_conversation_id": str(conversation.id),
-        }
-
-    async def retry_synthesis(self, run_id: UUID) -> dict[str, Any]:
-        """Keeps the same conversation and references/extraction artifacts."""
-        async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get_for_update(run_id)
-            if not run:
-                return {
-                    "action": "retry_synthesis",
-                    "status": "error",
-                    "error": f"Run {run_id} not found",
-                }
-
-            if run.status not in {
-                SubjectProductionStatus.READY,
-                SubjectProductionStatus.NEEDS_REVIEW,
-            }:
-                return {
-                    "action": "retry_synthesis",
-                    "status": "error",
-                    "error": f"Run is in {run.status.value} state, cannot retry",
-                }
-
-            run.current_stage = SubjectProductionStage.SYNTHESIS
-            run.status = SubjectProductionStatus.RUNNING
-
-            await uow.production_artifacts.mark_downstream_stale(
-                run_id, SubjectProductionStage.SYNTHESIS
-            )
-
-            await uow.subject_production_runs.save(run)
-            await uow.commit()
-
-        return {
-            "action": "retry_synthesis",
-            "status": "success",
-            "stage": "synthesis",
-        }
-
 
 def _q2_chunk_source_context(chunk: Any) -> str:
     """Archived source context deliberately safe for the stateless Q2 prompt."""

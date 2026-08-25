@@ -28,7 +28,10 @@ from cti_app.application.production_parsers import (
     parse_reference_report,
     reference_report_from_json,
 )
-from cti_app.application.production_prompts import REFERENCES_PROMPT_VERSION
+from cti_app.application.production_prompts import (
+    REFERENCES_PROMPT_VERSION,
+    SYNTHESIS_PROMPT_VERSION,
+)
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.source_evidence_processing import (
     ReferencedEvidenceLink,
@@ -759,6 +762,77 @@ async def test_synthesis_has_its_own_drafting_scope_and_local_repair() -> None:
     assert q4_repair["conversation_id"] == uow.run.synthesis_conversation_id
     assert q4_repair["mode"] is ConversationMode.CONTINUE
     assert q4_repair["web_search"] is False
+
+
+async def test_synthesis_retry_produces_a_fresh_turn_not_a_replay() -> None:
+    """A synthesis retry must never reuse the previous SUCCEEDED Q4 turn."""
+    first_synthesis = "Premiere synthese de la campagne [S1]."
+    second_synthesis = "Deuxieme synthese apres retry [S1]."
+    orchestrator, uow, conversations = _build(
+        [PERFECT_Q1, PERFECT_Q2, PERFECT_Q2, first_synthesis, second_synthesis]
+    )
+
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+    await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.REFERENCES)
+    uow.run.current_stage = SubjectProductionStage.EXTRACTION
+    await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.EXTRACTION)
+    uow.run.current_stage = SubjectProductionStage.SYNTHESIS
+    first_result = await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.SYNTHESIS)
+    assert first_result["status"] == "success", first_result
+
+    first_artifact = next(
+        a for a in uow.production_artifacts.items if a.stage is ProductionArtifactStage.SYNTHESIS
+    )
+
+    # Mirrors SubjectProductionService.retry_synthesis: READY -> RUNNING,
+    # back on SYNTHESIS, with a bumped generation.
+    uow.run.mark_ready()
+    uow.run.retry_synthesis()
+
+    second_result = await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.SYNTHESIS)
+    assert second_result["status"] == "success", second_result
+
+    synthesis_artifacts = [
+        a for a in uow.production_artifacts.items if a.stage is ProductionArtifactStage.SYNTHESIS
+    ]
+    assert len(synthesis_artifacts) == 2
+    second_artifact = synthesis_artifacts[-1]
+    assert second_artifact.id != first_artifact.id
+    assert second_artifact.version == first_artifact.version + 1
+
+    # Q4 (not the format-repair) turns used two distinct idempotency keys —
+    # never a replay of the previous SUCCEEDED generation's turn.
+    synthesis_keys = [
+        key
+        for _, _, key, _ in conversations.calls
+        if key.startswith("synthesis-") and "repair" not in key
+    ]
+    assert synthesis_keys == [
+        f"synthesis-{uow.run.id}-v{SYNTHESIS_PROMPT_VERSION}-generation-1",
+        f"synthesis-{uow.run.id}-v{SYNTHESIS_PROMPT_VERSION}-generation-2",
+    ]
+    assert len(set(synthesis_keys)) == 2
+
+    # Q1/Q2 were not replayed: still a single research conversation, a
+    # single extraction conversation-turn (Q2 uses structured calls, not
+    # add_turn), and a single references/extraction artifact each.
+    assert len(conversations.created) == 2
+    assert (
+        sum(
+            1
+            for a in uow.production_artifacts.items
+            if a.stage is ProductionArtifactStage.REFERENCES
+        )
+        == 1
+    )
+    assert (
+        sum(
+            1
+            for a in uow.production_artifacts.items
+            if a.stage is ProductionArtifactStage.EXTRACTION
+        )
+        == 1
+    )
 
 
 async def test_three_q2_chunks_with_one_loss_produce_no_canonical_extraction(

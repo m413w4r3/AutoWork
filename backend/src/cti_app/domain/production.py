@@ -54,6 +54,10 @@ class SubjectProductionRun:
     references_conversation_id: UUID | None = None
     synthesis_conversation_id: UUID | None = None
     run_number: int = 1
+    # Bumped on every synthesis retry: gives Q4 a fresh, deterministic
+    # idempotency identity so a retry can never replay the previous
+    # SUCCEEDED turn instead of drafting again.
+    synthesis_generation: int = 1
     # Frozen when the run starts: a retry after midnight must not shift the
     # boundary used to reject impossible publication dates.
     research_date: date | None = None
@@ -70,6 +74,8 @@ class SubjectProductionRun:
     def __post_init__(self) -> None:
         if self.run_number < 1 or self.version < 1:
             raise ValueError("run_number and version must be >= 1")
+        if self.synthesis_generation < 1:
+            raise ValueError("synthesis_generation must be >= 1")
 
     def start_running(self, *, now: datetime | None = None) -> None:
         if self.status is not SubjectProductionStatus.QUEUED:
@@ -134,6 +140,26 @@ class SubjectProductionRun:
         self.status = SubjectProductionStatus.CANCELLED
         self.finished_at = now or datetime.now(UTC)
         self.updated_at = self.finished_at
+        self.version += 1
+
+    def retry_synthesis(self, *, now: datetime | None = None) -> None:
+        """Re-runs Q4 in place: Q1/Q2 stay valid, only synthesis+brief redo.
+
+        Bumps `synthesis_generation` so the retried Q4 turn — and the
+        downstream SYNTHESIS/ASSEMBLY jobs — get a fresh idempotency
+        identity instead of colliding with the previous, already-SUCCEEDED
+        attempt.
+        """
+        if self.status is not SubjectProductionStatus.READY:
+            raise ValueError("Can only retry synthesis from READY status")
+        self.status = SubjectProductionStatus.RUNNING
+        self.current_stage = SubjectProductionStage.SYNTHESIS
+        self.synthesis_generation += 1
+        self.error_code = None
+        self.error_message = None
+        self.error_details = None
+        self.finished_at = None
+        self.updated_at = now or datetime.now(UTC)
         self.version += 1
 
 

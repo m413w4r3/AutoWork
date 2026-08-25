@@ -30,6 +30,8 @@ from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
     ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStatus,
@@ -93,7 +95,10 @@ class _Runs:
         self.items[run.id] = run
 
     async def get_current_for_subject(self, subject_id: UUID) -> SubjectProductionRun | None:
-        return next((r for r in self.items.values() if r.subject_id == subject_id), None)
+        # Mirrors the real repository: most recently created run wins, not
+        # insertion order — a retry's new run must shadow the old one.
+        matches = [r for r in self.items.values() if r.subject_id == subject_id]
+        return max(matches, key=lambda r: r.created_at) if matches else None
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectProductionRun]:
         return [r for r in self.items.values() if r.edition_id == edition_id]
@@ -155,9 +160,20 @@ class _Artifacts:
         matches = [
             artifact
             for artifact in self.items
-            if artifact.production_run_id == run_id and artifact.stage.value == stage
+            if artifact.production_run_id == run_id
+            and artifact.stage.value == stage
+            and artifact.status is not ProductionArtifactStatus.STALE
         ]
         return max(matches, key=lambda artifact: artifact.version) if matches else None
+
+    async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
+        stages = ["references", "extraction", "synthesis", "brief"]
+        if stage not in stages:
+            return
+        downstream = set(stages[stages.index(stage) + 1 :])
+        for artifact in self.items:
+            if artifact.production_run_id == run_id and artifact.stage.value in downstream:
+                artifact.status = ProductionArtifactStatus.STALE
 
 
 class _Uow:
@@ -386,3 +402,180 @@ async def test_save_brief_draft_appends_artifact_versions(
     assert second.status_code == 200, second.text
     assert [artifact.version for artifact in uow.production_artifacts.items] == [1, 2]
     assert second.json()["draft_version"] == 2
+
+
+def _ready_run(edition_id: UUID, subject_id: UUID, *, run_number: int = 1) -> SubjectProductionRun:
+    run = SubjectProductionRun(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        profile=ProductionProfile.BRIEF_AUTO,
+        run_number=run_number,
+    )
+    run.start_running()
+    run.mark_ready()
+    return run
+
+
+async def test_retry_references_from_ready_creates_a_new_run(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    previous = _ready_run(edition_id, subject_id)
+    await uow.subject_production_runs.add(previous)
+
+    response = await api.post(f"/api/subjects/{subject_id}/production/references/retry")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["action"] == "retry_references"
+    assert body["previous_run_id"] == str(previous.id)
+    assert body["run_id"] != str(previous.id)
+    assert body["job_id"] is not None
+
+    # The old run is untouched, immutable history.
+    assert uow.subject_production_runs.items[previous.id].status is SubjectProductionStatus.READY
+
+    new_run = uow.subject_production_runs.items[UUID(body["run_id"])]
+    assert new_run.run_number == previous.run_number + 1
+    assert new_run.status is SubjectProductionStatus.RUNNING
+    assert new_run.references_conversation_id is None
+
+    jobs = production_app.state.job_service
+    sources_jobs = [job for job in jobs.submitted if job["kind"] == "production.subject.sources"]
+    assert len(sources_jobs) == 1
+    assert sources_jobs[0]["idempotency_key"] == f"production-sources-{new_run.id}"
+
+
+async def test_retry_references_rejects_non_ready_status(api: AsyncClient, uow: _Uow) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    run = SubjectProductionRun(
+        subject_id=subject_id, edition_id=edition_id, profile=ProductionProfile.BRIEF_AUTO
+    )
+    run.start_running()
+    await uow.subject_production_runs.add(run)
+
+    response = await api.post(f"/api/subjects/{subject_id}/production/references/retry")
+
+    assert response.status_code == 400
+    assert len(uow.subject_production_runs.items) == 1
+
+
+async def test_retry_references_second_click_does_not_create_a_second_run(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    """A duplicate retry POST must not spawn multiple new runs."""
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    previous = _ready_run(edition_id, subject_id)
+    await uow.subject_production_runs.add(previous)
+
+    first = await api.post(f"/api/subjects/{subject_id}/production/references/retry")
+    assert first.status_code == 200, first.text
+
+    jobs = production_app.state.job_service
+    submitted_after_first = len(jobs.submitted)
+    runs_after_first = len(uow.subject_production_runs.items)
+
+    # The current run is now RUNNING, not READY: a second click is rejected
+    # rather than starting a second competing run.
+    second = await api.post(f"/api/subjects/{subject_id}/production/references/retry")
+
+    assert second.status_code == 400
+    assert len(jobs.submitted) == submitted_after_first
+    assert len(uow.subject_production_runs.items) == runs_after_first
+
+
+async def test_retry_synthesis_from_ready_dispatches_job_and_bumps_generation(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    run = _ready_run(edition_id, subject_id)
+    await uow.subject_production_runs.add(run)
+    for stage in (
+        ProductionArtifactStage.REFERENCES,
+        ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.SYNTHESIS,
+        ProductionArtifactStage.BRIEF,
+    ):
+        await uow.production_artifacts.append(
+            ProductionArtifact(
+                production_run_id=run.id,
+                subject_id=subject_id,
+                stage=stage,
+                version=1,
+                input_hash="a" * 64,
+            )
+        )
+
+    response = await api.post(f"/api/subjects/{subject_id}/production/synthesis/retry")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["action"] == "retry_synthesis"
+    assert body["run_id"] == str(run.id)
+    assert body["synthesis_generation"] == 2
+
+    updated = uow.subject_production_runs.items[run.id]
+    assert updated.status is SubjectProductionStatus.RUNNING
+    assert updated.current_stage.value == "synthesis"
+    assert updated.synthesis_generation == 2
+
+    # Q1/Q2 artifacts are untouched; synthesis + brief are stale.
+    statuses = {a.stage.value: a.status for a in uow.production_artifacts.items}
+    assert statuses["references"] is ProductionArtifactStatus.VERIFIED
+    assert statuses["extraction"] is ProductionArtifactStatus.VERIFIED
+    assert statuses["synthesis"] is ProductionArtifactStatus.STALE
+    assert statuses["brief"] is ProductionArtifactStatus.STALE
+
+    jobs = production_app.state.job_service
+    assert [job["kind"] for job in jobs.submitted] == ["production.subject.synthesis"]
+    assert jobs.submitted[0]["idempotency_key"] == f"production-synthesis-{run.id}-generation-2"
+
+
+async def test_retry_synthesis_rejects_non_ready_status(api: AsyncClient, uow: _Uow) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    run = SubjectProductionRun(
+        subject_id=subject_id, edition_id=edition_id, profile=ProductionProfile.BRIEF_AUTO
+    )
+    run.start_running()
+    await uow.subject_production_runs.add(run)
+
+    response = await api.post(f"/api/subjects/{subject_id}/production/synthesis/retry")
+
+    assert response.status_code == 400
+    assert uow.subject_production_runs.items[run.id].synthesis_generation == 1
+
+
+async def test_two_successive_synthesis_retries_have_distinct_identities(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    run = _ready_run(edition_id, subject_id)
+    await uow.subject_production_runs.add(run)
+
+    first = await api.post(f"/api/subjects/{subject_id}/production/synthesis/retry")
+    assert first.status_code == 200, first.text
+    assert first.json()["synthesis_generation"] == 2
+
+    # A second retry only makes sense once the run is READY again.
+    uow.subject_production_runs.items[run.id].mark_ready()
+
+    second = await api.post(f"/api/subjects/{subject_id}/production/synthesis/retry")
+    assert second.status_code == 200, second.text
+    assert second.json()["synthesis_generation"] == 3
+
+    jobs = production_app.state.job_service
+    keys = [job["idempotency_key"] for job in jobs.submitted]
+    assert keys == [
+        f"production-synthesis-{run.id}-generation-2",
+        f"production-synthesis-{run.id}-generation-3",
+    ]
+    assert len(set(keys)) == 2

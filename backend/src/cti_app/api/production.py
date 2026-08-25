@@ -11,7 +11,10 @@ from pydantic import BaseModel
 
 from cti_app.application.jobs import JobDispatcher, JobService
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.application.production_jobs import ProductionStageParameters
+from cti_app.application.production_jobs import (
+    ProductionStageParameters,
+    production_stage_idempotency_key,
+)
 from cti_app.application.production_stage_status import (
     build_stage_statuses,
     completed_stage_count,
@@ -144,6 +147,55 @@ def _run_view(
     }
 
 
+async def _create_and_start_run(
+    uow_factory: UnitOfWorkFactory,
+    jobs: JobService,
+    dispatcher: JobDispatcher,
+    *,
+    subject_id: UUID,
+    edition_id: UUID,
+    profile: ProductionProfile,
+    user: str,
+) -> tuple[SubjectProductionRun, UUID | None]:
+    """Creates (or reuses an in-flight) run and submits its SOURCES job.
+
+    Shared by "start production" and "retry references": both must go through
+    `SubjectProductionService.create_run`'s idempotency so a duplicate POST
+    never creates a second run nor submits a second job.
+    """
+    service = SubjectProductionService(uow_factory)
+    run, created = await service.create_run(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        profile=profile,
+    )
+
+    if run.status is SubjectProductionStatus.RUNNING and not created:
+        # Already in flight: never start it again, never re-prompt.
+        return run, None
+
+    if created or run.status is SubjectProductionStatus.QUEUED:
+        await service.start_run(run.id)
+
+    # The idempotency key makes a concurrent duplicate POST reuse this job.
+    parameters = ProductionStageParameters(
+        run_id=run.id,
+        expected_stage=SubjectProductionStage.SOURCES.value,
+    )
+    job = await jobs.submit(
+        kind="production.subject.sources",
+        aggregate_type="subject",
+        aggregate_id=run.subject_id,
+        idempotency_key=production_stage_idempotency_key(run, SubjectProductionStage.SOURCES),
+        correlation_id=get_correlation_id(),
+        input_parameters=parameters.model_dump(mode="json"),
+        max_attempts=1,
+        actor_id=user,
+    )
+    await dispatcher.dispatch(job.id)
+    return run, job.id
+
+
 # Subject Production Endpoints
 
 
@@ -186,46 +238,23 @@ async def start_subject_production(
             )
         edition_id = group.edition_id
 
-    service = SubjectProductionService(uow_factory)
-
     try:
-        run, created = await service.create_run(
+        run, job_id = await _create_and_start_run(
+            uow_factory,
+            jobs,
+            dispatcher,
             subject_id=subject_id,
             edition_id=edition_id,
             profile=profile,
+            user=user,
         )
-
-        if run.status is SubjectProductionStatus.RUNNING and not created:
-            # Already in flight: never start it again, never re-prompt.
-            return _run_view(run, edition_id, job_id=None)
-
-        if created or run.status is SubjectProductionStatus.QUEUED:
-            await service.start_run(run.id)
-
-        # The idempotency key makes a concurrent duplicate POST reuse this job.
-        parameters = ProductionStageParameters(
-            run_id=run.id,
-            expected_stage=SubjectProductionStage.SOURCES.value,
-        )
-
-        job = await jobs.submit(
-            kind="production.subject.sources",
-            aggregate_type="subject",
-            aggregate_id=run.subject_id,
-            idempotency_key=f"production-sources-{run.id}",
-            correlation_id=get_correlation_id(),
-            input_parameters=parameters.model_dump(mode="json"),
-            max_attempts=1,
-            actor_id=user,
-        )
-        await dispatcher.dispatch(job.id)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         ) from e
 
-    return _run_view(run, edition_id, job_id=job.id)
+    return _run_view(run, edition_id, job_id=job_id)
 
 
 @router.get("/subjects/{subject_id}/production")
@@ -290,72 +319,103 @@ async def get_subject_production(
 async def retry_references(
     subject_id: UUID,
     request: Request,
+    user: str = "system",
 ) -> dict[str, Any]:
-    uow_factory, _, _ = _runtime(request)
+    """Q1 can change every downstream fact, so a retry never reanimates the
+    old run: it creates a brand new one and restarts the pipeline from
+    SOURCES. The old run stays untouched, immutable history."""
+    uow_factory, jobs, dispatcher = _runtime(request)
 
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
-        if not run:
+        previous = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if not previous:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No production run found for subject {subject_id}",
             )
 
-        if run.status != SubjectProductionStatus.READY:
+        if previous.status != SubjectProductionStatus.READY:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Can only retry from READY status, current is {run.status.value}",
+                detail=f"Can only retry from READY status, current is {previous.status.value}",
             )
+        edition_id = previous.edition_id
+        profile = previous.profile
 
-        # The workflow archives and replaces the Q1 research conversation.
-        run.current_stage = SubjectProductionStage.SOURCES
-        run.references_conversation_id = None
-        await uow.subject_production_runs.save(run)
-        await uow.commit()
+    try:
+        run, job_id = await _create_and_start_run(
+            uow_factory,
+            jobs,
+            dispatcher,
+            subject_id=subject_id,
+            edition_id=edition_id,
+            profile=profile,
+            user=user,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
 
-        return {
-            "action": "retry_references",
-            "run_id": str(run.id),
-            "status": "initiated",
-        }
+    view = _run_view(run, edition_id, job_id=job_id)
+    view["action"] = "retry_references"
+    view["previous_run_id"] = str(previous.id)
+    return view
 
 
 @router.post("/subjects/{subject_id}/production/synthesis/retry")
 async def retry_synthesis(
     subject_id: UUID,
     request: Request,
+    user: str = "system",
 ) -> dict[str, Any]:
-    # Reuses the existing conversation and references/extraction; regenerates only synthesis+brief.
-    uow_factory, _, _ = _runtime(request)
+    """Q1/Q2 stay valid: the retry stays on the same run and only redoes Q4.
+
+    A fresh synthesis_generation gives the retried Q4 turn — and its
+    SYNTHESIS/ASSEMBLY jobs — an idempotency identity distinct from the
+    previous, already-SUCCEEDED attempt.
+    """
+    uow_factory, jobs, dispatcher = _runtime(request)
 
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
-        if not run:
+        current = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if not current:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No production run found for subject {subject_id}",
             )
+        edition_id = current.edition_id
 
-        if run.status != SubjectProductionStatus.READY:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Can only retry from READY status, current is {run.status.value}",
-            )
+    service = SubjectProductionService(uow_factory)
+    try:
+        run = await service.retry_synthesis(current.id)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
 
-        run.current_stage = SubjectProductionStage.SYNTHESIS
-        await uow.subject_production_runs.save(run)
+    parameters = ProductionStageParameters(
+        run_id=run.id,
+        expected_stage=SubjectProductionStage.SYNTHESIS.value,
+    )
+    job = await jobs.submit(
+        kind="production.subject.synthesis",
+        aggregate_type="subject",
+        aggregate_id=run.subject_id,
+        idempotency_key=production_stage_idempotency_key(run, SubjectProductionStage.SYNTHESIS),
+        correlation_id=get_correlation_id(),
+        input_parameters=parameters.model_dump(mode="json"),
+        max_attempts=3,
+        actor_id=user,
+    )
+    await dispatcher.dispatch(job.id)
 
-        await uow.production_artifacts.mark_downstream_stale(
-            run.id, SubjectProductionStage.SYNTHESIS.value
-        )
-
-        await uow.commit()
-
-        return {
-            "action": "retry_synthesis",
-            "run_id": str(run.id),
-            "status": "initiated",
-        }
+    view = _run_view(run, edition_id, job_id=job.id)
+    view["action"] = "retry_synthesis"
+    view["synthesis_generation"] = run.synthesis_generation
+    return view
 
 
 @router.post("/subjects/{subject_id}/production/cancel")
@@ -460,14 +520,24 @@ async def save_brief_draft(
             )
 
         # Artifacts are append-only: each saved draft creates a new version.
+        # Not get_current: a synthesis retry stales every prior brief
+        # artifact, and get_current excludes STALE rows — numbering off it
+        # would restart at 1 and collide with (production_run_id, stage,
+        # version) uniqueness against the original brief.
         current = await uow.production_artifacts.get_current(run.id, "brief")
+        all_briefs = [
+            artifact
+            for artifact in await uow.production_artifacts.list_for_run(run.id)
+            if artifact.stage is ProductionArtifactStage.BRIEF
+        ]
+        latest = max(all_briefs, key=lambda artifact: artifact.version, default=None)
         saved_at = datetime.now(UTC).isoformat()
         draft_version = int(current.metadata.get("draft_version", 0)) + 1 if current else 1
         artifact = ProductionArtifact(
             production_run_id=run.id,
             subject_id=subject_id,
             stage=ProductionArtifactStage.BRIEF,
-            version=current.version + 1 if current else 1,
+            version=latest.version + 1 if latest else 1,
             input_hash=sha256(body.content.encode("utf-8")).hexdigest(),
             status=ProductionArtifactStatus.NEEDS_REVIEW,
             metadata={

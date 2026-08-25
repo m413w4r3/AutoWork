@@ -309,6 +309,124 @@ describe("SubjectProduction", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("relance les références : POST réel, puis reprend le polling sur le nouveau run", async () => {
+    const readyStatus = runningStatus({
+      status: "ready",
+      current_stage: "assembly",
+      run_id: "r-1",
+      stages: Object.fromEntries(
+        Object.entries(runningStatus().stages).map(([stage, entry]) => [
+          stage,
+          { ...entry, status: "succeeded" },
+        ]),
+      ),
+    });
+    const newRunStatus = runningStatus({
+      status: "queued",
+      current_stage: "sources",
+      run_id: "r-2",
+    });
+    let getCount = 0;
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        // A real action started: a real job, not a synthetic "initiated".
+        return Promise.resolve(
+          Response.json({
+            action: "retry_references",
+            run_id: "r-2",
+            previous_run_id: "r-1",
+            status: "queued",
+            job_id: "job-sources-1",
+          }),
+        );
+      }
+      getCount += 1;
+      return Promise.resolve(
+        Response.json(getCount === 1 ? readyStatus : newRunStatus),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    const { container } = renderProduction();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Relancer les références" }),
+    );
+
+    // The panel must reflect the new run's real (polling) state, never a
+    // frozen "initiated" placeholder from the POST response.
+    await vi.waitFor(() => {
+      expect(container.querySelector(".badge.is-queued")).not.toBeNull();
+    });
+    expect(shouldPollProduction("queued")).toBe(true);
+
+    const post = fetchMock.mock.calls.find(
+      ([url]) => typeof url === "string" && url.includes("/references/retry"),
+    );
+    expect(post?.[0]).toBe(
+      `/api/subjects/${SUBJECT_ID}/production/references/retry`,
+    );
+  });
+
+  it("relance la synthèse : POST réel avec generation, run inchangé", async () => {
+    const readyStatus = runningStatus({
+      status: "ready",
+      current_stage: "assembly",
+      run_id: "r-1",
+      stages: Object.fromEntries(
+        Object.entries(runningStatus().stages).map(([stage, entry]) => [
+          stage,
+          { ...entry, status: "succeeded" },
+        ]),
+      ),
+    });
+    const retriedStatus = runningStatus({
+      status: "running",
+      current_stage: "synthesis",
+      run_id: "r-1",
+      stages: {
+        ...readyStatus.stages,
+        synthesis: { ...readyStatus.stages.synthesis, status: "running" },
+      },
+    });
+    let getCount = 0;
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return Promise.resolve(
+          Response.json({
+            action: "retry_synthesis",
+            run_id: "r-1",
+            status: "running",
+            job_id: "job-synthesis-1",
+            synthesis_generation: 2,
+          }),
+        );
+      }
+      getCount += 1;
+      return Promise.resolve(
+        Response.json(getCount === 1 ? readyStatus : retriedStatus),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    const { container } = renderProduction();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Relancer la synthèse" }),
+    );
+
+    await vi.waitFor(() => {
+      expect(container.querySelector(".badge.is-running")).not.toBeNull();
+    });
+
+    const post = fetchMock.mock.calls.find(
+      ([url]) => typeof url === "string" && url.includes("/synthesis/retry"),
+    );
+    expect(post?.[0]).toBe(
+      `/api/subjects/${SUBJECT_ID}/production/synthesis/retry`,
+    );
+  });
+
   it("arrête polling seulement quand run terminal", () => {
     expect(shouldPollProduction("queued")).toBe(true);
     expect(shouldPollProduction("running")).toBe(true);

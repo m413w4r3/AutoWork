@@ -292,10 +292,17 @@ class SynthesisService(_ArtifactPayloadMixin):
         conversation_turn_id: UUID | None = None,
     ) -> ProductionArtifact:
         async with self._uow_factory() as uow:
-            current = await uow.production_artifacts.get_current(
-                run_id, ProductionArtifactStage.SYNTHESIS.value
-            )
-            version = (current.version + 1) if current else 1
+            # Not get_current: a synthesis retry stales every prior synthesis
+            # artifact first, and get_current excludes STALE rows — using it
+            # here would restart numbering at 1 and collide with the
+            # (production_run_id, stage, version) uniqueness of the original.
+            existing = await uow.production_artifacts.list_for_run(run_id)
+            prior_versions = [
+                artifact.version
+                for artifact in existing
+                if artifact.stage is ProductionArtifactStage.SYNTHESIS
+            ]
+            version = max(prior_versions) + 1 if prior_versions else 1
 
             word_count = len(markdown_content.split())
             reference_count = markdown_content.count("[S")
@@ -373,10 +380,17 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
             }
             input_hash = compute_input_hash(input_data)
 
-            current = await uow.production_artifacts.get_current(
-                run_id, ProductionArtifactStage.BRIEF.value
-            )
-            version = (current.version + 1) if current else 1
+            # Not get_current: a synthesis retry stales the previous brief
+            # first, and get_current excludes STALE rows — using it here
+            # would restart numbering at 1 and collide with the
+            # (production_run_id, stage, version) uniqueness of the original.
+            existing = await uow.production_artifacts.list_for_run(run_id)
+            prior_versions = [
+                artifact.version
+                for artifact in existing
+                if artifact.stage is ProductionArtifactStage.BRIEF
+            ]
+            version = max(prior_versions) + 1 if prior_versions else 1
 
             document = build_brief_document(
                 subject_title=subject_title,

@@ -179,17 +179,39 @@ export async function getSubjectProduction(
   return requestOrNull(`/api/subjects/${subjectId}/production`);
 }
 
-export async function retryReferences(
-  subjectId: string,
-): Promise<{ status: string }> {
+/**
+ * Retry references (Q1).
+ *
+ * Always starts a brand new production run (new run_id, incremented
+ * run_number): Q1 can change every downstream fact, so the previous run is
+ * left untouched as immutable history. `status` reflects the real state of
+ * the new run (e.g. "queued"/"running") once its SOURCES job is dispatched
+ * — never a synthetic "initiated" placeholder.
+ */
+export async function retryReferences(subjectId: string): Promise<{
+  run_id: string;
+  previous_run_id: string;
+  status: string;
+  job_id: string | null;
+}> {
   return request(`/api/subjects/${subjectId}/production/references/retry`, {
     method: "POST",
   });
 }
 
-export async function retrySynthesis(
-  subjectId: string,
-): Promise<{ status: string }> {
+/**
+ * Retry synthesis (Q4).
+ *
+ * Stays on the same run — Q1/Q2 are not replayed — but dispatches a real
+ * SYNTHESIS job under a fresh `synthesis_generation` so it always produces a
+ * new Q4 turn instead of replaying the previous SUCCEEDED one.
+ */
+export async function retrySynthesis(subjectId: string): Promise<{
+  run_id: string;
+  status: string;
+  job_id: string | null;
+  synthesis_generation: number;
+}> {
   return request(`/api/subjects/${subjectId}/production/synthesis/retry`, {
     method: "POST",
   });

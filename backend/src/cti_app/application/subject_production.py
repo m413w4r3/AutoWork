@@ -14,6 +14,7 @@ from cti_app.domain.production import (
     EditionProductionBatchItem,
     ProductionProfile,
     SubjectProductionRun,
+    SubjectProductionStage,
     SubjectProductionStatus,
 )
 
@@ -129,6 +130,31 @@ class SubjectProductionService:
                 raise ValueError(f"Production run {run_id} not found")
 
             run.mark_cancelled(now=datetime.now(UTC))
+            await uow.subject_production_runs.save(run)
+            await uow.commit()
+            return run
+
+    async def retry_synthesis(self, run_id: UUID) -> SubjectProductionRun:
+        """Re-runs Q4 in place: same run, Q1/Q2 stay valid.
+
+        The only authority that mutates a run for a synthesis retry — the API
+        layer must not duplicate this transition. Bumps `synthesis_generation`
+        and stales the synthesis/brief artifacts so the retried Q4 turn (and
+        the artifact it produces) can never be mistaken for the previous one.
+        """
+        async with self._uow_factory() as uow:
+            run = await uow.subject_production_runs.get_for_update(run_id)
+            if not run:
+                raise ValueError(f"Production run {run_id} not found")
+
+            run.retry_synthesis(now=datetime.now(UTC))
+
+            # Downstream of EXTRACTION: stales both the previous synthesis
+            # artifact and the brief built from it, without touching Q1/Q2.
+            await uow.production_artifacts.mark_downstream_stale(
+                run_id, SubjectProductionStage.EXTRACTION.value
+            )
+
             await uow.subject_production_runs.save(run)
             await uow.commit()
             return run
