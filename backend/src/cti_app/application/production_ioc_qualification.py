@@ -133,13 +133,18 @@ def merge_qualified_candidates(
     items: list[ExtractionItem] = list(general_items)
     for index, candidate in enumerate(candidates, 1):
         qualification = by_qualification[candidate.candidate_id]
-        status, policy = _status_policy(qualification.status)
+        effective_status = qualification.status
+        reason = qualification.reason
+        if not candidate.source_backed and effective_status is QualificationStatus.CONFIRMED_IOC:
+            effective_status = QualificationStatus.CONTEXTUAL
+            reason = "discovery_only_without_literal_source_evidence: " + reason
+        status, policy = _status_policy(effective_status)
         items.append(
             ExtractionItem(
                 local_id=f"IOC{index}",
                 category="network_artifacts",
                 value=candidate.preferred_original_value,
-                context=qualification.reason,
+                context=reason,
                 artifact_type=candidate.artifact_type,
                 attack_id=None,
                 reference_ids=(),

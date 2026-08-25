@@ -2,8 +2,13 @@ from uuid import uuid4
 
 import pytest
 
-from cti_app.application.production_ioc_candidates import IocCandidate, IocCandidateBatch
+from cti_app.application.production_ioc_candidates import (
+    DiscoveryIocProvenance,
+    IocCandidate,
+    IocCandidateBatch,
+)
 from cti_app.application.production_ioc_qualification import (
+    IocQualification,
     QualificationStatus,
     merge_qualified_candidates,
     parse_ioc_qualifications,
@@ -43,7 +48,8 @@ def test_qualification_requires_exact_candidate_coverage_and_repairs_cleanly():
     assert missing.missing_candidate_ids == ("c2",)
     repaired = parse_ioc_qualifications(
         "candidate-id: c1\nstatus: confirmed_ioc\nreason: C2 publié\n\n"
-        "candidate-id: c2\nstatus: excluded\nreason: exemple", _batch(*candidates)
+        "candidate-id: c2\nstatus: excluded\nreason: exemple",
+        _batch(*candidates),
     )
     assert repaired.usable
     assert len(repaired.qualifications) == 2
@@ -89,7 +95,10 @@ def test_merge_uses_pack_facts_and_required_display_mapping(status, indicator_st
     )
     item = result.items[0]
     assert (item.value, item.normalized_value, item.artifact_type, item.source_ids) == (
-        "evil[.]example", "evil.example", ArtifactType.DOMAIN, ("S1",)
+        "evil[.]example",
+        "evil.example",
+        ArtifactType.DOMAIN,
+        ("S1",),
     )
     assert (item.indicator_status, item.display_policy) == (indicator_status, policy)
 
@@ -114,3 +123,24 @@ def test_q2_literal_absent_from_pack_can_never_remain_confirmed():
     assert result.items[0].indicator_status is IndicatorStatus.EXCLUDED
     assert result.items[0].display_policy is DisplayPolicy.HIDDEN
     assert result.items[0].context.startswith("unbacked_ioc_literal:")
+
+
+def test_discovery_only_confirmed_by_model_is_downgraded_to_contextual():
+    candidate = IocCandidate(
+        candidate_id="discovery-only",
+        artifact_type=ArtifactType.DOMAIN,
+        preferred_original_value="only.example",
+        normalized_value="only.example",
+        source_ids=(),
+        evidence=(),
+        indicator_ids=(),
+        discovery_provenance=(DiscoveryIocProvenance(uuid4(), (), ("P1",), "only.example"),),
+    )
+    result = merge_qualified_candidates(
+        TechnicalExtraction(()),
+        (IocQualification("discovery-only", QualificationStatus.CONFIRMED_IOC, "model says yes"),),
+        (candidate,),
+    )
+    item = result.items[0]
+    assert item.indicator_status is IndicatorStatus.CONTEXTUAL
+    assert item.display_policy is DisplayPolicy.BODY_ONLY

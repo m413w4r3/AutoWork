@@ -11,10 +11,10 @@ import hashlib
 import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Final
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.production_parsers import ReferenceReport
@@ -24,6 +24,7 @@ from cti_app.domain.collection import (
     IndicatorKind,
     SourceCollection,
 )
+from cti_app.domain.discovery import DiscoveryIocType, ProvisionalDiscoveryIoc
 from cti_app.domain.entities import SourceDocument
 from cti_app.domain.publication import ArtifactType
 
@@ -38,6 +39,27 @@ class CandidateWarningCode(StrEnum):
     SOURCE_NOT_MAPPED = "source_not_mapped"
     TEXT_NOT_AVAILABLE = "text_not_available"
     INVALID_SPAN = "invalid_span"
+    DISCOVERY_PUBLICATION_UNRESOLVED = "discovery_publication_unresolved"
+    DISCOVERY_VALUE_NOT_FOUND = "discovery_value_not_found"
+    DISCOVERY_TYPE_IGNORED = "discovery_type_ignored"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryPublicationEvidence:
+    """A real archived publication related to a provisional Discovery IOC."""
+
+    source_document_id: UUID
+    derived_artifact_id: UUID
+    source_ids: tuple[str, ...]
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryIocProvenance:
+    provisional_ioc_id: UUID
+    publication_ids: tuple[UUID, ...]
+    publication_refs: tuple[str, ...]
+    raw_value: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +83,13 @@ class IocCandidate:
     source_ids: tuple[str, ...]
     evidence: tuple[IocCandidateEvidence, ...]
     indicator_ids: tuple[UUID, ...]
+    discovery_provenance: tuple[DiscoveryIocProvenance, ...] = ()
+
+    @property
+    def source_backed(self) -> bool:
+        # ``source_ids`` is the persisted pack fact; evidence may be omitted by
+        # lightweight callers, while a discovery-only candidate has neither.
+        return bool(self.source_ids or any(item.source_ids for item in self.evidence))
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +114,11 @@ class IocCandidatePack:
     linked_evidence_occurrences: int
     warnings: tuple[str, ...]
     pack_hash: str
+    source_derived_candidates: int = 0
+    discovery_augmented_candidates: int = 0
+    discovery_only_candidates: int = 0
+    discovery_matched_to_source: int = 0
+    discovery_unmatched: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +137,17 @@ _KIND_TO_ARTIFACT: Final = {
     IndicatorKind.EMAIL: ArtifactType.EMAIL,
 }
 
+_DISCOVERY_TYPE_TO_ARTIFACT: Final = {
+    DiscoveryIocType.IPV4: ArtifactType.IP,
+    DiscoveryIocType.IPV6: ArtifactType.IP,
+    DiscoveryIocType.DOMAIN: ArtifactType.DOMAIN,
+    DiscoveryIocType.URL: ArtifactType.URL,
+    DiscoveryIocType.MD5: ArtifactType.HASH,
+    DiscoveryIocType.SHA1: ArtifactType.HASH,
+    DiscoveryIocType.SHA256: ArtifactType.HASH,
+    DiscoveryIocType.EMAIL: ArtifactType.EMAIL,
+}
+
 
 def build_candidate_pack(
     indicators: Sequence[Indicator],
@@ -112,6 +157,8 @@ def build_candidate_pack(
     artifacts: Sequence[DerivedArtifact] = (),
     reference_report: ReferenceReport,
     artifact_texts: Mapping[UUID, str] | None = None,
+    provisional_iocs: Sequence[ProvisionalDiscoveryIoc] = (),
+    discovery_publications: Mapping[UUID, DiscoveryPublicationEvidence] | None = None,
     max_candidates_per_batch: int = DEFAULT_MAX_CANDIDATES_PER_BATCH,
     max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
 ) -> IocCandidatePack:
@@ -124,7 +171,7 @@ def build_candidate_pack(
     if max_candidates_per_batch <= 0 or max_batch_chars <= 0:
         raise ValueError("Batch limits must be positive")
 
-    source_lookup = _source_ids_by_document(collections, source_documents, reference_report)
+    source_lookup = source_ids_by_document(collections, source_documents, reference_report)
     artifact_texts = artifact_texts or {}
     artifact_versions = tuple(sorted({a.parser_version for a in artifacts}))
     warnings: list[str] = []
@@ -178,11 +225,133 @@ def build_candidate_pack(
             )
         groups[key].append(_Occurrence(indicator, artifact_type, source_ids, snippet))
 
-    candidates = tuple(
+    source_derived_candidates = tuple(
         _candidate_for(key, occurrences)
         for key, occurrences in sorted(
             groups.items(), key=lambda item: (item[0][0].value, item[0][1])
         )
+    )
+    candidates_list = list(source_derived_candidates)
+    discovery_publications = discovery_publications or {}
+    discovery_stats = {
+        "augmented": 0,
+        "only": 0,
+        "matched": 0,
+        "unmatched": 0,
+    }
+    discovery_provenance: dict[tuple[ArtifactType, str], list[DiscoveryIocProvenance]] = (
+        defaultdict(list)
+    )
+    discovery_evidence: dict[tuple[ArtifactType, str], list[IocCandidateEvidence]] = defaultdict(
+        list
+    )
+    for provisional in sorted(provisional_iocs, key=lambda item: str(item.id)):
+        artifact_type = _DISCOVERY_TYPE_TO_ARTIFACT.get(provisional.proposed_type)
+        if artifact_type is None:
+            warnings.append(f"{CandidateWarningCode.DISCOVERY_TYPE_IGNORED.value}:{provisional.id}")
+            continue
+        try:
+            normalized = normalize_indicator_value(
+                provisional.normalized_value or provisional.raw_value, artifact_type
+            )
+        except ValueError:
+            warnings.append(f"{CandidateWarningCode.DISCOVERY_TYPE_IGNORED.value}:{provisional.id}")
+            continue
+        key = (artifact_type, normalized)
+        provenance = DiscoveryIocProvenance(
+            provisional_ioc_id=provisional.id,
+            publication_ids=tuple(
+                sorted((item.publication_id for item in provisional.publication_relations), key=str)
+            ),
+            publication_refs=tuple(
+                sorted({item.publication_ref for item in provisional.publication_relations})
+            ),
+            raw_value=provisional.raw_value,
+        )
+        discovery_provenance[key].append(provenance)
+        found = 0
+        search_values = _discovery_search_values(provisional, normalized)
+        for relation in provisional.publication_relations:
+            publication = discovery_publications.get(relation.publication_id)
+            if publication is None:
+                warnings.append(
+                    f"{CandidateWarningCode.DISCOVERY_PUBLICATION_UNRESOLVED.value}:"
+                    f"{provisional.id}:{relation.publication_ref}"
+                )
+                continue
+            match = _find_literal(publication.text, search_values)
+            if match is None:
+                continue
+            start, end = match
+            source_ids = publication.source_ids
+            discovery_evidence[key].append(
+                IocCandidateEvidence(
+                    indicator_id=uuid5(
+                        NAMESPACE_URL,
+                        f"discovery-indicator:{provisional.id}:{publication.derived_artifact_id}:{start}",
+                    ),
+                    derived_artifact_id=publication.derived_artifact_id,
+                    source_document_id=publication.source_document_id,
+                    source_ids=source_ids,
+                    original_value=publication.text[start:end],
+                    span_start=start,
+                    span_end=end,
+                    snippet=publication.text[
+                        max(0, start - SNIPPET_CONTEXT_CHARS) : min(
+                            len(publication.text), end + SNIPPET_CONTEXT_CHARS
+                        )
+                    ],
+                )
+            )
+            found += 1
+        if found:
+            discovery_stats["matched"] += 1
+        else:
+            discovery_stats["unmatched"] += 1
+            warnings.append(
+                f"{CandidateWarningCode.DISCOVERY_VALUE_NOT_FOUND.value}:{provisional.id}"
+            )
+    by_key = {
+        (candidate.artifact_type, candidate.normalized_value): candidate
+        for candidate in candidates_list
+    }
+    for key in sorted(discovery_provenance, key=lambda item: (item[0].value, item[1])):
+        current = by_key.get(key)
+        provenance_items = tuple(discovery_provenance[key])
+        evidence = tuple(discovery_evidence[key])
+        if current is not None:
+            discovery_stats["augmented"] += 1
+            updated = replace(
+                current,
+                discovery_provenance=tuple(
+                    sorted(
+                        (*current.discovery_provenance, *provenance_items),
+                        key=lambda item: str(item.provisional_ioc_id),
+                    )
+                ),
+            )
+            candidates_list[candidates_list.index(current)] = updated
+            by_key[key] = updated
+            continue
+        if evidence:
+            candidate = _discovery_candidate(
+                key,
+                provisional_ioc=provenance_items[0],
+                evidence=evidence,
+                provenance=provenance_items,
+            )
+        else:
+            candidate = _discovery_candidate(
+                key,
+                provisional_ioc=provenance_items[0],
+                evidence=(),
+                provenance=provenance_items,
+            )
+            discovery_stats["only"] += 1
+        candidates_list.append(candidate)
+        by_key[key] = candidate
+    candidates = tuple(
+        sorted(candidates_list, key=lambda item: (item.artifact_type.value, item.normalized_value))
     )
     batches = _make_batches(candidates, max_candidates_per_batch, max_batch_chars)
     occurrences = tuple(o for values in groups.values() for o in values)
@@ -199,7 +368,7 @@ def build_candidate_pack(
         for occurrence in occurrences
         if not occurrence.source_ids
     }
-    total_occurrences = sum(len(values) for values in groups.values())
+    total_occurrences = sum(len(candidate.evidence) for candidate in candidates)
     canonical_without_hash = {
         "pack_version": "1",
         "parser_versions": artifact_versions,
@@ -223,10 +392,19 @@ def build_candidate_pack(
         linked_evidence_occurrences=sum(1 for occurrence in occurrences if occurrence.source_ids),
         warnings=tuple(sorted(set(warnings))),
         pack_hash=pack_hash,
+        source_derived_candidates=len(source_derived_candidates),
+        discovery_augmented_candidates=sum(
+            1
+            for candidate in candidates
+            if candidate.discovery_provenance and candidate.source_backed
+        ),
+        discovery_only_candidates=discovery_stats["only"],
+        discovery_matched_to_source=discovery_stats["matched"],
+        discovery_unmatched=discovery_stats["unmatched"],
     )
 
 
-def _source_ids_by_document(
+def source_ids_by_document(
     collections: Sequence[SourceCollection],
     documents: Sequence[SourceDocument],
     report: ReferenceReport,
@@ -296,8 +474,58 @@ def _candidate_for(
     )
 
 
+def _discovery_search_values(
+    provisional: ProvisionalDiscoveryIoc,
+    normalized: str,
+) -> tuple[str, ...]:
+    values = [provisional.raw_value, provisional.normalized_value or "", normalized]
+    # This is only a search representation; canonicalization remains owned by
+    # production_normalization.  It permits the existing defanged spelling.
+    values.append(
+        provisional.raw_value.replace("[.]", ".")
+        .replace("(.)", ".")
+        .replace("[@]", "@")
+        .replace("(at)", "@")
+    )
+    return tuple(dict.fromkeys(value for value in values if value.strip()))
+
+
+def _find_literal(text: str, values: Sequence[str]) -> tuple[int, int] | None:
+    folded = text.casefold()
+    matches = [
+        (folded.find(value.casefold()), value)
+        for value in values
+        if value and folded.find(value.casefold()) >= 0
+    ]
+    if not matches:
+        return None
+    start, value = min(matches, key=lambda item: (item[0], -len(item[1])))
+    return start, start + len(value)
+
+
+def _discovery_candidate(
+    key: tuple[ArtifactType, str],
+    *,
+    provisional_ioc: DiscoveryIocProvenance,
+    evidence: tuple[IocCandidateEvidence, ...],
+    provenance: tuple[DiscoveryIocProvenance, ...],
+) -> IocCandidate:
+    artifact_type, normalized = key
+    return IocCandidate(
+        candidate_id="ioc-"
+        + hashlib.sha256(f"{artifact_type.value}\0{normalized}".encode()).hexdigest(),
+        artifact_type=artifact_type,
+        preferred_original_value=provisional_ioc.raw_value,
+        normalized_value=normalized,
+        source_ids=tuple(sorted({source_id for item in evidence for source_id in item.source_ids})),
+        evidence=evidence,
+        indicator_ids=tuple(item.indicator_id for item in evidence),
+        discovery_provenance=provenance,
+    )
+
+
 def _candidate_json(candidate: IocCandidate) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "candidate_id": candidate.candidate_id,
         "artifact_type": candidate.artifact_type.value,
         "preferred_original_value": candidate.preferred_original_value,
@@ -317,6 +545,17 @@ def _candidate_json(candidate: IocCandidate) -> dict[str, object]:
             for item in candidate.evidence
         ],
     }
+    if candidate.discovery_provenance:
+        payload["discovery_provenance"] = [
+            {
+                "provisional_ioc_id": str(item.provisional_ioc_id),
+                "publication_ids": [str(value) for value in item.publication_ids],
+                "publication_refs": item.publication_refs,
+                "raw_value": item.raw_value,
+            }
+            for item in candidate.discovery_provenance
+        ]
+    return payload
 
 
 def _make_batches(

@@ -16,10 +16,12 @@ from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_context import build_subject_production_context
 from cti_app.application.production_ioc_candidates import (
+    DiscoveryPublicationEvidence,
     IocCandidate,
     IocCandidateBatch,
     IocCandidatePack,
     build_candidate_pack,
+    source_ids_by_document,
 )
 from cti_app.application.production_ioc_qualification import (
     IOC_QUALIFICATION_PARSER_VERSION,
@@ -636,9 +638,7 @@ class ProductionWorkflowOrchestrator:
         referenced_evidence = {"selected": 0, "added": 0}
         evidence_processing = None
         if self._source_evidence_processor is not None:
-            links = await self._source_evidence_processor.select_referenced_evidence(
-                run.subject_id
-            )
+            links = await self._source_evidence_processor.select_referenced_evidence(run.subject_id)
             referenced_evidence["selected"] = len(links)
             if self._collection_service is not None and links:
                 children = await self._collection_service.add_referenced_evidence(
@@ -751,8 +751,11 @@ class ProductionWorkflowOrchestrator:
 
                 try:
                     parsed_qualification, _, _ = await self._ask_with_format_repair(
-                        run=run, conversation_id=conversation_id, stage=stage,
-                        prompt=qualification_prompt, mode=ConversationMode.CONTINUE,
+                        run=run,
+                        conversation_id=conversation_id,
+                        stage=stage,
+                        prompt=qualification_prompt,
+                        mode=ConversationMode.CONTINUE,
                         parse=parse_batch,
                         external_llm_allowed=policy_allows,
                     )
@@ -761,11 +764,11 @@ class ProductionWorkflowOrchestrator:
                 if parsed_qualification is None or not parsed_qualification.usable:
                     result = parsed_qualification
                     return {
-                        "stage": "extraction", "status": "needs_review",
+                        "stage": "extraction",
+                        "status": "needs_review",
                         "error_code": "ioc_candidate_coverage_incomplete",
                         "error": (
-                            "; ".join(result.errors)
-                            if result else "No qualification response"
+                            "; ".join(result.errors) if result else "No qualification response"
                         ),
                         "missing_candidate_ids": (
                             list(result.missing_candidate_ids) if result else []
@@ -834,15 +837,16 @@ class ProductionWorkflowOrchestrator:
                     "confirmed_total": sum(
                         q.status.value == "confirmed_ioc" for q in qualifications
                     ),
-                    "contextual_total": sum(
-                        q.status.value == "contextual" for q in qualifications
-                    ),
-                    "excluded_total": sum(
-                        q.status.value == "excluded" for q in qualifications
-                    ),
+                    "contextual_total": sum(q.status.value == "contextual" for q in qualifications),
+                    "excluded_total": sum(q.status.value == "excluded" for q in qualifications),
                     "missing_candidate_ids": [],
                     "unknown_candidate_ids": [],
                     "candidate_pack_hash": candidate_pack.pack_hash,
+                    "source_derived_candidates": candidate_pack.source_derived_candidates,
+                    "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,
+                    "discovery_only_candidates": candidate_pack.discovery_only_candidates,
+                    "discovery_matched_to_source": candidate_pack.discovery_matched_to_source,
+                    "discovery_unmatched": candidate_pack.discovery_unmatched,
                 },
             )
 
@@ -861,6 +865,11 @@ class ProductionWorkflowOrchestrator:
                 "contextual_total": sum(q.status.value == "contextual" for q in qualifications),
                 "excluded_total": sum(q.status.value == "excluded" for q in qualifications),
                 "candidate_pack_hash": candidate_pack.pack_hash,
+                "source_derived_candidates": candidate_pack.source_derived_candidates,
+                "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,
+                "discovery_only_candidates": candidate_pack.discovery_only_candidates,
+                "discovery_matched_to_source": candidate_pack.discovery_matched_to_source,
+                "discovery_unmatched": candidate_pack.discovery_unmatched,
                 "source_evidence_processing": (
                     evidence_processing.as_dict() if evidence_processing is not None else None
                 ),
@@ -872,15 +881,18 @@ class ProductionWorkflowOrchestrator:
     ) -> IocCandidatePack:
         """Load persisted evidence snapshots and build the pack before cache lookup."""
         # Lightweight test UoWs intentionally omit these repositories.
-        repositories = (
-            "indicators", "source_collections", "source_documents", "derived_artifacts"
-        )
+        repositories = ("indicators", "source_collections", "source_documents", "derived_artifacts")
         if not all(hasattr(uow, name) for name in repositories):
             return build_candidate_pack((), collections=(), reference_report=report)
         indicators = await uow.indicators.list_for_subject(subject_id)
         collections = await uow.source_collections.list_for_subject(subject_id)
         documents = await uow.source_documents.list_for_subject(subject_id)
         artifact_ids = {indicator.derived_artifact_id for indicator in indicators}
+        artifact_ids.update(
+            collection.derived_artifact_id
+            for collection in collections
+            if collection.derived_artifact_id is not None
+        )
         artifacts_list = []
         for artifact_id in sorted(artifact_ids, key=str):
             artifact = await uow.derived_artifacts.get(artifact_id)
@@ -896,6 +908,65 @@ class ProductionWorkflowOrchestrator:
                     )
                 except Exception:
                     continue
+        provisional_iocs = []
+        discovery_publications: dict[UUID, DiscoveryPublicationEvidence] = {}
+        discovery_repositories = (
+            "editorial_groups",
+            "discovery_subject_identities",
+            "subject_contributions",
+            "discovery_intakes",
+            "discovery_batches",
+        )
+        if all(hasattr(uow, name) for name in discovery_repositories):
+            group = await uow.editorial_groups.get_by_subject(subject_id)
+            if group is not None and group.discovery_subject_id is not None:
+                contributions = await uow.discovery_subject_identities.contribution_closure(
+                    group.discovery_subject_id
+                )
+                provisional_ids = {
+                    provisional_id
+                    for contribution in contributions
+                    for provisional_id in contribution.contributed_provisional_ioc_ids
+                }
+                for contribution in contributions:
+                    intake = await uow.discovery_intakes.get(contribution.intake_id)
+                    batch = (
+                        await uow.discovery_batches.get(intake.batch_id)
+                        if intake is not None
+                        else None
+                    )
+                    if batch is None:
+                        continue
+                    for topic in batch.candidates:
+                        for provisional in topic.provisional_iocs:
+                            if provisional.id in provisional_ids:
+                                provisional_iocs.append(provisional)
+
+                collections_by_publication = {
+                    collection.source_candidate_id: collection
+                    for collection in collections
+                    if collection.source_candidate_id is not None
+                }
+                source_ids = source_ids_by_document(collections, documents, report)
+                for provisional in provisional_iocs:
+                    for relation in provisional.publication_relations:
+                        collection = collections_by_publication.get(relation.publication_id)
+                        if collection is None or collection.source_document_id is None:
+                            continue
+                        publication_artifact_id = collection.derived_artifact_id
+                        if (
+                            publication_artifact_id is None
+                            or publication_artifact_id not in texts
+                        ):
+                            continue
+                        discovery_publications[relation.publication_id] = (
+                            DiscoveryPublicationEvidence(
+                                source_document_id=collection.source_document_id,
+                                derived_artifact_id=publication_artifact_id,
+                                source_ids=source_ids.get(collection.source_document_id, ()),
+                                text=texts[publication_artifact_id],
+                            )
+                        )
         return build_candidate_pack(
             indicators,
             collections=collections,
@@ -903,6 +974,8 @@ class ProductionWorkflowOrchestrator:
             artifacts=artifacts,
             reference_report=report,
             artifact_texts=texts,
+            provisional_iocs=tuple({item.id: item for item in provisional_iocs}.values()),
+            discovery_publications=discovery_publications,
         )
 
     @staticmethod
@@ -944,9 +1017,14 @@ class ProductionWorkflowOrchestrator:
             except ValueError:
                 key = None
             if key not in known:
-                items.append(replace(item, indicator_status=IndicatorStatus.EXCLUDED,
-                                     display_policy=DisplayPolicy.HIDDEN,
-                                     context=("unbacked_ioc_literal: " + item.context).strip()))
+                items.append(
+                    replace(
+                        item,
+                        indicator_status=IndicatorStatus.EXCLUDED,
+                        display_policy=DisplayPolicy.HIDDEN,
+                        context=("unbacked_ioc_literal: " + item.context).strip(),
+                    )
+                )
             else:
                 items.append(item)
         return replace(extraction, items=tuple(items))

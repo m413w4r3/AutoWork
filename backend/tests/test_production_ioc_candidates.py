@@ -4,7 +4,10 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.production_ioc_candidates import build_candidate_pack
+from cti_app.application.production_ioc_candidates import (
+    DiscoveryPublicationEvidence,
+    build_candidate_pack,
+)
 from cti_app.application.production_parsers import ParsedSource, ReferenceReport
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
@@ -15,7 +18,12 @@ from cti_app.domain.collection import (
     SourceOriginKind,
     SourceSpan,
 )
-from cti_app.domain.discovery import SourceRole
+from cti_app.domain.discovery import (
+    DiscoveryIocType,
+    ProvisionalDiscoveryIoc,
+    ProvisionalIocPublicationRelation,
+    SourceRole,
+)
 from cti_app.domain.entities import SourceDocument
 
 NOW = datetime(2025, 1, 1, tzinfo=UTC)
@@ -168,3 +176,83 @@ def test_input_order_does_not_change_canonical_result():
     forward = _pack(rows, _report("https://news.test/a"))
     reverse = _pack(rows[::-1], _report("https://news.test/a"))
     assert forward == reverse
+
+
+def _provisional(value: str, publication_id: UUID, kind=DiscoveryIocType.DOMAIN):
+    return ProvisionalDiscoveryIoc(
+        raw_value=value,
+        normalized_value=None,
+        declared_type=kind.value,
+        proposed_type=kind,
+        publication_relations=(
+            ProvisionalIocPublicationRelation(publication_id, "P1", value, value),
+        ),
+        model_run_id=None,
+        markdown_block=value,
+    )
+
+
+def test_discovery_existing_candidate_is_augmented_without_duplicate():
+    row = _records("evil.example")
+    provisional = _provisional("evil[.]example", row[1].id)
+    publication = DiscoveryPublicationEvidence(row[2].id, row[3].id, ("S1",), "x evil.example x")
+    pack = _pack(
+        [row],
+        _report("https://news.test/a"),
+        provisional_iocs=(provisional,),
+        discovery_publications={row[1].id: publication},
+    )
+    assert len(pack.candidates) == 1
+    assert pack.candidates[0].discovery_provenance[0].provisional_ioc_id == provisional.id
+    assert pack.discovery_augmented_candidates == 1
+
+
+def test_discovery_value_found_in_source_gets_real_evidence():
+    row = _records("other.example")
+    provisional = _provisional("evil[.]example", row[1].id)
+    publication = DiscoveryPublicationEvidence(row[2].id, row[3].id, ("S1",), "evil.example")
+    pack = _pack(
+        [row],
+        _report("https://news.test/a"),
+        provisional_iocs=(provisional,),
+        discovery_publications={row[1].id: publication},
+    )
+    candidate = next(item for item in pack.candidates if item.normalized_value == "evil.example")
+    assert candidate.source_ids == ("S1",)
+    assert candidate.evidence[0].derived_artifact_id == row[3].id
+    assert candidate.source_backed
+
+
+def test_discovery_only_is_retained_but_unknown_publication_never_fabricates_source():
+    provisional = _provisional("only.example", uuid4())
+    pack = _pack([], _report(), provisional_iocs=(provisional,), discovery_publications={})
+    candidate = pack.candidates[0]
+    assert candidate.source_ids == ()
+    assert pack.discovery_only_candidates == 1
+    assert pack.discovery_unmatched == 1
+    assert any("discovery_publication_unresolved" in warning for warning in pack.warnings)
+
+
+def test_discovery_defanged_duplicate_hashes_and_unsupported_type_is_ignored():
+    row = _records("evil.example")
+    first = _provisional("evil[.]example", row[1].id)
+    second = _provisional("evil.example", row[1].id)
+    ignored = _provisional("CVE-2025-1", row[1].id, DiscoveryIocType.CVE)
+    publication = DiscoveryPublicationEvidence(row[2].id, row[3].id, ("S1",), "evil.example")
+    one = _pack(
+        [row],
+        _report("https://news.test/a"),
+        provisional_iocs=(first,),
+        discovery_publications={row[1].id: publication},
+    )
+    two = _pack(
+        [row],
+        _report("https://news.test/a"),
+        provisional_iocs=(second,),
+        discovery_publications={row[1].id: publication},
+    )
+    ignored_pack = _pack([row], _report("https://news.test/a"), provisional_iocs=(ignored,))
+    assert one.pack_hash != two.pack_hash
+    assert len(two.candidates) == 1
+    assert ignored_pack.discovery_only_candidates == 0
+    assert any("discovery_type_ignored" in warning for warning in ignored_pack.warnings)
