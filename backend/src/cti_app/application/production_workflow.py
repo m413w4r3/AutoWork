@@ -22,21 +22,10 @@ from cti_app.application.production_context import build_subject_production_cont
 from cti_app.application.production_ioc_candidates import (
     DiscoveryPublicationEvidence,
     IocCandidate,
-    IocCandidateBatch,
     IocCandidatePack,
     Q2LiteralCandidate,
     build_candidate_pack,
     source_ids_by_document,
-)
-from cti_app.application.production_ioc_qualification import (
-    IOC_QUALIFICATION_PARSER_VERSION,
-    IOC_QUALIFICATION_PROMPT_VERSION,
-    IocQualification,
-    QualificationParseResult,
-    QualificationStatus,
-    effective_qualification_statuses,
-    merge_qualified_candidates,
-    parse_ioc_qualifications,
 )
 from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
@@ -57,7 +46,6 @@ from cti_app.application.production_parsers import (
 from cti_app.application.production_prompts import (
     EXTRACTION_FORMAT_REPAIR_VERSION,
     EXTRACTION_PROMPT_VERSION,
-    IOC_QUALIFICATION_FORMAT_REPAIR_VERSION,
     REFERENCES_FORMAT_REPAIR_VERSION,
     REFERENCES_PROMPT_VERSION,
     SYNTHESIS_FORMAT_REPAIR_VERSION,
@@ -235,7 +223,6 @@ class ProductionWorkflowOrchestrator:
         parse: Callable[[str], Any],
         external_llm_allowed: bool,
         web_search: bool = False,
-        repair_context: str = "",
     ) -> tuple[Any | None, str, UUID | None]:
         """Ask the model, and give it exactly one chance to fix its formatting.
 
@@ -274,7 +261,7 @@ class ProductionWorkflowOrchestrator:
             return result, raw, turn.id
 
         repair_prompt = ProductionPromptTemplates.get_format_repair_prompt(
-            stage=stage, problems=result.errors, candidates=repair_context
+            stage=stage, problems=result.errors
         )
         repair_idempotency_key = f"{stage}-format-repair-{run.id}-v{repair_version}"
         repair_turn = await self._model_service.add_turn(
@@ -303,12 +290,8 @@ class ProductionWorkflowOrchestrator:
         repaired = parse(repaired_raw)
         self._log_parse(run, f"{stage}-repair", repaired)
         repaired.repair_actions.append(
-            "ioc_qualification_format_repair"
-            if stage.startswith("ioc-qualification-")
-            else f"{stage}_format_repair"
+            f"{stage}_format_repair"
         )
-        if stage.startswith("ioc-qualification-"):
-            repaired.warnings.append("ioc_qualification_format_repair_applied")
         repaired.warnings.extend(result.errors)
         return repaired, repaired_raw, repair_turn.id
 
@@ -731,8 +714,6 @@ class ProductionWorkflowOrchestrator:
                 "stage": "extraction",
                 "prompt_version": EXTRACTION_PROMPT_VERSION,
                 "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
-                "ioc_qualification_prompt_version": IOC_QUALIFICATION_PROMPT_VERSION,
-                "ioc_qualification_parser_version": IOC_QUALIFICATION_PARSER_VERSION,
             }
             input_hash = compute_input_hash(input_data)
 
@@ -809,72 +790,14 @@ class ProductionWorkflowOrchestrator:
             q2_diagnostics = self._q2_literal_diagnostics(
                 q2_literals, initial_candidate_pack, candidate_pack
             )
-            qualifications: list[IocQualification] = []
-            qualification_warnings: list[str] = []
-            qualification_repair_actions: list[str] = []
-            for batch in candidate_pack.batches:
-                candidate_text = self._format_ioc_candidates(batch.candidates)
-                qualification_prompt = ProductionPromptTemplates.get_ioc_qualification_prompt(
-                    candidate_text
-                )
-                stage = (
-                    f"ioc-qualification-{candidate_pack.pack_hash}-"
-                    f"{batch.ordinal}-{IOC_QUALIFICATION_PROMPT_VERSION}"
-                )
-
-                def parse_batch(
-                    text: str, current_batch: IocCandidateBatch = batch
-                ) -> QualificationParseResult:
-                    return parse_ioc_qualifications(text, current_batch)
-
-                try:
-                    parsed_qualification, _, _ = await self._ask_with_format_repair(
-                        run=run,
-                        conversation_id=conversation_id,
-                        stage=stage,
-                        prompt=qualification_prompt,
-                        prompt_version=IOC_QUALIFICATION_PROMPT_VERSION,
-                        repair_version=IOC_QUALIFICATION_FORMAT_REPAIR_VERSION,
-                        mode=ConversationMode.CONTINUE,
-                        parse=parse_batch,
-                        external_llm_allowed=policy_allows,
-                        web_search=False,
-                        repair_context=candidate_text,
-                    )
-                except Exception as e:
-                    return self._handle_stage_exception(run, "extraction", e)
-                if parsed_qualification is None or not parsed_qualification.usable:
-                    result = parsed_qualification
-                    return {
-                        "stage": "extraction",
-                        "status": "needs_review",
-                        "error_code": "ioc_candidate_coverage_incomplete",
-                        "error": (
-                            "; ".join(result.errors) if result else "No qualification response"
-                        ),
-                        "missing_candidate_ids": (
-                            list(result.missing_candidate_ids) if result else []
-                        ),
-                        "unknown_candidate_ids": (
-                            list(result.unknown_candidate_ids) if result else []
-                        ),
-                        "candidate_pack_hash": candidate_pack.pack_hash,
-                    }
-                qualifications.extend(parsed_qualification.qualifications)
-                qualification_warnings.extend(parsed_qualification.errors)
-                qualification_warnings.extend(parsed_qualification.warnings)
-                qualification_repair_actions.extend(parsed_qualification.repair_actions)
-
             extraction = self._suppress_unbacked_q2_literals(
                 parsed.value, candidate_pack.candidates
             )
-            extraction = merge_qualified_candidates(
-                extraction, tuple(qualifications), candidate_pack.candidates
-            )
             assert extraction is not None
-            effective_statuses = effective_qualification_statuses(
-                tuple(qualifications), candidate_pack.candidates
-            )
+            status_totals = {
+                status.value: sum(item.indicator_status is status for item in extraction.items)
+                for status in IndicatorStatus
+            }
             artifact = await self._extraction.store_extraction_result(
                 run_id=run.id,
                 subject_id=run.subject_id,
@@ -882,23 +805,11 @@ class ProductionWorkflowOrchestrator:
                 raw_result=raw,
                 canonical_json=technical_extraction_to_json(extraction),
                 conversation_turn_id=turn_id,
-                warnings=parsed.warnings + qualification_warnings,
-                ioc_diagnostics={
+                warnings=parsed.warnings,
+                verification_diagnostics={
                     "candidate_total": candidate_pack.total_candidates,
-                    "batch_count": len(candidate_pack.batches),
-                    "qualified_total": len(qualifications),
-                    "confirmed_total": sum(
-                        s is QualificationStatus.CONFIRMED_IOC for s in effective_statuses
-                    ),
-                    "contextual_total": sum(
-                        s is QualificationStatus.CONTEXTUAL for s in effective_statuses
-                    ),
-                    "excluded_total": sum(
-                        s is QualificationStatus.EXCLUDED for s in effective_statuses
-                    ),
-                    "repair_actions": qualification_repair_actions + parsed.repair_actions,
-                    "missing_candidate_ids": [],
-                    "unknown_candidate_ids": [],
+                    "status_totals": status_totals,
+                    "repair_actions": parsed.repair_actions,
                     "candidate_pack_hash": candidate_pack.pack_hash,
                     "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
                     **q2_diagnostics,
@@ -916,20 +827,10 @@ class ProductionWorkflowOrchestrator:
                 "artifact_id": str(artifact.id),
                 "items_count": len(extraction.items),
                 "supported_items": len(extraction.supported_items()),
-                "warnings": parsed.warnings + qualification_warnings,
-                "repair_actions": qualification_repair_actions + parsed.repair_actions,
+                "warnings": parsed.warnings,
+                "repair_actions": parsed.repair_actions,
                 "candidate_total": candidate_pack.total_candidates,
-                "batch_count": len(candidate_pack.batches),
-                "qualified_total": len(qualifications),
-                "confirmed_total": sum(
-                    s is QualificationStatus.CONFIRMED_IOC for s in effective_statuses
-                ),
-                "contextual_total": sum(
-                    s is QualificationStatus.CONTEXTUAL for s in effective_statuses
-                ),
-                "excluded_total": sum(
-                    s is QualificationStatus.EXCLUDED for s in effective_statuses
-                ),
+                "status_totals": status_totals,
                 "candidate_pack_hash": candidate_pack.pack_hash,
                 "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
                 **q2_diagnostics,
@@ -1116,25 +1017,6 @@ class ProductionWorkflowOrchestrator:
             "q2_literal_recovered_from_source": recovered,
             "q2_literal_unresolved": len(literals) - matched - recovered,
         }
-
-    @staticmethod
-    def _format_ioc_candidates(candidates: tuple[IocCandidate, ...]) -> str:
-        blocks = []
-        for candidate in candidates:
-            evidence = "\n".join(
-                f"- sources: {', '.join(item.source_ids)}\n"
-                f"  snippet: {item.snippet or '[unavailable]'}"
-                for item in candidate.evidence
-            )
-            blocks.append(
-                f"candidate-id: {candidate.candidate_id}\n"
-                f"artifact-type: {candidate.artifact_type.value}\n"
-                f"preferred-original-value: {candidate.preferred_original_value}\n"
-                f"source-ids: {', '.join(candidate.source_ids)}\n"
-                f"q2-context-not-evidence: {' | '.join(candidate.q2_contexts) or '[none]'}\n"
-                f"evidence:\n{evidence or '[none]'}"
-            )
-        return "\n\n".join(blocks)
 
     @staticmethod
     def _suppress_unbacked_q2_literals(

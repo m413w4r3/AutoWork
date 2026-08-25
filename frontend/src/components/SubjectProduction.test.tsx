@@ -152,7 +152,7 @@ describe("SubjectProduction", () => {
                 version: null,
                 error_code: null,
                 error_message: null,
-                detail: "Qualification de 83 IOC",
+                detail: "Extraction technique de 83 éléments",
               },
             },
           }),
@@ -163,7 +163,7 @@ describe("SubjectProduction", () => {
     renderProduction();
 
     expect(
-      await screen.findByText(/Qualification de 83 IOC/),
+      await screen.findByText(/Extraction technique de 83 éléments/),
     ).toBeInTheDocument();
   });
 

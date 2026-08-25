@@ -34,8 +34,6 @@ from cti_app.domain.entities import SourceDocument
 from cti_app.domain.publication import ArtifactType
 
 PACK_BUILDER_VERSION: Final = "ioc-candidate-pack-v2"
-DEFAULT_MAX_CANDIDATES_PER_BATCH: Final = 64
-DEFAULT_MAX_BATCH_CHARS: Final = 120_000
 MAX_SNIPPETS_PER_SOURCE: Final = 3
 SNIPPET_CONTEXT_CHARS: Final = 200
 
@@ -104,20 +102,11 @@ class IocCandidate:
 
 
 @dataclass(frozen=True, slots=True)
-class IocCandidateBatch:
-    batch_id: str
-    ordinal: int
-    candidates: tuple[IocCandidate, ...]
-    serialized_chars: int
-
-
-@dataclass(frozen=True, slots=True)
 class IocCandidatePack:
     pack_version: str
     parser_versions: tuple[str, ...]
     builder_version: str
     candidates: tuple[IocCandidate, ...]
-    batches: tuple[IocCandidateBatch, ...]
     total_candidates: int
     total_evidence_occurrences: int
     sources_mapped: int
@@ -182,8 +171,6 @@ def build_candidate_pack(
     provisional_iocs: Sequence[ProvisionalDiscoveryIoc] = (),
     discovery_publications: Mapping[UUID, DiscoveryPublicationEvidence] | None = None,
     q2_literals: Sequence[Q2LiteralCandidate] = (),
-    max_candidates_per_batch: int = DEFAULT_MAX_CANDIDATES_PER_BATCH,
-    max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
 ) -> IocCandidatePack:
     """Build a canonical pack from already-loaded persisted records.
 
@@ -191,9 +178,6 @@ def build_candidate_pack(
     decoded text from its ``text_blob_id``.  Missing text is retained as
     internal provenance and reported as a warning; it never creates a source.
     """
-    if max_candidates_per_batch <= 0 or max_batch_chars <= 0:
-        raise ValueError("Batch limits must be positive")
-
     source_lookup = source_ids_by_document(collections, source_documents, reference_report)
     referenced_document_ids = {
         collection.source_document_id
@@ -462,7 +446,6 @@ def build_candidate_pack(
     candidates = tuple(
         sorted(candidates_list, key=lambda item: (item.artifact_type.value, item.normalized_value))
     )
-    batches = _make_batches(candidates, max_candidates_per_batch, max_batch_chars)
     occurrences = tuple(o for values in groups.values() for o in values)
     mapped_source_ids = {
         source_id for occurrence in occurrences for source_id in occurrence.source_ids
@@ -483,9 +466,6 @@ def build_candidate_pack(
         "parser_versions": artifact_versions,
         "builder_version": PACK_BUILDER_VERSION,
         "candidates": [_candidate_hash_json(candidate) for candidate in candidates],
-        "batches": [
-            [candidate.candidate_id for candidate in batch.candidates] for batch in batches
-        ],
     }
     pack_hash = _sha256(canonical_without_hash)
     return IocCandidatePack(
@@ -493,7 +473,6 @@ def build_candidate_pack(
         parser_versions=artifact_versions,
         builder_version=PACK_BUILDER_VERSION,
         candidates=candidates,
-        batches=batches,
         total_candidates=len(candidates),
         total_evidence_occurrences=total_occurrences,
         sources_mapped=len(mapped_source_ids),
@@ -746,33 +725,6 @@ def _candidate_hash_json(candidate: IocCandidate) -> dict[str, object]:
         ],
         "q2_contexts": candidate.q2_contexts,
     }
-
-
-def _make_batches(
-    candidates: tuple[IocCandidate, ...], max_candidates: int, max_chars: int
-) -> tuple[IocCandidateBatch, ...]:
-    batches: list[IocCandidateBatch] = []
-    current: list[IocCandidate] = []
-    for candidate in candidates:
-        prospective = [*current, candidate]
-        prospective_chars = len(_canonical_json([_candidate_json(item) for item in prospective]))
-        if current and (len(current) >= max_candidates or prospective_chars > max_chars):
-            batches.append(_batch(len(batches), current))
-            current = []
-        current.append(candidate)
-    if current:
-        batches.append(_batch(len(batches), current))
-    return tuple(batches)
-
-
-def _batch(ordinal: int, candidates: Sequence[IocCandidate]) -> IocCandidateBatch:
-    payload = [_candidate_json(candidate) for candidate in candidates]
-    return IocCandidateBatch(
-        batch_id="batch-" + hashlib.sha256(_canonical_json(payload).encode()).hexdigest(),
-        ordinal=ordinal,
-        candidates=tuple(candidates),
-        serialized_chars=len(_canonical_json(payload)),
-    )
 
 
 def _canonical_json(value: object) -> str:

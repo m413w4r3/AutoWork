@@ -301,7 +301,7 @@ async def test_retry_reuses_the_same_logical_model_turn() -> None:
 
 @pytest.mark.parametrize(
     "stage",
-    ("references", "extraction", "ioc-qualification-pack-0-2", "synthesis"),
+    ("references", "extraction", "synthesis"),
 )
 async def test_prompt_version_creates_a_new_logical_turn(stage: str) -> None:
     orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q1])
@@ -395,7 +395,7 @@ async def test_extraction_reuses_the_same_conversation_and_the_q1_corpus() -> No
     assert result["supported_items"] == 3
     assert result["candidate_pack_hash"]
     artifact = uow.production_artifacts.items[-1]
-    diagnostics = artifact.metadata["ioc_qualification"]
+    diagnostics = artifact.metadata["deterministic_verification"]
     assert diagnostics["candidate_pack_hash"] == result["candidate_pack_hash"]
     assert diagnostics["initial_candidate_pack_hash"] == result["initial_candidate_pack_hash"]
 

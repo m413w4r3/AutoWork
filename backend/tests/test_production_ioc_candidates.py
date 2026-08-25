@@ -227,11 +227,10 @@ def test_candidate_and_pack_hash_are_canonical_and_evidence_changes_hash():
     assert changed.pack_hash != first.pack_hash
 
 
-def test_batching_is_stable_and_bounded_by_candidate_count():
+def test_candidate_pack_is_stable():
     rows = [_records(f"host-{i}.example") for i in range(5)]
-    pack = _pack(rows[::-1], _report("https://news.test/a"), max_candidates_per_batch=2)
-    assert [len(batch.candidates) for batch in pack.batches] == [2, 2, 1]
-    assert [batch.ordinal for batch in pack.batches] == [0, 1, 2]
+    pack = _pack(rows[::-1], _report("https://news.test/a"))
+    assert pack.total_candidates == 5
 
 
 def test_input_order_does_not_change_canonical_result():

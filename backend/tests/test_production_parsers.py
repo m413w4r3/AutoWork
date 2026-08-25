@@ -311,7 +311,7 @@ def test_extraction_without_any_item_is_unusable() -> None:
     assert "no_usable_item" in result.errors
 
 
-# --- Q3 --------------------------------------------------------------------
+# --- Synthesis validation --------------------------------------------------
 
 
 def _corpus() -> ReferenceReport:

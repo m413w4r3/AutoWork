@@ -748,7 +748,7 @@ def parse_technical_extraction(
     return result
 
 
-# --- Q3 --------------------------------------------------------------------
+# --- Synthesis validation --------------------------------------------------
 
 
 @dataclass(frozen=True)
