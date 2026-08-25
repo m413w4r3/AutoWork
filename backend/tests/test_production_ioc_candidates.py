@@ -10,7 +10,14 @@ from cti_app.application.production_ioc_candidates import (
     build_candidate_pack,
 )
 from cti_app.application.production_normalization import normalize_indicator_value
-from cti_app.application.production_parsers import ParsedSource, ReferenceReport
+from cti_app.application.production_parsers import (
+    DisplayPolicy,
+    ExtractionItem,
+    IndicatorStatus,
+    ParsedSource,
+    ReferenceReport,
+    TechnicalExtraction,
+)
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
@@ -375,6 +382,27 @@ def test_discovery_only_is_retained_but_unknown_publication_never_fabricates_sou
     assert pack.discovery_only_candidates == 1
     assert pack.discovery_unmatched == 1
     assert any("discovery_publication_unresolved" in warning for warning in pack.warnings)
+
+    extraction = TechnicalExtraction(
+        items=(
+            ExtractionItem(
+                local_id="q2-1",
+                category="network",
+                value="only.example",
+                context="Q2 discovery-only proposal",
+                artifact_type=ArtifactType.DOMAIN,
+                attack_id=None,
+                reference_ids=(),
+                source_ids=("S1",),
+                supported=True,
+            ),
+        )
+    )
+    filtered = ProductionWorkflowOrchestrator._suppress_unbacked_q2_literals(
+        extraction, pack.candidates
+    )
+    assert filtered.items[0].indicator_status is IndicatorStatus.EXCLUDED
+    assert filtered.items[0].display_policy is DisplayPolicy.HIDDEN
 
 
 def test_discovery_defanged_duplicate_hashes_and_unsupported_type_is_ignored():

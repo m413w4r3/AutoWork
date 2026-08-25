@@ -18,6 +18,7 @@ import pytest
 
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_evidence_pack import EvidenceChunk, ProductionEvidencePack
 from cti_app.application.production_parsers import (
     parse_reference_report,
     reference_report_from_json,
@@ -28,7 +29,7 @@ from cti_app.application.source_evidence_processing import (
     ReferencedEvidenceLink,
     SourceEvidenceProcessingResult,
 )
-from cti_app.domain.collection import CollectionState
+from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.model_conversations import ConversationMode
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -115,6 +116,22 @@ class _Blobs:
         return self.data[blob_id]
 
 
+class _ArchiveProcessor:
+    def __init__(self, texts: dict[UUID, str]) -> None:
+        self.texts = texts
+
+    async def read_derived_text(self, blob_id: UUID) -> str:
+        return self.texts.get(blob_id, "198.51.100.10 malicious.example")
+
+    async def process_subject(self, subject_id: UUID) -> SourceEvidenceProcessingResult:
+        del subject_id
+        return SourceEvidenceProcessingResult(2, 2, 0, 0, 2, ())
+
+    async def select_referenced_evidence(self, subject_id: UUID) -> tuple[object, ...]:
+        del subject_id
+        return ()
+
+
 class _Groups:
     def __init__(self, title: str) -> None:
         self._title = title
@@ -169,18 +186,59 @@ class _Collections:
         return self.items
 
 
+class _Documents:
+    def __init__(self) -> None:
+        self.items: list[Any] = []
+
+    async def list_for_subject(self, subject_id: UUID) -> list[Any]:
+        del subject_id
+        return self.items
+
+
+class _DerivedArtifacts:
+    def __init__(self) -> None:
+        self.items: dict[UUID, Any] = {}
+
+    async def get(self, artifact_id: UUID) -> Any:
+        return self.items.get(artifact_id)
+
+
+class _Indicators:
+    async def list_for_subject(self, subject_id: UUID) -> list[Any]:
+        del subject_id
+        return []
+
+
 class _CollectionService:
     """Accepts supplemental sources and marks them archived immediately."""
 
-    def __init__(self, collections: _Collections) -> None:
-        self._collections = collections
+    def __init__(self, uow: _Uow) -> None:
+        self._uow = uow
         self.added: list[Any] = []
         self.collected = 0
         self.archived: list[UUID] = []
 
     async def add_supplemental_sources(self, subject_id: UUID, sources: Any) -> list[Any]:
         for source in sources:
-            self._collections.items.append(
+            if any(item.canonical_url == source.url for item in self._uow.source_collections.items):
+                self.added.append(source)
+                continue
+            document_id = uuid4()
+            artifact_id = uuid4()
+            blob_id = uuid4()
+            self._uow.source_documents.items.append(
+                type(
+                    "Document",
+                    (),
+                    {"id": document_id, "final_url": source.url, "title": source.title},
+                )()
+            )
+            self._uow.derived_artifacts.items[artifact_id] = type(
+                "Artifact",
+                (),
+                {"id": artifact_id, "text_blob_id": blob_id, "parser_version": "test-parser-1"},
+            )()
+            self._uow.source_collections.items.append(
                 type(
                     "Collection",
                     (),
@@ -193,6 +251,11 @@ class _CollectionService:
                         "proposed_role": source.role,
                         "do_not_submit": False,
                         "external_llm_allowed": True,
+                        "id": uuid4(),
+                        "source_document_id": document_id,
+                        "derived_artifact_id": artifact_id,
+                        "origin_kind": SourceOriginKind.REFERENCE_RESEARCH,
+                        "parent_source_collection_id": None,
                     },
                 )()
             )
@@ -204,7 +267,47 @@ class _CollectionService:
 
     async def add_referenced_evidence(self, subject_id: UUID, resources: Any) -> list[Any]:
         del subject_id
-        children = [type("Collection", (), {"id": uuid4()})() for _ in resources]
+        children = []
+        for resource in resources:
+            document_id = uuid4()
+            artifact_id = uuid4()
+            self._uow.source_documents.items.append(
+                type(
+                    "Document",
+                    (),
+                    {
+                        "id": document_id,
+                        "final_url": resource.url,
+                        "title": resource.anchor_text,
+                    },
+                )()
+            )
+            self._uow.derived_artifacts.items[artifact_id] = type(
+                "Artifact",
+                (),
+                {"id": artifact_id, "text_blob_id": uuid4(), "parser_version": "test-parser-1"},
+            )()
+            child = type(
+                "Collection",
+                (),
+                {
+                    "id": uuid4(),
+                    "canonical_url": resource.url,
+                    "state": CollectionState.ARCHIVED,
+                    "title": resource.anchor_text,
+                    "publisher": None,
+                    "published_at": None,
+                    "proposed_role": None,
+                    "do_not_submit": False,
+                    "external_llm_allowed": True,
+                    "source_document_id": document_id,
+                    "derived_artifact_id": artifact_id,
+                    "origin_kind": SourceOriginKind.REFERENCED_EVIDENCE,
+                    "parent_source_collection_id": resource.parent_source_collection_id,
+                },
+            )()
+            self._uow.source_collections.items.append(child)
+            children.append(child)
         self.added.extend(resources)
         return children
 
@@ -234,6 +337,9 @@ class _Uow:
     run: SubjectProductionRun
     production_artifacts: _Artifacts = field(default_factory=_Artifacts)
     source_collections: _Collections = field(default_factory=_Collections)
+    source_documents: _Documents = field(default_factory=_Documents)
+    derived_artifacts: _DerivedArtifacts = field(default_factory=_DerivedArtifacts)
+    indicators: _Indicators = field(default_factory=_Indicators)
     editions: _Editions = field(default_factory=_Editions)
     editorial_groups: _Groups = field(default_factory=lambda: _Groups("TAG-182"))
     subject_production_runs: _Runs = field(init=False)
@@ -262,15 +368,60 @@ def _build(
     )
     run.start_running()
     uow = _Uow(run=run)
+    for url, _text in (
+        ("https://research.example/rapport", "198.51.100.10 malicious.example"),
+        ("https://other.example/analyse", "203.0.113.7 evil.example"),
+    ):
+        document_id, artifact_id, blob_id = uuid4(), uuid4(), uuid4()
+        uow.source_documents.items.append(
+            type("Document", (), {"id": document_id, "final_url": url, "title": url})()
+        )
+        uow.derived_artifacts.items[artifact_id] = type(
+            "Artifact",
+            (),
+            {"id": artifact_id, "text_blob_id": blob_id, "parser_version": "test-parser-1"},
+        )()
+        uow.source_collections.items.append(
+            type(
+                "Collection",
+                (),
+                {
+                    "id": uuid4(),
+                    "canonical_url": url,
+                    "state": CollectionState.ARCHIVED,
+                    "title": url,
+                    "publisher": "test",
+                    "published_at": None,
+                    "proposed_role": None,
+                    "do_not_submit": False,
+                    "external_llm_allowed": True,
+                    "source_document_id": document_id,
+                    "derived_artifact_id": artifact_id,
+                        "origin_kind": SourceOriginKind.REFERENCE_RESEARCH,
+                    "parent_source_collection_id": None,
+                },
+            )()
+        )
+    archive_texts = {
+        artifact.text_blob_id: text
+        for artifact, text in zip(
+            uow.derived_artifacts.items.values(),
+            ("198.51.100.10 malicious.example", "203.0.113.7 evil.example"),
+            strict=True,
+        )
+    }
     conversations = _FakeConversations(answers)
     store = ProductionArtifactStore(_Blobs())  # type: ignore[arg-type]
+    archive_processor = _ArchiveProcessor(archive_texts)
+    if processor is not None and not hasattr(processor, "read_derived_text"):
+        processor.read_derived_text = archive_processor.read_derived_text
     orchestrator = ProductionWorkflowOrchestrator(
         lambda: uow,  # type: ignore[arg-type]
         model_service=conversations,  # type: ignore[arg-type]
-        collection_service=_CollectionService(uow.source_collections),  # type: ignore[arg-type]
+        collection_service=_CollectionService(uow),  # type: ignore[arg-type]
         artifact_store=store,
         diagnostics=diagnostics,
-        source_evidence_processor=processor,
+        source_evidence_processor=processor or archive_processor,
     )
     return orchestrator, uow, conversations
 
@@ -354,6 +505,39 @@ async def test_repair_version_creates_a_new_logical_repair_turn() -> None:
     }
 
 
+async def test_q2_repairs_have_distinct_chunk_idempotency_keys() -> None:
+    orchestrator, uow, conversations = _build([BROKEN_Q1, PERFECT_Q1, BROKEN_Q1, PERFECT_Q1])
+    conversation_id = (await conversations.create()).id
+
+    for chunk_id in ("chunk-a", "chunk-b"):
+        result, _, _ = await orchestrator._ask_with_format_repair(
+            run=uow.run,
+            conversation_id=conversation_id,
+            stage="extraction",
+            prompt="chunk prompt",
+            prompt_version="4",
+            repair_version="1",
+            mode=ConversationMode.FRESH,
+            repair_mode=ConversationMode.FRESH,
+            request_identity=chunk_id,
+            parse=lambda value: parse_reference_report(value, date.today()),
+            external_llm_allowed=True,
+        )
+        assert result is not None and result.usable
+
+    repair_keys = [key for _, _, key, _ in conversations.calls if "format-repair" in key]
+    assert len(repair_keys) == 2
+    assert len(set(repair_keys)) == 2
+    assert all(
+        f"-v4-{chunk}-rv1" in key
+        for chunk, key in zip(("chunk-a", "chunk-b"), repair_keys, strict=True)
+    )
+    repair_messages = [
+        message for _, _, key, message in conversations.calls if "format-repair" in key
+    ]
+    assert all("Answer to reformat:\n" + BROKEN_Q1 in message for message in repair_messages)
+
+
 async def test_references_stage_stores_a_readable_report() -> None:
     orchestrator, uow, conversations = _build([PERFECT_Q1])
     uow.run.current_stage = SubjectProductionStage.REFERENCES
@@ -379,8 +563,8 @@ async def test_references_stage_stores_a_readable_report() -> None:
     assert conversations.calls[0][1] is ConversationMode.FRESH
 
 
-async def test_extraction_reuses_the_same_conversation_and_the_q1_corpus() -> None:
-    orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2])
+async def test_extraction_uses_independent_stateless_conversations_per_q2_chunk() -> None:
+    orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2, PERFECT_Q2])
     uow.run.current_stage = SubjectProductionStage.REFERENCES
     await orchestrator.execute_stage(
         uow.run.id, SubjectProductionStage.REFERENCES, correlation_id="c1"
@@ -399,13 +583,54 @@ async def test_extraction_reuses_the_same_conversation_and_the_q1_corpus() -> No
     assert diagnostics["candidate_pack_hash"] == result["candidate_pack_hash"]
     assert diagnostics["initial_candidate_pack_hash"] == result["initial_candidate_pack_hash"]
 
-    # One conversation, Q1 fresh then Q2 continue.
-    assert len(conversations.created) == 1
+    # Q1 and every Q2 chunk use independent fresh conversations.
+    assert len(conversations.created) == 3
     assert [mode for _, mode, _, _ in conversations.calls] == [
         ConversationMode.FRESH,
-        ConversationMode.CONTINUE,
+        ConversationMode.FRESH,
+        ConversationMode.FRESH,
     ]
-    assert len({cid for cid, _, _, _ in conversations.calls}) == 1
+    assert len({cid for cid, _, _, _ in conversations.calls}) == 3
+
+
+async def test_three_q2_chunks_with_one_loss_produce_no_canonical_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator, uow, conversations = _build(
+        [PERFECT_Q1, PERFECT_Q2, BROKEN_Q1, BROKEN_Q1, PERFECT_Q2]
+    )
+    chunks = tuple(
+        EvidenceChunk(
+            source_document_id=uuid4(),
+            parent_source_ids=(),
+            source_ids=(f"S{index}",),
+            title=f"chunk {index}",
+            origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
+            chunk_id=f"q2-chunk-{index}",
+            text=f"archived evidence {index}",
+            sha256=f"hash-{index}",
+        )
+        for index in range(1, 4)
+    )
+
+    async def fake_pack(*args: Any, **kwargs: Any) -> ProductionEvidencePack:
+        return ProductionEvidencePack("ready", "three-chunk-pack", chunks, {})
+
+    monkeypatch.setattr(orchestrator, "_build_production_evidence_pack", fake_pack)
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+    await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.REFERENCES)
+    uow.run.current_stage = SubjectProductionStage.EXTRACTION
+
+    result = await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.EXTRACTION)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "q2_chunk_coverage_failed"
+    assert result["completed_chunk_ids"] == ["q2-chunk-1", "q2-chunk-3"]
+    assert result["failed_chunk_ids"] == ["q2-chunk-2"]
+    assert [artifact.stage for artifact in uow.production_artifacts.items] == [
+        ProductionArtifactStage.REFERENCES
+    ]
+    assert len(conversations.created) == 4
 
 
 async def test_deterministic_evidence_processing_runs_before_q2() -> None:
@@ -427,7 +652,9 @@ async def test_deterministic_evidence_processing_runs_before_q2() -> None:
             return ()
 
     processor = _Processor()
-    orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2], processor=processor)
+    orchestrator, uow, conversations = _build(
+        [PERFECT_Q1, PERFECT_Q2, PERFECT_Q2], processor=processor
+    )
     processor.conversations = conversations
     uow.run.current_stage = SubjectProductionStage.REFERENCES
     await orchestrator.execute_stage(
@@ -465,7 +692,7 @@ async def test_linked_evidence_is_archived_before_deterministic_extraction() -> 
             return SourceEvidenceProcessingResult(1, 1, 0, 0, 0, ())
 
     processor = _Processor()
-    orchestrator, uow, _ = _build([PERFECT_Q1, PERFECT_Q2], processor=processor)
+    orchestrator, uow, _ = _build([PERFECT_Q1, PERFECT_Q2, PERFECT_Q2], processor=processor)
     collection_service = cast(_CollectionService, orchestrator._collection_service)
     processor.archived = collection_service.archived
     uow.run.current_stage = SubjectProductionStage.REFERENCES
@@ -587,6 +814,9 @@ async def test_event_without_any_archived_source_sends_the_run_to_review() -> No
     uow.run.current_stage = SubjectProductionStage.REFERENCES
 
     # Nothing ever gets archived.
+    uow.source_collections.items.clear()
+    uow.source_documents.items.clear()
+    uow.derived_artifacts.items.clear()
     async def add_nothing(subject_id: Any, sources: Any) -> list[Any]:
         return []
 

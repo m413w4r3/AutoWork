@@ -13,8 +13,10 @@ from dataclasses import dataclass, field
 from uuid import UUID
 
 from cti_app.application.extraction import CHUNKING_VERSION, ChunkingPolicy, segment_text
+from cti_app.application.production_ioc_candidates import source_ids_by_document
 from cti_app.application.production_parsers import ReferenceReport
 from cti_app.domain.collection import CollectionState, SourceCollection, SourceOriginKind
+from cti_app.domain.discovery import canonicalize_http_url
 from cti_app.domain.entities import SourceDocument
 
 PACK_VERSION = "production-evidence-pack-v1"
@@ -34,6 +36,9 @@ class ArchivedCorpusDocument:
     collection: SourceCollection
     document: SourceDocument
     text: str
+    derived_artifact_id: UUID | None = None
+    parser_version: str | None = None
+    source_document_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +89,10 @@ def build_production_evidence_pack(
     if absolute_max_document_chars <= 0:
         raise ValueError("absolute_max_document_chars must be positive")
 
-    source_by_url = {source.canonical_url: source for source in reference_report.sources}
+    all_items = tuple(archived_publications) + tuple(archived_referenced_evidence)
+    collections = tuple(item.collection for item in all_items)
+    documents = tuple(item.document for item in all_items)
+    source_map = source_ids_by_document(collections, documents, reference_report)
     publications: dict[UUID, ArchivedCorpusDocument] = {}
     for item in archived_publications:
         collection = item.collection
@@ -93,8 +101,10 @@ def build_production_evidence_pack(
             or collection.origin_kind is SourceOriginKind.REFERENCED_EVIDENCE
         ):
             continue
-        source = source_by_url.get(collection.canonical_url)
-        if source is not None and collection.source_document_id == item.document.id:
+        if (
+            collection.source_document_id == item.document.id
+            and source_map.get(item.document.id)
+        ):
             publications[item.document.id] = item
 
     publication_collection_ids = {item.collection.id for item in publications.values()}
@@ -121,8 +131,21 @@ def build_production_evidence_pack(
                 "derived_text_empty", f"Document {item.document.id} has no derived text"
             )
 
-        source_ids = _source_ids(reference_report, item, publications)
+        source_ids = source_map.get(item.document.id, ())
         parent_source_ids = source_ids if item.collection.parent_source_collection_id else ()
+        parent = _parent_publication(item, publications)
+        internal_metadata = {
+            "canonical_source_url": _actual_canonical_url(item),
+            "source_document_id": str(item.source_document_id or item.document.id),
+        }
+        if item.derived_artifact_id is not None:
+            internal_metadata["derived_artifact_id"] = str(item.derived_artifact_id)
+        if item.parser_version:
+            internal_metadata["parser_version"] = item.parser_version
+        if parent is not None:
+            internal_metadata["parent_canonical_url"] = _canonicalize_url(
+                parent.collection.canonical_url
+            )
         for index, chunk in enumerate(segment_text(item.text, chunking_policy)):
             chunk_id = f"{item.document.id}:{index:06d}:{chunk.sha256[:16]}"
             chunks.append(
@@ -135,7 +158,7 @@ def build_production_evidence_pack(
                     chunk_id=chunk_id,
                     text=chunk.text,
                     sha256=chunk.sha256,
-                    internal_metadata={"canonical_source_url": _canonical_url(item, publications)},
+                    internal_metadata=internal_metadata,
                 )
             )
 
@@ -153,15 +176,16 @@ def build_production_evidence_pack(
         }
         for chunk in chunks
     ]
+    parser_versions = _parser_versions(selected)
     pack_hash = hashlib.sha256(
         json.dumps(
-            {"version": PACK_VERSION, "parser_versions": PARSER_VERSIONS, "chunks": payload},
+            {"version": PACK_VERSION, "parser_versions": parser_versions, "chunks": payload},
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    return ProductionEvidencePack("ready", pack_hash, tuple(chunks), PARSER_VERSIONS)
+    return ProductionEvidencePack("ready", pack_hash, tuple(chunks), parser_versions)
 
 
 def _archived(collection: SourceCollection) -> bool:
@@ -172,43 +196,37 @@ def _archived(collection: SourceCollection) -> bool:
     }
 
 
-def _source_ids(
-    report: ReferenceReport,
+def _parent_publication(
     item: ArchivedCorpusDocument,
     publications: Mapping[UUID, ArchivedCorpusDocument],
-) -> tuple[str, ...]:
-    if item.collection.parent_source_collection_id:
-        parent = next(
-            (
-                value
-                for value in publications.values()
-                if value.collection.id == item.collection.parent_source_collection_id
-            ),
-            None,
-        )
-        if parent is None:
-            return ()
-        url = parent.collection.canonical_url
-    else:
-        url = item.collection.canonical_url
-    return tuple(source.local_id for source in report.sources if source.canonical_url == url)
+) -> ArchivedCorpusDocument | None:
+    return next(
+        (
+            value
+            for value in publications.values()
+            if value.collection.id == item.collection.parent_source_collection_id
+        ),
+        None,
+    )
 
 
-def _canonical_url(
-    item: ArchivedCorpusDocument,
-    publications: Mapping[UUID, ArchivedCorpusDocument],
-) -> str:
-    if item.collection.parent_source_collection_id:
-        parent = next(
-            (
-                value
-                for value in publications.values()
-                if value.collection.id == item.collection.parent_source_collection_id
-            ),
-            None,
-        )
-        return parent.collection.canonical_url if parent else item.collection.canonical_url
-    return item.collection.canonical_url
+def _actual_canonical_url(item: ArchivedCorpusDocument) -> str:
+    return _canonicalize_url(item.document.final_url or item.collection.canonical_url)
+
+
+def _canonicalize_url(value: str) -> str:
+    try:
+        return canonicalize_http_url(value)
+    except ValueError:
+        return value
+
+
+def _parser_versions(items: Sequence[ArchivedCorpusDocument]) -> dict[str, str]:
+    versions = dict(PARSER_VERSIONS)
+    for item in items:
+        if item.derived_artifact_id is not None and item.parser_version:
+            versions[f"artifact:{item.derived_artifact_id}"] = item.parser_version
+    return versions
 
 
 def _review_pack(code: str, message: str) -> ProductionEvidencePack:

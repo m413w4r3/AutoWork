@@ -228,6 +228,8 @@ class ProductionWorkflowOrchestrator:
         parse: Callable[[str], Any],
         external_llm_allowed: bool,
         web_search: bool = False,
+        repair_mode: ConversationMode = ConversationMode.CONTINUE,
+        request_identity: str | None = None,
     ) -> tuple[Any | None, str, UUID | None]:
         """Ask the model, and give it exactly one chance to fix its formatting.
 
@@ -236,7 +238,8 @@ class ProductionWorkflowOrchestrator:
         the turn id it came from.
         """
         assert self._model_service is not None
-        idempotency_key = f"{stage}-{run.id}-v{prompt_version}"
+        identity = f"-{request_identity}" if request_identity else ""
+        idempotency_key = f"{stage}-{run.id}-v{prompt_version}{identity}"
         turn = await self._model_service.add_turn(
             conversation_id=conversation_id,
             message=prompt,
@@ -247,6 +250,7 @@ class ProductionWorkflowOrchestrator:
             correlation_id=self._correlation_id,
             context_subject_id=run.subject_id,
         )
+        self._last_model_run_id = getattr(turn, "model_run_id", None)
         raw = await self._turn_output_text(conversation_id, turn.id) or ""
         self._diagnostics.record_model_answer(
             run_id=run.id,
@@ -268,17 +272,28 @@ class ProductionWorkflowOrchestrator:
         repair_prompt = ProductionPromptTemplates.get_format_repair_prompt(
             stage=stage, problems=result.errors
         )
-        repair_idempotency_key = f"{stage}-format-repair-{run.id}-v{repair_version}"
+        # Q2 repairs are deliberately fresh/stateless.  A fresh transport has
+        # no previous answer to reformat, so carry only this request's raw
+        # answer in its repair prompt.  This never exposes Q1 or another Q2
+        # chunk, while preserving a usable one-shot repair path.
+        if repair_mode is ConversationMode.FRESH:
+            repair_prompt += f"\n\nAnswer to reformat:\n{raw}"
+        repair_idempotency_key = (
+            f"{stage}-format-repair-{run.id}-v{prompt_version}{identity}-rv{repair_version}"
+            if request_identity
+            else f"{stage}-format-repair-{run.id}-v{repair_version}"
+        )
         repair_turn = await self._model_service.add_turn(
             conversation_id=conversation_id,
             message=repair_prompt,
-            mode=ConversationMode.CONTINUE,
+            mode=repair_mode,
             external_llm_allowed=external_llm_allowed,
             web_search=False,
             idempotency_key=repair_idempotency_key,
             correlation_id=self._correlation_id,
             context_subject_id=run.subject_id,
         )
+        self._last_model_run_id = getattr(repair_turn, "model_run_id", None)
         repaired_raw = await self._turn_output_text(conversation_id, repair_turn.id) or ""
         self._diagnostics.record_model_answer(
             run_id=run.id,
@@ -763,61 +778,111 @@ class ProductionWorkflowOrchestrator:
 
             subject_title, _ = await self._subject_context(uow, run.subject_id)
             prompt = ProductionPromptTemplates.get_extraction_prompt(subject_title=subject_title)
-            archive_repositories_available = all(
-                hasattr(uow, name)
-                for name in ("source_collections", "source_documents", "derived_artifacts")
-            )
-
             try:
+                if not evidence_pack.chunks:
+                    return {
+                        "stage": "extraction",
+                        "status": "needs_review",
+                        "error_code": "evidence_pack_empty",
+                        "error": "ProductionEvidencePack contains no Q2 chunks",
+                        "completed_chunk_ids": [],
+                        "failed_chunk_ids": [],
+                    }
                 parsed_items = []
                 parsed_warnings: list[str] = []
+                repair_actions: list[str] = []
                 raw_parts: list[str] = []
                 turn_id = None
-                # Only lightweight unit-test UoWs lack archive repositories.
-                # Production always takes the explicit-pack path.
-                legacy_fallback = not evidence_pack.chunks and not archive_repositories_available
-                chunk_count = len(evidence_pack.chunks) or int(legacy_fallback)
-                for index in range(chunk_count):
-                    chunk = evidence_pack.chunks[index] if not legacy_fallback else None
+                completed_chunk_ids: list[str] = []
+                failed_chunk_ids: list[str] = []
+                chunk_failures: dict[str, str] = {}
+                chunk_provenance: dict[str, dict[str, str | None]] = {}
+                for chunk in evidence_pack.chunks:
                     chunk_prompt = (
                         prompt
-                        if chunk is None
-                        else (
-                            prompt
-                            + "\n\nCorpus Q2 — segment borné, uniquement données archivées.\n"
-                            + f"chunk_id: {chunk.chunk_id}\n"
-                            + f"source_ids: {', '.join(chunk.source_ids) or 'none'}\n"
-                            + chunk.text
+                        + "\n\nCorpus Q2 — segment borné, uniquement données archivées.\n"
+                        + f"chunk_id: {chunk.chunk_id}\n"
+                        + f"source_ids: {', '.join(chunk.source_ids) or 'none'}\n"
+                        + chunk.text
+                    )
+                    try:
+                        chunk_conversation = await self._open_conversation(run, subject_title)
+                        chunk_result, chunk_raw, chunk_turn_id = (
+                            await self._ask_with_format_repair(
+                                run=run,
+                                conversation_id=chunk_conversation.id,
+                                stage="extraction",
+                                prompt=chunk_prompt,
+                                prompt_version=EXTRACTION_PROMPT_VERSION,
+                                repair_version=EXTRACTION_FORMAT_REPAIR_VERSION,
+                                mode=ConversationMode.FRESH,
+                                repair_mode=ConversationMode.FRESH,
+                                request_identity=chunk.chunk_id,
+                                parse=lambda text: parse_technical_extraction(text, report),
+                                external_llm_allowed=policy_allows,
+                                web_search=False,
+                            )
                         )
-                    )
-                    parsed, raw, chunk_turn_id = await self._ask_with_format_repair(
-                        run=run,
-                        conversation_id=conversation_id,
-                        stage="extraction",
-                        prompt=chunk_prompt,
-                        prompt_version=(
-                            EXTRACTION_PROMPT_VERSION
-                            if chunk is None
-                            else f"{EXTRACTION_PROMPT_VERSION}-{chunk.chunk_id}"
+                    except Exception as exc:
+                        failed_chunk_ids.append(chunk.chunk_id)
+                        chunk_failures[chunk.chunk_id] = str(exc)
+                        continue
+                    chunk_provenance[chunk.chunk_id] = {
+                        "logical_request_id": (
+                            f"extraction-{run.id}-v{EXTRACTION_PROMPT_VERSION}-"
+                            f"{chunk.chunk_id}"
                         ),
-                        repair_version=EXTRACTION_FORMAT_REPAIR_VERSION,
-                        mode=ConversationMode.CONTINUE,
-                        parse=lambda text: parse_technical_extraction(text, report),
-                        external_llm_allowed=policy_allows,
-                        web_search=False,
+                        "model_run_id": (
+                            str(self._last_model_run_id)
+                            if self._last_model_run_id is not None
+                            else None
+                        ),
+                        "turn_id": str(chunk_turn_id) if chunk_turn_id else None,
+                    }
+                    if (
+                        chunk_result is None
+                        or not chunk_result.usable
+                        or chunk_result.value is None
+                    ):
+                        failed_chunk_ids.append(chunk.chunk_id)
+                        chunk_failures[chunk.chunk_id] = (
+                            "no response"
+                            if chunk_result is None
+                            else "; ".join(chunk_result.errors)
+                        )
+                        continue
+                    completed_chunk_ids.append(chunk.chunk_id)
+                    parsed_items.extend(chunk_result.value.items)
+                    parsed_warnings.extend(chunk_result.warnings)
+                    repair_actions.extend(chunk_result.repair_actions)
+                    raw_parts.append(chunk_raw)
+                    turn_id = chunk_turn_id
+                if failed_chunk_ids:
+                    self._diagnostics.record(
+                        event="extraction.q2_chunk_coverage_failed",
+                        run_id=run.id,
+                        subject_id=run.subject_id,
+                        stage="extraction",
+                        correlation_id=self._correlation_id,
+                        completed_chunk_ids=completed_chunk_ids,
+                        failed_chunk_ids=failed_chunk_ids,
+                        chunk_failures=chunk_failures,
+                        chunk_provenance=chunk_provenance,
                     )
-                    if parsed is not None and parsed.usable and parsed.value is not None:
-                        parsed_items.extend(parsed.value.items)
-                        parsed_warnings.extend(parsed.warnings)
-                        raw_parts.append(raw)
-                        turn_id = chunk_turn_id
-                parsed = (
-                    ParseResult(
-                        value=TechnicalExtraction(tuple(parsed_items)),
-                        warnings=parsed_warnings,
-                    )
-                    if parsed_items
-                    else None
+                    return {
+                        "stage": "extraction",
+                        "status": "needs_review",
+                        "error_code": "q2_chunk_coverage_failed",
+                        "error": "One or more Q2 chunks failed or were unparsable",
+                        "completed_chunk_ids": completed_chunk_ids,
+                        "failed_chunk_ids": failed_chunk_ids,
+                        "chunk_failures": chunk_failures,
+                        "chunk_provenance": chunk_provenance,
+                    }
+                parsed = ParseResult(
+                    value=TechnicalExtraction(tuple(self._merge_q2_items(parsed_items))),
+                    warnings=parsed_warnings,
+                    repair_actions=repair_actions,
                 )
                 raw = "\n\n".join(raw_parts)
             except Exception as e:
@@ -875,6 +940,9 @@ class ProductionWorkflowOrchestrator:
                         {str(chunk.source_document_id) for chunk in evidence_pack.chunks}
                     ),
                     "evidence_pack_parser_versions": dict(evidence_pack.parser_versions),
+                    "completed_chunk_ids": completed_chunk_ids,
+                    "failed_chunk_ids": failed_chunk_ids,
+                    "chunk_provenance": chunk_provenance,
                     **q2_diagnostics,
                     "source_derived_candidates": candidate_pack.source_derived_candidates,
                     "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,
@@ -902,6 +970,9 @@ class ProductionWorkflowOrchestrator:
                     {str(chunk.source_document_id) for chunk in evidence_pack.chunks}
                 ),
                 "evidence_pack_parser_versions": dict(evidence_pack.parser_versions),
+                "completed_chunk_ids": completed_chunk_ids,
+                "failed_chunk_ids": failed_chunk_ids,
+                "chunk_provenance": chunk_provenance,
                 **q2_diagnostics,
                 "source_derived_candidates": candidate_pack.source_derived_candidates,
                 "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,
@@ -958,7 +1029,12 @@ class ProductionWorkflowOrchestrator:
             if document is None or artifact is None:
                 continue
             item = ArchivedCorpusDocument(
-                collection, document, texts.get(artifact.text_blob_id, "")
+                collection=collection,
+                document=document,
+                text=texts.get(artifact.text_blob_id, ""),
+                derived_artifact_id=artifact.id,
+                parser_version=artifact.parser_version,
+                source_document_id=document.id,
             )
             (children if collection.origin_kind.value == "referenced_evidence" else items).append(
                 item
@@ -1138,7 +1214,11 @@ class ProductionWorkflowOrchestrator:
     def _suppress_unbacked_q2_literals(
         extraction: TechnicalExtraction, candidates: tuple[IocCandidate, ...]
     ) -> TechnicalExtraction:
-        known = {(candidate.artifact_type, candidate.normalized_value) for candidate in candidates}
+        known = {
+            (candidate.artifact_type, candidate.normalized_value)
+            for candidate in candidates
+            if candidate.source_backed
+        }
         literal_types = {
             ArtifactType.IP,
             ArtifactType.DOMAIN,
@@ -1167,6 +1247,35 @@ class ProductionWorkflowOrchestrator:
             else:
                 items.append(item)
         return replace(extraction, items=tuple(items))
+
+    @staticmethod
+    def _merge_q2_items(items: list[Any]) -> tuple[Any, ...]:
+        """Collapse overlap duplicates while retaining all source provenance."""
+        merged: dict[tuple[Any, ...], Any] = {}
+        for item in items:
+            value_key = (item.normalized_value or item.value).strip().casefold()
+            key = (
+                item.category,
+                item.artifact_type,
+                item.semantic_type,
+                value_key,
+                tuple(sorted(item.source_ids)),
+            )
+            previous = merged.get(key)
+            if previous is None:
+                merged[key] = item
+                continue
+            context = previous.context
+            if item.context and item.context not in context:
+                context = f"{context} | {item.context}".strip(" |")
+            merged[key] = replace(
+                previous,
+                context=context,
+                reference_ids=tuple(sorted(set(previous.reference_ids + item.reference_ids))),
+                source_ids=tuple(sorted(set(previous.source_ids + item.source_ids))),
+                supported=previous.supported or item.supported,
+            )
+        return tuple(merged.values())
 
     async def _execute_synthesis_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
         if not self._model_service:

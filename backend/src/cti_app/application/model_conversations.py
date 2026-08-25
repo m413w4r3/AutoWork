@@ -267,8 +267,14 @@ class ModelConversationService:
                 external_locator=conversation.external_locator
                 if mode is ConversationMode.CONTINUE
                 else None,
-                parent_turn_id=conversation.head_turn_id,
-                previous_head_hash=parent.output_sha256 if parent else None,
+                parent_turn_id=(
+                    conversation.head_turn_id if mode is ConversationMode.CONTINUE else None
+                ),
+                previous_head_hash=(
+                    parent.output_sha256
+                    if mode is ConversationMode.CONTINUE and parent
+                    else None
+                ),
                 expected_profile=conversation.expected_profile,
                 requested_model=conversation.requested_model,
                 external_id=conversation.external_id,
@@ -300,7 +306,9 @@ class ModelConversationService:
             turn = ModelConversationTurn(
                 conversation_id=conversation.id,
                 sequence=conversation.turn_count,
-                parent_turn_id=conversation.head_turn_id,
+                parent_turn_id=(
+                    conversation.head_turn_id if mode is ConversationMode.CONTINUE else None
+                ),
                 model_run_id=run.id,
                 input_blob_reference=input_reference,
                 input_sha256=input_blob.descriptor.sha256,

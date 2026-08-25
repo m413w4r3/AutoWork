@@ -13,7 +13,12 @@ from cti_app.domain.entities import SourceDocument
 
 
 def _item(
-    *, url: str, origin: SourceOriginKind = SourceOriginKind.DISCOVERY, parent=None, text="x"
+    *,
+    url: str,
+    origin: SourceOriginKind = SourceOriginKind.DISCOVERY,
+    parent=None,
+    text="x",
+    final_url: str | None = None,
 ):
     subject_id, edition_id, group_id = uuid4(), uuid4(), uuid4()
     document_id, collection_id = uuid4(), uuid4()
@@ -42,6 +47,7 @@ def _item(
         external_llm_allowed=True,
         source_collection_id=collection_id,
         title="Title",
+        final_url=final_url,
         id=document_id,
     )
     return ArchivedCorpusDocument(collection, document, text)
@@ -104,3 +110,58 @@ def test_text_change_changes_hash_and_oversize_is_explicit():
     review = build_production_evidence_pack(report, [item], absolute_max_document_chars=3)
     assert review.status == "needs_review"
     assert review.error_code == "document_text_too_large"
+
+
+def test_pack_hash_and_metadata_include_derived_parser_identity():
+    item = _item(url="https://example.test/a", text="archived")
+    artifact_id = uuid4()
+    first = ArchivedCorpusDocument(
+        item.collection,
+        item.document,
+        item.text,
+        derived_artifact_id=artifact_id,
+        parser_version="parser-1",
+        source_document_id=item.document.id,
+    )
+    second = ArchivedCorpusDocument(
+        item.collection,
+        item.document,
+        item.text,
+        derived_artifact_id=artifact_id,
+        parser_version="parser-2",
+        source_document_id=item.document.id,
+    )
+    report = _report(item.collection.canonical_url)
+    first_pack = build_production_evidence_pack(report, [first])
+    second_pack = build_production_evidence_pack(report, [second])
+
+    assert first_pack.pack_hash != second_pack.pack_hash
+    assert first_pack.parser_versions[f"artifact:{artifact_id}"] == "parser-1"
+    assert second_pack.parser_versions[f"artifact:{artifact_id}"] == "parser-2"
+
+
+def test_pack_uses_source_mapping_and_keeps_child_resource_url():
+    parent = _item(
+        url="https://example.test/report/",
+        final_url="https://EXAMPLE.test/report/?utm_source=feed",
+        text="publication",
+    )
+    child = _item(
+        url="https://download.example.test/iocs.json/",
+        final_url="https://DOWNLOAD.example.test/iocs.json/?utm_source=feed",
+        origin=SourceOriginKind.REFERENCED_EVIDENCE,
+        parent=parent.collection.id,
+        text="resource",
+    )
+
+    pack = build_production_evidence_pack(
+        _report("https://example.test/report"), [parent], [child]
+    )
+    resource = next(chunk for chunk in pack.chunks if chunk.source_document_id == child.document.id)
+
+    assert resource.source_ids == ("S1",)
+    assert resource.parent_source_ids == ("S1",)
+    assert resource.internal_metadata["parent_canonical_url"] == "https://example.test/report"
+    assert resource.internal_metadata["canonical_source_url"] == (
+        "https://download.example.test/iocs.json"
+    )

@@ -86,6 +86,7 @@ def test_select_technical_links_rejects_download_without_technical_signal(
         ("/indicators.json", "Download"),
         ("/download", "YARA rules"),
         ("/download", "Sigma rules"),
+        ("/download", "Threat indicators"),
         ("/technical-appendix.pdf", "Download report"),
     ),
 )
