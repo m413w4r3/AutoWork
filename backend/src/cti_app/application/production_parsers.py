@@ -1,4 +1,4 @@
-"""Parsers for the semi-structured Markdown returned by the production model.
+"""Q1 Markdown-tolerant parsers and Q2 structured Pydantic schemas.
 
 Strict JSON is a poor contract for a chat model: a single stray character makes
 the whole answer unusable. These parsers accept a forgiving Markdown dialect and
@@ -159,7 +159,7 @@ class TechnicalExtraction:
 
 
 class Q2FactProposal(BaseModel):
-    """One source-literal CTI fact proposed by Q2.
+    """One source-supported CTI fact proposed by Q2.
 
     IDs and provenance are assigned by orchestration, never accepted from model
     output.  Source text remains untrusted data and is only used as evidence.
@@ -184,6 +184,7 @@ class Q2FactProposal(BaseModel):
         "other_technical",
     ]
     value: str = Field(min_length=1, max_length=4000)
+    attack_id: str | None = Field(default=None, pattern=r"^T\d{4}(?:\.\d{3})?$")
     context: str = Field(min_length=1, max_length=4000)
     evidence_quote: str = Field(min_length=1, max_length=8000)
 
@@ -596,91 +597,6 @@ def _editorial_title(body: str) -> str | None:
         if match and _normalize_key(match.group("key")) in {"editorial-title", "brief-title"}:
             return match.group("value").strip() or None
     return None
-
-
-def q2_chunk_to_extraction(
-    output: Q2ChunkOutput,
-    *,
-    chunk_text: str,
-    source_ids: tuple[str, ...],
-    source_document_id: str,
-    chunk_id: str,
-    model_run_id: str | None,
-) -> ParseResult[TechnicalExtraction]:
-    """Validate literal Q2 proposals and attach provenance deterministically."""
-    result: ParseResult[TechnicalExtraction] = ParseResult()
-    items: list[ExtractionItem] = []
-    proposals: list[Q2FactProposal | Q2ArtifactProposal] = [
-        *output.facts,
-        *output.artifacts,
-    ]
-    for index, proposal in enumerate(proposals, start=1):
-        if proposal.value not in chunk_text or proposal.value not in proposal.evidence_quote:
-            result.warnings.append("q2_nonliteral_proposal_dropped")
-            continue
-        if proposal.evidence_quote not in chunk_text:
-            result.warnings.append("q2_quote_not_in_chunk_dropped")
-            continue
-        if isinstance(proposal, Q2FactProposal):
-            items.append(
-                ExtractionItem(
-                    local_id=f"Q2F{index}",
-                    category=proposal.category,
-                    value=proposal.value,
-                    context=proposal.context,
-                    artifact_type=None,
-                    attack_id=None,
-                    reference_ids=(),
-                    source_ids=source_ids,
-                    supported=bool(source_ids),
-                    evidence_quote=proposal.evidence_quote,
-                    source_document_ids=(source_document_id,),
-                    chunk_ids=(chunk_id,),
-                    model_run_ids=(model_run_id,) if model_run_id else (),
-                )
-            )
-            continue
-        artifact_type = ArtifactType(proposal.artifact_type)
-        normalized_value = None
-        try:
-            normalized_value = normalize_indicator_value(proposal.value, artifact_type)
-        except ValueError:
-            result.warnings.append("invalid_artifact_value")
-        status = (
-            IndicatorStatus(proposal.indicator_status)
-            if proposal.indicator_status != "not_applicable"
-            else IndicatorStatus.CONTEXTUAL
-        )
-        items.append(
-            ExtractionItem(
-                local_id=f"Q2A{index}",
-                category="network_artifacts",
-                value=proposal.value,
-                context=proposal.context,
-                artifact_type=artifact_type,
-                attack_id=None,
-                reference_ids=(),
-                source_ids=source_ids,
-                supported=bool(source_ids),
-                semantic_type=SemanticType.INDICATOR,
-                indicator_status=status,
-                display_policy=(
-                    DisplayPolicy.IOC_SECTION
-                    if status is IndicatorStatus.CONFIRMED_IOC
-                    else DisplayPolicy.BODY_ONLY
-                ),
-                normalized_value=normalized_value,
-                evidence_quote=proposal.evidence_quote,
-                source_document_ids=(source_document_id,),
-                chunk_ids=(chunk_id,),
-                model_run_ids=(model_run_id,) if model_run_id else (),
-            )
-        )
-    if not items:
-        result.errors.append("no_usable_item")
-        return result
-    result.value = TechnicalExtraction(tuple(items), tuple(output.uncertainties))
-    return result
 
 
 # --- Synthesis validation --------------------------------------------------

@@ -13,8 +13,8 @@ from dataclasses import dataclass, field
 from uuid import UUID
 
 from cti_app.application.extraction import CHUNKING_VERSION, ChunkingPolicy, segment_text
-from cti_app.application.production_ioc_candidates import source_ids_by_document
 from cti_app.application.production_parsers import ReferenceReport
+from cti_app.application.production_provenance import source_ids_by_document
 from cti_app.domain.collection import CollectionState, SourceCollection, SourceOriginKind
 from cti_app.domain.discovery import canonicalize_http_url
 from cti_app.domain.entities import SourceDocument

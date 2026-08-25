@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from cti_app.application.production_evidence_pack import (
     ArchivedCorpusDocument,
@@ -16,10 +16,10 @@ def _item(
     *,
     url: str,
     origin: SourceOriginKind = SourceOriginKind.DISCOVERY,
-    parent=None,
-    text="x",
+    parent: UUID | None = None,
+    text: str = "x",
     final_url: str | None = None,
-):
+) -> ArchivedCorpusDocument:
     subject_id, edition_id, group_id = uuid4(), uuid4(), uuid4()
     document_id, collection_id = uuid4(), uuid4()
     collection = SourceCollection(
@@ -70,7 +70,7 @@ def _report(url: str) -> ReferenceReport:
     )
 
 
-def test_pack_hash_and_chunks_are_stable_and_overlap():
+def test_pack_hash_and_chunks_are_stable_and_overlap() -> None:
     item = _item(url="https://example.test/a", text="a" * 12_100)
     first = build_production_evidence_pack(_report(item.collection.canonical_url), [item])
     second = build_production_evidence_pack(_report(item.collection.canonical_url), [item])
@@ -80,7 +80,7 @@ def test_pack_hash_and_chunks_are_stable_and_overlap():
     assert first.chunk_ids == second.chunk_ids
 
 
-def test_child_evidence_inherits_parent_s1_and_unarchived_is_absent():
+def test_child_evidence_inherits_parent_s1_and_unarchived_is_absent() -> None:
     parent = _item(url="https://example.test/a", text="publication")
     child = _item(
         url="https://example.test/a/resource",
@@ -99,7 +99,7 @@ def test_child_evidence_inherits_parent_s1_and_unarchived_is_absent():
     assert resource.source_ids == ("S1",)
 
 
-def test_text_change_changes_hash_and_oversize_is_explicit():
+def test_text_change_changes_hash_and_oversize_is_explicit() -> None:
     item = _item(url="https://example.test/a", text="before")
     changed = _item(url="https://example.test/a", text="after")
     report = _report(item.collection.canonical_url)
@@ -112,7 +112,7 @@ def test_text_change_changes_hash_and_oversize_is_explicit():
     assert review.error_code == "document_text_too_large"
 
 
-def test_pack_hash_and_metadata_include_derived_parser_identity():
+def test_pack_hash_and_metadata_include_derived_parser_identity() -> None:
     item = _item(url="https://example.test/a", text="archived")
     artifact_id = uuid4()
     first = ArchivedCorpusDocument(
@@ -140,7 +140,7 @@ def test_pack_hash_and_metadata_include_derived_parser_identity():
     assert second_pack.parser_versions[f"artifact:{artifact_id}"] == "parser-2"
 
 
-def test_pack_uses_source_mapping_and_keeps_child_resource_url():
+def test_pack_uses_source_mapping_and_keeps_child_resource_url() -> None:
     parent = _item(
         url="https://example.test/report/",
         final_url="https://EXAMPLE.test/report/?utm_source=feed",
@@ -154,9 +154,7 @@ def test_pack_uses_source_mapping_and_keeps_child_resource_url():
         text="resource",
     )
 
-    pack = build_production_evidence_pack(
-        _report("https://example.test/report"), [parent], [child]
-    )
+    pack = build_production_evidence_pack(_report("https://example.test/report"), [parent], [child])
     resource = next(chunk for chunk in pack.chunks if chunk.source_document_id == child.document.id)
 
     assert resource.source_ids == ("S1",)

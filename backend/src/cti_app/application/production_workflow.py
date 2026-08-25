@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
@@ -28,23 +27,12 @@ from cti_app.application.production_evidence_pack import (
     ProductionEvidencePack,
     build_production_evidence_pack,
 )
-from cti_app.application.production_ioc_candidates import (
-    DiscoveryPublicationEvidence,
-    IocCandidate,
-    IocCandidatePack,
-    Q2LiteralCandidate,
-    build_candidate_pack,
-    source_ids_by_document,
-)
-from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
-    DisplayPolicy,
     IndicatorStatus,
     ParsedEvent,
     ParseResult,
     Q2ChunkOutput,
     ReferenceReport,
-    TechnicalExtraction,
     parse_reference_report,
     reference_report_from_json,
     reference_report_to_json,
@@ -81,7 +69,6 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
-from cti_app.domain.publication import ArtifactType
 
 if TYPE_CHECKING:
     from cti_app.application.collection import SubjectCollectionService
@@ -734,16 +721,12 @@ class ProductionWorkflowOrchestrator:
                     "error": evidence_pack.error_message,
                     "pack_hash": evidence_pack.pack_hash,
                 }
-            initial_candidate_pack = await self._build_ioc_candidate_pack(
-                uow, run.subject_id, report
-            )
             input_data = {
                 "subject_id": str(run.subject_id),
                 "references_version": references.version,
                 "references_hash": references.input_hash,
                 "stage": "extraction",
                 "prompt_version": EXTRACTION_PROMPT_VERSION,
-                "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
                 "evidence_pack_hash": evidence_pack.pack_hash,
             }
             input_hash = compute_input_hash(input_data)
@@ -803,7 +786,10 @@ class ProductionWorkflowOrchestrator:
                     chunk_prompt = (
                         prompt
                         + "\n\nCorpus Q2 — segment borné, uniquement données archivées.\n"
+                        + _q2_chunk_source_context(chunk)
+                        + "\n\n<TEXT_ARCHIVÉ>\n"
                         + chunk.text
+                        + "\n</TEXT_ARCHIVÉ>"
                     )
                     try:
                         execution = await self._model_service.extract_structured(
@@ -905,17 +891,7 @@ class ProductionWorkflowOrchestrator:
                 }
 
             assert parsed.value is not None
-            q2_literals = self._q2_literals(parsed.value)
-            candidate_pack = await self._build_ioc_candidate_pack(
-                uow, run.subject_id, report, extraction=parsed.value
-            )
-            q2_diagnostics = self._q2_literal_diagnostics(
-                q2_literals, initial_candidate_pack, candidate_pack
-            )
-            extraction = self._suppress_unbacked_q2_literals(
-                parsed.value, candidate_pack.candidates
-            )
-            assert extraction is not None
+            extraction = parsed.value
             status_totals = {
                 status.value: sum(item.indicator_status is status for item in extraction.items)
                 for status in IndicatorStatus
@@ -929,10 +905,7 @@ class ProductionWorkflowOrchestrator:
                 conversation_turn_id=turn_id,
                 warnings=parsed.warnings,
                 verification_diagnostics={
-                    "candidate_total": candidate_pack.total_candidates,
                     "status_totals": status_totals,
-                    "candidate_pack_hash": candidate_pack.pack_hash,
-                    "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
                     "evidence_pack_hash": evidence_pack.pack_hash,
                     "evidence_pack_chunk_ids": list(evidence_pack.chunk_ids),
                     "evidence_pack_source_document_ids": sorted(
@@ -946,18 +919,15 @@ class ProductionWorkflowOrchestrator:
                         {
                             "status": item.status.value,
                             "proposal_index": item.proposal_index,
+                            "proposal_kind": item.proposal_kind,
+                            "artifact_type": item.artifact_type,
                             "source_document_id": item.source_document_id,
                             "chunk_id": item.chunk_id,
+                            "value_hash": item.value_hash,
                             "reason_code": item.reason_code,
                         }
                         for item in verification.diagnostics
                     ],
-                    **q2_diagnostics,
-                    "source_derived_candidates": candidate_pack.source_derived_candidates,
-                    "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,
-                    "discovery_only_candidates": candidate_pack.discovery_only_candidates,
-                    "discovery_matched_to_source": candidate_pack.discovery_matched_to_source,
-                    "discovery_unmatched": candidate_pack.discovery_unmatched,
                 },
             )
 
@@ -969,10 +939,7 @@ class ProductionWorkflowOrchestrator:
                 "supported_items": len(extraction.supported_items()),
                 "warnings": parsed.warnings,
                 "repair_actions": parsed.repair_actions,
-                "candidate_total": candidate_pack.total_candidates,
                 "status_totals": status_totals,
-                "candidate_pack_hash": candidate_pack.pack_hash,
-                "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
                 "evidence_pack_hash": evidence_pack.pack_hash,
                 "evidence_pack_chunk_ids": list(evidence_pack.chunk_ids),
                 "evidence_pack_source_document_ids": sorted(
@@ -982,12 +949,6 @@ class ProductionWorkflowOrchestrator:
                 "completed_chunk_ids": completed_chunk_ids,
                 "failed_chunk_ids": failed_chunk_ids,
                 "chunk_provenance": chunk_provenance,
-                **q2_diagnostics,
-                "source_derived_candidates": candidate_pack.source_derived_candidates,
-                "discovery_augmented_candidates": candidate_pack.discovery_augmented_candidates,
-                "discovery_only_candidates": candidate_pack.discovery_only_candidates,
-                "discovery_matched_to_source": candidate_pack.discovery_matched_to_source,
-                "discovery_unmatched": candidate_pack.discovery_unmatched,
                 "source_evidence_processing": (
                     evidence_processing.as_dict() if evidence_processing is not None else None
                 ),
@@ -1049,247 +1010,6 @@ class ProductionWorkflowOrchestrator:
                 item
             )
         return build_production_evidence_pack(report, items, children)
-
-    async def _build_ioc_candidate_pack(
-        self,
-        uow: UnitOfWork,
-        subject_id: UUID,
-        report: ReferenceReport,
-        extraction: TechnicalExtraction | None = None,
-    ) -> IocCandidatePack:
-        """Load persisted evidence snapshots and build the pack before cache lookup."""
-        # Lightweight test UoWs intentionally omit these repositories.
-        repositories = ("indicators", "source_collections", "source_documents", "derived_artifacts")
-        if not all(hasattr(uow, name) for name in repositories):
-            return build_candidate_pack((), collections=(), reference_report=report)
-        collections = await uow.source_collections.list_for_subject(subject_id)
-        documents = await uow.source_documents.list_for_subject(subject_id)
-        artifact_ids = {
-            collection.derived_artifact_id
-            for collection in collections
-            if collection.derived_artifact_id is not None
-        }
-        indicators = tuple(
-            indicator
-            for indicator in await uow.indicators.list_for_subject(subject_id)
-            if indicator.derived_artifact_id in artifact_ids
-        )
-        artifacts_list = []
-        for artifact_id in sorted(artifact_ids, key=str):
-            artifact = await uow.derived_artifacts.get(artifact_id)
-            if artifact is not None:
-                artifacts_list.append(artifact)
-        artifacts = tuple(artifacts_list)
-        texts: dict[UUID, str] = {}
-        if self._source_evidence_processor is not None:
-            for artifact in artifacts:
-                try:
-                    texts[artifact.id] = await self._source_evidence_processor.read_derived_text(
-                        artifact.text_blob_id
-                    )
-                except Exception:
-                    continue
-        provisional_iocs = []
-        discovery_publications: dict[UUID, DiscoveryPublicationEvidence] = {}
-        discovery_repositories = (
-            "editorial_groups",
-            "discovery_subject_identities",
-            "subject_contributions",
-            "discovery_intakes",
-            "discovery_batches",
-        )
-        if all(hasattr(uow, name) for name in discovery_repositories):
-            group = await uow.editorial_groups.get_by_subject(subject_id)
-            if group is not None and group.discovery_subject_id is not None:
-                contributions = await uow.discovery_subject_identities.contribution_closure(
-                    group.discovery_subject_id
-                )
-                provisional_ids = {
-                    provisional_id
-                    for contribution in contributions
-                    for provisional_id in contribution.contributed_provisional_ioc_ids
-                }
-                for contribution in contributions:
-                    intake = await uow.discovery_intakes.get(contribution.intake_id)
-                    batch = (
-                        await uow.discovery_batches.get(intake.batch_id)
-                        if intake is not None
-                        else None
-                    )
-                    if batch is None:
-                        continue
-                    for topic in batch.candidates:
-                        for provisional in topic.provisional_iocs:
-                            if provisional.id in provisional_ids:
-                                provisional_iocs.append(provisional)
-
-                collections_by_publication = {
-                    collection.source_candidate_id: collection
-                    for collection in collections
-                    if collection.source_candidate_id is not None
-                }
-                source_ids = source_ids_by_document(collections, documents, report)
-                for provisional in provisional_iocs:
-                    for relation in provisional.publication_relations:
-                        collection = collections_by_publication.get(relation.publication_id)
-                        if collection is None or collection.source_document_id is None:
-                            continue
-                        publication_artifact_id = collection.derived_artifact_id
-                        if publication_artifact_id is None or publication_artifact_id not in texts:
-                            continue
-                        discovery_publications[relation.publication_id] = (
-                            DiscoveryPublicationEvidence(
-                                source_document_id=collection.source_document_id,
-                                derived_artifact_id=publication_artifact_id,
-                                source_ids=source_ids.get(collection.source_document_id, ()),
-                                text=texts[publication_artifact_id],
-                            )
-                        )
-        return build_candidate_pack(
-            indicators,
-            collections=collections,
-            source_documents=documents,
-            artifacts=artifacts,
-            reference_report=report,
-            artifact_texts=texts,
-            provisional_iocs=tuple({item.id: item for item in provisional_iocs}.values()),
-            discovery_publications=discovery_publications,
-            q2_literals=self._q2_literals(extraction),
-        )
-
-    @staticmethod
-    def _q2_literals(extraction: TechnicalExtraction | None) -> tuple[Q2LiteralCandidate, ...]:
-        if extraction is None:
-            return ()
-        literal_types = {
-            ArtifactType.IP,
-            ArtifactType.DOMAIN,
-            ArtifactType.URL,
-            ArtifactType.HASH,
-            ArtifactType.EMAIL,
-        }
-        literals: dict[tuple[ArtifactType, str], Q2LiteralCandidate] = {}
-        for item in extraction.items:
-            if item.artifact_type not in literal_types:
-                continue
-            try:
-                normalized = canonical_indicator_key(item.value, item.artifact_type)
-            except ValueError:
-                continue
-            key = (item.artifact_type, normalized)
-            literals.setdefault(
-                key,
-                Q2LiteralCandidate(
-                    artifact_type=item.artifact_type,
-                    raw_value=item.value,
-                    normalized_value=normalized,
-                    context=item.context,
-                ),
-            )
-        return tuple(
-            literals[key] for key in sorted(literals, key=lambda item: (item[0].value, item[1]))
-        )
-
-    @staticmethod
-    def _q2_literal_diagnostics(
-        literals: tuple[Q2LiteralCandidate, ...],
-        initial_pack: IocCandidatePack,
-        final_pack: IocCandidatePack,
-    ) -> dict[str, int]:
-        initial_keys = {
-            (candidate.artifact_type, candidate.normalized_value)
-            for candidate in initial_pack.candidates
-        }
-        final_candidates = {
-            (candidate.artifact_type, candidate.normalized_value): candidate
-            for candidate in final_pack.candidates
-        }
-        matched = 0
-        recovered = 0
-        for literal in literals:
-            key = (literal.artifact_type, literal.normalized_value)
-            if key in initial_keys:
-                matched += 1
-            elif (candidate := final_candidates.get(key)) is not None and candidate.source_backed:
-                recovered += 1
-        return {
-            "q2_literal_total": len(literals),
-            "q2_literal_matched_candidates": matched,
-            "q2_literal_recovered_from_source": recovered,
-            "q2_literal_unresolved": len(literals) - matched - recovered,
-        }
-
-    @staticmethod
-    def _suppress_unbacked_q2_literals(
-        extraction: TechnicalExtraction, candidates: tuple[IocCandidate, ...]
-    ) -> TechnicalExtraction:
-        known = {
-            (candidate.artifact_type, candidate.normalized_value)
-            for candidate in candidates
-            if candidate.source_backed
-        }
-        literal_types = {
-            ArtifactType.IP,
-            ArtifactType.DOMAIN,
-            ArtifactType.URL,
-            ArtifactType.HASH,
-            ArtifactType.EMAIL,
-        }
-        items = []
-        for item in extraction.items:
-            if item.artifact_type not in literal_types:
-                items.append(item)
-                continue
-            try:
-                key = (item.artifact_type, canonical_indicator_key(item.value, item.artifact_type))
-            except ValueError:
-                key = None
-            if key not in known:
-                items.append(
-                    replace(
-                        item,
-                        indicator_status=IndicatorStatus.EXCLUDED,
-                        display_policy=DisplayPolicy.HIDDEN,
-                        context=("unbacked_ioc_literal: " + item.context).strip(),
-                    )
-                )
-            else:
-                items.append(item)
-        return replace(extraction, items=tuple(items))
-
-    @staticmethod
-    def _merge_q2_items(items: list[Any]) -> tuple[Any, ...]:
-        """Collapse overlap duplicates while retaining all source provenance."""
-        merged: dict[tuple[Any, ...], Any] = {}
-        for item in items:
-            value_key = (item.normalized_value or item.value).strip().casefold()
-            key = (
-                item.category,
-                item.artifact_type,
-                item.semantic_type,
-                value_key,
-                tuple(sorted(item.source_ids)),
-            )
-            previous = merged.get(key)
-            if previous is None:
-                merged[key] = item
-                continue
-            context = previous.context
-            if item.context and item.context not in context:
-                context = f"{context} | {item.context}".strip(" |")
-            merged[key] = replace(
-                previous,
-                context=context,
-                reference_ids=tuple(sorted(set(previous.reference_ids + item.reference_ids))),
-                source_ids=tuple(sorted(set(previous.source_ids + item.source_ids))),
-                source_document_ids=tuple(
-                    sorted(set(previous.source_document_ids + item.source_document_ids))
-                ),
-                chunk_ids=tuple(sorted(set(previous.chunk_ids + item.chunk_ids))),
-                model_run_ids=tuple(sorted(set(previous.model_run_ids + item.model_run_ids))),
-                supported=previous.supported or item.supported,
-            )
-        return tuple(merged[key] for key in sorted(merged, key=str))
 
     async def _execute_synthesis_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
         if not self._model_service:
@@ -1586,3 +1306,18 @@ class ProductionWorkflowOrchestrator:
             "status": "success",
             "stage": "synthesis",
         }
+
+
+def _q2_chunk_source_context(chunk: Any) -> str:
+    """Archived source context deliberately safe for the stateless Q2 prompt."""
+    lines = ["Métadonnées source archivée (contexte, jamais preuve) :"]
+    if chunk.title:
+        lines.append(f"- titre: {chunk.title}")
+    lines.append(f"- origine: {chunk.origin_kind.value}")
+    if chunk.parent_source_ids:
+        lines.append(f"- source parente: {', '.join(chunk.parent_source_ids)}")
+    if chunk.source_ids:
+        lines.append(f"- source: {', '.join(chunk.source_ids)}")
+    if chunk.origin_kind.value == "referenced_evidence":
+        lines.append("- evidence référencée: oui")
+    return "\n".join(lines)

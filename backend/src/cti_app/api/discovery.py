@@ -649,5 +649,3 @@ def _incomplete_source_view(source: IncompleteSourceCandidate) -> IncompleteSour
         ioc_visible_count=source.ioc_visible_count,
         parsing_warnings=list(source.parsing_warnings),
     )
-
-

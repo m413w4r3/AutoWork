@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -13,14 +14,14 @@ from cti_app.domain.collection import SourceOriginKind
 
 
 def _pack(
-    text: str, *, source_document_id: str | None = None
+    text: str, *, source_document_id: str | None = None, title: str | None = None
 ) -> tuple[ProductionEvidencePack, str]:
     source = source_document_id or str(uuid4())
     chunk = EvidenceChunk(
         source_document_id=UUID(source),
         parent_source_ids=(),
         source_ids=("S1",),
-        title=None,
+        title=title,
         origin_kind=SourceOriginKind.DISCOVERY,
         chunk_id="chunk-1",
         text=text,
@@ -34,7 +35,12 @@ def _pack(
     )
 
 
-def _submission(source: str, artifacts: list[dict], *, text_facts: list[dict] | None = None):
+def _submission(
+    source: str,
+    artifacts: list[dict[str, Any]],
+    *,
+    text_facts: list[dict[str, Any]] | None = None,
+) -> Q2ProposalSubmission:
     return Q2ProposalSubmission(
         output=Q2ChunkOutput.model_validate(
             {
@@ -52,7 +58,7 @@ def _submission(source: str, artifacts: list[dict], *, text_facts: list[dict] | 
 
 def _artifact(
     value: str, kind: str, *, quote: str | None = None, status: str = "contextual"
-) -> dict:
+) -> dict[str, str]:
     return {
         "value": value,
         "artifact_type": kind,
@@ -70,6 +76,7 @@ def _artifact(
         ("yahelisrael.com", "domain"),
         ("46.30.190.173", "ip"),
         ("c2[.]example.org", "domain"),
+        ("hxxp://198[.]51[.]100[.]7/path", "url"),
         ("2001:db8::7", "ip"),
         ("d41d8cd98f00b204e9800998ecf8427e", "hash"),
         ("a" * 40, "hash"),
@@ -116,7 +123,9 @@ def test_rejects_false_domains(value: str) -> None:
         (_artifact("not-an-ip", "ip"), "not-an-ip", "invalid_value"),
     ],
 )
-def test_rejection_proof_and_value_reason_codes(artifact: dict, text: str, reason: str) -> None:
+def test_rejection_proof_and_value_reason_codes(
+    artifact: dict[str, str], text: str, reason: str
+) -> None:
     pack, source = _pack(text)
     result = verify_q2_proposals([_submission(source, [artifact])], pack)
 
@@ -153,17 +162,27 @@ def test_rejects_value_absent_from_original_derived_text() -> None:
 
 
 def test_merges_verified_artifact_provenance_and_statuses() -> None:
-    text = "c2[.]example.org c2.example.org"
+    text = "c2[.]example.org c2.example.org is C2 infrastructure"
     pack, source = _pack(text)
     first = _submission(source, [_artifact("c2[.]example.org", "domain", status="excluded")])
-    second = _submission(source, [_artifact("c2.example.org", "domain", status="confirmed_ioc")])
+    second = _submission(
+        source,
+        [
+            _artifact(
+                "c2.example.org",
+                "domain",
+                quote="c2.example.org is C2 infrastructure",
+                status="confirmed_ioc",
+            )
+        ],
+    )
     result = verify_q2_proposals([first, second], pack)
 
     assert len(result.canonical.items) == 1
     item = result.canonical.items[0]
     assert item.normalized_value == "c2.example.org"
-    assert item.indicator_status.value == "confirmed_ioc"
-    assert "q2_indicator_status_divergence" in result.warnings
+    assert item.indicator_status.value == "contextual"
+    assert "semantic_status_conflict" in result.warnings
 
 
 def test_rule_is_not_applicable_and_fact_needs_archived_literal() -> None:
@@ -190,3 +209,40 @@ def test_rule_is_not_applicable_and_fact_needs_archived_literal() -> None:
     assert len(result.canonical.items) == 2
     rule = next(item for item in result.canonical.items if item.artifact_type is not None)
     assert rule.indicator_status.value == "not_applicable"
+
+
+def test_fact_can_be_paraphrased_when_its_quote_and_attack_id_are_literal() -> None:
+    text = "APT Z uses T1566.001 to deliver phishing emails."
+    pack, source = _pack(text)
+    result = verify_q2_proposals(
+        [
+            _submission(
+                source,
+                [],
+                text_facts=[
+                    {
+                        "category": "ttps",
+                        "value": "Hameçonnage",
+                        "attack_id": "T1566.001",
+                        "context": "Vecteur initial",
+                        "evidence_quote": text,
+                    }
+                ],
+            )
+        ],
+        pack,
+    )
+
+    fact = result.canonical.items[0]
+    assert fact.value == "Hameçonnage"
+    assert fact.attack_id == "T1566.001"
+
+
+def test_ioc_titled_document_can_confirm_a_bare_literal_list() -> None:
+    pack, source = _pack("203.0.113.9", title="IOC list")
+    result = verify_q2_proposals(
+        [_submission(source, [_artifact("203.0.113.9", "ip", status="confirmed_ioc")])],
+        pack,
+    )
+
+    assert result.canonical.items[0].display_policy.value == "ioc_section"

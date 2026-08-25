@@ -13,7 +13,8 @@ _COLON = re.compile(r"\[:\]", re.IGNORECASE)
 _AT = re.compile(r"\[(?:at|@)\]|\((?:at|@)\)", re.IGNORECASE)
 
 
-def _refang(raw: str) -> str:
+def refang(raw: str) -> str:
+    """Undo supported CTI defanging without performing validation."""
     value = _DOT.sub(".", raw.strip())
     value = _COLON.sub(":", value)
     value = _AT.sub("@", value)
@@ -26,7 +27,7 @@ def _refang(raw: str) -> str:
 
 def normalize_indicator_value(raw: str, artifact_type: ArtifactType) -> str:
     """Return the fang-ed canonical representation while preserving no metadata."""
-    value = _refang(raw)
+    value = refang(raw)
     if artifact_type is ArtifactType.DOMAIN:
         return value.rstrip(".").lower()
     if artifact_type is ArtifactType.IP:

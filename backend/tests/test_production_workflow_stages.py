@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_evidence_pack import EvidenceChunk, ProductionEvidencePack
 from cti_app.application.production_parsers import (
@@ -28,6 +29,7 @@ from cti_app.application.production_workflow import ProductionWorkflowOrchestrat
 from cti_app.application.source_evidence_processing import (
     ReferencedEvidenceLink,
     SourceEvidenceProcessingResult,
+    SourceEvidenceProcessingService,
 )
 from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.model_conversations import ConversationMode
@@ -469,7 +471,9 @@ def _build(
         collection_service=_CollectionService(uow),  # type: ignore[arg-type]
         artifact_store=store,
         diagnostics=diagnostics,
-        source_evidence_processor=processor or archive_processor,
+        source_evidence_processor=cast(
+            SourceEvidenceProcessingService, processor or archive_processor
+        ),
     )
     return orchestrator, uow, conversations
 
@@ -623,11 +627,10 @@ async def test_extraction_uses_stateless_structured_output_per_q2_chunk() -> Non
 
     assert result["status"] == "success", result
     assert result["supported_items"] == 2
-    assert result["candidate_pack_hash"]
+    assert result["evidence_pack_hash"]
     artifact = uow.production_artifacts.items[-1]
     diagnostics = artifact.metadata["deterministic_verification"]
-    assert diagnostics["candidate_pack_hash"] == result["candidate_pack_hash"]
-    assert diagnostics["initial_candidate_pack_hash"] == result["initial_candidate_pack_hash"]
+    assert diagnostics["evidence_pack_hash"] == result["evidence_pack_hash"]
 
     # Q1 alone opens a conversation. Q2 calls native structured output.
     assert len(conversations.created) == 1
@@ -743,7 +746,7 @@ async def test_linked_evidence_is_archived_before_deterministic_extraction() -> 
     result = await orchestrator.execute_stage(
         uow.run.id,
         SubjectProductionStage.EXTRACTION,
-        context=_JobContext(),
+        context=cast(JobExecutionContext, _JobContext()),
     )
 
     assert result["status"] == "success"

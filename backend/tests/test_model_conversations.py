@@ -100,7 +100,7 @@ def test_only_analyst_assistance_and_pivot_research_can_continue() -> None:
 
 
 def test_model_request_lifecycle_contract() -> None:
-    """Regression: fresh conversations without an explicit lifecycle policy must raise ValueError."""
+    """Fresh conversations without explicit lifecycle policy raise ValueError."""
     conversation_id = uuid4()
 
     request = ModelRequest(

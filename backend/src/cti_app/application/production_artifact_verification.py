@@ -9,8 +9,9 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from urllib.parse import urlsplit
 
+from cti_app.application.iana_tlds_snapshot import IANA_TLDS
 from cti_app.application.production_evidence_pack import EvidenceChunk, ProductionEvidencePack
-from cti_app.application.production_normalization import normalize_indicator_value
+from cti_app.application.production_normalization import normalize_indicator_value, refang
 from cti_app.application.production_parsers import (
     DisplayPolicy,
     ExtractionItem,
@@ -44,8 +45,11 @@ class Q2ProposalSubmission:
 class ProposalDiagnostic:
     status: ProposalStatus
     proposal_index: int
+    proposal_kind: str
+    artifact_type: str | None
     source_document_id: str
     chunk_id: str
+    value_hash: str
     reason_code: str | None = None
 
 
@@ -60,30 +64,9 @@ class ArtifactVerificationResult:
         return tuple(item for item in self.diagnostics if item.status is ProposalStatus.REJECTED)
 
 
-_REFANG_DOT = re.compile(r"\[\.\]|\(\.\)|\{\.\}", re.IGNORECASE)
-_REFANG_AT = re.compile(r"\[(?:at|@)\]|\((?:at|@)\)", re.IGNORECASE)
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
 _CVE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 _LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
-
-# IANA TLD snapshot 2026-08-25, deliberately local and versioned.  This
-# compact allow-list covers operational CTI sources and blocks prose/file suffixes.
-IANA_TLD_SNAPSHOT_VERSION = "iana-tlds-2026-08-25"
-_IANA_TLDS = frozenset(
-    (
-        "ac ad ae af ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bm bn "
-        "bo bq br bs bt bw by bz ca cc cd cf cg ch ci ck cl cm cn co com coop cr cu cv cw cx "
-        "cy cz de dev dj dk dm do dz ec edu ee eg er es et eu fi fj fk fm fo fr ga gd ge gf gg "
-        "gh gi gl gm gn gov gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in info int io "
-        "iq ir is it je jm jo jobs jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt "
-        "lu lv ly ma mc md me mg mh mil mk ml mm mn mo mobi mp mq mr ms mt mu museum mv mw mx "
-        "my mz na name nc ne net nf ng ni nl no np nr nu nz om org pa pe pf pg ph pk pl pm pn pr "
-        "pro ps pt pw py qa re ro rs ru rw sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st su "
-        "sv sx sy sz tc td tel tf tg th tj tk tl tm tn to top tr travel tt tv tw tz ua ug uk us uy "
-        "uz va vc ve vg vi vn vu wf ws xyz ye yt za zm zw"
-    ).split()
-)
-_MULTI_LABEL_SUFFIXES = frozenset({"org.il", "co.uk", "org.uk", "com.au", "net.au", "org.au"})
 
 
 def verify_q2_proposals(
@@ -109,9 +92,12 @@ def verify_q2_proposals(
                     ProposalDiagnostic(
                         ProposalStatus.REJECTED,
                         index,
-                        submission.source_document_id,
-                        submission.chunk_id,
-                        rejection,
+                        proposal_kind=_proposal_kind(proposal),
+                        artifact_type=_artifact_type(proposal),
+                        source_document_id=submission.source_document_id,
+                        chunk_id=submission.chunk_id,
+                        value_hash=_value_hash(proposal.value),
+                        reason_code=rejection,
                     )
                 )
                 continue
@@ -122,9 +108,12 @@ def verify_q2_proposals(
                     ProposalDiagnostic(
                         ProposalStatus.REJECTED,
                         index,
-                        submission.source_document_id,
-                        submission.chunk_id,
-                        "normalization_error",
+                        proposal_kind=_proposal_kind(proposal),
+                        artifact_type=_artifact_type(proposal),
+                        source_document_id=submission.source_document_id,
+                        chunk_id=submission.chunk_id,
+                        value_hash=_value_hash(proposal.value),
+                        reason_code="normalization_error",
                     )
                 )
                 continue
@@ -132,8 +121,11 @@ def verify_q2_proposals(
                 ProposalDiagnostic(
                     ProposalStatus.VERIFIED,
                     index,
+                    _proposal_kind(proposal),
+                    _artifact_type(proposal),
                     submission.source_document_id,
                     submission.chunk_id,
+                    _value_hash(proposal.value),
                 )
             )
     merged, warnings = _merge_verified(verified)
@@ -161,10 +153,25 @@ def _rejection_reason(
         return "chunk_not_found"
     if proposal.evidence_quote not in chunk.text:
         return "evidence_quote_not_found"
-    if proposal.value not in proposal.evidence_quote:
+    if isinstance(proposal, Q2ArtifactProposal) and proposal.value not in proposal.evidence_quote:
         return "value_not_in_quote"
-    if proposal.value not in original_texts[submission.source_document_id]:
+    if (
+        isinstance(proposal, Q2ArtifactProposal)
+        and proposal.indicator_status == IndicatorStatus.CONFIRMED_IOC.value
+        and not _confirmed_ioc_is_explicit(proposal, chunk)
+    ):
+        return "confirmed_ioc_not_explicit"
+    if (
+        isinstance(proposal, Q2ArtifactProposal)
+        and proposal.value not in original_texts[submission.source_document_id]
+    ):
         return "literal_not_found"
+    if (
+        isinstance(proposal, Q2FactProposal)
+        and proposal.attack_id
+        and proposal.attack_id not in proposal.evidence_quote
+    ):
+        return "attack_id_not_in_quote"
     if isinstance(proposal, Q2ArtifactProposal):
         try:
             artifact_type = ArtifactType(proposal.artifact_type)
@@ -181,6 +188,17 @@ def _rejection_reason(
     return None
 
 
+def _confirmed_ioc_is_explicit(proposal: Q2ArtifactProposal, chunk: EvidenceChunk) -> bool:
+    """Confirming language must come from the archived source, never model context."""
+    proof = proposal.evidence_quote.casefold()
+    if re.search(
+        r"\b(ioc|indicator|compromise|malicious|c2|command[- ]and[- ]control|payload)\b", proof
+    ):
+        return True
+    title = (chunk.title or "").casefold()
+    return bool(re.search(r"\b(ioc|indicator|compromise)\b", title))
+
+
 def _to_item(
     proposal: Q2FactProposal | Q2ArtifactProposal,
     index: int,
@@ -193,7 +211,7 @@ def _to_item(
             value=proposal.value,
             context=proposal.context,
             artifact_type=None,
-            attack_id=None,
+            attack_id=proposal.attack_id,
             reference_ids=(),
             source_ids=submission.source_ids,
             supported=bool(submission.source_ids),
@@ -203,24 +221,18 @@ def _to_item(
             model_run_ids=(submission.model_run_id,) if submission.model_run_id else (),
         )
     artifact_type = ArtifactType(proposal.artifact_type)
-    status = IndicatorStatus(proposal.indicator_status)
-    if artifact_type in {
-        ArtifactType.YARA_RULE,
-        ArtifactType.SIGMA_RULE,
-        ArtifactType.SURICATA_RULE,
-    }:
-        status = IndicatorStatus.NOT_APPLICABLE
+    category, semantic_type, status, display_policy = _artifact_fields(
+        artifact_type, IndicatorStatus(proposal.indicator_status)
+    )
     return ExtractionItem(
         local_id=f"Q2A{index}",
-        category="network_artifacts",
+        category=category,
         value=proposal.value,
         context=proposal.context,
         artifact_type=artifact_type,
-        semantic_type=SemanticType.INDICATOR,
+        semantic_type=semantic_type,
         indicator_status=status,
-        display_policy=DisplayPolicy.IOC_SECTION
-        if status is IndicatorStatus.CONFIRMED_IOC
-        else DisplayPolicy.BODY_ONLY,
+        display_policy=display_policy,
         normalized_value=normalize_indicator_value(proposal.value, artifact_type),
         attack_id=None,
         reference_ids=(),
@@ -234,7 +246,7 @@ def _to_item(
 
 
 def _validate_value(raw: str, artifact_type: ArtifactType) -> None:
-    value = _refang(raw)
+    value = refang(raw)
     if artifact_type is ArtifactType.IP:
         ipaddress.ip_address(value)
     elif artifact_type is ArtifactType.DOMAIN:
@@ -243,7 +255,10 @@ def _validate_value(raw: str, artifact_type: ArtifactType) -> None:
         parts = urlsplit(value)
         if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
             raise ValueError("invalid URL")
-        _validate_hostname(parts.hostname)
+        try:
+            ipaddress.ip_address(parts.hostname)
+        except ValueError:
+            _validate_hostname(parts.hostname)
         _ = parts.port
     elif artifact_type is ArtifactType.HASH:
         if len(value) not in {32, 40, 64, 128} or not _HEX.fullmatch(value):
@@ -269,8 +284,7 @@ def _validate_hostname(raw: str) -> None:
     labels = hostname.split(".")
     if any(not _LABEL.fullmatch(label) for label in labels):
         raise ValueError("invalid hostname")
-    suffix = ".".join(labels[-2:]) if ".".join(labels[-2:]) in _MULTI_LABEL_SUFFIXES else labels[-1]
-    if suffix not in _IANA_TLDS and suffix not in _MULTI_LABEL_SUFFIXES:
+    if labels[-1] not in IANA_TLDS:
         raise ValueError("unknown public suffix")
     # File extensions and glued prose commonly pass label syntax; require a
     # plausible registrable label, never an extension-looking final label.
@@ -278,8 +292,47 @@ def _validate_hostname(raw: str) -> None:
         raise ValueError("file or prose fragment")
 
 
-def _refang(value: str) -> str:
-    return _REFANG_AT.sub("@", _REFANG_DOT.sub(".", value.strip()))
+def _proposal_kind(proposal: Q2FactProposal | Q2ArtifactProposal) -> str:
+    return "artifact" if isinstance(proposal, Q2ArtifactProposal) else "fact"
+
+
+def _artifact_type(proposal: Q2FactProposal | Q2ArtifactProposal) -> str | None:
+    return proposal.artifact_type if isinstance(proposal, Q2ArtifactProposal) else None
+
+
+def _value_hash(value: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _artifact_fields(
+    artifact_type: ArtifactType, status: IndicatorStatus
+) -> tuple[str, SemanticType, IndicatorStatus, DisplayPolicy]:
+    if artifact_type in {
+        ArtifactType.YARA_RULE,
+        ArtifactType.SIGMA_RULE,
+        ArtifactType.SURICATA_RULE,
+    }:
+        return (
+            "detections",
+            SemanticType.OTHER,
+            IndicatorStatus.NOT_APPLICABLE,
+            DisplayPolicy.BODY_ONLY,
+        )
+    if artifact_type in {ArtifactType.FILENAME, ArtifactType.FILEPATH}:
+        return "files", SemanticType.FILE, status, _display_policy(status, allow_ioc=False)
+    if artifact_type is ArtifactType.CVE:
+        return "cves", SemanticType.OTHER, status, _display_policy(status, allow_ioc=False)
+    return "network_artifacts", SemanticType.INDICATOR, status, _display_policy(status)
+
+
+def _display_policy(status: IndicatorStatus, *, allow_ioc: bool = True) -> DisplayPolicy:
+    if status is IndicatorStatus.EXCLUDED:
+        return DisplayPolicy.HIDDEN
+    if allow_ioc and status is IndicatorStatus.CONFIRMED_IOC:
+        return DisplayPolicy.IOC_SECTION
+    return DisplayPolicy.BODY_ONLY
 
 
 def _merge_verified(items: Sequence[ExtractionItem]) -> tuple[list[ExtractionItem], list[str]]:
@@ -297,7 +350,7 @@ def _merge_verified(items: Sequence[ExtractionItem]) -> tuple[list[ExtractionIte
             continue
         statuses = {previous.indicator_status, item.indicator_status}
         if len(statuses) > 1:
-            warnings.append("q2_indicator_status_divergence")
+            warnings.append("semantic_status_conflict")
         status = _merged_status(statuses)
         context = " | ".join(
             dict.fromkeys(part for part in (previous.context, item.context) if part)
@@ -306,9 +359,9 @@ def _merge_verified(items: Sequence[ExtractionItem]) -> tuple[list[ExtractionIte
             previous,
             context=context,
             indicator_status=status,
-            display_policy=DisplayPolicy.IOC_SECTION
-            if status is IndicatorStatus.CONFIRMED_IOC
-            else DisplayPolicy.BODY_ONLY,
+            display_policy=_display_policy(
+                status, allow_ioc=previous.semantic_type is SemanticType.INDICATOR
+            ),
             source_ids=tuple(sorted(set(previous.source_ids + item.source_ids))),
             source_document_ids=tuple(
                 sorted(set(previous.source_document_ids + item.source_document_ids))
@@ -317,10 +370,23 @@ def _merge_verified(items: Sequence[ExtractionItem]) -> tuple[list[ExtractionIte
             model_run_ids=tuple(sorted(set(previous.model_run_ids + item.model_run_ids))),
             supported=previous.supported or item.supported,
         )
-    return [merged[key] for key in sorted(merged, key=str)], list(dict.fromkeys(warnings))
+    ordered = [merged[key] for key in sorted(merged, key=str)]
+    artifact_number = fact_number = 0
+    canonical: list[ExtractionItem] = []
+    for item in ordered:
+        if item.artifact_type is None:
+            fact_number += 1
+            local_id = f"Q2F{fact_number}"
+        else:
+            artifact_number += 1
+            local_id = f"Q2A{artifact_number}"
+        canonical.append(replace(item, local_id=local_id))
+    return canonical, list(dict.fromkeys(warnings))
 
 
 def _merged_status(statuses: set[IndicatorStatus]) -> IndicatorStatus:
+    if IndicatorStatus.CONFIRMED_IOC in statuses and IndicatorStatus.EXCLUDED in statuses:
+        return IndicatorStatus.CONTEXTUAL
     if IndicatorStatus.CONFIRMED_IOC in statuses:
         return IndicatorStatus.CONFIRMED_IOC
     if IndicatorStatus.CONTEXTUAL in statuses:

@@ -70,10 +70,13 @@ def test_select_technical_links_applies_a_deterministic_parent_cap() -> None:
 def test_select_technical_links_rejects_download_without_technical_signal(
     anchor_text: str,
 ) -> None:
-    assert select_technical_links(
-        "https://reports.example/advisory",
-        (ParsedLink("/download", anchor_text),),
-    ) == ()
+    assert (
+        select_technical_links(
+            "https://reports.example/advisory",
+            (ParsedLink("/download", anchor_text),),
+        )
+        == ()
+    )
 
 
 @pytest.mark.parametrize(
@@ -104,7 +107,7 @@ async def _archived_sources(
     factory: InMemoryCollectionUnitOfWorkFactory,
     root: Path,
     *bodies: bytes,
-) -> tuple[SourceEvidenceProcessingService, list[object]]:
+) -> tuple[SourceEvidenceProcessingService, list[SourceCollection]]:
     subject = selected_subject(
         factory,
         tuple(f"https://source-{index}.example/report" for index in range(len(bodies))),
@@ -115,7 +118,7 @@ async def _archived_sources(
         await collector.archive_one(collection.id, uuid4())
     processor = SourceEvidenceProcessingService(
         factory,
-        BlobCatalogService(FilesystemBlobStore(root / "blobs"), factory),  # type: ignore[arg-type]
+        BlobCatalogService(FilesystemBlobStore(root / "blobs"), factory),
     )
     return processor, collections
 
@@ -182,16 +185,14 @@ async def test_stale_parser_artifact_is_reprocessed_and_becomes_current(tmp_path
     )
     assert report_result.value is not None
     workflow = object.__new__(ProductionWorkflowOrchestrator)
-    workflow._source_evidence_processor = None
+    workflow._source_evidence_processor = processor
     async with factory() as uow:
-        pack = await workflow._build_ioc_candidate_pack(
+        pack = await workflow._build_production_evidence_pack(
             uow, collection.subject_id, report_result.value
         )
-    assert {
-        evidence.derived_artifact_id
-        for candidate in pack.candidates
-        for evidence in candidate.evidence
-    } == {current}
+    assert {chunk.internal_metadata["derived_artifact_id"] for chunk in pack.chunks} == {
+        str(current)
+    }
 
 
 async def test_one_unparseable_archived_source_does_not_rollback_others(tmp_path: Path) -> None:

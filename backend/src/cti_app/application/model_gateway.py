@@ -127,6 +127,7 @@ class ConversationLifecycleSpec:
     This is a first-order control data, not metadata. Every ModelRequest
     creating a fresh conversation MUST provide this.
     """
+
     policy: ConversationPolicy
 
 
@@ -458,7 +459,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         evidence_pack_hash: str,
         actor_id: str,
     ) -> ModelRun:
-        """Not a real API call: records user-supplied Markdown as a ModelRun marked manual_import."""
+        """Record user Markdown as a ModelRun marked manual_import; no API call."""
         digest = hashlib.sha256(content).hexdigest()
 
         async with self._uow_factory() as uow:
@@ -702,9 +703,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 model_role=role.value,
                 routing_hint=request.routing_hint.value,
                 background=request.background,
-                conversation_mode=(
-                    request.conversation.mode if request.conversation else None
-                ),
+                conversation_mode=(request.conversation.mode if request.conversation else None),
                 duration_ms=max(0, int((time.monotonic() - started) * 1000)),
             )
             async with self._uow_factory() as uow:

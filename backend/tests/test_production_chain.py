@@ -90,6 +90,7 @@ class _Uow:
         self.subject_production_runs = _Runs()
         self.edition_production_batches = _Batches()
         self.edition_production_batch_items = _BatchItems()
+        self.jobs = _ExecutionJobs()
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -109,6 +110,20 @@ class _Job:
         self.id = uuid4()
         self.kind = kind
         self.idempotency_key = idempotency_key
+
+
+class _ExecutionJob:
+    def __init__(self, *, attempt: int, max_attempts: int) -> None:
+        self.attempt = attempt
+        self.max_attempts = max_attempts
+
+
+class _ExecutionJobs:
+    def __init__(self) -> None:
+        self.items: dict[UUID, _ExecutionJob] = {}
+
+    async def get(self, job_id: UUID) -> _ExecutionJob | None:
+        return self.items.get(job_id)
 
 
 class _Jobs:
@@ -368,6 +383,8 @@ async def test_transient_error_stays_retryable_and_keeps_the_run_alive(
         {"stage": "references", "status": "transient_error", "error_code": "bridge_timeout"},
     )
     run = _run(uow, SubjectProductionStage.REFERENCES)
+    context = _Context()
+    uow.jobs.items[context.job_id] = _ExecutionJob(attempt=1, max_attempts=3)
 
     handler = registry.handler(stage_job_kind(SubjectProductionStage.REFERENCES))
     with pytest.raises(JobHandlerError) as excinfo:
@@ -375,7 +392,7 @@ async def test_transient_error_stays_retryable_and_keeps_the_run_alive(
             ProductionStageParameters(
                 run_id=run.id, expected_stage=SubjectProductionStage.REFERENCES.value
             ),
-            _Context(),  # type: ignore[arg-type]
+            context,  # type: ignore[arg-type]
         )
 
     assert excinfo.value.transient is True
