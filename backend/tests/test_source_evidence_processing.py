@@ -5,6 +5,8 @@ from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.extraction import PARSER_VERSION, ParsedLink
 from cti_app.application.production_parsers import parse_reference_report
@@ -53,6 +55,48 @@ def test_select_technical_links_applies_a_deterministic_parent_cap() -> None:
     assert [url for url, _ in selected] == [
         f"https://reports.example/files/{number:02}.json" for number in range(8)
     ]
+
+
+@pytest.mark.parametrize(
+    "anchor_text",
+    (
+        "WHOIS Database Download",
+        "DNS Database Download",
+        "Download",
+        "Download report",
+        "Product database download",
+    ),
+)
+def test_select_technical_links_rejects_download_without_technical_signal(
+    anchor_text: str,
+) -> None:
+    assert select_technical_links(
+        "https://reports.example/advisory",
+        (ParsedLink("/download", anchor_text),),
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    ("href", "anchor_text"),
+    (
+        ("/download", "Download IOC list"),
+        ("/download", "Indicators of Compromise"),
+        ("/download", "IOC appendix"),
+        ("/iocs.csv", "Download"),
+        ("/indicators.json", "Download"),
+        ("/download", "YARA rules"),
+        ("/download", "Sigma rules"),
+        ("/technical-appendix.pdf", "Download report"),
+    ),
+)
+def test_select_technical_links_accepts_technical_signals_or_extensions(
+    href: str,
+    anchor_text: str,
+) -> None:
+    assert select_technical_links(
+        "https://reports.example/advisory",
+        (ParsedLink(href, anchor_text),),
+    ) == ((f"https://reports.example{href}", anchor_text),)
 
 
 async def _archived_sources(

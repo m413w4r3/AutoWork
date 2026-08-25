@@ -40,9 +40,8 @@ _FORBIDDEN_RESOURCE_EXTENSIONS: Final = frozenset(
     }
 )
 _TECHNICAL_SIGNALS: Final = (
-    "ioc", "iocs", "indicator", "indicators", "hash", "hashes", "sha1", "sha256",
-    "sha512", "appendix", "annex", "technical report", "download", "yara", "sigma",
-    "suricata", "stix", "misp",
+    "ioc", "iocs", "indicator", "indicators", "indicators of compromise", "md5", "sha1",
+    "sha256", "sha512", "yara", "sigma", "suricata", "stix", "misp", "appendix", "annex",
 )
 _NON_TECHNICAL_SIGNALS: Final = (
     "login", "sign in", "privacy", "terms", "cookie", "facebook", "linkedin", "twitter",
