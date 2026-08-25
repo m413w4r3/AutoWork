@@ -36,7 +36,7 @@ from cti_app.domain.collection import (
 )
 
 PARSER_NAME = "cti-safe-text"
-PARSER_VERSION = "2.0.0"
+PARSER_VERSION = "2.1.0"
 CHUNKING_VERSION = "fixed-overlap-v1"
 CancellationCheck = Callable[[], Awaitable[None]]
 
@@ -110,9 +110,16 @@ class QwenEvidenceOutput(BaseModel):
 
 
 @dataclass(frozen=True, slots=True)
+class ParsedLink:
+    href: str
+    anchor_text: str
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedDocument:
     text: str
     metadata: dict[str, str]
+    links: tuple[ParsedLink, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,9 +155,15 @@ def parse_document(
         parser = _CleanHtmlParser()
         parser.feed(content.decode(_html_encoding(content), errors="replace"))
         parser.close()
-        return ParsedDocument(text=parser.text, metadata=parser.metadata)
+        return ParsedDocument(text=parser.text, metadata=parser.metadata, links=parser.links)
     if mime_type is DetectedMimeType.PDF:
         return _parse_pdf_isolated(content, pdf_policy or PdfParsingPolicy())
+    if mime_type in {DetectedMimeType.TEXT, DetectedMimeType.JSON}:
+        policy = pdf_policy or PdfParsingPolicy()
+        text = content.decode("utf-8", errors="replace")
+        if len(text) > policy.max_text_chars:
+            raise DocumentParsingError("text_too_large", "Text exceeds the limit")
+        return ParsedDocument(text=text, metadata={})
     raise ValueError(f"Unsupported parser MIME: {mime_type}")
 
 
@@ -172,6 +185,7 @@ def extract_indicators(
         (IndicatorKind.ATTACK_ID, _ATTACK_PATTERN),
         (IndicatorKind.HASH, _HASH_PATTERN),
         (IndicatorKind.IP, _IP_PATTERN),
+        (IndicatorKind.IP, _IPV6_PATTERN),
         (IndicatorKind.DOMAIN, _DOMAIN_PATTERN),
     )
     for kind, pattern in patterns:
@@ -510,10 +524,17 @@ class _CleanHtmlParser(HTMLParser):
         self._skip_depth = 0
         self.metadata: dict[str, str] = {}
         self._in_title = False
+        self._links: list[ParsedLink] = []
+        self._link_href: str | None = None
+        self._link_parts: list[str] = []
 
     @property
     def text(self) -> str:
         return "\n".join(part for part in self._parts if part).strip()
+
+    @property
+    def links(self) -> tuple[ParsedLink, ...]:
+        return tuple(self._links)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = {key.casefold(): value for key, value in attrs if value is not None}
@@ -521,6 +542,9 @@ class _CleanHtmlParser(HTMLParser):
             self._skip_depth += 1
         if tag == "title":
             self._in_title = True
+        if tag == "a" and self._skip_depth == 0:
+            self._link_href = values.get("href")
+            self._link_parts = []
         if tag == "meta":
             key = values.get("property") or values.get("name")
             content = values.get("content")
@@ -543,6 +567,12 @@ class _CleanHtmlParser(HTMLParser):
             self._skip_depth -= 1
         if tag == "title":
             self._in_title = False
+        if tag == "a" and self._link_href is not None:
+            self._links.append(
+                ParsedLink(href=self._link_href, anchor_text=" ".join(self._link_parts))
+            )
+            self._link_href = None
+            self._link_parts = []
 
     def handle_data(self, data: str) -> None:
         if self._skip_depth:
@@ -551,6 +581,8 @@ class _CleanHtmlParser(HTMLParser):
         if not cleaned:
             return
         self._parts.append(cleaned)
+        if self._link_href is not None:
+            self._link_parts.append(cleaned)
         if self._in_title:
             self.metadata["title"] = cleaned
 
@@ -610,6 +642,12 @@ _EMAIL_PATTERN = re.compile(
 )
 _CVE_PATTERN = re.compile(r"(?i)\bCVE-\d{4}-\d{4,7}\b")
 _ATTACK_PATTERN = re.compile(r"(?i)\bT\d{4}(?:\.\d{3})?\b")
-_HASH_PATTERN = re.compile(r"(?i)\b(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64})\b")
+_HASH_PATTERN = re.compile(
+    r"(?i)\b(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}|[a-f0-9]{128})\b"
+)
 _IP_PATTERN = re.compile(rf"(?<![\w])(?:\d{{1,3}}{_DOT}){{3}}\d{{1,3}}(?![\w])")
+_IPV6_PATTERN = re.compile(
+    r"(?<![\w:])[0-9a-f:.]{0,39}:[0-9a-f:.]{0,38}(?![\w:])",
+    re.IGNORECASE,
+)
 _DOMAIN_PATTERN = re.compile(rf"(?i)\b(?:[a-z0-9-]+{_DOT})+[a-z]{{2,63}}\b")

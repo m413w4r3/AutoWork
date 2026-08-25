@@ -20,7 +20,7 @@ from cti_app.application.extraction import (
     segment_text,
 )
 from cti_app.application.model_gateway import StructuredExtractionModel
-from cti_app.domain.collection import ClaimKind, DetectedMimeType, IndicatorKind
+from cti_app.domain.collection import ClaimKind, DetectedMimeType, Indicator, IndicatorKind
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -83,6 +83,105 @@ def test_defanged_indicators_keep_original_and_normalize_value() -> None:
     ) in values
     assert any(item.kind is IndicatorKind.CVE for item in indicators)
     assert any(item.kind is IndicatorKind.ATTACK_ID for item in indicators)
+
+
+def _indicators(text: str) -> tuple[Indicator, ...]:
+    return extract_indicators(
+        text,
+        subject_id=uuid4(),
+        edition_id=uuid4(),
+        group_id=uuid4(),
+        source_document_id=uuid4(),
+        artifact_id=uuid4(),
+    )
+
+
+def test_text_and_json_documents_preserve_ioc_text() -> None:
+    text = "IPv6 2001:db8::42"
+    assert parse_document(text.encode(), DetectedMimeType.TEXT).text == text
+
+    raw_json = '{"ioc":"2001:db8::42","hash":"' + "a" * 128 + '"}'
+    parsed = parse_document(raw_json.encode(), DetectedMimeType.JSON)
+    assert parsed.text == raw_json
+    assert any(item.normalized_value == "2001:db8::42" for item in _indicators(parsed.text))
+
+
+def test_ipv6_validation_and_sha512() -> None:
+    sha512 = "a" * 128
+    indicators = _indicators(
+        f"valid 2001:db8::1 loopback ::1 invalid 2001:db8:zzzz::1 {sha512}"
+    )
+
+    assert any(
+        item.kind is IndicatorKind.IP and item.normalized_value == "2001:db8::1"
+        for item in indicators
+    )
+    assert any(
+        item.kind is IndicatorKind.IP and item.normalized_value == "::1"
+        for item in indicators
+    )
+    assert not any("zzzz" in item.original_value for item in indicators)
+    assert any(
+        item.kind is IndicatorKind.HASH and item.normalized_value == sha512
+        for item in indicators
+    )
+
+
+def test_hash_families_and_spans_are_not_deduplicated() -> None:
+    md5 = "a" * 32
+    sha1 = "b" * 40
+    sha256 = "c" * 64
+    text = f"{md5} {sha1} {sha256} {sha1}"
+    indicators = _indicators(text)
+
+    assert {len(item.original_value) for item in indicators} == {32, 40, 64}
+    repeated = [item for item in indicators if item.normalized_value == sha1]
+    assert len(repeated) == 2
+    assert repeated[0].span != repeated[1].span
+
+
+def test_url_does_not_emit_overlapping_domain() -> None:
+    indicators = _indicators("https://example.test/path")
+    assert [item.kind for item in indicators] == [IndicatorKind.URL]
+
+
+def test_html_links_keep_href_and_anchor_text_but_skip_script_and_style() -> None:
+    parsed = parse_document(
+        b'<a href="/report">Read <strong>report</strong></a>'
+        b'<script><a href="/bad">bad</a></script>'
+        b'<style>.hidden { content: "bad" }</style>',
+        DetectedMimeType.HTML,
+    )
+
+    assert [(link.href, link.anchor_text) for link in parsed.links] == [
+        ("/report", "Read report")
+    ]
+    assert "bad" not in parsed.text
+
+
+def test_synthetic_olalampo_like_fixture_extracts_all_network_artifacts() -> None:
+    text = (
+        "alpha.example beta.example gamma.test delta.org "
+        "192.0.2.1 192.0.2.2 198.51.100.1 203.0.113.9 "
+        "1111111111111111111111111111111111111111 "
+        "2222222222222222222222222222222222222222 "
+        "3333333333333333333333333333333333333333"
+    )
+    indicators = _indicators(text)
+
+    assert {item.normalized_value for item in indicators if item.kind is IndicatorKind.DOMAIN} >= {
+        "alpha.example",
+        "beta.example",
+        "gamma.test",
+        "delta.org",
+    }
+    assert {item.normalized_value for item in indicators if item.kind is IndicatorKind.IP} >= {
+        "192.0.2.1",
+        "192.0.2.2",
+        "198.51.100.1",
+        "203.0.113.9",
+    }
+    assert len([item for item in indicators if item.kind is IndicatorKind.HASH]) >= 3
 
 
 async def test_hallucinated_literal_ioc_claim_is_rejected() -> None:
