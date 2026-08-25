@@ -245,6 +245,8 @@ class BridgeRoutes:
                 stored = {
                     "status_code": 503,
                     "body": {
+                        "id": run_id,
+                        "status": "failed",
                         "error": {
                             "code": "bridge_server_error",
                             "message": "Le bridge a interrompu cette exécution pendant son arrêt.",
@@ -268,7 +270,10 @@ class BridgeRoutes:
                     "message": str(exc.detail),
                     "retryable": exc.status_code in {408, 429, 502, 503, 504},
                 }
-                stored = {"status_code": exc.status_code, "body": {"error": detail}}
+                stored = {
+                    "status_code": exc.status_code,
+                    "body": {"id": run_id, "status": "failed", "error": detail},
+                }
                 self.registry.set_state(key, "failed", stored)
                 self.bridge_metrics["runs_failed"] += 1
                 raise
@@ -277,6 +282,8 @@ class BridgeRoutes:
                 stored = {
                     "status_code": 500,
                     "body": {
+                        "id": run_id,
+                        "status": "failed",
                         "error": {
                             "code": "bridge_server_error",
                             "message": "La génération via le bridge a échoué.",

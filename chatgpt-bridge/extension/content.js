@@ -130,6 +130,7 @@ const SETTLE_UNKNOWN_MS = 15000; // pas de signal UI fiable : prudence
 const EMPTY_FINAL_SETTLE_MS = 10000;
 const NO_MARKDOWN_FALLBACK_MS = 25000;
 const HEARTBEAT_INTERVAL_MS = 5000;
+const RUNTIME_METRICS_INTERVAL_MS = 30000;
 
 // Une réponse non vide et inchangée ne doit jamais rester "running"
 // pendant plusieurs minutes uniquement à cause d'un signal DOM périmé.
@@ -975,6 +976,27 @@ async function streamAnswer(job, locator, before) {
     confidence: "low",
   };
   let stableForMs = 0;
+  let lastSerializationMs = 0;
+  let lastRuntimeMetricsAt = 0;
+  let runtimeMetrics = {};
+
+  // Scalars only: never retain DOM nodes, snapshots, or response buffers.
+  const sampledRuntimeMetrics = (now) => {
+    if (now - lastRuntimeMetricsAt < RUNTIME_METRICS_INTERVAL_MS)
+      return runtimeMetrics;
+    lastRuntimeMetricsAt = now;
+    const next = {};
+    const heapBytes = globalThis.performance?.memory?.usedJSHeapSize;
+    if (Number.isFinite(heapBytes) && heapBytes >= 0)
+      next.js_heap_bytes = Math.floor(heapBytes);
+    try {
+      next.dom_node_count = document.getElementsByTagName("*").length;
+    } catch (_) {
+      // Une métrique absente ne doit jamais perturber la génération.
+    }
+    runtimeMetrics = next;
+    return runtimeMetrics;
+  };
 
   // Progression persistante entre les itérations, indépendante de la présence du tour.
   // Le heartbeat est un signal de liveness, pas une preuve que le DOM est lisible.
@@ -1021,7 +1043,18 @@ async function streamAnswer(job, locator, before) {
       turn,
       finished === true || Date.now() - debut > NO_MARKDOWN_FALLBACK_MS,
     );
+    const serializationStartedAt = globalThis.performance?.now?.();
     const snapshot = root ? readAnswer(root, finished !== true) : null;
+    const serializationFinishedAt = globalThis.performance?.now?.();
+    if (
+      Number.isFinite(serializationStartedAt) &&
+      Number.isFinite(serializationFinishedAt)
+    ) {
+      lastSerializationMs = Math.max(
+        0,
+        Math.round(serializationFinishedAt - serializationStartedAt),
+      );
+    }
     full = snapshot ? snapshot.text : "";
     output.observe(full);
 
@@ -1074,6 +1107,8 @@ async function streamAnswer(job, locator, before) {
       stable_for_ms: stableForMs,
       completion_signal: completion.signal,
       completion_confidence: completion.confidence,
+      serialization_ms: lastSerializationMs,
+      ...sampledRuntimeMetrics(now),
     };
     const outcome = globalThis.ChatGPTBridgeFinalOutput.settledOutcome({
       completion,

@@ -83,6 +83,7 @@ class HttpResponsesTransport:
         idempotency_key: str | None = None,
         timeout_seconds: float | None = None,
         retry: bool = False,
+        retry_status_codes: frozenset[int] | None = None,
     ) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         if idempotency_key:
@@ -113,7 +114,14 @@ class HttpResponsesTransport:
                         )
                 if response.is_error:
                     error = _bridge_http_error(response, attempt)
-                    if attempt >= attempts or not error.retryable:
+                    retry_allowed = (
+                        error.retryable
+                        and (
+                            retry_status_codes is None
+                            or response.status_code in retry_status_codes
+                        )
+                    )
+                    if attempt >= attempts or not retry_allowed:
                         raise error
                     last_error = error
                     delay = _retry_delay(response, attempt)
@@ -185,6 +193,8 @@ class BridgeTransportError(ModelGatewayError):
         attempts: int = 1,
         retry_after: float | None = None,
         phase: str = "generation",
+        bridge_run_id: str | None = None,
+        bridge_status: str | None = None,
     ) -> None:
         super().__init__(safe_description)
         self.code = code
@@ -192,6 +202,8 @@ class BridgeTransportError(ModelGatewayError):
         self.attempts = attempts
         self.retry_after = retry_after
         self.phase = phase
+        self.bridge_run_id = bridge_run_id
+        self.bridge_status = bridge_status
 
 
 def _bounded_backoff(attempt: int) -> float:
@@ -219,9 +231,20 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
 def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTransportError:
     status = response.status_code
     server_code: str | None = None
+    bridge_run_id: str | None = None
+    bridge_status: str | None = None
+    phase = "generation"
     try:
         body = response.json()
-        error = body.get("error") if isinstance(body, dict) else None
+        detail = body.get("detail") if isinstance(body, dict) else None
+        source = detail if isinstance(detail, dict) else body
+        error = source.get("error") if isinstance(source, dict) else None
+        if isinstance(source, dict):
+            bridge_run_id = source.get("id") if isinstance(source.get("id"), str) else None
+            bridge_status = source.get("status") if isinstance(source.get("status"), str) else None
+            metadata = source.get("metadata")
+            if isinstance(metadata, dict) and isinstance(metadata.get("phase"), str):
+                phase = metadata["phase"][:64]
         if isinstance(error, dict) and isinstance(error.get("code"), str):
             server_code = error["code"]
     except ValueError:
@@ -286,6 +309,9 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         retryable=retryable,
         attempts=attempts,
         retry_after=_retry_after_seconds(response.headers.get("Retry-After")),
+        phase=phase,
+        bridge_run_id=bridge_run_id,
+        bridge_status=bridge_status,
     )
 
 
@@ -327,7 +353,11 @@ class ChatGPTBridgeTransport(HttpResponsesTransport):
             "/bridge/runs",
             json_body=bridge_payload,
             idempotency_key=idempotency_key,
+            # Seul un 429 prouve que le bridge n'a pas admis la soumission. Une
+            # perte de réponse ou un 5xx peut suivre le clic UI : GET/recovery,
+            # jamais un second POST implicite.
             retry=True,
+            retry_status_codes=frozenset({429}),
         )
 
     async def retrieve(self, response_id: str) -> dict[str, Any]:
@@ -404,7 +434,7 @@ class OpenAIResearchAdapter:
             payload["conversation"] = request.conversation.bridge_payload()
             payload["bridge_profile"] = request.conversation.expected_profile
             payload["bridge_ui_model"] = request.conversation.requested_model
-        if role is ModelRole.RESEARCH and request.parameters.get("bridge_recovery") is not True:
+        if request.web_search:
             payload["tools"] = [{"type": "web_search"}]
             payload["include"] = ["web_search_call.action.sources"]
         payload.update(_allowed_parameters(request.parameters, _RESPONSES_PARAMETERS))

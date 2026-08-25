@@ -141,6 +141,9 @@ class ModelRequest:
     sensitivity: str = "internal"
     metadata: dict[str, Any] = field(default_factory=dict)
     parameters: dict[str, Any] = field(default_factory=dict)
+    # Deliberate turn control. Routing to a research-capable model must never
+    # implicitly enable web search in a shared conversation.
+    web_search: bool = False
     background: bool = False
     provider: ModelProvider | None = None
     # Stateless requests (bulk extraction, drafting) carry no conversation at all.
@@ -178,6 +181,7 @@ class SafeModelRequest:
     sensitivity: str
     metadata: dict[str, Any]
     parameters: dict[str, Any]
+    web_search: bool
     background: bool
     authorized_input_hash: str
     request_id: str | None = None
@@ -795,6 +799,7 @@ def sanitize_model_request(request: ModelRequest) -> SafeModelRequest:
         "text": text,
         "metadata": metadata,
         "parameters": parameters,
+        "web_search": request.web_search,
         "prompt_template_id": request.prompt_template_id,
         "prompt_template_version": request.prompt_template_version,
         "evidence_pack_hash": request.evidence_pack_hash,
@@ -823,6 +828,7 @@ def sanitize_model_request(request: ModelRequest) -> SafeModelRequest:
         sensitivity=request.sensitivity,
         metadata=metadata,
         parameters=parameters,
+        web_search=request.web_search,
         background=request.background,
         authorized_input_hash=digest,
         conversation=request.conversation,
@@ -882,12 +888,17 @@ def _public_error(exc: Exception) -> str:
 
 
 def _error_details(exc: Exception) -> dict[str, str | bool | int]:
-    return {
+    details: dict[str, str | bool | int] = {
         "provider": str(getattr(exc, "provider", "unknown"))[:64],
         "phase": str(getattr(exc, "phase", "model_call"))[:64],
         "retryable": bool(getattr(exc, "retryable", False)),
         "attempts": max(1, int(getattr(exc, "attempts", 1))),
     }
+    for key in ("bridge_run_id", "bridge_status"):
+        value = getattr(exc, key, None)
+        if isinstance(value, str) and value:
+            details[key] = value[:128]
+    return details
 
 
 def _optional_metadata_text(metadata: dict[str, Any], key: str) -> str | None:

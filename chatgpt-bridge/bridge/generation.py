@@ -272,7 +272,8 @@ async def run_generation(
             progress = _live_progress.get(request_id, {})
             logger.warning(
                 "%s bridge_run_id=%s phase=%s output_chars=%s stable_for_ms=%s "
-                "completion_signal=%s elapsed_seconds=%.3f idle_seconds=%.3f "
+                "completion_signal=%s serialization_ms=%s js_heap_bytes=%s "
+                "dom_node_count=%s elapsed_seconds=%.3f idle_seconds=%.3f "
                 "total_timeout=%s idle_timeout=%s",
                 code,
                 request_id,
@@ -280,6 +281,9 @@ async def run_generation(
                 progress.get("output_chars"),
                 progress.get("stable_for_ms"),
                 progress.get("completion_signal"),
+                progress.get("serialization_ms"),
+                progress.get("js_heap_bytes"),
+                progress.get("dom_node_count"),
                 now - started_at,
                 now - last_packet_at,
                 TOTAL_TIMEOUT,
@@ -348,6 +352,14 @@ async def run_generation(
                             progress.get("completion_confidence", "low")
                         )[:16],
                     }
+                    for field, ceiling in (
+                        ("serialization_ms", 60_000),
+                        ("js_heap_bytes", 16 * 1024 * 1024 * 1024),
+                        ("dom_node_count", 5_000_000),
+                    ):
+                        value = progress.get(field)
+                        if isinstance(value, int) and 0 <= value <= ceiling:
+                            _live_progress[request_id][field] = value
             elif kind == "conversation_bound":
                 reported = packet.get("conversation")
                 if conversation is None or not isinstance(reported, dict):

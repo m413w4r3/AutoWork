@@ -12,7 +12,10 @@ from uuid import UUID
 from cti_app.application.collection import ReferencedEvidence, SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.jobs import JobExecutionContext
-from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.model_conversations import (
+    ConversationTurnFailedError,
+    ModelConversationService,
+)
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_context import build_subject_production_context
@@ -114,7 +117,9 @@ _REVIEW_CODES = {
 def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
     code = str(getattr(exc, "code", "") or "")
     retryable = bool(getattr(exc, "retryable", False))
-    if code in _REVIEW_CODES:
+    if isinstance(exc, ConversationTurnFailedError) and exc.status.value == "needs_review":
+        status = "needs_review"
+    elif code in _REVIEW_CODES:
         # The conversation is gone or busy: an operator has to look, but the
         # subject is not corrupted and the batch must keep moving.
         status = "needs_review"
@@ -229,6 +234,7 @@ class ProductionWorkflowOrchestrator:
         mode: ConversationMode,
         parse: Callable[[str], Any],
         external_llm_allowed: bool,
+        web_search: bool = False,
         repair_context: str = "",
     ) -> tuple[Any | None, str, UUID | None]:
         """Ask the model, and give it exactly one chance to fix its formatting.
@@ -244,6 +250,7 @@ class ProductionWorkflowOrchestrator:
             message=prompt,
             mode=mode,
             external_llm_allowed=external_llm_allowed,
+            web_search=web_search,
             idempotency_key=idempotency_key,
             correlation_id=self._correlation_id,
             context_subject_id=run.subject_id,
@@ -275,6 +282,7 @@ class ProductionWorkflowOrchestrator:
             message=repair_prompt,
             mode=ConversationMode.CONTINUE,
             external_llm_allowed=external_llm_allowed,
+            web_search=False,
             idempotency_key=repair_idempotency_key,
             correlation_id=self._correlation_id,
             context_subject_id=run.subject_id,
@@ -590,6 +598,7 @@ class ProductionWorkflowOrchestrator:
                     mode=ConversationMode.FRESH,
                     parse=lambda text: parse_reference_report(text, research_date),
                     external_llm_allowed=ctx.external_llm_allowed,
+                    web_search=True,
                 )
             except Exception as e:
                 return self._handle_stage_exception(run, "references", e)
@@ -772,6 +781,7 @@ class ProductionWorkflowOrchestrator:
                     mode=ConversationMode.CONTINUE,
                     parse=lambda text: parse_technical_extraction(text, report),
                     external_llm_allowed=policy_allows,
+                    web_search=False,
                 )
             except Exception as e:
                 return self._handle_stage_exception(run, "extraction", e)
@@ -828,6 +838,7 @@ class ProductionWorkflowOrchestrator:
                         mode=ConversationMode.CONTINUE,
                         parse=parse_batch,
                         external_llm_allowed=policy_allows,
+                        web_search=False,
                         repair_context=candidate_text,
                     )
                 except Exception as e:
@@ -1256,6 +1267,7 @@ class ProductionWorkflowOrchestrator:
                     mode=ConversationMode.CONTINUE,
                     parse=lambda text: validate_synthesis(text, report, extraction_payload),
                     external_llm_allowed=synthesis_policy_allows,
+                    web_search=False,
                 )
                 if parsed is None:
                     return {

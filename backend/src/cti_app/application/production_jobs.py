@@ -189,6 +189,21 @@ def register_production_jobs(
         # A transient failure must stay retryable and must NOT end the run:
         # the batch keeps its slot and the job is retried.
         if outcome == "transient_error":
+            # The generic job service exhausts retries only after the handler
+            # returns. Finish the production aggregate here on its last
+            # attempt so it cannot remain RUNNING behind a failed terminal job.
+            async with uow_factory() as uow:
+                job = await uow.jobs.get(context.job_id)
+            exhausted = job is not None and job.attempt >= job.max_attempts
+            if exhausted:
+                async with uow_factory() as uow:
+                    ending = await uow.subject_production_runs.get_for_update(parameters.run_id)
+                    if ending is not None and ending.status not in _TERMINAL_STATUSES:
+                        ending.mark_needs_review(code=error_code, message=error_message)
+                        await uow.subject_production_runs.save(ending)
+                        await uow.commit()
+                await advance_batch(parameters.run_id, correlation_id)
+                return f"production-stage://{parameters.run_id}/{stage.value}#needs_review"
             raise JobHandlerError(
                 code=error_code,
                 public_message=f"Erreur temporaire lors de l'étape {stage.value}",

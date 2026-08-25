@@ -191,6 +191,7 @@ class ModelConversationService:
         message: str,
         mode: ConversationMode,
         external_llm_allowed: bool,
+        web_search: bool = False,
         idempotency_key: str,
         correlation_id: str,
         context_subject_id: UUID | None = None,
@@ -289,6 +290,7 @@ class ModelConversationService:
                 routing_hint=_routing_hint(conversation.purpose),
                 sensitivity="conversation",
                 metadata={"conversation_output": True, "primary_evidence": False},
+                web_search=web_search,
                 provider=conversation.provider,
                 conversation=context,
                 conversation_lifecycle=conversation_lifecycle,
@@ -364,6 +366,15 @@ class ModelConversationService:
                     await uow.model_conversation_turns.save(persisted_turn)
                     await uow.model_conversations.save(persisted_conversation)
                     await uow.commit()
+            # Le résultat d'un POST bridge est inconnu : ce tour est scellé en
+            # NEEDS_REVIEW et ne doit pas consommer les retries du job avec la
+            # même clé d'idempotence.
+            if uncertain:
+                raise ConversationTurnFailedError(
+                    str(exc),
+                    code=str(getattr(exc, "code", "conversation_turn_failed")),
+                    status=ConversationTurnStatus.NEEDS_REVIEW,
+                ) from exc
             raise
 
     async def archive(

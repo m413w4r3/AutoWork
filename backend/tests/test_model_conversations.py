@@ -1,3 +1,4 @@
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
@@ -55,6 +56,21 @@ def test_authorized_hash_binds_conversation_parent_head_message_and_prompt() -> 
         != sanitize_model_request(_request(other_head)).authorized_input_hash
     )
     assert sanitize_model_request(_request(first)).conversation == first
+
+
+def test_authorized_hash_binds_the_explicit_web_search_choice() -> None:
+    context = ConversationContext(
+        mode="continue",
+        id=uuid4(),
+        external_locator="https://chatgpt.com/opaque/a",
+    )
+    request = _request(context)
+
+    assert sanitize_model_request(request).web_search is False
+    assert (
+        sanitize_model_request(request).authorized_input_hash
+        != sanitize_model_request(replace(request, web_search=True)).authorized_input_hash
+    )
 
 
 def test_only_analyst_assistance_and_pivot_research_can_continue() -> None:

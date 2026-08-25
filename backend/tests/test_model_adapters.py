@@ -69,6 +69,7 @@ def safe_request(*, background: bool = False) -> SafeModelRequest:
         sensitivity="internal",
         metadata={},
         parameters={},
+        web_search=False,
         background=background,
         authorized_input_hash="b" * 64,
     )
@@ -151,7 +152,7 @@ async def test_openai_research_uses_responses_web_search_and_background() -> Non
     adapter = OpenAIResearchAdapter(transport, model="chatgpt-web")
 
     unsafe_overrides = replace(
-        safe_request(background=True),
+        replace(safe_request(background=True), web_search=True),
         parameters={
             "model": "policy-bypass",
             "tools": [],
@@ -332,7 +333,7 @@ async def test_chatgpt_bridge_transport_uses_native_capabilities() -> None:
 
 @pytest.mark.parametrize(
     ("status", "code", "attempts"),
-    [(401, "bridge_auth_failed", 1), (500, "bridge_server_error", 3)],
+    [(401, "bridge_auth_failed", 1), (500, "bridge_server_error", 1)],
 )
 async def test_bridge_classifies_http_errors_and_never_retries_auth(
     status: int, code: str, attempts: int
