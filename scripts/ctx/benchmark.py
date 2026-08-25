@@ -3,11 +3,11 @@
 # requires-python = ">=3.12"
 # dependencies = ["numpy>=1.26", "openai>=1.60"]
 # ///
-"""Runner reproductible pour le benchmark de navigation R67.
+"""Runner reproductible pour le benchmark de navigation ctx.py (R88).
 
-Rejoue les 12 requêtes gelées de ``refacto_baseLine/R67_benchmark_spec.md``
-contre l'index ctx.py courant et calcule, MÉCANIQUEMENT (aucun rang codé en
-dur), les métriques définies par la spec :
+Rejoue les requêtes de ``refacto_baseLine/ctx_benchmark.json`` contre
+l'index ctx.py courant et calcule, MÉCANIQUEMENT (aucun rang codé en dur),
+les métriques :
 
     first_relevant_rank, top3, top8, files_before_first_hit,
     lines_before_first_hit
@@ -19,15 +19,17 @@ primitives existantes de ``scripts/ctx/ctx.py`` (``load_chunks``,
 ``rank_chunks``, ``select_results``, ``maybe_refresh``) et ne fait que les
 appeler avec les mêmes paramètres que la CLI ``ctx.py query``.
 
-La seule donnée figée ici est la ground truth du benchmark R67 (les 12
-requêtes exactes + les fichiers "owner" identifiés dans
-``refacto_baseLine/R67_ab_results.md`` pour l'état final). Le classement,
-les rangs et les métriques sont recalculés à chaque exécution contre
-l'index courant.
+La ground truth (requêtes + fichiers "owner" attendus) N'EST PAS dans ce
+fichier : elle vit dans ``refacto_baseLine/ctx_benchmark.json``, un chemin
+déjà exclu de l'index ctx.py (``EXCLUDE_PREFIXES`` dans ctx.py). La garder
+hors de ce runner évite que scripts/ctx/benchmark.py — lui-même indexable —
+n'injecte la réponse attendue dans le corpus que le benchmark évalue.
+Le classement, les rangs et les métriques sont recalculés à chaque
+exécution contre l'index courant.
 
 Exemples :
 
-    # Index lexical frais, puis benchmark en lexical-only (protocole R67) :
+    # Index lexical frais, puis benchmark en lexical-only :
     env -u BASE_URL -u EMBEDDING_API_KEY \\
         uv run scripts/ctx/ctx.py build --lexical-only
     uv run scripts/ctx/benchmark.py --lexical-only
@@ -50,99 +52,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ctx  # noqa: E402  (après sys.path.insert, cf. import local du module)
 
-# --------------------------------------------------------------------------- ground truth gelée (R67)
+# --------------------------------------------------------------------------- ground truth (données externes)
 #
-# Source : refacto_baseLine/R67_benchmark_spec.md (les 12 requêtes EXACTES)
-#          refacto_baseLine/R67_ab_results.md (owner files "final")
-#
-# Ne pas modifier ces requêtes ni ces owners en réaction à un résultat de
-# benchmark — ils sont gelés par la spec R67a.
+# Chargée depuis refacto_baseLine/ctx_benchmark.json (exclu de l'index ctx.py)
+# pour ne pas fuiter les queries/owners attendus dans le corpus indexé.
+# Ne pas dupliquer ces données ici : modifier le fichier JSON, pas ce runner.
 
-QUERIES: list[dict[str, object]] = [
-    {
-        "id": "Q1",
-        "text": "conversation lifecycle release after discovery amendment production publication",
-        "owners": ("chatgpt-bridge/bridge/routes_conversations.py",),
-    },
-    {
-        "id": "Q2",
-        "text": "persist and reload model conversation state database repository",
-        "owners": ("backend/src/cti_app/infrastructure/database/repositories/model_conversations.py",),
-    },
-    {
-        "id": "Q3",
-        "text": "recover incomplete discovery operation after failed or interrupted model run",
-        "owners": (
-            "chatgpt-bridge/bridge/registry.py",
-            "backend/src/cti_app/application/discovery/service.py",
-            "backend/src/cti_app/application/discovery/recovery.py",
-        ),
-    },
-    {
-        "id": "Q4",
-        "text": "validate discovery merge conflicts before applying cumulative merge",
-        "owners": (
-            "backend/src/cti_app/application/discovery/cumulative/service.py",
-            "backend/src/cti_app/application/discovery/cumulative/validation.py",
-        ),
-    },
-    {
-        "id": "Q5",
-        "text": "detect stale discovery merge and replan outdated merge run",
-        "owners": ("backend/src/cti_app/application/discovery/cumulative/service.py",),
-    },
-    {
-        "id": "Q6",
-        "text": "brief amendment repository indexing querying storage retrieval",
-        "owners": ("backend/src/cti_app/api/production.py",),
-    },
-    {
-        "id": "Q7",
-        "text": "create edition frontend form submit API persistence",
-        "owners": (
-            "frontend/src/pages/EditionCreatePage.tsx",
-            "frontend/src/api/editions.ts",
-        ),
-    },
-    {
-        "id": "Q8",
-        "text": "production workflow orchestrate parse render publish stages",
-        "owners": (
-            "backend/src/cti_app/application/production_workflow.py",
-            "backend/src/cti_app/application/production_stages.py",
-        ),
-    },
-    {
-        "id": "Q9",
-        "text": "ChatGPT bridge browser extension server request conversation routing",
-        "owners": (
-            "chatgpt-bridge/bridge/generation.py",
-            "chatgpt-bridge/bridge/routes_openai.py",
-        ),
-    },
-    {
-        "id": "Q10",
-        "text": "published brief immutability amendment preservation rules",
-        "owners": ("backend/src/cti_app/application/amendment_service.py",),
-    },
-    {
-        "id": "Q11",
-        "text": "replay edition workflow lineage mapping activation",
-        "owners": (
-            "backend/src/cti_app/application/replay_activator.py",
-            "backend/src/cti_app/application/replay_service.py",
-            "backend/src/cti_app/domain/discovery_cumulative.py",
-        ),
-    },
-    {
-        "id": "Q12",
-        "text": "evidence pack coverage calculate contributions tracking",
-        "owners": (
-            "backend/src/cti_app/application/coverage_calculator.py",
-            "backend/src/cti_app/application/amendment_service.py",
-        ),
-    },
-]
+DEFAULT_GROUND_TRUTH_PATH = Path(__file__).resolve().parents[2] / "refacto_baseLine" / "ctx_benchmark.json"
+
+
+def load_queries(path: Path) -> list[dict[str, object]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    queries = payload["queries"]
+    return [
+        {
+            "id": str(spec["id"]),
+            "text": str(spec["text"]),
+            "owners": tuple(str(o) for o in spec["owners"]),
+        }
+        for spec in queries
+    ]
 
 
 # --------------------------------------------------------------------------- mesure
@@ -327,6 +256,12 @@ def main() -> int:
     )
     parser.add_argument("--json", action="store_true", help="Sortie JSON machine-readable au lieu du Markdown.")
     parser.add_argument("--no-check", action="store_true", help="Ne pas appliquer les seuils (toujours code 0).")
+    parser.add_argument(
+        "--ground-truth",
+        type=Path,
+        default=DEFAULT_GROUND_TRUTH_PATH,
+        help="Chemin du fichier JSON de cas (défaut: refacto_baseLine/ctx_benchmark.json).",
+    )
 
     parser.add_argument("--min-top3", type=float, default=0.80, help="Seuil top3_hit_rate (défaut: 0.80).")
     parser.add_argument("--min-top8", type=float, default=0.833, help="Seuil top8_hit_rate (défaut: 0.833).")
@@ -338,6 +273,8 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+
+    queries = load_queries(args.ground_truth)
 
     results = [
         score_query(
@@ -353,7 +290,7 @@ def main() -> int:
                 refresh=args.refresh,
             ),
         )
-        for spec in QUERIES
+        for spec in queries
     ]
     agg = aggregate(results)
 

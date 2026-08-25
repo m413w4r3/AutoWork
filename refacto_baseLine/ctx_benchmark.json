@@ -1,0 +1,104 @@
+{
+  "_comment": [
+    "Ground truth pour scripts/ctx/benchmark.py (R88).",
+    "Ce fichier vit sous refacto_baseLine/, deja exclu de l'index ctx.py",
+    "(EXCLUDE_PREFIXES = 'refacto_baseLine/' dans scripts/ctx/ctx.py) : les",
+    "queries et owners ci-dessous ne fuient donc pas dans le corpus indexe.",
+    "Chaque owner pointe vers un fichier runtime qui existe reellement sur",
+    "la branche courante (verifie a la main lors de la redaction R88, pas",
+    "seulement par grep) : aucun ne designe une feature supprimee.",
+    "Ne pas modifier ces requetes/owners en reaction a un resultat de",
+    "benchmark : reformuler seulement si l'owner reel a change (renommage,",
+    "suppression) ou pour couvrir une zone manquante."
+  ],
+  "queries": [
+    {
+      "id": "Q1",
+      "text": "conversation lifecycle release after discovery amendment production publication",
+      "owners": ["chatgpt-bridge/bridge/routes_conversations.py"]
+    },
+    {
+      "id": "Q2",
+      "text": "persist and reload model conversation state database repository",
+      "owners": ["backend/src/cti_app/infrastructure/database/repositories/model_conversations.py"]
+    },
+    {
+      "id": "Q3",
+      "text": "recover incomplete discovery operation after failed or interrupted model run",
+      "owners": [
+        "chatgpt-bridge/bridge/registry.py",
+        "backend/src/cti_app/application/discovery/service.py",
+        "backend/src/cti_app/application/discovery/recovery.py"
+      ]
+    },
+    {
+      "id": "Q4",
+      "text": "validate discovery merge conflicts before applying cumulative merge",
+      "owners": [
+        "backend/src/cti_app/application/discovery/cumulative/service.py",
+        "backend/src/cti_app/application/discovery/cumulative/validation.py"
+      ]
+    },
+    {
+      "id": "Q5",
+      "text": "detect stale discovery merge and replan outdated merge run",
+      "owners": ["backend/src/cti_app/application/discovery/cumulative/service.py"]
+    },
+    {
+      "id": "Q6",
+      "text": "analyst manually attaches a real URL to a no-URL discovery candidate",
+      "owners": ["backend/src/cti_app/application/discovery/manual_source_edits.py"]
+    },
+    {
+      "id": "Q7",
+      "text": "create edition frontend form submit API persistence",
+      "owners": [
+        "frontend/src/pages/EditionCreatePage.tsx",
+        "frontend/src/api/editions.ts"
+      ]
+    },
+    {
+      "id": "Q8",
+      "text": "production workflow orchestrate parse render publish stages",
+      "owners": [
+        "backend/src/cti_app/application/production_workflow.py",
+        "backend/src/cti_app/application/production_stages.py"
+      ]
+    },
+    {
+      "id": "Q9",
+      "text": "expose OpenAI-compatible chat completions endpoint over the bridge transport",
+      "owners": ["chatgpt-bridge/bridge/routes_openai.py"]
+    },
+    {
+      "id": "Q10",
+      "text": "record a human accept or reject decision on an editorial candidate group",
+      "owners": ["backend/src/cti_app/application/editorial.py"]
+    },
+    {
+      "id": "Q11",
+      "text": "extract the authoritative final snapshot from a ChatGPT run report",
+      "owners": ["chatgpt-bridge/bridge/generation.py"]
+    },
+    {
+      "id": "Q12",
+      "text": "worker that deletes a conversation once it is marked pending cleanup",
+      "owners": ["chatgpt-bridge/bridge/lifecycle.py"]
+    },
+    {
+      "id": "Q13",
+      "text": "freeze a drafted brief into an evidence pack and run its QA checks",
+      "owners": ["backend/src/cti_app/application/briefs.py"]
+    },
+    {
+      "id": "Q14",
+      "text": "list extracted claims and indicators as evidence for a subject",
+      "owners": ["backend/src/cti_app/application/collection_review.py"]
+    },
+    {
+      "id": "Q15",
+      "text": "operator panel for reviewing and resolving pending discovery merge candidates",
+      "owners": ["frontend/src/components/DiscoveryMergeReview.tsx"]
+    }
+  ]
+}
