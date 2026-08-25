@@ -20,10 +20,10 @@ corpus being benchmarked.
 Examples:
 
     env -u BASE_URL -u EMBEDDING_API_KEY \\
-        uv run scripts/ctx/ctx.py build --lexical-only
-    uv run scripts/ctx/benchmark.py --lexical-only
+        python3 scripts/ctx/ctx.py build --lexical-only
+    python3 scripts/ctx/benchmark.py --lexical-only
 
-    uv run scripts/ctx/benchmark.py --lexical-only --json --no-check
+    python3 scripts/ctx/benchmark.py --lexical-only --json --no-check
 """
 
 from __future__ import annotations
@@ -96,7 +96,7 @@ def run_query(
 
     if lexical_only:
         chunks = ctx.load_chunks()
-        matrix = __import__("numpy").empty((0, 0), dtype="float32")
+        matrix = []
     else:
         chunks, matrix, _ = ctx.load_index(model)
 

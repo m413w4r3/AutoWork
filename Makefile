@@ -1,6 +1,6 @@
 .PHONY: up down clean up-clean status logs bridge-status bridge-logs bridge-soak \
 	restart-bridge model-run-diagnostics diagnostics dev stop test test-integration \
-	lint format typecheck ctx ctx-lexical ctx-status ctx-doctor ctx-benchmark
+	lint format typecheck ctx ctx-dense ctx-lexical ctx-status ctx-doctor ctx-benchmark
 
 UV ?= uv
 PNPM ?= pnpm
@@ -90,21 +90,25 @@ format:
 	cd frontend && $(PNPM) format
 
 ctx:
+	$(MAKE) ctx-dense
+
+# Explicit dense build; the ordinary inspection targets below are stdlib-only.
+ctx-dense:
 	$(UV) run scripts/ctx/ctx.py build
 
 # Fallback sans credentials d'embedding : construit/rafraîchit uniquement
 # les chunks + l'index lexical, sans appeler le service d'embedding.
 ctx-lexical:
-	$(UV) run scripts/ctx/ctx.py build --lexical-only
+	python3 scripts/ctx/ctx.py build --lexical-only
 
 ctx-status:
-	$(UV) run scripts/ctx/ctx.py status
+	python3 scripts/ctx/ctx.py status
 
 ctx-doctor:
-	$(UV) run scripts/ctx/ctx.py doctor
+	python3 scripts/ctx/ctx.py doctor
 
 # Rejoue le benchmark de navigation gelé R67 (spec figée dans
 # refacto_baseLine/R67_benchmark_spec.md) contre l'index lexical courant.
 # Code de sortie non-zero si les seuils par défaut ne sont pas atteints.
 ctx-benchmark: ctx-lexical
-	env -u BASE_URL -u EMBEDDING_API_KEY $(UV) run scripts/ctx/benchmark.py --lexical-only
+	env -u BASE_URL -u EMBEDDING_API_KEY python3 scripts/ctx/benchmark.py --lexical-only

@@ -13,7 +13,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 CTX_SCRIPT = Path(__file__).resolve().parents[1] / "ctx.py"
 BENCHMARK_SCRIPT = Path(__file__).resolve().parents[1] / "benchmark.py"
@@ -32,13 +35,14 @@ NEW_OWNER_SOURCE = (
 )
 
 
-def run_ctx(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run_ctx(repo: Path, *args: str, stdlib_only: bool = False) -> subprocess.CompletedProcess[str]:
     """Lance ctx.py dans `repo`, sans aucun credential d'embedding."""
     env = dict(os.environ)
     env.pop("BASE_URL", None)
     env.pop("EMBEDDING_API_KEY", None)
     return subprocess.run(
-        ["uv", "run", str(CTX_SCRIPT), *args],
+        ([sys.executable, "-S"] if stdlib_only else [sys.executable])
+        + [str(CTX_SCRIPT), *args],
         cwd=repo,
         env=env,
         text=True,
@@ -63,15 +67,15 @@ def git_snapshot(repo: Path) -> None:
     )
 
 
-def test_fresh_lexical_build_without_credentials(tmp_path: Path) -> None:
+def test_fresh_lexical_build_stdlib_only(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     (repo / "src" / "old_owner.py").write_text(OLD_OWNER_SOURCE)
     git_snapshot(repo)
 
-    build = run_ctx(repo, "build", "--lexical-only")
+    build = run_ctx(repo, "build", "--lexical-only", stdlib_only=True)
     assert build.returncode == 0, build.stderr
 
-    query = run_ctx(repo, "query", "distinctive owner", "--lexical-only", "--paths-only")
+    query = run_ctx(repo, "query", "distinctive owner", "--lexical-only", "--paths-only", stdlib_only=True)
     assert query.returncode == 0, query.stderr
     assert "src/old_owner.py" in query.stdout.splitlines()
 
@@ -104,10 +108,18 @@ def test_lexical_build_does_not_pretend_dense_is_ready(tmp_path: Path) -> None:
     build = run_ctx(repo, "build", "--lexical-only")
     assert build.returncode == 0, build.stderr
 
-    # Une query hybride normale doit échouer proprement : pas de credentials.
-    dense_query = run_ctx(repo, "query", "distinctive owner")
-    assert dense_query.returncode != 0
-    assert "BASE_URL" in dense_query.stderr and "EMBEDDING_API_KEY" in dense_query.stderr
+    # AUTO retombe automatiquement sur le lexical sans credentials.
+    dense_query = run_ctx(repo, "query", "distinctive owner", "--paths-only")
+    assert dense_query.returncode == 0, dense_query.stderr
+    assert "src/old_owner.py" in dense_query.stdout.splitlines()
+
+    hybrid_query = run_ctx(repo, "query", "distinctive owner", "--hybrid-only")
+    assert hybrid_query.returncode != 0
+    assert (
+        "credentials" in hybrid_query.stderr
+        or "BASE_URL" in hybrid_query.stderr
+        or "dépendance dense" in hybrid_query.stderr
+    )
 
     # L'échec dense ne doit pas avoir corrompu l'index lexical.
     lexical_query = run_ctx(repo, "query", "distinctive owner", "--lexical-only", "--paths-only")
@@ -148,6 +160,17 @@ def test_exact_symbol_beats_narrative_test_mention(tmp_path: Path) -> None:
     paths = query.stdout.splitlines()
     assert paths, "expected at least one result"
     assert paths[0] == "src/write_path.py", paths
+
+
+def test_auto_falls_back_without_site_packages(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    (repo / "src" / "stdlib_only.py").write_text("def stdlib_only_locator():\n    return True\n")
+    git_snapshot(repo)
+
+    result = run_ctx(repo, "query", "stdlib only locator", "--paths-only", stdlib_only=True)
+    assert result.returncode == 0, result.stderr
+    assert "src/stdlib_only.py" in result.stdout.splitlines()
+    assert "fallback lexical" in result.stderr
 
 
 def test_source_implementation_beats_adr_narrative(tmp_path: Path) -> None:
@@ -274,7 +297,7 @@ print("OK")
     )
 
     result = subprocess.run(
-        ["uv", "run", "--python", "3.12", "--with", "openai", "--with", "numpy", str(test_script)],
+        [sys.executable, str(test_script)],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -295,12 +318,9 @@ print("OK")
 # forme et la cohérence de la sortie CLI sur les 12 requêtes réellement
 # gelées, qui pointent nécessairement vers des fichiers d'AutoWork.
 #
-# `benchmark.py` importe `ctx.py`, qui dépend de numpy/openai au niveau
-# module : comme les autres tests de ce fichier tournent via
-# `uv run --python 3.12 --with pytest pytest ...` (sans ces deps dans
-# l'environnement pytest lui-même), les tests unitaires de scoring
-# s'exécutent dans un sous-processus `uv run --with openai --with numpy`,
-# exactement comme `test_empty_cache_file_cleanup` ci-dessus.
+# Le scorer lexical s'exécute directement avec l'interpréteur du test. Les
+# tests de cache dense chargent numpy uniquement dans leur script auxiliaire,
+# sans l'imposer au démarrage de ctx.py.
 
 
 def run_benchmark_scoring_script(repo: Path, body: str) -> subprocess.CompletedProcess[str]:
@@ -320,7 +340,7 @@ def run_benchmark_scoring_script(repo: Path, body: str) -> subprocess.CompletedP
         "print('OK')\n"
     )
     return subprocess.run(
-        ["uv", "run", "--python", "3.12", "--with", "openai", "--with", "numpy", str(script)],
+        [sys.executable, "-S", str(script)],
         cwd=repo,
         capture_output=True,
         text=True,
@@ -407,12 +427,14 @@ def test_benchmark_cli_runs_frozen_12_queries_lexical_only() -> None:
     benchmark gelé pointe par nature vers des fichiers réels d'AutoWork, donc
     ce test (contrairement aux autres de ce fichier) s'exécute dans le vrai
     dépôt plutôt que dans un dépôt synthétique."""
+    if not (REPO_ROOT / "refacto_baseLine" / "ctx_benchmark.json").exists():
+        pytest.skip("benchmark fixture absent from this checkout")
     env = dict(os.environ)
     env.pop("BASE_URL", None)
     env.pop("EMBEDDING_API_KEY", None)
 
     build = subprocess.run(
-        ["uv", "run", str(CTX_SCRIPT), "build", "--lexical-only"],
+        [sys.executable, str(CTX_SCRIPT), "build", "--lexical-only"],
         cwd=REPO_ROOT,
         env=env,
         text=True,
@@ -422,7 +444,7 @@ def test_benchmark_cli_runs_frozen_12_queries_lexical_only() -> None:
     assert build.returncode == 0, build.stderr
 
     run = subprocess.run(
-        ["uv", "run", str(BENCHMARK_SCRIPT), "--lexical-only", "--json", "--no-check"],
+        [sys.executable, str(BENCHMARK_SCRIPT), "--lexical-only", "--json", "--no-check"],
         cwd=REPO_ROOT,
         env=env,
         text=True,
@@ -456,12 +478,14 @@ def test_benchmark_cli_runs_frozen_12_queries_lexical_only() -> None:
 
 
 def test_benchmark_exit_code_reflects_thresholds() -> None:
+    if not (REPO_ROOT / "refacto_baseLine" / "ctx_benchmark.json").exists():
+        pytest.skip("benchmark fixture absent from this checkout")
     env = dict(os.environ)
     env.pop("BASE_URL", None)
     env.pop("EMBEDDING_API_KEY", None)
 
     checked = subprocess.run(
-        ["uv", "run", str(BENCHMARK_SCRIPT), "--lexical-only", "--json"],
+        [sys.executable, str(BENCHMARK_SCRIPT), "--lexical-only", "--json"],
         cwd=REPO_ROOT,
         env=env,
         text=True,
@@ -469,7 +493,7 @@ def test_benchmark_exit_code_reflects_thresholds() -> None:
         timeout=180,
     )
     unchecked = subprocess.run(
-        ["uv", "run", str(BENCHMARK_SCRIPT), "--lexical-only", "--json", "--no-check"],
+        [sys.executable, str(BENCHMARK_SCRIPT), "--lexical-only", "--json", "--no-check"],
         cwd=REPO_ROOT,
         env=env,
         text=True,
@@ -493,13 +517,12 @@ def test_benchmark_exit_code_reflects_thresholds() -> None:
 # requête du benchmark R67 et d'aucun index construit : ils décrivent des
 # propriétés générales du scorer, valables pour n'importe quel dépôt.
 #
-# ctx.py déclare ses dépendances en PEP 723 ; on exécute donc ces assertions
-# via `uv run --with numpy --with openai`, comme `test_empty_cache_file_cleanup`.
+# Ces assertions sont lancées directement avec l'interpréteur courant : elles
+# vérifient que le scorer lexical reste disponible sans bootstrap dense.
 
 SCORER_PRELUDE = '''
 import sys
 sys.path.insert(0, {ctx_dir!r})
-import numpy as np
 import ctx
 
 
@@ -520,7 +543,7 @@ def rank(chunks, query):
     """Ordre lexical-only : renvoie les chunks du meilleur au moins bon."""
     ranked = ctx.rank_chunks(
         chunks,
-        np.empty((0, 0), dtype=np.float32),
+        [],
         query,
         model="unused",
         lexical_only=True,
@@ -531,13 +554,13 @@ def rank(chunks, query):
 
 
 def run_scorer(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
-    """Exécute des assertions de scoring dans un interpréteur ayant numpy."""
+    """Exécute des assertions de scoring dans un interpréteur stdlib-only."""
     script = tmp_path / "scorer_case.py"
     script.write_text(
         SCORER_PRELUDE.format(ctx_dir=str(CTX_SCRIPT.parent)) + body + '\nprint("OK")\n'
     )
     return subprocess.run(
-        ["uv", "run", "--python", "3.12", "--with", "openai", "--with", "numpy", str(script)],
+        [sys.executable, "-S", str(script)],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -775,7 +798,7 @@ chunks = [
 ]
 ranked = ctx.rank_chunks(
     chunks,
-    np.empty((0, 0), dtype=np.float32),
+    [],
     "alpha handler",
     model="unused",
     lexical_only=True,
@@ -789,7 +812,7 @@ assert ranked[0].score > 0.0
 # Une requête sans terme exploitable ne doit pas exploser.
 empty = ctx.rank_chunks(
     chunks,
-    np.empty((0, 0), dtype=np.float32),
+    [],
     "   ",
     model="unused",
     lexical_only=True,

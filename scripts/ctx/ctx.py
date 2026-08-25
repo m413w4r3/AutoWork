@@ -19,12 +19,12 @@ Principes :
 
 Exemples :
 
-    uv run scripts/ctx/ctx.py build
-    uv run scripts/ctx/ctx.py query "cycle de vie conversation release" -k 8
-    uv run scripts/ctx/ctx.py query "external_locator cleanup" --path chatgpt-bridge/
-    uv run scripts/ctx/ctx.py query "ConversationPolicy" --lexical-only
-    uv run scripts/ctx/ctx.py status
-    uv run scripts/ctx/ctx.py doctor
+    uv run scripts/ctx/ctx.py build                 # build dense explicite
+    python3 scripts/ctx/ctx.py query "cycle de vie conversation release" -k 8
+    python3 scripts/ctx/ctx.py query "external_locator cleanup" --path chatgpt-bridge/
+    python3 scripts/ctx/ctx.py query "ConversationPolicy" --lexical-only
+    python3 scripts/ctx/ctx.py status
+    python3 scripts/ctx/ctx.py doctor
 """
 
 from __future__ import annotations
@@ -45,9 +45,6 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterator
-
-import numpy as np
-from openai import APIConnectionError, APIStatusError, OpenAI
 
 try:  # POSIX ; AutoWork est utilisé sous Linux.
     import fcntl
@@ -221,6 +218,8 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 
 def atomic_save_npy(path: Path, matrix: np.ndarray) -> None:
+    import numpy as np
+
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".npy", dir=path.parent)
     os.close(fd)
@@ -250,6 +249,8 @@ def build_lock() -> Iterator[None]:
 
 
 def make_client() -> OpenAI:
+    from openai import OpenAI
+
     base_url = os.getenv("BASE_URL", "").strip()
     api_key = os.getenv("EMBEDDING_API_KEY", "").strip()
     if not base_url or not api_key:
@@ -695,11 +696,16 @@ def build_chunks() -> tuple[list[Chunk], dict[str, str], str, list[Path]]:
 
 
 def normalize(matrix: np.ndarray) -> np.ndarray:
+    import numpy as np
+
     norms = np.linalg.norm(matrix, axis=-1, keepdims=True)
     return matrix / np.clip(norms, 1e-12, None)
 
 
 def embed(client: OpenAI, model: str, texts: list[str], *, quiet: bool = False) -> np.ndarray:
+    import numpy as np
+    from openai import APIConnectionError, APIStatusError
+
     out: list[list[float]] = []
     for start in range(0, len(texts), BATCH):
         batch = texts[start:start + BATCH]
@@ -728,6 +734,11 @@ def embed(client: OpenAI, model: str, texts: list[str], *, quiet: bool = False) 
 
 
 def load_cache(model: str) -> dict[str, np.ndarray]:
+    try:
+        import numpy as np
+    except ImportError:
+        return {}
+
     directory = cache_dir(model)
     meta_path = directory / "meta.json"
     vec_path = directory / "vectors.npy"
@@ -750,6 +761,8 @@ def load_cache(model: str) -> dict[str, np.ndarray]:
 
 
 def save_cache(model: str, cache: dict[str, np.ndarray]) -> None:
+    import numpy as np
+
     directory = cache_dir(model)
 
     if not cache:
@@ -843,7 +856,10 @@ def do_build(
 ) -> dict[str, object]:
     with build_lock():
         chunks, texts, signature, _ = build_chunks()
-        cache = {} if full else load_cache(model)
+        # Le noyau lexical ne lit ni n'écrit jamais le cache numpy. Cela rend
+        # build/query --lexical-only réellement stdlib-only, même si un cache
+        # dense existe déjà.
+        cache = {} if full or lexical_only else load_cache(model)
         missing = [key for key in texts if key not in cache]
 
         if not quiet:
@@ -866,7 +882,8 @@ def do_build(
         wanted = set(texts)
         cache = {key: vector for key, vector in cache.items() if key in wanted}
 
-        save_cache(model, cache)
+        if not lexical_only:
+            save_cache(model, cache)
         write_index(chunks, model, signature, cache)
 
         dim = int(next(iter(cache.values())).shape[0]) if cache else 0
@@ -928,6 +945,8 @@ def index_stale(manifest: dict[str, object] | None = None) -> tuple[bool, str]:
 
 
 def load_index(model: str) -> tuple[list[Chunk], np.ndarray, dict[str, object]]:
+    import numpy as np
+
     manifest = load_manifest()
     built_model = str(manifest.get("model", ""))
     if built_model != model:
@@ -986,10 +1005,10 @@ def path_prior(path: str) -> float:
     return ROLE_PRIORS[path_role(path)]
 
 
-def lexical_scores(chunks: list[Chunk], text: str) -> np.ndarray:
+def lexical_scores(chunks: list[Chunk], text: str) -> list[float]:
     q_terms = query_terms(text)
     if not q_terms:
-        return np.zeros(len(chunks), dtype=np.float32)
+        return [0.0] * len(chunks)
 
     qset = set(q_terms)
     doc_sets = [set(chunk.terms) for chunk in chunks]
@@ -1010,7 +1029,7 @@ def lexical_scores(chunks: list[Chunk], text: str) -> np.ndarray:
     avg_len = (sum(len(terms) for terms in doc_sets) / len(doc_sets)) if doc_sets else 1.0
     avg_len = max(avg_len, 1.0)
 
-    scores = np.zeros(len(chunks), dtype=np.float32)
+    scores = [0.0] * len(chunks)
     for i, chunk in enumerate(chunks):
         matched = qset & doc_sets[i]
         if not matched:
@@ -1049,10 +1068,10 @@ def lexical_scores(chunks: list[Chunk], text: str) -> np.ndarray:
     return scores
 
 
-def meta_scores(chunks: list[Chunk], text: str) -> np.ndarray:
+def meta_scores(chunks: list[Chunk], text: str) -> list[float]:
     q = text.casefold().strip()
     q_tokens = set(query_terms(text))
-    out = np.zeros(len(chunks), dtype=np.float32)
+    out = [0.0] * len(chunks)
 
     for i, chunk in enumerate(chunks):
         symbol = chunk.symbol.casefold()
@@ -1127,7 +1146,7 @@ def select_results(
 
 def rank_chunks(
     chunks: list[Chunk],
-    matrix: np.ndarray,
+    matrix: object,
     text: str,
     *,
     model: str,
@@ -1138,9 +1157,15 @@ def rank_chunks(
     meta = meta_scores(chunks, text)
 
     if lexical_only:
-        dense = np.zeros(len(chunks), dtype=np.float32)
-        scores = LEXICAL_ONLY_LEXICAL_WEIGHT * lexical + LEXICAL_ONLY_META_WEIGHT * meta
+        dense = [0.0] * len(chunks)
+        scores = [
+            LEXICAL_ONLY_LEXICAL_WEIGHT * lexical[i]
+            + LEXICAL_ONLY_META_WEIGHT * meta[i]
+            for i in range(len(chunks))
+        ]
     else:
+        import numpy as np
+
         query_text = text
         if not no_instruct:
             query_text = f"Instruct: {QUERY_INSTRUCTION}\nQuery: {text}"
@@ -1154,11 +1179,15 @@ def rank_chunks(
         dense = matrix @ query_vector
         # cosine [-1,1] -> [0,1] pour rendre le mélange lisible.
         dense01 = np.clip((dense + 1.0) / 2.0, 0.0, 1.0)
-        scores = DENSE_WEIGHT * dense01 + LEXICAL_WEIGHT * lexical + META_WEIGHT * meta
+        scores = DENSE_WEIGHT * dense01 + np.asarray(LEXICAL_WEIGHT * np.asarray(lexical)) + np.asarray(META_WEIGHT * np.asarray(meta))
 
     # Prior de chemin léger, appliqué après fusion.
-    scores = scores * np.asarray([path_prior(c.path) for c in chunks], dtype=np.float32)
-    order = np.argsort(-scores)
+    if lexical_only:
+        scores = [score * path_prior(chunk.path) for score, chunk in zip(scores, chunks, strict=True)]
+        order = sorted(range(len(chunks)), key=lambda i: (-scores[i], i))
+    else:
+        scores = scores * np.asarray([path_prior(c.path) for c in chunks], dtype=np.float32)
+        order = np.argsort(-scores)
     return [
         Ranked(
             chunk=chunks[int(i)],
@@ -1211,40 +1240,80 @@ def maybe_refresh(args: argparse.Namespace) -> None:
         do_build(args.model, full=False, quiet=True)
 
 
-def cmd_query(args: argparse.Namespace) -> int:
+def dense_prerequisite_error() -> str | None:
+    """Retourne une raison courte sans importer de dépendance au démarrage."""
     try:
-        maybe_refresh(args)
-        if args.lexical_only:
-            # Le scoring lexical n'utilise jamais la matrice dense (voir
-            # rank_chunks) : ne pas exiger des vecteurs complets/présents
-            # pour rester utilisable sans credentials d'embedding.
-            chunks = load_chunks()
-            matrix = np.empty((0, 0), dtype=np.float32)
-        else:
-            chunks, matrix, _ = load_index(args.model)
+        __import__("numpy")
+        __import__("openai")
+    except ImportError as exc:
+        return f"dépendance dense indisponible ({exc.name})"
+    if not os.getenv("BASE_URL", "").strip() or not os.getenv("EMBEDDING_API_KEY", "").strip():
+        return "credentials d'embedding absents"
+    return None
 
-        ranked = rank_chunks(
+
+def lexical_query(args: argparse.Namespace) -> list[Ranked]:
+    """Exécute le locator lexical sans toucher au chemin dense."""
+    lexical_args = argparse.Namespace(**vars(args))
+    lexical_args.lexical_only = True
+    maybe_refresh(lexical_args)
+    chunks = load_chunks()
+    return select_results(
+        rank_chunks(
             chunks,
-            matrix,
+            [],
             args.text,
             model=args.model,
-            lexical_only=args.lexical_only,
+            lexical_only=True,
             no_instruct=args.no_instruct,
-        )
-        picked = select_results(
-            ranked,
-            k=args.k,
-            per_file=args.per_file,
-            path_prefixes=args.path,
-            relative_floor=args.relative_floor,
-        )
+        ),
+        k=args.k,
+        per_file=args.per_file,
+        path_prefixes=args.path,
+        relative_floor=args.relative_floor,
+    )
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    picked: list[Ranked]
+    try:
+        if args.lexical_only:
+            picked = lexical_query(args)
+        else:
+            prerequisite_error = dense_prerequisite_error()
+            if prerequisite_error:
+                if args.hybrid_only:
+                    raise RuntimeError(prerequisite_error)
+                print(f"NOTE: {prerequisite_error}; fallback lexical.", file=sys.stderr)
+                picked = lexical_query(args)
+            else:
+                maybe_refresh(args)
+                chunks, matrix, _ = load_index(args.model)
+                ranked = rank_chunks(
+                    chunks,
+                    matrix,
+                    args.text,
+                    model=args.model,
+                    lexical_only=False,
+                    no_instruct=args.no_instruct,
+                )
+                picked = select_results(
+                    ranked,
+                    k=args.k,
+                    per_file=args.per_file,
+                    path_prefixes=args.path,
+                    relative_floor=args.relative_floor,
+                )
     except RuntimeError as exc:
-        # Si le service d'embedding est indisponible mais que l'index existe,
-        # l'utilisateur peut explicitement retenter en lexical-only.
-        print(f"ERROR: {exc}", file=sys.stderr)
-        if not args.lexical_only:
-            print("HINT: essaie `ctx.py query ... --lexical-only` si l'index existe.", file=sys.stderr)
-        return 2
+        if args.hybrid_only or args.lexical_only:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        print(f"NOTE: mode hybride indisponible ({exc}); fallback lexical.", file=sys.stderr)
+        try:
+            picked = lexical_query(args)
+        except RuntimeError as lexical_exc:
+            print(f"ERROR: {lexical_exc}", file=sys.stderr)
+            return 2
 
     if args.json:
         print(json.dumps([
@@ -1408,6 +1477,11 @@ def main() -> int:
         "--lexical-only",
         action="store_true",
         help="N'appelle pas le service d'embedding pour la requête.",
+    )
+    query.add_argument(
+        "--hybrid-only",
+        action="store_true",
+        help="Exige le mode hybride et échoue si ses prérequis sont indisponibles.",
     )
     query.add_argument(
         "--refresh",
