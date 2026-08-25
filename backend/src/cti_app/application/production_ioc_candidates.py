@@ -32,7 +32,7 @@ from cti_app.domain.discovery import (
 from cti_app.domain.entities import SourceDocument
 from cti_app.domain.publication import ArtifactType
 
-PACK_BUILDER_VERSION: Final = "ioc-candidate-pack-v1"
+PACK_BUILDER_VERSION: Final = "ioc-candidate-pack-v2"
 DEFAULT_MAX_CANDIDATES_PER_BATCH: Final = 64
 DEFAULT_MAX_BATCH_CHARS: Final = 120_000
 MAX_SNIPPETS_PER_SOURCE: Final = 3
@@ -48,6 +48,7 @@ class CandidateWarningCode(StrEnum):
     DISCOVERY_PUBLICATION_UNRESOLVED = "discovery_publication_unresolved"
     DISCOVERY_VALUE_NOT_FOUND = "discovery_value_not_found"
     DISCOVERY_TYPE_IGNORED = "discovery_type_ignored"
+    Q2_LITERAL_UNRESOLVED = "q2_literal_unresolved"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +91,8 @@ class IocCandidate:
     evidence: tuple[IocCandidateEvidence, ...]
     indicator_ids: tuple[UUID, ...]
     discovery_provenance: tuple[DiscoveryIocProvenance, ...] = ()
+    # Model-provided context is retained for audit only.  It is never evidence.
+    q2_contexts: tuple[str, ...] = ()
 
     @property
     def source_backed(self) -> bool:
@@ -125,6 +128,16 @@ class IocCandidatePack:
     discovery_only_candidates: int = 0
     discovery_matched_to_source: int = 0
     discovery_unmatched: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class Q2LiteralCandidate:
+    """A literal surfaced by Q2, pending deterministic corpus recovery."""
+
+    artifact_type: ArtifactType
+    raw_value: str
+    normalized_value: str
+    context: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +178,7 @@ def build_candidate_pack(
     artifact_texts: Mapping[UUID, str] | None = None,
     provisional_iocs: Sequence[ProvisionalDiscoveryIoc] = (),
     discovery_publications: Mapping[UUID, DiscoveryPublicationEvidence] | None = None,
+    q2_literals: Sequence[Q2LiteralCandidate] = (),
     max_candidates_per_batch: int = DEFAULT_MAX_CANDIDATES_PER_BATCH,
     max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
 ) -> IocCandidatePack:
@@ -337,7 +351,7 @@ def build_candidate_pack(
     for key in sorted(discovery_provenance, key=lambda item: (item[0].value, item[1])):
         current = by_key.get(key)
         provenance_items = tuple(discovery_provenance[key])
-        evidence = tuple(discovery_evidence[key])
+        discovered_evidence = tuple(discovery_evidence[key])
         if current is not None:
             discovery_stats["augmented"] += 1
             updated = replace(
@@ -352,11 +366,11 @@ def build_candidate_pack(
             candidates_list[candidates_list.index(current)] = updated
             by_key[key] = updated
             continue
-        if evidence:
+        if discovered_evidence:
             candidate = _discovery_candidate(
                 key,
                 provisional_ioc=provenance_items[0],
-                evidence=evidence,
+                evidence=discovered_evidence,
                 provenance=provenance_items,
             )
         else:
@@ -367,6 +381,63 @@ def build_candidate_pack(
                 provenance=provenance_items,
             )
             discovery_stats["only"] += 1
+        candidates_list.append(candidate)
+        by_key[key] = candidate
+
+    # Q2 may surface a literal that deterministic extraction missed.  Recover
+    # it only from the already archived corpus; its model context is not proof.
+    artifact_documents = {
+        collection.derived_artifact_id: collection.source_document_id
+        for collection in collections
+        if collection.derived_artifact_id is not None and collection.source_document_id is not None
+    }
+    for literal in sorted(
+        q2_literals, key=lambda item: (item.artifact_type.value, item.normalized_value)
+    ):
+        key = (literal.artifact_type, literal.normalized_value)
+        current = by_key.get(key)
+        context = " ".join(literal.context.split())[:600]
+        if current is not None:
+            updated = replace(
+                current,
+                q2_contexts=tuple(sorted(set((*current.q2_contexts, context)) - {""})),
+            )
+            candidates_list[candidates_list.index(current)] = updated
+            by_key[key] = updated
+            continue
+
+        evidence: list[IocCandidateEvidence] = []
+        for artifact_id, text in sorted(artifact_texts.items(), key=lambda item: str(item[0])):
+            source_document_id = artifact_documents.get(artifact_id)
+            if source_document_id is None:
+                continue
+            match = _find_literal(text, _q2_search_values(literal))
+            if match is None:
+                continue
+            start, end = match
+            source_ids = source_lookup.get(source_document_id, ())
+            evidence.append(
+                IocCandidateEvidence(
+                    indicator_id=uuid5(
+                        NAMESPACE_URL,
+                        f"q2-recovery:{literal.artifact_type.value}:{literal.normalized_value}:{artifact_id}:{start}",
+                    ),
+                    derived_artifact_id=artifact_id,
+                    source_document_id=source_document_id,
+                    source_ids=source_ids,
+                    original_value=text[start:end],
+                    span_start=start,
+                    span_end=end,
+                    snippet=text[
+                        max(0, start - SNIPPET_CONTEXT_CHARS) : min(
+                            len(text), end + SNIPPET_CONTEXT_CHARS
+                        )
+                    ],
+                )
+            )
+        if not evidence:
+            warnings.append(f"{CandidateWarningCode.Q2_LITERAL_UNRESOLVED.value}:{literal.raw_value}")
+        candidate = _q2_candidate(key, literal, tuple(evidence), context)
         candidates_list.append(candidate)
         by_key[key] = candidate
     candidates = tuple(
@@ -524,6 +595,17 @@ def _discovery_search_values(
     return tuple(dict.fromkeys(value for value in values if value.strip()))
 
 
+def _q2_search_values(literal: Q2LiteralCandidate) -> tuple[str, ...]:
+    values = [literal.raw_value, literal.normalized_value]
+    values.append(
+        literal.raw_value.replace("[.]", ".")
+        .replace("(.)", ".")
+        .replace("[@]", "@")
+        .replace("(at)", "@")
+    )
+    return tuple(dict.fromkeys(value for value in values if value.strip()))
+
+
 def _find_literal(text: str, values: Sequence[str]) -> tuple[int, int] | None:
     folded = text.casefold()
     matches = [
@@ -558,6 +640,26 @@ def _discovery_candidate(
     )
 
 
+def _q2_candidate(
+    key: tuple[ArtifactType, str],
+    literal: Q2LiteralCandidate,
+    evidence: tuple[IocCandidateEvidence, ...],
+    context: str,
+) -> IocCandidate:
+    artifact_type, normalized = key
+    return IocCandidate(
+        candidate_id="ioc-"
+        + hashlib.sha256(f"{artifact_type.value}\0{normalized}".encode()).hexdigest(),
+        artifact_type=artifact_type,
+        preferred_original_value=literal.raw_value,
+        normalized_value=normalized,
+        source_ids=tuple(sorted({source_id for item in evidence for source_id in item.source_ids})),
+        evidence=evidence,
+        indicator_ids=tuple(item.indicator_id for item in evidence),
+        q2_contexts=(context,) if context else (),
+    )
+
+
 def _candidate_json(candidate: IocCandidate) -> dict[str, object]:
     payload: dict[str, object] = {
         "candidate_id": candidate.candidate_id,
@@ -589,6 +691,8 @@ def _candidate_json(candidate: IocCandidate) -> dict[str, object]:
             }
             for item in candidate.discovery_provenance
         ]
+    if candidate.q2_contexts:
+        payload["q2_contexts_not_evidence"] = candidate.q2_contexts
     return payload
 
 
@@ -618,6 +722,7 @@ def _candidate_hash_json(candidate: IocCandidate) -> dict[str, object]:
             }
             for item in candidate.discovery_provenance
         ],
+        "q2_contexts": candidate.q2_contexts,
     }
 
 

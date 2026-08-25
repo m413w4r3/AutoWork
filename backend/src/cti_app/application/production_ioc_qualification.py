@@ -21,7 +21,7 @@ from cti_app.application.production_parsers import (
     TechnicalExtraction,
 )
 
-IOC_QUALIFICATION_PROMPT_VERSION: Final = "1"
+IOC_QUALIFICATION_PROMPT_VERSION: Final = "2"
 IOC_QUALIFICATION_PARSER_VERSION: Final = "1"
 MAX_REASON_CHARS: Final = 600
 

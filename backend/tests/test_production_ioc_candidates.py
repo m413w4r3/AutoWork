@@ -6,8 +6,10 @@ import pytest
 
 from cti_app.application.production_ioc_candidates import (
     DiscoveryPublicationEvidence,
+    Q2LiteralCandidate,
     build_candidate_pack,
 )
+from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.production_parsers import ParsedSource, ReferenceReport
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import (
@@ -25,6 +27,7 @@ from cti_app.domain.discovery import (
     SourceRole,
 )
 from cti_app.domain.entities import SourceDocument
+from cti_app.domain.publication import ArtifactType
 
 NOW = datetime(2025, 1, 1, tzinfo=UTC)
 
@@ -235,6 +238,44 @@ def test_input_order_does_not_change_canonical_result():
     forward = _pack(rows, _report("https://news.test/a"))
     reverse = _pack(rows[::-1], _report("https://news.test/a"))
     assert forward == reverse
+
+
+def test_q2_literal_is_recovered_from_archived_text_with_sourced_evidence():
+    row = _records("ignored.example")
+    collection = replace(row[1], derived_artifact_id=row[3].id)
+    literal = Q2LiteralCandidate(
+        artifact_type=ArtifactType.DOMAIN,
+        raw_value="evil[.]example",
+        normalized_value=normalize_indicator_value("evil[.]example", ArtifactType.DOMAIN),
+        context="C2 cité par le rapport.",
+    )
+    pack = build_candidate_pack(
+        (),
+        collections=(collection,),
+        source_documents=(row[2],),
+        artifacts=(row[3],),
+        reference_report=_report("https://news.test/a"),
+        artifact_texts={row[3].id: "Le C2 est evil.example."},
+        q2_literals=(literal,),
+    )
+    candidate = pack.candidates[0]
+    assert candidate.source_ids == ("S1",)
+    assert candidate.evidence[0].original_value == "evil.example"
+    assert candidate.q2_contexts == ("C2 cité par le rapport.",)
+
+
+def test_unresolved_q2_literal_is_retained_without_source_backing():
+    literal = Q2LiteralCandidate(
+        artifact_type=ArtifactType.DOMAIN,
+        raw_value="missing.example",
+        normalized_value="missing.example",
+        context="non retrouvé",
+    )
+    pack = build_candidate_pack(
+        (), collections=(), reference_report=_report("https://news.test/a"), q2_literals=(literal,)
+    )
+    assert not pack.candidates[0].source_backed
+    assert any("q2_literal_unresolved" in warning for warning in pack.warnings)
 
 
 def _provisional(value: str, publication_id: UUID, kind=DiscoveryIocType.DOMAIN):

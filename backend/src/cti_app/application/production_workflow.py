@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -20,6 +21,7 @@ from cti_app.application.production_ioc_candidates import (
     IocCandidate,
     IocCandidateBatch,
     IocCandidatePack,
+    Q2LiteralCandidate,
     build_candidate_pack,
     source_ids_by_document,
 )
@@ -697,14 +699,16 @@ class ProductionWorkflowOrchestrator:
                     "error_code": "references_payload_missing",
                     "error": "Reference report content is not readable",
                 }
-            candidate_pack = await self._build_ioc_candidate_pack(uow, run.subject_id, report)
+            initial_candidate_pack = await self._build_ioc_candidate_pack(
+                uow, run.subject_id, report
+            )
             input_data = {
                 "subject_id": str(run.subject_id),
                 "references_version": references.version,
                 "references_hash": references.input_hash,
                 "stage": "extraction",
                 "prompt_version": EXTRACTION_PROMPT_VERSION,
-                "candidate_pack_hash": candidate_pack.pack_hash,
+                "initial_candidate_pack_hash": initial_candidate_pack.pack_hash,
                 "ioc_qualification_prompt_version": IOC_QUALIFICATION_PROMPT_VERSION,
                 "ioc_qualification_parser_version": IOC_QUALIFICATION_PARSER_VERSION,
             }
@@ -741,6 +745,41 @@ class ProductionWorkflowOrchestrator:
                     "referenced_evidence": referenced_evidence,
                 }
 
+            subject_title, _ = await self._subject_context(uow, run.subject_id)
+            prompt = ProductionPromptTemplates.get_extraction_prompt(subject_title=subject_title)
+
+            try:
+                parsed, raw, turn_id = await self._ask_with_format_repair(
+                    run=run,
+                    conversation_id=conversation_id,
+                    stage="extraction",
+                    prompt=prompt,
+                    mode=ConversationMode.CONTINUE,
+                    parse=lambda text: parse_technical_extraction(text, report),
+                    external_llm_allowed=policy_allows,
+                )
+            except Exception as e:
+                return self._handle_stage_exception(run, "extraction", e)
+
+            if parsed is None:
+                return {
+                    "stage": "extraction",
+                    "status": "needs_review",
+                    "error_code": "no_model_response",
+                    "error": "No response from model",
+                }
+            if not parsed.usable:
+                return {
+                    "stage": "extraction",
+                    "status": "needs_review",
+                    "error_code": "extraction_format_unusable",
+                    "error": "; ".join(parsed.errors),
+                    "warnings": parsed.warnings,
+                }
+
+            candidate_pack = await self._build_ioc_candidate_pack(
+                uow, run.subject_id, report, extraction=parsed.value
+            )
             qualifications: list[IocQualification] = []
             qualification_warnings: list[str] = []
             qualification_repair_actions: list[str] = []
@@ -793,40 +832,6 @@ class ProductionWorkflowOrchestrator:
                 qualification_warnings.extend(parsed_qualification.errors)
                 qualification_warnings.extend(parsed_qualification.warnings)
                 qualification_repair_actions.extend(parsed_qualification.repair_actions)
-
-            subject_title, _ = await self._subject_context(uow, run.subject_id)
-            prompt = ProductionPromptTemplates.get_extraction_prompt(
-                subject_title=subject_title,
-            )
-
-            try:
-                parsed, raw, turn_id = await self._ask_with_format_repair(
-                    run=run,
-                    conversation_id=conversation_id,
-                    stage="extraction",
-                    prompt=prompt,
-                    mode=ConversationMode.CONTINUE,
-                    parse=lambda text: parse_technical_extraction(text, report),
-                    external_llm_allowed=policy_allows,
-                )
-            except Exception as e:
-                return self._handle_stage_exception(run, "extraction", e)
-
-            if parsed is None:
-                return {
-                    "stage": "extraction",
-                    "status": "needs_review",
-                    "error_code": "no_model_response",
-                    "error": "No response from model",
-                }
-            if not parsed.usable:
-                return {
-                    "stage": "extraction",
-                    "status": "needs_review",
-                    "error_code": "extraction_format_unusable",
-                    "error": "; ".join(parsed.errors),
-                    "warnings": parsed.warnings,
-                }
 
             extraction = self._suppress_unbacked_q2_literals(
                 parsed.value, candidate_pack.candidates
@@ -904,7 +909,11 @@ class ProductionWorkflowOrchestrator:
             }
 
     async def _build_ioc_candidate_pack(
-        self, uow: UnitOfWork, subject_id: UUID, report: ReferenceReport
+        self,
+        uow: UnitOfWork,
+        subject_id: UUID,
+        report: ReferenceReport,
+        extraction: TechnicalExtraction | None = None,
     ) -> IocCandidatePack:
         """Load persisted evidence snapshots and build the pack before cache lookup."""
         # Lightweight test UoWs intentionally omit these repositories.
@@ -1003,6 +1012,41 @@ class ProductionWorkflowOrchestrator:
             artifact_texts=texts,
             provisional_iocs=tuple({item.id: item for item in provisional_iocs}.values()),
             discovery_publications=discovery_publications,
+            q2_literals=self._q2_literals(extraction),
+        )
+
+    @staticmethod
+    def _q2_literals(extraction: TechnicalExtraction | None) -> tuple[Q2LiteralCandidate, ...]:
+        if extraction is None:
+            return ()
+        literal_types = {
+            ArtifactType.IP,
+            ArtifactType.DOMAIN,
+            ArtifactType.URL,
+            ArtifactType.HASH,
+            ArtifactType.EMAIL,
+        }
+        literals: dict[tuple[ArtifactType, str], Q2LiteralCandidate] = {}
+        for item in extraction.items:
+            if item.artifact_type not in literal_types:
+                continue
+            try:
+                normalized = canonical_indicator_key(item.value, item.artifact_type)
+            except ValueError:
+                continue
+            key = (item.artifact_type, normalized)
+            literals.setdefault(
+                key,
+                Q2LiteralCandidate(
+                    artifact_type=item.artifact_type,
+                    raw_value=item.value,
+                    normalized_value=normalized,
+                    context=item.context,
+                ),
+            )
+        return tuple(
+            literals[key]
+            for key in sorted(literals, key=lambda item: (item[0].value, item[1]))
         )
 
     @staticmethod
@@ -1018,7 +1062,9 @@ class ProductionWorkflowOrchestrator:
                 f"candidate-id: {candidate.candidate_id}\n"
                 f"artifact-type: {candidate.artifact_type.value}\n"
                 f"preferred-original-value: {candidate.preferred_original_value}\n"
-                f"source-ids: {', '.join(candidate.source_ids)}\nevidence:\n{evidence}"
+                f"source-ids: {', '.join(candidate.source_ids)}\n"
+                f"q2-context-not-evidence: {' | '.join(candidate.q2_contexts) or '[none]'}\n"
+                f"evidence:\n{evidence or '[none]'}"
             )
         return "\n\n".join(blocks)
 
@@ -1117,11 +1163,6 @@ class ProductionWorkflowOrchestrator:
                     "artifact_id": str(existing.id),
                 }
 
-            subject_title, _ = await self._subject_context(uow, run.subject_id)
-            prompt = ProductionPromptTemplates.get_synthesis_prompt(
-                subject_title=subject_title,
-            )
-
             report = await self._load_reference_report(references)
             if (
                 report is None
@@ -1136,6 +1177,15 @@ class ProductionWorkflowOrchestrator:
                 }
             extraction_payload = technical_extraction_from_json(
                 await self._artifact_store.read_json(extraction.canonical_blob_id)
+            )
+            subject_title, _ = await self._subject_context(uow, run.subject_id)
+            prompt = ProductionPromptTemplates.get_synthesis_prompt(
+                subject_title=subject_title,
+                technical_extraction=json.dumps(
+                    technical_extraction_to_json(extraction_payload),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
             )
 
             try:
