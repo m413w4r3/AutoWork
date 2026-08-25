@@ -35,6 +35,7 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionProfile,
     SubjectProductionRun,
+    SubjectProductionStage,
     SubjectProductionStatus,
 )
 
@@ -421,6 +422,74 @@ async def test_second_start_while_running_does_not_reprompt(
     assert second.json()["job_id"] is None
     assert len(jobs.submitted) == submitted_after_first
     assert len(uow.subject_production_runs.items) == 1
+
+
+def _terminal_run(
+    edition_id: UUID,
+    subject_id: UUID,
+    *,
+    status: SubjectProductionStatus,
+    run_number: int = 1,
+) -> SubjectProductionRun:
+    run = SubjectProductionRun(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        profile=ProductionProfile.BRIEF_AUTO,
+        run_number=run_number,
+    )
+    run.start_running()
+    if status is SubjectProductionStatus.FAILED:
+        run.mark_failed(code="model_gateway_error", message="Model run needs reconciliation")
+    elif status is SubjectProductionStatus.NEEDS_REVIEW:
+        run.mark_needs_review(code="no_model_response", message="No response from model")
+    else:  # pragma: no cover - guard against a bad call in a future edit
+        raise AssertionError(f"Unsupported terminal status for this helper: {status}")
+    return run
+
+
+@pytest.mark.parametrize(
+    "status", (SubjectProductionStatus.FAILED, SubjectProductionStatus.NEEDS_REVIEW)
+)
+async def test_start_production_after_failure_creates_a_new_run(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+    status: SubjectProductionStatus,
+) -> None:
+    """P23.6 part F: POST /subjects/{id}/production is the retry path for a
+    FAILED or NEEDS_REVIEW run -- it must create a brand-new run (new run_id,
+    new run_number, its own idempotency keys/conversations) rather than
+    reanimate the terminal one, and dispatch a real SOURCES job."""
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    previous = _terminal_run(edition_id, subject_id, status=status)
+    await uow.subject_production_runs.add(previous)
+
+    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["run_id"] != str(previous.id)
+    assert body["status"] == "running"
+    assert body["stage"] == "sources"
+
+    # The old run is untouched, immutable history.
+    assert uow.subject_production_runs.items[previous.id].status is status
+    assert uow.subject_production_runs.items[previous.id].id == previous.id
+
+    new_run = uow.subject_production_runs.items[UUID(body["run_id"])]
+    assert new_run.run_number == previous.run_number + 1
+    assert new_run.status is SubjectProductionStatus.RUNNING
+    assert new_run.current_stage is SubjectProductionStage.SOURCES
+
+    jobs = production_app.state.job_service
+    sources_jobs = [job for job in jobs.submitted if job["kind"] == "production.subject.sources"]
+    assert len(sources_jobs) == 1
+    assert sources_jobs[0]["idempotency_key"] == f"production-sources-{new_run.id}"
+
+    dispatcher = production_app.state.job_dispatcher
+    assert len(dispatcher.dispatched) == 1
 
 
 async def test_save_brief_draft_appends_artifact_versions(

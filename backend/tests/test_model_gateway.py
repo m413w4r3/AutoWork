@@ -331,6 +331,78 @@ async def test_needs_review_run_is_never_resubmitted() -> None:
     assert adapter.calls == 1
 
 
+async def test_running_not_submitted_run_is_claimed_exactly_once() -> None:
+    """Regression for P23.6: ModelConversationService pre-persists the ModelRun
+    (RUNNING/NOT_SUBMITTED) before ever calling the gateway, so this must be a
+    legitimate first submission rather than a rejected replay."""
+    fake = FakeModelAdapter()
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=FakeModelAdapter(),
+            openai_structured=FakeModelAdapter(),
+            qwen=FakeModelAdapter(),
+            fake=fake,
+        ),
+        model_uow,
+        InMemoryModelOutputStore(),
+    )
+    model_request = request(
+        external_llm_allowed=False,
+        routing_hint=ModelRoutingHint.STANDARD_DRAFT,
+        provider=ModelProvider.FAKE,
+        run_id=uuid4(),
+    )
+    assert model_request.run_id is not None
+    pre_persisted = gateway.build_run(model_request, ModelRole.DRAFTING)
+    assert pre_persisted.status is ModelRunStatus.RUNNING
+    assert pre_persisted.submission_state.value == "not_submitted"
+    model_uow.state[pre_persisted.id] = pre_persisted
+
+    execution = await gateway.draft(model_request)
+
+    assert execution.run.status is ModelRunStatus.SUCCEEDED
+    assert len(fake.calls) == 1
+
+    # Replaying the same call now hits the persisted checkpoint, not the adapter.
+    replay = await gateway.draft(model_request)
+    assert replay.run.status is ModelRunStatus.SUCCEEDED
+    assert len(fake.calls) == 1
+
+
+async def test_running_submitted_or_unknown_run_is_never_resubmitted() -> None:
+    """A run that made it past the initial-submission claim is a possible
+    duplicate-in-flight and must never be reposted."""
+    fake = FakeModelAdapter()
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=FakeModelAdapter(),
+            openai_structured=FakeModelAdapter(),
+            qwen=FakeModelAdapter(),
+            fake=fake,
+        ),
+        model_uow,
+        InMemoryModelOutputStore(),
+    )
+    model_request = request(
+        external_llm_allowed=False,
+        routing_hint=ModelRoutingHint.STANDARD_DRAFT,
+        provider=ModelProvider.FAKE,
+        run_id=uuid4(),
+    )
+    assert model_request.run_id is not None
+    pre_persisted = gateway.build_run(model_request, ModelRole.DRAFTING)
+    pre_persisted.mark_submission_uncertain()
+    assert pre_persisted.submission_state.value == "submitted_or_unknown"
+    model_uow.state[pre_persisted.id] = pre_persisted
+
+    with pytest.raises(ModelGatewayError, match="reconciliation"):
+        await gateway.draft(model_request)
+
+    assert len(fake.calls) == 0
+
+
 async def test_qwen_unknown_failure_is_not_resubmitted() -> None:
     transport = FailingChatTransport()
     model_uow = InMemoryModelRunUnitOfWorkFactory()

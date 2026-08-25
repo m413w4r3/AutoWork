@@ -280,6 +280,12 @@ export function SubjectProduction({
         </div>
       )}
 
+      {showIssue && startMutation.error ? (
+        <p className="error-message" role="alert">
+          {String(startMutation.error)}
+        </p>
+      ) : null}
+
       {status.status === "ready" && (
         <BriefDraftEditor
           subjectId={subjectId}
@@ -310,6 +316,16 @@ export function SubjectProduction({
                 : "Relancer la synthèse"}
             </button>
           </>
+        )}
+
+        {(status.status === "failed" || status.status === "needs_review") && (
+          <button
+            className="button"
+            onClick={() => startMutation.mutate()}
+            disabled={startMutation.isPending}
+          >
+            {startMutation.isPending ? "Démarrage…" : "Relancer la production"}
+          </button>
         )}
 
         {status.status === "running" && (

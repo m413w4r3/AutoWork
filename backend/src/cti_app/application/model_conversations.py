@@ -31,7 +31,12 @@ from cti_app.domain.model_conversations import (
     ModelConversation,
     ModelConversationTurn,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
+from cti_app.domain.model_runs import (
+    ModelProvider,
+    ModelRole,
+    ModelRunStatus,
+    ModelSubmissionState,
+)
 
 NO_EVIDENCE_PACK_HASH = hashlib.sha256(b"model-conversation:no-evidence-pack").hexdigest()
 CONVERSATION_PROMPT_ID = "analyst-conversation"
@@ -375,7 +380,25 @@ class ModelConversationService:
                     persisted_conversation.mark_problem(uncertain=uncertain)
                     await uow.model_conversation_turns.save(persisted_turn)
                     await uow.model_conversations.save(persisted_conversation)
-                    await uow.commit()
+                # The gateway is the primary authority over the ModelRun's provider
+                # lifecycle. This only guards a narrow, locally-certain case: the
+                # ModelRun this turn pre-persisted (for the turn's FK) never left
+                # RUNNING/NOT_SUBMITTED, meaning the gateway failed before ever
+                # claiming it for submission. Left alone that run would stay RUNNING
+                # forever. Any run the gateway did touch (SUCCEEDED, NEEDS_REVIEW,
+                # FAILED, or SUBMITTED_OR_UNKNOWN) is left untouched.
+                persisted_run = await uow.model_runs.get_for_update(run.id)
+                if (
+                    persisted_run is not None
+                    and persisted_run.status is ModelRunStatus.RUNNING
+                    and persisted_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
+                ):
+                    persisted_run.fail(
+                        str(getattr(exc, "code", "conversation_turn_failed")),
+                        "Le tour conversationnel a échoué avant toute soumission au fournisseur.",
+                    )
+                    await uow.model_runs.save(persisted_run)
+                await uow.commit()
             # Le résultat d'un POST bridge est inconnu : ce tour est scellé en
             # NEEDS_REVIEW et ne doit pas consommer les retries du job avec la
             # même clé d'idempotence.

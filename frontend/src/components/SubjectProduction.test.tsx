@@ -237,9 +237,11 @@ describe("SubjectProduction", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(
       "la conversation ChatGPT n’a pas pu être finalisée",
     );
+    // The failed stage's details stay visible next to the retry action --
+    // neither replaces the other.
     expect(
-      screen.queryByRole("button", { name: "Relancer la production" }),
-    ).toBeNull();
+      screen.getByRole("button", { name: "Relancer la production" }),
+    ).toBeInTheDocument();
     expect(screen.getByText("3. Extraction CTI").closest("li")).toHaveClass(
       "is-failed",
     );
@@ -425,6 +427,165 @@ describe("SubjectProduction", () => {
     expect(post?.[0]).toBe(
       `/api/subjects/${SUBJECT_ID}/production/synthesis/retry`,
     );
+  });
+
+  it("relance la production depuis un run FAILED : POST /production, refetch, polling reprend", async () => {
+    const failedStatus = runningStatus({
+      status: "failed",
+      current_stage: "extraction",
+      run_id: "r-1",
+      stages: {
+        ...runningStatus().stages,
+        extraction: {
+          status: "failed",
+          version: null,
+          error_code: "bridge_timeout",
+          error_message: "timeout",
+        },
+      },
+    });
+    const newRunStatus = runningStatus({
+      status: "running",
+      current_stage: "sources",
+      run_id: "r-2",
+    });
+    let getCount = 0;
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return Promise.resolve(
+          Response.json({ run_id: "r-2", status: "running" }),
+        );
+      }
+      getCount += 1;
+      return Promise.resolve(
+        Response.json(getCount === 1 ? failedStatus : newRunStatus),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    const { container } = renderProduction();
+
+    expect(
+      await screen.findByRole("button", { name: "Relancer la production" }),
+    ).toBeInTheDocument();
+    // Details of the failed stage remain visible next to the retry action.
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Extraction CTI",
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Relancer la production" }),
+    );
+
+    const post = fetchMock.mock.calls.find(
+      ([, init]) => init?.method === "POST",
+    );
+    expect(post?.[0]).toBe(`/api/subjects/${SUBJECT_ID}/production`);
+
+    // A brand-new run must be reflected -- a new run_id, RUNNING, polling.
+    await vi.waitFor(() => {
+      expect(container.querySelector(".badge.is-running")).not.toBeNull();
+    });
+    expect(screen.getByText(/r-2/)).toBeInTheDocument();
+    expect(shouldPollProduction("running")).toBe(true);
+  });
+
+  it("relance la production depuis un run NEEDS_REVIEW : POST /production, refetch, polling reprend", async () => {
+    const needsReviewStatus = runningStatus({
+      status: "needs_review",
+      current_stage: "references",
+      run_id: "r-1",
+      stages: {
+        ...runningStatus().stages,
+        references: {
+          status: "needs_review",
+          version: null,
+          error_code: "no_model_response",
+          error_message: "no response",
+        },
+      },
+    });
+    const newRunStatus = runningStatus({
+      status: "running",
+      current_stage: "sources",
+      run_id: "r-2",
+    });
+    let getCount = 0;
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return Promise.resolve(
+          Response.json({ run_id: "r-2", status: "running" }),
+        );
+      }
+      getCount += 1;
+      return Promise.resolve(
+        Response.json(getCount === 1 ? needsReviewStatus : newRunStatus),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    const { container } = renderProduction();
+
+    expect(
+      await screen.findByRole("button", { name: "Relancer la production" }),
+    ).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: "Relancer la production" }),
+    );
+
+    const post = fetchMock.mock.calls.find(
+      ([, init]) => init?.method === "POST",
+    );
+    expect(post?.[0]).toBe(`/api/subjects/${SUBJECT_ID}/production`);
+
+    await vi.waitFor(() => {
+      expect(container.querySelector(".badge.is-running")).not.toBeNull();
+    });
+    expect(screen.getByText(/r-2/)).toBeInTheDocument();
+  });
+
+  it("n'affiche aucun bouton de relance de production pour un run RUNNING", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(Response.json(runningStatus())),
+    );
+
+    renderProduction();
+
+    await screen.findByText("TAG-182 et MarkiRAT");
+    expect(
+      screen.queryByRole("button", { name: "Relancer la production" }),
+    ).toBeNull();
+  });
+
+  it("conserve les boutons existants pour un run READY", async () => {
+    const readyStatus = runningStatus({
+      status: "ready",
+      current_stage: "assembly",
+      stages: Object.fromEntries(
+        Object.entries(runningStatus().stages).map(([stage, entry]) => [
+          stage,
+          { ...entry, status: "succeeded" },
+        ]),
+      ),
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(Response.json(readyStatus)),
+    );
+
+    renderProduction();
+
+    expect(
+      await screen.findByRole("button", { name: "Relancer les références" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Relancer la synthèse" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Relancer la production" }),
+    ).toBeNull();
   });
 
   it("arrête polling seulement quand run terminal", () => {

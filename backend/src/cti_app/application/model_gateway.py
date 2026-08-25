@@ -670,7 +670,56 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         raise ModelGatewayError(
                             "Model run needs reconciliation before resubmission"
                         )
-                elif run.status in {ModelRunStatus.RUNNING, ModelRunStatus.NEEDS_REVIEW}:
+                elif run.status is ModelRunStatus.RUNNING:
+                    # RUNNING covers two very different situations:
+                    # - SUBMITTED_OR_UNKNOWN: the prompt may already be in flight at
+                    #   the provider. Posting again could double-submit, so this is
+                    #   never resubmitted — it needs reconciliation.
+                    # - NOT_SUBMITTED: ModelConversationService.add_turn pre-persists
+                    #   the ModelRun (for its FK) before ever calling the gateway.
+                    #   Nothing has been sent to a provider yet, so this is a first
+                    #   submission, not a replay, and is allowed exactly once.
+                    if run.submission_state is not ModelSubmissionState.NOT_SUBMITTED:
+                        self._diagnostics.record(
+                            event="model.reconciliation_required",
+                            run_id=run.id,
+                            provider=run.provider.value if run.provider else None,
+                            role=run.model_role.value if run.model_role else None,
+                            status=run.status.value,
+                            submission_state=run.submission_state.value,
+                            prompt_template_id=run.prompt_template_id,
+                            prompt_template_version=run.prompt_template_version,
+                            correlation_id=get_correlation_id(),
+                            recovery_action="reconciliation_required",
+                        )
+                        raise ModelGatewayError(
+                            "Model run needs reconciliation before resubmission"
+                        )
+                    self._diagnostics.record(
+                        event="model.initial_submission_claim",
+                        run_id=run.id,
+                        provider=run.provider.value if run.provider else None,
+                        role=run.model_role.value if run.model_role else None,
+                        previous_status=run.status.value,
+                        previous_submission_state=run.submission_state.value,
+                        prompt_template_id=run.prompt_template_id,
+                        prompt_template_version=run.prompt_template_version,
+                        correlation_id=get_correlation_id(),
+                        recovery_action="initial_submission_claim",
+                    )
+                elif run.status is ModelRunStatus.NEEDS_REVIEW:
+                    self._diagnostics.record(
+                        event="model.reconciliation_required",
+                        run_id=run.id,
+                        provider=run.provider.value if run.provider else None,
+                        role=run.model_role.value if run.model_role else None,
+                        status=run.status.value,
+                        submission_state=run.submission_state.value,
+                        prompt_template_id=run.prompt_template_id,
+                        prompt_template_version=run.prompt_template_version,
+                        correlation_id=get_correlation_id(),
+                        recovery_action="reconciliation_required",
+                    )
                     raise ModelGatewayError("Model run needs reconciliation before resubmission")
                 elif run.status is ModelRunStatus.FAILED:
                     if not (
