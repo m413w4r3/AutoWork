@@ -239,6 +239,17 @@ def test_cavern_document_round_trip_and_pandoc_golden() -> None:
     assert "CVE-2026-1234" not in markdown
 
 
+def test_brief_document_title_uses_editorial_title_exactly() -> None:
+    """Q1's editorial_title must reach the published title verbatim."""
+    document = build_brief_document(
+        subject_title="Cavern",
+        report=_report(),
+        extraction=_extraction(),
+        synthesis_text="Cavern Manticore utilise WinDirStat [S1].",
+    )
+    assert document.title == _report().editorial_title
+
+
 def test_reference_doc_contains_every_mapped_style() -> None:
     reference = ROOT / "backend/assets/pandoc/reference-doc-v1.docx"
     with zipfile.ZipFile(reference) as archive:

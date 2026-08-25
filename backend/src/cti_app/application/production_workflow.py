@@ -11,6 +11,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.collection import ReferencedEvidence, SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.iana_tlds_snapshot import IANA_TLD_SNAPSHOT_VERSION
 from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.model_conversations import (
     ConversationTurnFailedError,
@@ -19,6 +20,7 @@ from cti_app.application.model_conversations import (
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_artifact_verification import (
+    ARTIFACT_VERIFIER_VERSION,
     Q2ProposalSubmission,
     verify_q2_proposals,
 )
@@ -376,6 +378,7 @@ class ProductionWorkflowOrchestrator:
                 sources=kept_sources,
                 events=tuple(kept_events),
                 uncertainties=report.uncertainties,
+                editorial_title=report.editorial_title,
             ),
             "kept_events": kept_events,
             "warnings": warnings,
@@ -742,6 +745,12 @@ class ProductionWorkflowOrchestrator:
                 "q2_schema_version": Q2_SCHEMA_VERSION,
                 "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
                 "evidence_pack_hash": evidence_pack.pack_hash,
+                # Canonical Verification Cache identity: a change here forces the
+                # canonical extraction artifact to be recomputed, but never forces
+                # a new Q2 model call — that call is checkpointed independently
+                # by _q2_logical_request_id, which does not include these.
+                "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
+                "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
             }
             input_hash = compute_input_hash(input_data)
 

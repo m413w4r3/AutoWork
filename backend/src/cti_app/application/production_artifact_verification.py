@@ -24,6 +24,12 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.domain.publication import ArtifactType
 
+# Bump whenever deterministic verification/normalization rules change (e.g. a
+# validation rule, a public-suffix check, or how facts get a semantic type).
+# Participates in the extraction artifact's input_hash so a canonical
+# extraction artifact gets recomputed, without forcing a new Q2 model call.
+ARTIFACT_VERIFIER_VERSION = "1"
+
 
 class ProposalStatus(StrEnum):
     VERIFIED = "verified"
@@ -67,6 +73,20 @@ class ArtifactVerificationResult:
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
 _CVE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 _LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", re.IGNORECASE)
+
+# Deterministic Q2FactProposal.category -> SemanticType.  The model only ever
+# emits a structured category; this table, not the model, decides the
+# semantic type.  Categories not listed fall back to SemanticType.OTHER.
+_SEMANTIC_TYPE_BY_FACT_CATEGORY: Mapping[str, SemanticType] = {
+    "actors": SemanticType.ACTOR,
+    "campaigns": SemanticType.CAMPAIGN,
+    "malware": SemanticType.MALWARE,
+    "tools": SemanticType.TOOL,
+    "ttps": SemanticType.TECHNIQUE,
+    "protocols": SemanticType.PROTOCOL,
+    "infrastructure": SemanticType.INFRASTRUCTURE,
+    "files": SemanticType.FILE,
+}
 
 
 def verify_q2_proposals(
@@ -211,6 +231,9 @@ def _to_item(
             value=proposal.value,
             context=proposal.context,
             artifact_type=None,
+            semantic_type=_SEMANTIC_TYPE_BY_FACT_CATEGORY.get(
+                proposal.category, SemanticType.OTHER
+            ),
             attack_id=proposal.attack_id,
             reference_ids=(),
             source_ids=submission.source_ids,

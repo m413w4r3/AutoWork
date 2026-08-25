@@ -43,9 +43,11 @@ def source_ids_by_document(
         )
         source_id = next(
             (
-                report_ids.get(canonicalize_http_url(value))
+                sid
                 for value in values
                 if value and _is_url(value)
+                for sid in (report_ids.get(canonicalize_http_url(value)),)
+                if sid is not None
             ),
             None,
         )

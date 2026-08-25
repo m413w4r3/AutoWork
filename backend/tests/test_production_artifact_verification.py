@@ -9,7 +9,7 @@ from cti_app.application.production_artifact_verification import (
     verify_q2_proposals,
 )
 from cti_app.application.production_evidence_pack import EvidenceChunk, ProductionEvidencePack
-from cti_app.application.production_parsers import Q2ChunkOutput
+from cti_app.application.production_parsers import Q2ChunkOutput, SemanticType
 from cti_app.domain.collection import SourceOriginKind
 
 
@@ -246,3 +246,51 @@ def test_ioc_titled_document_can_confirm_a_bare_literal_list() -> None:
     )
 
     assert result.canonical.items[0].display_policy.value == "ioc_section"
+
+
+def _fact(category: str, value: str) -> dict[str, str]:
+    return {
+        "category": category,
+        "value": value,
+        "context": "archived evidence",
+        "evidence_quote": value,
+    }
+
+
+@pytest.mark.parametrize(
+    ("category", "expected"),
+    [
+        ("actors", SemanticType.ACTOR),
+        ("campaigns", SemanticType.CAMPAIGN),
+        ("malware", SemanticType.MALWARE),
+        ("tools", SemanticType.TOOL),
+        ("ttps", SemanticType.TECHNIQUE),
+        ("protocols", SemanticType.PROTOCOL),
+        ("infrastructure", SemanticType.INFRASTRUCTURE),
+        ("files", SemanticType.FILE),
+    ],
+)
+def test_fact_category_maps_to_deterministic_semantic_type(
+    category: str, expected: SemanticType
+) -> None:
+    value = f"literal {category}"
+    pack, source = _pack(value)
+    result = verify_q2_proposals(
+        [_submission(source, [], text_facts=[_fact(category, value)])], pack
+    )
+
+    assert result.canonical.items[0].semantic_type is expected
+
+
+@pytest.mark.parametrize(
+    "category",
+    ["infection_chain", "victimology", "commands", "persistence", "detections", "other_technical"],
+)
+def test_fact_category_without_a_dedicated_type_falls_back_to_other(category: str) -> None:
+    value = f"literal {category}"
+    pack, source = _pack(value)
+    result = verify_q2_proposals(
+        [_submission(source, [], text_facts=[_fact(category, value)])], pack
+    )
+
+    assert result.canonical.items[0].semantic_type is SemanticType.OTHER

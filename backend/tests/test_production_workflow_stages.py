@@ -1241,3 +1241,174 @@ async def test_lost_conversation_parks_the_subject_instead_of_failing_it() -> No
 
     assert result["status"] == "needs_review"
     assert result["error_code"] == "conversation_unavailable"
+
+
+EDITORIAL_TITLE = "[Cavern Manticore] Un rapport avec filtration partielle"
+
+Q1_WITH_TITLE_AND_UNARCHIVED_SOURCE = PERFECT_Q1.replace(
+    "# REFERENCES\n",
+    f"# REFERENCES\n\neditorial-title: {EDITORIAL_TITLE}\n",
+) + """
+## SOURCE S3
+
+title: Source jamais archivee
+url: https://unarchived.example/never
+publisher: Nobody
+published-at: 2026-07-02
+role: independent
+
+## EVENT R2
+
+date: 2026-07-02
+sources: S3
+text: Evenement rattache a une source jamais archivee.
+"""
+
+
+async def test_editorial_title_survives_source_and_event_filtering() -> None:
+    """Q1's editorial_title must be preserved even when some sources/events are
+    dropped because their source never got archived."""
+    orchestrator, uow, _ = _build([Q1_WITH_TITLE_AND_UNARCHIVED_SOURCE])
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+    service = cast(_CollectionService, orchestrator._collection_service)
+    original_add = service.add_supplemental_sources
+
+    async def add_but_never_archive_s3(subject_id: UUID, sources: Any) -> list[Any]:
+        return await original_add(
+            subject_id,
+            [source for source in sources if source.url != "https://unarchived.example/never"],
+        )
+
+    service.add_supplemental_sources = add_but_never_archive_s3  # type: ignore[method-assign]
+
+    result = await orchestrator.execute_stage(
+        uow.run.id,
+        SubjectProductionStage.REFERENCES,
+        context=_JobContext(),  # type: ignore[arg-type]
+        correlation_id="c1",
+    )
+
+    assert result["status"] == "success", result
+    # The unarchived source's event was actually filtered out.
+    assert result["events_count"] == 1
+    assert result["sources_count"] == 2
+
+    artifact = uow.production_artifacts.items[-1]
+    assert artifact.canonical_blob_id is not None
+    store = cast(ProductionArtifactStore, orchestrator._artifact_store)
+    payload = await store.read_json(artifact.canonical_blob_id)
+    stored_report = reference_report_from_json(payload)
+
+    assert stored_report.editorial_title == EDITORIAL_TITLE
+    assert {source.local_id for source in stored_report.sources} == {"S1", "S2"}
+    assert {event.local_id for event in stored_report.events} == {"R1"}
+
+
+def _single_chunk_pack(pack_hash: str) -> ProductionEvidencePack:
+    chunk = EvidenceChunk(
+        source_document_id=uuid4(),
+        parent_source_ids=(),
+        source_ids=("S1",),
+        title="chunk",
+        origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
+        chunk_id="q2-chunk-1",
+        text="archived evidence 1",
+        sha256="1" * 64,
+    )
+    return ProductionEvidencePack("ready", pack_hash, (chunk,), {})
+
+
+async def _run_references_then_extraction(
+    orchestrator: ProductionWorkflowOrchestrator, uow: _Uow
+) -> dict[str, Any]:
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+    await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.REFERENCES)
+    uow.run.current_stage = SubjectProductionStage.EXTRACTION
+    return await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.EXTRACTION)
+
+
+async def test_verifier_version_change_recomputes_canonical_extraction_without_new_q2_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bumping ARTIFACT_VERIFIER_VERSION must invalidate the canonical extraction
+    cache, but must reuse the already-SUCCEEDED Q2 ModelRun checkpoint."""
+    orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2])
+    pack = _single_chunk_pack("verifier-cache-pack")
+
+    async def fake_pack(*args: Any, **kwargs: Any) -> ProductionEvidencePack:
+        return pack
+
+    monkeypatch.setattr(orchestrator, "_build_production_evidence_pack", fake_pack)
+
+    first = await _run_references_then_extraction(orchestrator, uow)
+    assert first["status"] == "success", first
+    assert len(conversations.structured_submissions) == 1
+
+    monkeypatch.setattr(
+        "cti_app.application.production_workflow.ARTIFACT_VERIFIER_VERSION", "verifier-v2"
+    )
+    uow.run.current_stage = SubjectProductionStage.EXTRACTION
+    second = await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.EXTRACTION)
+
+    assert second["status"] == "success", second
+    assert second["artifact_id"] != first["artifact_id"]
+    extraction_artifacts = [
+        a for a in uow.production_artifacts.items if a.stage is ProductionArtifactStage.EXTRACTION
+    ]
+    assert len(extraction_artifacts) == 2
+    assert extraction_artifacts[0].input_hash != extraction_artifacts[1].input_hash
+    # No new Q2 model call happened: the existing SUCCEEDED ModelRun was reused.
+    assert len(conversations.structured_submissions) == 1
+    assert len(conversations.structured_calls) == 2
+
+
+async def test_iana_snapshot_version_change_invalidates_artifact_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bumping the IANA TLD snapshot version must also invalidate the canonical
+    extraction cache, independently from the verifier version."""
+    orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2])
+    pack = _single_chunk_pack("iana-cache-pack")
+
+    async def fake_pack(*args: Any, **kwargs: Any) -> ProductionEvidencePack:
+        return pack
+
+    monkeypatch.setattr(orchestrator, "_build_production_evidence_pack", fake_pack)
+
+    first = await _run_references_then_extraction(orchestrator, uow)
+    assert first["status"] == "success", first
+
+    monkeypatch.setattr(
+        "cti_app.application.production_workflow.IANA_TLD_SNAPSHOT_VERSION", "snapshot-v2"
+    )
+    uow.run.current_stage = SubjectProductionStage.EXTRACTION
+    second = await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.EXTRACTION)
+
+    assert second["status"] == "success", second
+    assert second["artifact_id"] != first["artifact_id"]
+    # Still no new Q2 model call: only the canonical verification cache moved.
+    assert len(conversations.structured_submissions) == 1
+
+
+async def test_model_run_q2_succeeded_is_reused_when_q2_identity_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-running extraction with an unchanged Q2 identity must be a pure cache
+    hit: no new artifact, no new Q2 call."""
+    orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2])
+    pack = _single_chunk_pack("stable-pack")
+
+    async def fake_pack(*args: Any, **kwargs: Any) -> ProductionEvidencePack:
+        return pack
+
+    monkeypatch.setattr(orchestrator, "_build_production_evidence_pack", fake_pack)
+
+    first = await _run_references_then_extraction(orchestrator, uow)
+    assert first["status"] == "success", first
+
+    uow.run.current_stage = SubjectProductionStage.EXTRACTION
+    second = await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.EXTRACTION)
+
+    assert second["status"] == "cached"
+    assert second["artifact_id"] == first["artifact_id"]
+    assert len(conversations.structured_submissions) == 1
