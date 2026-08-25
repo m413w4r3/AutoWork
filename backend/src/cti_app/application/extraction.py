@@ -23,6 +23,7 @@ from cti_app.application.model_gateway import (
     ModelRoutingHint,
     StructuredExtractionModel,
 )
+from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.domain.collection import (
     Claim,
     ClaimKind,
@@ -34,6 +35,7 @@ from cti_app.domain.collection import (
     SourceSpan,
     validate_claim_literal,
 )
+from cti_app.domain.publication import ArtifactType
 
 PARSER_NAME = "cti-safe-text"
 PARSER_VERSION = "2.1.0"
@@ -195,7 +197,10 @@ def extract_indicators(
                 continue
             original = found.group(0).rstrip(".,;)")
             end = start + len(original)
-            normalized = _normalize_indicator(original, kind)
+            try:
+                normalized = _normalize_indicator(original, kind)
+            except ValueError:
+                continue
             if not _valid_indicator(normalized, kind):
                 continue
             matches.append((start, end, kind, original, normalized))
@@ -602,21 +607,18 @@ def _html_encoding(content: bytes) -> str:
 
 
 def _normalize_indicator(value: str, kind: IndicatorKind) -> str:
+    artifact_type = {
+        IndicatorKind.IP: ArtifactType.IP,
+        IndicatorKind.DOMAIN: ArtifactType.DOMAIN,
+        IndicatorKind.URL: ArtifactType.URL,
+        IndicatorKind.HASH: ArtifactType.HASH,
+        IndicatorKind.EMAIL: ArtifactType.EMAIL,
+    }.get(kind)
+    if artifact_type is not None:
+        return normalize_indicator_value(value, artifact_type)
     normalized = value.strip()
-    normalized = re.sub(r"(?i)^hxxps", "https", normalized)
-    normalized = re.sub(r"(?i)^hxxp", "http", normalized)
-    normalized = re.sub(
-        r"\[(?::|\.)\]|\((?:\.)\)|\{(?:\.)\}",
-        lambda m: ":" if ":" in m.group() else ".",
-        normalized,
-    )
-    normalized = normalized.replace("[@]", "@").replace("[at]", "@")
-    if kind in {IndicatorKind.DOMAIN, IndicatorKind.EMAIL, IndicatorKind.CVE}:
+    if kind is IndicatorKind.CVE:
         normalized = normalized.casefold()
-    if kind is IndicatorKind.URL:
-        parsed = urlsplit(normalized)
-        if parsed.hostname:
-            normalized = normalized.replace(parsed.hostname, parsed.hostname.casefold(), 1)
     if kind is IndicatorKind.ATTACK_ID:
         normalized = normalized.upper()
     return normalized
@@ -630,7 +632,11 @@ def _valid_indicator(value: str, kind: IndicatorKind) -> bool:
         except ValueError:
             return False
     if kind is IndicatorKind.URL:
-        parsed = urlsplit(value)
+        try:
+            parsed = urlsplit(value)
+            _ = parsed.port
+        except ValueError:
+            return False
         return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
     return True
 
@@ -642,12 +648,10 @@ _EMAIL_PATTERN = re.compile(
 )
 _CVE_PATTERN = re.compile(r"(?i)\bCVE-\d{4}-\d{4,7}\b")
 _ATTACK_PATTERN = re.compile(r"(?i)\bT\d{4}(?:\.\d{3})?\b")
-_HASH_PATTERN = re.compile(
-    r"(?i)\b(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}|[a-f0-9]{128})\b"
-)
+_HASH_PATTERN = re.compile(r"(?i)\b(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}|[a-f0-9]{128})\b")
 _IP_PATTERN = re.compile(rf"(?<![\w])(?:\d{{1,3}}{_DOT}){{3}}\d{{1,3}}(?![\w])")
 _IPV6_PATTERN = re.compile(
-    r"(?<![\w:])[0-9a-f:.]{0,39}:[0-9a-f:.]{0,38}(?![\w:])",
+    r"(?<![\w:])[0-9a-f:.\[\]]{0,45}:[0-9a-f:.\[\]]{0,44}(?![\w:])",
     re.IGNORECASE,
 )
 _DOMAIN_PATTERN = re.compile(rf"(?i)\b(?:[a-z0-9-]+{_DOT})+[a-z]{{2,63}}\b")

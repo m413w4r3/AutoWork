@@ -8,12 +8,14 @@ from urllib.parse import urlsplit, urlunsplit
 
 from cti_app.domain.publication import ArtifactType
 
-_DOT = re.compile(r"\[\.\]|\(\.\)", re.IGNORECASE)
+_DOT = re.compile(r"\[\.\]|\(\.\)|\{\.\}", re.IGNORECASE)
+_COLON = re.compile(r"\[:\]", re.IGNORECASE)
 _AT = re.compile(r"\[(?:at|@)\]|\((?:at|@)\)", re.IGNORECASE)
 
 
 def _refang(raw: str) -> str:
     value = _DOT.sub(".", raw.strip())
+    value = _COLON.sub(":", value)
     value = _AT.sub("@", value)
     if value.lower().startswith("hxxps://"):
         value = "https://" + value[8:]
@@ -47,7 +49,10 @@ def normalize_indicator_value(raw: str, artifact_type: ArtifactType) -> str:
             if parts.password:
                 userinfo += f":{parts.password}"
             userinfo += "@"
-        port = f":{parts.port}" if parts.port else ""
+        # Accessing ``port`` validates it and intentionally raises ValueError
+        # for malformed URLs. Callers treat one invalid literal as non-fatal.
+        port_number = parts.port
+        port = f":{port_number}" if port_number else ""
         return urlunsplit(
             (
                 parts.scheme.lower(),
@@ -65,9 +70,7 @@ def canonical_indicator_key(raw: str, artifact_type: ArtifactType) -> str:
     return normalize_indicator_value(raw, artifact_type)
 
 
-def display_indicator_value(
-    value: str, artifact_type: ArtifactType, *, defanged: bool
-) -> str:
+def display_indicator_value(value: str, artifact_type: ArtifactType, *, defanged: bool) -> str:
     """Render a canonical indicator for prose (defanged) or the IOC inventory."""
     canonical = normalize_indicator_value(value, artifact_type)
     if not defanged:

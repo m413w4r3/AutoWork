@@ -24,7 +24,11 @@ from cti_app.domain.collection import (
     IndicatorKind,
     SourceCollection,
 )
-from cti_app.domain.discovery import DiscoveryIocType, ProvisionalDiscoveryIoc
+from cti_app.domain.discovery import (
+    DiscoveryIocType,
+    ProvisionalDiscoveryIoc,
+    canonicalize_http_url,
+)
 from cti_app.domain.entities import SourceDocument
 from cti_app.domain.publication import ArtifactType
 
@@ -39,6 +43,8 @@ class CandidateWarningCode(StrEnum):
     SOURCE_NOT_MAPPED = "source_not_mapped"
     TEXT_NOT_AVAILABLE = "text_not_available"
     INVALID_SPAN = "invalid_span"
+    INVALID_INDICATOR = "invalid_indicator"
+    PERSISTED_NORMALIZATION_MISMATCH = "persisted_normalization_mismatch"
     DISCOVERY_PUBLICATION_UNRESOLVED = "discovery_publication_unresolved"
     DISCOVERY_VALUE_NOT_FOUND = "discovery_value_not_found"
     DISCOVERY_TYPE_IGNORED = "discovery_type_ignored"
@@ -183,14 +189,27 @@ def build_candidate_pack(
         artifact_type = _KIND_TO_ARTIFACT.get(indicator.kind)
         if artifact_type is None:
             continue
-        normalized = normalize_indicator_value(indicator.original_value, artifact_type)
+        try:
+            normalized = normalize_indicator_value(indicator.original_value, artifact_type)
+        except ValueError:
+            warnings.append(
+                f"{CandidateWarningCode.INVALID_INDICATOR.value}: indicator={indicator.id}"
+            )
+            continue
         # Persisted normalized values are retained for audit, but normalization
         # from the original value is the grouping rule used by this builder.
-        if (
-            indicator.normalized_value
-            and normalize_indicator_value(indicator.normalized_value, artifact_type) == normalized
-        ):
-            normalized = normalize_indicator_value(indicator.normalized_value, artifact_type)
+        if indicator.normalized_value:
+            try:
+                persisted_normalized = normalize_indicator_value(
+                    indicator.normalized_value, artifact_type
+                )
+            except ValueError:
+                persisted_normalized = None
+            if persisted_normalized != normalized:
+                warnings.append(
+                    f"{CandidateWarningCode.PERSISTED_NORMALIZATION_MISMATCH.value}: "
+                    f"indicator={indicator.id}"
+                )
         source_ids = source_lookup.get(indicator.source_document_id, ())
         if not source_ids:
             warnings.append(
@@ -373,7 +392,7 @@ def build_candidate_pack(
         "pack_version": "1",
         "parser_versions": artifact_versions,
         "builder_version": PACK_BUILDER_VERSION,
-        "candidates": [_candidate_json(candidate) for candidate in candidates],
+        "candidates": [_candidate_hash_json(candidate) for candidate in candidates],
         "batches": [
             [candidate.candidate_id for candidate in batch.candidates] for batch in batches
         ],
@@ -409,7 +428,12 @@ def source_ids_by_document(
     documents: Sequence[SourceDocument],
     report: ReferenceReport,
 ) -> dict[UUID, tuple[str, ...]]:
-    report_ids = {source.canonical_url: source.local_id for source in report.sources}
+    report_ids: dict[str, str] = {}
+    for source in report.sources:
+        try:
+            report_ids[canonicalize_http_url(source.canonical_url)] = source.local_id
+        except ValueError:
+            continue
     docs = {document.id: document for document in documents}
     by_id = {collection.id: collection for collection in collections}
     result: dict[UUID, tuple[str, ...]] = {}
@@ -424,12 +448,22 @@ def source_ids_by_document(
         document = (
             docs.get(collection.source_document_id) if collection.source_document_id else None
         )
-        canonical_url = (
-            root.canonical_url
-            if collection.parent_source_collection_id is not None
-            else (document.final_url if document else None) or root.canonical_url
-        )
-        source_id = report_ids.get(canonical_url)
+        candidate_urls: tuple[str | None, ...]
+        if collection.parent_source_collection_id is not None:
+            candidate_urls = (root.canonical_url,)
+        else:
+            candidate_urls = ((document.final_url if document else None), root.canonical_url)
+        source_id = None
+        for value in candidate_urls:
+            if not value:
+                continue
+            try:
+                canonical_url = canonicalize_http_url(value)
+            except ValueError:
+                continue
+            source_id = report_ids.get(canonical_url)
+            if source_id:
+                break
         if source_id and collection.source_document_id:
             result.setdefault(collection.source_document_id, tuple())
             result[collection.source_document_id] = tuple(
@@ -556,6 +590,35 @@ def _candidate_json(candidate: IocCandidate) -> dict[str, object]:
             for item in candidate.discovery_provenance
         ]
     return payload
+
+
+def _candidate_hash_json(candidate: IocCandidate) -> dict[str, object]:
+    """Stable pack facts; raw spellings remain in the auditable payload only."""
+    return {
+        "candidate_id": candidate.candidate_id,
+        "artifact_type": candidate.artifact_type.value,
+        "normalized_value": candidate.normalized_value,
+        "source_ids": candidate.source_ids,
+        "indicator_ids": [str(item) for item in candidate.indicator_ids],
+        "evidence": [
+            {
+                "indicator_id": str(item.indicator_id),
+                "derived_artifact_id": str(item.derived_artifact_id),
+                "source_document_id": str(item.source_document_id),
+                "source_ids": item.source_ids,
+                "span": [item.span_start, item.span_end],
+            }
+            for item in candidate.evidence
+        ],
+        "discovery_provenance": [
+            {
+                "provisional_ioc_id": str(item.provisional_ioc_id),
+                "publication_ids": [str(value) for value in item.publication_ids],
+                "publication_refs": item.publication_refs,
+            }
+            for item in candidate.discovery_provenance
+        ],
+    }
 
 
 def _make_batches(

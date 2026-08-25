@@ -108,23 +108,38 @@ def test_text_and_json_documents_preserve_ioc_text() -> None:
 
 def test_ipv6_validation_and_sha512() -> None:
     sha512 = "a" * 128
-    indicators = _indicators(
-        f"valid 2001:db8::1 loopback ::1 invalid 2001:db8:zzzz::1 {sha512}"
-    )
+    indicators = _indicators(f"valid 2001:db8::1 loopback ::1 invalid 2001:db8:zzzz::1 {sha512}")
 
     assert any(
         item.kind is IndicatorKind.IP and item.normalized_value == "2001:db8::1"
         for item in indicators
     )
     assert any(
-        item.kind is IndicatorKind.IP and item.normalized_value == "::1"
-        for item in indicators
+        item.kind is IndicatorKind.IP and item.normalized_value == "::1" for item in indicators
     )
     assert not any("zzzz" in item.original_value for item in indicators)
     assert any(
-        item.kind is IndicatorKind.HASH and item.normalized_value == sha512
-        for item in indicators
+        item.kind is IndicatorKind.HASH and item.normalized_value == sha512 for item in indicators
     )
+
+
+def test_shared_normalization_accepts_defanged_forms_and_rejects_bad_url_port() -> None:
+    indicators = _indicators(
+        "evil{.}example user[@]evil[.]example user[at]evil[.]example "
+        "hxxps[:]//EVIL[.]example/path 2001[:]db8::1 http://example.test:bad/path"
+    )
+    values = {(item.kind, item.original_value, item.normalized_value) for item in indicators}
+
+    assert (IndicatorKind.DOMAIN, "evil{.}example", "evil.example") in values
+    assert (IndicatorKind.EMAIL, "user[@]evil[.]example", "user@evil.example") in values
+    assert (IndicatorKind.EMAIL, "user[at]evil[.]example", "user@evil.example") in values
+    assert (
+        IndicatorKind.URL,
+        "hxxps[:]//EVIL[.]example/path",
+        "https://evil.example/path",
+    ) in values
+    assert (IndicatorKind.IP, "2001[:]db8::1", "2001:db8::1") in values
+    assert not any("example.test:bad" in item.original_value for item in indicators)
 
 
 def test_hash_families_and_spans_are_not_deduplicated() -> None:
@@ -153,9 +168,7 @@ def test_html_links_keep_href_and_anchor_text_but_skip_script_and_style() -> Non
         DetectedMimeType.HTML,
     )
 
-    assert [(link.href, link.anchor_text) for link in parsed.links] == [
-        ("/report", "Read report")
-    ]
+    assert [(link.href, link.anchor_text) for link in parsed.links] == [("/report", "Read report")]
     assert "bad" not in parsed.text
 
 

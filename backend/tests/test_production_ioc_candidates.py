@@ -146,6 +146,65 @@ def test_unmappable_source_warns_without_fabricated_source():
     assert any("source_not_mapped" in warning for warning in pack.warnings)
 
 
+@pytest.mark.parametrize(
+    ("final_url", "report_url"),
+    [
+        ("https://vendor.test/report/", "https://vendor.test/report"),
+        ("https://VENDOR.test/report?utm_source=x", "https://vendor.test/report"),
+    ],
+)
+def test_root_final_url_is_canonicalized_for_source_mapping(final_url, report_url):
+    row = _records("evil.example", source_url="https://vendor.test/report")
+    row = (row[0], row[1], replace(row[2], final_url=final_url), row[3])
+    pack = _pack([row], _report(report_url))
+    assert pack.candidates[0].source_ids == ("S1",)
+
+
+def test_invalid_final_url_falls_back_to_collection_and_child_uses_root_source():
+    root = _records("evil.example", source_url="https://vendor.test/report")
+    root = (root[0], root[1], replace(root[2], final_url="https://vendor.test:bad/report"), root[3])
+    child = _records(
+        "2001:db8::1",
+        kind=IndicatorKind.IP,
+        source_url="https://vendor.test/report/iocs.json",
+        parent=root[1].id,
+    )
+    pack = _pack([root, child], _report("https://vendor.test/report"))
+    assert {candidate.normalized_value: candidate.source_ids for candidate in pack.candidates} == {
+        "evil.example": ("S1",),
+        "2001:db8::1": ("S1",),
+    }
+
+
+def test_olalampo_redirect_keeps_document_iocs_on_s1():
+    url = "https://www.group-ib.com/blog/muddywater-operation-olalampo"
+    domain = _records("olalampo[.]example", source_url=url)
+    domain = (domain[0], domain[1], replace(domain[2], final_url=f"{url}/"), domain[3])
+    ip = _records("203.0.113.9", kind=IndicatorKind.IP, source_url=url)
+    pack = _pack([domain, ip], _report(url))
+    assert {candidate.normalized_value: candidate.source_ids for candidate in pack.candidates} == {
+        "olalampo.example": ("S1",),
+        "203.0.113.9": ("S1",),
+    }
+
+
+def test_invalid_indicator_is_skipped_without_losing_valid_candidate():
+    invalid = _records("http://example.test:bad/path", kind=IndicatorKind.URL)
+    valid = _records("evil{.}example")
+    pack = _pack([invalid, valid], _report("https://news.test/a"))
+    assert [candidate.normalized_value for candidate in pack.candidates] == ["evil.example"]
+    assert any("invalid_indicator" in warning for warning in pack.warnings)
+
+
+def test_equivalent_literals_share_candidate_id_and_pack_hash():
+    one = _records("evil{.}example")
+    two = (replace(one[0], original_value="evil[.]example"), *one[1:])
+    first = _pack([one], _report("https://news.test/a"), texts=False)
+    second = _pack([two], _report("https://news.test/a"), texts=False)
+    assert first.candidates[0].candidate_id == second.candidates[0].candidate_id
+    assert first.pack_hash == second.pack_hash
+
+
 @pytest.mark.parametrize("kind", [IndicatorKind.CVE, IndicatorKind.ATTACK_ID])
 def test_general_cti_types_are_excluded(kind):
     row = _records("CVE-2025-0001" if kind is IndicatorKind.CVE else "T1059", kind=kind)
