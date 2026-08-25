@@ -615,6 +615,7 @@ def create_job_registry(
     production_chain: object | None = None,
     production_artifact_store: object | None = None,
     production_diagnostics: object | None = None,
+    source_evidence_processor: object | None = None,
     cumulative_discovery_service: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
@@ -667,6 +668,7 @@ def create_job_registry(
             ProductionStageChain,
             register_production_jobs,
         )
+        from cti_app.application.source_evidence_processing import SourceEvidenceProcessingService
 
         if not callable(uow_factory):
             raise TypeError("uow_factory must be callable")
@@ -684,6 +686,10 @@ def create_job_registry(
             production_diagnostics, DiagnosticsLog
         ):
             raise TypeError("production_diagnostics must be a DiagnosticsLog")
+        if source_evidence_processor is not None and not isinstance(
+            source_evidence_processor, SourceEvidenceProcessingService
+        ):
+            raise TypeError("source_evidence_processor must be a SourceEvidenceProcessingService")
         register_production_jobs(
             registry,
             uow_factory,
@@ -692,6 +698,7 @@ def create_job_registry(
             collection_service=collection_service,
             artifact_store=production_artifact_store,
             diagnostics=production_diagnostics,
+            source_evidence_processor=source_evidence_processor,
         )
     return registry
 

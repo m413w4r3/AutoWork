@@ -20,6 +20,7 @@ from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
+from cti_app.application.source_evidence_processing import SourceEvidenceProcessingService
 from cti_app.application.subject_production import EditionProductionService
 from cti_app.domain.production import (
     ProductionProfile,
@@ -110,6 +111,7 @@ def register_production_jobs(
     collection_service: SubjectCollectionService | None = None,
     artifact_store: ProductionArtifactStore | None = None,
     diagnostics: DiagnosticsLog | None = None,
+    source_evidence_processor: SourceEvidenceProcessingService | None = None,
 ) -> None:
     """Register the five production stage jobs."""
     stage_chain = chain or ProductionStageChain()
@@ -153,6 +155,7 @@ def register_production_jobs(
             collection_service=collection_service,
             artifact_store=artifact_store,
             diagnostics=diagnostics,
+            source_evidence_processor=source_evidence_processor,
         )
 
         correlation_id = await context.correlation_id()

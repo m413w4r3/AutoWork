@@ -40,6 +40,7 @@ from cti_app.application.production_stages import (
     SynthesisService,
     compute_input_hash,
 )
+from cti_app.application.source_evidence_processing import SourceEvidenceProcessingService
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPurpose,
@@ -109,12 +110,14 @@ class ProductionWorkflowOrchestrator:
         collection_service: SubjectCollectionService | None = None,
         artifact_store: ProductionArtifactStore | None = None,
         diagnostics: DiagnosticsLog | None = None,
+        source_evidence_processor: SourceEvidenceProcessingService | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._model_service = model_service
         self._collection_service = collection_service
         self._artifact_store = artifact_store
         self._diagnostics = diagnostics or DiagnosticsLog(None)
+        self._source_evidence_processor = source_evidence_processor
         self._correlation_id = "-"
         self._references = ReferenceResearchService(uow_factory, artifact_store)
         self._extraction = ExtractionService(uow_factory, artifact_store)
@@ -606,6 +609,12 @@ class ProductionWorkflowOrchestrator:
             }
 
     async def _execute_extraction_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
+        evidence_processing = None
+        if self._source_evidence_processor is not None:
+            evidence_processing = await self._source_evidence_processor.process_subject(
+                run.subject_id
+            )
+
         if not self._model_service:
             return {
                 "stage": "extraction",
@@ -664,6 +673,9 @@ class ProductionWorkflowOrchestrator:
                     "stage": "extraction",
                     "status": "cached",
                     "artifact_id": str(existing.id),
+                    "source_evidence_processing": (
+                        evidence_processing.as_dict() if evidence_processing is not None else None
+                    ),
                 }
 
             subject_title, _ = await self._subject_context(uow, run.subject_id)
@@ -720,6 +732,9 @@ class ProductionWorkflowOrchestrator:
                 "supported_items": len(extraction.supported_items()),
                 "warnings": parsed.warnings,
                 "repair_actions": parsed.repair_actions,
+                "source_evidence_processing": (
+                    evidence_processing.as_dict() if evidence_processing is not None else None
+                ),
             }
 
     async def _execute_synthesis_stage(self, run: SubjectProductionRun) -> dict[str, Any]:

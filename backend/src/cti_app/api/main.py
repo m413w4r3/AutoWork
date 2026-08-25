@@ -42,6 +42,7 @@ from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
+from cti_app.application.source_evidence_processing import SourceEvidenceProcessingService
 from cti_app.application.subject_production import (
     EditionProductionService,
     SubjectProductionService,
@@ -205,12 +206,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     subject_production_service = SubjectProductionService(uow_factory)
     edition_production_service = EditionProductionService(uow_factory)
+    production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+    source_evidence_processor = SourceEvidenceProcessingService(
+        uow_factory,
+        BlobCatalogService(blob_store, uow_factory),
+    )
     workflow_orchestrator = ProductionWorkflowOrchestrator(
         uow_factory,
         model_service=model_conversation_service,
+        source_evidence_processor=source_evidence_processor,
     )
-
-    production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
     production_chain = ProductionStageChain()
     registry = create_job_registry(
         model_gateway,
@@ -222,6 +227,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         production_chain=production_chain,
         production_artifact_store=production_artifact_store,
         production_diagnostics=production_diagnostics,
+        source_evidence_processor=source_evidence_processor,
         cumulative_discovery_service=cumulative_discovery_service,
     )
     app.state.readiness = readiness

@@ -20,6 +20,7 @@ from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_parsers import reference_report_from_json
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
+from cti_app.application.source_evidence_processing import SourceEvidenceProcessingResult
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.model_conversations import ConversationMode
 from cti_app.domain.production import (
@@ -232,7 +233,7 @@ class _Uow:
 
 
 def _build(
-    answers: list[str], diagnostics: DiagnosticsLog | None = None
+    answers: list[str], diagnostics: DiagnosticsLog | None = None, processor: Any | None = None
 ) -> tuple[ProductionWorkflowOrchestrator, _Uow, _FakeConversations]:
     run = SubjectProductionRun(
         subject_id=uuid4(), edition_id=uuid4(), profile=ProductionProfile.BRIEF_AUTO
@@ -247,6 +248,7 @@ def _build(
         collection_service=_CollectionService(uow.source_collections),  # type: ignore[arg-type]
         artifact_store=store,
         diagnostics=diagnostics,
+        source_evidence_processor=processor,
     )
     return orchestrator, uow, conversations
 
@@ -298,6 +300,44 @@ async def test_extraction_reuses_the_same_conversation_and_the_q1_corpus() -> No
         ConversationMode.CONTINUE,
     ]
     assert len({cid for cid, _, _, _ in conversations.calls}) == 1
+
+
+async def test_deterministic_evidence_processing_runs_before_q2() -> None:
+    class _Processor:
+        def __init__(self) -> None:
+            self.calls: list[UUID] = []
+            self.conversations: _FakeConversations | None = None
+
+        async def process_subject(self, subject_id: UUID) -> SourceEvidenceProcessingResult:
+            assert self.conversations is not None
+            assert not any(
+                key.startswith("extraction-") for _, _, key, _ in self.conversations.calls
+            )
+            self.calls.append(subject_id)
+            return SourceEvidenceProcessingResult(1, 1, 0, 0, 2, ())
+
+    processor = _Processor()
+    orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2], processor=processor)
+    processor.conversations = conversations
+    uow.run.current_stage = SubjectProductionStage.REFERENCES
+    await orchestrator.execute_stage(
+        uow.run.id, SubjectProductionStage.REFERENCES, correlation_id="c1"
+    )
+
+    uow.run.current_stage = SubjectProductionStage.EXTRACTION
+    result = await orchestrator.execute_stage(
+        uow.run.id, SubjectProductionStage.EXTRACTION, correlation_id="c1"
+    )
+
+    assert processor.calls == [uow.run.subject_id]
+    assert result["source_evidence_processing"] == {
+        "sources_seen": 1,
+        "sources_processed": 1,
+        "sources_cached": 0,
+        "sources_failed": 0,
+        "indicator_occurrences": 2,
+        "outcomes": [],
+    }
 
 
 async def test_badly_formatted_answer_triggers_one_repair_turn() -> None:
