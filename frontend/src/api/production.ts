@@ -62,7 +62,6 @@ export interface BatchStatus {
   completed: number;
   needs_review: number;
   failed: number;
-  current_subject_index: number | null;
   cancelled: number;
   item_details: BatchItemDetail[];
   created_at: string;

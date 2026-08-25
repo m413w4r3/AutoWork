@@ -85,7 +85,6 @@ describe("ProductionQueue", () => {
           needs_review: 0,
           failed: 0,
           cancelled: 0,
-          current_subject_index: 1,
           created_at: "2026-08-10T10:00:00Z",
           started_at: "2026-08-10T10:00:00Z",
           finished_at: null,

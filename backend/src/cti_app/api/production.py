@@ -93,7 +93,6 @@ class BatchStatus(BaseModel):
     completed: int
     needs_review: int
     failed: int
-    current_subject_index: int | None = None
     cancelled: int = 0
     item_details: list[BatchItemDetail] = []
     created_at: str
@@ -543,7 +542,6 @@ async def start_edition_brief_production(
                 completed=0,
                 needs_review=0,
                 failed=0,
-                current_subject_index=None,
                 created_at=active_batch.created_at.isoformat(),
                 started_at=active_batch.started_at.isoformat() if active_batch.started_at else None,
                 finished_at=active_batch.finished_at.isoformat()
@@ -613,7 +611,6 @@ async def start_edition_brief_production(
         completed=0,
         needs_review=0,
         failed=0,
-        current_subject_index=0,
         created_at=batch.created_at.isoformat(),
         started_at=batch.started_at.isoformat() if batch.started_at else None,
         finished_at=None,
@@ -642,12 +639,11 @@ async def get_edition_brief_production(
         completed = 0
         needs_review = 0
         failed = 0
-        current_index = None
 
         cancelled = 0
         details: list[BatchItemDetail] = []
 
-        for i, item in enumerate(items):
+        for item in items:
             run = await uow.subject_production_runs.get(item.production_run_id)
             if not run:
                 continue
@@ -660,8 +656,6 @@ async def get_edition_brief_production(
                 failed += 1
             elif run.status == SubjectProductionStatus.CANCELLED:
                 cancelled += 1
-            elif run.status == SubjectProductionStatus.RUNNING:
-                current_index = i
 
             group = await uow.editorial_groups.get_by_subject(item.subject_id)
             details.append(
@@ -684,7 +678,6 @@ async def get_edition_brief_production(
             completed=completed,
             needs_review=needs_review,
             failed=failed,
-            current_subject_index=current_index,
             cancelled=cancelled,
             item_details=details,
             created_at=batch.created_at.isoformat(),
