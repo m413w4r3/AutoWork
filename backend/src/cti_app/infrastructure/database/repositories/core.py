@@ -288,6 +288,7 @@ class SqlAlchemyVirusTotalObservationRepository:
                 exhaustive=observation.exhaustive,
                 page_order=observation.page_order,
                 normalization_contract_version=observation.normalization_contract_version,
+                execution_id=observation.execution_id,
             )
         )
         await self._session.flush()

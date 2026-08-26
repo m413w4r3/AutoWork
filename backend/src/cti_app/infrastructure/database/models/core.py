@@ -160,8 +160,19 @@ class VirusTotalObservationRow(Base):
         CheckConstraint("raw_size >= 0", name="ck_vt_observation_raw_size"),
         CheckConstraint("observed_count >= 0", name="ck_vt_observation_count"),
         CheckConstraint("page_order >= 0", name="ck_vt_observation_page_order"),
+        CheckConstraint(
+            "capability IN ("
+            "'file_report','file_relationships','intelligence_search',"
+            "'file_download','submissions','behaviour_pcap','retrohunt'"
+            ")",
+            name="ck_vt_observation_capability",
+        ),
+        CheckConstraint(
+            "raw_sha256 ~ '^[0-9a-f]{64}$'", name="ck_vt_observation_raw_sha256"
+        ),
         Index("ix_vt_observations_blob_id", "blob_id"),
         Index("ix_vt_observations_subject_id", "subject_id"),
+        Index("ix_vt_observations_execution_id", "execution_id"),
     )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     subject_id: Mapped[UUID | None] = mapped_column(
@@ -184,6 +195,7 @@ class VirusTotalObservationRow(Base):
     exhaustive: Mapped[bool] = mapped_column(Boolean, nullable=False)
     page_order: Mapped[int] = mapped_column(nullable=False)
     normalization_contract_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    execution_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
 
 
 class VirusTotalFileViewRow(Base):

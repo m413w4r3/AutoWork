@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -5,6 +6,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from cti_app.domain.errors import DomainError
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class VirusTotalOperation(StrEnum):
@@ -73,11 +76,18 @@ class VirusTotalObservation:
     exhaustive: bool = True
     page_order: int = 0
     normalization_contract_version: str = "vt-normalization-v1"
+    execution_id: UUID = field(default_factory=uuid4)
     id: UUID = field(default_factory=uuid4)
 
     def __post_init__(self) -> None:
-        if not self.capability or not self.source_identifier:
-            raise DomainError("VirusTotal observation requires a capability and source identifier")
+        if not isinstance(self.capability, VirusTotalCapability):
+            raise DomainError("VirusTotal observation capability must be a VirusTotalCapability")
+        if not self.source_identifier.strip():
+            raise DomainError("VirusTotal observation requires a non-empty source identifier")
+        if not self.normalization_contract_version.strip():
+            raise DomainError("VirusTotal observation requires a non-empty contract version")
+        if not _SHA256_RE.fullmatch(self.raw_sha256):
+            raise DomainError("VirusTotal observation raw_sha256 must be a lowercase 64-hex digest")
         if not 200 <= self.http_status < 300:
             raise DomainError("VirusTotal observations represent successful HTTP responses only")
         if self.raw_size < 0 or self.observed_count < 0 or self.page_order < 0:

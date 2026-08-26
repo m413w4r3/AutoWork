@@ -26,6 +26,7 @@ from cti_app.application.virustotal import (
     VirusTotalPage,
     VirusTotalPayloadError,
     VirusTotalPort,
+    VirusTotalRawResponse,
     VirusTotalRelationNotAllowedError,
     VirusTotalResponseTooLargeError,
     VirusTotalRouteStep,
@@ -151,15 +152,26 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         self._require(VirusTotalCapability.FILE_REPORT)
         normalized = normalize_file_hash(file_hash)
         route = self._resolve_route(VirusTotalCapability.FILE_REPORT)
-        body = await self._execute_route(
+        response, step = await self._execute_route(
             route, lambda step: self._file_report_request(step, normalized)
         )
-        payload = _json_object(body)
-        if _is_v2_file_report(payload):
-            return VirusTotalFileReport(file=_parse_v2_file(payload, normalized), raw_json=body)
-        return VirusTotalFileReport(file=_parse_file(payload), raw_json=body)
+        payload = _json_object(response.body)
+        file = (
+            _parse_v2_file(payload, normalized)
+            if _is_v2_file_report(payload)
+            else _parse_file(payload)
+        )
+        return VirusTotalFileReport(
+            file=file,
+            raw_json=response.body,
+            http_status=response.status_code,
+            transport=step.transport,
+            api_generation=step.variant,
+        )
 
-    async def _file_report_request(self, step: VirusTotalRouteStep, file_hash: str) -> bytes:
+    async def _file_report_request(
+        self, step: VirusTotalRouteStep, file_hash: str
+    ) -> VirusTotalRawResponse:
         client, base_url = self._resolve_transport(step)
         if step.variant is VirusTotalEndpointVariant.LEGACY_V2:
             return await self._get(
@@ -173,13 +185,13 @@ class VirusTotalHttpAdapter(VirusTotalPort):
     async def _execute_route(
         self,
         route: VirusTotalOperationRoute,
-        request: Callable[[VirusTotalRouteStep], Awaitable[bytes]],
-    ) -> bytes:
+        request: Callable[[VirusTotalRouteStep], Awaitable[VirusTotalRawResponse]],
+    ) -> tuple[VirusTotalRawResponse, VirusTotalRouteStep]:
         steps = route.steps()
         for index, step in enumerate(steps):
             is_last = index == len(steps) - 1
             try:
-                return await request(step)
+                return await request(step), step
             except VirusTotalError as error:
                 if is_last or not route.permits_fallback(error):
                     raise
@@ -253,6 +265,10 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             stopped_due_to_limit=page.stopped_due_to_limit,
             exhaustive=page.exhaustive,
             raw_json_pages=page.raw_json_pages,
+            http_statuses=page.http_statuses,
+            limit_used=page.limit_used,
+            transport=page.transport,
+            api_generation=page.api_generation,
         )
 
     async def _paginate(
@@ -266,6 +282,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
     ) -> VirusTotalPage:
         page_limit = self._page_limit(limit)
         pages: list[bytes] = []
+        statuses: list[int] = []
         items: list[dict[str, Any]] = []
         current_cursor = cursor
         stopped = False
@@ -274,10 +291,11 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             params["limit"] = page_limit
             if current_cursor:
                 params["cursor"] = current_cursor
-            body = await self._get(path, params=params)
-            payload = _json_object(body)
+            response = await self._get(path, params=params)
+            payload = _json_object(response.body)
             page_items = _parse_items(payload)
-            pages.append(body)
+            pages.append(response.body)
+            statuses.append(response.status_code)
             remaining = self._max_results - len(items)
             items.extend(page_items[:remaining])
             next_cursor = _next_cursor(payload)
@@ -300,6 +318,10 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             stopped_due_to_limit=stopped,
             exhaustive=exhaustive,
             raw_json_pages=tuple(pages),
+            http_statuses=tuple(statuses),
+            limit_used=page_limit,
+            transport=VirusTotalTransportKind.PROXY,
+            api_generation=VirusTotalEndpointVariant.V3,
         )
 
     async def _get(
@@ -309,7 +331,7 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         params: Mapping[str, Any] | None = None,
         client: httpx.AsyncClient | None = None,
         base_url: str | None = None,
-    ) -> bytes:
+    ) -> VirusTotalRawResponse:
         try:
             response = await (client or self._client).get(
                 f"{base_url or self._base_url}{path}", params=params
@@ -322,7 +344,8 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             if response.status_code >= 400:
                 retry_after = _retry_after(response.headers.get("Retry-After"))
                 raise _http_error(response.status_code, retry_after)
-            return await _read_bounded(response, self._max_response_bytes)
+            body = await _read_bounded(response, self._max_response_bytes)
+            return VirusTotalRawResponse(body=body, status_code=response.status_code)
         except VirusTotalError:
             raise
         except httpx.ConnectTimeout as exc:

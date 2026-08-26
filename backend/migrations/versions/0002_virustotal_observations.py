@@ -35,6 +35,7 @@ def upgrade() -> None:
         sa.Column("exhaustive", sa.Boolean(), nullable=False),
         sa.Column("page_order", sa.Integer(), nullable=False),
         sa.Column("normalization_contract_version", sa.String(length=64), nullable=False),
+        sa.Column("execution_id", sa.Uuid(), nullable=False),
         sa.CheckConstraint(
             "http_status >= 200 AND http_status < 300",
             name="ck_vt_observation_http_success",
@@ -42,12 +43,25 @@ def upgrade() -> None:
         sa.CheckConstraint("raw_size >= 0", name="ck_vt_observation_raw_size"),
         sa.CheckConstraint("observed_count >= 0", name="ck_vt_observation_count"),
         sa.CheckConstraint("page_order >= 0", name="ck_vt_observation_page_order"),
+        sa.CheckConstraint(
+            "capability IN ("
+            "'file_report','file_relationships','intelligence_search',"
+            "'file_download','submissions','behaviour_pcap','retrohunt'"
+            ")",
+            name="ck_vt_observation_capability",
+        ),
+        sa.CheckConstraint(
+            "raw_sha256 ~ '^[0-9a-f]{64}$'", name="ck_vt_observation_raw_sha256"
+        ),
         sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["blob_id"], ["blobs.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_vt_observations_blob_id", "virustotal_observations", ["blob_id"])
     op.create_index("ix_vt_observations_subject_id", "virustotal_observations", ["subject_id"])
+    op.create_index(
+        "ix_vt_observations_execution_id", "virustotal_observations", ["execution_id"]
+    )
     op.create_table(
         "virustotal_file_views",
         sa.Column("id", sa.Uuid(), nullable=False),
@@ -83,6 +97,7 @@ def downgrade() -> None:
     op.execute("DROP TRIGGER trg_vt_file_views_append_only ON virustotal_file_views")
     op.execute("DROP TRIGGER trg_vt_observations_append_only ON virustotal_observations")
     op.drop_table("virustotal_file_views")
+    op.drop_index("ix_vt_observations_execution_id", table_name="virustotal_observations")
     op.drop_index("ix_vt_observations_subject_id", table_name="virustotal_observations")
     op.drop_index("ix_vt_observations_blob_id", table_name="virustotal_observations")
     op.drop_table("virustotal_observations")

@@ -175,6 +175,20 @@ class FileRelationship(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class VirusTotalRawResponse:
+    """The safe, httpx-independent shape of one successful upstream response.
+
+    Carries only what the domain and persistence layers need to reproduce
+    the transport's outcome: the exact body bytes and the HTTP status the
+    server actually returned. Never carries headers, cookies, or anything
+    that could leak credentials.
+    """
+
+    body: bytes
+    status_code: int
+
+
+@dataclass(frozen=True, slots=True)
 class VirusTotalFile:
     id: str
     type: str
@@ -193,6 +207,9 @@ class VirusTotalFile:
 class VirusTotalFileReport:
     file: VirusTotalFile
     raw_json: bytes
+    http_status: int
+    transport: VirusTotalTransportKind
+    api_generation: VirusTotalEndpointVariant
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +220,10 @@ class VirusTotalPage:
     stopped_due_to_limit: bool
     exhaustive: bool
     raw_json_pages: tuple[bytes, ...]
+    http_statuses: tuple[int, ...]
+    limit_used: int
+    transport: VirusTotalTransportKind
+    api_generation: VirusTotalEndpointVariant
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +234,10 @@ class VirusTotalSearchResult:
     stopped_due_to_limit: bool
     exhaustive: bool
     raw_json_pages: tuple[bytes, ...]
+    http_statuses: tuple[int, ...]
+    limit_used: int
+    transport: VirusTotalTransportKind
+    api_generation: VirusTotalEndpointVariant
 
 
 class VirusTotalPort(Protocol):
