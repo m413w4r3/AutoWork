@@ -204,4 +204,10 @@ def _file_view(observation_id: UUID, file: VirusTotalFile) -> VirusTotalFileView
         last_submission_date=file.last_submission_date,
         last_modification_date=file.last_modification_date,
         tags=file.tags,
+        vhash=file.vhash,
+        imphash=file.imphash,
+        ssdeep=file.ssdeep,
+        tlsh=file.tlsh,
+        main_icon_dhash=file.main_icon_dhash,
+        rich_header_hash=file.rich_header_hash,
     )

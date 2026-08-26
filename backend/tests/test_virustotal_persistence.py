@@ -157,7 +157,17 @@ class _Factory:
 def _report(raw: bytes = b'{"data":{"id":"a"}}') -> VirusTotalFileReport:
     return VirusTotalFileReport(
         file=VirusTotalFile(
-            id="a", type="file", lookup_value=VALID_SHA256, meaningful_name="x", tags=("tag",)
+            id="a",
+            type="file",
+            lookup_value=VALID_SHA256,
+            meaningful_name="x",
+            tags=("tag",),
+            vhash="vhash-value",
+            imphash="imphash-value",
+            ssdeep="ssdeep-value",
+            tlsh="tlsh-value",
+            main_icon_dhash="icon-value",
+            rich_header_hash="rich-value",
         ),
         raw_json=raw,
         http_status=200,
@@ -181,6 +191,8 @@ async def test_report_is_raw_content_addressed_and_normalized(tmp_path: Path) ->
         and first.raw_sha256 == next(iter(factory.blobs.values())).descriptor.sha256
     )
     assert factory.views[0].observation_id == first.id
+    assert factory.views[0].vhash == "vhash-value"
+    assert factory.views[0].rich_header_hash == "rich-value"
     assert next(iter(factory.blobs.values())).descriptor.logical_bucket == VIRUSTOTAL_RAW_BUCKET
     assert await store.read(next(iter(factory.blobs.values())).descriptor, max_bytes=100) == (
         report.raw_json

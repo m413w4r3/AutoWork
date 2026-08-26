@@ -201,6 +201,12 @@ class VirusTotalFile:
     last_submission_date: int | None = None
     last_modification_date: int | None = None
     tags: tuple[str, ...] = ()
+    vhash: str | None = None
+    imphash: str | None = None
+    ssdeep: str | None = None
+    tlsh: str | None = None
+    main_icon_dhash: str | None = None
+    rich_header_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

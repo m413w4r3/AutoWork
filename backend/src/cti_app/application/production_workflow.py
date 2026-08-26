@@ -11,6 +11,10 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from cti_app.application.analyst_input_pack import (
+    ANALYST_INPUT_PACK_BUCKET,
+    build_analyst_input_pack_v1,
+)
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.iana_tlds_snapshot import IANA_TLD_SNAPSHOT_VERSION
@@ -68,6 +72,9 @@ from cti_app.domain.model_conversations import (
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole
 from cti_app.domain.production import (
+    AnalystInvestigation,
+    LoopBudget,
+    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -1128,15 +1135,94 @@ class ProductionWorkflowOrchestrator:
                     },
                 )
 
-                return {
+                analyst_investigation_id = await self._create_analyst_input_pack(
+                    run=run,
+                    synthesis=artifact,
+                    extraction=extraction,
+                    extraction_payload=extraction_payload,
+                    policy=synthesis_ctx,
+                )
+
+                result = {
                     "stage": "synthesis",
                     "status": "success",
                     "artifact_id": str(artifact.id),
                     "word_count": len(output_text.split()),
                     "repair_actions": parsed.repair_actions,
                 }
+                if analyst_investigation_id is not None:
+                    result["analyst_investigation_id"] = str(analyst_investigation_id)
+                return result
             except Exception as e:
                 return self._handle_stage_exception(run, "synthesis", e)
+
+    async def _create_analyst_input_pack(
+        self,
+        *,
+        run: SubjectProductionRun,
+        synthesis: Any,
+        extraction: Any,
+        extraction_payload: Any,
+        policy: Any,
+    ) -> UUID | None:
+        """Create the internal major-assisted hand-off once, after SYNTHESIS.
+
+        The production job advances the run to ANALYST_RESEARCH through its
+        normal profile state machine.  Nothing here exposes a public
+        major_assisted route.
+        """
+        if run.profile is not ProductionProfile.MAJOR_ASSISTED:
+            return None
+        if self._artifact_store is None:
+            raise ValueError("Analyst input pack requires the production artifact store")
+
+        async with self._uow_factory() as uow:
+            repository = getattr(uow, "analyst_investigations", None)
+            if repository is None:
+                raise ValueError("Analyst investigation persistence is not configured")
+            existing = await repository.get_for_run(run.id)
+            if existing is not None:
+                return UUID(str(existing.id))
+
+            investigation = AnalystInvestigation.from_verified_synthesis(
+                synthesis=synthesis,
+                budget=LoopBudget(),
+            )
+            items = []
+            for item in extraction_payload.items:
+                artifact_type = getattr(item, "artifact_type", None)
+                indicator_status = getattr(item, "indicator_status", None)
+                items.append(
+                    {
+                        "id": getattr(item, "local_id", None),
+                        "value": getattr(item, "value", None),
+                        "artifact_type": getattr(artifact_type, "value", artifact_type),
+                        "indicator_status": getattr(indicator_status, "value", indicator_status),
+                        "source_ids": list(getattr(item, "source_ids", ())),
+                    }
+                )
+            research_date = run.research_date
+            if research_date is None:
+                raise ValueError("Analyst input pack requires frozen research_date")
+            pack = build_analyst_input_pack_v1(
+                run=run,
+                investigation=investigation,
+                synthesis=synthesis,
+                extraction_artifacts=(extraction,),
+                extraction_items=items,
+                tlp=getattr(policy, "tlp", None),
+                do_not_submit=bool(getattr(policy, "do_not_submit", False)),
+                external_llm_allowed=bool(getattr(policy, "external_llm_allowed", False)),
+                research_date=research_date,
+            )
+            blob_id, sha256 = await self._artifact_store.put_canonical_json(
+                pack.payload, bucket=ANALYST_INPUT_PACK_BUCKET
+            )
+            investigation.input_pack_blob_id = blob_id
+            investigation.input_sha256 = sha256
+            await repository.add(investigation)
+            await uow.commit()
+            return investigation.id
 
     async def _execute_assembly_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
         """Deterministic: pure rendering from artifacts, no LLM call."""

@@ -110,4 +110,10 @@ class VirusTotalFileView:
     last_submission_date: int | None
     last_modification_date: int | None
     tags: tuple[str, ...]
+    vhash: str | None = None
+    imphash: str | None = None
+    ssdeep: str | None = None
+    tlsh: str | None = None
+    main_icon_dhash: str | None = None
+    rich_header_hash: str | None = None
     id: UUID = field(default_factory=uuid4)

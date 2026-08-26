@@ -10,6 +10,7 @@ deduplicates by SHA-256 — and leaves `metadata` for counters alone.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from io import BytesIO
 from typing import Any
@@ -41,13 +42,31 @@ class ProductionArtifactStore:
         return record.id
 
     async def put_json(self, payload: dict[str, Any], *, bucket: str) -> UUID:
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        encoded = self.canonical_json_bytes(payload)
         record = await self._catalog.ingest(
             BytesIO(encoded),
             logical_bucket=bucket,
             mime_type="application/json",
         )
         return record.id
+
+    @staticmethod
+    def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
+        """Canonical JSON bytes used for immutable, content-addressed payloads."""
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+    async def put_canonical_json(self, payload: dict[str, Any], *, bucket: str) -> tuple[UUID, str]:
+        encoded = self.canonical_json_bytes(payload)
+        record = await self._catalog.ingest(
+            BytesIO(encoded), logical_bucket=bucket, mime_type="application/json"
+        )
+        return record.id, hashlib.sha256(encoded).hexdigest()
 
     async def read_text(self, blob_id: UUID) -> str:
         raw = await self._catalog.read(blob_id, max_bytes=MAX_ARTIFACT_BYTES)
