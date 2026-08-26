@@ -53,6 +53,28 @@ class HumanDecisionType(StrEnum):
     BRIEF_PROMOTE = "brief_promote"
 
 
+class AnalystDecisionType(StrEnum):
+    MEMBER_VALIDATE = "member_validate"
+    MEMBER_REJECT = "member_reject"
+    FEATURE_VALIDATE = "feature_validate"
+    FEATURE_REJECT = "feature_reject"
+    PIVOT_APPROVE = "pivot_approve"
+    PIVOT_REJECT = "pivot_reject"
+    NOTE_APPROVE = "note_approve"
+    NOTE_CHANGES_REQUESTED = "note_changes_requested"
+
+
+class AnalystDecisionTargetType(StrEnum):
+    MEMBER = "member"
+    FEATURE = "feature"
+    TOOL = "tool"
+    INVARIANT = "invariant"
+    PIVOT = "pivot"
+    CORPUS = "corpus"
+    DETECTION = "detection"
+    NOTE = "note"
+
+
 @dataclass(frozen=True, slots=True)
 class CandidateReference:
     batch_id: UUID
@@ -197,3 +219,20 @@ class HumanDecision:
     def __post_init__(self) -> None:
         if not self.group_ids or not self.actor_id.strip() or not self.correlation_id.strip():
             raise ValueError("Human decision requires groups, actor and correlation")
+
+
+@dataclass(frozen=True, slots=True)
+class AnalystDecision:
+    investigation_id: UUID
+    decision_type: AnalystDecisionType
+    target_type: AnalystDecisionTargetType
+    target_id: UUID
+    actor_id: str
+    reason: str
+    correlation_id: str
+    id: UUID = field(default_factory=uuid4)
+    occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        if not self.actor_id.strip() or not self.reason.strip() or not self.correlation_id.strip():
+            raise ValueError("Analyst decision requires actor, reason and correlation")

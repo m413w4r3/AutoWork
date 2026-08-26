@@ -11,13 +11,20 @@ from uuid import uuid4
 import pytest
 
 from cti_app.domain.production import (
+    AnalystInvestigation,
+    AnalystInvestigationStatus,
     EditionProductionBatch,
     EditionProductionBatchItem,
+    LoopBudget,
+    LoopBudgetCategory,
+    ProductionArtifact,
     ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
+    next_stage,
 )
 
 
@@ -145,8 +152,6 @@ class TestSubjectProductionRunStates:
             run.start_running(now=datetime.now(UTC))
 
 
-
-
 class TestEditionProductionBatch:
     def test_create_batch_queued_status(self) -> None:
         edition_id = uuid4()
@@ -225,6 +230,42 @@ class TestProductionProfileVariants:
         )
 
         assert run.profile == ProductionProfile.MAJOR_ASSISTED
+
+    def test_profile_progression_is_explicit(self) -> None:
+        assert (
+            next_stage(ProductionProfile.BRIEF_AUTO, SubjectProductionStage.SYNTHESIS)
+            is SubjectProductionStage.ASSEMBLY
+        )
+        assert (
+            next_stage(ProductionProfile.MAJOR_ASSISTED, SubjectProductionStage.SYNTHESIS)
+            is SubjectProductionStage.ANALYST_RESEARCH
+        )
+
+
+class TestAnalystInvestigation:
+    def test_requires_verified_synthesis_and_exhausts_without_members(self) -> None:
+        artifact = ProductionArtifact(
+            production_run_id=uuid4(),
+            subject_id=uuid4(),
+            stage=ProductionArtifactStage.SYNTHESIS,
+            version=1,
+            input_hash="a" * 64,
+            status=ProductionArtifactStatus.VERIFIED,
+        )
+        investigation = AnalystInvestigation.from_verified_synthesis(
+            synthesis=artifact,
+            budget=LoopBudget(
+                max_pivot_runs=1, max_hits_acquired=2, max_new_samples=3, max_vt_read_units=4
+            ),
+        )
+
+        investigation.start(now=datetime.now(UTC))
+        investigation.consume_budget(LoopBudgetCategory.PIVOT_RUNS, now=datetime.now(UTC))
+        with pytest.raises(ValueError, match="Budget exceeded"):
+            investigation.consume_budget(LoopBudgetCategory.PIVOT_RUNS, now=datetime.now(UTC))
+        investigation.finish_cycle(validated_new_members=0, now=datetime.now(UTC))
+
+        assert investigation.status is AnalystInvestigationStatus.EXHAUSTED
 
 
 class TestProductionArtifactValidation:

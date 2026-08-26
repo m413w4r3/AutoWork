@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     String,
+    Text,
     UniqueConstraint,
     Uuid,
 )
@@ -19,11 +20,27 @@ from .base import Base
 
 PRODUCTION_PROFILE_VALUES_SQL = "'brief_auto', 'major_assisted'"
 PRODUCTION_STATUS_VALUES_SQL = "'queued', 'running', 'ready', 'needs_review', 'failed', 'cancelled'"
-PRODUCTION_STAGE_VALUES_SQL = "'sources', 'references', 'extraction', 'synthesis', 'assembly'"
+PRODUCTION_STAGE_VALUES_SQL = (
+    "'sources', 'references', 'extraction', 'synthesis', 'analyst_research', 'analyst_note', "
+    "'assembly'"
+)
 PRODUCTION_ARTIFACT_STAGE_VALUES_SQL = "'references', 'extraction', 'synthesis', 'brief'"
 PRODUCTION_ARTIFACT_STATUS_VALUES_SQL = "'verified', 'stale', 'needs_review'"
 PRODUCTION_BATCH_STATUS_VALUES_SQL = (
     "'queued', 'running', 'completed', 'completed_with_issues', 'cancelled'"
+)
+ANALYST_INVESTIGATION_STATUS_VALUES_SQL = (
+    "'queued', 'running', 'awaiting_review', 'completed', 'exhausted', 'failed', 'cancelled'"
+)
+ANALYST_INVESTIGATION_STAGE_VALUES_SQL = (
+    "'seeds', 'features', 'tooling', 'invariants', 'pivots', 'corpus', 'detection', 'note'"
+)
+ANALYST_DECISION_VALUES_SQL = (
+    "'member_validate', 'member_reject', 'feature_validate', 'feature_reject', "
+    "'pivot_approve', 'pivot_reject', 'note_approve', 'note_changes_requested'"
+)
+ANALYST_DECISION_TARGET_VALUES_SQL = (
+    "'member', 'feature', 'tool', 'invariant', 'pivot', 'corpus', 'detection', 'note'"
 )
 
 
@@ -120,6 +137,113 @@ class ProductionArtifactRow(Base):
         JSONB, name="metadata", nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AnalystInvestigationRow(Base):
+    __tablename__ = "analyst_investigations"
+    __table_args__ = (
+        UniqueConstraint("production_run_id", name="uq_analyst_investigation_run"),
+        CheckConstraint("version >= 1", name="ck_analyst_investigation_version"),
+        CheckConstraint("cycle_number >= 1", name="ck_analyst_investigation_cycle"),
+        CheckConstraint("max_cycles >= 1", name="ck_analyst_investigation_max_cycles"),
+        CheckConstraint(
+            "max_pivot_runs >= 0 AND max_hits_acquired >= 0 AND max_new_samples >= 0 "
+            "AND max_vt_read_units >= 0",
+            name="ck_analyst_investigation_budget_max",
+        ),
+        CheckConstraint(
+            "consumed_pivot_runs BETWEEN 0 AND max_pivot_runs AND "
+            "consumed_hits_acquired BETWEEN 0 AND max_hits_acquired AND "
+            "consumed_new_samples BETWEEN 0 AND max_new_samples AND "
+            "consumed_vt_read_units BETWEEN 0 AND max_vt_read_units",
+            name="ck_analyst_investigation_budget_consumed",
+        ),
+        CheckConstraint(
+            f"status IN ({ANALYST_INVESTIGATION_STATUS_VALUES_SQL})",
+            name="ck_analyst_investigation_status",
+        ),
+        CheckConstraint(
+            f"current_stage IN ({ANALYST_INVESTIGATION_STAGE_VALUES_SQL})",
+            name="ck_analyst_investigation_stage",
+        ),
+        CheckConstraint(
+            "(input_pack_blob_id IS NULL) = (input_sha256 IS NULL)",
+            name="ck_analyst_investigation_input_pair",
+        ),
+        CheckConstraint(
+            "input_sha256 IS NULL OR (char_length(input_sha256) = 64 "
+            "AND input_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_analyst_investigation_input_sha256",
+        ),
+        Index("ix_analyst_investigations_subject_status", "subject_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    production_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("subject_production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subject_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
+    )
+    synthesis_artifact_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("production_artifacts.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    current_stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    cycle_number: Mapped[int] = mapped_column(nullable=False)
+    input_pack_blob_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT")
+    )
+    input_sha256: Mapped[str | None] = mapped_column(String(64))
+    pivot_conversation_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("model_conversations.id", ondelete="SET NULL")
+    )
+    max_cycles: Mapped[int] = mapped_column(nullable=False)
+    max_pivot_runs: Mapped[int] = mapped_column(nullable=False)
+    max_hits_acquired: Mapped[int] = mapped_column(nullable=False)
+    max_new_samples: Mapped[int] = mapped_column(nullable=False)
+    max_vt_read_units: Mapped[int] = mapped_column(nullable=False)
+    consumed_pivot_runs: Mapped[int] = mapped_column(nullable=False)
+    consumed_hits_acquired: Mapped[int] = mapped_column(nullable=False)
+    consumed_new_samples: Mapped[int] = mapped_column(nullable=False)
+    consumed_vt_read_units: Mapped[int] = mapped_column(nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+
+
+class AnalystDecisionRow(Base):
+    __tablename__ = "analyst_decisions"
+    __table_args__ = (
+        CheckConstraint(
+            f"decision_type IN ({ANALYST_DECISION_VALUES_SQL})", name="ck_analyst_decisions_type"
+        ),
+        CheckConstraint(
+            f"target_type IN ({ANALYST_DECISION_TARGET_VALUES_SQL})",
+            name="ck_analyst_decisions_target",
+        ),
+        Index("ix_analyst_decisions_investigation", "investigation_id", "occurred_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    investigation_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("analyst_investigations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    decision_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class EditionProductionBatchRow(Base):
