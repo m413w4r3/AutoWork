@@ -62,6 +62,8 @@ cd ../frontend && pnpm install --frozen-lockfile
 
 Les commandes racine sont `make test`, `make test-integration`, `make lint`, `make typecheck` et `make format`. Aucun test ne contacte une API externe. Les tests d'intégration utilisent une base PostgreSQL temporaire indiquée par `TEST_POSTGRES_ADMIN_DSN`.
 
+`make test-integration` démarre automatiquement le service PostgreSQL éphémère `postgres-test`, indépendant de la DB applicative, puis le supprime même en cas d'échec. `POSTGRES_DSN` désigne la DB applicative ; `TEST_POSTGRES_ADMIN_DSN` est réservé à la création et suppression des bases temporaires de pytest. Après une réécriture locale des migrations, `make up-clean` recrée les volumes applicatifs ; cette commande est destructive et conserve uniquement `bridge_data`.
+
 ## Organisation
 
 - `backend/` : API FastAPI, ports d'infrastructure et worker Dramatiq ;

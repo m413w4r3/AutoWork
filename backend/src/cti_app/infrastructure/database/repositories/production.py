@@ -143,6 +143,9 @@ class SqlAlchemySubjectProductionRunRepository:
             version=run.version,
         )
         self._session.add(row)
+        # Repository rows do not have ORM relationships, so SQLAlchemy cannot
+        # infer this FK ordering when artifacts are added in the same UoW.
+        await self._session.flush()
 
     async def get(self, run_id: UUID) -> SubjectProductionRun | None:
         row = await self._session.get(SubjectProductionRunRow, run_id)

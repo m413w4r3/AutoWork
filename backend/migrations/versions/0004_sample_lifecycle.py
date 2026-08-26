@@ -6,7 +6,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0004_sample_lifecycle"
-down_revision: str | None = "0003_analyst_investigation"
+down_revision: str | None = "0003_analyst_workflow"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -47,8 +47,8 @@ def upgrade() -> None:
     op.create_check_constraint(
         "ck_samples_expected_hash",
         "samples",
-        "expected_hash IS NULL OR (char_length(expected_hash) = 64 AND "
-        "expected_hash ~ '^[0-9a-f]{64}$')",
+        "expected_hash IS NULL OR (char_length(expected_hash) IN (32, 40, 64) "
+        "AND expected_hash ~ '^[0-9a-f]+$')",
     )
     for name in ("imphash", "ssdeep", "tlsh", "rich_header_hash", "vhash", "main_icon_dhash"):
         op.create_check_constraint(

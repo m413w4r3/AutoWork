@@ -1,6 +1,6 @@
 """Canonical VirusTotal observations.
 
-Revision ID: 0002_virustotal_observations
+Revision ID: 0002_virustotal
 Revises: 0001_baseline
 """
 from collections.abc import Sequence
@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0002_virustotal_observations"
+revision: str = "0002_virustotal"
 down_revision: str | None = "0001_baseline"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
@@ -77,6 +77,12 @@ def upgrade() -> None:
         sa.Column("last_submission_date", sa.BigInteger(), nullable=True),
         sa.Column("last_modification_date", sa.BigInteger(), nullable=True),
         sa.Column("tags", postgresql.JSONB(), nullable=False),
+        sa.Column("vhash", sa.String(length=255), nullable=True),
+        sa.Column("imphash", sa.String(length=255), nullable=True),
+        sa.Column("ssdeep", sa.String(length=255), nullable=True),
+        sa.Column("tlsh", sa.String(length=255), nullable=True),
+        sa.Column("main_icon_dhash", sa.String(length=255), nullable=True),
+        sa.Column("rich_header_hash", sa.String(length=255), nullable=True),
         sa.ForeignKeyConstraint(
             ["observation_id"], ["virustotal_observations.id"], ondelete="RESTRICT"
         ),

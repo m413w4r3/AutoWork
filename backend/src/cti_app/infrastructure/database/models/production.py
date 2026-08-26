@@ -250,6 +250,10 @@ class AnalystInputPackRow(Base):
     __tablename__ = "analyst_input_packs"
     __table_args__ = (
         UniqueConstraint("investigation_id", name="uq_analyst_input_packs_investigation"),
+        CheckConstraint(
+            "char_length(sha256) = 64 AND sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_analyst_input_pack_sha256",
+        ),
     )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     investigation_id: Mapped[UUID] = mapped_column(

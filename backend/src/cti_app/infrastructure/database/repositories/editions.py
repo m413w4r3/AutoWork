@@ -52,7 +52,20 @@ class SqlAlchemyEditionRepository:
             )
             .returning(EditionRow.id)
         )
-        return await self._session.scalar(statement) is not None
+        inserted_id = await self._session.scalar(statement)
+        if inserted_id is not None:
+            return True
+
+        existing_id = await self._session.scalar(
+            select(EditionRow.id).where(
+                EditionRow.country_code == edition.country_code,
+                EditionRow.period_start == edition.period_start,
+                EditionRow.period_end == edition.period_end,
+            )
+        )
+        if existing_id is not None:
+            edition.id = existing_id
+        return False
 
     async def get(self, edition_id: UUID) -> Edition | None:
         row = await self._session.get(EditionRow, edition_id)

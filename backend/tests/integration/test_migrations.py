@@ -91,6 +91,8 @@ IndexShape = tuple[str, tuple[str, ...], bool, bool]
 # migration chain at HEAD. This is the complete, canonical baseline installed
 # by the current migration chain.
 EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
+    ("virustotal_observations", "trg_vt_observations_append_only"): "reject_evidence_mutation",
+    ("virustotal_file_views", "trg_vt_file_views_append_only"): "reject_evidence_mutation",
     ("subjects", "trg_subjects_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
     ("source_documents", "trg_source_documents_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
     ("samples", "trg_samples_prevent_tlp_downgrade"): "prevent_tlp_downgrade",
@@ -100,6 +102,7 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
     ("job_events", "trg_job_events_append_only"): "reject_audit_mutation",
     ("human_decisions", "trg_human_decisions_append_only"): "reject_human_decision_mutation",
     ("analyst_decisions", "trg_analyst_decisions_append_only"): "reject_evidence_mutation",
+    ("analyst_input_packs", "trg_analyst_input_packs_append_only"): "reject_evidence_mutation",
     ("collection_attempts", "trg_collection_attempts_append_only"): "reject_evidence_mutation",
     ("derived_artifacts", "trg_derived_artifacts_append_only"): "reject_evidence_mutation",
     ("claims", "trg_claims_append_only"): "reject_evidence_mutation",

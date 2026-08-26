@@ -112,6 +112,25 @@ class SampleRow(Base):
             "state IN ('quarantined','review_candidate','validated','rejected')",
             name="ck_samples_state",
         ),
+        CheckConstraint(
+            "expected_hash IS NULL OR (char_length(expected_hash) IN (32, 40, 64) "
+            "AND expected_hash ~ '^[0-9a-f]+$')",
+            name="ck_samples_expected_hash",
+        ),
+        *(
+            CheckConstraint(
+                f"{name}_source IS NULL OR {name}_source IN ('local','vt')",
+                name=f"ck_samples_{name}_source",
+            )
+            for name in (
+                "imphash",
+                "ssdeep",
+                "tlsh",
+                "rich_header_hash",
+                "vhash",
+                "main_icon_dhash",
+            )
+        ),
         Index("ix_samples_subject_id", "subject_id"),
         Index("ix_samples_blob_id", "blob_id"),
         Index("ix_samples_imphash", "imphash"),

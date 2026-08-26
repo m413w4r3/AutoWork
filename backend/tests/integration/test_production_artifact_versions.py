@@ -115,8 +115,8 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
     edition = Edition(
         country="France",
         country_code="FR",
-        period_start=date(2026, 8, 1),
-        period_end=date(2026, 8, 31),
+        period_start=date(2026, 9, 1),
+        period_end=date(2026, 9, 30),
         tlp=TLP.AMBER,
         languages=("fr",),
         target_major_articles=1,
@@ -222,8 +222,8 @@ async def test_run_number_allocation_is_serialized_in_postgres(
     edition = Edition(
         country="France",
         country_code="FR",
-        period_start=date(2026, 8, 1),
-        period_end=date(2026, 8, 31),
+        period_start=date(2026, 10, 1),
+        period_end=date(2026, 10, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
         target_major_articles=1,

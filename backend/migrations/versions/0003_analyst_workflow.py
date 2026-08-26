@@ -1,7 +1,7 @@
 """Add analyst investigation state, bounded budgets and append-only decisions.
 
-Revision ID: 0003_analyst_investigation
-Revises: 0002_virustotal_observations
+Revision ID: 0003_analyst_workflow
+Revises: 0002_virustotal
 """
 
 from collections.abc import Sequence
@@ -9,8 +9,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0003_analyst_investigation"
-down_revision: str | None = "0002_virustotal_observations"
+revision: str = "0003_analyst_workflow"
+down_revision: str | None = "0002_virustotal"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -138,9 +138,34 @@ def upgrade() -> None:
         "CREATE TRIGGER trg_analyst_decisions_append_only BEFORE UPDATE OR DELETE "
         "ON analyst_decisions FOR EACH ROW EXECUTE FUNCTION reject_evidence_mutation()"
     )
+    op.create_table(
+        "analyst_input_packs",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("investigation_id", sa.Uuid(), nullable=False),
+        sa.Column("blob_id", sa.Uuid(), nullable=False),
+        sa.Column("sha256", sa.String(length=64), nullable=False),
+        sa.Column("schema_version", sa.String(length=64), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint(
+            "char_length(sha256) = 64 AND sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_analyst_input_pack_sha256",
+        ),
+        sa.ForeignKeyConstraint(
+            ["investigation_id"], ["analyst_investigations.id"], ondelete="CASCADE"
+        ),
+        sa.ForeignKeyConstraint(["blob_id"], ["blobs.id"], ondelete="RESTRICT"),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("investigation_id", name="uq_analyst_input_packs_investigation"),
+    )
+    op.execute(
+        "CREATE TRIGGER trg_analyst_input_packs_append_only BEFORE UPDATE OR DELETE "
+        "ON analyst_input_packs FOR EACH ROW EXECUTE FUNCTION reject_evidence_mutation()"
+    )
 
 
 def downgrade() -> None:
+    op.execute("DROP TRIGGER trg_analyst_input_packs_append_only ON analyst_input_packs")
+    op.drop_table("analyst_input_packs")
     op.execute("DROP TRIGGER trg_analyst_decisions_append_only ON analyst_decisions")
     op.drop_index("ix_analyst_decisions_investigation", table_name="analyst_decisions")
     op.drop_table("analyst_decisions")

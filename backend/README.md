@@ -15,19 +15,32 @@ uv run python -m cti_app.workers.scheduler
 
 ## Migrations
 
-PostgreSQL est la base principale. La migration initiale est appliquée automatiquement par le service Compose `migrate`. Hors Compose :
+PostgreSQL est la base principale. La migration initiale est appliquée automatiquement par le service Compose `migrate`. La chaîne post-baseline est volontairement réécrivable tant que le projet est en développement local : une base existante doit être recréée après une réécriture. Hors Compose :
 
 ```bash
 uv run alembic upgrade head
 uv run alembic downgrade base
 ```
 
-Les tests d'intégration créent une base PostgreSQL temporaire et exigent une URL d'administration dédiée :
+Le workflow local recommandé lance automatiquement un PostgreSQL éphémère séparé :
 
 ```bash
-TEST_POSTGRES_ADMIN_DSN=postgresql+asyncpg://postgres:postgres@localhost:5432/postgres \
-  uv run pytest -m integration
+make test-integration
 ```
+
+Équivalent manuel :
+
+```bash
+docker compose --profile integration-test up -d --wait postgres-test
+cd backend
+TEST_POSTGRES_ADMIN_DSN=postgresql+asyncpg://postgres:postgres@127.0.0.1:55432/postgres \
+  uv run pytest -m integration
+docker compose --profile integration-test rm -sf postgres-test
+```
+
+Les tests créent une base temporaire dans ce serveur. `POSTGRES_DSN` est la connexion à la DB applicative ; `TEST_POSTGRES_ADMIN_DSN` est la connexion ADMIN réservée à pytest pour `CREATE DATABASE` / `DROP DATABASE`. Ces deux URLs ne sont pas interchangeables. Un DSN explicite peut remplacer le service local : `TEST_POSTGRES_ADMIN_DSN=<dsn> make test-integration`.
+
+Après réécriture de l'historique des migrations, `make up-clean` est nécessaire pour recréer la DB applicative. Cette commande est destructive : elle supprime les volumes PostgreSQL, Redis, MinIO et workspaces, mais conserve volontairement `bridge_data`. Sauvegarder les données locales importantes avant de l'utiliser.
 
 Les octets des documents et échantillons ne sont jamais stockés dans PostgreSQL.
 

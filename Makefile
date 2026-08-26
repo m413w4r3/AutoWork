@@ -74,7 +74,23 @@ test:
 	cd frontend && $(PNPM) test --run
 
 test-integration:
-	cd backend && $(UV) run --python $(PYTHON_VERSION) pytest -m integration
+	@set -eu; \
+	started=0; \
+	cleanup() { \
+		if [ "$$started" -eq 1 ]; then \
+			$(COMPOSE) --profile integration-test rm -sf postgres-test >/dev/null 2>&1 || true; \
+		fi; \
+	}; \
+	trap cleanup EXIT INT TERM; \
+	if [ -n "$(TEST_POSTGRES_ADMIN_DSN)" ]; then \
+		test_dsn="$(TEST_POSTGRES_ADMIN_DSN)"; \
+	else \
+		started=1; \
+		$(COMPOSE) --profile integration-test up -d --wait postgres-test; \
+		test_dsn="postgresql+asyncpg://postgres:postgres@127.0.0.1:$${TEST_POSTGRES_PORT:-55432}/postgres"; \
+	fi; \
+	cd backend; \
+	TEST_POSTGRES_ADMIN_DSN="$$test_dsn" $(UV) run --python $(PYTHON_VERSION) pytest -m integration
 
 lint:
 	cd backend && $(UV) run --python $(PYTHON_VERSION) ruff check .

@@ -13,7 +13,7 @@ Code lives under `src/cti_app/`.
   Do not encode control state as free-form strings or metadata keys.
 - Business decisions never belong in `infrastructure/`.
 - Tests never contact external APIs.
-- Integration tests use `TEST_POSTGRES_ADMIN_DSN`.
+- Integration tests use make test-integration
 - The database is assumed empty for migrations:
   no backfills, legacy columns, or compatibility modes.
 - `alembic upgrade head` on an empty database must create the complete target
