@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -19,6 +19,12 @@ from cti_app.application.production_jobs import (
 from cti_app.application.production_stage_status import (
     build_stage_statuses,
     completed_stage_count,
+)
+from cti_app.application.production_state import (
+    ProductionStateError,
+    ProductionStateImportResult,
+    ProductionStateService,
+    ProductionStateSnapshotV1,
 )
 from cti_app.application.subject_production import (
     EditionProductionService,
@@ -115,6 +121,58 @@ def _runtime(request: Request) -> tuple[UnitOfWorkFactory, JobService, JobDispat
         request.app.state.job_service,
         request.app.state.job_dispatcher,
     )
+
+
+async def _selected_brief_group(request: Request, subject_id: UUID) -> EditorialGroup:
+    async with request.app.state.uow_factory() as uow:
+        group = cast(EditorialGroup | None, await uow.editorial_groups.get_by_subject(subject_id))
+        if group is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No editorial group found for subject {subject_id}",
+            )
+        if group.status != EditorialGroupStatus.SELECTED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Subject is not selected",
+            )
+        if group.editorial_type != EditorialType.BRIEF:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Subject is not a brief",
+            )
+        return group
+
+
+def _production_state_error(exc: ProductionStateError) -> HTTPException:
+    code_to_status = {
+        "production_state_not_found": status.HTTP_404_NOT_FOUND,
+        "production_state_active_run": status.HTTP_409_CONFLICT,
+        "production_state_incomplete": status.HTTP_409_CONFLICT,
+        "production_state_unverified": status.HTTP_409_CONFLICT,
+        "production_state_too_large": status.HTTP_413_CONTENT_TOO_LARGE,
+        "production_state_invalid_format": status.HTTP_400_BAD_REQUEST,
+        "production_state_version_unsupported": status.HTTP_400_BAD_REQUEST,
+        "production_state_invalid": status.HTTP_400_BAD_REQUEST,
+        "production_state_checksum_mismatch": status.HTTP_400_BAD_REQUEST,
+    }
+    return HTTPException(
+        status_code=code_to_status[exc.code],
+        detail={"code": exc.code, "message": exc.message},
+    )
+
+
+def _production_state_service(request: Request) -> ProductionStateService:
+    artifact_store = getattr(request.app.state, "production_artifact_store", None)
+    if artifact_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "production_state_storage_unavailable",
+                "message": "Le stockage des artefacts de production est indisponible.",
+            },
+        )
+    return ProductionStateService(request.app.state.uow_factory, artifact_store)
 
 
 def _eligible_brief_subject_ids(groups: Iterable[EditorialGroup]) -> list[UUID]:
@@ -264,6 +322,37 @@ async def start_subject_production(
         ) from e
 
     return _run_view(run, edition_id, job_id=job_id)
+
+
+@router.get("/subjects/{subject_id}/production/state/export")
+async def export_subject_production_state(
+    subject_id: UUID,
+    request: Request,
+) -> ProductionStateSnapshotV1:
+    group = await _selected_brief_group(request, subject_id)
+    service = _production_state_service(request)
+    try:
+        return await service.export_state(subject_id=subject_id, subject_title=group.title)
+    except ProductionStateError as exc:
+        raise _production_state_error(exc) from exc
+
+
+@router.post("/subjects/{subject_id}/production/state/import")
+async def import_subject_production_state(
+    subject_id: UUID,
+    request: Request,
+    payload: dict[str, Any],
+) -> ProductionStateImportResult:
+    group = await _selected_brief_group(request, subject_id)
+    service = _production_state_service(request)
+    try:
+        return await service.import_state(
+            subject_id=subject_id,
+            edition_id=group.edition_id,
+            payload=payload,
+        )
+    except ProductionStateError as exc:
+        raise _production_state_error(exc) from exc
 
 
 @router.get("/subjects/{subject_id}/production")

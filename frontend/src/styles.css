@@ -1175,6 +1175,52 @@ h1 {
   gap: 0.7rem;
 }
 
+.production-state-transfer {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.75rem;
+  background: #f8fbf9;
+}
+
+.production-state-transfer__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+}
+
+.production-state-transfer__actions input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.production-state-transfer__preview {
+  display: grid;
+  gap: 0.5rem;
+  padding: 1rem;
+  border: 1px solid #b9cfc0;
+  border-radius: 0.65rem;
+  background: #fff;
+}
+
+.production-state-transfer__preview p,
+.production-state-transfer__preview h4 {
+  margin: 0;
+}
+
+.production-state-transfer__stage-list {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
 .production-counters {
   margin: 0;
 }

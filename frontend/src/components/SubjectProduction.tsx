@@ -9,6 +9,7 @@ import {
 import type { StageStatus } from "../api/production";
 import { ProductionStageCard } from "./ProductionStageCard";
 import { BriefDraftEditor } from "./BriefDraftEditor";
+import { ProductionStateTransfer } from "./ProductionStateTransfer";
 
 interface SubjectProductionProps {
   subjectId: string;
@@ -82,6 +83,9 @@ function stageArtifactHref(subjectId: string, stage: string): string {
 }
 
 function issueCopy(status: string, errorCode: string | null): string {
+  if (errorCode === "imported_production_state") {
+    return "État restauré — références, extraction et synthèse sont disponibles. L’assemblage n’a pas été rejoué.";
+  }
   if (errorCode === "q2_source_coverage_failed") {
     return "Couverture des sources incomplète — certaines sources n’ont pas été analysées.";
   }
@@ -179,6 +183,10 @@ export function SubjectProduction({
               ? "Relancer la production"
               : "Produire cette brève"}
         </button>
+        <ProductionStateTransfer
+          subjectId={subjectId}
+          productionStatus={status ?? null}
+        />
       </section>
     );
   }
@@ -397,6 +405,11 @@ export function SubjectProduction({
           </button>
         )}
       </div>
+
+      <ProductionStateTransfer
+        subjectId={subjectId}
+        productionStatus={status}
+      />
 
       <details className="production-diagnostics">
         <summary>Diagnostic</summary>

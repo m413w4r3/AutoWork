@@ -105,6 +105,42 @@ export interface ExtractionDocumentV2 {
   uncertainties: string[];
 }
 
+export interface ProductionStateSnapshotV1 {
+  format: "autowork.production-state";
+  schema_version: 1;
+  exported_at: string;
+  origin: {
+    subject_title: string;
+    editorial_type: "brief";
+    profile: "brief_auto";
+    research_date: string | null;
+  };
+  artifacts: {
+    references: {
+      input_hash: string;
+      canonical_content: Record<string, unknown>;
+    };
+    extraction: {
+      input_hash: string;
+      canonical_content: ExtractionDocumentV2;
+    };
+    synthesis: {
+      input_hash: string;
+      rendered_content: string;
+    };
+  };
+  content_sha256: string;
+}
+
+export interface ProductionStateImportResult {
+  run_id: string;
+  status: "needs_review";
+  current_stage: "assembly";
+  imported_stages: ["references", "extraction", "synthesis"];
+  schema_version: 1;
+  content_sha256: string;
+}
+
 export type RichSpanKind =
   | "text"
   | "emphasis"
@@ -172,6 +208,23 @@ export async function getSubjectProduction(
   subjectId: string,
 ): Promise<ProductionStatus | null> {
   return requestOrNull(`/api/subjects/${subjectId}/production`);
+}
+
+export async function exportProductionState(
+  subjectId: string,
+): Promise<ProductionStateSnapshotV1> {
+  return request(`/api/subjects/${subjectId}/production/state/export`);
+}
+
+export async function importProductionState(
+  subjectId: string,
+  snapshot: ProductionStateSnapshotV1,
+): Promise<ProductionStateImportResult> {
+  return request(`/api/subjects/${subjectId}/production/state/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(snapshot),
+  });
 }
 
 /** Recompute one stage in place, invalidating its downstream artifacts. */

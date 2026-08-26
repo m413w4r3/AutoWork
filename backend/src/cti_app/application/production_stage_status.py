@@ -27,7 +27,13 @@ _STAGE_ARTIFACT: dict[SubjectProductionStage, ProductionArtifactStage | None] = 
     SubjectProductionStage.ASSEMBLY: ProductionArtifactStage.BRIEF,
 }
 
-_STAGES = list(SubjectProductionStage)
+_STAGES = [
+    SubjectProductionStage.SOURCES,
+    SubjectProductionStage.REFERENCES,
+    SubjectProductionStage.EXTRACTION,
+    SubjectProductionStage.SYNTHESIS,
+    SubjectProductionStage.ASSEMBLY,
+]
 
 
 def build_stage_statuses(
