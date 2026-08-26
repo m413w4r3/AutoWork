@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
+
+from cti_app.domain.virustotal import (
+    VirusTotalCapability,
+    VirusTotalEndpointVariant,
+    VirusTotalFallbackTrigger,
+    VirusTotalTransportKind,
+)
 
 
 class VirusTotalError(RuntimeError):
@@ -36,6 +44,18 @@ class VirusTotalConfigurationError(VirusTotalError):
 
 class VirusTotalCapabilityDisabledError(VirusTotalError):
     code = "virustotal_capability_disabled"
+
+
+class VirusTotalRouteUnavailableError(VirusTotalError):
+    """The operation is authorized but no usable route is configured for it.
+
+    Distinct from `VirusTotalCapabilityDisabledError`: a capability may be
+    enabled while its route is direct-only and the direct transport is not
+    wired (missing key, missing client, ...). This is a local configuration
+    failure, raised before any network call.
+    """
+
+    code = "virustotal_route_unavailable"
 
 
 class VirusTotalRelationNotAllowedError(VirusTotalError):
@@ -72,6 +92,13 @@ class VirusTotalTransportError(VirusTotalError):
 
 @dataclass(frozen=True, slots=True)
 class VirusTotalCapabilities:
+    """Authorization to request each operation. Says nothing about transport.
+
+    `file_report=True` means the application may request a file report; it
+    means neither "proxy is allowed" nor "direct is allowed". Which network
+    path is used is decided separately by `VirusTotalRoutingPolicy`.
+    """
+
     file_report: bool = False
     file_relationships: bool = False
     intelligence_search: bool = False
@@ -79,6 +106,60 @@ class VirusTotalCapabilities:
     submissions: bool = False
     behaviour_pcap: bool = False
     retrohunt: bool = False
+
+    def is_enabled(self, capability: VirusTotalCapability) -> bool:
+        return bool(getattr(self, capability.value))
+
+
+@dataclass(frozen=True, slots=True)
+class VirusTotalRouteStep:
+    """One concrete hop a route may take: a transport plus a wire variant."""
+
+    transport: VirusTotalTransportKind
+    variant: VirusTotalEndpointVariant
+
+
+@dataclass(frozen=True, slots=True)
+class VirusTotalOperationRoute:
+    """The explicit, ordered set of steps allowed for one operation.
+
+    `primary` is always attempted first. A step in `fallbacks` is attempted
+    only after the previous step failed with an outcome matching
+    `fallback_trigger` (e.g. 404) — never on 403, 429, timeout, or 5xx unless
+    the trigger says so. Nothing here is deduced from the presence of a proxy
+    URL or an API key; both are wired separately and checked for
+    availability when a step is actually reached.
+    """
+
+    primary: VirusTotalRouteStep
+    fallbacks: tuple[VirusTotalRouteStep, ...] = ()
+    fallback_trigger: VirusTotalFallbackTrigger = VirusTotalFallbackTrigger.NOT_FOUND
+
+    def steps(self) -> tuple[VirusTotalRouteStep, ...]:
+        return (self.primary, *self.fallbacks)
+
+    def permits_fallback(self, error: VirusTotalError) -> bool:
+        if self.fallback_trigger is VirusTotalFallbackTrigger.NOT_FOUND:
+            return error.status_code == 404
+        return False
+
+
+@dataclass(frozen=True, slots=True)
+class VirusTotalRoutingPolicy:
+    """Deny-by-default map of capability -> allowed route.
+
+    A capability absent from `routes` has no usable transport at all, even
+    if enabled in `VirusTotalCapabilities` and even if a proxy or a direct
+    key happens to be configured. Fully inspectable and testable without
+    performing any request.
+    """
+
+    routes: Mapping[VirusTotalCapability, VirusTotalOperationRoute] = field(
+        default_factory=dict
+    )
+
+    def route_for(self, capability: VirusTotalCapability) -> VirusTotalOperationRoute | None:
+        return self.routes.get(capability)
 
 
 class FileRelationship(StrEnum):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import ssl
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -22,11 +22,15 @@ from cti_app.application.virustotal import (
     VirusTotalHttpError,
     VirusTotalInvalidInputError,
     VirusTotalJsonError,
+    VirusTotalOperationRoute,
     VirusTotalPage,
     VirusTotalPayloadError,
     VirusTotalPort,
     VirusTotalRelationNotAllowedError,
     VirusTotalResponseTooLargeError,
+    VirusTotalRouteStep,
+    VirusTotalRouteUnavailableError,
+    VirusTotalRoutingPolicy,
     VirusTotalSearchResult,
     VirusTotalTransportError,
     VirusTotalUnexpectedRedirectError,
@@ -34,6 +38,11 @@ from cti_app.application.virustotal import (
     validate_search_query,
 )
 from cti_app.config import Settings
+from cti_app.domain.virustotal import (
+    VirusTotalCapability,
+    VirusTotalEndpointVariant,
+    VirusTotalTransportKind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +73,17 @@ def create_virustotal_http_client(settings: Settings) -> httpx.AsyncClient:
 
 
 def create_virustotal_direct_http_client(settings: Settings) -> httpx.AsyncClient:
-    """Create the optional direct client used only by explicitly authorized fallbacks."""
+    """Create the optional direct client used only by explicitly authorized fallbacks.
+
+    Built only when a key exists AND at least one direct route is actually
+    enabled — the key's mere presence never authorizes building this client.
+    """
     if settings.virustotal_api_key is None:
         raise VirusTotalConfigurationError("La clé API directe VirusTotal n'est pas configurée.")
+    if not settings.virustotal_file_report_legacy_fallback_enabled:
+        raise VirusTotalConfigurationError(
+            "Aucune route directe VirusTotal n'est activée explicitement."
+        )
     timeout = httpx.Timeout(
         settings.virustotal_read_timeout_seconds,
         connect=settings.virustotal_connect_timeout_seconds,
@@ -93,6 +110,9 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         legacy_base_url: str | None = None,
         direct_client: httpx.AsyncClient | None = None,
         api_key: str | None = None,
+        file_report_proxy_fallback_enabled: bool = False,
+        file_report_legacy_fallback_enabled: bool = False,
+        routing_policy: VirusTotalRoutingPolicy | None = None,
         max_response_bytes: int = 10 * 1024 * 1024,
         default_page_size: int = 40,
         max_page_size: int = 100,
@@ -112,6 +132,15 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         if (direct_client is None) != (api_key is None):
             raise ValueError("direct_client et api_key doivent être fournis ensemble")
         self._capabilities = capabilities
+        self._routing_policy = routing_policy or _default_routing_policy(
+            base_url=self._base_url,
+            fallback_base_url=self._fallback_base_url,
+            legacy_base_url=self._legacy_base_url,
+            direct_client=self._direct_client,
+            api_key=self._api_key,
+            proxy_fallback_enabled=file_report_proxy_fallback_enabled,
+            legacy_fallback_enabled=file_report_legacy_fallback_enabled,
+        )
         self._max_response_bytes = _positive(max_response_bytes, "max_response_bytes")
         self._default_page_size = _bounded(default_page_size, 1, max_page_size, "default_page_size")
         self._max_page_size = _positive(max_page_size, "max_page_size")
@@ -119,34 +148,67 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         self._max_results = _positive(max_results, "max_results")
 
     async def file_report(self, file_hash: str) -> VirusTotalFileReport:
-        self._require(self._capabilities.file_report)
+        self._require(VirusTotalCapability.FILE_REPORT)
         normalized = normalize_file_hash(file_hash)
-        try:
-            body = await self._get(f"/files/{normalized}")
-        except VirusTotalError as error:
-            if error.status_code != 404:
-                raise
-            body = await self._file_report_fallback(normalized, error)
+        route = self._resolve_route(VirusTotalCapability.FILE_REPORT)
+        body = await self._execute_route(
+            route, lambda step: self._file_report_request(step, normalized)
+        )
         payload = _json_object(body)
         if _is_v2_file_report(payload):
             return VirusTotalFileReport(file=_parse_v2_file(payload, normalized), raw_json=body)
         return VirusTotalFileReport(file=_parse_file(payload), raw_json=body)
 
-    async def _file_report_fallback(self, file_hash: str, original: VirusTotalError) -> bytes:
-        if self._fallback_base_url and self._fallback_base_url != self._base_url:
+    async def _file_report_request(self, step: VirusTotalRouteStep, file_hash: str) -> bytes:
+        client, base_url = self._resolve_transport(step)
+        if step.variant is VirusTotalEndpointVariant.LEGACY_V2:
+            return await self._get(
+                "/file/report",
+                client=client,
+                base_url=base_url,
+                params={"resource": file_hash, "apikey": self._api_key},
+            )
+        return await self._get(f"/files/{file_hash}", client=client, base_url=base_url)
+
+    async def _execute_route(
+        self,
+        route: VirusTotalOperationRoute,
+        request: Callable[[VirusTotalRouteStep], Awaitable[bytes]],
+    ) -> bytes:
+        steps = route.steps()
+        for index, step in enumerate(steps):
+            is_last = index == len(steps) - 1
             try:
-                return await self._get(f"/files/{file_hash}", base_url=self._fallback_base_url)
+                return await request(step)
             except VirusTotalError as error:
-                if error.status_code != 404:
+                if is_last or not route.permits_fallback(error):
                     raise
-        if self._direct_client is None or self._api_key is None or self._legacy_base_url is None:
-            raise original
-        return await self._get(
-            "/file/report",
-            client=self._direct_client,
-            base_url=self._legacy_base_url,
-            params={"resource": file_hash, "apikey": self._api_key},
+        raise VirusTotalRouteUnavailableError(
+            "Aucune route VirusTotal utilisable n'est configurée."
         )
+
+    def _resolve_transport(self, step: VirusTotalRouteStep) -> tuple[httpx.AsyncClient, str]:
+        if step.transport is VirusTotalTransportKind.PROXY:
+            if step.variant is VirusTotalEndpointVariant.V3_FALLBACK:
+                if self._fallback_base_url is None:
+                    raise VirusTotalRouteUnavailableError(
+                        "La route proxy de secours VirusTotal n'est pas configurée."
+                    )
+                return self._client, self._fallback_base_url
+            return self._client, self._base_url
+        if self._direct_client is None or self._legacy_base_url is None or self._api_key is None:
+            raise VirusTotalRouteUnavailableError(
+                "La route directe VirusTotal n'est pas configurée."
+            )
+        return self._direct_client, self._legacy_base_url
+
+    def _resolve_route(self, capability: VirusTotalCapability) -> VirusTotalOperationRoute:
+        route = self._routing_policy.route_for(capability)
+        if route is None:
+            raise VirusTotalRouteUnavailableError(
+                "Aucune route VirusTotal n'est configurée pour cette opération."
+            )
+        return route
 
     async def file_relationship(
         self,
@@ -157,7 +219,8 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         cursor: str | None = None,
         paginate: bool = False,
     ) -> VirusTotalPage:
-        self._require(self._capabilities.file_relationships)
+        self._require(VirusTotalCapability.FILE_RELATIONSHIPS)
+        self._resolve_route(VirusTotalCapability.FILE_RELATIONSHIPS)
         normalized = normalize_file_hash(file_hash)
         if not isinstance(relation, FileRelationship):
             raise VirusTotalRelationNotAllowedError("La relation fichier n'est pas autorisée.")
@@ -173,7 +236,8 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         cursor: str | None = None,
         paginate: bool = False,
     ) -> VirusTotalSearchResult:
-        self._require(self._capabilities.intelligence_search)
+        self._require(VirusTotalCapability.INTELLIGENCE_SEARCH)
+        self._resolve_route(VirusTotalCapability.INTELLIGENCE_SEARCH)
         query = validate_search_query(query)
         page = await self._paginate(
             "/intelligence/search",
@@ -309,10 +373,60 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             raise VirusTotalInvalidInputError("La taille de page VirusTotal est hors limites.")
         return value
 
-    @staticmethod
-    def _require(enabled: bool) -> None:
-        if not enabled:
+    def _require(self, capability: VirusTotalCapability) -> None:
+        if not self._capabilities.is_enabled(capability):
             raise VirusTotalCapabilityDisabledError("La capability VirusTotal est désactivée.")
+
+
+def _default_routing_policy(
+    *,
+    base_url: str,
+    fallback_base_url: str | None,
+    legacy_base_url: str | None,
+    direct_client: httpx.AsyncClient | None,
+    api_key: str | None,
+    proxy_fallback_enabled: bool,
+    legacy_fallback_enabled: bool,
+) -> VirusTotalRoutingPolicy:
+    """Build the deny-by-default policy this adapter ships with.
+
+    Every step below requires its own explicit enable flag: neither a
+    configured fallback base URL nor a present API key is, by itself,
+    sufficient to add a step. Only `file_report` carries fallbacks; other
+    operations use the proxy primary route only, matching what this adapter
+    actually implements for them.
+    """
+    file_report_steps = [
+        VirusTotalRouteStep(VirusTotalTransportKind.PROXY, VirusTotalEndpointVariant.V3)
+    ]
+    if proxy_fallback_enabled and fallback_base_url is not None and fallback_base_url != base_url:
+        file_report_steps.append(
+            VirusTotalRouteStep(
+                VirusTotalTransportKind.PROXY, VirusTotalEndpointVariant.V3_FALLBACK
+            )
+        )
+    if (
+        legacy_fallback_enabled
+        and direct_client is not None
+        and api_key is not None
+        and legacy_base_url is not None
+    ):
+        file_report_steps.append(
+            VirusTotalRouteStep(VirusTotalTransportKind.DIRECT, VirusTotalEndpointVariant.LEGACY_V2)
+        )
+    file_report_primary, *file_report_fallbacks = file_report_steps
+    proxy_only = VirusTotalOperationRoute(
+        primary=VirusTotalRouteStep(VirusTotalTransportKind.PROXY, VirusTotalEndpointVariant.V3)
+    )
+    return VirusTotalRoutingPolicy(
+        routes={
+            VirusTotalCapability.FILE_REPORT: VirusTotalOperationRoute(
+                primary=file_report_primary, fallbacks=tuple(file_report_fallbacks)
+            ),
+            VirusTotalCapability.FILE_RELATIONSHIPS: proxy_only,
+            VirusTotalCapability.INTELLIGENCE_SEARCH: proxy_only,
+        }
+    )
 
 
 def _validate_base_url(value: str) -> str:

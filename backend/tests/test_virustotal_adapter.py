@@ -14,10 +14,19 @@ from cti_app.application.virustotal import (
     VirusTotalCapabilityDisabledError,
     VirusTotalError,
     VirusTotalInvalidInputError,
+    VirusTotalOperationRoute,
     VirusTotalRelationNotAllowedError,
     VirusTotalResponseTooLargeError,
+    VirusTotalRouteStep,
+    VirusTotalRouteUnavailableError,
+    VirusTotalRoutingPolicy,
 )
 from cti_app.config import Settings
+from cti_app.domain.virustotal import (
+    VirusTotalCapability,
+    VirusTotalEndpointVariant,
+    VirusTotalTransportKind,
+)
 from cti_app.infrastructure.virustotal import (
     VirusTotalHttpAdapter,
     create_virustotal_direct_http_client,
@@ -112,6 +121,7 @@ async def test_file_report_falls_back_to_v2_only_with_direct_key_client() -> Non
         base_url=BASE,
         legacy_base_url="http://www.virustotal.com/vtapi/v2",
         capabilities=VirusTotalCapabilities(file_report=True),
+        file_report_legacy_fallback_enabled=True,
     )
     try:
         result = await value.file_report(SHA256)
@@ -127,12 +137,21 @@ async def test_file_report_falls_back_to_v2_only_with_direct_key_client() -> Non
 
 
 @pytest.mark.asyncio
-async def test_direct_client_requires_explicit_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_direct_client_requires_explicit_api_key_and_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     settings = Settings(_env_file=None)
     with pytest.raises(VirusTotalError) as caught:
         create_virustotal_direct_http_client(settings)
     assert caught.value.code == "virustotal_transport_not_configured"
+
+    # Key alone is never enough: no direct route is explicitly enabled yet.
     monkeypatch.setenv("VIRUSTOTAL_API_KEY", "direct-test-key")
+    with pytest.raises(VirusTotalError) as caught:
+        create_virustotal_direct_http_client(Settings(_env_file=None))
+    assert caught.value.code == "virustotal_transport_not_configured"
+
+    monkeypatch.setenv("VIRUSTOTAL_FILE_REPORT_LEGACY_FALLBACK_ENABLED", "true")
     client = create_virustotal_direct_http_client(Settings(_env_file=None))
     try:
         assert client.headers["x-apikey"] == "direct-test-key"
@@ -380,3 +399,177 @@ async def test_transport_errors_are_normalized(
         await client.aclose()
     assert caught.value.code == code
     assert caught.value.retryable is retryable
+
+
+@pytest.mark.asyncio
+async def test_route_absent_is_a_local_error_before_network() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    value = VirusTotalHttpAdapter(
+        client=client,
+        base_url=BASE,
+        capabilities=VirusTotalCapabilities(file_report=True),
+        routing_policy=VirusTotalRoutingPolicy(routes={}),
+    )
+    try:
+        with pytest.raises(VirusTotalRouteUnavailableError) as caught:
+            await value.file_report(SHA256)
+        assert caught.value.code == "virustotal_route_unavailable"
+    finally:
+        await client.aclose()
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_direct_only_route_without_key_is_a_local_error_before_network() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    direct_only = VirusTotalOperationRoute(
+        primary=VirusTotalRouteStep(
+            VirusTotalTransportKind.DIRECT, VirusTotalEndpointVariant.LEGACY_V2
+        )
+    )
+    value = VirusTotalHttpAdapter(
+        client=client,
+        base_url=BASE,
+        capabilities=VirusTotalCapabilities(file_report=True),
+        routing_policy=VirusTotalRoutingPolicy(
+            routes={VirusTotalCapability.FILE_REPORT: direct_only}
+        ),
+    )
+    try:
+        with pytest.raises(VirusTotalRouteUnavailableError):
+            await value.file_report(SHA256)
+    finally:
+        await client.aclose()
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_proxy_fallback_requires_explicit_flag_and_then_follows_policy() -> None:
+    fallback_base = "https://virustotal.com/api/v3"
+    calls: list[str] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(fallback_base):
+            calls.append("fallback")
+            return httpx.Response(
+                200,
+                json={"data": {"id": SHA256.lower(), "type": "file", "attributes": {}}},
+                request=request,
+            )
+        calls.append("primary")
+        return httpx.Response(404, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+    # Without the explicit flag, the fallback base URL is never used even
+    # though it is configured and distinct from the primary base URL.
+    value = VirusTotalHttpAdapter(
+        client=client,
+        base_url=BASE,
+        fallback_base_url=fallback_base,
+        capabilities=VirusTotalCapabilities(file_report=True),
+    )
+    with pytest.raises(VirusTotalError) as caught:
+        await value.file_report(SHA256)
+    assert caught.value.status_code == 404
+    assert calls == ["primary"]
+
+    calls.clear()
+    value = VirusTotalHttpAdapter(
+        client=client,
+        base_url=BASE,
+        fallback_base_url=fallback_base,
+        capabilities=VirusTotalCapabilities(file_report=True),
+        file_report_proxy_fallback_enabled=True,
+    )
+    try:
+        result = await value.file_report(SHA256)
+    finally:
+        await client.aclose()
+    assert calls == ["primary", "fallback"]
+    assert result.file.lookup_value == SHA256.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [403, 429, 500, 503])
+async def test_non_404_never_falls_back_to_direct(status: int) -> None:
+    proxy_calls = 0
+    direct_calls = 0
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal proxy_calls
+        proxy_calls += 1
+        headers = {"Retry-After": "1"} if status == 429 else {}
+        return httpx.Response(status, headers=headers, request=request)
+
+    def direct_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal direct_calls
+        direct_calls += 1
+        return httpx.Response(200, json={"response_code": 1, "scans": {}}, request=request)
+
+    proxy = httpx.AsyncClient(transport=httpx.MockTransport(proxy_handler))
+    direct = httpx.AsyncClient(transport=httpx.MockTransport(direct_handler))
+    value = VirusTotalHttpAdapter(
+        client=proxy,
+        direct_client=direct,
+        api_key="direct-test-key",
+        base_url=BASE,
+        legacy_base_url="http://www.virustotal.com/vtapi/v2",
+        capabilities=VirusTotalCapabilities(file_report=True),
+        file_report_legacy_fallback_enabled=True,
+    )
+    try:
+        with pytest.raises(VirusTotalError) as caught:
+            await value.file_report(SHA256)
+        assert caught.value.status_code == status
+    finally:
+        await direct.aclose()
+        await proxy.aclose()
+    assert proxy_calls == 1
+    assert direct_calls == 0
+
+
+def test_api_key_never_appears_in_settings_repr(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VIRUSTOTAL_API_KEY", "super-secret-key")
+    settings = Settings(_env_file=None)
+    assert "super-secret-key" not in repr(settings)
+    assert "super-secret-key" not in str(settings)
+
+
+@pytest.mark.asyncio
+async def test_api_key_never_appears_in_raised_errors() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, request=request)
+
+    proxy = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    direct = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    value = VirusTotalHttpAdapter(
+        client=proxy,
+        direct_client=direct,
+        api_key="super-secret-key",
+        base_url=BASE,
+        legacy_base_url="http://www.virustotal.com/vtapi/v2",
+        capabilities=VirusTotalCapabilities(file_report=True),
+        file_report_legacy_fallback_enabled=True,
+    )
+    try:
+        with pytest.raises(VirusTotalError) as caught:
+            await value.file_report(SHA256)
+        assert "super-secret-key" not in str(caught.value)
+        assert "super-secret-key" not in repr(caught.value)
+    finally:
+        await direct.aclose()
+        await proxy.aclose()

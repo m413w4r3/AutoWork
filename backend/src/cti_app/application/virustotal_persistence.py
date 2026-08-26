@@ -20,7 +20,12 @@ from cti_app.application.virustotal import (
     VirusTotalPage,
     VirusTotalSearchResult,
 )
-from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation, VirusTotalOperation
+from cti_app.domain.virustotal import (
+    VirusTotalCapability,
+    VirusTotalFileView,
+    VirusTotalObservation,
+    VirusTotalOperation,
+)
 
 VIRUSTOTAL_RAW_BUCKET = "virustotal-raw"
 VIRUSTOTAL_JSON_MIME_TYPE = "application/json"
@@ -37,7 +42,7 @@ class VirusTotalObservationService:
         observation = await self._store_raw(
             raw_body=report.raw_json,
             operation=VirusTotalOperation.FILE_REPORT,
-            capability="file_report",
+            capability=VirusTotalCapability.FILE_REPORT,
             source_identifier=report.file.lookup_value,
             safe_parameters={"file_hash": report.file.lookup_value},
             subject_id=subject_id,
@@ -67,7 +72,7 @@ class VirusTotalObservationService:
         return await self._store_pages(
             page.raw_json_pages,
             VirusTotalOperation.FILE_RELATIONSHIP,
-            "file_relationships",
+            VirusTotalCapability.FILE_RELATIONSHIPS,
             file_hash,
             {"file_hash": file_hash, "relation": relation},
             page,
@@ -88,7 +93,7 @@ class VirusTotalObservationService:
         return await self._store_pages(
             result.raw_json_pages,
             VirusTotalOperation.INTELLIGENCE_SEARCH,
-            "intelligence_search",
+            VirusTotalCapability.INTELLIGENCE_SEARCH,
             query,
             {"query": query},
             result,
@@ -101,7 +106,7 @@ class VirusTotalObservationService:
         self,
         bodies: tuple[bytes, ...],
         operation: VirusTotalOperation,
-        capability: str,
+        capability: VirusTotalCapability,
         source: str,
         parameters: dict[str, Any],
         result: VirusTotalPage | VirusTotalSearchResult,
@@ -139,7 +144,7 @@ class VirusTotalObservationService:
         *,
         raw_body: bytes,
         operation: VirusTotalOperation,
-        capability: str,
+        capability: VirusTotalCapability,
         source_identifier: str,
         safe_parameters: dict[str, Any],
         subject_id: UUID | None,

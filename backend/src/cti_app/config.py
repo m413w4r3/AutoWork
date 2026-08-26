@@ -70,12 +70,24 @@ class Settings(BaseSettings):
     qwen_chunk_max_chars: int = Field(default=12_000, gt=100)
     qwen_chunk_overlap_chars: int = Field(default=500, ge=0)
     # VirusTotal is intentionally disabled unless a proxy and capabilities are
-    # explicitly supplied by the composition root. No VT credential exists here.
+    # explicitly supplied by the composition root. `virustotal_api_key`, when
+    # set, only makes the direct transport *available to be wired*; it never
+    # authorizes an operation and never selects a route by itself. Which
+    # transport an operation actually uses is a separate, explicit,
+    # deny-by-default decision (see application.virustotal.VirusTotalRoutingPolicy
+    # and the *_fallback_enabled flags below) — proxy stays the only transport
+    # used unless a fallback is explicitly turned on.
     virustotal_proxy_url: str | None = None
     virustotal_base_url: str = "http://www.virustotal.com/api/v3"
     virustotal_fallback_base_url: str | None = "http://www.virustotal.com/api/v3"
     virustotal_legacy_base_url: str | None = "http://www.virustotal.com/vtapi/v2"
     virustotal_api_key: SecretStr | None = None
+    # Explicit opt-in for file_report's proxy fallback base URL (still proxy
+    # transport, second v3 base) and its legacy v2 direct fallback. Both
+    # default to disabled: neither the presence of `virustotal_fallback_base_url`
+    # / `virustotal_legacy_base_url` nor of `virustotal_api_key` enables them.
+    virustotal_file_report_proxy_fallback_enabled: bool = False
+    virustotal_file_report_legacy_fallback_enabled: bool = False
     virustotal_proxy_insecure: bool = False
     virustotal_connect_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
     virustotal_read_timeout_seconds: float = Field(default=60.0, gt=0, le=600)

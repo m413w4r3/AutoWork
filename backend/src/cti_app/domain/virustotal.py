@@ -13,10 +13,52 @@ class VirusTotalOperation(StrEnum):
     INTELLIGENCE_SEARCH = "intelligence_search"
 
 
+class VirusTotalCapability(StrEnum):
+    """Authorization to request an operation. Says nothing about transport.
+
+    A capability being enabled never implies proxy access, direct access, or
+    any particular route: see `VirusTotalRoutingPolicy` in the application
+    layer for how a route is chosen. Persisted verbatim on observations.
+    """
+
+    FILE_REPORT = "file_report"
+    FILE_RELATIONSHIPS = "file_relationships"
+    INTELLIGENCE_SEARCH = "intelligence_search"
+    FILE_DOWNLOAD = "file_download"
+    SUBMISSIONS = "submissions"
+    BEHAVIOUR_PCAP = "behaviour_pcap"
+    RETROHUNT = "retrohunt"
+
+
+class VirusTotalTransportKind(StrEnum):
+    """The network path used to reach VirusTotal, independent of authorization."""
+
+    PROXY = "proxy"
+    DIRECT = "direct"
+
+
+class VirusTotalEndpointVariant(StrEnum):
+    """The concrete wire endpoint a route step targets."""
+
+    V3 = "v3"
+    V3_FALLBACK = "v3_fallback"
+    LEGACY_V2 = "legacy_v2"
+
+
+class VirusTotalFallbackTrigger(StrEnum):
+    """The exact upstream outcome allowed to advance a route to its next step.
+
+    Any other outcome (403, 429, timeout, 5xx, ...) propagates immediately and
+    never causes an implicit fallback.
+    """
+
+    NOT_FOUND = "not_found"
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class VirusTotalObservation:
     operation: VirusTotalOperation
-    capability: str
+    capability: VirusTotalCapability
     source_identifier: str
     safe_parameters: dict[str, Any]
     http_status: int

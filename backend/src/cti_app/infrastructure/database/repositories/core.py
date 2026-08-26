@@ -274,7 +274,7 @@ class SqlAlchemyVirusTotalObservationRepository:
                 id=observation.id,
                 subject_id=observation.subject_id,
                 operation=observation.operation.value,
-                capability=observation.capability,
+                capability=observation.capability.value,
                 source_identifier=observation.source_identifier,
                 safe_parameters=observation.safe_parameters,
                 http_status=observation.http_status,
