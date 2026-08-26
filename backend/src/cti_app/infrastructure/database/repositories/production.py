@@ -35,7 +35,7 @@ class SqlAlchemySubjectProductionRunRepository:
             references_conversation_id=run.references_conversation_id,
             synthesis_conversation_id=run.synthesis_conversation_id,
             run_number=run.run_number,
-            synthesis_generation=run.synthesis_generation,
+            pipeline_generation=run.pipeline_generation,
             research_date=run.research_date,
             error_code=run.error_code,
             error_message=run.error_message,
@@ -71,7 +71,7 @@ class SqlAlchemySubjectProductionRunRepository:
                 current_stage=run.current_stage.value,
                 references_conversation_id=run.references_conversation_id,
                 synthesis_conversation_id=run.synthesis_conversation_id,
-                synthesis_generation=run.synthesis_generation,
+                pipeline_generation=run.pipeline_generation,
                 research_date=run.research_date,
                 error_code=run.error_code,
                 error_message=run.error_message,
@@ -179,6 +179,33 @@ class SqlAlchemyProductionArtifactRepository:
                 .values(status=ProductionArtifactStatus.STALE.value)
             )
             await self._session.execute(stmt)
+
+    async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]:
+        """Mark selected production output and every downstream output stale."""
+        pipeline = ["sources", "references", "extraction", "synthesis", "assembly"]
+        if stage not in pipeline:
+            return []
+        artifact_stages = {
+            "references": "references", "extraction": "extraction",
+            "synthesis": "synthesis", "assembly": "brief",
+        }
+        affected = [
+            artifact_stages[item]
+            for item in pipeline[pipeline.index(stage) :]
+            if item in artifact_stages
+        ]
+        if not affected:
+            return []
+        await self._session.execute(
+            update(ProductionArtifactRow)
+            .where(
+                (ProductionArtifactRow.production_run_id == run_id)
+                & (ProductionArtifactRow.stage.in_(affected))
+                & (ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value)
+            )
+            .values(status=ProductionArtifactStatus.STALE.value)
+        )
+        return affected
 
 
 class SqlAlchemyEditionProductionBatchRepository:
@@ -303,7 +330,7 @@ def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectPro
         references_conversation_id=row.references_conversation_id,
         synthesis_conversation_id=row.synthesis_conversation_id,
         run_number=row.run_number,
-        synthesis_generation=row.synthesis_generation,
+        pipeline_generation=row.pipeline_generation,
         research_date=row.research_date,
         error_code=row.error_code,
         error_message=row.error_message,

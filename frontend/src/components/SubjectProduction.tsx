@@ -1,8 +1,7 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   getSubjectProduction,
-  retryReferences,
-  retrySynthesis,
+  retryProductionStage,
   cancelSubjectProduction,
   startSubjectProduction,
   shouldPollProduction,
@@ -96,13 +95,9 @@ export function SubjectProduction({
     },
   });
 
-  const retryReferencesMutation = useMutation({
-    mutationFn: () => retryReferences(subjectId),
-    onSuccess: () => refetch(),
-  });
-
-  const retrySynthesisMutation = useMutation({
-    mutationFn: () => retrySynthesis(subjectId),
+  const retryStageMutation = useMutation({
+    mutationFn: (stage: "sources" | "references" | "extraction" | "synthesis" | "assembly") =>
+      retryProductionStage(subjectId, stage),
     onSuccess: () => refetch(),
   });
 
@@ -295,37 +290,19 @@ export function SubjectProduction({
       )}
 
       <div className="production-actions">
-        {status.status === "ready" && (
+        {["ready", "failed", "needs_review"].includes(status.status) && (
           <>
-            <button
-              className="button"
-              onClick={() => retryReferencesMutation.mutate()}
-              disabled={retryReferencesMutation.isPending}
-            >
-              {retryReferencesMutation.isPending
-                ? "Relance…"
-                : "Relancer les références"}
-            </button>
-            <button
-              className="button button--secondary"
-              onClick={() => retrySynthesisMutation.mutate()}
-              disabled={retrySynthesisMutation.isPending}
-            >
-              {retrySynthesisMutation.isPending
-                ? "Relance…"
-                : "Relancer la synthèse"}
-            </button>
+            {(["sources", "references", "extraction", "synthesis", "assembly"] as const).map((stage) => (
+              <button
+                key={stage}
+                className={stage === "sources" ? "button" : "button button--secondary"}
+                onClick={() => retryStageMutation.mutate(stage)}
+                disabled={retryStageMutation.isPending}
+              >
+                {retryStageMutation.isPending ? "Relance…" : `Relancer : ${STAGE_LABELS[stage]}`}
+              </button>
+            ))}
           </>
-        )}
-
-        {(status.status === "failed" || status.status === "needs_review") && (
-          <button
-            className="button"
-            onClick={() => startMutation.mutate()}
-            disabled={startMutation.isPending}
-          >
-            {startMutation.isPending ? "Démarrage…" : "Relancer la production"}
-          </button>
         )}
 
         {status.status === "running" && (

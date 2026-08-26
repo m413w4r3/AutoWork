@@ -545,6 +545,8 @@ class ProductionArtifactRepository(Protocol):
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None: ...
 
+    async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]: ...
+
 
 class EditionProductionBatchRepository(Protocol):
     async def add(self, batch: EditionProductionBatch) -> None: ...
@@ -571,6 +573,7 @@ class EditionProductionBatchItemRepository(Protocol):
 class ProductionUnitOfWork(Protocol):
     subject_production_runs: SubjectProductionRunRepository
     production_artifacts: ProductionArtifactRepository
+    source_collections: SourceCollectionRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
 

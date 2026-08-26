@@ -53,6 +53,7 @@ class ProductionStageParameters(JobParameters):
 
     run_id: UUID = Field(..., description="Production run ID")
     expected_stage: str = Field(..., description="Expected production stage")
+    pipeline_generation: int = Field(0, ge=0, description="Pipeline generation")
 
 
 def stage_job_kind(stage: SubjectProductionStage) -> str:
@@ -61,20 +62,10 @@ def stage_job_kind(stage: SubjectProductionStage) -> str:
     return f"production.subject.{stage.value}"
 
 
-# SYNTHESIS and its downstream ASSEMBLY are the only stages a retry can
-# re-enter on an existing run (Q1/Q2 stay put): their idempotency key must
-# carry the run's synthesis_generation, or a synthesis retry's ASSEMBLY job
-# collides with the previous generation's already-terminal one.
-_GENERATION_SCOPED_STAGES = {SubjectProductionStage.SYNTHESIS, SubjectProductionStage.ASSEMBLY}
-
-
 def production_stage_idempotency_key(
     run: SubjectProductionRun, stage: SubjectProductionStage
 ) -> str:
-    key = f"production-{stage.value}-{run.id}"
-    if stage in _GENERATION_SCOPED_STAGES:
-        key = f"{key}-generation-{run.synthesis_generation}"
-    return key
+    return f"production-{stage.value}-{run.id}-g{run.pipeline_generation}"
 
 
 class ProductionStageChain:
@@ -104,12 +95,14 @@ class ProductionStageChain:
         correlation_id: str,
         actor_id: str = "system",
     ) -> UUID | None:
-        """Idempotency key is derived from run+stage (+ synthesis_generation for
-        SYNTHESIS/ASSEMBLY): a retried/duplicated handler never enqueues the
-        same stage, or re-sends the same prompt, twice."""
+        """Worker attempts share a generation; manual retries get a new one."""
         if self._jobs is None or self._dispatcher is None:
             return None
-        parameters = ProductionStageParameters(run_id=run.id, expected_stage=stage.value)
+        parameters = ProductionStageParameters(
+            run_id=run.id,
+            expected_stage=stage.value,
+            pipeline_generation=run.pipeline_generation,
+        )
         job = await self._jobs.submit(
             kind=stage_job_kind(stage),
             aggregate_type="subject",
@@ -171,6 +164,10 @@ def register_production_jobs(
             raise TypeError("Invalid production stage parameters")
 
         stage = SubjectProductionStage(parameters.expected_stage)
+        async with uow_factory() as uow:
+            current = await uow.subject_production_runs.get(parameters.run_id)
+        if current is None or current.pipeline_generation != parameters.pipeline_generation:
+            return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
         orchestrator = ProductionWorkflowOrchestrator(
             uow_factory,
             model_service=model_service,

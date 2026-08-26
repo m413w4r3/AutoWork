@@ -8,7 +8,7 @@ PORT = int(os.getenv("BRIDGE_PORT", "8001"))
 # Si défini, les clients doivent envoyer  Authorization: Bearer <clé>
 API_KEY = os.getenv("BRIDGE_API_KEY")
 # Délai max sans le moindre paquet depuis l'extension avant d'abandonner.
-IDLE_TIMEOUT = float(os.getenv("BRIDGE_IDLE_TIMEOUT", "120"))
+IDLE_TIMEOUT = float(os.getenv("BRIDGE_IDLE_TIMEOUT", "300"))
 # Délai max pour une génération complète. Une recherche approfondie ChatGPT
 # dépasse couramment le quart d'heure : cette borne protège d'une génération
 # réellement bloquée, elle ne doit pas arbitrer la durée normale d'une recherche.

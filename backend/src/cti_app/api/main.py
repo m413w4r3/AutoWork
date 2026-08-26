@@ -227,6 +227,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory
     app.state.production_artifact_store = production_artifact_store
+    app.state.production_diagnostics = production_diagnostics
     job_service = JobService(uow_factory, registry)
     job_dispatcher = DramatiqJobDispatcher()
     # Registry must exist before the service consuming it, so bind only once both are ready.

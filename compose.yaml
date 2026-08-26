@@ -15,7 +15,7 @@ services:
       # au bridge (court, en mode background), pas la durée d'une recherche
       # ChatGPT, qui dépasse couramment le quart d'heure.
       BRIDGE_TOTAL_TIMEOUT: ${BRIDGE_TOTAL_TIMEOUT_SECONDS:-3600}
-      BRIDGE_IDLE_TIMEOUT: ${BRIDGE_IDLE_TIMEOUT_SECONDS:-120}
+      BRIDGE_IDLE_TIMEOUT: ${BRIDGE_IDLE_TIMEOUT_SECONDS:-300}
       BRIDGE_UI_TIMEOUT: ${BRIDGE_UI_TIMEOUT_SECONDS:-30}
       BRIDGE_SHUTDOWN_GRACE_SECONDS: ${BRIDGE_SHUTDOWN_GRACE_SECONDS:-20}
     ports:

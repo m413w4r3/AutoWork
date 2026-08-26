@@ -100,6 +100,8 @@ Q2_ROUTING_POLICY_VERSION = "3"
 # for this attempt and must not silently burn the subject.
 _TRANSIENT_CODES = {
     "bridge_server_error",
+    "bridge_idle_timeout",
+    "bridge_total_timeout",
     "bridge_timeout",
     "bridge_ui_timeout",
 }
@@ -240,7 +242,7 @@ class ProductionWorkflowOrchestrator:
         web_search: bool = False,
         request_identity: str | None = None,
         lifecycle_policy: ConversationPolicy = ConversationPolicy.KEEP,
-    ) -> tuple[Any | None, str, UUID | None]:
+    ) -> tuple[Any | None, str, UUID | None, UUID | None]:
         """Ask the model, and give it exactly one chance to fix its formatting.
 
         Used by Q1 (references) and Q4 (synthesis): both draft FRESH with web
@@ -263,7 +265,7 @@ class ProductionWorkflowOrchestrator:
             context_subject_id=run.subject_id,
             lifecycle_policy=lifecycle_policy,
         )
-        self._last_model_run_id = getattr(turn, "model_run_id", None)
+        model_run_id = getattr(turn, "model_run_id", None)
         raw = await self._turn_output_text(conversation_id, turn.id) or ""
         self._diagnostics.record_model_answer(
             run_id=run.id,
@@ -275,12 +277,12 @@ class ProductionWorkflowOrchestrator:
             idempotency_key=idempotency_key,
         )
         if not raw:
-            return None, "", turn.id
+            return None, "", turn.id, model_run_id
 
         result = parse(raw)
         self._log_parse(run, stage, result)
         if result.usable:
-            return result, raw, turn.id
+            return result, raw, turn.id, model_run_id
 
         repair_prompt = ProductionPromptTemplates.get_format_repair_prompt(
             stage=stage, problems=result.errors
@@ -300,7 +302,7 @@ class ProductionWorkflowOrchestrator:
             correlation_id=self._correlation_id,
             context_subject_id=run.subject_id,
         )
-        self._last_model_run_id = getattr(repair_turn, "model_run_id", None)
+        repair_model_run_id = getattr(repair_turn, "model_run_id", None)
         repaired_raw = await self._turn_output_text(conversation_id, repair_turn.id) or ""
         self._diagnostics.record_model_answer(
             run_id=run.id,
@@ -312,13 +314,13 @@ class ProductionWorkflowOrchestrator:
             idempotency_key=repair_idempotency_key,
         )
         if not repaired_raw:
-            return result, raw, turn.id
+            return result, raw, turn.id, model_run_id
 
         repaired = parse(repaired_raw)
         self._log_parse(run, f"{stage}-repair", repaired)
         repaired.repair_actions.append(f"{stage}_format_repair")
         repaired.warnings.extend(result.errors)
-        return repaired, repaired_raw, repair_turn.id
+        return repaired, repaired_raw, repair_turn.id, repair_model_run_id
 
     async def _integrate_reference_sources(
         self,
@@ -568,6 +570,7 @@ class ProductionWorkflowOrchestrator:
                 "research_date": research_date.isoformat(),
                 "stage": "references",
                 "prompt_version": REFERENCES_PROMPT_VERSION,
+                "pipeline_generation": run.pipeline_generation,
             }
             input_hash = compute_input_hash(input_data)
 
@@ -603,7 +606,7 @@ class ProductionWorkflowOrchestrator:
             )
 
             try:
-                parsed, raw, turn_id = await self._ask_with_format_repair(
+                parsed, raw, turn_id, _ = await self._ask_with_format_repair(
                     run=run,
                     conversation_id=run.references_conversation_id,
                     stage="references",
@@ -614,6 +617,7 @@ class ProductionWorkflowOrchestrator:
                     parse=lambda text: parse_reference_report(text, research_date),
                     external_llm_allowed=ctx.external_llm_allowed,
                     web_search=True,
+                    request_identity=f"g{run.pipeline_generation}",
                 )
             except Exception as e:
                 return self._handle_stage_exception(run, "references", e)
@@ -801,6 +805,7 @@ class ProductionWorkflowOrchestrator:
                             "subject_id": str(run.subject_id),
                             "source_id": source.local_id,
                             "source_url": source.canonical_url,
+                            "pipeline_generation": run.pipeline_generation,
                         },
                     ),
                     ModelRole.RESEARCH,
@@ -919,6 +924,7 @@ class ProductionWorkflowOrchestrator:
                 # by _q2_logical_request_id, which does not include these.
                 "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
                 "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
+                "pipeline_generation": run.pipeline_generation,
             }
             input_hash = compute_input_hash(input_data)
 
@@ -971,6 +977,7 @@ class ProductionWorkflowOrchestrator:
                         subject_id=run.subject_id,
                         evidence_pack_hash=evidence_pack.pack_hash,
                         chunk_sha256=chunk.sha256,
+                        pipeline_generation=run.pipeline_generation,
                     )
                     conversation_id = _q2_chunk_conversation_id(logical_request_id)
                     # Idempotency keys are column-limited (255 chars); the full
@@ -1016,7 +1023,12 @@ class ProductionWorkflowOrchestrator:
                             expected_profile=None,
                             requested_model=None,
                         )
-                        chunk_parsed, chunk_raw, chunk_turn_id = await self._ask_with_format_repair(
+                        (
+                            chunk_parsed,
+                            chunk_raw,
+                            chunk_turn_id,
+                            chunk_model_run_id,
+                        ) = await self._ask_with_format_repair(
                             run=run,
                             conversation_id=conversation.id,
                             stage="extraction",
@@ -1036,9 +1048,7 @@ class ProductionWorkflowOrchestrator:
                         chunk_provenance[chunk.chunk_id] = {
                             "logical_request_id": logical_request_id,
                             "conversation_id": str(conversation_id),
-                            "model_run_id": (
-                                str(self._last_model_run_id) if self._last_model_run_id else None
-                            ),
+                            "model_run_id": None,
                             "recovery_action": "none",
                             "status": "failed",
                         }
@@ -1061,7 +1071,7 @@ class ProductionWorkflowOrchestrator:
                             "conversation_id": str(conversation_id),
                             "turn_id": str(chunk_turn_id) if chunk_turn_id else None,
                             "model_run_id": (
-                                str(self._last_model_run_id) if self._last_model_run_id else None
+                                str(chunk_model_run_id) if chunk_model_run_id else None
                             ),
                             "provider": ModelProvider.OPENAI.value,
                             "recovery_action": "none",
@@ -1102,7 +1112,7 @@ class ProductionWorkflowOrchestrator:
                         "conversation_id": str(conversation_id),
                         "turn_id": str(chunk_turn_id) if chunk_turn_id else None,
                         "model_run_id": (
-                            str(self._last_model_run_id) if self._last_model_run_id else None
+                            str(chunk_model_run_id) if chunk_model_run_id else None
                         ),
                         "provider": ModelProvider.OPENAI.value,
                         "recovery_action": "repair" if repaired else "none",
@@ -1132,7 +1142,7 @@ class ProductionWorkflowOrchestrator:
                             chunk_id=chunk.chunk_id,
                             source_ids=chunk.source_ids,
                             model_run_id=(
-                                str(self._last_model_run_id) if self._last_model_run_id else None
+                                str(chunk_model_run_id) if chunk_model_run_id else None
                             ),
                         )
                     )
@@ -1472,7 +1482,7 @@ class ProductionWorkflowOrchestrator:
                     "web_policy_version": "q4-web-non-authoritative-v1",
                     "model_routing_policy": "openai-drafting-v1",
                     "stage": "synthesis",
-                    "synthesis_generation": run.synthesis_generation,
+                    "pipeline_generation": run.pipeline_generation,
                 }
             )
             existing = await uow.production_artifacts.get_current(run.id, "synthesis")
@@ -1503,7 +1513,7 @@ class ProductionWorkflowOrchestrator:
             )
 
             try:
-                parsed, output_text, turn_id = await self._ask_with_format_repair(
+                parsed, output_text, turn_id, _ = await self._ask_with_format_repair(
                     run=run,
                     conversation_id=run.synthesis_conversation_id,
                     stage="synthesis",
@@ -1514,9 +1524,7 @@ class ProductionWorkflowOrchestrator:
                     parse=lambda text: validate_synthesis(text, report, extraction_payload),
                     external_llm_allowed=synthesis_policy_allows,
                     web_search=True,
-                    # A synthesis retry bumps this: it must never replay the
-                    # previous, already-SUCCEEDED Q4 turn.
-                    request_identity=f"generation-{run.synthesis_generation}",
+                    request_identity=f"g{run.pipeline_generation}",
                 )
                 if parsed is None:
                     return {
@@ -1647,7 +1655,12 @@ def _q2_chunk_source_context(chunk: Any) -> str:
 
 
 def _q2_logical_request_id(
-    *, run_id: UUID, subject_id: UUID, evidence_pack_hash: str, chunk_sha256: str
+    *,
+    run_id: UUID,
+    subject_id: UUID,
+    evidence_pack_hash: str,
+    chunk_sha256: str,
+    pipeline_generation: int = 0,
 ) -> str:
     """Stable Q2 checkpoint identity.  Every semantic input/policy version participates.
 
@@ -1663,6 +1676,7 @@ def _q2_logical_request_id(
             "subject_id": str(subject_id),
             "evidence_pack_hash": evidence_pack_hash,
             "chunk_sha256": chunk_sha256,
+            "pipeline_generation": pipeline_generation,
             "provider": ModelProvider.OPENAI.value,
             "q2_schema_version": Q2_SCHEMA_VERSION,
             "parser_version": Q2_MARKDOWN_PARSER_VERSION,

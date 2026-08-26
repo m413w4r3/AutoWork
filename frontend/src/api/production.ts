@@ -29,6 +29,7 @@ export interface ProductionStatus {
   references_conversation_id: string | null;
   synthesis_conversation_id: string | null;
   run_id: string;
+  pipeline_generation: number;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -179,41 +180,20 @@ export async function getSubjectProduction(
   return requestOrNull(`/api/subjects/${subjectId}/production`);
 }
 
-/**
- * Retry references (Q1).
- *
- * Always starts a brand new production run (new run_id, incremented
- * run_number): Q1 can change every downstream fact, so the previous run is
- * left untouched as immutable history. `status` reflects the real state of
- * the new run (e.g. "queued"/"running") once its SOURCES job is dispatched
- * — never a synthetic "initiated" placeholder.
- */
-export async function retryReferences(subjectId: string): Promise<{
-  run_id: string;
-  previous_run_id: string;
-  status: string;
-  job_id: string | null;
-}> {
-  return request(`/api/subjects/${subjectId}/production/references/retry`, {
-    method: "POST",
-  });
-}
-
-/**
- * Retry synthesis (Q4).
- *
- * Stays on the same run — Q1/Q2 are not replayed — but dispatches a real
- * SYNTHESIS job under a fresh `synthesis_generation` so it always produces a
- * new Q4 turn instead of replaying the previous SUCCEEDED one.
- */
-export async function retrySynthesis(subjectId: string): Promise<{
+/** Recompute one stage in place, invalidating its downstream artifacts. */
+export async function retryProductionStage(
+  subjectId: string,
+  stage: "sources" | "references" | "extraction" | "synthesis" | "assembly",
+): Promise<{
   run_id: string;
   status: string;
   job_id: string | null;
-  synthesis_generation: number;
+  pipeline_generation: number;
 }> {
-  return request(`/api/subjects/${subjectId}/production/synthesis/retry`, {
+  return request(`/api/subjects/${subjectId}/production/retry`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stage }),
   });
 }
 

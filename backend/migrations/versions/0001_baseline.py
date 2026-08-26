@@ -1670,7 +1670,7 @@ def _create_subject_production_runs() -> None:
         sa.Column("references_conversation_id", sa.Uuid(), nullable=True),
         sa.Column("synthesis_conversation_id", sa.Uuid(), nullable=True),
         sa.Column("run_number", sa.Integer(), nullable=False),
-        sa.Column("synthesis_generation", sa.Integer(), nullable=False, server_default="1"),
+        sa.Column("pipeline_generation", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("error_code", sa.String(64), nullable=True),
         sa.Column("error_message", sa.String(500), nullable=True),
         sa.Column("error_details", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
@@ -1692,7 +1692,7 @@ def _create_subject_production_runs() -> None:
         sa.Column("research_date", sa.Date(), nullable=True),
         sa.CheckConstraint("version >= 1", name="ck_run_version"),
         sa.CheckConstraint("run_number >= 1", name="ck_run_number"),
-        sa.CheckConstraint("synthesis_generation >= 1", name="ck_run_synthesis_generation"),
+        sa.CheckConstraint("pipeline_generation >= 0", name="ck_run_pipeline_generation"),
         sa.CheckConstraint(
             "status IN ('queued','running','ready','needs_review','failed','cancelled')",
             name="ck_run_status",
