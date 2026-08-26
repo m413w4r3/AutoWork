@@ -7,7 +7,6 @@ and only a genuinely empty result is unusable.
 
 from __future__ import annotations
 
-import json
 import pathlib
 from datetime import date
 
@@ -52,7 +51,10 @@ text: Premiere observation de la campagne.
 - Attribution non confirmee
 """
 
-PERFECT_Q2 = json.dumps({"facts": [], "artifacts": [], "uncertainties": []})
+# Sentinel consumed by _FakeConversations in test_production_workflow_stages:
+# it swaps this marker for a real Q2 Markdown answer built from whichever
+# archived literal appears in that specific chunk's prompt.
+PERFECT_Q2 = "__PERFECT_Q2_SENTINEL__"
 
 
 def _report() -> ReferenceReport:

@@ -40,7 +40,6 @@ from cti_app.application.source_evidence_processing import (
 )
 from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.model_conversations import ConversationMode, ConversationPurpose
-from cti_app.domain.model_runs import ModelProvider, ModelRunStatus
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -67,6 +66,29 @@ class _JobContext:
 
 BROKEN_Q1 = "Je n'ai pas trouvé de structure claire, voici mes notes en vrac."
 
+# Q2 candidate literals the fake picks from the chunk prompt to build a valid
+# Markdown FACT block — mirrors the archived text the test fixtures embed.
+_Q2_LITERAL_CANDIDATES = (
+    "198.51.100.10",
+    "203.0.113.7",
+    "archived evidence 1",
+    "archived evidence 2",
+    "archived evidence 3",
+)
+
+
+def _perfect_q2_markdown_for(message: str) -> str:
+    literal = next((value for value in _Q2_LITERAL_CANDIDATES if value in message), None)
+    if literal is None:
+        raise AssertionError("Q2 request must contain only an evidence chunk")
+    return (
+        "# FACT\n"
+        "category: other_technical\n"
+        f"value: {literal}\n"
+        "context: archive evidence\n"
+        f"evidence-quote: {literal}\n"
+    )
+
 
 @dataclass
 class _Turn:
@@ -84,15 +106,21 @@ class _FakeConversations:
         self._turns_by_idempotency_key: dict[str, _Turn] = {}
         self.created: list[UUID] = []
         self.create_requests: list[dict[str, Any]] = []
-        self.structured_calls: list[dict[str, Any]] = []
-        self.structured_submissions: list[dict[str, Any]] = []
-        self._structured_by_run_id: dict[UUID, Any] = {}
         self.turn_requests: list[dict[str, Any]] = []
 
     async def create(self, **kwargs: Any) -> Any:
         conversation_id = uuid4()
         self.created.append(conversation_id)
         self.create_requests.append(kwargs)
+        self._turns[conversation_id] = []
+        return type("Conversation", (), {"id": conversation_id})()
+
+    async def get_or_create(self, conversation_id: UUID, **kwargs: Any) -> Any:
+        """Mirrors the real service: same id in -> same conversation, no re-insert."""
+        if conversation_id in self._turns:
+            return type("Conversation", (), {"id": conversation_id})()
+        self.created.append(conversation_id)
+        self.create_requests.append({"conversation_id": conversation_id, **kwargs})
         self._turns[conversation_id] = []
         return type("Conversation", (), {"id": conversation_id})()
 
@@ -117,7 +145,12 @@ class _FakeConversations:
         )
         if existing := self._turns_by_idempotency_key.get(idempotency_key):
             return existing
-        turn = _Turn(id=uuid4(), text=self._answers.pop(0))
+        answer = self._answers.pop(0)
+        if answer == "__CRASH__":
+            raise KeyboardInterrupt("simulated worker crash")
+        if answer == PERFECT_Q2:
+            answer = _perfect_q2_markdown_for(message)
+        turn = _Turn(id=uuid4(), text=answer)
         self._turns_by_idempotency_key[idempotency_key] = turn
         self._turns.setdefault(conversation_id, []).append(turn)
         return turn
@@ -128,74 +161,30 @@ class _FakeConversations:
             for t in self._turns.get(conversation_id, [])
         ]
 
-    async def extract_structured(self, **kwargs: Any) -> Any:
-        self.structured_calls.append(kwargs)
-        run_id = kwargs.get("run_id")
-        if isinstance(run_id, UUID) and run_id in self._structured_by_run_id:
-            return self._structured_by_run_id[run_id]
-        answer = self._answers.pop(0)
-        if answer == "__CRASH__":
-            raise KeyboardInterrupt("simulated worker crash")
-        self.structured_submissions.append(kwargs)
-        schema = kwargs["output_schema"]
-        if answer == PERFECT_Q2:
-            message = kwargs["message"]
-            literal = next(
-                (
-                    value
-                    for value in (
-                        "198.51.100.10",
-                        "203.0.113.7",
-                        "archived evidence 1",
-                        "archived evidence 2",
-                        "archived evidence 3",
-                    )
-                    if value in message
-                ),
-                None,
-            )
-            if literal is None:
-                raise AssertionError("Q2 request must contain only an evidence chunk")
-            answer = json.dumps(
-                {
-                    "facts": [
-                        {
-                            "category": "other_technical",
-                            "value": literal,
-                            "context": "archive evidence",
-                            "evidence_quote": literal,
-                        }
-                    ],
-                    "artifacts": [],
-                    "uncertainties": [],
-                }
-            )
-        output = schema.model_validate_json(answer)
-        execution = type(
-            "Execution",
-            (),
-            {
-                "run": type(
-                    "Run",
-                    (),
-                    {
-                        "id": run_id or uuid4(),
-                        "provider": ModelProvider.FAKE,
-                        "requested_model": "fake",
-                        "actual_model_version": "fake",
-                        "duration_ms": 0,
-                        "status": ModelRunStatus.SUCCEEDED,
-                        "error_details": None,
-                    },
-                )(),
-                "output_text": answer,
-                "structured_output": output,
-                "metadata": {"checkpoint": "miss"},
-            },
-        )()
-        if isinstance(run_id, UUID):
-            self._structured_by_run_id[run_id] = execution
-        return execution
+    def q2_calls(self) -> list[tuple[UUID, ConversationMode, str, str]]:
+        """Every Q2 draft turn attempt (a genuine bridge submission would be
+        one of these), excluding repair turns."""
+        return [c for c in self.calls if c[2].startswith("extraction-") and "-repair-" not in c[2]]
+
+    def q2_turn_requests(self) -> list[dict[str, Any]]:
+        """Same as `q2_calls`, but as the full request dict (message,
+        web_search, ...) — the equivalent of the old `structured_submissions`."""
+        return [
+            r
+            for r in self.turn_requests
+            if r["idempotency_key"].startswith("extraction-")
+            and "-repair-" not in r["idempotency_key"]
+        ]
+
+    def q2_succeeded_keys(self) -> set[str]:
+        """Idempotency keys of Q2 draft/repair turns that actually completed —
+        a crashed attempt never lands here, so this is the checkpoint set a
+        retry would reuse without a new bridge call."""
+        return {
+            key
+            for key in self._turns_by_idempotency_key
+            if key.startswith("extraction-") and "-repair-" not in key
+        }
 
 
 class _Blobs:
@@ -625,7 +614,7 @@ async def test_references_stage_stores_a_readable_report() -> None:
     assert conversations.calls[0][1] is ConversationMode.FRESH
 
 
-async def test_extraction_uses_stateless_structured_output_per_q2_chunk() -> None:
+async def test_extraction_uses_a_bounded_gpt_conversation_per_q2_chunk() -> None:
     orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2, PERFECT_Q2])
     uow.run.current_stage = SubjectProductionStage.REFERENCES
     await orchestrator.execute_stage(
@@ -644,11 +633,15 @@ async def test_extraction_uses_stateless_structured_output_per_q2_chunk() -> Non
     diagnostics = artifact.metadata["deterministic_verification"]
     assert diagnostics["evidence_pack_hash"] == result["evidence_pack_hash"]
 
-    # Q1 alone opens a conversation. Q2 calls native structured output.
-    assert len(conversations.created) == 1
-    assert [mode for _, mode, _, _ in conversations.calls] == [ConversationMode.FRESH]
-    assert len(conversations.structured_calls) == 2
-    assert all(len(call["evidence_pack_hash"]) == 64 for call in conversations.structured_calls)
+    # Q1 opens one conversation; each of the two Q2 chunks opens its own,
+    # bounded, distinct conversation — never Q1's, never each other's.
+    assert len(conversations.created) == 3
+    assert [mode for _, mode, _, _ in conversations.calls] == [ConversationMode.FRESH] * 3
+    q2_calls = conversations.q2_calls()
+    assert len(q2_calls) == 2
+    q2_conversation_ids = {call[0] for call in q2_calls}
+    assert len(q2_conversation_ids) == 2
+    assert conversations.created[0] not in q2_conversation_ids
 
 
 def test_synthesis_evidence_pack_omits_internal_and_non_publishable_data() -> None:
@@ -713,14 +706,17 @@ async def test_synthesis_has_its_own_drafting_scope_and_local_repair() -> None:
     assert uow.run.synthesis_conversation_id is not None
     assert uow.run.references_conversation_id != uow.run.synthesis_conversation_id
     assert [request["purpose"] for request in conversations.create_requests] == [
-        ConversationPurpose.SUBJECT_RESEARCH,
+        ConversationPurpose.SUBJECT_RESEARCH,  # Q1
+        ConversationPurpose.SUBJECT_RESEARCH,  # Q2 chunk 1's own bounded conversation
+        ConversationPurpose.SUBJECT_RESEARCH,  # Q2 chunk 2's own bounded conversation
         ConversationPurpose.DRAFTING,
     ]
-    assert len(conversations.structured_calls) == 2
-    assert all(call["web_search"] is False for call in conversations.structured_calls)
+    assert len(conversations.q2_calls()) == 2
 
-    q1, q4, q4_repair = conversations.turn_requests
+    q1, q2a, q2b, q4, q4_repair = conversations.turn_requests
     assert q1["web_search"] is True
+    assert q2a["web_search"] is False
+    assert q2b["web_search"] is False
     assert q4["conversation_id"] == uow.run.synthesis_conversation_id
     assert q4["mode"] is ConversationMode.FRESH
     assert q4["web_search"] is True
@@ -780,10 +776,11 @@ async def test_synthesis_retry_produces_a_fresh_turn_not_a_replay() -> None:
     ]
     assert len(set(synthesis_keys)) == 2
 
-    # Q1/Q2 were not replayed: still a single research conversation, a
-    # single extraction conversation-turn (Q2 uses structured calls, not
-    # add_turn), and a single references/extraction artifact each.
-    assert len(conversations.created) == 2
+    # Q1/Q2 were not replayed: still one Q1 conversation, one bounded Q2
+    # conversation per chunk, and a single references/extraction artifact each.
+    # (Q4's own conversation is the 4th; synthesis retries reuse it.)
+    assert len(conversations.created) == 4  # Q1 + 2 Q2 chunks + Q4
+    assert len(conversations.q2_calls()) == 2
     assert (
         sum(
             1
@@ -805,7 +802,12 @@ async def test_synthesis_retry_produces_a_fresh_turn_not_a_replay() -> None:
 async def test_three_q2_chunks_with_one_loss_produce_no_canonical_extraction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    orchestrator, uow, conversations = _build([PERFECT_Q1, PERFECT_Q2, BROKEN_Q1, PERFECT_Q2])
+    # chunk 2's draft AND its one allowed repair are both unreadable, so it
+    # stays permanently failed — a single bad turn must not be enough, since
+    # the repair loop gets exactly one shot to fix it.
+    orchestrator, uow, conversations = _build(
+        [PERFECT_Q1, PERFECT_Q2, BROKEN_Q1, BROKEN_Q1, PERFECT_Q2]
+    )
     chunks = tuple(
         EvidenceChunk(
             source_document_id=uuid4(),
@@ -837,7 +839,13 @@ async def test_three_q2_chunks_with_one_loss_produce_no_canonical_extraction(
     assert [artifact.stage for artifact in uow.production_artifacts.items] == [
         ProductionArtifactStage.REFERENCES
     ]
-    assert len(conversations.created) == 1
+    # Q1 + one bounded conversation per chunk (chunk 2's repair continues its
+    # own conversation, it never opens a new one nor touches chunk 1/3's).
+    assert len(conversations.created) == 4
+    repair_calls = [c for c in conversations.calls if "-repair-" in c[2]]
+    assert len(repair_calls) == 1
+    draft_call = next(c for c in conversations.q2_calls() if repair_calls[0][0] == c[0])
+    assert repair_calls[0][0] == draft_call[0]  # same conversation, continued
 
 
 async def test_q2_retry_after_crash_reuses_ten_completed_chunk_checkpoints(
@@ -873,10 +881,13 @@ async def test_q2_retry_after_crash_reuses_ten_completed_chunk_checkpoints(
     result = await orchestrator.execute_stage(uow.run.id, SubjectProductionStage.EXTRACTION)
 
     assert result["status"] == "success", result
-    assert len(conversations.structured_submissions) == 20
-    submitted_ids = [call["run_id"] for call in conversations.structured_submissions]
-    assert len(set(submitted_ids)) == 20
-    assert len(conversations.structured_calls) == 31
+    # 20 chunks each got exactly one succeeded checkpoint — the crashed 11th
+    # attempt never lands here, so a retry from it needed a real bridge call.
+    assert len(conversations.q2_succeeded_keys()) == 20
+    # 11 draft attempts before the crash (10 succeeded + the crash) + 20 draft
+    # attempts on retry (10 checkpoint hits that still call add_turn, replayed
+    # instantly, + 10 genuinely new calls for chunks 11-20) = 31 invocations.
+    assert len(conversations.q2_calls()) == 31
 
 
 async def test_deterministic_evidence_processing_runs_before_q2() -> None:
@@ -1309,7 +1320,7 @@ async def test_verifier_version_change_recomputes_canonical_extraction_without_n
 
     first = await _run_references_then_extraction(orchestrator, uow)
     assert first["status"] == "success", first
-    assert len(conversations.structured_submissions) == 1
+    assert len(conversations.q2_succeeded_keys()) == 1
 
     monkeypatch.setattr(
         "cti_app.application.production_workflow.ARTIFACT_VERIFIER_VERSION", "verifier-v2"
@@ -1324,9 +1335,11 @@ async def test_verifier_version_change_recomputes_canonical_extraction_without_n
     ]
     assert len(extraction_artifacts) == 2
     assert extraction_artifacts[0].input_hash != extraction_artifacts[1].input_hash
-    # No new Q2 model call happened: the existing SUCCEEDED ModelRun was reused.
-    assert len(conversations.structured_submissions) == 1
-    assert len(conversations.structured_calls) == 2
+    # No new Q2 model call happened: the existing SUCCEEDED turn was reused —
+    # the loop re-ran (verifier_version is not part of the Q2 identity), but
+    # its idempotency key hit the same checkpoint both times.
+    assert len(conversations.q2_succeeded_keys()) == 1
+    assert len(conversations.q2_calls()) == 2
 
 
 async def test_iana_snapshot_version_change_invalidates_artifact_extraction(
@@ -1354,7 +1367,7 @@ async def test_iana_snapshot_version_change_invalidates_artifact_extraction(
     assert second["status"] == "success", second
     assert second["artifact_id"] != first["artifact_id"]
     # Still no new Q2 model call: only the canonical verification cache moved.
-    assert len(conversations.structured_submissions) == 1
+    assert len(conversations.q2_succeeded_keys()) == 1
 
 
 async def test_model_run_q2_succeeded_is_reused_when_q2_identity_is_unchanged(
@@ -1378,4 +1391,4 @@ async def test_model_run_q2_succeeded_is_reused_when_q2_identity_is_unchanged(
 
     assert second["status"] == "cached"
     assert second["artifact_id"] == first["artifact_id"]
-    assert len(conversations.structured_submissions) == 1
+    assert len(conversations.q2_succeeded_keys()) == 1

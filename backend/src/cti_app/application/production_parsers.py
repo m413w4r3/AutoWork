@@ -16,9 +16,9 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from cti_app.application.discovery_report_parser import extract_http_urls
 from cti_app.application.production_normalization import (
@@ -224,6 +224,10 @@ class Q2ChunkOutput(BaseModel):
 # Bump whenever Q2ChunkOutput contract changes.  Checkpoints validate against it.
 Q2_SCHEMA_VERSION = "1"
 
+# Bump whenever the Q2 Markdown dialect or its lexing rules change. Participates
+# in the Q2 checkpoint identity so a parser change forces a fresh model call.
+Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v1"
+
 
 # --- Shared lexing ---------------------------------------------------------
 
@@ -252,6 +256,9 @@ _HEADING_WORDS = frozenset(
         "item",
         "element",
         "entree",
+        "fact",
+        "artifact",
+        "artefact",
     }
 )
 _FIELD = re.compile(r"^\s{0,3}(?P<key>[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 _-]{0,40}?)\s*[:=]\s*(?P<value>.*)$")
@@ -601,6 +608,269 @@ def _editorial_title(body: str) -> str | None:
         if match and _normalize_key(match.group("key")) in {"editorial-title", "brief-title"}:
             return match.group("value").strip() or None
     return None
+
+
+# --- Q2 (permissive Markdown, GPT bridge free text) -------------------------
+#
+# The bridge does not guarantee response_format / JSON Schema: it drives an
+# ordinary ChatGPT conversation and hands back rendered prose. Q2 therefore
+# asks for a tolerant Markdown dialect, like Q1, and reuses the same lexing
+# primitives (normalize_text, headings with/without '#', multiline `_fields`,
+# alias handling). Unlike Q1, an unreadable proposal is a structural loss, not
+# a silent drop: it lands in `errors`, which fails `ParseResult.usable` and
+# lets the existing FRESH->repair-CONTINUE flow (`_ask_with_format_repair`)
+# ask the model to reformat, exactly once, before the chunk is treated as
+# failed. The parser never checks a proposal against the archived source; that
+# proof stays entirely inside `verify_q2_proposals`.
+
+_Q2_BLOCKS = {
+    "fact": "fact",
+    "artifact": "artifact",
+    "artefact": "artifact",
+}
+
+_Q2_FACT_CATEGORIES = frozenset(
+    {
+        "actors",
+        "campaigns",
+        "malware",
+        "tools",
+        "infection_chain",
+        "ttps",
+        "victimology",
+        "protocols",
+        "infrastructure",
+        "files",
+        "commands",
+        "persistence",
+        "detections",
+        "other_technical",
+    }
+)
+
+# The bridge cannot be trusted to keep a single "hash" word; the prompt asks
+# for the concrete algorithm instead. All of it normalizes to the internal
+# ArtifactType the rest of the pipeline already understands.
+_Q2_ARTIFACT_TYPE_ALIASES = {
+    "domain": "domain",
+    "ip": "ip",
+    "ip_address": "ip",
+    "url": "url",
+    "email": "email",
+    "hash": "hash",
+    "md5": "hash",
+    "sha1": "hash",
+    "sha256": "hash",
+    "sha512": "hash",
+    "filename": "filename",
+    "file_name": "filename",
+    "filepath": "filepath",
+    "file_path": "filepath",
+    "cve": "cve",
+    "yara_rule": "yara_rule",
+    "yara": "yara_rule",
+    "sigma_rule": "sigma_rule",
+    "sigma": "sigma_rule",
+    "suricata_rule": "suricata_rule",
+    "suricata": "suricata_rule",
+}
+
+_Q2_INDICATOR_STATUSES = frozenset({"confirmed_ioc", "contextual", "excluded", "not_applicable"})
+# A status the model left out or misspelled must never be silently promoted to
+# an IOC: fall back to the value that keeps the item out of the IOC section.
+_Q2_DEFAULT_INDICATOR_STATUS = "contextual"
+
+_ATTACK_ID = re.compile(r"T\d{4}(?:\.\d{3})?")
+
+_Q2_KNOWN_FACT_FIELDS = frozenset(
+    {
+        "category",
+        "categorie",
+        "value",
+        "valeur",
+        "context",
+        "contexte",
+        "evidence-quote",
+        "evidence",
+        "quote",
+        "citation",
+        "attack-id",
+    }
+)
+_Q2_KNOWN_ARTIFACT_FIELDS = frozenset(
+    {
+        "artifact-type",
+        "type",
+        "value",
+        "valeur",
+        "indicator-status",
+        "status",
+        "context",
+        "contexte",
+        "evidence-quote",
+        "evidence",
+        "quote",
+        "citation",
+    }
+)
+
+
+def _warn_unknown_fields(
+    values: dict[str, str], known: frozenset[str], result: ParseResult[Q2ChunkOutput]
+) -> None:
+    for key in values:
+        if key not in known:
+            result.warnings.append(f"unknown_field_ignored:{key}")
+
+
+def _q2_field(values: dict[str, str], *keys: str) -> str:
+    for key in keys:
+        value = values.get(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _normalize_token(raw: str) -> str:
+    """Fold a field value onto the underscored vocabulary the schema expects."""
+    return _normalize_key(raw).replace("-", "_")
+
+
+def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2ChunkOutput]:
+    """Parse one Q2 chunk answer: permissive on syntax, strict on structure.
+
+    Returns a `Q2ChunkOutput` — the same Pydantic contract `verify_q2_proposals`
+    already consumes — so the deterministic verifier and its provenance
+    plumbing (`Q2ProposalSubmission`) need no change. A structural-loss code in
+    `errors` is what tells the caller to run the single allowed repair turn.
+    """
+    result: ParseResult[Q2ChunkOutput] = ParseResult()
+    body = normalize_text(text)
+    if not body:
+        result.errors.append("empty_response")
+        return result
+
+    blocks, _ = _split_blocks(body, _Q2_BLOCKS)
+    if not blocks:
+        result.errors.append("no_fact_or_artifact_block")
+        return result
+
+    facts: list[Q2FactProposal] = []
+    artifacts: list[Q2ArtifactProposal] = []
+    for block in blocks:
+        values = _fields(block.lines)
+        if not values:
+            result.dropped_blocks.append(block.raw())
+            result.errors.append("proposal_block_unreadable")
+            continue
+        if block.kind == "fact":
+            fact = _parse_q2_fact(values, block, result)
+            if fact is not None:
+                facts.append(fact)
+        else:
+            artifact = _parse_q2_artifact(values, block, result)
+            if artifact is not None:
+                artifacts.append(artifact)
+
+    if not facts and not artifacts:
+        result.errors.append("no_usable_proposal")
+        return result
+
+    result.value = Q2ChunkOutput(
+        facts=facts, artifacts=artifacts, uncertainties=list(_collect_uncertainties(body))
+    )
+    return result
+
+
+def _parse_q2_fact(
+    values: dict[str, str], block: _Block, result: ParseResult[Q2ChunkOutput]
+) -> Q2FactProposal | None:
+    _warn_unknown_fields(values, _Q2_KNOWN_FACT_FIELDS, result)
+    category_raw = _q2_field(values, "category", "categorie")
+    value = _q2_field(values, "value", "valeur")
+    context = _q2_field(values, "context", "contexte")
+    quote = _q2_field(values, "evidence-quote", "evidence", "quote", "citation")
+    attack_id_raw = _q2_field(values, "attack-id")
+
+    category = _normalize_token(category_raw) if category_raw else ""
+    lost = False
+    if category not in _Q2_FACT_CATEGORIES:
+        result.errors.append("fact_without_category")
+        lost = True
+    if not value:
+        result.errors.append("fact_without_value")
+        lost = True
+    if not quote:
+        result.errors.append("fact_without_evidence_quote")
+        lost = True
+    if lost:
+        result.dropped_blocks.append(block.raw())
+        return None
+
+    attack_id: str | None = None
+    if attack_id_raw:
+        match = _ATTACK_ID.search(attack_id_raw.strip())
+        if match:
+            attack_id = match.group(0)
+        else:
+            result.warnings.append("attack_id_unreadable_dropped")
+
+    try:
+        return Q2FactProposal(
+            category=cast(Any, category),
+            value=value,
+            attack_id=attack_id,
+            context=context or value,
+            evidence_quote=quote,
+        )
+    except ValidationError:
+        result.dropped_blocks.append(block.raw())
+        result.errors.append("fact_schema_invalid")
+        return None
+
+
+def _parse_q2_artifact(
+    values: dict[str, str], block: _Block, result: ParseResult[Q2ChunkOutput]
+) -> Q2ArtifactProposal | None:
+    _warn_unknown_fields(values, _Q2_KNOWN_ARTIFACT_FIELDS, result)
+    type_raw = _q2_field(values, "artifact-type", "type")
+    value = _q2_field(values, "value", "valeur")
+    context = _q2_field(values, "context", "contexte")
+    quote = _q2_field(values, "evidence-quote", "evidence", "quote", "citation")
+    status_raw = _q2_field(values, "indicator-status", "status")
+
+    artifact_type = _Q2_ARTIFACT_TYPE_ALIASES.get(_normalize_token(type_raw)) if type_raw else None
+    lost = False
+    if artifact_type is None:
+        result.errors.append("unknown_artifact_type")
+        lost = True
+    if not value:
+        result.errors.append("artifact_without_value")
+        lost = True
+    if not quote:
+        result.errors.append("artifact_without_evidence_quote")
+        lost = True
+    if lost:
+        result.dropped_blocks.append(block.raw())
+        return None
+
+    status = _normalize_token(status_raw) if status_raw else ""
+    if status not in _Q2_INDICATOR_STATUSES:
+        result.warnings.append("indicator_status_defaulted")
+        status = _Q2_DEFAULT_INDICATOR_STATUS
+
+    try:
+        return Q2ArtifactProposal(
+            value=value,
+            artifact_type=cast(Any, artifact_type),
+            indicator_status=cast(Any, status),
+            context=context or value,
+            evidence_quote=quote,
+        )
+    except ValidationError:
+        result.dropped_blocks.append(block.raw())
+        result.errors.append("artifact_schema_invalid")
+        return None
 
 
 # --- Synthesis validation --------------------------------------------------

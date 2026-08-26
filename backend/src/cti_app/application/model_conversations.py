@@ -143,6 +143,50 @@ class ModelConversationService:
             await uow.commit()
         return conversation
 
+    async def get_or_create(
+        self,
+        conversation_id: UUID,
+        *,
+        provider: ModelProvider,
+        transport: ConversationTransport,
+        purpose: ConversationPurpose,
+        title: str,
+        edition_id: UUID | None,
+        subject_id: UUID | None,
+        expected_profile: str | None,
+        requested_model: str | None,
+    ) -> ModelConversation:
+        """Reuse a conversation the caller can rederive a stable id for.
+
+        Used for Q2's per-chunk, bounded conversations: `conversation_id` is
+        deterministic from the chunk's checkpoint identity, so a retry lands
+        on the same conversation instead of orphaning a new one — the turn
+        idempotency check in `add_turn` requires exactly that.
+        """
+        async with self._uow_factory() as uow:
+            existing = await uow.model_conversations.get(conversation_id)
+            if existing is not None:
+                self._ensure_visible(existing, subject_id)
+                return existing
+            conversation = ModelConversation(
+                id=conversation_id,
+                provider=provider,
+                transport=transport,
+                purpose=purpose,
+                title=title,
+                edition_id=edition_id,
+                subject_id=subject_id,
+                expected_profile=expected_profile,
+                requested_model=requested_model,
+            )
+            if subject_id is not None and await uow.subjects.get(subject_id) is None:
+                raise ConversationNotFoundError("Sujet introuvable")
+            if edition_id is not None and await uow.editions.get(edition_id) is None:
+                raise ConversationNotFoundError("Édition introuvable")
+            await uow.model_conversations.add(conversation)
+            await uow.commit()
+        return conversation
+
     async def list(
         self,
         *,
@@ -204,6 +248,7 @@ class ModelConversationService:
         idempotency_key: str,
         correlation_id: str,
         context_subject_id: UUID | None = None,
+        lifecycle_policy: ConversationPolicy = ConversationPolicy.KEEP,
     ) -> ModelConversationTurn:
         message = message.strip()
         if not message:
@@ -287,10 +332,11 @@ class ModelConversationService:
                 external_id=conversation.external_id,
             )
             # Provide explicit lifecycle policy for fresh conversations to avoid leaking
-            # them on the ChatGPT side. Subject production conversations are multi-turn
-            # and must be preserved for extraction and synthesis phases.
+            # them on the ChatGPT side. Multi-turn subject production conversations
+            # (Q1/Q4) default to KEEP; a caller with a bounded, per-chunk conversation
+            # (Q2) may ask for DELETE_ON_SUCCESS instead.
             conversation_lifecycle = (
-                ConversationLifecycleSpec(policy=ConversationPolicy.KEEP)
+                ConversationLifecycleSpec(policy=lifecycle_policy)
                 if mode is ConversationMode.FRESH
                 else None
             )

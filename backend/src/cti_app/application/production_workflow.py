@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.collection import ReferencedEvidence, SupplementalSource
@@ -31,12 +33,13 @@ from cti_app.application.production_evidence_pack import (
     build_production_evidence_pack,
 )
 from cti_app.application.production_parsers import (
+    Q2_MARKDOWN_PARSER_VERSION,
     Q2_SCHEMA_VERSION,
     IndicatorStatus,
     ParsedEvent,
     ParseResult,
-    Q2ChunkOutput,
     ReferenceReport,
+    parse_q2_proposals_markdown,
     parse_reference_report,
     reference_report_from_json,
     reference_report_to_json,
@@ -45,6 +48,7 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.production_prompts import (
+    EXTRACTION_FORMAT_REPAIR_VERSION,
     EXTRACTION_PROMPT_VERSION,
     REFERENCES_FORMAT_REPAIR_VERSION,
     REFERENCES_PROMPT_VERSION,
@@ -63,6 +67,7 @@ from cti_app.application.production_stages import (
 from cti_app.application.source_evidence_processing import SourceEvidenceProcessingService
 from cti_app.domain.model_conversations import (
     ConversationMode,
+    ConversationPolicy,
     ConversationPurpose,
     ConversationTransport,
     ModelConversation,
@@ -83,7 +88,11 @@ _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 
 # Version routing decision separately from prompt/schema: changing provider policy
 # must produce a distinct persisted Q2 checkpoint.
-Q2_ROUTING_POLICY_VERSION = "1"
+# "2": Q2 moved off the OpenAI structured-output contract onto free-text GPT
+# via the ChatGPT bridge + a permissive Markdown parser (P23.7). Qwen structured
+# output remains available outside production/benchmark but is no longer the
+# default Q2 provider.
+Q2_ROUTING_POLICY_VERSION = "2"
 
 
 # Bridge and network hiccups are worth retrying; anything else is a dead end
@@ -227,6 +236,7 @@ class ProductionWorkflowOrchestrator:
         external_llm_allowed: bool,
         web_search: bool = False,
         request_identity: str | None = None,
+        lifecycle_policy: ConversationPolicy = ConversationPolicy.KEEP,
     ) -> tuple[Any | None, str, UUID | None]:
         """Ask the model, and give it exactly one chance to fix its formatting.
 
@@ -248,6 +258,7 @@ class ProductionWorkflowOrchestrator:
             idempotency_key=idempotency_key,
             correlation_id=self._correlation_id,
             context_subject_id=run.subject_id,
+            lifecycle_policy=lifecycle_policy,
         )
         self._last_model_run_id = getattr(turn, "model_run_id", None)
         raw = await self._turn_output_text(conversation_id, turn.id) or ""
@@ -799,7 +810,11 @@ class ProductionWorkflowOrchestrator:
                         evidence_pack_hash=evidence_pack.pack_hash,
                         chunk_sha256=chunk.sha256,
                     )
-                    model_run_id = uuid5(NAMESPACE_URL, logical_request_id)
+                    conversation_id = _q2_chunk_conversation_id(logical_request_id)
+                    # Idempotency keys are column-limited (255 chars); the full
+                    # logical_request_id JSON does not fit, so a short digest of
+                    # it stands in — it is exactly as version-sensitive.
+                    chunk_identity = hashlib.sha256(logical_request_id.encode()).hexdigest()
                     chunk_prompt = (
                         prompt
                         + "\n\nCorpus Q2 — segment borné, uniquement données archivées.\n"
@@ -808,65 +823,149 @@ class ProductionWorkflowOrchestrator:
                         + chunk.text
                         + "\n</TEXT_ARCHIVÉ>"
                     )
+                    self._diagnostics.record(
+                        event="q2.chunk.started",
+                        run_id=run.id,
+                        subject_id=run.subject_id,
+                        stage="extraction",
+                        correlation_id=self._correlation_id,
+                        chunk_id=chunk.chunk_id,
+                        source_document_id=str(chunk.source_document_id),
+                        chunk_chars=len(chunk.text),
+                        provider=ModelProvider.OPENAI.value,
+                        web_search=False,
+                        prompt_version=EXTRACTION_PROMPT_VERSION,
+                        parser_version=Q2_MARKDOWN_PARSER_VERSION,
+                        logical_request_id=logical_request_id,
+                    )
+                    started_at = time.monotonic()
                     try:
-                        execution = await self._model_service.extract_structured(
-                            message=chunk_prompt,
-                            evidence_pack_hash=chunk.sha256,
-                            output_schema=Q2ChunkOutput,
-                            external_llm_allowed=policy_allows,
-                            prompt_template_id="production-q2-extraction",
-                            prompt_template_version=EXTRACTION_PROMPT_VERSION,
-                            correlation_id=self._correlation_id,
-                            web_search=False,
-                            run_id=model_run_id,
-                            parameters={
-                                "logical_request_id": logical_request_id,
-                                "q2_schema_version": Q2_SCHEMA_VERSION,
-                                "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-                                "chunk_sha256": chunk.sha256,
-                                "production_run_id": str(run.id),
-                                "subject_id": str(run.subject_id),
-                            },
+                        conversation = await self._model_service.get_or_create(
+                            conversation_id,
+                            provider=ModelProvider.OPENAI,
+                            transport=ConversationTransport.CHATGPT_BRIDGE,
+                            purpose=ConversationPurpose.SUBJECT_RESEARCH,
+                            title=(
+                                f"Production Q2 extraction — {subject_title} — "
+                                f"chunk {chunk.chunk_id}"
+                            ),
+                            edition_id=run.edition_id,
+                            subject_id=run.subject_id,
+                            expected_profile=None,
+                            requested_model=None,
                         )
-                        self._last_model_run_id = execution.run.id
-                        model_output = cast(Q2ChunkOutput, execution.structured_output)
-                        chunk_raw = execution.output_text or model_output.model_dump_json()
-                        chunk_turn_id = None
-                        chunk_result = model_output
+                        chunk_parsed, chunk_raw, chunk_turn_id = await self._ask_with_format_repair(
+                            run=run,
+                            conversation_id=conversation.id,
+                            stage="extraction",
+                            prompt=chunk_prompt,
+                            prompt_version=EXTRACTION_PROMPT_VERSION,
+                            repair_version=EXTRACTION_FORMAT_REPAIR_VERSION,
+                            mode=ConversationMode.FRESH,
+                            parse=parse_q2_proposals_markdown,
+                            external_llm_allowed=policy_allows,
+                            web_search=False,
+                            request_identity=chunk_identity,
+                            lifecycle_policy=ConversationPolicy.DELETE_ON_SUCCESS,
+                        )
                     except Exception as exc:
                         failed_chunk_ids.append(chunk.chunk_id)
                         chunk_failures[chunk.chunk_id] = str(exc)
                         chunk_provenance[chunk.chunk_id] = {
                             "logical_request_id": logical_request_id,
-                            "model_run_id": str(model_run_id),
-                            "checkpoint": "miss",
+                            "conversation_id": str(conversation_id),
+                            "model_run_id": (
+                                str(self._last_model_run_id) if self._last_model_run_id else None
+                            ),
                             "recovery_action": "none",
                             "status": "failed",
                         }
+                        self._diagnostics.record(
+                            event="q2.chunk.failed",
+                            run_id=run.id,
+                            subject_id=run.subject_id,
+                            stage="extraction",
+                            correlation_id=self._correlation_id,
+                            chunk_id=chunk.chunk_id,
+                            error=str(exc),
+                        )
                         continue
-                    chunk_provenance[chunk.chunk_id] = {
-                        "logical_request_id": logical_request_id,
-                        "model_run_id": str(execution.run.id),
-                        "turn_id": str(chunk_turn_id) if chunk_turn_id else None,
-                        "checkpoint": getattr(execution, "metadata", {}).get("checkpoint", "miss"),
-                        "provider": execution.run.provider.value,
-                        "requested_model": execution.run.requested_model,
-                        "actual_model": execution.run.actual_model_version,
-                        "attempt": str((execution.run.error_details or {}).get("attempts", 1)),
-                        "recovery_action": getattr(execution, "metadata", {}).get(
-                            "recovery_action", "new_submission"
-                        ),
-                        "duration_ms": str(execution.run.duration_ms or 0),
-                        "status": execution.run.status.value,
-                    }
-                    if chunk_result is None:
+                    duration_ms = int((time.monotonic() - started_at) * 1000)
+                    if chunk_parsed is None:
                         failed_chunk_ids.append(chunk.chunk_id)
                         chunk_failures[chunk.chunk_id] = "no response"
+                        chunk_provenance[chunk.chunk_id] = {
+                            "logical_request_id": logical_request_id,
+                            "conversation_id": str(conversation_id),
+                            "turn_id": str(chunk_turn_id) if chunk_turn_id else None,
+                            "model_run_id": (
+                                str(self._last_model_run_id) if self._last_model_run_id else None
+                            ),
+                            "provider": ModelProvider.OPENAI.value,
+                            "recovery_action": "none",
+                            "duration_ms": str(duration_ms),
+                            "status": "no_response",
+                        }
+                        self._diagnostics.record(
+                            event="q2.chunk.failed",
+                            run_id=run.id,
+                            subject_id=run.subject_id,
+                            stage="extraction",
+                            correlation_id=self._correlation_id,
+                            chunk_id=chunk.chunk_id,
+                            error="no_model_response",
+                        )
+                        continue
+                    repaired = "extraction_format_repair" in chunk_parsed.repair_actions
+                    self._diagnostics.record(
+                        event="q2.chunk.answer",
+                        run_id=run.id,
+                        subject_id=run.subject_id,
+                        stage="extraction",
+                        correlation_id=self._correlation_id,
+                        chunk_id=chunk.chunk_id,
+                        answer_chars=len(chunk_raw),
+                        parse_usable=chunk_parsed.usable,
+                        facts_count=len(chunk_parsed.value.facts) if chunk_parsed.value else 0,
+                        artifacts_count=(
+                            len(chunk_parsed.value.artifacts) if chunk_parsed.value else 0
+                        ),
+                        warning_count=len(chunk_parsed.warnings),
+                        structural_loss_count=len(chunk_parsed.errors),
+                        repaired=repaired,
+                        duration_ms=duration_ms,
+                    )
+                    chunk_provenance[chunk.chunk_id] = {
+                        "logical_request_id": logical_request_id,
+                        "conversation_id": str(conversation_id),
+                        "turn_id": str(chunk_turn_id) if chunk_turn_id else None,
+                        "model_run_id": (
+                            str(self._last_model_run_id) if self._last_model_run_id else None
+                        ),
+                        "provider": ModelProvider.OPENAI.value,
+                        "recovery_action": "repair" if repaired else "none",
+                        "duration_ms": str(duration_ms),
+                        "status": "succeeded" if chunk_parsed.usable else "unusable",
+                    }
+                    if not chunk_parsed.usable or chunk_parsed.value is None:
+                        failed_chunk_ids.append(chunk.chunk_id)
+                        chunk_failures[chunk.chunk_id] = "; ".join(chunk_parsed.errors) or (
+                            "no response"
+                        )
+                        self._diagnostics.record(
+                            event="q2.chunk.failed",
+                            run_id=run.id,
+                            subject_id=run.subject_id,
+                            stage="extraction",
+                            correlation_id=self._correlation_id,
+                            chunk_id=chunk.chunk_id,
+                            errors=chunk_parsed.errors,
+                        )
                         continue
                     completed_chunk_ids.append(chunk.chunk_id)
                     q2_submissions.append(
                         Q2ProposalSubmission(
-                            output=chunk_result,
+                            output=chunk_parsed.value,
                             source_document_id=str(chunk.source_document_id),
                             chunk_id=chunk.chunk_id,
                             source_ids=chunk.source_ids,
@@ -876,7 +975,16 @@ class ProductionWorkflowOrchestrator:
                         )
                     )
                     raw_parts.append(chunk_raw)
+                    parsed_warnings.extend(chunk_parsed.warnings)
                     turn_id = chunk_turn_id
+                    self._diagnostics.record(
+                        event="q2.chunk.completed",
+                        run_id=run.id,
+                        subject_id=run.subject_id,
+                        stage="extraction",
+                        correlation_id=self._correlation_id,
+                        chunk_id=chunk.chunk_id,
+                    )
                 if failed_chunk_ids:
                     self._diagnostics.record(
                         event="extraction.q2_chunk_coverage_failed",
@@ -1360,6 +1468,7 @@ class ProductionWorkflowOrchestrator:
                     "qa": qa_result,
                 }
 
+
 def _q2_chunk_source_context(chunk: Any) -> str:
     """Archived source context deliberately safe for the stateless Q2 prompt."""
     lines = ["Métadonnées source archivée (contexte, jamais preuve) :"]
@@ -1378,17 +1487,40 @@ def _q2_chunk_source_context(chunk: Any) -> str:
 def _q2_logical_request_id(
     *, run_id: UUID, subject_id: UUID, evidence_pack_hash: str, chunk_sha256: str
 ) -> str:
-    """Stable Q2 checkpoint identity.  Every semantic input/policy version participates."""
+    """Stable Q2 checkpoint identity.  Every semantic input/policy version participates.
+
+    Provider is implicitly `openai` (the routing policy version pins that), the
+    Markdown parser version pins the dialect, and the repair policy version
+    pins the one-shot repair prompt: a change to any of them must invalidate
+    both the deterministic chunk conversation id and the turn idempotency key,
+    so a stale checkpoint is never replayed.
+    """
     return "q2:" + json.dumps(
         {
             "production_run_id": str(run_id),
             "subject_id": str(subject_id),
             "evidence_pack_hash": evidence_pack_hash,
             "chunk_sha256": chunk_sha256,
+            "provider": ModelProvider.OPENAI.value,
             "q2_schema_version": Q2_SCHEMA_VERSION,
+            "parser_version": Q2_MARKDOWN_PARSER_VERSION,
             "prompt_version": EXTRACTION_PROMPT_VERSION,
+            "repair_policy_version": EXTRACTION_FORMAT_REPAIR_VERSION,
             "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
         },
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _q2_chunk_conversation_id(logical_request_id: str) -> UUID:
+    """Deterministic id for a chunk's bounded conversation.
+
+    Q2 checkpointing on `add_turn`'s idempotency key requires calling with the
+    *same* conversation id on every retry — a fresh random id per attempt would
+    make the dedup check reject the retry as belonging to "another
+    conversation". Deriving it from the same versioned identity as the turn's
+    idempotency key means any prompt/parser/policy bump naturally opens a new
+    conversation instead of replaying an old FRESH turn under a new contract.
+    """
+    return uuid5(NAMESPACE_URL, f"q2-chunk-conversation:{logical_request_id}")
