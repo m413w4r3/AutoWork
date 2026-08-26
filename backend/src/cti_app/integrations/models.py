@@ -114,12 +114,8 @@ class HttpResponsesTransport:
                         )
                 if response.is_error:
                     error = _bridge_http_error(response, attempt)
-                    retry_allowed = (
-                        error.retryable
-                        and (
-                            retry_status_codes is None
-                            or response.status_code in retry_status_codes
-                        )
+                    retry_allowed = error.retryable and (
+                        retry_status_codes is None or response.status_code in retry_status_codes
                     )
                     if attempt >= attempts or not retry_allowed:
                         raise error
@@ -254,6 +250,8 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         "bridge_rate_limited",
         "bridge_extension_disconnected",
         "bridge_ui_timeout",
+        "bridge_idle_timeout",
+        "bridge_total_timeout",
         "bridge_timeout",
         "bridge_unreachable",
         "bridge_payload_conflict",
@@ -294,6 +292,10 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         "bridge_rate_limited": "Le bridge limite temporairement les requêtes.",
         "bridge_extension_disconnected": "L'extension ChatGPT est déconnectée.",
         "bridge_ui_timeout": "L'inspection de l'interface ChatGPT a expiré.",
+        "bridge_idle_timeout": (
+            "L'extension ChatGPT n'a envoyé aucun heartbeat pendant la fenêtre autorisée."
+        ),
+        "bridge_total_timeout": "La génération ChatGPT a dépassé la durée totale autorisée.",
         "bridge_payload_conflict": "La clé d'idempotence est liée à une autre requête.",
         "bridge_protocol_error": "Le protocole du bridge est invalide.",
         "bridge_timeout": "Le bridge ChatGPT n'a pas répondu à temps.",

@@ -253,7 +253,7 @@ async def test_next_stage_job_is_idempotent_per_run_and_stage(
         _Context(),  # type: ignore[arg-type]
     )
 
-    assert jobs.submitted[0].idempotency_key == f"production-references-{run.id}"
+    assert jobs.submitted[0].idempotency_key == f"production-references-{run.id}-g0"
     assert jobs.submission_options[0]["max_attempts"] == 3
 
 

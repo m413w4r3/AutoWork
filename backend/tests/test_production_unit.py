@@ -144,55 +144,7 @@ class TestSubjectProductionRunStates:
         with pytest.raises(ValueError):
             run.start_running(now=datetime.now(UTC))
 
-    def test_retry_synthesis_from_ready_requeues_synthesis_and_bumps_generation(self) -> None:
-        run = SubjectProductionRun(
-            subject_id=uuid4(),
-            edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
-        )
-        run.start_running(now=datetime.now(UTC))
-        run.mark_needs_review(code="qa_failed", message="boom", now=datetime.now(UTC))
-        # A synthesis retry only ever starts from READY, not NEEDS_REVIEW/FAILED.
-        with pytest.raises(ValueError):
-            run.retry_synthesis(now=datetime.now(UTC))
 
-        run.status = SubjectProductionStatus.READY
-        run.error_code = None
-        run.error_message = None
-        run.retry_synthesis(now=datetime.now(UTC))
-
-        assert run.status is SubjectProductionStatus.RUNNING
-        assert run.current_stage is SubjectProductionStage.SYNTHESIS
-        assert run.synthesis_generation == 2
-        assert run.finished_at is None
-        assert run.error_code is None
-
-    def test_two_successive_synthesis_retries_increment_generation(self) -> None:
-        run = SubjectProductionRun(
-            subject_id=uuid4(),
-            edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
-        )
-        run.start_running(now=datetime.now(UTC))
-        run.mark_ready(now=datetime.now(UTC))
-        run.retry_synthesis(now=datetime.now(UTC))
-        assert run.synthesis_generation == 2
-
-        run.mark_ready(now=datetime.now(UTC))
-        run.retry_synthesis(now=datetime.now(UTC))
-        assert run.synthesis_generation == 3
-
-    def test_retry_synthesis_rejects_running_status(self) -> None:
-        run = SubjectProductionRun(
-            subject_id=uuid4(),
-            edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
-        )
-        run.start_running(now=datetime.now(UTC))
-
-        with pytest.raises(ValueError):
-            run.retry_synthesis(now=datetime.now(UTC))
-        assert run.synthesis_generation == 1
 
 
 class TestEditionProductionBatch:

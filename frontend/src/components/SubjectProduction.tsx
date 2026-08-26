@@ -57,6 +57,8 @@ const CONVERSATION_ERROR_CODES = new Set([
   "bridge_server_error",
   "bridge_timeout",
   "bridge_ui_timeout",
+  "bridge_idle_timeout",
+  "bridge_total_timeout",
   "conversation_unavailable",
   "conversation_locator_invalid",
   "conversation_profile_mismatch",
@@ -80,8 +82,8 @@ function stageArtifactHref(subjectId: string, stage: string): string {
 }
 
 function issueCopy(status: string, errorCode: string | null): string {
-  if (errorCode === "q2_chunk_coverage_failed") {
-    return "Couverture des segments incomplète — certains éléments n’ont pas été vérifiés.";
+  if (errorCode === "q2_source_coverage_failed") {
+    return "Couverture des sources incomplète — certaines sources n’ont pas été analysées.";
   }
   if (errorCode === "model_needs_review") {
     return "Le modèle demande une revue avant poursuite.";
@@ -158,8 +160,8 @@ export function SubjectProduction({
         ) : null}
         <p>
           AutoWork collecte et archive les sources ; ChatGPT établit les
-          références ; l’extraction technique structurée est vérifiée
-          automatiquement ; ChatGPT rédige ensuite la synthèse.
+          références et analyse chaque source technique ; AutoWork normalise et
+          valide les artefacts avant la synthèse.
         </p>
         {startMutation.error ? (
           <p className="error-message" role="alert">
@@ -322,12 +324,6 @@ export function SubjectProduction({
             </button>
           </div>
         )}
-
-      {showIssue && startMutation.error ? (
-        <p className="error-message" role="alert">
-          {String(startMutation.error)}
-        </p>
-      ) : null}
 
       {retryStageMutation.error ? (
         <p className="error-message" role="alert">

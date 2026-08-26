@@ -120,10 +120,12 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
         warnings: list[str] | None = None,
     ) -> ProductionArtifact:
         async with self._uow_factory() as uow:
-            current = await uow.production_artifacts.get_current(
-                run_id, ProductionArtifactStage.REFERENCES.value
-            )
-            version = (current.version + 1) if current else 1
+            prior_versions = [
+                artifact.version
+                for artifact in await uow.production_artifacts.list_for_run(run_id)
+                if artifact.stage is ProductionArtifactStage.REFERENCES
+            ]
+            version = max(prior_versions, default=0) + 1
 
             raw_id, canonical_id, _ = await self._store_payloads(
                 raw=raw_result, canonical=canonical_json
@@ -204,10 +206,12 @@ class ExtractionService(_ArtifactPayloadMixin):
         verification_diagnostics: dict[str, Any] | None = None,
     ) -> ProductionArtifact:
         async with self._uow_factory() as uow:
-            current = await uow.production_artifacts.get_current(
-                run_id, ProductionArtifactStage.EXTRACTION.value
-            )
-            version = (current.version + 1) if current else 1
+            prior_versions = [
+                artifact.version
+                for artifact in await uow.production_artifacts.list_for_run(run_id)
+                if artifact.stage is ProductionArtifactStage.EXTRACTION
+            ]
+            version = max(prior_versions, default=0) + 1
 
             element_counts = {
                 category: len(items)

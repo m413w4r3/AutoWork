@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,8 +8,6 @@ import pytest
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.extraction import PARSER_VERSION, ParsedLink
-from cti_app.application.production_parsers import parse_reference_report
-from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.source_evidence_processing import (
     SourceEvidenceProcessingService,
     select_technical_links,
@@ -177,23 +174,6 @@ async def test_stale_parser_artifact_is_reprocessed_and_becomes_current(tmp_path
     assert factory.artifacts[original_artifact_id].parser_version == "obsolete-parser"
     assert factory.artifacts[current].parser_version == PARSER_VERSION
     assert original_indicator_ids < set(factory.indicators)
-
-    report_result = parse_reference_report(
-        "## SOURCE S1\ntitle: Source\nurl: https://source-0.example/report\nrole: primary"
-        "\n\n## EVENT R1\ndate: 2026-08-25\nsources: S1\ntext: Evidence processed.",
-        date(2026, 8, 25),
-    )
-    assert report_result.value is not None
-    workflow = object.__new__(ProductionWorkflowOrchestrator)
-    workflow._source_evidence_processor = processor
-    async with factory() as uow:
-        pack = await workflow._build_production_evidence_pack(
-            uow, collection.subject_id, report_result.value
-        )
-    assert {chunk.internal_metadata["derived_artifact_id"] for chunk in pack.chunks} == {
-        str(current)
-    }
-
 
 async def test_one_unparseable_archived_source_does_not_rollback_others(tmp_path: Path) -> None:
     factory = InMemoryCollectionUnitOfWorkFactory()

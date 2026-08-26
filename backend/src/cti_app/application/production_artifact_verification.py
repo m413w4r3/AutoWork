@@ -148,9 +148,9 @@ def verify_q2_proposals(
 def _rejection_reason(
     proposal: Q2FactProposal | Q2ArtifactProposal,
 ) -> str | None:
-    if _is_placeholder(proposal.value):
-        return "redacted_placeholder"
     if isinstance(proposal, Q2ArtifactProposal):
+        if _is_placeholder(proposal.value):
+            return "redacted_placeholder"
         try:
             artifact_type = ArtifactType(proposal.artifact_type)
         except ValueError:

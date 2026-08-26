@@ -11,9 +11,8 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from cti_app.application.collection import ReferencedEvidence, SupplementalSource
+from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.iana_tlds_snapshot import IANA_TLD_SNAPSHOT_VERSION
 from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.model_conversations import (
     ConversationTurnFailedError,
@@ -28,14 +27,8 @@ from cti_app.application.production_artifact_verification import (
     verify_q2_proposals,
 )
 from cti_app.application.production_context import build_subject_production_context
-from cti_app.application.production_evidence_pack import (
-    ArchivedCorpusDocument,
-    ProductionEvidencePack,
-    build_production_evidence_pack,
-)
 from cti_app.application.production_parsers import (
     Q2_MARKDOWN_PARSER_VERSION,
-    Q2_SCHEMA_VERSION,
     IndicatorStatus,
     ParsedEvent,
     ParseResult,
@@ -49,7 +42,6 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.production_prompts import (
-    EXTRACTION_FORMAT_REPAIR_VERSION,
     EXTRACTION_PROMPT_VERSION,
     REFERENCES_FORMAT_REPAIR_VERSION,
     REFERENCES_PROMPT_VERSION,
@@ -686,52 +678,8 @@ class ProductionWorkflowOrchestrator:
     ) -> dict[str, Any]:
         return await self._execute_direct_url_extraction(run)
 
-        # Historical archived-corpus implementation retained below temporarily
-        # while the production migration is split out for review.
-        referenced_evidence = {"selected": 0, "added": 0}
-        evidence_processing = None
-        assert evidence_processing is None
-        if self._source_evidence_processor is not None:
-            links = await self._source_evidence_processor.select_referenced_evidence(run.subject_id)
-            referenced_evidence["selected"] = len(links)
-            if self._collection_service is not None and links:
-                if context is None:
-                    raise RuntimeError(
-                        "Extraction with referenced evidence requires a persisted job context"
-                    )
-                children = await self._collection_service.add_referenced_evidence(
-                    run.subject_id,
-                    tuple(
-                        ReferencedEvidence(
-                            parent_source_collection_id=link.parent_source_collection_id,
-                            url=link.url,
-                            anchor_text=link.anchor_text,
-                        )
-                        for link in links
-                    ),
-                )
-                referenced_evidence["added"] = len(children)
-                for child in children:
-                    await self._collection_service.archive_one(
-                        child.id,
-                        context.job_id,
-                        context=context,
-                    )
-            await self._source_evidence_processor.process_subject(run.subject_id)
-
-        if not self._model_service:
-            return {
-                "stage": "extraction",
-                "status": "error",
-                "error": "ModelConversationService not configured",
-            }
-
     async def _execute_direct_url_extraction(self, run: SubjectProductionRun) -> dict[str, Any]:
         """Q2: exactly one fresh, web-enabled model request per Q1 source."""
-        # Kept only to make the unreachable legacy tail below syntactically
-        # self-contained until it is deleted with its historical pack module.
-        referenced_evidence: dict[str, int] = {"selected": 0, "added": 0}
-        evidence_processing = None
         if self._model_gateway is None:
             return {
                 "stage": "extraction",
@@ -772,6 +720,7 @@ class ProductionWorkflowOrchestrator:
                     "parser_version": Q2_MARKDOWN_PARSER_VERSION,
                     "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
                     "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+                    "pipeline_generation": run.pipeline_generation,
                 }
             )
             existing = await uow.production_artifacts.get_current(run.id, "extraction")
@@ -784,23 +733,42 @@ class ProductionWorkflowOrchestrator:
         warnings: list[str] = []
         completed: list[str] = []
         failed: list[str] = []
-        failures: dict[str, str] = {}
+        failures: dict[str, dict[str, str]] = {}
         for source in report.sources:
             prompt = ProductionPromptTemplates.get_extraction_prompt(
                 subject_title, source.local_id, source.title, source.canonical_url
             )
-            request_hash = hashlib.sha256(prompt.encode()).hexdigest()
+            model_run_id = _q2_source_model_run_id(
+                production_run_id=run.id,
+                pipeline_generation=run.pipeline_generation,
+                source_id=source.local_id,
+                canonical_url=source.canonical_url,
+            )
+            self._diagnostics.record(
+                event="q2.source.started",
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage="extraction",
+                correlation_id=self._correlation_id,
+                pipeline_generation=run.pipeline_generation,
+                source_id=source.local_id,
+                source_url=source.canonical_url,
+                model_run_id=str(model_run_id),
+                web_search=True,
+            )
+            started_at = time.monotonic()
             try:
                 execution = await self._model_gateway.execute(
                     ModelRequest(
                         text=prompt,
                         prompt_template_id="production-q2-url",
                         prompt_template_version=EXTRACTION_PROMPT_VERSION,
-                        evidence_pack_hash=request_hash,
+                        evidence_pack_hash=hashlib.sha256(prompt.encode()).hexdigest(),
                         external_llm_allowed=True,
                         routing_hint=ModelRoutingHint.WEB_RESEARCH,
                         provider=ModelProvider.OPENAI,
                         web_search=True,
+                        run_id=model_run_id,
                         metadata={
                             "subject_id": str(run.subject_id),
                             "source_id": source.local_id,
@@ -825,9 +793,40 @@ class ProductionWorkflowOrchestrator:
                 completed.append(source.local_id)
                 url_raw_parts.append(raw)
                 warnings.extend(parsed.warnings)
+                self._diagnostics.record(
+                    event="q2.source.completed",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    source_id=source.local_id,
+                    model_run_id=str(model_run_id),
+                    answer_chars=len(raw),
+                    facts_count=len(parsed.value.facts),
+                    artifacts_count=len(parsed.value.artifacts),
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                )
             except Exception as exc:
+                error_code = str(getattr(exc, "code", "") or "q2_source_failed")
+                error = str(exc)[:1000]
                 failed.append(source.local_id)
-                failures[source.local_id] = str(exc)
+                failures[source.local_id] = {
+                    "model_run_id": str(model_run_id),
+                    "error_code": error_code,
+                    "error": error,
+                }
+                self._diagnostics.record(
+                    event="q2.source.failed",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    source_id=source.local_id,
+                    model_run_id=str(model_run_id),
+                    error_code=error_code,
+                    error=error,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                )
         if failed:
             return {
                 "stage": "extraction",
@@ -882,456 +881,6 @@ class ProductionWorkflowOrchestrator:
             "completed_source_ids": completed,
             "failed_source_ids": failed,
         }
-
-        async with self._uow_factory() as uow:
-            references = await uow.production_artifacts.get_current(run.id, "references")
-            if not references:
-                return {
-                    "stage": "extraction",
-                    "status": "error",
-                    "error": "References artifact not found",
-                }
-
-            report = await self._load_reference_report(references)
-            if report is None:
-                return {
-                    "stage": "extraction",
-                    "status": "terminal_error",
-                    "error_code": "references_payload_missing",
-                    "error": "Reference report content is not readable",
-                }
-            evidence_pack = await self._build_production_evidence_pack(uow, run.subject_id, report)
-            if evidence_pack.needs_review:
-                return {
-                    "stage": "extraction",
-                    "status": "needs_review",
-                    "error_code": evidence_pack.error_code,
-                    "error": evidence_pack.error_message,
-                    "pack_hash": evidence_pack.pack_hash,
-                }
-            input_data = {
-                "subject_id": str(run.subject_id),
-                "references_version": references.version,
-                "references_hash": references.input_hash,
-                "stage": "extraction",
-                "prompt_version": EXTRACTION_PROMPT_VERSION,
-                "q2_schema_version": Q2_SCHEMA_VERSION,
-                "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-                "evidence_pack_hash": evidence_pack.pack_hash,
-                # Canonical Verification Cache identity: a change here forces the
-                # canonical extraction artifact to be recomputed, but never forces
-                # a new Q2 model call — that call is checkpointed independently
-                # by _q2_logical_request_id, which does not include these.
-                "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
-                "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
-                "pipeline_generation": run.pipeline_generation,
-            }
-            input_hash = compute_input_hash(input_data)
-
-            research_date = run.research_date or datetime.now(UTC).date()
-            ctx = await build_subject_production_context(uow, run.subject_id, research_date)
-            policy_allows = ctx.external_llm_allowed
-            if not policy_allows:
-                return {
-                    "stage": "extraction",
-                    "status": "needs_review",
-                    "error_code": "external_llm_blocked",
-                    "error": "Diffusion policy forbids sending this subject to an external model",
-                }
-
-            existing = await uow.production_artifacts.get_current(run.id, "extraction")
-            if existing and existing.input_hash == input_hash:
-                return {
-                    "stage": "extraction",
-                    "status": "cached",
-                    "artifact_id": str(existing.id),
-                    "source_evidence_processing": (
-                        evidence_processing.as_dict() if evidence_processing is not None else None
-                    ),
-                    "referenced_evidence": referenced_evidence,
-                }
-
-            subject_title, _ = await self._subject_context(uow, run.subject_id)
-            prompt = ProductionPromptTemplates.get_extraction_prompt(subject_title=subject_title)
-            try:
-                if not evidence_pack.chunks:
-                    return {
-                        "stage": "extraction",
-                        "status": "needs_review",
-                        "error_code": "evidence_pack_empty",
-                        "error": "ProductionEvidencePack contains no Q2 chunks",
-                        "completed_chunk_ids": [],
-                        "failed_chunk_ids": [],
-                    }
-                q2_submissions: list[Q2ProposalSubmission] = []
-                parsed_warnings: list[str] = []
-                raw_parts: list[str] = []
-                turn_id = None
-                completed_chunk_ids: list[str] = []
-                failed_chunk_ids: list[str] = []
-                chunk_failures: dict[str, str] = {}
-                chunk_provenance: dict[str, dict[str, str | None]] = {}
-                for chunk in evidence_pack.chunks:
-                    logical_request_id = _q2_logical_request_id(
-                        run_id=run.id,
-                        subject_id=run.subject_id,
-                        evidence_pack_hash=evidence_pack.pack_hash,
-                        chunk_sha256=chunk.sha256,
-                        pipeline_generation=run.pipeline_generation,
-                    )
-                    conversation_id = _q2_chunk_conversation_id(logical_request_id)
-                    # Idempotency keys are column-limited (255 chars); the full
-                    # logical_request_id JSON does not fit, so a short digest of
-                    # it stands in — it is exactly as version-sensitive.
-                    chunk_identity = hashlib.sha256(logical_request_id.encode()).hexdigest()
-                    chunk_prompt = (
-                        prompt
-                        + "\n\nCorpus Q2 — segment borné, uniquement données archivées.\n"
-                        + _q2_chunk_source_context(chunk)
-                        + "\n\n<TEXT_ARCHIVÉ>\n"
-                        + chunk.text
-                        + "\n</TEXT_ARCHIVÉ>"
-                    )
-                    self._diagnostics.record(
-                        event="q2.chunk.started",
-                        run_id=run.id,
-                        subject_id=run.subject_id,
-                        stage="extraction",
-                        correlation_id=self._correlation_id,
-                        chunk_id=chunk.chunk_id,
-                        source_document_id=str(chunk.source_document_id),
-                        chunk_chars=len(chunk.text),
-                        provider=ModelProvider.OPENAI.value,
-                        web_search=False,
-                        prompt_version=EXTRACTION_PROMPT_VERSION,
-                        parser_version=Q2_MARKDOWN_PARSER_VERSION,
-                        logical_request_id=logical_request_id,
-                    )
-                    started_at = time.monotonic()
-                    try:
-                        conversation = await self._model_service.get_or_create(
-                            conversation_id,
-                            provider=ModelProvider.OPENAI,
-                            transport=ConversationTransport.CHATGPT_BRIDGE,
-                            purpose=ConversationPurpose.SUBJECT_RESEARCH,
-                            title=(
-                                f"Production Q2 extraction — {subject_title} — "
-                                f"chunk {chunk.chunk_id}"
-                            ),
-                            edition_id=run.edition_id,
-                            subject_id=run.subject_id,
-                            expected_profile=None,
-                            requested_model=None,
-                        )
-                        (
-                            chunk_parsed,
-                            chunk_raw,
-                            chunk_turn_id,
-                            chunk_model_run_id,
-                        ) = await self._ask_with_format_repair(
-                            run=run,
-                            conversation_id=conversation.id,
-                            stage="extraction",
-                            prompt=chunk_prompt,
-                            prompt_version=EXTRACTION_PROMPT_VERSION,
-                            repair_version=EXTRACTION_FORMAT_REPAIR_VERSION,
-                            mode=ConversationMode.FRESH,
-                            parse=parse_q2_proposals_markdown,
-                            external_llm_allowed=policy_allows,
-                            web_search=False,
-                            request_identity=chunk_identity,
-                            lifecycle_policy=ConversationPolicy.DELETE_ON_SUCCESS,
-                        )
-                    except Exception as exc:
-                        failed_chunk_ids.append(chunk.chunk_id)
-                        chunk_failures[chunk.chunk_id] = str(exc)
-                        chunk_provenance[chunk.chunk_id] = {
-                            "logical_request_id": logical_request_id,
-                            "conversation_id": str(conversation_id),
-                            "model_run_id": None,
-                            "recovery_action": "none",
-                            "status": "failed",
-                        }
-                        self._diagnostics.record(
-                            event="q2.chunk.failed",
-                            run_id=run.id,
-                            subject_id=run.subject_id,
-                            stage="extraction",
-                            correlation_id=self._correlation_id,
-                            chunk_id=chunk.chunk_id,
-                            error=str(exc),
-                        )
-                        continue
-                    duration_ms = int((time.monotonic() - started_at) * 1000)
-                    if chunk_parsed is None:
-                        failed_chunk_ids.append(chunk.chunk_id)
-                        chunk_failures[chunk.chunk_id] = "no response"
-                        chunk_provenance[chunk.chunk_id] = {
-                            "logical_request_id": logical_request_id,
-                            "conversation_id": str(conversation_id),
-                            "turn_id": str(chunk_turn_id) if chunk_turn_id else None,
-                            "model_run_id": (
-                                str(chunk_model_run_id) if chunk_model_run_id else None
-                            ),
-                            "provider": ModelProvider.OPENAI.value,
-                            "recovery_action": "none",
-                            "duration_ms": str(duration_ms),
-                            "status": "no_response",
-                        }
-                        self._diagnostics.record(
-                            event="q2.chunk.failed",
-                            run_id=run.id,
-                            subject_id=run.subject_id,
-                            stage="extraction",
-                            correlation_id=self._correlation_id,
-                            chunk_id=chunk.chunk_id,
-                            error="no_model_response",
-                        )
-                        continue
-                    repaired = "extraction_format_repair" in chunk_parsed.repair_actions
-                    self._diagnostics.record(
-                        event="q2.chunk.answer",
-                        run_id=run.id,
-                        subject_id=run.subject_id,
-                        stage="extraction",
-                        correlation_id=self._correlation_id,
-                        chunk_id=chunk.chunk_id,
-                        answer_chars=len(chunk_raw),
-                        parse_usable=chunk_parsed.usable,
-                        facts_count=len(chunk_parsed.value.facts) if chunk_parsed.value else 0,
-                        artifacts_count=(
-                            len(chunk_parsed.value.artifacts) if chunk_parsed.value else 0
-                        ),
-                        warning_count=len(chunk_parsed.warnings),
-                        structural_loss_count=len(chunk_parsed.errors),
-                        repaired=repaired,
-                        duration_ms=duration_ms,
-                    )
-                    chunk_provenance[chunk.chunk_id] = {
-                        "logical_request_id": logical_request_id,
-                        "conversation_id": str(conversation_id),
-                        "turn_id": str(chunk_turn_id) if chunk_turn_id else None,
-                        "model_run_id": (
-                            str(chunk_model_run_id) if chunk_model_run_id else None
-                        ),
-                        "provider": ModelProvider.OPENAI.value,
-                        "recovery_action": "repair" if repaired else "none",
-                        "duration_ms": str(duration_ms),
-                        "status": "succeeded" if chunk_parsed.usable else "unusable",
-                    }
-                    if not chunk_parsed.usable or chunk_parsed.value is None:
-                        failed_chunk_ids.append(chunk.chunk_id)
-                        chunk_failures[chunk.chunk_id] = "; ".join(chunk_parsed.errors) or (
-                            "no response"
-                        )
-                        self._diagnostics.record(
-                            event="q2.chunk.failed",
-                            run_id=run.id,
-                            subject_id=run.subject_id,
-                            stage="extraction",
-                            correlation_id=self._correlation_id,
-                            chunk_id=chunk.chunk_id,
-                            errors=chunk_parsed.errors,
-                        )
-                        continue
-                    completed_chunk_ids.append(chunk.chunk_id)
-                    q2_submissions.append(
-                        Q2ProposalSubmission(
-                            output=chunk_parsed.value,
-                            source_document_id=str(chunk.source_document_id),
-                            chunk_id=chunk.chunk_id,
-                            source_ids=chunk.source_ids,
-                            model_run_id=(
-                                str(chunk_model_run_id) if chunk_model_run_id else None
-                            ),
-                        )
-                    )
-                    raw_parts.append(chunk_raw)
-                    parsed_warnings.extend(chunk_parsed.warnings)
-                    turn_id = chunk_turn_id
-                    self._diagnostics.record(
-                        event="q2.chunk.completed",
-                        run_id=run.id,
-                        subject_id=run.subject_id,
-                        stage="extraction",
-                        correlation_id=self._correlation_id,
-                        chunk_id=chunk.chunk_id,
-                    )
-                if failed_chunk_ids:
-                    self._diagnostics.record(
-                        event="extraction.q2_chunk_coverage_failed",
-                        run_id=run.id,
-                        subject_id=run.subject_id,
-                        stage="extraction",
-                        correlation_id=self._correlation_id,
-                        completed_chunk_ids=completed_chunk_ids,
-                        failed_chunk_ids=failed_chunk_ids,
-                        chunk_failures=chunk_failures,
-                        chunk_provenance=chunk_provenance,
-                    )
-                    return {
-                        "stage": "extraction",
-                        "status": "needs_review",
-                        "error_code": "q2_chunk_coverage_failed",
-                        "error": "One or more Q2 chunks failed or were unparsable",
-                        "completed_chunk_ids": completed_chunk_ids,
-                        "failed_chunk_ids": failed_chunk_ids,
-                        "chunk_failures": chunk_failures,
-                        "chunk_provenance": chunk_provenance,
-                    }
-                verification = verify_q2_proposals(q2_submissions, evidence_pack)
-                parsed = ParseResult(
-                    value=verification.canonical,
-                    warnings=[
-                        *parsed_warnings,
-                        *verification.warnings,
-                        *(f"q2_rejected:{item.reason_code}" for item in verification.rejected),
-                    ],
-                )
-                raw = "\n\n".join(raw_parts)
-            except Exception as e:
-                return self._handle_stage_exception(run, "extraction", e)
-
-            if parsed is None:
-                return {
-                    "stage": "extraction",
-                    "status": "needs_review",
-                    "error_code": "no_model_response",
-                    "error": "No response from model",
-                }
-            if not parsed.usable:
-                return {
-                    "stage": "extraction",
-                    "status": "needs_review",
-                    "error_code": "extraction_format_unusable",
-                    "error": "; ".join(parsed.errors),
-                    "warnings": parsed.warnings,
-                }
-
-            assert parsed.value is not None
-            extraction = parsed.value
-            status_totals = {
-                status.value: sum(item.indicator_status is status for item in extraction.items)
-                for status in IndicatorStatus
-            }
-            artifact = await self._extraction.store_extraction_result(
-                run_id=run.id,
-                subject_id=run.subject_id,
-                input_hash=input_hash,
-                raw_result=raw,
-                canonical_json=technical_extraction_to_json(extraction),
-                conversation_turn_id=turn_id,
-                warnings=parsed.warnings,
-                verification_diagnostics={
-                    # Also carried in this artifact's input_hash; repeated here
-                    # so a manual run inspection doesn't have to decode the hash.
-                    "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
-                    "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
-                    "status_totals": status_totals,
-                    "evidence_pack_hash": evidence_pack.pack_hash,
-                    "evidence_pack_chunk_ids": list(evidence_pack.chunk_ids),
-                    "evidence_pack_source_document_ids": sorted(
-                        {str(chunk.source_document_id) for chunk in evidence_pack.chunks}
-                    ),
-                    "evidence_pack_parser_versions": dict(evidence_pack.parser_versions),
-                    "completed_chunk_ids": completed_chunk_ids,
-                    "failed_chunk_ids": failed_chunk_ids,
-                    "chunk_provenance": chunk_provenance,
-                    "q2_proposal_diagnostics": [
-                        {
-                            "status": item.status.value,
-                            "proposal_index": item.proposal_index,
-                            "proposal_kind": item.proposal_kind,
-                            "artifact_type": item.artifact_type,
-                            "source_document_id": item.source_document_id,
-                            "chunk_id": item.chunk_id,
-                            "value_hash": item.value_hash,
-                            "reason_code": item.reason_code,
-                        }
-                        for item in verification.diagnostics
-                    ],
-                },
-            )
-
-            return {
-                "stage": "extraction",
-                "status": "success",
-                "artifact_id": str(artifact.id),
-                "items_count": len(extraction.items),
-                "supported_items": len(extraction.supported_items()),
-                "warnings": parsed.warnings,
-                "repair_actions": parsed.repair_actions,
-                "status_totals": status_totals,
-                "evidence_pack_hash": evidence_pack.pack_hash,
-                "evidence_pack_chunk_ids": list(evidence_pack.chunk_ids),
-                "evidence_pack_source_document_ids": sorted(
-                    {str(chunk.source_document_id) for chunk in evidence_pack.chunks}
-                ),
-                "evidence_pack_parser_versions": dict(evidence_pack.parser_versions),
-                "completed_chunk_ids": completed_chunk_ids,
-                "failed_chunk_ids": failed_chunk_ids,
-                "chunk_provenance": chunk_provenance,
-                "source_evidence_processing": (
-                    evidence_processing.as_dict() if evidence_processing is not None else None
-                ),
-                "referenced_evidence": referenced_evidence,
-            }
-
-    async def _build_production_evidence_pack(
-        self, uow: UnitOfWork, subject_id: UUID, report: ReferenceReport
-    ) -> ProductionEvidencePack:
-        repositories = ("source_collections", "source_documents", "derived_artifacts")
-        if not all(hasattr(uow, name) for name in repositories):
-            return build_production_evidence_pack(report, ())
-        collections = await uow.source_collections.list_for_subject(subject_id)
-        documents = {
-            document.id: document
-            for document in await uow.source_documents.list_for_subject(subject_id)
-        }
-        artifact_ids = {
-            collection.derived_artifact_id
-            for collection in collections
-            if collection.derived_artifact_id is not None
-        }
-        artifacts = {}
-        for artifact_id in artifact_ids:
-            artifact = await uow.derived_artifacts.get(artifact_id)
-            if artifact is not None:
-                artifacts[artifact.id] = artifact
-        texts: dict[UUID, str] = {}
-        if self._source_evidence_processor is not None:
-            for artifact in artifacts.values():
-                try:
-                    texts[
-                        artifact.text_blob_id
-                    ] = await self._source_evidence_processor.read_derived_text(
-                        artifact.text_blob_id
-                    )
-                except Exception:
-                    pass
-        items: list[ArchivedCorpusDocument] = []
-        children: list[ArchivedCorpusDocument] = []
-        for collection in collections:
-            collection_artifact_id = collection.derived_artifact_id
-            collection_document_id = collection.source_document_id
-            if collection_artifact_id is None or collection_document_id is None:
-                continue
-            document = documents.get(collection_document_id)
-            artifact = artifacts.get(collection_artifact_id)
-            if document is None or artifact is None:
-                continue
-            item = ArchivedCorpusDocument(
-                collection=collection,
-                document=document,
-                text=texts.get(artifact.text_blob_id, ""),
-                derived_artifact_id=artifact.id,
-                parser_version=artifact.parser_version,
-                source_document_id=document.id,
-            )
-            (children if collection.origin_kind.value == "referenced_evidence" else items).append(
-                item
-            )
-        return build_production_evidence_pack(report, items, children)
 
     @staticmethod
     def _build_synthesis_evidence_pack(report: ReferenceReport, extraction: Any) -> dict[str, Any]:
@@ -1639,64 +1188,28 @@ class ProductionWorkflowOrchestrator:
                 }
 
 
-def _q2_chunk_source_context(chunk: Any) -> str:
-    """Archived source context deliberately safe for the stateless Q2 prompt."""
-    lines = ["Métadonnées source archivée (contexte, jamais preuve) :"]
-    if chunk.title:
-        lines.append(f"- titre: {chunk.title}")
-    lines.append(f"- origine: {chunk.origin_kind.value}")
-    if chunk.parent_source_ids:
-        lines.append(f"- source parente: {', '.join(chunk.parent_source_ids)}")
-    if chunk.source_ids:
-        lines.append(f"- source: {', '.join(chunk.source_ids)}")
-    if chunk.origin_kind.value == "referenced_evidence":
-        lines.append("- evidence référencée: oui")
-    return "\n".join(lines)
-
-
-def _q2_logical_request_id(
+def _q2_source_model_run_id(
     *,
-    run_id: UUID,
-    subject_id: UUID,
-    evidence_pack_hash: str,
-    chunk_sha256: str,
-    pipeline_generation: int = 0,
-) -> str:
-    """Stable Q2 checkpoint identity.  Every semantic input/policy version participates.
-
-    Provider is implicitly `openai` (the routing policy version pins that), the
-    Markdown parser version pins the dialect, and the repair policy version
-    pins the one-shot repair prompt: a change to any of them must invalidate
-    both the deterministic chunk conversation id and the turn idempotency key,
-    so a stale checkpoint is never replayed.
-    """
-    return "q2:" + json.dumps(
+    production_run_id: UUID,
+    pipeline_generation: int,
+    source_id: str,
+    canonical_url: str,
+    prompt_version: str = EXTRACTION_PROMPT_VERSION,
+    parser_version: str = Q2_MARKDOWN_PARSER_VERSION,
+    provider: ModelProvider = ModelProvider.OPENAI,
+) -> UUID:
+    """Stable ModelRun identity for one Q1 source in a Q2 generation."""
+    identity = json.dumps(
         {
-            "production_run_id": str(run_id),
-            "subject_id": str(subject_id),
-            "evidence_pack_hash": evidence_pack_hash,
-            "chunk_sha256": chunk_sha256,
+            "production_run_id": str(production_run_id),
             "pipeline_generation": pipeline_generation,
-            "provider": ModelProvider.OPENAI.value,
-            "q2_schema_version": Q2_SCHEMA_VERSION,
-            "parser_version": Q2_MARKDOWN_PARSER_VERSION,
-            "prompt_version": EXTRACTION_PROMPT_VERSION,
-            "repair_policy_version": EXTRACTION_FORMAT_REPAIR_VERSION,
-            "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+            "source_id": source_id,
+            "canonical_url": canonical_url,
+            "prompt_version": prompt_version,
+            "parser_version": parser_version,
+            "provider": provider.value,
         },
         sort_keys=True,
         separators=(",", ":"),
     )
-
-
-def _q2_chunk_conversation_id(logical_request_id: str) -> UUID:
-    """Deterministic id for a chunk's bounded conversation.
-
-    Q2 checkpointing on `add_turn`'s idempotency key requires calling with the
-    *same* conversation id on every retry — a fresh random id per attempt would
-    make the dedup check reject the retry as belonging to "another
-    conversation". Deriving it from the same versioned identity as the turn's
-    idempotency key means any prompt/parser/policy bump naturally opens a new
-    conversation instead of replaying an old FRESH turn under a new contract.
-    """
-    return uuid5(NAMESPACE_URL, f"q2-chunk-conversation:{logical_request_id}")
+    return uuid5(NAMESPACE_URL, f"production-q2-source:{identity}")
