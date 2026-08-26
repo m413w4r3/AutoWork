@@ -72,10 +72,10 @@ class VirusTotalSeedEnrichmentService:
         has_bytes: bool = True,
         observed_at: datetime | None = None,
     ) -> SeedEnrichmentResult:
-        if not external_lookup_allowed or not self._capabilities.is_enabled(
-            VirusTotalCapability.FILE_REPORT
-        ):
+        if not external_lookup_allowed:
             return SeedEnrichmentResult(issue=SeedEnrichmentIssue.LOOKUP_FORBIDDEN)
+        if not self._capabilities.is_enabled(VirusTotalCapability.FILE_REPORT):
+            return SeedEnrichmentResult(issue=SeedEnrichmentIssue.UNAVAILABLE)
         if not file_hash:
             return SeedEnrichmentResult(issue=SeedEnrichmentIssue.NOT_APPLICABLE)
         try:

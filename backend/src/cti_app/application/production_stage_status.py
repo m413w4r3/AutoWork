@@ -16,6 +16,7 @@ from cti_app.domain.production import (
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
+    production_stages,
 )
 
 # Artifact that evidences each stage, when there is one.
@@ -24,16 +25,10 @@ _STAGE_ARTIFACT: dict[SubjectProductionStage, ProductionArtifactStage | None] = 
     SubjectProductionStage.REFERENCES: ProductionArtifactStage.REFERENCES,
     SubjectProductionStage.EXTRACTION: ProductionArtifactStage.EXTRACTION,
     SubjectProductionStage.SYNTHESIS: ProductionArtifactStage.SYNTHESIS,
+    SubjectProductionStage.ANALYST_RESEARCH: None,
+    SubjectProductionStage.ANALYST_NOTE: None,
     SubjectProductionStage.ASSEMBLY: ProductionArtifactStage.BRIEF,
 }
-
-_STAGES = [
-    SubjectProductionStage.SOURCES,
-    SubjectProductionStage.REFERENCES,
-    SubjectProductionStage.EXTRACTION,
-    SubjectProductionStage.SYNTHESIS,
-    SubjectProductionStage.ASSEMBLY,
-]
 
 
 def build_stage_statuses(
@@ -47,10 +42,11 @@ def build_stage_statuses(
     Stages before the current one are complete, the current one is running, and
     a terminal run reports its outcome on the stage it stopped at.
     """
-    current_index = _STAGES.index(run.current_stage)
+    stages_for_profile = production_stages(run.profile)
+    current_index = stages_for_profile.index(run.current_stage)
     statuses: dict[str, dict[str, Any]] = {}
 
-    for index, stage in enumerate(_STAGES):
+    for index, stage in enumerate(stages_for_profile):
         artifact_stage = _STAGE_ARTIFACT[stage]
         artifact = artifacts.get(artifact_stage.value) if artifact_stage else None
 

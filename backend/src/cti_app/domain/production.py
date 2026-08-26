@@ -33,10 +33,8 @@ class SubjectProductionStage(StrEnum):
     ASSEMBLY = "assembly"
 
 
-def next_stage(
-    profile: ProductionProfile, stage: SubjectProductionStage
-) -> SubjectProductionStage | None:
-    """Return the declared successor for a profile; enum declaration order is irrelevant."""
+def production_stages(profile: ProductionProfile) -> tuple[SubjectProductionStage, ...]:
+    """The ordered, executable-or-manual production pipeline for a profile."""
     pipelines: dict[ProductionProfile, tuple[SubjectProductionStage, ...]] = {
         ProductionProfile.BRIEF_AUTO: (
             SubjectProductionStage.SOURCES,
@@ -55,7 +53,14 @@ def next_stage(
             SubjectProductionStage.ASSEMBLY,
         ),
     }
-    stages = pipelines[profile]
+    return pipelines[profile]
+
+
+def next_stage(
+    profile: ProductionProfile, stage: SubjectProductionStage
+) -> SubjectProductionStage | None:
+    """Return the declared successor for a profile; enum declaration order is irrelevant."""
+    stages = production_stages(profile)
     try:
         index = stages.index(stage)
     except ValueError as exc:
@@ -417,6 +422,20 @@ class AnalystInvestigation:
     def _bump(self, now: datetime | None = None) -> None:
         self.updated_at = now or datetime.now(UTC)
         self.version += 1
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AnalystInputPack:
+    investigation_id: UUID
+    blob_id: UUID
+    sha256: str
+    schema_version: str
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        if len(self.sha256) != 64 or any(c not in "0123456789abcdef" for c in self.sha256):
+            raise ValueError("sha256 must be lowercase SHA-256")
 
 
 @dataclass(slots=True, kw_only=True)

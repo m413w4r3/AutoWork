@@ -30,6 +30,7 @@ from cti_app.application.subject_production import (
     EditionProductionService,
     SubjectProductionService,
 )
+from cti_app.config import get_settings
 from cti_app.domain.editorial import EditorialGroup, EditorialGroupStatus, EditorialType
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -278,7 +279,10 @@ async def start_subject_production(
     payload = body or StartSubjectProductionRequest()
     profile = payload.profile
 
-    if profile == ProductionProfile.MAJOR_ASSISTED:
+    if (
+        profile == ProductionProfile.MAJOR_ASSISTED
+        and not get_settings().production_major_assisted_enabled
+    ):
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail="major_assisted production not yet implemented",
@@ -395,14 +399,10 @@ async def get_subject_production(
             progress_current=completed_stages,
             progress_total=len(stages),
             references_conversation_id=(
-                str(run.references_conversation_id)
-                if run.references_conversation_id
-                else None
+                str(run.references_conversation_id) if run.references_conversation_id else None
             ),
             synthesis_conversation_id=(
-                str(run.synthesis_conversation_id)
-                if run.synthesis_conversation_id
-                else None
+                str(run.synthesis_conversation_id) if run.synthesis_conversation_id else None
             ),
             run_id=str(run.id),
             pipeline_generation=run.pipeline_generation,
@@ -412,6 +412,42 @@ async def get_subject_production(
             warnings=_collect_warnings(artifacts),
             stages={name: StageStatus(**stage) for name, stage in stages.items()},
         )
+
+
+@router.get("/subjects/{subject_id}/investigation")
+async def get_subject_investigation(subject_id: UUID, request: Request) -> dict[str, Any]:
+    """Read-only visibility into the manual major-assisted checkpoint."""
+    uow_factory, _, _ = _runtime(request)
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if run is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="No production run found"
+            )
+        investigation = await uow.analyst_investigations.get_for_run(run.id)
+        if investigation is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="No investigation found"
+            )
+        result: dict[str, Any] = {
+            "investigation_id": str(investigation.id),
+            "production_run_id": str(investigation.production_run_id),
+            "status": investigation.status.value,
+            "stage": investigation.current_stage.value,
+            "cycle_number": investigation.cycle_number,
+            "synthesis_artifact_id": str(investigation.synthesis_artifact_id),
+            "input_pack_blob_id": str(investigation.input_pack_blob_id)
+            if investigation.input_pack_blob_id
+            else None,
+            "input_sha256": investigation.input_sha256,
+            "file_indicators": None,
+        }
+        store = getattr(request.app.state, "production_artifact_store", None)
+        if store is not None and investigation.input_pack_blob_id is not None:
+            result["file_indicators"] = (
+                await store.read_json(investigation.input_pack_blob_id)
+            ).get("file_indicators", [])
+        return result
 
 
 @router.post("/subjects/{subject_id}/production/retry")

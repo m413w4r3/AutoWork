@@ -16,6 +16,7 @@ from cti_app.domain.production import (
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
+    production_stages,
 )
 
 
@@ -144,6 +145,8 @@ class SubjectProductionService:
 
             if run.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
                 raise ValueError("retry_not_allowed_while_running")
+            if stage not in production_stages(run.profile):
+                raise ValueError("retry_stage_not_in_profile")
             if stage is SubjectProductionStage.REFERENCES:
                 sources = await uow.source_collections.list_for_subject(run.subject_id)
                 source_ready = any(

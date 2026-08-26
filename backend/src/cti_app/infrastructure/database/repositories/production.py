@@ -4,20 +4,110 @@ from uuid import UUID
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cti_app.domain.editorial import AnalystDecision, AnalystDecisionTargetType, AnalystDecisionType
 from cti_app.domain.production import (
+    AnalystInputPack,
+    AnalystInvestigation,
     EditionProductionBatch,
     EditionProductionBatchItem,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionProfile,
     SubjectProductionRun,
+    SubjectProductionStage,
+    SubjectProductionStatus,
 )
 from cti_app.infrastructure.database.models.production import (
+    AnalystDecisionRow,
+    AnalystInputPackRow,
+    AnalystInvestigationRow,
     EditionProductionBatchItemRow,
     EditionProductionBatchRow,
     ProductionArtifactRow,
     SubjectProductionRunRow,
 )
+
+
+class SqlAlchemyAnalystInvestigationRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self, investigation_id: UUID) -> AnalystInvestigation | None:
+        row = await self._session.get(AnalystInvestigationRow, investigation_id)
+        return _analyst_investigation_from_row(row) if row else None
+
+    async def get_for_run(self, run_id: UUID) -> AnalystInvestigation | None:
+        row = await self._session.scalar(
+            select(AnalystInvestigationRow).where(
+                AnalystInvestigationRow.production_run_id == run_id
+            )
+        )
+        return _analyst_investigation_from_row(row) if row else None
+
+    async def add(self, value: AnalystInvestigation) -> None:
+        self._session.add(_analyst_investigation_row(value))
+
+    async def save(self, value: AnalystInvestigation) -> None:
+        await self._session.execute(
+            update(AnalystInvestigationRow)
+            .where(AnalystInvestigationRow.id == value.id)
+            .values(**_analyst_investigation_values(value))
+        )
+
+
+class SqlAlchemyAnalystDecisionRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def append(self, value: AnalystDecision) -> None:
+        self._session.add(
+            AnalystDecisionRow(
+                id=value.id,
+                investigation_id=value.investigation_id,
+                decision_type=value.decision_type.value,
+                target_type=value.target_type.value,
+                target_id=value.target_id,
+                actor_id=value.actor_id,
+                reason=value.reason,
+                correlation_id=value.correlation_id,
+                occurred_at=value.occurred_at,
+            )
+        )
+
+    async def list_for_investigation(self, investigation_id: UUID) -> Sequence[AnalystDecision]:
+        query = (
+            select(AnalystDecisionRow)
+            .where(AnalystDecisionRow.investigation_id == investigation_id)
+            .order_by(AnalystDecisionRow.occurred_at)
+        )
+        rows = (await self._session.execute(query)).scalars()
+        return [_analyst_decision_from_row(row) for row in rows]
+
+
+class SqlAlchemyAnalystInputPackRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_for_investigation(self, investigation_id: UUID) -> AnalystInputPack | None:
+        row = await self._session.scalar(
+            select(AnalystInputPackRow).where(
+                AnalystInputPackRow.investigation_id == investigation_id
+            )
+        )
+        return _analyst_input_pack_from_row(row) if row else None
+
+    async def append(self, value: AnalystInputPack) -> None:
+        self._session.add(
+            AnalystInputPackRow(
+                id=value.id,
+                investigation_id=value.investigation_id,
+                blob_id=value.blob_id,
+                sha256=value.sha256,
+                schema_version=value.schema_version,
+                created_at=value.created_at,
+            )
+        )
 
 
 class SqlAlchemySubjectProductionRunRepository:
@@ -186,8 +276,10 @@ class SqlAlchemyProductionArtifactRepository:
         if stage not in pipeline:
             return []
         artifact_stages = {
-            "references": "references", "extraction": "extraction",
-            "synthesis": "synthesis", "assembly": "brief",
+            "references": "references",
+            "extraction": "extraction",
+            "synthesis": "synthesis",
+            "assembly": "brief",
         }
         affected = [
             artifact_stages[item]
@@ -313,13 +405,6 @@ class SqlAlchemyEditionProductionBatchItemRepository:
 
 
 def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectProductionRun:
-    from cti_app.domain.production import (
-        ProductionProfile,
-        SubjectProductionRun,
-        SubjectProductionStage,
-        SubjectProductionStatus,
-    )
-
     return SubjectProductionRun(
         id=row.id,
         subject_id=row.subject_id,
@@ -340,6 +425,104 @@ def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectPro
         created_at=row.created_at,
         updated_at=row.updated_at,
         version=row.version,
+    )
+
+
+def _analyst_investigation_values(value: AnalystInvestigation) -> dict[str, object]:
+    budget = value.budget
+    return {
+        "status": value.status.value,
+        "current_stage": value.current_stage.value,
+        "cycle_number": value.cycle_number,
+        "input_pack_blob_id": value.input_pack_blob_id,
+        "input_sha256": value.input_sha256,
+        "pivot_conversation_id": value.pivot_conversation_id,
+        "max_cycles": budget.max_cycles,
+        "max_pivot_runs": budget.max_pivot_runs,
+        "max_hits_acquired": budget.max_hits_acquired,
+        "max_new_samples": budget.max_new_samples,
+        "max_vt_read_units": budget.max_vt_read_units,
+        "consumed_pivot_runs": budget.consumed_pivot_runs,
+        "consumed_hits_acquired": budget.consumed_hits_acquired,
+        "consumed_new_samples": budget.consumed_new_samples,
+        "consumed_vt_read_units": budget.consumed_vt_read_units,
+        "started_at": value.started_at,
+        "finished_at": value.finished_at,
+        "updated_at": value.updated_at,
+        "version": value.version,
+    }
+
+
+def _analyst_investigation_row(value: AnalystInvestigation) -> AnalystInvestigationRow:
+    return AnalystInvestigationRow(
+        id=value.id,
+        production_run_id=value.production_run_id,
+        subject_id=value.subject_id,
+        synthesis_artifact_id=value.synthesis_artifact_id,
+        created_at=value.created_at,
+        **_analyst_investigation_values(value),
+    )
+
+
+def _analyst_investigation_from_row(row: AnalystInvestigationRow) -> AnalystInvestigation:
+    from cti_app.domain.production import (
+        AnalystInvestigationStage,
+        AnalystInvestigationStatus,
+        LoopBudget,
+    )
+
+    return AnalystInvestigation(
+        id=row.id,
+        production_run_id=row.production_run_id,
+        subject_id=row.subject_id,
+        synthesis_artifact_id=row.synthesis_artifact_id,
+        status=AnalystInvestigationStatus(row.status),
+        current_stage=AnalystInvestigationStage(row.current_stage),
+        cycle_number=row.cycle_number,
+        input_pack_blob_id=row.input_pack_blob_id,
+        input_sha256=row.input_sha256,
+        pivot_conversation_id=row.pivot_conversation_id,
+        budget=LoopBudget(
+            max_cycles=row.max_cycles,
+            max_pivot_runs=row.max_pivot_runs,
+            max_hits_acquired=row.max_hits_acquired,
+            max_new_samples=row.max_new_samples,
+            max_vt_read_units=row.max_vt_read_units,
+            consumed_pivot_runs=row.consumed_pivot_runs,
+            consumed_hits_acquired=row.consumed_hits_acquired,
+            consumed_new_samples=row.consumed_new_samples,
+            consumed_vt_read_units=row.consumed_vt_read_units,
+        ),
+        started_at=row.started_at,
+        finished_at=row.finished_at,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        version=row.version,
+    )
+
+
+def _analyst_decision_from_row(row: AnalystDecisionRow) -> AnalystDecision:
+    return AnalystDecision(
+        id=row.id,
+        investigation_id=row.investigation_id,
+        decision_type=AnalystDecisionType(row.decision_type),
+        target_type=AnalystDecisionTargetType(row.target_type),
+        target_id=row.target_id,
+        actor_id=row.actor_id,
+        reason=row.reason,
+        correlation_id=row.correlation_id,
+        occurred_at=row.occurred_at,
+    )
+
+
+def _analyst_input_pack_from_row(row: AnalystInputPackRow) -> AnalystInputPack:
+    return AnalystInputPack(
+        id=row.id,
+        investigation_id=row.investigation_id,
+        blob_id=row.blob_id,
+        sha256=row.sha256,
+        schema_version=row.schema_version,
+        created_at=row.created_at,
     )
 
 

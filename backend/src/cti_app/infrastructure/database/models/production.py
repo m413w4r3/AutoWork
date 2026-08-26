@@ -246,6 +246,25 @@ class AnalystDecisionRow(Base):
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class AnalystInputPackRow(Base):
+    __tablename__ = "analyst_input_packs"
+    __table_args__ = (
+        UniqueConstraint("investigation_id", name="uq_analyst_input_packs_investigation"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    investigation_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("analyst_investigations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class EditionProductionBatchRow(Base):
     __tablename__ = "edition_production_batches"
     __table_args__ = (

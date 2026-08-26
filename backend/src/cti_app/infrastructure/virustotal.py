@@ -558,7 +558,21 @@ def _parse_file(payload: dict[str, Any]) -> VirusTotalFile:
         if isinstance(attrs.get("last_modification_date"), int)
         else None,
         tags=tuple(tags),
+        vhash=_string_value(attrs.get("vhash")),
+        imphash=_string_value(attrs.get("imphash")),
+        ssdeep=_string_value(attrs.get("ssdeep")),
+        tlsh=_string_value(attrs.get("tlsh")),
+        main_icon_dhash=_nested_string(attrs.get("main_icon"), "dhash"),
+        rich_header_hash=_nested_string(attrs.get("pe_info"), "rich_header_hash"),
     )
+
+
+def _string_value(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _nested_string(value: object, key: str) -> str | None:
+    return value.get(key) if isinstance(value, dict) and isinstance(value.get(key), str) else None
 
 
 def _is_v2_file_report(payload: dict[str, Any]) -> bool:

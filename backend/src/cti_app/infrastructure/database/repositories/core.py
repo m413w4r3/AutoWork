@@ -328,6 +328,12 @@ class SqlAlchemyVirusTotalFileViewRepository:
                 last_submission_date=view.last_submission_date,
                 last_modification_date=view.last_modification_date,
                 tags=list(view.tags),
+                vhash=view.vhash,
+                imphash=view.imphash,
+                ssdeep=view.ssdeep,
+                tlsh=view.tlsh,
+                main_icon_dhash=view.main_icon_dhash,
+                rich_header_hash=view.rich_header_hash,
             )
         )
         await self._session.flush()

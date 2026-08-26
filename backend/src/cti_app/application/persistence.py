@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections.abc import Sequence
 from datetime import date, datetime
 from types import TracebackType
@@ -25,7 +27,7 @@ from cti_app.domain.discovery_cumulative import (
     SubjectMergeEvent,
 )
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
-from cti_app.domain.editorial import EditorialGroup, HumanDecision
+from cti_app.domain.editorial import AnalystDecision, EditorialGroup, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics
 from cti_app.domain.model_conversations import (
@@ -37,6 +39,8 @@ from cti_app.domain.model_conversations import (
 )
 from cti_app.domain.model_runs import ModelOutputRejection, ModelProvider, ModelRun
 from cti_app.domain.production import (
+    AnalystInputPack,
+    AnalystInvestigation,
     EditionProductionBatch,
     EditionProductionBatchItem,
     ProductionArtifact,
@@ -414,6 +418,9 @@ class UnitOfWork(Protocol):
     provenance: ProvenanceRepository
     virustotal_observations: VirusTotalObservationRepository
     virustotal_file_views: VirusTotalFileViewRepository
+    analyst_investigations: AnalystInvestigationRepository
+    analyst_decisions: AnalystDecisionRepository
+    analyst_input_packs: AnalystInputPackRepository
     jobs: JobRepository
     job_events: JobEventRepository
     editions: EditionRepository
@@ -442,10 +449,10 @@ class UnitOfWork(Protocol):
     brief_evidence_packs: BriefEvidencePackRepository
     brief_drafts: BriefDraftRepository
     # Defined further down in this module.
-    subject_production_runs: "SubjectProductionRunRepository"
-    production_artifacts: "ProductionArtifactRepository"
-    edition_production_batches: "EditionProductionBatchRepository"
-    edition_production_batch_items: "EditionProductionBatchItemRepository"
+    subject_production_runs: SubjectProductionRunRepository
+    production_artifacts: ProductionArtifactRepository
+    edition_production_batches: EditionProductionBatchRepository
+    edition_production_batch_items: EditionProductionBatchItemRepository
 
     async def __aenter__(self) -> Self: ...
 
@@ -559,6 +566,23 @@ class ProductionArtifactRepository(Protocol):
     async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]: ...
 
 
+class AnalystInvestigationRepository(Protocol):
+    async def get(self, investigation_id: UUID) -> AnalystInvestigation | None: ...
+    async def get_for_run(self, run_id: UUID) -> AnalystInvestigation | None: ...
+    async def add(self, investigation: AnalystInvestigation) -> None: ...
+    async def save(self, investigation: AnalystInvestigation) -> None: ...
+
+
+class AnalystDecisionRepository(Protocol):
+    async def append(self, decision: AnalystDecision) -> None: ...
+    async def list_for_investigation(self, investigation_id: UUID) -> Sequence[AnalystDecision]: ...
+
+
+class AnalystInputPackRepository(Protocol):
+    async def get_for_investigation(self, investigation_id: UUID) -> AnalystInputPack | None: ...
+    async def append(self, pack: AnalystInputPack) -> None: ...
+
+
 class EditionProductionBatchRepository(Protocol):
     async def add(self, batch: EditionProductionBatch) -> None: ...
 
@@ -584,6 +608,9 @@ class EditionProductionBatchItemRepository(Protocol):
 class ProductionUnitOfWork(Protocol):
     subject_production_runs: SubjectProductionRunRepository
     production_artifacts: ProductionArtifactRepository
+    analyst_investigations: AnalystInvestigationRepository
+    analyst_decisions: AnalystDecisionRepository
+    analyst_input_packs: AnalystInputPackRepository
     source_collections: SourceCollectionRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository

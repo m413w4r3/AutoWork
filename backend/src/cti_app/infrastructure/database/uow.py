@@ -3,6 +3,9 @@ from types import TracebackType
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cti_app.application.persistence import (
+    AnalystDecisionRepository,
+    AnalystInputPackRepository,
+    AnalystInvestigationRepository,
     BlobRepository,
     BriefDraftRepository,
     BriefEvidencePackRepository,
@@ -97,6 +100,9 @@ from cti_app.infrastructure.database.repositories.model_runs import (
     SqlAlchemyModelRunRepository,
 )
 from cti_app.infrastructure.database.repositories.production import (
+    SqlAlchemyAnalystDecisionRepository,
+    SqlAlchemyAnalystInputPackRepository,
+    SqlAlchemyAnalystInvestigationRepository,
     SqlAlchemyEditionProductionBatchItemRepository,
     SqlAlchemyEditionProductionBatchRepository,
     SqlAlchemyProductionArtifactRepository,
@@ -141,6 +147,9 @@ class SqlAlchemyUnitOfWork:
     brief_drafts: BriefDraftRepository
     subject_production_runs: SubjectProductionRunRepository
     production_artifacts: ProductionArtifactRepository
+    analyst_investigations: AnalystInvestigationRepository
+    analyst_decisions: AnalystDecisionRepository
+    analyst_input_packs: AnalystInputPackRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
 
@@ -191,6 +200,9 @@ class SqlAlchemyUnitOfWork:
         self.brief_drafts = SqlAlchemyBriefDraftRepository(self._session)
         self.subject_production_runs = SqlAlchemySubjectProductionRunRepository(self._session)
         self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)
+        self.analyst_investigations = SqlAlchemyAnalystInvestigationRepository(self._session)
+        self.analyst_decisions = SqlAlchemyAnalystDecisionRepository(self._session)
+        self.analyst_input_packs = SqlAlchemyAnalystInputPackRepository(self._session)
         self.edition_production_batches = SqlAlchemyEditionProductionBatchRepository(self._session)
         self.edition_production_batch_items = SqlAlchemyEditionProductionBatchItemRepository(
             self._session

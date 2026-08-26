@@ -27,6 +27,7 @@ from cti_app.domain.production import (
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
+    production_stages,
 )
 
 # Every automatic production stage job — SOURCES from the API, and every
@@ -183,7 +184,7 @@ def register_production_jobs(
             correlation_id=correlation_id,
         )
 
-        stages = list(SubjectProductionStage)
+        stages = list(production_stages(current.profile))
         stage_index = stages.index(stage)
         await context.report_progress(
             stage_index + 1,
@@ -262,6 +263,10 @@ def register_production_jobs(
             await uow.subject_production_runs.save(advancing)
             await uow.commit()
             next_stage = advancing.current_stage
+
+        # ANALYST_RESEARCH is a deliberate manual checkpoint in P04.
+        if next_stage is SubjectProductionStage.ANALYST_RESEARCH:
+            return f"production-stage://{parameters.run_id}/{stage.value}#awaiting_analyst"
 
         job_id = await stage_chain.submit(
             run=advancing,

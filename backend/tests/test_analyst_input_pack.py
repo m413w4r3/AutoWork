@@ -43,10 +43,29 @@ def test_pack_is_canonical_and_uses_only_accepted_structured_file_indicators() -
         synthesis=synthesis, budget=LoopBudget()
     )
     items = [
-        {"value": "A" * 64, "indicator_status": "accepted", "source_ids": ["S2", "S1"]},
-        {"value": "b" * 64, "indicator_status": "excluded", "source_ids": ["S3"]},
+        {
+            "id": "q2-hash",
+            "normalized_value": "A" * 64,
+            "artifact_type": "hash",
+            "supported": True,
+            "indicator_status": "confirmed_ioc",
+            "source_ids": ["S2", "S1"],
+        },
+        {
+            "value": "b" * 64,
+            "artifact_type": "hash",
+            "supported": True,
+            "indicator_status": "excluded",
+            "source_ids": ["S3"],
+        },
         # A hash-looking sentence is not an accepted structured indicator.
-        {"value": "prose " + "c" * 64, "indicator_status": "accepted", "source_ids": ["S4"]},
+        {
+            "value": "prose " + "c" * 64,
+            "artifact_type": "hash",
+            "supported": True,
+            "indicator_status": "confirmed_ioc",
+            "source_ids": ["S4"],
+        },
     ]
     pack = build_analyst_input_pack_v1(
         run=run,
@@ -75,7 +94,11 @@ def test_pack_is_canonical_and_uses_only_accepted_structured_file_indicators() -
     assert pack.canonical_bytes == again.canonical_bytes
     assert pack.sha256 == hashlib.sha256(pack.canonical_bytes).hexdigest()
     assert pack.payload["file_indicators"] == [
-        {"sha256": "a" * 64, "provenance": {"source_ids": ["S1", "S2"], "extraction_item_id": None}}
+        {
+            "hash_type": "sha256",
+            "value": "a" * 64,
+            "provenance": {"source_ids": ["S1", "S2"], "extraction_item_id": "q2-hash"},
+        }
     ]
     assert pack.payload["policy"] == {
         "tlp": "amber",

@@ -13,6 +13,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.analyst_input_pack import (
     ANALYST_INPUT_PACK_BUCKET,
+    ANALYST_INPUT_PACK_SCHEMA_VERSION,
     build_analyst_input_pack_v1,
 )
 from cti_app.application.collection import SupplementalSource
@@ -1177,11 +1178,15 @@ class ProductionWorkflowOrchestrator:
             raise ValueError("Analyst input pack requires the production artifact store")
 
         async with self._uow_factory() as uow:
-            repository = getattr(uow, "analyst_investigations", None)
-            if repository is None:
-                raise ValueError("Analyst investigation persistence is not configured")
-            existing = await repository.get_for_run(run.id)
+            existing = await uow.analyst_investigations.get_for_run(run.id)
             if existing is not None:
+                persisted_pack = await uow.analyst_input_packs.get_for_investigation(existing.id)
+                if (
+                    persisted_pack is None
+                    or existing.input_pack_blob_id != persisted_pack.blob_id
+                    or existing.input_sha256 != persisted_pack.sha256
+                ):
+                    raise ValueError("Analyst investigation input pack reference is inconsistent")
                 return UUID(str(existing.id))
 
             investigation = AnalystInvestigation.from_verified_synthesis(
@@ -1196,9 +1201,11 @@ class ProductionWorkflowOrchestrator:
                     {
                         "id": getattr(item, "local_id", None),
                         "value": getattr(item, "value", None),
+                        "normalized_value": getattr(item, "normalized_value", None),
                         "artifact_type": getattr(artifact_type, "value", artifact_type),
                         "indicator_status": getattr(indicator_status, "value", indicator_status),
                         "source_ids": list(getattr(item, "source_ids", ())),
+                        "supported": getattr(item, "supported", False),
                     }
                 )
             research_date = run.research_date
@@ -1220,7 +1227,17 @@ class ProductionWorkflowOrchestrator:
             )
             investigation.input_pack_blob_id = blob_id
             investigation.input_sha256 = sha256
-            await repository.add(investigation)
+            from cti_app.domain.production import AnalystInputPack
+
+            await uow.analyst_investigations.add(investigation)
+            await uow.analyst_input_packs.append(
+                AnalystInputPack(
+                    investigation_id=investigation.id,
+                    blob_id=blob_id,
+                    sha256=sha256,
+                    schema_version=ANALYST_INPUT_PACK_SCHEMA_VERSION,
+                )
+            )
             await uow.commit()
             return investigation.id
 

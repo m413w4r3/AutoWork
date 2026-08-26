@@ -63,14 +63,17 @@ def _accepted_file_indicators(items: Iterable[dict[str, Any]]) -> list[dict[str,
     """
     accepted: list[dict[str, Any]] = []
     for item in items:
-        value = item.get("value")
+        value = item.get("normalized_value") or item.get("value")
         status = item.get("indicator_status")
+        artifact_type = item.get("artifact_type")
+        supported = item.get("supported")
         if not isinstance(value, str):
             continue
         normalized = value.strip().lower()
-        if len(normalized) != 64 or any(c not in "0123456789abcdef" for c in normalized):
+        hash_type = {32: "md5", 40: "sha1", 64: "sha256"}.get(len(normalized))
+        if hash_type is None or any(c not in "0123456789abcdef" for c in normalized):
             continue
-        if status not in {"accepted", "verified", "retained"}:
+        if supported is not True or artifact_type != "hash" or status != "confirmed_ioc":
             continue
         source_ids = item.get("source_ids", ())
         if not isinstance(source_ids, (list, tuple)) or not all(
@@ -79,7 +82,8 @@ def _accepted_file_indicators(items: Iterable[dict[str, Any]]) -> list[dict[str,
             continue
         accepted.append(
             {
-                "sha256": normalized,
+                "hash_type": hash_type,
+                "value": normalized,
                 "provenance": {
                     "source_ids": sorted(set(source_ids)),
                     "extraction_item_id": item.get("id") or item.get("local_id"),
@@ -89,7 +93,8 @@ def _accepted_file_indicators(items: Iterable[dict[str, Any]]) -> list[dict[str,
     return sorted(
         accepted,
         key=lambda indicator: (
-            indicator["sha256"],
+            indicator["hash_type"],
+            indicator["value"],
             indicator["provenance"]["extraction_item_id"] or "",
         ),
     )

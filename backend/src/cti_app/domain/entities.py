@@ -123,8 +123,10 @@ class Sample:
         _require_aware(self.created_at, "created_at")
         if self.validation_date is not None:
             _require_aware(self.validation_date, "validation_date")
-        if self.expected_hash is not None and not re.fullmatch(r"[0-9a-f]{64}", self.expected_hash):
-            raise DomainError("expected_hash must be a lowercase SHA-256")
+        if self.expected_hash is not None and not re.fullmatch(
+            r"(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})", self.expected_hash
+        ):
+            raise DomainError("expected_hash must be a lowercase MD5, SHA-1, or SHA-256")
 
     def restrict_tlp(self, requested: TLP) -> None:
         ensure_tlp_not_downgraded(self.tlp, requested)
