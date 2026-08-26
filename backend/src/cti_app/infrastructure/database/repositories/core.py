@@ -12,6 +12,7 @@ from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.errors import EntityNotFoundError
+from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 from cti_app.infrastructure.database.models.briefs import BriefEvidencePackRow
 from cti_app.infrastructure.database.models.collection import (
     DerivedArtifactRow,
@@ -23,6 +24,8 @@ from cti_app.infrastructure.database.models.core import (
     SampleRow,
     SourceDocumentRow,
     SubjectRow,
+    VirusTotalFileViewRow,
+    VirusTotalObservationRow,
 )
 from cti_app.infrastructure.database.models.model_execution import (
     ModelConversationTurnRow,
@@ -106,6 +109,11 @@ class SqlAlchemyBlobRepository:
             .select_from(ModelConversationTurnRow)
             .where(ModelConversationTurnRow.output_blob_reference == f"blob://{blob_id}")
         )
+        virustotal_observation_count = await self._session.scalar(
+            select(func.count())
+            .select_from(VirusTotalObservationRow)
+            .where(VirusTotalObservationRow.blob_id == blob_id)
+        )
         return (
             int(document_count or 0)
             + int(decoded_document_count or 0)
@@ -116,6 +124,7 @@ class SqlAlchemyBlobRepository:
             + int(brief_pack_count or 0)
             + int(conversation_input_count or 0)
             + int(conversation_output_count or 0)
+            + int(virustotal_observation_count or 0)
         )
 
     async def delete(self, blob_id: UUID) -> None:
@@ -253,6 +262,67 @@ class SqlAlchemyProvenanceRepository:
             .order_by(ProvenanceEventRow.occurred_at, ProvenanceEventRow.id)
         )
         return [_provenance_from_row(row) for row in rows]
+
+
+class SqlAlchemyVirusTotalObservationRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, observation: VirusTotalObservation) -> None:
+        self._session.add(
+            VirusTotalObservationRow(
+                id=observation.id,
+                subject_id=observation.subject_id,
+                operation=observation.operation.value,
+                capability=observation.capability,
+                source_identifier=observation.source_identifier,
+                safe_parameters=observation.safe_parameters,
+                http_status=observation.http_status,
+                blob_id=observation.blob_id,
+                raw_sha256=observation.raw_sha256,
+                raw_size=observation.raw_size,
+                observed_at=observation.observed_at,
+                input_cursor=observation.input_cursor,
+                output_cursor=observation.output_cursor,
+                observed_count=observation.observed_count,
+                exhaustive=observation.exhaustive,
+                page_order=observation.page_order,
+                normalization_contract_version=observation.normalization_contract_version,
+            )
+        )
+        await self._session.flush()
+
+
+class SqlAlchemyVirusTotalFileViewRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add_if_absent(self, view: VirusTotalFileView) -> bool:
+        if await self._session.scalar(
+            select(VirusTotalFileViewRow.id).where(
+                VirusTotalFileViewRow.observation_id == view.observation_id
+            )
+        ):
+            return False
+        self._session.add(
+            VirusTotalFileViewRow(
+                id=view.id,
+                observation_id=view.observation_id,
+                vt_file_id=view.vt_file_id,
+                file_type=view.file_type,
+                lookup_hash=view.lookup_hash,
+                meaningful_name=view.meaningful_name,
+                type_description=view.type_description,
+                size=view.size,
+                last_analysis_stats=view.last_analysis_stats,
+                first_submission_date=view.first_submission_date,
+                last_submission_date=view.last_submission_date,
+                last_modification_date=view.last_modification_date,
+                tags=list(view.tags),
+            )
+        )
+        await self._session.flush()
+        return True
 
 
 def _blob_from_row(row: BlobRow) -> BlobRecord:

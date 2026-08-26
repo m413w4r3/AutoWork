@@ -42,6 +42,7 @@ from cti_app.domain.production import (
     ProductionArtifact,
     SubjectProductionRun,
 )
+from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 
 
 class BlobRepository(Protocol):
@@ -86,6 +87,14 @@ class ProvenanceRepository(Protocol):
     async def list_for_aggregate(
         self, aggregate_type: str, aggregate_id: UUID
     ) -> Sequence[ProvenanceEvent]: ...
+
+
+class VirusTotalObservationRepository(Protocol):
+    async def add(self, observation: VirusTotalObservation) -> None: ...
+
+
+class VirusTotalFileViewRepository(Protocol):
+    async def add_if_absent(self, view: VirusTotalFileView) -> bool: ...
 
 
 class JobRepository(Protocol):
@@ -403,6 +412,8 @@ class UnitOfWork(Protocol):
     source_documents: SourceDocumentRepository
     samples: SampleRepository
     provenance: ProvenanceRepository
+    virustotal_observations: VirusTotalObservationRepository
+    virustotal_file_views: VirusTotalFileViewRepository
     jobs: JobRepository
     job_events: JobEventRepository
     editions: EditionRepository

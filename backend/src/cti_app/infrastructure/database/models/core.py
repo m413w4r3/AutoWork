@@ -149,3 +149,60 @@ class ProvenanceEventRow(Base):
     tlp: Mapped[str] = mapped_column(String(16), nullable=False)
     actor_id: Mapped[str | None] = mapped_column(String(255))
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class VirusTotalObservationRow(Base):
+    __tablename__ = "virustotal_observations"
+    __table_args__ = (
+        CheckConstraint(
+            "http_status >= 200 AND http_status < 300", name="ck_vt_observation_http_success"
+        ),
+        CheckConstraint("raw_size >= 0", name="ck_vt_observation_raw_size"),
+        CheckConstraint("observed_count >= 0", name="ck_vt_observation_count"),
+        CheckConstraint("page_order >= 0", name="ck_vt_observation_page_order"),
+        Index("ix_vt_observations_blob_id", "blob_id"),
+        Index("ix_vt_observations_subject_id", "subject_id"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    subject_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT")
+    )
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    capability: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_identifier: Mapped[str] = mapped_column(Text, nullable=False)
+    safe_parameters: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    http_status: Mapped[int] = mapped_column(nullable=False)
+    blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    raw_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    input_cursor: Mapped[str | None] = mapped_column(Text)
+    output_cursor: Mapped[str | None] = mapped_column(Text)
+    observed_count: Mapped[int] = mapped_column(nullable=False)
+    exhaustive: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    page_order: Mapped[int] = mapped_column(nullable=False)
+    normalization_contract_version: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class VirusTotalFileViewRow(Base):
+    __tablename__ = "virustotal_file_views"
+    __table_args__ = (UniqueConstraint("observation_id", name="uq_vt_file_views_observation"),)
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    observation_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("virustotal_observations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    vt_file_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    file_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    lookup_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    meaningful_name: Mapped[str | None] = mapped_column(Text)
+    type_description: Mapped[str | None] = mapped_column(Text)
+    size: Mapped[int | None] = mapped_column(BigInteger)
+    last_analysis_stats: Mapped[dict[str, int] | None] = mapped_column(JSONB)
+    first_submission_date: Mapped[int | None] = mapped_column(BigInteger)
+    last_submission_date: Mapped[int | None] = mapped_column(BigInteger)
+    last_modification_date: Mapped[int | None] = mapped_column(BigInteger)
+    tags: Mapped[list[str]] = mapped_column(JSONB, nullable=False)

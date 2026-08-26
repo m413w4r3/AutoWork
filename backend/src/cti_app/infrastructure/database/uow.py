@@ -39,6 +39,8 @@ from cti_app.application.persistence import (
     SubjectMergeEventRepository,
     SubjectProductionRunRepository,
     SubjectRepository,
+    VirusTotalFileViewRepository,
+    VirusTotalObservationRepository,
 )
 from cti_app.infrastructure.database.repositories.briefs import (
     SqlAlchemyBriefDraftRepository,
@@ -59,6 +61,8 @@ from cti_app.infrastructure.database.repositories.core import (
     SqlAlchemySampleRepository,
     SqlAlchemySourceDocumentRepository,
     SqlAlchemySubjectRepository,
+    SqlAlchemyVirusTotalFileViewRepository,
+    SqlAlchemyVirusTotalObservationRepository,
 )
 from cti_app.infrastructure.database.repositories.discovery import (
     SqlAlchemyDiscoveryBatchRepository,
@@ -106,6 +110,8 @@ class SqlAlchemyUnitOfWork:
     source_documents: SourceDocumentRepository
     samples: SampleRepository
     provenance: ProvenanceRepository
+    virustotal_observations: VirusTotalObservationRepository
+    virustotal_file_views: VirusTotalFileViewRepository
     jobs: JobRepository
     job_events: JobEventRepository
     editions: EditionRepository
@@ -150,6 +156,8 @@ class SqlAlchemyUnitOfWork:
         self.source_documents = SqlAlchemySourceDocumentRepository(self._session)
         self.samples = SqlAlchemySampleRepository(self._session)
         self.provenance = SqlAlchemyProvenanceRepository(self._session)
+        self.virustotal_observations = SqlAlchemyVirusTotalObservationRepository(self._session)
+        self.virustotal_file_views = SqlAlchemyVirusTotalFileViewRepository(self._session)
         self.jobs = SqlAlchemyJobRepository(self._session)
         self.job_events = SqlAlchemyJobEventRepository(self._session)
         self.editions = SqlAlchemyEditionRepository(self._session)
