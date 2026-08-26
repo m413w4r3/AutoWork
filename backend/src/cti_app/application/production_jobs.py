@@ -6,6 +6,7 @@ from uuid import UUID
 
 from pydantic import ConfigDict, Field
 
+from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.jobs import (
@@ -127,6 +128,7 @@ def register_production_jobs(
     collection_service: SubjectCollectionService | None = None,
     artifact_store: ProductionArtifactStore | None = None,
     diagnostics: DiagnosticsLog | None = None,
+    seed_enrichment: VirusTotalSeedEnrichmentService | None = None,
 ) -> None:
     """Register the five production stage jobs."""
     stage_chain = chain or ProductionStageChain()
@@ -174,6 +176,7 @@ def register_production_jobs(
             collection_service=collection_service,
             artifact_store=artifact_store,
             diagnostics=diagnostics,
+            seed_enrichment=seed_enrichment,
         )
 
         correlation_id = await context.correlation_id()

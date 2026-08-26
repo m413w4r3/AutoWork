@@ -16,6 +16,7 @@ from cti_app.application.analyst_input_pack import (
     ANALYST_INPUT_PACK_SCHEMA_VERSION,
     build_analyst_input_pack_v1,
 )
+from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.iana_tlds_snapshot import IANA_TLD_SNAPSHOT_VERSION
@@ -149,6 +150,7 @@ class ProductionWorkflowOrchestrator:
         collection_service: SubjectCollectionService | None = None,
         artifact_store: ProductionArtifactStore | None = None,
         diagnostics: DiagnosticsLog | None = None,
+        seed_enrichment: VirusTotalSeedEnrichmentService | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._model_service = model_service
@@ -162,6 +164,7 @@ class ProductionWorkflowOrchestrator:
         self._synthesis = SynthesisService(uow_factory, artifact_store)
         self._assembly = BriefAssemblyService(uow_factory, artifact_store)
         self._qa = ProductionQAService(uow_factory)
+        self._seed_enrichment = seed_enrichment
 
     async def execute_stage(
         self,
@@ -1187,6 +1190,21 @@ class ProductionWorkflowOrchestrator:
                     or existing.input_sha256 != persisted_pack.sha256
                 ):
                     raise ValueError("Analyst investigation input pack reference is inconsistent")
+                if self._seed_enrichment is not None:
+                    payload = await self._artifact_store.read_json(persisted_pack.blob_id)
+                    for indicator in payload.get("file_indicators", []):
+                        value = indicator["value"]
+                        await self._seed_enrichment.enrich(
+                            value,
+                            subject_id=run.subject_id,
+                            external_lookup_allowed=bool(
+                                getattr(policy, "external_llm_allowed", False)
+                            ),
+                            has_bytes=False,
+                            checkpoint_id=(
+                                f"analyst-input-pack:{existing.id}:{persisted_pack.sha256}:{value}"
+                            ),
+                        )
                 return UUID(str(existing.id))
 
             investigation = AnalystInvestigation.from_verified_synthesis(
@@ -1239,6 +1257,18 @@ class ProductionWorkflowOrchestrator:
                 )
             )
             await uow.commit()
+            if self._seed_enrichment is not None:
+                for indicator in pack.payload["file_indicators"]:
+                    value = indicator["value"]
+                    await self._seed_enrichment.enrich(
+                        value,
+                        subject_id=run.subject_id,
+                        external_lookup_allowed=bool(
+                            getattr(policy, "external_llm_allowed", False)
+                        ),
+                        has_bytes=False,
+                        checkpoint_id=f"analyst-input-pack:{investigation.id}:{sha256}:{value}",
+                    )
             return investigation.id
 
     async def _execute_assembly_stage(self, run: SubjectProductionRun) -> dict[str, Any]:

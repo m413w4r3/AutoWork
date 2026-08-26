@@ -38,22 +38,33 @@ class VirusTotalObservationService:
         self._uow_factory = uow_factory
 
     async def store_file_report(
-        self, report: VirusTotalFileReport, *, subject_id: UUID | None = None, observed_at: datetime
+        self, report: VirusTotalFileReport, *, subject_id: UUID | None = None,
+        observed_at: datetime, checkpoint_id: str | None = None
     ) -> VirusTotalObservation:
+        if checkpoint_id is not None:
+            async with self._uow_factory() as uow:
+                existing = await uow.virustotal_observations.find_file_report_checkpoint(
+                    checkpoint_id, report.file.lookup_value
+                )
+            if existing is not None:
+                return existing
         blob = await self._catalog.ingest(
             BytesIO(report.raw_json),
             logical_bucket=VIRUSTOTAL_RAW_BUCKET,
             mime_type=VIRUSTOTAL_JSON_MIME_TYPE,
         )
+        safe_parameters = {
+            "file_hash": report.file.lookup_value,
+            "transport": report.transport.value,
+            "api_generation": report.api_generation.value,
+        }
+        if checkpoint_id is not None:
+            safe_parameters["checkpoint_id"] = checkpoint_id
         observation = VirusTotalObservation(
             operation=VirusTotalOperation.FILE_REPORT,
             capability=VirusTotalCapability.FILE_REPORT,
             source_identifier=report.file.lookup_value,
-            safe_parameters={
-                "file_hash": report.file.lookup_value,
-                "transport": report.transport.value,
-                "api_generation": report.api_generation.value,
-            },
+            safe_parameters=safe_parameters,
             http_status=report.http_status,
             blob_id=blob.id,
             raw_sha256=blob.descriptor.sha256,

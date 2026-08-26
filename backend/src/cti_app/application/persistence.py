@@ -96,6 +96,10 @@ class ProvenanceRepository(Protocol):
 class VirusTotalObservationRepository(Protocol):
     async def add(self, observation: VirusTotalObservation) -> None: ...
 
+    async def find_file_report_checkpoint(
+        self, checkpoint_id: str, file_hash: str
+    ) -> VirusTotalObservation | None: ...
+
 
 class VirusTotalFileViewRepository(Protocol):
     async def add_if_absent(self, view: VirusTotalFileView) -> bool: ...

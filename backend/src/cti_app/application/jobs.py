@@ -618,6 +618,7 @@ def create_job_registry(
     production_artifact_store: object | None = None,
     production_diagnostics: object | None = None,
     cumulative_discovery_service: object | None = None,
+    seed_enrichment: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
@@ -695,6 +696,7 @@ def create_job_registry(
             collection_service=collection_service,
             artifact_store=production_artifact_store,
             diagnostics=production_diagnostics,
+            seed_enrichment=cast(Any, seed_enrichment),
         )
     return registry
 

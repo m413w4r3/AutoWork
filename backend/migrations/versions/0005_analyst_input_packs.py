@@ -36,7 +36,9 @@ def upgrade() -> None:
         "ON analyst_input_packs FOR EACH ROW EXECUTE FUNCTION reject_evidence_mutation()"
     )
     for name in ("vhash", "imphash", "ssdeep", "tlsh", "main_icon_dhash", "rich_header_hash"):
-        op.add_column("virustotal_file_views", sa.Column(name, sa.String(length=255), nullable=True))
+        op.add_column(
+            "virustotal_file_views", sa.Column(name, sa.String(length=255), nullable=True)
+        )
 
 
 def downgrade() -> None:

@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import select, update
@@ -49,11 +50,16 @@ class SqlAlchemyAnalystInvestigationRepository:
         self._session.add(_analyst_investigation_row(value))
 
     async def save(self, value: AnalystInvestigation) -> None:
-        await self._session.execute(
+        result = await self._session.execute(
             update(AnalystInvestigationRow)
-            .where(AnalystInvestigationRow.id == value.id)
+            .where(
+                AnalystInvestigationRow.id == value.id,
+                AnalystInvestigationRow.version == value.version - 1,
+            )
             .values(**_analyst_investigation_values(value))
         )
+        if cast(Any, result).rowcount != 1:
+            raise RuntimeError("stale analyst investigation write")
 
 
 class SqlAlchemyAnalystDecisionRepository:

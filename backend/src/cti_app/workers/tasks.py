@@ -3,8 +3,10 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import dramatiq
+import httpx
 from minio import Minio
 
+from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
@@ -32,6 +34,8 @@ from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import ProductionStageChain
+from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalRoutingPolicy
+from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
 from cti_app.domain.jobs import JobStatus
@@ -40,6 +44,11 @@ from cti_app.infrastructure.database.session import create_postgres_engine, crea
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
 from cti_app.infrastructure.jobs import DramatiqJobDispatcher
+from cti_app.infrastructure.virustotal import (
+    VirusTotalHttpAdapter,
+    create_virustotal_direct_http_client,
+    create_virustotal_http_client,
+)
 from cti_app.integrations.model_factory import (
     create_bridge_capabilities_provider,
     create_model_gateway,
@@ -80,11 +89,61 @@ async def _execute_job(job_id: UUID) -> int | None:
     settings = get_settings()
     engine = create_postgres_engine(settings.postgres_dsn)
     session_factory = create_session_factory(engine)
+    vt_proxy_client: httpx.AsyncClient | None = None
+    vt_direct_client: httpx.AsyncClient | None = None
 
     def uow_factory() -> UnitOfWork:
         return SqlAlchemyUnitOfWork(session_factory)
 
     try:
+        if settings.virustotal_proxy_url:
+            vt_proxy_client = create_virustotal_http_client(settings)
+        else:
+            vt_proxy_client = httpx.AsyncClient()
+        if settings.virustotal_api_key and settings.virustotal_file_report_legacy_fallback_enabled:
+            vt_direct_client = create_virustotal_direct_http_client(settings)
+        vt_adapter = VirusTotalHttpAdapter(
+            client=vt_proxy_client,
+            base_url=settings.virustotal_base_url,
+            fallback_base_url=settings.virustotal_fallback_base_url,
+            legacy_base_url=settings.virustotal_legacy_base_url,
+            direct_client=vt_direct_client,
+            api_key=(
+                settings.virustotal_api_key.get_secret_value()
+                if vt_direct_client is not None and settings.virustotal_api_key is not None
+                else None
+            ),
+            capabilities=VirusTotalCapabilities(
+                file_report=settings.virustotal_file_report_enabled
+            ),
+            file_report_proxy_fallback_enabled=(
+                settings.virustotal_file_report_proxy_fallback_enabled
+            ),
+            file_report_legacy_fallback_enabled=(
+                settings.virustotal_file_report_legacy_fallback_enabled
+            ),
+            routing_policy=(
+                None
+                if settings.virustotal_file_report_enabled and settings.virustotal_proxy_url
+                else VirusTotalRoutingPolicy(routes={})
+            ),
+            max_response_bytes=settings.virustotal_max_response_bytes,
+            default_page_size=settings.virustotal_default_page_size,
+            max_page_size=settings.virustotal_max_page_size,
+            max_pages=settings.virustotal_max_pages,
+            max_results=settings.virustotal_max_results,
+        )
+        seed_enrichment = VirusTotalSeedEnrichmentService(
+            vt_adapter,
+            VirusTotalObservationService(BlobCatalogService(
+                MinioBlobStore(
+                    Minio(settings.s3_endpoint, access_key=settings.s3_access_key,
+                         secret_key=settings.s3_secret_key, secure=settings.s3_secure),
+                    physical_bucket=settings.s3_bucket,
+                ), uow_factory
+            ), uow_factory),
+            VirusTotalCapabilities(file_report=settings.virustotal_file_report_enabled),
+        )
         production_diagnostics = DiagnosticsLog.from_env(settings.diagnostics_log_root)
         model_gateway = create_model_gateway(settings, uow_factory)
         editorial_service = EditorialGroupingService(uow_factory)
@@ -197,6 +256,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             production_artifact_store=production_artifact_store,
             production_diagnostics=production_diagnostics,
             cumulative_discovery_service=cumulative_discovery_service,
+            seed_enrichment=seed_enrichment,
         )
         job_service = JobService(uow_factory, registry)
         production_chain.bind(job_service, job_dispatcher)
@@ -214,6 +274,10 @@ async def _execute_job(job_id: UUID) -> int | None:
             return int(seconds * 1000)
         return None
     finally:
+        if vt_direct_client is not None:
+            await vt_direct_client.aclose()
+        if vt_proxy_client is not None:
+            await vt_proxy_client.aclose()
         await engine.dispose()
 
 

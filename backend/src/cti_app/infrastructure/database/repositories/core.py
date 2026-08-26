@@ -20,7 +20,12 @@ from cti_app.domain.entities import (
     Subject,
 )
 from cti_app.domain.errors import EntityNotFoundError
-from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
+from cti_app.domain.virustotal import (
+    VirusTotalCapability,
+    VirusTotalFileView,
+    VirusTotalObservation,
+    VirusTotalOperation,
+)
 from cti_app.infrastructure.database.models.briefs import BriefEvidencePackRow
 from cti_app.infrastructure.database.models.collection import (
     DerivedArtifactRow,
@@ -300,6 +305,42 @@ class SqlAlchemyVirusTotalObservationRepository:
             )
         )
         await self._session.flush()
+
+    async def find_file_report_checkpoint(
+        self, checkpoint_id: str, file_hash: str
+    ) -> VirusTotalObservation | None:
+        row = await self._session.scalar(
+            select(VirusTotalObservationRow).where(
+                VirusTotalObservationRow.operation == "file_report",
+                VirusTotalObservationRow.source_identifier == file_hash,
+                VirusTotalObservationRow.safe_parameters["checkpoint_id"].as_string()
+                == checkpoint_id,
+            )
+        )
+        return _observation_from_row(row) if row else None
+
+
+def _observation_from_row(row: VirusTotalObservationRow) -> VirusTotalObservation:
+    return VirusTotalObservation(
+        id=row.id,
+        subject_id=row.subject_id,
+        operation=VirusTotalOperation(row.operation),
+        capability=VirusTotalCapability(row.capability),
+        source_identifier=row.source_identifier,
+        safe_parameters=row.safe_parameters,
+        http_status=row.http_status,
+        blob_id=row.blob_id,
+        raw_sha256=row.raw_sha256,
+        raw_size=row.raw_size,
+        observed_at=row.observed_at,
+        input_cursor=row.input_cursor,
+        output_cursor=row.output_cursor,
+        observed_count=row.observed_count,
+        exhaustive=row.exhaustive,
+        page_order=row.page_order,
+        normalization_contract_version=row.normalization_contract_version,
+        execution_id=row.execution_id,
+    )
 
 
 class SqlAlchemyVirusTotalFileViewRepository:

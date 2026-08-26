@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     # and the *_fallback_enabled flags below) — proxy stays the only transport
     # used unless a fallback is explicitly turned on.
     virustotal_proxy_url: str | None = None
+    virustotal_file_report_enabled: bool = False
     virustotal_base_url: str = "http://www.virustotal.com/api/v3"
     virustotal_fallback_base_url: str | None = "http://www.virustotal.com/api/v3"
     virustotal_legacy_base_url: str | None = "http://www.virustotal.com/vtapi/v2"

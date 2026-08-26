@@ -71,6 +71,7 @@ class VirusTotalSeedEnrichmentService:
         external_lookup_allowed: bool,
         has_bytes: bool = True,
         observed_at: datetime | None = None,
+        checkpoint_id: str | None = None,
     ) -> SeedEnrichmentResult:
         if not external_lookup_allowed:
             return SeedEnrichmentResult(issue=SeedEnrichmentIssue.LOOKUP_FORBIDDEN)
@@ -98,6 +99,7 @@ class VirusTotalSeedEnrichmentService:
             report,
             subject_id=subject_id,
             observed_at=observed_at or datetime.now(UTC),
+            checkpoint_id=checkpoint_id,
         )
         if not has_bytes:
             return SeedEnrichmentResult(

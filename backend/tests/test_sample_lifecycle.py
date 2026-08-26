@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -14,14 +15,14 @@ from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 
 def _sample(
     subject: Subject,
-    blob_id,
+    blob_id: UUID,
     *,
-    origin_kind=SampleOrigin.MANUAL,
-    state=SampleState.QUARANTINED,
-    tlp=TLP.GREEN,
-    do_not_submit=False,
-    external_llm_allowed=True,
-    name="hostile/../name",
+    origin_kind: SampleOrigin = SampleOrigin.MANUAL,
+    state: SampleState = SampleState.QUARANTINED,
+    tlp: TLP = TLP.GREEN,
+    do_not_submit: bool = False,
+    external_llm_allowed: bool = True,
+    name: str = "hostile/../name",
 ) -> Sample:
     return Sample(
         subject_id=subject.id,
