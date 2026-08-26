@@ -154,7 +154,8 @@ async def test_context_carries_the_real_editorial_anchors() -> None:
     assert ctx.period_start == "2026-07-01"
     assert ctx.period_end == "2026-07-31"
     assert ctx.research_date == date(2026, 8, 1)
-    assert "https://research.example/rapport" in ctx.existing_sources_text
+    assert "https://research.example/rapport" in ctx.core_sources_text
+    assert ctx.supporting_sources_text == ""
     assert "1 publication(s)" in ctx.technical_summary
 
 
@@ -184,3 +185,22 @@ async def test_context_allows_external_model_when_every_source_permits_it() -> N
 
     assert ctx.external_llm_allowed is True
     assert ctx.blocking_sources == ()
+
+
+async def test_context_separates_core_and_supporting_publications() -> None:
+    discovery = _collection("https://research.example/discovery")
+    manual = _collection("https://research.example/manual")
+    manual.origin_kind = SourceOriginKind.MANUAL
+    supporting = _collection("https://research.example/supporting")
+    supporting.origin_kind = SourceOriginKind.REFERENCE_RESEARCH
+
+    ctx = await build_subject_production_context(
+        _Uow([discovery, manual, supporting]),  # type: ignore[arg-type]
+        uuid4(),
+        date(2026, 8, 1),
+    )
+
+    assert "discovery" in ctx.core_sources_text
+    assert "manual" in ctx.core_sources_text
+    assert "supporting" not in ctx.core_sources_text
+    assert "supporting" in ctx.supporting_sources_text

@@ -19,12 +19,6 @@ from cti_app.application.production_parsers import (
     reference_report_from_json,
     technical_extraction_from_json,
 )
-from cti_app.application.production_prompts import (
-    EXTRACTION_PROMPT_VERSION,
-    REFERENCES_PROMPT_VERSION,
-    SYNTHESIS_PROMPT_VERSION,
-    ProductionPromptTemplates,
-)
 from cti_app.application.production_rendering import collect_indicators
 from cti_app.application.publication_builder import build_brief_document
 from cti_app.application.semantic_annotation import SEMANTIC_ANNOTATOR_VERSION
@@ -69,44 +63,6 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
-
-    async def prepare_references_stage(
-        self,
-        run_id: UUID,
-        subject_id: UUID,
-        subject_title: str,
-        subject_description: str,
-        actor_info: str,
-        technical_summary: str,
-        research_date: str,
-        period_start: str,
-        period_end: str,
-        existing_sources_text: str = "",
-    ) -> dict[str, Any]:
-        prompt = ProductionPromptTemplates.get_references_prompt(
-            subject_title=subject_title,
-            subject_description=subject_description,
-            actor_info=actor_info,
-            technical_summary=technical_summary,
-            research_date=research_date,
-            period_start=period_start,
-            period_end=period_end,
-            existing_sources_text=existing_sources_text,
-        )
-
-        input_data = {
-            "subject_id": str(subject_id),
-            "subject_title": subject_title,
-            "research_date": research_date,
-            "prompt_version": REFERENCES_PROMPT_VERSION,
-        }
-        input_hash = compute_input_hash(input_data)
-
-        return {
-            "prompt": prompt,
-            "input_hash": input_hash,
-            "mode": "fresh",
-        }
 
     async def store_references_result(
         self,
@@ -167,31 +123,6 @@ class ExtractionService(_ArtifactPayloadMixin):
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
-
-    async def prepare_extraction_stage(
-        self,
-        run_id: UUID,
-        subject_id: UUID,
-        subject_title: str,
-        references_artifact: ProductionArtifact,
-    ) -> dict[str, Any]:
-        prompt = ProductionPromptTemplates.get_extraction_prompt(
-            subject_title=subject_title,
-        )
-
-        input_data = {
-            "subject_id": str(subject_id),
-            "references_artifact_id": str(references_artifact.id),
-            "references_hash": references_artifact.input_hash,
-            "prompt_version": EXTRACTION_PROMPT_VERSION,
-        }
-        input_hash = compute_input_hash(input_data)
-
-        return {
-            "prompt": prompt,
-            "input_hash": input_hash,
-            "mode": "fresh",
-        }
 
     async def store_extraction_result(
         self,
@@ -260,31 +191,6 @@ class SynthesisService(_ArtifactPayloadMixin):
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
 
-    async def prepare_synthesis_stage(
-        self,
-        run_id: UUID,
-        subject_id: UUID,
-        subject_title: str,
-        extraction_artifact: ProductionArtifact,
-    ) -> dict[str, Any]:
-        prompt = ProductionPromptTemplates.get_synthesis_prompt(
-            subject_title=subject_title,
-        )
-
-        input_data = {
-            "subject_id": str(subject_id),
-            "extraction_artifact_id": str(extraction_artifact.id),
-            "extraction_hash": extraction_artifact.input_hash,
-            "prompt_version": SYNTHESIS_PROMPT_VERSION,
-        }
-        input_hash = compute_input_hash(input_data)
-
-        return {
-            "prompt": prompt,
-            "input_hash": input_hash,
-            "mode": "continue",
-        }
-
     async def store_synthesis_result(
         self,
         run_id: UUID,
@@ -294,6 +200,7 @@ class SynthesisService(_ArtifactPayloadMixin):
         markdown_content: str,
         model_run_id: UUID | None = None,
         conversation_turn_id: UUID | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> ProductionArtifact:
         async with self._uow_factory() as uow:
             # Not get_current: a synthesis retry stales every prior synthesis
@@ -328,6 +235,7 @@ class SynthesisService(_ArtifactPayloadMixin):
                 metadata={
                     "word_count": word_count,
                     "reference_count": reference_count,
+                    "diagnostics": diagnostics or {},
                     "generated_at": datetime.now(UTC).isoformat(),
                 },
             )

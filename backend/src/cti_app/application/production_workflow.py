@@ -13,6 +13,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.iana_tlds_snapshot import IANA_TLD_SNAPSHOT_VERSION
 from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.model_conversations import (
     ConversationTurnFailedError,
@@ -57,6 +58,7 @@ from cti_app.application.production_stages import (
     SynthesisService,
     compute_input_hash,
 )
+from cti_app.domain.collection import SourceOriginKind
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
@@ -590,7 +592,8 @@ class ProductionWorkflowOrchestrator:
                 research_date=research_date.isoformat(),
                 period_start=ctx.period_start,
                 period_end=ctx.period_end,
-                existing_sources_text=ctx.existing_sources_text,
+                core_sources_text=ctx.core_sources_text,
+                supporting_sources_text=ctx.supporting_sources_text,
             )
 
             try:
@@ -707,17 +710,11 @@ class ProductionWorkflowOrchestrator:
                     "error_code": "external_llm_blocked",
                     "error": "Diffusion policy forbids sending this subject to an external model",
                 }
-            input_hash = compute_input_hash(
-                {
-                    "subject_id": str(run.subject_id),
-                    "references_hash": references.input_hash,
-                    "source_urls": [source.canonical_url for source in report.sources],
-                    "prompt_version": EXTRACTION_PROMPT_VERSION,
-                    "parser_version": Q2_MARKDOWN_PARSER_VERSION,
-                    "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
-                    "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-                    "pipeline_generation": run.pipeline_generation,
-                }
+            input_hash = _extraction_input_hash(
+                subject_id=run.subject_id,
+                references_hash=references.input_hash,
+                source_urls=[source.canonical_url for source in report.sources],
+                pipeline_generation=run.pipeline_generation,
             )
             existing = await uow.production_artifacts.get_current(run.id, "extraction")
             if existing and existing.input_hash == input_hash:
@@ -852,6 +849,7 @@ class ProductionWorkflowOrchestrator:
             ],
             verification_diagnostics={
                 "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
+                "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
                 "completed_source_ids": completed,
                 "failed_source_ids": failed,
                 "q2_proposal_diagnostics": [
@@ -879,11 +877,15 @@ class ProductionWorkflowOrchestrator:
         }
 
     @staticmethod
-    def _build_synthesis_evidence_pack(report: ReferenceReport, extraction: Any) -> dict[str, Any]:
+    def _build_synthesis_evidence_pack(
+        report: ReferenceReport,
+        extraction: Any,
+        source_tiers_by_url: dict[str, str],
+    ) -> dict[str, Any]:
         """Deterministic Q4 input, stripped of operational/internal evidence.
 
         Q4 must write from the verified Q1/Q2 results, not from raw collection
-        material.  In particular, never expose source URLs, chunk/model IDs, or
+        material. In particular, never expose source URLs or model IDs, or
         items explicitly kept out of publication.
         """
         items: list[dict[str, Any]] = []
@@ -908,11 +910,12 @@ class ProductionWorkflowOrchestrator:
             items.append(published)
 
         return {
-            "version": "1",
+            "version": "2",
             "reference_report": {
                 "sources": [
                     {
                         "id": source.local_id,
+                        "tier": source_tiers_by_url.get(source.canonical_url, "unknown"),
                         "title": source.title,
                         "publisher": source.publisher,
                         "published_at": (
@@ -1008,7 +1011,16 @@ class ProductionWorkflowOrchestrator:
                 await self._artifact_store.read_json(extraction.canonical_blob_id)
             )
             subject_title, _ = await self._subject_context(uow, run.subject_id)
-            synthesis_pack = self._build_synthesis_evidence_pack(report, extraction_payload)
+            collections = await uow.source_collections.list_for_subject(run.subject_id)
+            source_tiers_by_url: dict[str, str] = {}
+            for collection in collections:
+                if collection.origin_kind in {SourceOriginKind.DISCOVERY, SourceOriginKind.MANUAL}:
+                    source_tiers_by_url[collection.canonical_url] = "core"
+                elif collection.origin_kind is SourceOriginKind.REFERENCE_RESEARCH:
+                    source_tiers_by_url[collection.canonical_url] = "supporting"
+            synthesis_pack = self._build_synthesis_evidence_pack(
+                report, extraction_payload, source_tiers_by_url
+            )
             synthesis_pack_hash = compute_input_hash(synthesis_pack)
             input_hash = compute_input_hash(
                 {
@@ -1021,7 +1033,7 @@ class ProductionWorkflowOrchestrator:
                     "technical_extraction_hash": compute_input_hash(
                         technical_extraction_to_json(extraction_payload)
                     ),
-                    "synthesis_evidence_pack_version": "1",
+                    "synthesis_evidence_pack_version": "2",
                     "synthesis_evidence_pack_hash": synthesis_pack_hash,
                     "prompt_version": SYNTHESIS_PROMPT_VERSION,
                     "web_policy_version": "q4-web-non-authoritative-v1",
@@ -1095,6 +1107,13 @@ class ProductionWorkflowOrchestrator:
                         "repair_actions": parsed.repair_actions,
                     }
 
+                source_tiers_by_id = {
+                    source["id"]: source["tier"]
+                    for source in synthesis_pack["reference_report"]["sources"]
+                }
+                citation_counts = {"core": 0, "supporting": 0, "unknown": 0}
+                for source_id in re.findall(r"\[S(\d+)\]", output_text):
+                    citation_counts[source_tiers_by_id.get(f"S{source_id}", "unknown")] += 1
                 artifact = await self._synthesis.store_synthesis_result(
                     run_id=run.id,
                     subject_id=run.subject_id,
@@ -1102,6 +1121,11 @@ class ProductionWorkflowOrchestrator:
                     raw_result=output_text,
                     markdown_content=output_text,
                     conversation_turn_id=turn_id,
+                    diagnostics={
+                        "core_citation_count": citation_counts["core"],
+                        "supporting_citation_count": citation_counts["supporting"],
+                        "unknown_citation_count": citation_counts["unknown"],
+                    },
                 )
 
                 return {
@@ -1210,3 +1234,26 @@ def _q2_source_model_run_id(
         separators=(",", ":"),
     )
     return uuid5(NAMESPACE_URL, f"production-q2-source:{identity}")
+
+
+def _extraction_input_hash(
+    *,
+    subject_id: UUID,
+    references_hash: str,
+    source_urls: list[str],
+    pipeline_generation: int,
+) -> str:
+    """Q2 canonical-artifact identity, distinct from per-source model runs."""
+    return compute_input_hash(
+        {
+            "subject_id": str(subject_id),
+            "references_hash": references_hash,
+            "source_urls": source_urls,
+            "prompt_version": EXTRACTION_PROMPT_VERSION,
+            "parser_version": Q2_MARKDOWN_PARSER_VERSION,
+            "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
+            "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
+            "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+            "pipeline_generation": pipeline_generation,
+        }
+    )

@@ -12,7 +12,7 @@ from datetime import date
 from uuid import UUID
 
 from cti_app.application.persistence import UnitOfWork
-from cti_app.domain.collection import CollectionState
+from cti_app.domain.collection import CollectionState, SourceOriginKind
 
 _ARCHIVED_STATES = {
     CollectionState.ARCHIVED,
@@ -32,7 +32,8 @@ class SubjectProductionContext:
     period_start: str
     period_end: str
     research_date: date
-    existing_sources_text: str
+    core_sources_text: str
+    supporting_sources_text: str
     external_llm_allowed: bool
     blocking_sources: tuple[str, ...]
 
@@ -71,7 +72,16 @@ async def build_subject_production_context(
             period_end = edition.period_end.isoformat()
 
     collections = list(await uow.source_collections.list_for_subject(subject_id))
-    existing_sources_text = "\n".join(_describe(item) for item in collections)
+    core_sources_text = "\n".join(
+        _describe(item)
+        for item in collections
+        if item.origin_kind in {SourceOriginKind.DISCOVERY, SourceOriginKind.MANUAL}
+    )
+    supporting_sources_text = "\n".join(
+        _describe(item)
+        for item in collections
+        if item.origin_kind is SourceOriginKind.REFERENCE_RESEARCH
+    )
 
     # The diffusion policy decides whether this subject may reach an external
     # model at all; it is never a hardcoded True.
@@ -100,7 +110,8 @@ async def build_subject_production_context(
         period_start=period_start,
         period_end=period_end,
         research_date=research_date,
-        existing_sources_text=existing_sources_text,
+        core_sources_text=core_sources_text,
+        supporting_sources_text=supporting_sources_text,
         external_llm_allowed=not blocking,
         blocking_sources=blocking,
     )

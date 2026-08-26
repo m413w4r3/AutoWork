@@ -11,7 +11,7 @@ from cti_app.application.model_gateway import (
     ModelRoutingHint,
 )
 from cti_app.application.production_parsers import parse_q2_proposals_markdown
-from cti_app.application.production_workflow import _q2_source_model_run_id
+from cti_app.application.production_workflow import _extraction_input_hash, _q2_source_model_run_id
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
 from cti_app.integrations.models import (
     FakeModelAdapter,
@@ -63,6 +63,42 @@ def test_q2_source_model_run_id_changes_when_routing_policy_changes(
         canonical_url="https://example.test/report",
     )
     assert after != before
+
+
+def test_iana_snapshot_bump_recomputes_extraction_without_new_q2_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = uuid4()
+    before_artifact = _extraction_input_hash(
+        subject_id=run_id,
+        references_hash="references",
+        source_urls=["https://example.test/report"],
+        pipeline_generation=0,
+    )
+    before_q2_run = _q2_source_model_run_id(
+        production_run_id=run_id,
+        pipeline_generation=0,
+        source_id="S1",
+        canonical_url="https://example.test/report",
+    )
+
+    monkeypatch.setattr(production_workflow, "IANA_TLD_SNAPSHOT_VERSION", "next-snapshot")
+
+    after_artifact = _extraction_input_hash(
+        subject_id=run_id,
+        references_hash="references",
+        source_urls=["https://example.test/report"],
+        pipeline_generation=0,
+    )
+    after_q2_run = _q2_source_model_run_id(
+        production_run_id=run_id,
+        pipeline_generation=0,
+        source_id="S1",
+        canonical_url="https://example.test/report",
+    )
+
+    assert after_artifact != before_artifact
+    assert after_q2_run == before_q2_run
 
 
 async def test_q2_model_gateway_reuses_persisted_model_run_across_worker_replay() -> None:

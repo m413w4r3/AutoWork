@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-REFERENCES_PROMPT_VERSION = "3"
+REFERENCES_PROMPT_VERSION = "4"
 # Q2 moved off the OpenAI structured-output contract (the bridge does not
 # actually guarantee response_format / JSON Schema) onto free-text GPT plus a
 # permissive Markdown parser (P23.7). EXTRACTION_PROMPT_VERSION now names that
 # Markdown dialect.
 EXTRACTION_PROMPT_VERSION = "8"
-SYNTHESIS_PROMPT_VERSION = "4"
+SYNTHESIS_PROMPT_VERSION = "5"
 REFERENCES_FORMAT_REPAIR_VERSION = "1"
 SYNTHESIS_FORMAT_REPAIR_VERSION = "2"
 
@@ -34,8 +34,11 @@ class ProductionPromptTemplates:
 
 **Editorial Period**: {period_start} to {period_end}
 
-**Known Publications**:
-{existing_sources}
+**Core Publications**:
+{core_sources}
+
+**Previously Known Supporting References**:
+{supporting_sources}
 
 **Research Guidelines**:
 1. Prioritize government bodies (CISA, CERT, national agencies)
@@ -50,6 +53,12 @@ class ProductionPromptTemplates:
    campaign, add that URL as a distinct SOURCE. Do not add generic download or
    database pages, navigation, marketing, generic documentation, or unrelated
    reports.
+8. Core publications define the central editorial subject. Preserve every
+   relevant accessible core publication in the resulting SOURCE set.
+9. Web research is additive. New references supplement or corroborate core
+   publications; they do not replace them.
+10. Supporting references may add chronology, attribution, technical details,
+    IOC context, annexes and corroboration.
 
 **Output format** — plain Markdown, no code fence, no JSON:
 
@@ -142,7 +151,7 @@ Rules:
   never the bare word "hash".
 - For YARA/Sigma/Suricata, value is the rule name/identifier, never the full
   rule body.
-- Do not emit source_document_id, source_ids, chunk_id, model_run_id,
+- Do not emit source_document_id, source_ids, model_run_id,
   references, or any other internal identifier; the system assigns provenance
   and verifies your proposals afterwards.
 """
@@ -164,7 +173,7 @@ Expected structure:
 {expected_structure}
 """
 
-    TECHNICAL_SYNTHESIS_V4 = """You are a senior CTI technical writer. Write concise sourced French CTI prose.
+    TECHNICAL_SYNTHESIS_V5 = """You are a senior CTI technical writer. Write concise sourced French CTI prose.
 
 **Subject**: {subject_title}
 
@@ -177,6 +186,17 @@ conflicts with canonical data, canonical data wins. Use only supplied [S#] marke
 <synthesis-evidence-pack>
 {synthesis_evidence_pack}
 </synthesis-evidence-pack>
+
+The CORE sources are the editorial backbone of the brief. Base the main
+narrative primarily on CORE sources: the central incident or campaign, actor
+or malware relationship, essential chronology, main technical mechanism, and
+impact or victimology when present. SUPPORTING sources are secondary evidence:
+use them to corroborate core claims, contextualize, add useful technical detail,
+refine chronology, enrich IOC interpretation, or provide technical annex/context
+absent from core sources. A supporting source may introduce genuinely useful
+information, but must not displace the core subject or become the dominant
+narrative unless canonical evidence makes that necessary. When the same claim
+is supported by CORE and SUPPORTING sources, prefer/cite the CORE source.
 
 Strict publication rules:
 - Produce no Markdown title or heading.
@@ -212,7 +232,8 @@ functional description. Return only French prose.
         research_date: str,
         period_start: str,
         period_end: str,
-        existing_sources_text: str,
+        core_sources_text: str,
+        supporting_sources_text: str,
     ) -> str:
         return cls.REFERENCES_RESEARCH_V2.format(
             subject_title=subject_title,
@@ -222,7 +243,8 @@ functional description. Return only French prose.
             research_date=research_date,
             period_start=period_start,
             period_end=period_end,
-            existing_sources=existing_sources_text,
+            core_sources=core_sources_text or "- None supplied.",
+            supporting_sources=supporting_sources_text or "- None supplied.",
         )
 
     @classmethod
@@ -273,7 +295,7 @@ text: <event>
         subject_title: str,
         synthesis_evidence_pack: str = "{}",
     ) -> str:
-        return cls.TECHNICAL_SYNTHESIS_V4.format(
+        return cls.TECHNICAL_SYNTHESIS_V5.format(
             subject_title=subject_title,
             synthesis_evidence_pack=synthesis_evidence_pack,
         )

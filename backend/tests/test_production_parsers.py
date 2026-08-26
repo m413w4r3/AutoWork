@@ -53,7 +53,7 @@ text: Premiere observation de la campagne.
 
 # Sentinel consumed by _FakeConversations in test_production_workflow_stages:
 # it swaps this marker for a real Q2 Markdown answer built from whichever
-# archived literal appears in that specific chunk's prompt.
+# archived literal appears in that specific source's prompt.
 PERFECT_Q2 = "__PERFECT_Q2_SENTINEL__"
 
 

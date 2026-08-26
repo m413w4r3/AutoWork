@@ -209,7 +209,7 @@ class Q2ArtifactProposal(BaseModel):
     evidence_quote: str = Field(min_length=1, max_length=8000)
 
 
-class Q2ChunkOutput(BaseModel):
+class Q2SourceOutput(BaseModel):
     """Strict Q2 contract; deliberately contains no internal identifiers."""
 
     model_config = ConfigDict(extra="forbid")
@@ -219,7 +219,7 @@ class Q2ChunkOutput(BaseModel):
     uncertainties: list[str] = Field(default_factory=list)
 
 
-# Bump whenever Q2ChunkOutput contract changes.  Checkpoints validate against it.
+# Bump whenever Q2SourceOutput contract changes. Checkpoints validate against it.
 Q2_SCHEMA_VERSION = "1"
 
 # Bump whenever the Q2 Markdown dialect or its lexing rules change. Participates
@@ -621,10 +621,9 @@ def _editorial_title(body: str) -> str | None:
 # primitives (normalize_text, headings with/without '#', multiline `_fields`,
 # alias handling). Unlike Q1, an unreadable proposal is a structural loss, not
 # a silent drop: it lands in `errors`, which fails `ParseResult.usable` and
-# lets the existing FRESH->repair-CONTINUE flow (`_ask_with_format_repair`)
-# ask the model to reformat, exactly once, before the chunk is treated as
-# failed. The parser never checks a proposal against the archived source; that
-# proof stays entirely inside `verify_q2_proposals`.
+# marks this one stateless source request as failed. The parser validates only
+# deterministic shape and normalization; source access is the responsibility
+# of the web-enabled Q2 request.
 
 _Q2_BLOCKS = {
     "fact": "fact",
@@ -719,7 +718,7 @@ _Q2_KNOWN_ARTIFACT_FIELDS = frozenset(
 
 
 def _warn_unknown_fields(
-    values: dict[str, str], known: frozenset[str], result: ParseResult[Q2ChunkOutput]
+    values: dict[str, str], known: frozenset[str], result: ParseResult[Q2SourceOutput]
 ) -> None:
     for key in values:
         if key not in known:
@@ -739,15 +738,15 @@ def _normalize_token(raw: str) -> str:
     return _normalize_key(raw).replace("-", "_")
 
 
-def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2ChunkOutput]:
-    """Parse one Q2 chunk answer: permissive on syntax, strict on structure.
+def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
+    """Parse one Q2 source answer: permissive on syntax, strict on structure.
 
-    Returns a `Q2ChunkOutput` — the same Pydantic contract `verify_q2_proposals`
+    Returns a `Q2SourceOutput` — the same Pydantic contract `verify_q2_proposals`
     already consumes — so the deterministic verifier and its provenance
     plumbing (`Q2ProposalSubmission`) need no change. A structural-loss code in
-    `errors` is what tells the caller to run the single allowed repair turn.
+    `errors` marks the direct source request as unusable.
     """
-    result: ParseResult[Q2ChunkOutput] = ParseResult()
+    result: ParseResult[Q2SourceOutput] = ParseResult()
     body = normalize_text(text)
     if not body:
         result.errors.append("empty_response")
@@ -779,14 +778,14 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2ChunkOutput]:
         result.errors.append("no_usable_proposal")
         return result
 
-    result.value = Q2ChunkOutput(
+    result.value = Q2SourceOutput(
         facts=facts, artifacts=artifacts, uncertainties=list(_collect_uncertainties(body))
     )
     return result
 
 
 def _parse_q2_fact(
-    values: dict[str, str], block: _Block, result: ParseResult[Q2ChunkOutput]
+    values: dict[str, str], block: _Block, result: ParseResult[Q2SourceOutput]
 ) -> Q2FactProposal | None:
     _warn_unknown_fields(values, _Q2_KNOWN_FACT_FIELDS, result)
     category_raw = _q2_field(values, "category", "categorie")
@@ -833,7 +832,7 @@ def _parse_q2_fact(
 
 
 def _parse_q2_artifact(
-    values: dict[str, str], block: _Block, result: ParseResult[Q2ChunkOutput]
+    values: dict[str, str], block: _Block, result: ParseResult[Q2SourceOutput]
 ) -> Q2ArtifactProposal | None:
     _warn_unknown_fields(values, _Q2_KNOWN_ARTIFACT_FIELDS, result)
     type_raw = _q2_field(values, "artifact-type", "type")

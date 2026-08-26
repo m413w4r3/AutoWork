@@ -16,8 +16,8 @@ from cti_app.application.production_parsers import (
     ExtractionItem,
     IndicatorStatus,
     Q2ArtifactProposal,
-    Q2ChunkOutput,
     Q2FactProposal,
+    Q2SourceOutput,
     SemanticType,
     TechnicalExtraction,
 )
@@ -39,7 +39,7 @@ class ProposalStatus(StrEnum):
 class Q2ProposalSubmission:
     """One stateless Q2 call, bound by orchestration to one Q1 source."""
 
-    output: Q2ChunkOutput
+    output: Q2SourceOutput
     source_ids: tuple[str, ...]
     model_run_id: str | None = None
 
