@@ -19,6 +19,7 @@ from cti_app.application.model_conversations import (
     ConversationTurnFailedError,
     ModelConversationService,
 )
+from cti_app.application.model_gateway import ModelGateway, ModelRequest, ModelRoutingHint
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_artifact_verification import (
@@ -72,7 +73,7 @@ from cti_app.domain.model_conversations import (
     ConversationTransport,
     ModelConversation,
 )
-from cti_app.domain.model_runs import ModelProvider
+from cti_app.domain.model_runs import ModelProvider, ModelRole
 from cti_app.domain.production import (
     SubjectProductionRun,
     SubjectProductionStage,
@@ -92,7 +93,7 @@ _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 # via the ChatGPT bridge + a permissive Markdown parser (P23.7). Qwen structured
 # output remains available outside production/benchmark but is no longer the
 # default Q2 provider.
-Q2_ROUTING_POLICY_VERSION = "2"
+Q2_ROUTING_POLICY_VERSION = "3"
 
 
 # Bridge and network hiccups are worth retrying; anything else is a dead end
@@ -142,6 +143,7 @@ class ProductionWorkflowOrchestrator:
         self,
         uow_factory: UnitOfWorkFactory,
         model_service: ModelConversationService | None = None,
+        model_gateway: ModelGateway | None = None,
         collection_service: SubjectCollectionService | None = None,
         artifact_store: ProductionArtifactStore | None = None,
         diagnostics: DiagnosticsLog | None = None,
@@ -149,6 +151,7 @@ class ProductionWorkflowOrchestrator:
     ) -> None:
         self._uow_factory = uow_factory
         self._model_service = model_service
+        self._model_gateway = model_gateway or getattr(model_service, "_gateway", None)
         self._collection_service = collection_service
         self._artifact_store = artifact_store
         self._diagnostics = diagnostics or DiagnosticsLog(None)
@@ -677,8 +680,13 @@ class ProductionWorkflowOrchestrator:
         run: SubjectProductionRun,
         context: JobExecutionContext | None,
     ) -> dict[str, Any]:
+        return await self._execute_direct_url_extraction(run)
+
+        # Historical archived-corpus implementation retained below temporarily
+        # while the production migration is split out for review.
         referenced_evidence = {"selected": 0, "added": 0}
         evidence_processing = None
+        assert evidence_processing is None
         if self._source_evidence_processor is not None:
             links = await self._source_evidence_processor.select_referenced_evidence(run.subject_id)
             referenced_evidence["selected"] = len(links)
@@ -705,9 +713,7 @@ class ProductionWorkflowOrchestrator:
                         context.job_id,
                         context=context,
                     )
-            evidence_processing = await self._source_evidence_processor.process_subject(
-                run.subject_id
-            )
+            await self._source_evidence_processor.process_subject(run.subject_id)
 
         if not self._model_service:
             return {
@@ -715,6 +721,162 @@ class ProductionWorkflowOrchestrator:
                 "status": "error",
                 "error": "ModelConversationService not configured",
             }
+
+    async def _execute_direct_url_extraction(self, run: SubjectProductionRun) -> dict[str, Any]:
+        """Q2: exactly one fresh, web-enabled model request per Q1 source."""
+        # Kept only to make the unreachable legacy tail below syntactically
+        # self-contained until it is deleted with its historical pack module.
+        referenced_evidence: dict[str, int] = {"selected": 0, "added": 0}
+        evidence_processing = None
+        if self._model_gateway is None:
+            return {
+                "stage": "extraction",
+                "status": "error",
+                "error": "ModelGateway not configured",
+            }
+        async with self._uow_factory() as uow:
+            references = await uow.production_artifacts.get_current(run.id, "references")
+            if references is None:
+                return {
+                    "stage": "extraction",
+                    "status": "error",
+                    "error": "References artifact not found",
+                }
+            report = await self._load_reference_report(references)
+            if report is None:
+                return {
+                    "stage": "extraction",
+                    "status": "terminal_error",
+                    "error_code": "references_payload_missing",
+                    "error": "Reference report content is not readable",
+                }
+            research_date = run.research_date or datetime.now(UTC).date()
+            policy = await build_subject_production_context(uow, run.subject_id, research_date)
+            if not policy.external_llm_allowed:
+                return {
+                    "stage": "extraction",
+                    "status": "needs_review",
+                    "error_code": "external_llm_blocked",
+                    "error": "Diffusion policy forbids sending this subject to an external model",
+                }
+            input_hash = compute_input_hash(
+                {
+                    "subject_id": str(run.subject_id),
+                    "references_hash": references.input_hash,
+                    "source_urls": [source.canonical_url for source in report.sources],
+                    "prompt_version": EXTRACTION_PROMPT_VERSION,
+                    "parser_version": Q2_MARKDOWN_PARSER_VERSION,
+                    "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
+                    "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+                }
+            )
+            existing = await uow.production_artifacts.get_current(run.id, "extraction")
+            if existing and existing.input_hash == input_hash:
+                return {"stage": "extraction", "status": "cached", "artifact_id": str(existing.id)}
+            subject_title, _ = await self._subject_context(uow, run.subject_id)
+
+        submissions: list[Q2ProposalSubmission] = []
+        url_raw_parts: list[str] = []
+        warnings: list[str] = []
+        completed: list[str] = []
+        failed: list[str] = []
+        failures: dict[str, str] = {}
+        for source in report.sources:
+            prompt = ProductionPromptTemplates.get_extraction_prompt(
+                subject_title, source.local_id, source.title, source.canonical_url
+            )
+            request_hash = hashlib.sha256(prompt.encode()).hexdigest()
+            try:
+                execution = await self._model_gateway.execute(
+                    ModelRequest(
+                        text=prompt,
+                        prompt_template_id="production-q2-url",
+                        prompt_template_version=EXTRACTION_PROMPT_VERSION,
+                        evidence_pack_hash=request_hash,
+                        external_llm_allowed=True,
+                        routing_hint=ModelRoutingHint.WEB_RESEARCH,
+                        provider=ModelProvider.OPENAI,
+                        web_search=True,
+                        metadata={
+                            "subject_id": str(run.subject_id),
+                            "source_id": source.local_id,
+                            "source_url": source.canonical_url,
+                        },
+                    ),
+                    ModelRole.RESEARCH,
+                )
+                raw = execution.output_text or ""
+                parsed = parse_q2_proposals_markdown(raw)
+                self._log_parse(run, "extraction", parsed)
+                if not parsed.usable or parsed.value is None:
+                    raise ValueError("; ".join(parsed.errors) or "source_unavailable")
+                submissions.append(
+                    Q2ProposalSubmission(
+                        output=parsed.value,
+                        source_ids=(source.local_id,),
+                        model_run_id=str(execution.run.id),
+                    )
+                )
+                completed.append(source.local_id)
+                url_raw_parts.append(raw)
+                warnings.extend(parsed.warnings)
+            except Exception as exc:
+                failed.append(source.local_id)
+                failures[source.local_id] = str(exc)
+        if failed:
+            return {
+                "stage": "extraction",
+                "status": "needs_review",
+                "error_code": "q2_source_coverage_failed",
+                "error": "One or more Q1 sources could not be analysed",
+                "completed_source_ids": completed,
+                "failed_source_ids": failed,
+                "source_failures": failures,
+            }
+        verification = verify_q2_proposals(submissions)
+        extraction = verification.canonical
+        status_totals = {
+            status.value: sum(item.indicator_status is status for item in extraction.items)
+            for status in IndicatorStatus
+        }
+        artifact = await self._extraction.store_extraction_result(
+            run_id=run.id,
+            subject_id=run.subject_id,
+            input_hash=input_hash,
+            raw_result="\n\n".join(url_raw_parts),
+            canonical_json=technical_extraction_to_json(extraction),
+            warnings=[
+                *warnings,
+                *verification.warnings,
+                *(f"q2_rejected:{item.reason_code}" for item in verification.rejected),
+            ],
+            verification_diagnostics={
+                "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
+                "completed_source_ids": completed,
+                "failed_source_ids": failed,
+                "q2_proposal_diagnostics": [
+                    {
+                        "status": item.status.value,
+                        "proposal_index": item.proposal_index,
+                        "proposal_kind": item.proposal_kind,
+                        "artifact_type": item.artifact_type,
+                        "value_hash": item.value_hash,
+                        "reason_code": item.reason_code,
+                    }
+                    for item in verification.diagnostics
+                ],
+            },
+        )
+        return {
+            "stage": "extraction",
+            "status": "success",
+            "artifact_id": str(artifact.id),
+            "items_count": len(extraction.items),
+            "supported_items": len(extraction.supported_items()),
+            "status_totals": status_totals,
+            "completed_source_ids": completed,
+            "failed_source_ids": failed,
+        }
 
         async with self._uow_factory() as uow:
             references = await uow.production_artifacts.get_current(run.id, "references")

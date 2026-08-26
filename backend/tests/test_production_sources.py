@@ -40,6 +40,15 @@ def test_canonical_url_is_derived_and_strips_tracking_parameters() -> None:
     assert plain.canonical_url == tracked.canonical_url
 
 
+def test_canonical_url_removes_known_tracking_and_keeps_business_parameter() -> None:
+    collection = _collection(
+        "https://research.example/report?id=42&utm_source=chatgpt&utm_medium=x"
+        "&utm_campaign=y&utm_term=z&utm_content=a&fbclid=one&gclid=two"
+    )
+
+    assert collection.canonical_url == "https://research.example/report?id=42"
+
+
 def test_trailing_slash_and_case_do_not_create_a_second_source() -> None:
     a = _collection("https://Research.Example/rapport/")
     b = _collection("https://research.example/rapport")

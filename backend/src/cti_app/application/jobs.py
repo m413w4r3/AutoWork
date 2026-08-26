@@ -346,9 +346,7 @@ class JobService:
         self, aggregate_type: str, aggregate_id: UUID, *, kind: str | None = None
     ) -> list[Job]:
         async with self._uow_factory() as uow:
-            return list(
-                await uow.jobs.list_for_aggregate(aggregate_type, aggregate_id, kind=kind)
-            )
+            return list(await uow.jobs.list_for_aggregate(aggregate_type, aggregate_id, kind=kind))
 
     async def history(self, job_id: UUID) -> list[JobEvent]:
         async with self._uow_factory() as uow:
@@ -699,6 +697,7 @@ def create_job_registry(
             uow_factory,
             chain=production_chain,
             model_service=model_conversation_service,
+            model_gateway=model_gateway,
             collection_service=collection_service,
             artifact_store=production_artifact_store,
             diagnostics=production_diagnostics,

@@ -10,7 +10,6 @@ from enum import StrEnum
 from urllib.parse import urlsplit
 
 from cti_app.application.iana_tlds_snapshot import IANA_TLDS
-from cti_app.application.production_evidence_pack import EvidenceChunk, ProductionEvidencePack
 from cti_app.application.production_normalization import normalize_indicator_value, refang
 from cti_app.application.production_parsers import (
     DisplayPolicy,
@@ -38,11 +37,9 @@ class ProposalStatus(StrEnum):
 
 @dataclass(frozen=True)
 class Q2ProposalSubmission:
-    """One Q2 call, bound by orchestration to exactly one archived chunk."""
+    """One stateless Q2 call, bound by orchestration to one Q1 source."""
 
     output: Q2ChunkOutput
-    source_document_id: str
-    chunk_id: str
     source_ids: tuple[str, ...]
     model_run_id: str | None = None
 
@@ -53,8 +50,6 @@ class ProposalDiagnostic:
     proposal_index: int
     proposal_kind: str
     artifact_type: str | None
-    source_document_id: str
-    chunk_id: str
     value_hash: str
     reason_code: str | None = None
 
@@ -91,22 +86,17 @@ _SEMANTIC_TYPE_BY_FACT_CATEGORY: Mapping[str, SemanticType] = {
 
 def verify_q2_proposals(
     submissions: Sequence[Q2ProposalSubmission],
-    evidence_pack: ProductionEvidencePack,
-    original_derived_texts: Mapping[str, str] | None = None,
 ) -> ArtifactVerificationResult:
-    """Accept only literals demonstrated in archived text; never Q2 context."""
-    original_texts = original_derived_texts or evidence_pack.original_derived_texts
-    chunks = {chunk.chunk_id: chunk for chunk in evidence_pack.chunks}
+    """Validate IOC shape and system-assigned provenance, not local evidence."""
     verified: list[ExtractionItem] = []
     diagnostics: list[ProposalDiagnostic] = []
     for submission in submissions:
-        chunk = chunks.get(submission.chunk_id)
         proposals: list[Q2FactProposal | Q2ArtifactProposal] = [
             *submission.output.facts,
             *submission.output.artifacts,
         ]
         for index, proposal in enumerate(proposals, start=1):
-            rejection = _rejection_reason(proposal, submission, chunk, original_texts)
+            rejection = _rejection_reason(proposal)
             if rejection is not None:
                 diagnostics.append(
                     ProposalDiagnostic(
@@ -114,8 +104,6 @@ def verify_q2_proposals(
                         index,
                         proposal_kind=_proposal_kind(proposal),
                         artifact_type=_artifact_type(proposal),
-                        source_document_id=submission.source_document_id,
-                        chunk_id=submission.chunk_id,
                         value_hash=_value_hash(proposal.value),
                         reason_code=rejection,
                     )
@@ -130,8 +118,6 @@ def verify_q2_proposals(
                         index,
                         proposal_kind=_proposal_kind(proposal),
                         artifact_type=_artifact_type(proposal),
-                        source_document_id=submission.source_document_id,
-                        chunk_id=submission.chunk_id,
                         value_hash=_value_hash(proposal.value),
                         reason_code="normalization_error",
                     )
@@ -143,8 +129,6 @@ def verify_q2_proposals(
                     index,
                     _proposal_kind(proposal),
                     _artifact_type(proposal),
-                    submission.source_document_id,
-                    submission.chunk_id,
                     _value_hash(proposal.value),
                 )
             )
@@ -163,35 +147,9 @@ def verify_q2_proposals(
 
 def _rejection_reason(
     proposal: Q2FactProposal | Q2ArtifactProposal,
-    submission: Q2ProposalSubmission,
-    chunk: EvidenceChunk | None,
-    original_texts: Mapping[str, str],
 ) -> str | None:
-    if submission.source_document_id not in original_texts:
-        return "source_not_found"
-    if chunk is None or str(chunk.source_document_id) != submission.source_document_id:
-        return "chunk_not_found"
-    if proposal.evidence_quote not in chunk.text:
-        return "evidence_quote_not_found"
-    if isinstance(proposal, Q2ArtifactProposal) and proposal.value not in proposal.evidence_quote:
-        return "value_not_in_quote"
-    if (
-        isinstance(proposal, Q2ArtifactProposal)
-        and proposal.indicator_status == IndicatorStatus.CONFIRMED_IOC.value
-        and not _confirmed_ioc_is_explicit(proposal, chunk)
-    ):
-        return "confirmed_ioc_not_explicit"
-    if (
-        isinstance(proposal, Q2ArtifactProposal)
-        and proposal.value not in original_texts[submission.source_document_id]
-    ):
-        return "literal_not_found"
-    if (
-        isinstance(proposal, Q2FactProposal)
-        and proposal.attack_id
-        and proposal.attack_id not in proposal.evidence_quote
-    ):
-        return "attack_id_not_in_quote"
+    if _is_placeholder(proposal.value):
+        return "redacted_placeholder"
     if isinstance(proposal, Q2ArtifactProposal):
         try:
             artifact_type = ArtifactType(proposal.artifact_type)
@@ -208,15 +166,9 @@ def _rejection_reason(
     return None
 
 
-def _confirmed_ioc_is_explicit(proposal: Q2ArtifactProposal, chunk: EvidenceChunk) -> bool:
-    """Confirming language must come from the archived source, never model context."""
-    proof = proposal.evidence_quote.casefold()
-    if re.search(
-        r"\b(ioc|indicator|compromise|malicious|c2|command[- ]and[- ]control|payload)\b", proof
-    ):
-        return True
-    title = (chunk.title or "").casefold()
-    return bool(re.search(r"\b(ioc|indicator|compromise)\b", title))
+def _is_placeholder(value: str) -> bool:
+    folded = value.casefold()
+    return bool(re.search(r"redacted|\bfuzz\b|<[^>]+>|example\.(?:com|org|net)", folded))
 
 
 def _to_item(
@@ -239,8 +191,6 @@ def _to_item(
             source_ids=submission.source_ids,
             supported=bool(submission.source_ids),
             evidence_quote=proposal.evidence_quote,
-            source_document_ids=(submission.source_document_id,),
-            chunk_ids=(submission.chunk_id,),
             model_run_ids=(submission.model_run_id,) if submission.model_run_id else (),
         )
     artifact_type = ArtifactType(proposal.artifact_type)
@@ -262,8 +212,6 @@ def _to_item(
         source_ids=submission.source_ids,
         supported=bool(submission.source_ids),
         evidence_quote=proposal.evidence_quote,
-        source_document_ids=(submission.source_document_id,),
-        chunk_ids=(submission.chunk_id,),
         model_run_ids=(submission.model_run_id,) if submission.model_run_id else (),
     )
 
@@ -387,10 +335,6 @@ def _merge_verified(items: Sequence[ExtractionItem]) -> tuple[list[ExtractionIte
                 status, allow_ioc=previous.semantic_type is SemanticType.INDICATOR
             ),
             source_ids=tuple(sorted(set(previous.source_ids + item.source_ids))),
-            source_document_ids=tuple(
-                sorted(set(previous.source_document_ids + item.source_document_ids))
-            ),
-            chunk_ids=tuple(sorted(set(previous.chunk_ids + item.chunk_ids))),
             model_run_ids=tuple(sorted(set(previous.model_run_ids + item.model_run_ids))),
             supported=previous.supported or item.supported,
         )

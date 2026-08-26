@@ -144,8 +144,6 @@ class ExtractionItem:
     display_policy: DisplayPolicy = DisplayPolicy.BODY_ONLY
     normalized_value: str | None = None
     evidence_quote: str = ""
-    source_document_ids: tuple[str, ...] = ()
-    chunk_ids: tuple[str, ...] = ()
     model_run_ids: tuple[str, ...] = ()
 
 
@@ -271,7 +269,9 @@ _ID_TOKEN = re.compile(r"[SR]\d{1,3}", re.IGNORECASE)
 
 def normalize_text(raw: str) -> str:
     """Strip an outer code fence and normalise whitespace oddities."""
-    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    # Markdown escaping may survive the bridge; unescape punctuation only, so
+    # Windows paths (``C:\\Windows``) stay untouched.
+    text = raw.replace("\r\n", "\n").replace("\r", "\n").replace("\\_", "_")
     for exotic in (_NBSP, _NARROW_NBSP):
         text = text.replace(exotic, " ")
     text = text.replace(_BOM, "")
@@ -492,7 +492,7 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
             result.dropped_blocks.append(block.raw())
             result.warnings.append("source_without_url_dropped")
             continue
-        raw_url, canonical = urls[0]
+        _raw_url, canonical = urls[0]
 
         auto_source += 1
         local_id = block.local_id
@@ -526,7 +526,10 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
             ParsedSource(
                 local_id=local_id,
                 title=(values.get("title") or values.get("titre") or "").strip(),
-                url=raw_url.strip(),
+                # Subject Production never exposes the model's tracking URL.
+                # The canonical URL is also the user-visible URL and the URL
+                # handed to Q2.
+                url=canonical,
                 canonical_url=canonical,
                 publisher=(values.get("publisher") or values.get("editeur") or "").strip() or None,
                 published_at=published_at,
@@ -1095,8 +1098,6 @@ def technical_extraction_to_json(extraction: TechnicalExtraction) -> dict[str, A
                 "display_policy": item.display_policy.value,
                 "normalized_value": item.normalized_value,
                 "evidence_quote": item.evidence_quote,
-                "source_document_ids": list(item.source_document_ids),
-                "chunk_ids": list(item.chunk_ids),
                 "model_run_ids": list(item.model_run_ids),
                 "attack_id": item.attack_id,
                 "reference_ids": list(item.reference_ids),
@@ -1146,8 +1147,6 @@ def technical_extraction_from_json(payload: dict[str, Any]) -> TechnicalExtracti
             or DisplayPolicy.BODY_ONLY,
             normalized_value=normalized,
             evidence_quote=item.get("evidence_quote", ""),
-            source_document_ids=tuple(item.get("source_document_ids", [])),
-            chunk_ids=tuple(item.get("chunk_ids", [])),
             model_run_ids=tuple(item.get("model_run_ids", [])),
         )
 

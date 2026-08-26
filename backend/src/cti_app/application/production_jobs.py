@@ -17,6 +17,7 @@ from cti_app.application.jobs import (
     JobService,
 )
 from cti_app.application.model_conversations import ModelConversationService
+from cti_app.application.model_gateway import ModelGateway
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
@@ -129,6 +130,7 @@ def register_production_jobs(
     *,
     chain: ProductionStageChain | None = None,
     model_service: ModelConversationService | None = None,
+    model_gateway: ModelGateway | None = None,
     collection_service: SubjectCollectionService | None = None,
     artifact_store: ProductionArtifactStore | None = None,
     diagnostics: DiagnosticsLog | None = None,
@@ -172,6 +174,7 @@ def register_production_jobs(
         orchestrator = ProductionWorkflowOrchestrator(
             uow_factory,
             model_service=model_service,
+            model_gateway=model_gateway,
             collection_service=collection_service,
             artifact_store=artifact_store,
             diagnostics=diagnostics,

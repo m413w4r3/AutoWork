@@ -50,6 +50,28 @@ def test_canonical_markdown_is_parsed() -> None:
     assert not result.errors
 
 
+def test_markdown_escapes_are_tolerated_without_touching_windows_paths() -> None:
+    text = """# FACT
+category: infection\\_chain
+value: C:\\Windows\\System32
+context: chemin observe
+evidence: chemin observe dans la source
+
+# ARTIFACT
+artifact-type: filepath
+value: C:\\inetpub\\wwwroot
+indicator-status: contextual
+context: repertoire observe
+evidence: tableau technique
+location: table
+"""
+    result = parse_q2_proposals_markdown(text)
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert result.value.facts[0].category == "infection_chain"
+    assert result.value.artifacts[0].value == r"C:\inetpub\wwwroot"
+
+
 def test_headings_without_hash_markers_are_recognized() -> None:
     """The bridge serialises the rendered DOM: headings routinely lose `#`."""
     text = """FACT
