@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.source_filenames import validate_logical_filename
 from cti_app.domain.blobs import BlobRecord, utc_now
-from cti_app.domain.entities import Sample, SourceDocument, Subject
+from cti_app.domain.entities import Sample, SampleOrigin, SampleState, SourceDocument, Subject
 from cti_app.domain.errors import EntityNotFoundError
 
 SUBJECT_DIRECTORIES = (
@@ -20,6 +20,7 @@ SUBJECT_DIRECTORIES = (
     "03_samples/original",
     "03_samples/manifests",
     "03_samples/quarantine",
+    "03_samples/benign",
     "04_hunt/queries",
     "04_hunt/raw_results",
     "04_hunt/review",
@@ -92,8 +93,13 @@ class SubjectWorkspaceMaterializer:
         sample_manifest = []
         for sample in samples:
             blob = self._require_blob(blobs, sample.blob_id)
-            relative_path = Path("03_samples/original") / blob.descriptor.sha256
-            method = await self._store.materialize(blob.descriptor, subject_path / relative_path)
+            relative_path = self._sample_relative_path(sample, blob.descriptor.sha256)
+            destination = subject_path / relative_path
+            if destination.parent.is_symlink() or not destination.parent.resolve().is_relative_to(
+                subject_path.resolve()
+            ):
+                raise ValueError("Sample materialization escaped the workspace")
+            method = await self._store.materialize(blob.descriptor, destination)
             sample_manifest.append(self._sample_manifest_entry(sample, blob, relative_path, method))
 
         manifest = {
@@ -191,7 +197,27 @@ class SubjectWorkspaceMaterializer:
             "tlp": asset.tlp.value,
             "do_not_submit": asset.do_not_submit,
             "external_llm_allowed": asset.external_llm_allowed,
+            "origin_kind": asset.origin_kind.value,
+            "state": asset.state.value,
         }
+
+    @staticmethod
+    def _sample_relative_path(sample: Sample, sha256: str) -> Path:
+        if sample.origin_kind in (SampleOrigin.SOURCE_SEED, SampleOrigin.VT_SEED):
+            bucket = (
+                "03_samples/original"
+                if sample.state is SampleState.VALIDATED
+                else "03_samples/quarantine"
+            )
+        elif (
+            sample.origin_kind is SampleOrigin.VT_HUNT_HIT and sample.state is SampleState.VALIDATED
+        ):
+            bucket = "04_hunt/validated/samples"
+        elif sample.origin_kind is SampleOrigin.BENIGN_REFERENCE:
+            bucket = "03_samples/benign"
+        else:
+            bucket = "03_samples/quarantine"
+        return Path(bucket) / sha256
 
     @staticmethod
     def _require_blob(blobs: Mapping[UUID, BlobRecord], blob_id: UUID) -> BlobRecord:

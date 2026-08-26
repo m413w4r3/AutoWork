@@ -1,6 +1,7 @@
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -92,6 +93,26 @@ class Sample:
     tlp: TLP
     do_not_submit: bool
     external_llm_allowed: bool
+    origin_kind: "SampleOrigin" = field(default_factory=lambda: SampleOrigin.SOURCE_SEED)
+    state: "SampleState" = field(default_factory=lambda: SampleState.VALIDATED)
+    source_service: str | None = None
+    source_object_id: str | None = None
+    expected_hash: str | None = None
+    validation_actor: str | None = None
+    validation_date: datetime | None = None
+    validation_reason: str | None = None
+    imphash: str | None = None
+    ssdeep: str | None = None
+    tlsh: str | None = None
+    rich_header_hash: str | None = None
+    vhash: str | None = None
+    main_icon_dhash: str | None = None
+    imphash_source: "SampleHashSource | None" = None
+    ssdeep_source: "SampleHashSource | None" = None
+    tlsh_source: "SampleHashSource | None" = None
+    rich_header_hash_source: "SampleHashSource | None" = None
+    vhash_source: "SampleHashSource | None" = None
+    main_icon_dhash_source: "SampleHashSource | None" = None
     id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=utc_now)
 
@@ -100,10 +121,34 @@ class Sample:
         _require_text(self.origin, "origin")
         _require_aware(self.acquired_at, "acquired_at")
         _require_aware(self.created_at, "created_at")
+        if self.validation_date is not None:
+            _require_aware(self.validation_date, "validation_date")
+        if self.expected_hash is not None and not re.fullmatch(r"[0-9a-f]{64}", self.expected_hash):
+            raise DomainError("expected_hash must be a lowercase SHA-256")
 
     def restrict_tlp(self, requested: TLP) -> None:
         ensure_tlp_not_downgraded(self.tlp, requested)
         self.tlp = requested
+
+
+class SampleOrigin(StrEnum):
+    SOURCE_SEED = "source_seed"
+    VT_SEED = "vt_seed"
+    VT_HUNT_HIT = "vt_hunt_hit"
+    BENIGN_REFERENCE = "benign_reference"
+    MANUAL = "manual"
+
+
+class SampleState(StrEnum):
+    QUARANTINED = "quarantined"
+    REVIEW_CANDIDATE = "review_candidate"
+    VALIDATED = "validated"
+    REJECTED = "rejected"
+
+
+class SampleHashSource(StrEnum):
+    LOCAL = "local"
+    VT = "vt"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -10,7 +10,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
-from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
+from cti_app.domain.entities import (
+    ProvenanceEvent,
+    Sample,
+    SampleHashSource,
+    SampleOrigin,
+    SampleState,
+    SourceDocument,
+    Subject,
+)
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 from cti_app.infrastructure.database.models.briefs import BriefEvidencePackRow
@@ -411,6 +419,30 @@ def _sample_to_row(sample: Sample) -> SampleRow:
         tlp=sample.tlp.value,
         do_not_submit=sample.do_not_submit,
         external_llm_allowed=sample.external_llm_allowed,
+        origin_kind=sample.origin_kind.value,
+        state=sample.state.value,
+        source_service=sample.source_service,
+        source_object_id=sample.source_object_id,
+        expected_hash=sample.expected_hash,
+        validation_actor=sample.validation_actor,
+        validation_date=sample.validation_date,
+        validation_reason=sample.validation_reason,
+        imphash=sample.imphash,
+        ssdeep=sample.ssdeep,
+        tlsh=sample.tlsh,
+        rich_header_hash=sample.rich_header_hash,
+        vhash=sample.vhash,
+        main_icon_dhash=sample.main_icon_dhash,
+        imphash_source=sample.imphash_source.value if sample.imphash_source else None,
+        ssdeep_source=sample.ssdeep_source.value if sample.ssdeep_source else None,
+        tlsh_source=sample.tlsh_source.value if sample.tlsh_source else None,
+        rich_header_hash_source=sample.rich_header_hash_source.value
+        if sample.rich_header_hash_source
+        else None,
+        vhash_source=sample.vhash_source.value if sample.vhash_source else None,
+        main_icon_dhash_source=sample.main_icon_dhash_source.value
+        if sample.main_icon_dhash_source
+        else None,
         created_at=sample.created_at,
     )
 
@@ -427,6 +459,30 @@ def _sample_from_row(row: SampleRow) -> Sample:
         tlp=TLP(row.tlp),
         do_not_submit=row.do_not_submit,
         external_llm_allowed=row.external_llm_allowed,
+        origin_kind=SampleOrigin(row.origin_kind),
+        state=SampleState(row.state),
+        source_service=row.source_service,
+        source_object_id=row.source_object_id,
+        expected_hash=row.expected_hash,
+        validation_actor=row.validation_actor,
+        validation_date=row.validation_date,
+        validation_reason=row.validation_reason,
+        imphash=row.imphash,
+        ssdeep=row.ssdeep,
+        tlsh=row.tlsh,
+        rich_header_hash=row.rich_header_hash,
+        vhash=row.vhash,
+        main_icon_dhash=row.main_icon_dhash,
+        imphash_source=SampleHashSource(row.imphash_source) if row.imphash_source else None,
+        ssdeep_source=SampleHashSource(row.ssdeep_source) if row.ssdeep_source else None,
+        tlsh_source=SampleHashSource(row.tlsh_source) if row.tlsh_source else None,
+        rich_header_hash_source=SampleHashSource(row.rich_header_hash_source)
+        if row.rich_header_hash_source
+        else None,
+        vhash_source=SampleHashSource(row.vhash_source) if row.vhash_source else None,
+        main_icon_dhash_source=SampleHashSource(row.main_icon_dhash_source)
+        if row.main_icon_dhash_source
+        else None,
         created_at=row.created_at,
     )
 

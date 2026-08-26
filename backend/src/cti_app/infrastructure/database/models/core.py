@@ -104,8 +104,22 @@ class SampleRow(Base):
     __tablename__ = "samples"
     __table_args__ = (
         CheckConstraint(f"tlp IN ({TLP_VALUES_SQL})", name="ck_samples_tlp"),
+        CheckConstraint(
+            "origin_kind IN ('source_seed','vt_seed','vt_hunt_hit','benign_reference','manual')",
+            name="ck_samples_origin_kind",
+        ),
+        CheckConstraint(
+            "state IN ('quarantined','review_candidate','validated','rejected')",
+            name="ck_samples_state",
+        ),
         Index("ix_samples_subject_id", "subject_id"),
         Index("ix_samples_blob_id", "blob_id"),
+        Index("ix_samples_imphash", "imphash"),
+        Index("ix_samples_ssdeep", "ssdeep"),
+        Index("ix_samples_tlsh", "tlsh"),
+        Index("ix_samples_rich_header_hash", "rich_header_hash"),
+        Index("ix_samples_vhash", "vhash"),
+        Index("ix_samples_main_icon_dhash", "main_icon_dhash"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -122,6 +136,26 @@ class SampleRow(Base):
     tlp: Mapped[str] = mapped_column(String(16), nullable=False)
     do_not_submit: Mapped[bool] = mapped_column(Boolean, nullable=False)
     external_llm_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    origin_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="source_seed")
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="validated")
+    source_service: Mapped[str | None] = mapped_column(Text)
+    source_object_id: Mapped[str | None] = mapped_column(Text)
+    expected_hash: Mapped[str | None] = mapped_column(String(64))
+    validation_actor: Mapped[str | None] = mapped_column(String(255))
+    validation_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    validation_reason: Mapped[str | None] = mapped_column(Text)
+    imphash: Mapped[str | None] = mapped_column(String(255))
+    ssdeep: Mapped[str | None] = mapped_column(String(255))
+    tlsh: Mapped[str | None] = mapped_column(String(255))
+    rich_header_hash: Mapped[str | None] = mapped_column(String(255))
+    vhash: Mapped[str | None] = mapped_column(String(255))
+    main_icon_dhash: Mapped[str | None] = mapped_column(String(255))
+    imphash_source: Mapped[str | None] = mapped_column(String(8))
+    ssdeep_source: Mapped[str | None] = mapped_column(String(8))
+    tlsh_source: Mapped[str | None] = mapped_column(String(8))
+    rich_header_hash_source: Mapped[str | None] = mapped_column(String(8))
+    vhash_source: Mapped[str | None] = mapped_column(String(8))
+    main_icon_dhash_source: Mapped[str | None] = mapped_column(String(8))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
@@ -167,9 +201,7 @@ class VirusTotalObservationRow(Base):
             ")",
             name="ck_vt_observation_capability",
         ),
-        CheckConstraint(
-            "raw_sha256 ~ '^[0-9a-f]{64}$'", name="ck_vt_observation_raw_sha256"
-        ),
+        CheckConstraint("raw_sha256 ~ '^[0-9a-f]{64}$'", name="ck_vt_observation_raw_sha256"),
         Index("ix_vt_observations_blob_id", "blob_id"),
         Index("ix_vt_observations_subject_id", "subject_id"),
         Index("ix_vt_observations_execution_id", "execution_id"),
