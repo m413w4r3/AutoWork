@@ -130,27 +130,6 @@ class RunControls(BaseModel):
         return {k: v for k, v in self.model_dump().items() if v is not None}
 
 
-class ConversationReleaseRequest(BaseModel):
-    """Only the client decides a conversation is done, and with what outcome."""
-
-    outcome: str = Field(..., pattern="^(success|failure|needs_review|cancelled)$")
-
-
-class ConversationLifecycleResponse(BaseModel):
-    conversation_id: str
-    policy: str
-    status: str
-    release_outcome: Optional[str] = None
-    created_at: float
-    updated_at: float
-    released_at: Optional[float] = None
-    deleted_at: Optional[float] = None
-    cleanup_attempt_count: int
-    last_cleanup_attempt_at: Optional[float] = None
-    last_cleanup_error_code: Optional[str] = None
-    version: int
-
-
 class ControlOutcome(BaseModel):
     """Résultat d'un contrôle, tel que le content script l'a *relu* dans le DOM."""
 
@@ -213,18 +192,3 @@ class RunReport(BaseModel):
     # `model_*` est un espace de noms réservé par pydantic ; ici ce sont bien
     # des champs de données, pas de la configuration.
     model_config = {"protected_namespaces": ()}
-
-
-class CleanupStartRequest(BaseModel):
-    pass
-
-
-class CleanupStartResponse(BaseModel):
-    conversation_id: str
-    status: str
-    cleanup_attempt_count: int
-
-
-class CleanupFailureRequest(BaseModel):
-    error_code: str = Field(..., pattern="^[a-z_]+$", max_length=64)
-    error_message: Optional[str] = None

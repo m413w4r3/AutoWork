@@ -149,8 +149,6 @@ async function connect() {
       handleConversationArchive(msg);
     } else if (msg.type === "recovery_capture") {
       handleRecoveryCapture(msg);
-    } else if (msg.type === "cleanup_conversation") {
-      handleCleanupConversation(msg);
     } else if (msg.type === "abort") {
       const tabId = inflight.get(msg.id);
       inflight.delete(msg.id);
@@ -192,48 +190,14 @@ async function handleRecoveryCapture(msg) {
   }
 }
 
-async function handleCleanupConversation(msg) {
-  let tab;
-  try {
-    tab = await resolveConversationTab({
-      mode: "continue",
-      id: msg.conversation_id,
-      external_locator: msg.external_locator,
-    });
-
-    const result = await sendToTab(tab.id, {
-      type: "delete_conversation",
-      id: msg.id,
-      conversation_id: msg.conversation_id,
-      external_locator: msg.external_locator,
-      timeout: msg.timeout || 30000,
-    });
-
-    send({
-      type: "cleanup_conversation",
-      id: msg.id,
-      success: result.success || false,
-      verified_deleted: result.verified_deleted || false,
-      error_code: result.error_code || null,
-      error_message: result.error_message || null,
-      steps_completed: result.steps_completed || [],
-    });
-  } catch (err) {
-    send({
-      type: "cleanup_conversation",
-      id: msg.id,
-      success: false,
-      verified_deleted: false,
-      error_code: "extension_error",
-      error_message: err.message,
-      steps_completed: [],
-    });
-  }
-}
-
 async function handleConversationArchive(msg) {
   await conversationRegistryReady;
   const known = conversationRegistry.get(msg.conversation_id);
+  console.log(
+    "🗂️ conversation_archive reçu — ferme l'onglet local (la conversation est en " +
+      "'Temporary chat', donc jamais écrite dans l'historique ChatGPT)",
+    { conversation_id: msg.conversation_id, tab_id: known?.tab_id ?? null }
+  );
   if (known?.tab_id) await chrome.tabs.remove(known.tab_id).catch(() => {});
   conversationRegistry.delete(msg.conversation_id);
   persistConversationRegistry();

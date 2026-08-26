@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "17";
+const VERSION = "18";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -93,26 +93,17 @@ const SELECTORS = {
     "button[aria-haspopup='menu'][aria-label*='Ajouter']",
   ],
 
-  // --- Cleanup : suppression de conversation --- //
-  // Bouton qui ouvre le menu contextuel d'une conversation (barre latérale gauche).
-  conversationOptionsButton: [
-    "button[data-testid='conversation-options-button']",
-    "button[aria-label='More']",
-    "button[aria-label='Options']",
+  // --- Conversation éphémère --- //
+  // Bascule « Temporary chat » : rend la conversation non sauvegardée dans
+  // l'historique ChatGPT, ce qui évite d'avoir à la supprimer après coup.
+  temporaryChatToggle: [
+    "button[aria-label='Temporary chat']",
+    "button[aria-label*='Temporary chat']",
+    "button[aria-label*='temporaire']",
   ],
-  deleteMenuItem: [
-    "button[data-testid='delete-conversation-button']",
-    "[role='menuitem']:contains('Delete')",
-    "div[role='menuitem']:contains('Delete')",
-  ],
-  confirmDeleteDialog: [
-    "div[role='dialog']",
-    "[role='alertdialog']",
-  ],
-  confirmDeleteButton: [
-    "button[data-testid='delete-conversation-confirm-button']",
-    "button[class*='btn-danger']",
-  ],
+  // Icône affichée quand la bascule est active (le second <use> de la paire
+  // superposée perd sa classe opacity-0).
+  temporaryChatCheckedIcon: ["use[href$='#chat-temp-checked']"],
 };
 
 // Libellés reconnus comme « recherche web » dans un menu d'outils (FR/EN).
@@ -1216,6 +1207,52 @@ function verifiedLocator() {
   return url.toString();
 }
 
+// Active la bascule « Temporary chat » sur une conversation neuve. Toute
+// conversation créée par le bridge doit être éphémère : c'est ce qui évite le
+// pipeline de suppression (jamais fiable en pratique — voir chatgpt-bridge/AGENTS.md,
+// section « Destructive actions »). Non bloquant : si le sélecteur ne trouve
+// rien, on logue bruyamment mais on laisse le prompt partir, plutôt que de
+// bloquer toute génération pour un changement d'UI côté OpenAI.
+async function ensureTemporaryChat() {
+  const toggle = $(SELECTORS.temporaryChatToggle);
+  if (!toggle) {
+    console.error(
+      "❌ Bouton 'Temporary chat' introuvable — la conversation NE sera PAS éphémère " +
+        "et restera dans l'historique ChatGPT tant que ce sélecteur n'est pas mis à jour.",
+    );
+    return false;
+  }
+
+  const isActive = () => {
+    const checkedIcon = toggle.querySelector(SELECTORS.temporaryChatCheckedIcon.join(", "));
+    const checkedSvg = checkedIcon?.closest("svg");
+    if (checkedSvg) return !checkedSvg.classList.contains("opacity-0");
+    return toggle.getAttribute("aria-pressed") === "true";
+  };
+
+  if (isActive()) {
+    console.log("🕶️ Temporary chat déjà actif sur cet onglet");
+    return true;
+  }
+
+  toggle.click();
+  try {
+    await waitFor(
+      () => (isActive() ? true : null),
+      3000,
+      "activation de 'Temporary chat' non confirmée",
+    );
+    console.log("🕶️ Temporary chat activé — conversation éphémère (aucun historique ChatGPT)");
+    return true;
+  } catch (err) {
+    console.error(
+      "❌ Clic sur 'Temporary chat' envoyé mais l'activation n'a pas pu être confirmée : " +
+        err.message,
+    );
+    return false;
+  }
+}
+
 async function handlePrompt({
   id,
   prompt,
@@ -1247,6 +1284,12 @@ async function handlePrompt({
       }
       await sleep(1200);
     }
+
+    // Toute conversation neuve créée par le bridge (newChat explicite, ou
+    // conversation.mode === "fresh" — un onglet chatgpt.com/ vierge ouvert par
+    // background.js) doit être éphémère : voir ensureTemporaryChat() ci-dessus.
+    const wantsEphemeral = Boolean(newChat) || conversation?.mode === "fresh";
+    const ephemeralApplied = wantsEphemeral ? await ensureTemporaryChat() : null;
 
     const composer = await waitFor(
       () => $(SELECTORS.composer),
@@ -1297,6 +1340,7 @@ async function handlePrompt({
             : null,
           verified: true,
           verified_at: new Date().toISOString(),
+          ephemeral: ephemeralApplied,
         },
       });
     }
@@ -1406,199 +1450,6 @@ async function captureLaterResponse(msg) {
   };
 }
 
-// --------------------------------------------------------------------------- //
-// Conversation cleanup
-// --------------------------------------------------------------------------- //
-
-async function deleteConversation(conversationId, externalLocator, options = {}) {
-  const menuTimeout = options.menuTimeout || 5000;
-  const dialogTimeout = options.dialogTimeout || 5000;
-  const verifyTimeout = options.verifyTimeout || 10000;
-  const steps = [];
-
-  try {
-    const currentUrl = window.location.href;
-    if (currentUrl !== externalLocator) {
-      return {
-        success: false,
-        conversation_id: conversationId,
-        verified_deleted: false,
-        error_code: "locator_mismatch",
-        error_message: `Current URL (${currentUrl}) does not match expected locator (${externalLocator})`,
-        steps_completed: steps,
-      };
-    }
-    steps.push("locator_verified");
-
-    const menuButton = $(SELECTORS.conversationOptionsButton);
-    if (!menuButton) {
-      return {
-        success: false,
-        conversation_id: conversationId,
-        verified_deleted: false,
-        error_code: "conversation_menu_not_found",
-        error_message: "Cannot find conversation options button",
-        steps_completed: steps,
-      };
-    }
-    steps.push("found_menu_button");
-
-    menuButton.click();
-    let menuElement = null;
-    try {
-      menuElement = await waitFor(
-        () => {
-          for (const sel of SELECTORS.menu) {
-            const menus = document.querySelectorAll(sel);
-            for (const m of menus) {
-              if (m.offsetParent !== null && m.getClientRects().length > 0) {
-                return m;
-              }
-            }
-          }
-          return null;
-        },
-        menuTimeout,
-        "Timeout waiting for menu to open"
-      );
-    } catch (err) {
-      return {
-        success: false,
-        conversation_id: conversationId,
-        verified_deleted: false,
-        error_code: "menu_open_timeout",
-        error_message: err.message,
-        steps_completed: steps,
-      };
-    }
-    steps.push("menu_opened");
-
-    let deleteItem = null;
-    for (const sel of SELECTORS.deleteMenuItem) {
-      if (sel.includes("contains")) {
-        // Sélecteur contenant ":contains" — ne pas supporter XPath, chercher manuellement
-        const items = menuElement.querySelectorAll("[role='menuitem'], div[role='menuitem']");
-        for (const item of items) {
-          if (item.textContent && item.textContent.includes("Delete")) {
-            deleteItem = item;
-            break;
-          }
-        }
-      } else {
-        deleteItem = menuElement.querySelector(sel);
-        if (deleteItem) break;
-      }
-      if (deleteItem) break;
-    }
-
-    if (!deleteItem) {
-      closeMenu(menuElement);
-      return {
-        success: false,
-        conversation_id: conversationId,
-        verified_deleted: false,
-        error_code: "delete_action_not_found",
-        error_message: "Cannot find 'Delete' option in conversation menu",
-        steps_completed: steps,
-      };
-    }
-    steps.push("found_delete_item");
-
-    deleteItem.click();
-    await sleep(200);
-
-    let confirmDialog = null;
-    try {
-      confirmDialog = await waitFor(
-        () => {
-          for (const sel of SELECTORS.confirmDeleteDialog) {
-            const dialog = document.querySelector(sel);
-            if (dialog && dialog.offsetParent !== null && dialog.getClientRects().length > 0) {
-              return dialog;
-            }
-          }
-          return null;
-        },
-        dialogTimeout,
-        "Timeout waiting for confirmation dialog"
-      );
-    } catch (err) {
-      return {
-        success: false,
-        conversation_id: conversationId,
-        verified_deleted: false,
-        error_code: "confirm_dialog_timeout",
-        error_message: err.message,
-        steps_completed: steps,
-      };
-    }
-    steps.push("confirm_dialog_opened");
-
-    let confirmButton = null;
-    for (const sel of SELECTORS.confirmDeleteButton) {
-      confirmButton = confirmDialog.querySelector(sel);
-      if (confirmButton) break;
-    }
-
-    if (!confirmButton) {
-      return {
-        success: false,
-        conversation_id: conversationId,
-        verified_deleted: false,
-        error_code: "confirm_button_not_found",
-        error_message: "Cannot find confirmation delete button",
-        steps_completed: steps,
-      };
-    }
-    steps.push("found_confirm_button");
-
-    confirmButton.click();
-    steps.push("clicked_confirm");
-
-    let verifiedDeleted = false;
-    try {
-      await waitFor(
-        () => {
-          for (const sel of SELECTORS.confirmDeleteDialog) {
-            const dialog = document.querySelector(sel);
-            if (!dialog || dialog.offsetParent === null) {
-              return true;
-            }
-          }
-          return null;
-        },
-        verifyTimeout,
-        "Timeout verifying deletion"
-      );
-      verifiedDeleted = true;
-      steps.push("deletion_verified");
-    } catch (err) {
-      // La dialog peut ne pas disparaître immédiatement sur toutes les UI
-      // Mais l'absence de message d'erreur suggère le succès
-      if (confirmDialog && !confirmDialog.querySelector("[role='alert']")) {
-        verifiedDeleted = true;
-        steps.push("deletion_verified_no_error");
-      }
-    }
-
-    return {
-      success: true,
-      conversation_id: conversationId,
-      verified_deleted: verifiedDeleted,
-      steps_completed: steps,
-    };
-  } catch (err) {
-    return {
-      success: false,
-      conversation_id: conversationId,
-      verified_deleted: false,
-      error_code: "internal_error",
-      error_message: err.message,
-      steps_completed: steps,
-    };
-  }
-}
-
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "ui_state" || msg?.type === "ui_control") {
     // Requête/réponse : le service worker attend la valeur, d'où le `return true`
@@ -1608,14 +1459,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg?.type === "recovery_capture") {
     captureLaterResponse(msg).then(sendResponse);
-    return true;
-  }
-  if (msg?.type === "delete_conversation") {
-    deleteConversation(msg.conversation_id, msg.external_locator, {
-      menuTimeout: msg.timeout ? msg.timeout * 0.3 : 5000,
-      dialogTimeout: msg.timeout ? msg.timeout * 0.3 : 5000,
-      verifyTimeout: msg.timeout ? msg.timeout * 0.4 : 10000,
-    }).then(sendResponse);
     return true;
   }
   if (msg?.type === "prompt") {

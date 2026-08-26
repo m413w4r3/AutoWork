@@ -24,10 +24,6 @@ from bridge.config import (
     SHUTDOWN_GRACE_SECONDS,
     WS_TOKEN,
 )
-from bridge.lifecycle import (
-    CleanupWorker,
-    ConversationSweeper,
-)
 from bridge.registry import RunRegistry
 from bridge.routes_bridge import BridgeRoutes
 from bridge.routes_conversations import ConversationRoutes
@@ -58,8 +54,6 @@ class BridgeApplication:
         self.registry = registry or RunRegistry(RUN_DB_PATH)
 
         self.accepting_runs = True
-        self.cleanup_worker: Optional[CleanupWorker] = None
-        self.conversation_sweeper: Optional[ConversationSweeper] = None
 
         self.app = FastAPI(
             title="ChatGPT Mini-Bridge", version="1.0.0", lifespan=self.lifespan
@@ -67,7 +61,6 @@ class BridgeApplication:
 
         self.conversation_routes = ConversationRoutes(
             bridge=self.bridge,
-            registry=self.registry,
             auth_dependency=self.require_key,
         )
         self.app.include_router(self.conversation_routes.router)
@@ -93,10 +86,6 @@ class BridgeApplication:
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/ready", self.ready, methods=["GET"])
         self.app.add_exception_handler(HTTPException, self.openai_error)
-
-    # ----------------------------------------------------------------- #
-    # Conversation cleanup
-    # ----------------------------------------------------------------- #
 
     async def keepalive_loop(self) -> None:
         """Ping périodique : réveille le service worker MV3 et détecte les sockets morts."""
@@ -162,22 +151,11 @@ class BridgeApplication:
         self.registry.recover_interrupted()
         self.registry.cleanup()
 
-        self.cleanup_worker = CleanupWorker(self.registry, self.bridge)
-        self.conversation_sweeper = ConversationSweeper(self.registry, self.cleanup_worker)
-
-        # Reprend les DELETE_PENDING laissés par un arrêt précédent.
-        try:
-            await self.conversation_sweeper.sweep()
-        except Exception as e:
-            logger.error(f"Initial cleanup sweep failed: {e}", exc_info=True)
-
-        sweep_task = asyncio.create_task(self._periodic_cleanup_retry(self.conversation_sweeper))
-
         configuration = self._configuration_state()
         registry_state = "accessible" if self.registry.accessible() else "unavailable"
         logger.info(
             "bridge_started host=%s port=%s http_auth=%s websocket_token=%s "
-            "sqlite_registry=%s extension=disconnected cleanup_worker=active",
+            "sqlite_registry=%s extension=disconnected",
             HOST,
             PORT,
             configuration["http_auth"],
@@ -188,19 +166,8 @@ class BridgeApplication:
             yield
         finally:
             task.cancel()
-            sweep_task.cancel()
-            await asyncio.gather(task, sweep_task, return_exceptions=True)
+            await asyncio.gather(task, return_exceptions=True)
             await self.shutdown_bridge()
-
-    async def _periodic_cleanup_retry(self, sweeper: ConversationSweeper):
-        while True:
-            try:
-                await asyncio.sleep(300)
-                await sweeper.retry_failed()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Periodic cleanup retry error: {e}", exc_info=True)
 
     # ----------------------------------------------------------------- #
     # Auth

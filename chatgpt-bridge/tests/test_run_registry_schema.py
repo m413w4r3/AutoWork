@@ -58,28 +58,6 @@ class TestFreshSchema:
 
         assert "needs_review" in table_sql
 
-    def test_bridge_conversations_table_exists(self, temp_db):
-        RunRegistry(temp_db)
-
-        with sqlite3.connect(temp_db) as db:
-            columns = {row[1] for row in db.execute("PRAGMA table_info(bridge_conversations)")}
-
-        assert columns == {
-            "id",
-            "external_locator",
-            "policy",
-            "status",
-            "release_outcome",
-            "created_at",
-            "updated_at",
-            "released_at",
-            "deleted_at",
-            "cleanup_attempt_count",
-            "last_cleanup_attempt_at",
-            "last_cleanup_error_code",
-            "version",
-        }
-
     def test_no_legacy_table_created(self, temp_db):
         RunRegistry(temp_db)
 
