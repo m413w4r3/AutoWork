@@ -153,13 +153,7 @@ function groupExtractionItems(
     grouped.set(identity, {
       ...existing,
       indicator_status: sameStatus ? existing.indicator_status : "contextual",
-      source_document_ids: unique([
-        ...existing.source_document_ids,
-        ...item.source_document_ids,
-      ]),
-      chunk_ids: unique([...existing.chunk_ids, ...item.chunk_ids]),
       source_ids: unique([...existing.source_ids, ...item.source_ids]),
-      reference_ids: unique([...existing.reference_ids, ...item.reference_ids]),
       evidence_quotes: unique([
         ...existing.evidence_quotes,
         ...(item.evidence_quote ? [item.evidence_quote] : []),
@@ -178,6 +172,7 @@ function EvidenceItem({ item }: { item: GroupedExtractionItem }) {
   return (
     <li className="extraction-item">
       <code>{item.value}</code>
+      <p className="extraction-item__context">{item.context}</p>
       <dl>
         <div>
           <dt>Type</dt>
@@ -194,12 +189,8 @@ function EvidenceItem({ item }: { item: GroupedExtractionItem }) {
           <dd>{item.source_ids.join(", ") || "—"}</dd>
         </div>
         <div>
-          <dt>Document</dt>
-          <dd>{item.source_document_ids.join(", ") || "—"}</dd>
-        </div>
-        <div>
-          <dt>Preuves</dt>
-          <dd>{item.evidence_quotes.length || item.chunk_ids.length}</dd>
+          <dt>Sources</dt>
+          <dd>{item.source_ids.length}</dd>
         </div>
       </dl>
       {item.evidence_quotes.map((quote) => (
@@ -232,43 +223,7 @@ function ExtractionSection({
   );
 }
 
-interface RejectedProposal {
-  proposal_index: number;
-  proposal_kind: string;
-  artifact_type: string | null;
-  source_document_id: string;
-  chunk_id: string;
-  reason_code: string | null;
-}
-
-function rejectedProposals(
-  metadata: Record<string, unknown>,
-): RejectedProposal[] {
-  const verification = metadata.deterministic_verification;
-  if (typeof verification !== "object" || verification === null) return [];
-  const diagnostics = (verification as Record<string, unknown>)
-    .q2_proposal_diagnostics;
-  if (!Array.isArray(diagnostics)) return [];
-  return diagnostics.filter(
-    (entry): entry is RejectedProposal =>
-      typeof entry === "object" &&
-      entry !== null &&
-      (entry as Record<string, unknown>).status === "rejected" &&
-      typeof (entry as Record<string, unknown>).proposal_index === "number" &&
-      typeof (entry as Record<string, unknown>).proposal_kind === "string" &&
-      typeof (entry as Record<string, unknown>).source_document_id ===
-        "string" &&
-      typeof (entry as Record<string, unknown>).chunk_id === "string",
-  );
-}
-
-function ExtractionPreview({
-  document,
-  metadata,
-}: {
-  document: ExtractionDocumentV2;
-  metadata: Record<string, unknown>;
-}) {
+function ExtractionPreview({ document }: { document: ExtractionDocumentV2 }) {
   const items = groupExtractionItems(document.items);
   const confirmedIocs = items.filter(
     (item) =>
@@ -287,7 +242,6 @@ function ExtractionPreview({
       !filesAndCves.includes(item) &&
       !rules.includes(item),
   );
-  const rejected = rejectedProposals(metadata);
 
   return (
     <article className="extraction-preview">
@@ -304,53 +258,6 @@ function ExtractionPreview({
             ))}
           </ul>
         </section>
-      )}
-      {rejected.length > 0 && (
-        <details className="extraction-diagnostics">
-          <summary>
-            Diagnostic — {rejected.length} proposition(s) rejetée(s)
-          </summary>
-          <ul>
-            {rejected.map((proposal) => (
-              <li key={`${proposal.proposal_index}:${proposal.chunk_id}`}>
-                <strong>Proposition {proposal.proposal_index}</strong> — valeur
-                non conservée
-                <dl>
-                  <div>
-                    <dt>Type</dt>
-                    <dd>
-                      {TYPE_LABELS[proposal.artifact_type ?? ""] ??
-                        proposal.artifact_type ??
-                        proposal.proposal_kind}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Statut</dt>
-                    <dd>REJECTED</dd>
-                  </div>
-                  <div>
-                    <dt>S#</dt>
-                    <dd>—</dd>
-                  </div>
-                  <div>
-                    <dt>Document</dt>
-                    <dd>{proposal.source_document_id}</dd>
-                  </div>
-                  <div>
-                    <dt>Preuves</dt>
-                    <dd>1 segment ({proposal.chunk_id})</dd>
-                  </div>
-                  {proposal.reason_code && (
-                    <div>
-                      <dt>Motif</dt>
-                      <dd>{proposal.reason_code}</dd>
-                    </div>
-                  )}
-                </dl>
-              </li>
-            ))}
-          </ul>
-        </details>
       )}
     </article>
   );
@@ -486,10 +393,7 @@ export function ProductionArtifactView({
 
       {stage === "extraction" &&
         isExtractionDocument(artifact.canonical_content) && (
-          <ExtractionPreview
-            document={artifact.canonical_content}
-            metadata={artifact.metadata}
-          />
+          <ExtractionPreview document={artifact.canonical_content} />
         )}
 
       {stage === "brief" && artifact.rendered_content && (

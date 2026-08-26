@@ -95,13 +95,7 @@ export interface ExtractionItemV2 {
   display_policy: "ioc_section" | "body_only" | "both" | "hidden";
   normalized_value: string | null;
   evidence_quote: string | null;
-  source_document_ids: string[];
-  chunk_ids: string[];
-  model_run_ids: string[];
-  attack_id: string | null;
-  reference_ids: string[];
   source_ids: string[];
-  supported: boolean;
 }
 
 export interface ExtractionDocumentV2 {

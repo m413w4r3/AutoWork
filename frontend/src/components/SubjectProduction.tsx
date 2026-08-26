@@ -27,9 +27,30 @@ const STATUS_LABELS: Record<string, string> = {
 const STAGE_LABELS: Record<string, string> = {
   sources: "Sources",
   references: "Références",
-  extraction: "Extraction CTI",
+  extraction: "Extraction",
   synthesis: "Synthèse",
-  assembly: "Brève",
+  assembly: "Assemblage",
+};
+
+const RETRY_STAGES = [
+  "sources",
+  "references",
+  "extraction",
+  "synthesis",
+  "assembly",
+] as const;
+type RetryStage = (typeof RETRY_STAGES)[number];
+
+const RETRY_DESCRIPTIONS: Record<RetryStage, string> = {
+  sources: "Les sources et toutes les étapes suivantes seront recalculées.",
+  references:
+    "Les références et toutes les étapes suivantes seront recalculées. Les sources existantes seront conservées.",
+  extraction:
+    "L’extraction et toutes les étapes suivantes seront recalculées. Les références existantes seront conservées.",
+  synthesis:
+    "La synthèse et toutes les étapes suivantes seront recalculées. Les références existantes seront conservées.",
+  assembly:
+    "L’assemblage sera recalculé. Les références existantes seront conservées.",
 };
 
 const CONVERSATION_ERROR_CODES = new Set([
@@ -96,8 +117,7 @@ export function SubjectProduction({
   });
 
   const retryStageMutation = useMutation({
-    mutationFn: (stage: "sources" | "references" | "extraction" | "synthesis" | "assembly") =>
-      retryProductionStage(subjectId, stage),
+    mutationFn: (stage: RetryStage) => retryProductionStage(subjectId, stage),
     onSuccess: () => refetch(),
   });
 
@@ -161,13 +181,7 @@ export function SubjectProduction({
     );
   }
 
-  const stageList = [
-    "sources",
-    "references",
-    "extraction",
-    "synthesis",
-    "assembly",
-  ];
+  const stageList = [...RETRY_STAGES];
   // Warnings are recoveries the parser made: worth showing, never blocking.
   const warnings = status.warnings ?? [];
 
@@ -182,6 +196,18 @@ export function SubjectProduction({
   const completedStages = stageList.filter(
     (stage) => stages[stage]?.status === "succeeded",
   ).length;
+  const issueStageIndex = RETRY_STAGES.indexOf(
+    status.current_stage as RetryStage,
+  );
+  const retryStages: readonly RetryStage[] =
+    status.status === "ready"
+      ? RETRY_STAGES
+      : showIssue && issueStageIndex >= 0
+        ? RETRY_STAGES.slice(0, issueStageIndex + 1)
+        : [];
+  const issueRetryStage = showIssue
+    ? (status.current_stage as RetryStage)
+    : null;
 
   return (
     <section className="production-panel">
@@ -261,6 +287,7 @@ export function SubjectProduction({
             {issueCopy(status.status, issueCode)}
           </p>
           <p>Code : {issueCode ?? "inconnu"}</p>
+          {issueStage?.error_message ? <p>{issueStage.error_message}</p> : null}
           {issueIsConversation &&
           (status.references_conversation_id ||
             status.synthesis_conversation_id) ? (
@@ -275,9 +302,36 @@ export function SubjectProduction({
         </div>
       )}
 
+      {showIssue &&
+        issueRetryStage &&
+        retryStages.includes(issueRetryStage) && (
+          <div className="production-retry-primary">
+            <p>
+              <strong>Relancer depuis {STAGE_LABELS[issueRetryStage]}</strong>
+              <br />
+              {RETRY_DESCRIPTIONS[issueRetryStage]}
+            </p>
+            <button
+              className="button"
+              onClick={() => retryStageMutation.mutate(issueRetryStage)}
+              disabled={retryStageMutation.isPending}
+            >
+              {retryStageMutation.isPending
+                ? "Relance…"
+                : "Relancer cette étape"}
+            </button>
+          </div>
+        )}
+
       {showIssue && startMutation.error ? (
         <p className="error-message" role="alert">
           {String(startMutation.error)}
+        </p>
+      ) : null}
+
+      {retryStageMutation.error ? (
+        <p className="error-message" role="alert">
+          La relance n’a pas pu démarrer : {String(retryStageMutation.error)}
         </p>
       ) : null}
 
@@ -290,19 +344,45 @@ export function SubjectProduction({
       )}
 
       <div className="production-actions">
-        {["ready", "failed", "needs_review"].includes(status.status) && (
-          <>
-            {(["sources", "references", "extraction", "synthesis", "assembly"] as const).map((stage) => (
-              <button
-                key={stage}
-                className={stage === "sources" ? "button" : "button button--secondary"}
-                onClick={() => retryStageMutation.mutate(stage)}
-                disabled={retryStageMutation.isPending}
-              >
-                {retryStageMutation.isPending ? "Relance…" : `Relancer : ${STAGE_LABELS[stage]}`}
-              </button>
-            ))}
-          </>
+        {status.status === "ready" && (
+          <label>
+            Relancer depuis…
+            <select
+              aria-label="Relancer depuis une étape"
+              defaultValue=""
+              onChange={(event) => {
+                const stage = event.target.value as RetryStage;
+                if (stage) retryStageMutation.mutate(stage);
+              }}
+              disabled={retryStageMutation.isPending}
+            >
+              <option value="">Choisir une étape</option>
+              {retryStages.map((stage) => (
+                <option key={stage} value={stage}>
+                  {STAGE_LABELS[stage]}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        {showIssue && retryStages.length > 1 && (
+          <details>
+            <summary>Relancer depuis une étape précédente</summary>
+            <div>
+              {retryStages
+                .filter((stage) => stage !== issueRetryStage)
+                .map((stage) => (
+                  <button
+                    key={stage}
+                    className="button button--secondary"
+                    onClick={() => retryStageMutation.mutate(stage)}
+                    disabled={retryStageMutation.isPending}
+                  >
+                    Relancer depuis {STAGE_LABELS[stage]}
+                  </button>
+                ))}
+            </div>
+          </details>
         )}
 
         {status.status === "running" && (
@@ -322,16 +402,20 @@ export function SubjectProduction({
         )}
       </div>
 
-      <div className="production-meta">
-        <p>Identifiant du run : {status.run_id}</p>
-        <p>Créé : {new Date(status.created_at).toLocaleString()}</p>
-        {status.started_at && (
-          <p>Démarré : {new Date(status.started_at).toLocaleString()}</p>
-        )}
-        {status.finished_at && (
-          <p>Terminé : {new Date(status.finished_at).toLocaleString()}</p>
-        )}
-      </div>
+      <details className="production-diagnostics">
+        <summary>Diagnostic</summary>
+        <div className="production-meta">
+          <p>Identifiant du run : {status.run_id}</p>
+          <p>Créé : {new Date(status.created_at).toLocaleString()}</p>
+          {status.started_at && (
+            <p>Démarré : {new Date(status.started_at).toLocaleString()}</p>
+          )}
+          {status.finished_at && (
+            <p>Terminé : {new Date(status.finished_at).toLocaleString()}</p>
+          )}
+          <p>Tentative pipeline : {status.pipeline_generation}</p>
+        </div>
+      </details>
     </section>
   );
 }
