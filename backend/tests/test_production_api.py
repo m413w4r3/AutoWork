@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import AsyncIterator, Sequence
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -31,6 +32,7 @@ from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
     ProductionArtifact,
+    ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionProfile,
     SubjectProductionRun,
@@ -181,6 +183,37 @@ class _Artifacts:
             if artifact.production_run_id == run_id and artifact.stage.value in downstream:
                 artifact.status = ProductionArtifactStatus.STALE
 
+    async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]:
+        """Mirror the SQL repository's selected-stage-plus-downstream semantics."""
+        pipeline = ["sources", "references", "extraction", "synthesis", "assembly"]
+        artifact_stages = {
+            "references": "references",
+            "extraction": "extraction",
+            "synthesis": "synthesis",
+            "assembly": "brief",
+        }
+        if stage not in pipeline:
+            return []
+        affected = [
+            artifact_stages[item]
+            for item in pipeline[pipeline.index(stage) :]
+            if item in artifact_stages
+        ]
+        for artifact in self.items:
+            if (
+                artifact.production_run_id == run_id
+                and artifact.stage.value in affected
+                and artifact.status is not ProductionArtifactStatus.STALE
+            ):
+                artifact.status = ProductionArtifactStatus.STALE
+        return affected
+
+
+class _SourceCollections:
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[SimpleNamespace]:
+        del subject_id
+        return [SimpleNamespace(state=SimpleNamespace(value="archived"))]
+
 
 class _Uow:
     """Single shared in-memory unit of work; commit is a no-op."""
@@ -191,6 +224,7 @@ class _Uow:
         self.edition_production_batches = _Batches()
         self.edition_production_batch_items = _BatchItems()
         self.production_artifacts = _Artifacts()
+        self.source_collections = _SourceCollections()
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -491,9 +525,7 @@ async def test_start_production_after_failure_creates_a_new_run(
     assert len(dispatcher.dispatched) == 1
 
 
-async def test_save_brief_draft_appends_artifact_versions(
-    api: AsyncClient, uow: _Uow
-) -> None:
+async def test_save_brief_draft_appends_artifact_versions(api: AsyncClient, uow: _Uow) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
     run = SubjectProductionRun(
@@ -530,7 +562,122 @@ def _ready_run(edition_id: UUID, subject_id: UUID, *, run_number: int = 1) -> Su
     return run
 
 
+def _artifact(run: SubjectProductionRun, stage: ProductionArtifactStage) -> ProductionArtifact:
+    return ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=run.subject_id,
+        stage=stage,
+        version=1,
+        input_hash="a" * 64,
+    )
 
 
+@pytest.mark.parametrize(
+    ("initial_status", "stage", "expected_stale"),
+    (
+        (
+            SubjectProductionStatus.READY,
+            SubjectProductionStage.SOURCES,
+            ["references", "extraction", "synthesis", "brief"],
+        ),
+        (
+            SubjectProductionStatus.READY,
+            SubjectProductionStage.REFERENCES,
+            ["references", "extraction", "synthesis", "brief"],
+        ),
+        (
+            SubjectProductionStatus.READY,
+            SubjectProductionStage.EXTRACTION,
+            ["extraction", "synthesis", "brief"],
+        ),
+        (SubjectProductionStatus.READY, SubjectProductionStage.SYNTHESIS, ["synthesis", "brief"]),
+        (SubjectProductionStatus.READY, SubjectProductionStage.ASSEMBLY, ["brief"]),
+        (
+            SubjectProductionStatus.FAILED,
+            SubjectProductionStage.EXTRACTION,
+            ["extraction", "synthesis", "brief"],
+        ),
+        (
+            SubjectProductionStatus.NEEDS_REVIEW,
+            SubjectProductionStage.EXTRACTION,
+            ["extraction", "synthesis", "brief"],
+        ),
+    ),
+)
+async def test_retry_stage_reuses_run_and_stales_selected_stage_and_downstream(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+    initial_status: SubjectProductionStatus,
+    stage: SubjectProductionStage,
+    expected_stale: list[str],
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    run = SubjectProductionRun(
+        subject_id=subject_id, edition_id=edition_id, profile=ProductionProfile.BRIEF_AUTO
+    )
+    run.start_running()
+    run.current_stage = SubjectProductionStage.ASSEMBLY
+    if initial_status is SubjectProductionStatus.READY:
+        run.mark_ready()
+    elif initial_status is SubjectProductionStatus.FAILED:
+        run.mark_failed(code="extraction_failed", message="failed")
+    else:
+        run.mark_needs_review(code="extraction_review", message="review")
+    await uow.subject_production_runs.add(run)
+    for artifact_stage in ProductionArtifactStage:
+        await uow.production_artifacts.append(_artifact(run, artifact_stage))
+
+    response = await api.post(
+        f"/api/subjects/{subject_id}/production/retry", json={"stage": stage.value}
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["run_id"] == str(run.id)
+    assert body["pipeline_generation"] == 1
+    persisted = uow.subject_production_runs.items[run.id]
+    assert persisted.current_stage is stage
+    assert persisted.status is SubjectProductionStatus.RUNNING
+    assert body["staled_artifacts"] == expected_stale
+    stale = {
+        item.stage.value
+        for item in uow.production_artifacts.items
+        if item.status is ProductionArtifactStatus.STALE
+    }
+    assert stale == set(expected_stale)
+    assert all(
+        item.status is ProductionArtifactStatus.VERIFIED
+        for item in uow.production_artifacts.items
+        if item.stage.value not in expected_stale
+    )
+    job = production_app.state.job_service.submitted[-1]
+    expected_kind = (
+        "production.subject.assemble"
+        if stage is SubjectProductionStage.ASSEMBLY
+        else f"production.subject.{stage.value}"
+    )
+    assert job["kind"] == expected_kind
+    assert job["idempotency_key"] == f"production-{stage.value}-{run.id}-g1"
+    assert job["max_attempts"] == 3
 
 
+@pytest.mark.parametrize(
+    "status", (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING)
+)
+async def test_retry_stage_rejects_queued_or_running_run(
+    api: AsyncClient, uow: _Uow, status: SubjectProductionStatus
+) -> None:
+    run = SubjectProductionRun(
+        subject_id=uuid4(), edition_id=uuid4(), profile=ProductionProfile.BRIEF_AUTO
+    )
+    if status is SubjectProductionStatus.RUNNING:
+        run.start_running()
+    await uow.subject_production_runs.add(run)
+
+    response = await api.post(
+        f"/api/subjects/{run.subject_id}/production/retry", json={"stage": "extraction"}
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "retry_not_allowed_while_running"

@@ -57,7 +57,6 @@ from cti_app.application.production_stages import (
     SynthesisService,
     compute_input_hash,
 )
-from cti_app.application.source_evidence_processing import SourceEvidenceProcessingService
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
@@ -81,10 +80,9 @@ _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 
 # Version routing decision separately from prompt/schema: changing provider policy
 # must produce a distinct persisted Q2 checkpoint.
-# "2": Q2 moved off the OpenAI structured-output contract onto free-text GPT
-# via the ChatGPT bridge + a permissive Markdown parser (P23.7). Qwen structured
-# output remains available outside production/benchmark but is no longer the
-# default Q2 provider.
+# "3": Q2 is one direct, web-enabled ModelGateway request per Q1 source.
+# Its deterministic ModelRun identity includes this routing policy, so changing
+# that policy creates a fresh checkpoint without conversations or repair turns.
 Q2_ROUTING_POLICY_VERSION = "3"
 
 
@@ -141,7 +139,6 @@ class ProductionWorkflowOrchestrator:
         collection_service: SubjectCollectionService | None = None,
         artifact_store: ProductionArtifactStore | None = None,
         diagnostics: DiagnosticsLog | None = None,
-        source_evidence_processor: SourceEvidenceProcessingService | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._model_service = model_service
@@ -149,7 +146,6 @@ class ProductionWorkflowOrchestrator:
         self._collection_service = collection_service
         self._artifact_store = artifact_store
         self._diagnostics = diagnostics or DiagnosticsLog(None)
-        self._source_evidence_processor = source_evidence_processor
         self._correlation_id = "-"
         self._references = ReferenceResearchService(uow_factory, artifact_store)
         self._extraction = ExtractionService(uow_factory, artifact_store)
@@ -1207,6 +1203,7 @@ def _q2_source_model_run_id(
             "canonical_url": canonical_url,
             "prompt_version": prompt_version,
             "parser_version": parser_version,
+            "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
             "provider": provider.value,
         },
         sort_keys=True,
