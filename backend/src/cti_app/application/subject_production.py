@@ -44,9 +44,13 @@ class SubjectProductionService:
             ):
                 return existing, False
 
-            all_runs = await uow.subject_production_runs.list_for_edition(edition_id)
-            subject_runs = [r for r in all_runs if r.subject_id == subject_id]
-            next_run_number = len(subject_runs) + 1
+            allocator = getattr(uow.subject_production_runs, "allocate_next_run_number", None)
+            if allocator is not None:
+                next_run_number = await allocator(subject_id)
+            else:
+                # Lightweight test repositories predating the SQL helper.
+                all_runs = await uow.subject_production_runs.list_for_edition(edition_id)
+                next_run_number = 1 + sum(1 for r in all_runs if r.subject_id == subject_id)
 
             run = SubjectProductionRun(
                 subject_id=subject_id,

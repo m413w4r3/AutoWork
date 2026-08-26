@@ -1,5 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
+import { ApiError } from "../api/editions";
 import {
   exportProductionState,
   importProductionState,
@@ -36,6 +37,29 @@ function isSnapshot(value: unknown): value is ProductionStateSnapshotV1 {
 }
 
 function errorText(error: unknown): string {
+  if (error instanceof ApiError) {
+    const messages: Record<string, string> = {
+      production_state_not_found: "Aucun état exportable n’est disponible.",
+      production_state_active_run:
+        "Cette action est indisponible pendant une production en cours.",
+      production_state_incomplete:
+        "Les trois artefacts vérifiés ne sont pas disponibles.",
+      production_state_unverified:
+        "Les artefacts de production ne sont pas tous vérifiés.",
+      production_state_invalid_format: "Le format du fichier est invalide.",
+      production_state_version_unsupported:
+        "La version de cet état n’est pas prise en charge.",
+      production_state_invalid: "Le contenu de cet état est invalide.",
+      production_state_checksum_mismatch:
+        "La vérification d’intégrité du fichier a échoué.",
+      production_state_too_large:
+        "Le fichier ou un artefact est trop volumineux.",
+    };
+    return (
+      messages[error.code] ??
+      "Une erreur est survenue avec l’état de production."
+    );
+  }
   return error instanceof Error ? error.message : String(error);
 }
 
@@ -167,18 +191,23 @@ export function ProductionStateTransfer({
         >
           {exportMutation.isPending ? "Export…" : "Exporter l’état"}
         </button>
-        <label className="button button--secondary">
+        <button
+          type="button"
+          className="button button--secondary"
+          disabled={importDisabled}
+          onClick={() => inputRef.current?.click()}
+        >
           Importer un état
-          <input
-            ref={inputRef}
-            type="file"
-            accept=".json,application/json"
-            aria-label="Importer un état"
-            disabled={importDisabled}
-            onChange={(event) => void handleFileChange(event)}
-            hidden
-          />
-        </label>
+        </button>
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".json,application/json"
+          aria-label="Importer un état"
+          disabled={importDisabled}
+          onChange={(event) => void handleFileChange(event)}
+          hidden
+        />
       </div>
       {productionStatus?.status === "queued" ||
       productionStatus?.status === "running" ? (
@@ -216,8 +245,9 @@ export function ProductionStateTransfer({
             <li>✓ Synthèse</li>
           </ul>
           <p>
-            L’import crée un nouveau run local. Il ne relance ni ChatGPT, ni la
-            collecte des sources, ni VirusTotal.
+            Ce fichier restaure les résultats coûteux de recherche, extraction
+            et synthèse. Aucun appel ChatGPT, collecte de source ou analyse
+            VirusTotal ne sera lancé.
           </p>
           {productionStatus?.title &&
           productionStatus.title !== selectedSnapshot.origin.subject_title ? (
@@ -229,7 +259,7 @@ export function ProductionStateTransfer({
           <div className="production-state-transfer__actions">
             <button
               className="button"
-              disabled={importMutation.isPending}
+              disabled={importDisabled || importMutation.isPending}
               onClick={() => importMutation.mutate(selectedSnapshot)}
             >
               {importMutation.isPending ? "Import…" : "Importer"}

@@ -1,4 +1,10 @@
-"""Portable export and import of verified brief production state."""
+"""Portable export and import of verified brief production state.
+
+Blob ingestion necessarily precedes the SQL transaction that references the
+three new immutable payloads. If that transaction fails, the content-addressed
+catalog may retain unreferenced, safely deduplicated blobs; operators can
+reclaim them with the existing ``delete_unreferenced`` operation.
+"""
 
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ from cti_app.application.production_parsers import (
     technical_extraction_from_json,
     validate_synthesis,
 )
+from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -259,23 +266,14 @@ class ProductionStateService:
                 raise ProductionStateError(
                     code="production_state_active_run", message="Production run is active"
                 )
-            artifacts = {
-                artifact.stage: artifact
-                for artifact in await uow.production_artifacts.list_for_run(run.id)
-            }
+            refs = await uow.production_artifacts.get_current(run.id, "references")
+            extraction = await uow.production_artifacts.get_current(run.id, "extraction")
+            synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
 
-        required = (
-            ProductionArtifactStage.REFERENCES,
-            ProductionArtifactStage.EXTRACTION,
-            ProductionArtifactStage.SYNTHESIS,
-        )
-        if any(stage not in artifacts for stage in required):
+        if refs is None or extraction is None or synthesis is None:
             raise ProductionStateError(
                 code="production_state_incomplete", message="Production artifacts are incomplete"
             )
-        refs = artifacts[ProductionArtifactStage.REFERENCES]
-        extraction = artifacts[ProductionArtifactStage.EXTRACTION]
-        synthesis = artifacts[ProductionArtifactStage.SYNTHESIS]
         if any(
             artifact.status is not ProductionArtifactStatus.VERIFIED
             for artifact in (refs, extraction, synthesis)
@@ -297,7 +295,7 @@ class ProductionStateService:
                 await self._artifact_store.read_json(extraction.canonical_blob_id)
             )
             synthesis_content = await self._artifact_store.read_text(synthesis.rendered_blob_id)
-        except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+        except (EntityNotFoundError, KeyError, TypeError, ValueError, UnicodeError) as exc:
             raise _invalid("Production artifact content is invalid") from exc
 
         origin = ProductionStateOrigin(
@@ -390,14 +388,19 @@ class ProductionStateService:
                 raise ProductionStateError(
                     code="production_state_active_run", message="Production run is active"
                 )
-            runs = await uow.subject_production_runs.list_for_edition(edition_id)
+            allocator = getattr(uow.subject_production_runs, "allocate_next_run_number", None)
+            if allocator is not None:
+                next_run_number = await allocator(subject_id)
+            else:
+                runs = await uow.subject_production_runs.list_for_edition(edition_id)
+                next_run_number = 1 + sum(1 for item in runs if item.subject_id == subject_id)
             run = SubjectProductionRun(
                 subject_id=subject_id,
                 edition_id=edition_id,
                 profile=ProductionProfile.BRIEF_AUTO,
                 status=SubjectProductionStatus.NEEDS_REVIEW,
                 current_stage=SubjectProductionStage.ASSEMBLY,
-                run_number=len([item for item in runs if item.subject_id == subject_id]) + 1,
+                run_number=next_run_number,
                 research_date=snapshot.origin.research_date,
                 error_code=IMPORTED_RUN_ERROR_CODE,
                 error_message=(

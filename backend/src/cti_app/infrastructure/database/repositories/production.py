@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.domain.editorial import AnalystDecision, AnalystDecisionTargetType, AnalystDecisionType
@@ -199,6 +199,22 @@ class SqlAlchemySubjectProductionRunRepository:
         )
         result = await self._session.execute(query)
         return [_subject_production_run_from_row(row) for row in result.scalars()]
+
+    async def allocate_next_run_number(self, subject_id: UUID) -> int:
+        """Allocate a subject-local number while holding a transaction lock.
+
+        The advisory lock is released by the surrounding UoW commit/rollback,
+        so concurrent run creation cannot observe the same maximum number.
+        """
+        await self._session.execute(
+            select(func.pg_advisory_xact_lock(func.hashtext(str(subject_id))))
+        )
+        maximum = await self._session.scalar(
+            select(func.max(SubjectProductionRunRow.run_number)).where(
+                SubjectProductionRunRow.subject_id == subject_id
+            )
+        )
+        return int(maximum or 0) + 1
 
 
 class SqlAlchemyProductionArtifactRepository:
