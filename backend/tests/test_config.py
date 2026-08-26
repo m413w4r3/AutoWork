@@ -58,3 +58,11 @@ def test_job_actor_time_limit_outlives_the_dramatiq_default(
     monkeypatch.setenv("JOB_ACTOR_TIME_LIMIT_SECONDS", "600")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_virustotal_settings_are_optional_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(_env_file=None)
+    assert settings.virustotal_proxy_url is None
+    monkeypatch.setenv("VIRUSTOTAL_MAX_PAGE_SIZE", "101")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)

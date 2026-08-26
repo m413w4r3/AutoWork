@@ -69,6 +69,21 @@ class Settings(BaseSettings):
     pdf_max_metadata_length: int = Field(default=16_384, gt=0)
     qwen_chunk_max_chars: int = Field(default=12_000, gt=100)
     qwen_chunk_overlap_chars: int = Field(default=500, ge=0)
+    # VirusTotal is intentionally disabled unless a proxy and capabilities are
+    # explicitly supplied by the composition root. No VT credential exists here.
+    virustotal_proxy_url: str | None = None
+    virustotal_base_url: str = "http://www.virustotal.com/api/v3"
+    virustotal_fallback_base_url: str | None = "http://www.virustotal.com/api/v3"
+    virustotal_legacy_base_url: str | None = "http://www.virustotal.com/vtapi/v2"
+    virustotal_api_key: SecretStr | None = None
+    virustotal_proxy_insecure: bool = False
+    virustotal_connect_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    virustotal_read_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    virustotal_max_response_bytes: int = Field(default=10 * 1024 * 1024, gt=0, le=100 * 1024 * 1024)
+    virustotal_default_page_size: int = Field(default=40, ge=1, le=100)
+    virustotal_max_page_size: int = Field(default=100, ge=1, le=100)
+    virustotal_max_pages: int = Field(default=10, ge=1, le=100)
+    virustotal_max_results: int = Field(default=1000, ge=1, le=100_000)
 
 
 @lru_cache
