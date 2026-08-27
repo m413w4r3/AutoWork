@@ -136,7 +136,7 @@ def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
 
 
 class ProductionWorkflowOrchestrator:
-    """Orchestrates the complete brief_auto production workflow."""
+    """Orchestrates the complete production workflow for supported profiles."""
 
     def __init__(
         self,

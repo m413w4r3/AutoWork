@@ -30,6 +30,7 @@ from cti_app.domain.production import (
     ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
+    SubjectProductionStatus,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 
@@ -258,8 +259,17 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
     async with uow_factory() as uow:
         imported = await uow.subject_production_runs.get(result.run_id)
         assert imported is not None
-        assert imported.status.value == "needs_review"
-        assert imported.current_stage.value == "assembly"
+        assert imported.profile is ProductionProfile.BRIEF_AUTO
+        assert imported.status is SubjectProductionStatus.NEEDS_REVIEW
+        assert imported.current_stage is SubjectProductionStage.ASSEMBLY
+        assert imported.started_at is not None
+        assert imported.finished_at is not None
+        assert imported.error_code == "imported_production_state"
+        assert imported.error_message == (
+            "État importé : références, extraction et synthèse restaurées ; "
+            "assemblage non rejoué."
+        )
+        assert imported.error_details is None
         imported_artifacts = [
             await uow.production_artifacts.get_current(imported.id, stage.value)
             for stage in (
@@ -404,8 +414,15 @@ async def test_major_assisted_import_creates_handoff_without_llm_on_real_postgre
         for artifact in imported_artifacts
         if artifact.stage is ProductionArtifactStage.SYNTHESIS
     ]
-    assert imported_run.status.value == "running"
-    assert imported_run.current_stage is SubjectProductionStage.ANALYST_RESEARCH
+    assert imported_run.profile is ProductionProfile.MAJOR_ASSISTED
+    assert imported_run.status == SubjectProductionStatus.RUNNING
+    assert imported_run.current_stage == SubjectProductionStage.ANALYST_RESEARCH
+    assert imported_run.research_date is not None
+    assert imported_run.started_at is not None
+    assert imported_run.finished_at is None
+    assert imported_run.error_code is None
+    assert imported_run.error_message is None
+    assert imported_run.error_details is None
     assert [(artifact.version, artifact.status.value) for artifact in synthesis_artifacts] == [
         (1, "verified")
     ]

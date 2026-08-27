@@ -286,7 +286,7 @@ async def start_subject_production(
     ):
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail="major_assisted production not yet implemented",
+            detail="major_assisted production is disabled",
         )
 
     uow_factory, jobs, dispatcher = _runtime(request)

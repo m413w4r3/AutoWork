@@ -231,6 +231,30 @@ class TestProductionProfileVariants:
 
         assert run.profile == ProductionProfile.MAJOR_ASSISTED
 
+    def test_major_import_resume_clears_terminal_fields(self) -> None:
+        moment = datetime.now(UTC)
+        run = SubjectProductionRun(
+            subject_id=uuid4(),
+            edition_id=uuid4(),
+            profile=ProductionProfile.MAJOR_ASSISTED,
+            research_date=moment.date(),
+            started_at=moment,
+            finished_at=moment,
+            error_code="imported_production_state",
+            error_message="stale import message",
+            error_details={"stale": True},
+        )
+
+        run.resume_verified_import_at_analyst_research(now=moment)
+
+        assert run.status == SubjectProductionStatus.RUNNING
+        assert run.current_stage == SubjectProductionStage.ANALYST_RESEARCH
+        assert run.started_at == moment
+        assert run.finished_at is None
+        assert run.error_code is None
+        assert run.error_message is None
+        assert run.error_details is None
+
     def test_profile_progression_is_explicit(self) -> None:
         assert (
             next_stage(ProductionProfile.BRIEF_AUTO, SubjectProductionStage.SYNTHESIS)

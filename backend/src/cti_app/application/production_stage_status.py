@@ -1,9 +1,10 @@
 """Per-stage status shown to the UI.
 
-The five workflow stages do not map one-to-one onto artifacts: SOURCES never
-produces one, and ASSEMBLY produces the artifact named `brief`. Deriving the
-stage list from artifacts alone therefore reports SOURCES as pending forever
-and ASSEMBLY as never done.
+Profile-specific workflow stages do not map one-to-one onto artifacts:
+SOURCES, ANALYST_RESEARCH, and ANALYST_NOTE never produce one, while ASSEMBLY
+produces the artifact named `brief`. Deriving the stage list from artifacts
+alone therefore reports some stages as pending forever and ASSEMBLY as never
+done.
 """
 
 from __future__ import annotations

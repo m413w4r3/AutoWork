@@ -410,33 +410,32 @@ class ProductionStateService:
             else:
                 runs = await uow.subject_production_runs.list_for_edition(edition_id)
                 next_run_number = 1 + sum(1 for item in runs if item.subject_id == subject_id)
+            is_brief_auto = profile is ProductionProfile.BRIEF_AUTO
             run = SubjectProductionRun(
                 subject_id=subject_id,
                 edition_id=edition_id,
                 profile=profile,
                 status=(
                     SubjectProductionStatus.NEEDS_REVIEW
-                    if profile is ProductionProfile.BRIEF_AUTO
+                    if is_brief_auto
                     else SubjectProductionStatus.QUEUED
                 ),
                 current_stage=(
                     SubjectProductionStage.ASSEMBLY
-                    if profile is ProductionProfile.BRIEF_AUTO
+                    if is_brief_auto
                     else SubjectProductionStage.SOURCES
                 ),
                 run_number=next_run_number,
                 research_date=snapshot.origin.research_date,
-                error_code=IMPORTED_RUN_ERROR_CODE,
+                error_code=IMPORTED_RUN_ERROR_CODE if is_brief_auto else None,
                 error_message=(
                     "État importé : références, extraction et synthèse restaurées ; "
-                    + (
-                        "assemblage non rejoué."
-                        if profile is ProductionProfile.BRIEF_AUTO
-                        else "reprise au checkpoint analyste."
-                    )
+                    "assemblage non rejoué."
+                    if is_brief_auto
+                    else None
                 ),
-                started_at=now,
-                finished_at=now,
+                started_at=now if is_brief_auto else None,
+                finished_at=now if is_brief_auto else None,
                 created_at=now,
                 updated_at=now,
                 version=1,
@@ -478,6 +477,8 @@ class ProductionStateService:
             )
             await uow.production_artifacts.append(synthesis)
             if profile is ProductionProfile.MAJOR_ASSISTED:
+                # Seed VT enrichment is intentionally outside this deterministic
+                # import; the consuming workflow must ensure it idempotently.
                 policy = analyst_handoff_policy_from_sources(
                     await uow.source_collections.list_for_subject(subject_id)
                 )

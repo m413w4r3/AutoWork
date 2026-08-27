@@ -1,4 +1,4 @@
-"""Domain models for subject production workflow (brief_auto)."""
+"""Domain models for subject production workflows."""
 
 from __future__ import annotations
 
@@ -210,6 +210,10 @@ class SubjectProductionRun:
         self.status = SubjectProductionStatus.RUNNING
         self.current_stage = SubjectProductionStage.ANALYST_RESEARCH
         self.started_at = moment
+        self.finished_at = None
+        self.error_code = None
+        self.error_message = None
+        self.error_details = None
         self.updated_at = moment
         self.version += 1
 
