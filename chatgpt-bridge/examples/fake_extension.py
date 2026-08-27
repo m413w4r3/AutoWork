@@ -47,7 +47,11 @@ PROFILS = [
 ]
 
 UI = {"model": "gpt-5", "profile": "personnel", "web_search": False}
-CONVERSATIONS: dict[str, str] = {}
+# Identité par id ; continuation par expected_turn_id — jamais par locator/URL.
+# Toutes les conversations simulées partagent la même URL Temporary Chat,
+# volontairement, pour prouver que le routage n'en dépend pas.
+TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true"
+CONVERSATIONS: dict[str, str | None] = {}
 
 
 def _picker(courant: list, choix: str, probe: bool) -> dict:
@@ -175,28 +179,47 @@ async def main() -> None:
                 if target:
                     conversation_id = target["id"]
                     if target["mode"] == "fresh":
-                        locator = f"https://chatgpt.com/simulated/{uuid.uuid4()}"
-                        CONVERSATIONS[conversation_id] = locator
-                    else:
-                        locator = target.get("external_locator")
-                        if CONVERSATIONS.get(conversation_id) != locator:
+                        if conversation_id in CONVERSATIONS:
                             await ws.send(
                                 json.dumps(
                                     {
                                         "type": "error",
                                         "id": msg["id"],
                                         "code": "conversation_unavailable",
-                                        "message": "conversation simulée introuvable",
+                                        "message": "une session live existe déjà pour cet id",
                                     }
                                 )
                             )
                             continue
+                    else:
+                        expected_turn_id = target.get("expected_turn_id")
+                        known_turn_id = CONVERSATIONS.get(conversation_id)
+                        if known_turn_id is None or known_turn_id != expected_turn_id:
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "id": msg["id"],
+                                        "code": "conversation_unavailable",
+                                        "message": (
+                                            "conversation simulée introuvable ou "
+                                            "expected_turn_id périmé"
+                                        ),
+                                    }
+                                )
+                            )
+                            continue
+                    new_turn_id = f"simulated-turn-{uuid.uuid4()}"
+                    CONVERSATIONS[conversation_id] = new_turn_id
                     conversation_result = {
                         "id": conversation_id,
-                        "external_locator": locator,
-                        "turn_id": f"simulated-turn-{uuid.uuid4()}",
+                        "turn_id": new_turn_id,
                         "mode": target["mode"],
                         "verified": True,
+                        "ephemeral": True,
+                        # Diagnostic only: the same URL may be shared by every
+                        # simulated conversation, on purpose.
+                        "external_locator": TEMPORARY_CHAT_URL,
                     }
 
                 files = msg.get("files") or []

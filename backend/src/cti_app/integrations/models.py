@@ -258,7 +258,6 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         "bridge_protocol_error",
         "bridge_server_error",
         "conversation_busy",
-        "conversation_locator_invalid",
         "conversation_unavailable",
         "conversation_profile_mismatch",
     }:
@@ -281,7 +280,6 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         "bridge_payload_conflict",
         "bridge_protocol_error",
         "conversation_busy",
-        "conversation_locator_invalid",
         "conversation_unavailable",
         "conversation_profile_mismatch",
     }:
@@ -301,7 +299,6 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         "bridge_timeout": "Le bridge ChatGPT n'a pas répondu à temps.",
         "bridge_server_error": "Le bridge ChatGPT a rencontré une erreur.",
         "conversation_busy": "La conversation exécute déjà un tour.",
-        "conversation_locator_invalid": "Le locator de conversation est invalide.",
         "conversation_unavailable": "La conversation ChatGPT est inaccessible.",
         "conversation_profile_mismatch": "La conversation appartient à un autre profil.",
     }

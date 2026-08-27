@@ -31,7 +31,6 @@ from cti_app.application.discovery_report_parser import (
 from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.model_gateway import (
     ConversationContext,
-    ConversationLifecycleSpec,
     ModelExecution,
     ModelGatewayError,
     ModelRequest,
@@ -49,11 +48,6 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
 )
 from cti_app.domain.discovery_cumulative import DiscoveryInputMode
-from cti_app.domain.model_conversations import (
-    ConversationLifecycle,
-    ConversationPolicy,
-    ConversationReleaseOutcome,
-)
 from cti_app.domain.model_runs import ModelProvider, ModelRunStatus
 from cti_app.logging import get_correlation_id
 
@@ -136,14 +130,6 @@ class DiscoveryService:
         research_run_id = uuid5(NAMESPACE_URL, f"cti-discovery-model-run:{request_hash}")
         fresh_conversation_id = uuid5(NAMESPACE_URL, f"cti-discovery-conversation:{request_hash}")
 
-        conversation_lifecycle = ConversationLifecycle(
-            id=fresh_conversation_id,
-            policy=ConversationPolicy.DELETE_ON_SUCCESS,
-        )
-        async with self._uow_factory() as uow:
-            await uow.conversation_lifecycles.add(conversation_lifecycle)
-            await uow.commit()
-
         research_request = ModelRequest(
             text=_research_prompt(parameters),
             prompt_template_id=PROMPT_TEMPLATE_ID,
@@ -162,9 +148,6 @@ class DiscoveryService:
             parameters={"reasoning": {"effort": "high"}},
             background=True,
             conversation=ConversationContext(mode="fresh", id=fresh_conversation_id),
-            conversation_lifecycle=ConversationLifecycleSpec(
-                policy=ConversationPolicy.DELETE_ON_SUCCESS,
-            ),
             run_id=research_run_id,
         )
         await context.report_progress(2, 4, "ChatGPT recherche et analyse les sources")
@@ -206,15 +189,11 @@ class DiscoveryService:
                 batch = existing
             await uow.commit()
 
-        async with self._uow_factory() as uow:
-            lifecycle = await uow.conversation_lifecycles.get(fresh_conversation_id)
-            if lifecycle is not None:
-                lifecycle.release(outcome=ConversationReleaseOutcome.SUCCESS)
-                await uow.conversation_lifecycles.save(lifecycle)
-                await uow.commit()
-        # DELETE_ON_SUCCESS only means something if something acts on it: the
-        # lifecycle row above records the policy, this call is what actually
-        # closes the ChatGPT-side conversation now that it succeeded.
+        # This discovery conversation is bounded (DELETE_ON_SUCCESS semantics):
+        # only close its live Temporary Chat browser session once the batch it
+        # produced is durably persisted as the canonical successful result.
+        # Generation error, needs_review, parser failure, or uncertain recovery
+        # never reach this line — the session stays alive for inspection/recovery.
         await self._archive_ephemeral_conversation(fresh_conversation_id)
 
         if self._after_persisted_batch is not None:

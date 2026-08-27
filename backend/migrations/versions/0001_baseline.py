@@ -266,7 +266,6 @@ _TABLES_IN_CREATION_ORDER: tuple[str, ...] = (
     "production_artifacts",
     "edition_production_batches",
     "edition_production_batch_items",
-    "conversation_lifecycles",
 )
 
 
@@ -333,7 +332,6 @@ def upgrade() -> None:
     _create_production_artifacts()
     _create_edition_production_batches()
     _create_edition_production_batch_items()
-    _create_conversation_lifecycles()
 
     for table, trigger_name, function_name, kind in _TRIGGERS:
         _install_trigger(table, trigger_name, function_name, kind)
@@ -1837,55 +1835,3 @@ def _create_edition_production_batch_items() -> None:
     )
 
 
-def _create_conversation_lifecycles() -> None:
-    op.create_table(
-        "conversation_lifecycles",
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("conversation_id", sa.Uuid(), nullable=False),
-        sa.Column("policy", sa.String(length=32), nullable=False),
-        sa.Column("status", sa.String(length=32), nullable=False),
-        sa.Column("release_outcome", sa.String(length=32), nullable=True),
-        sa.Column("released_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("cleanup_attempt_count", sa.BigInteger(), nullable=False, server_default="0"),
-        sa.Column("last_cleanup_attempt_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("last_cleanup_error_code", sa.String(length=64), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("version", sa.BigInteger(), nullable=False, server_default="1"),
-        sa.CheckConstraint(
-            "policy IN ('keep', 'delete_on_success')",
-            name="ck_conv_lifecycle_policy",
-        ),
-        sa.CheckConstraint(
-            "status IN ('active', 'released', 'delete_pending', 'deleting', 'deleted', "
-            "'cleanup_failed', 'retained')",
-            name="ck_conv_lifecycle_status",
-        ),
-        sa.CheckConstraint(
-            "release_outcome IS NULL OR release_outcome IN ('success', 'failure', "
-            "'needs_review', 'cancelled')",
-            name="ck_conv_lifecycle_outcome",
-        ),
-        sa.CheckConstraint(
-            "cleanup_attempt_count >= 0",
-            name="ck_conv_lifecycle_attempts",
-        ),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("conversation_id", name="uq_conv_lifecycle_conversation_id"),
-    )
-    op.create_index(
-        "ix_conversation_lifecycles_conversation_id",
-        "conversation_lifecycles",
-        ["conversation_id"],
-    )
-    op.create_index(
-        "ix_conversation_lifecycles_status",
-        "conversation_lifecycles",
-        ["status"],
-    )
-    op.create_index(
-        "ix_conversation_lifecycles_created_at",
-        "conversation_lifecycles",
-        ["created_at"],
-    )

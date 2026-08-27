@@ -12,6 +12,13 @@ const RECONNECT_MAX = 30000;
 
 const REPLACED_BACKOFF = 60000; // après un remplacement, on laisse la place
 
+// Toute conversation fraîche ouverte par le bridge est un Temporary Chat :
+// jamais écrite dans l'historique ChatGPT, donc jamais à en supprimer après
+// coup. C'est l'URL canonique — on ne dépend jamais d'une navigation
+// ultérieure vers /c/... pour obtenir une identité.
+const TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
+const ALLOWED_CHAT_ORIGINS = ["https://chatgpt.com", "https://chat.openai.com"];
+
 let socket = null;
 let reconnectDelay = RECONNECT_MIN;
 let reconnectTimer = null;
@@ -22,6 +29,13 @@ const inflight = new Map();
 /** Deuxième barrière persistante : un id reçu n'est jamais retransmis deux fois au DOM. */
 const requestStates = new Map();
 const eventCounters = new Map();
+/**
+ * Registre des sessions live : conversation.id (UUID applicatif) -> onglet
+ * Chrome exact. C'est l'identité de routage — jamais l'URL. Vit uniquement
+ * dans chrome.storage.session : un redémarrage du service worker le
+ * recharge, mais un redémarrage du navigateur / rechargement de l'extension
+ * le perd volontairement (Temporary Chat n'est alors plus reconstructible).
+ */
 const conversationRegistry = new Map();
 const busyTabs = new Set();
 const requestConversationResults = new Map();
@@ -29,12 +43,22 @@ const requestExtensionMetadata = new Map();
 const requestFinalOutputs = new Map();
 const requestConversationBindings = new Map();
 
+/** Erreur de routage typée : `.code` est ce que le serveur doit voir, jamais aplati. */
+class BridgeRoutingError extends Error {
+  constructor(code, message) {
+    super(message || code);
+    this.code = code;
+  }
+}
+
 const requestStatesReady = chrome.storage.local.get("bridgeRequestStates").then(({ bridgeRequestStates }) => {
   for (const [id, state] of Object.entries(bridgeRequestStates || {})) requestStates.set(id, state);
 });
-const conversationRegistryReady = chrome.storage.local
+
+// Métadonnées de rejeu final : utiles après coup (recovery, idempotence),
+// jamais des bindings d'onglet vivants. Restent en chrome.storage.local.
+const replayMetadataReady = chrome.storage.local
   .get([
-    "bridgeConversationRegistry",
     "bridgeRequestConversationResults",
     "bridgeRequestExtensionMetadata",
     "bridgeRequestFinalOutputs",
@@ -42,47 +66,56 @@ const conversationRegistryReady = chrome.storage.local
   ])
   .then(
     ({
-      bridgeConversationRegistry,
       bridgeRequestConversationResults,
       bridgeRequestExtensionMetadata,
       bridgeRequestFinalOutputs,
       bridgeRequestConversationBindings,
     }) => {
-    for (const [id, entry] of Object.entries(bridgeConversationRegistry || {})) {
-      conversationRegistry.set(id, { ...entry, tab_id: null, window_id: null });
-    }
-    for (const [id, value] of Object.entries(bridgeRequestConversationResults || {})) {
-      requestConversationResults.set(id, value);
-    }
-    for (const [id, value] of Object.entries(bridgeRequestExtensionMetadata || {})) {
-      requestExtensionMetadata.set(id, value);
-    }
-    for (const [id, value] of Object.entries(bridgeRequestFinalOutputs || {})) {
-      if (typeof value === "string") requestFinalOutputs.set(id, value);
-    }
-    for (const [id, value] of Object.entries(bridgeRequestConversationBindings || {})) {
-      requestConversationBindings.set(id, value);
-    }
-  },
+      for (const [id, value] of Object.entries(bridgeRequestConversationResults || {})) {
+        requestConversationResults.set(id, value);
+      }
+      for (const [id, value] of Object.entries(bridgeRequestExtensionMetadata || {})) {
+        requestExtensionMetadata.set(id, value);
+      }
+      for (const [id, value] of Object.entries(bridgeRequestFinalOutputs || {})) {
+        if (typeof value === "string") requestFinalOutputs.set(id, value);
+      }
+      for (const [id, value] of Object.entries(bridgeRequestConversationBindings || {})) {
+        requestConversationBindings.set(id, value);
+      }
+    },
   );
+
+// Le registre de sessions live vit exclusivement dans chrome.storage.session :
+// il doit survivre à une suspension/relance du service worker, mais jamais à
+// un redémarrage du navigateur ou un rechargement de l'extension.
+const conversationRegistryReady = chrome.storage.session
+  .get("bridgeConversationRegistry")
+  .then(({ bridgeConversationRegistry }) => {
+    for (const [id, entry] of Object.entries(bridgeConversationRegistry || {})) {
+      conversationRegistry.set(id, entry);
+    }
+  });
 
 function persistRequestStates() {
   const entries = [...requestStates.entries()].slice(-1000);
   chrome.storage.local.set({ bridgeRequestStates: Object.fromEntries(entries) });
 }
 
-function persistConversationRegistry() {
-  const durable = Object.fromEntries(
-    [...conversationRegistry.entries()].map(([id, entry]) => [id, { ...entry, tab_id: null, window_id: null }]),
-  );
+function persistReplayMetadata() {
   chrome.storage.local.set({
-    bridgeConversationRegistry: durable,
     bridgeRequestConversationResults: Object.fromEntries([...requestConversationResults.entries()].slice(-1000)),
     bridgeRequestExtensionMetadata: Object.fromEntries([...requestExtensionMetadata.entries()].slice(-1000)),
     bridgeRequestFinalOutputs: Object.fromEntries([...requestFinalOutputs.entries()].slice(-50)),
     bridgeRequestConversationBindings: Object.fromEntries(
       [...requestConversationBindings.entries()].slice(-1000),
     ),
+  });
+}
+
+function persistConversationRegistry() {
+  chrome.storage.session.set({
+    bridgeConversationRegistry: Object.fromEntries(conversationRegistry.entries()),
   });
 }
 
@@ -172,21 +205,31 @@ async function connect() {
 }
 
 async function handleRecoveryCapture(msg) {
+  await conversationRegistryReady;
+  const known = conversationRegistry.get(msg.conversation.id);
+  if (!known) {
+    send({ type: "recovery_preview", id: msg.id, error: "conversation_unavailable" });
+    return;
+  }
   let tab;
   try {
-    tab = await resolveConversationTab({
-      mode: "continue",
-      id: msg.conversation.id,
-      external_locator: msg.conversation.external_locator,
-    });
+    tab = await chrome.tabs.get(known.tab_id);
+  } catch {
+    // L'onglet n'existe plus : la session live est perdue, jamais reconstruite.
+    conversationRegistry.delete(msg.conversation.id);
+    persistConversationRegistry();
+    send({ type: "recovery_preview", id: msg.id, error: "conversation_unavailable" });
+    return;
+  }
+  if (!isAllowedChatOrigin(tab.url)) {
+    send({ type: "recovery_preview", id: msg.id, error: "conversation_unavailable" });
+    return;
+  }
+  try {
     const result = await sendToTab(tab.id, msg);
     send({ ...result, type: "recovery_preview", id: msg.id });
   } catch (err) {
-    send({
-      type: "recovery_preview",
-      id: msg.id,
-      error: err.message,
-    });
+    send({ type: "recovery_preview", id: msg.id, error: err.message });
   }
 }
 
@@ -194,9 +237,9 @@ async function handleConversationArchive(msg) {
   await conversationRegistryReady;
   const known = conversationRegistry.get(msg.conversation_id);
   console.log(
-    "🗂️ conversation_archive reçu — ferme l'onglet local (la conversation est en " +
-      "'Temporary chat', donc jamais écrite dans l'historique ChatGPT)",
-    { conversation_id: msg.conversation_id, tab_id: known?.tab_id ?? null }
+    "🗂️ conversation_archive reçu — ferme la session Temporary Chat exacte (jamais " +
+      "écrite dans l'historique ChatGPT, donc rien à y supprimer)",
+    { conversation_id: msg.conversation_id, tab_id: known?.tab_id ?? null },
   );
   if (known?.tab_id) await chrome.tabs.remove(known.tab_id).catch(() => {});
   conversationRegistry.delete(msg.conversation_id);
@@ -238,7 +281,9 @@ function flush() {
   }
 }
 
-/** Onglet ChatGPT le plus pertinent : actif en priorité, sinon le plus récent. */
+/** Onglet ChatGPT le plus pertinent : actif en priorité, sinon le plus récent.
+ *  Réservé aux opérations sans conversation (lecture/pilotage d'UI). Ne
+ *  participe jamais au routage d'une conversation identifiée. */
 async function findChatTab() {
   const tabs = await chrome.tabs.query({
     url: ["https://chatgpt.com/*", "https://chat.openai.com/*"],
@@ -247,17 +292,11 @@ async function findChatTab() {
   return tabs.find((t) => t.active) || tabs[tabs.length - 1];
 }
 
-function validChatLocator(value) {
+/** Un onglet appartient-il à une origine ChatGPT autorisée ? Jamais une identité. */
+function isAllowedChatOrigin(value) {
   try {
     const url = new URL(value);
-    return (
-      url.protocol === "https:" &&
-      ["chatgpt.com", "chat.openai.com"].includes(url.hostname) &&
-      !url.username &&
-      !url.password &&
-      !url.hash &&
-      url.pathname !== "/"
-    );
+    return url.protocol === "https:" && ALLOWED_CHAT_ORIGINS.includes(url.origin);
   } catch {
     return false;
   }
@@ -272,54 +311,73 @@ async function waitForTab(tabId) {
   throw new Error("chargement de la conversation expiré");
 }
 
+/**
+ * Résout l'onglet exact d'une conversation identifiée par conversation.id.
+ * L'URL n'est jamais une identité : `fresh` ouvre toujours un Temporary Chat
+ * neuf, `continue` ne fait jamais que retrouver l'onglet déjà lié.
+ */
 async function resolveConversationTab(conversation) {
   if (!conversation?.id || !["fresh", "continue"].includes(conversation.mode)) {
-    throw new Error("cible de conversation invalide");
+    throw new BridgeRoutingError("conversation_unavailable", "cible de conversation invalide");
   }
   await conversationRegistryReady;
-  const known = conversationRegistry.get(conversation.id);
+
   if (conversation.mode === "fresh") {
-    if (known?.tab_id) {
-      const cached = await chrome.tabs.get(known.tab_id).catch(() => null);
-      if (cached && !busyTabs.has(cached.id)) return cached;
+    if (conversationRegistry.has(conversation.id)) {
+      throw new BridgeRoutingError(
+        "conversation_unavailable",
+        "une session live existe déjà pour cette conversation : fresh refusé",
+      );
     }
-    const tab = await chrome.tabs.create({ url: "https://chatgpt.com/", active: false });
+    const tab = await chrome.tabs.create({ url: TEMPORARY_CHAT_URL, active: false });
     const loaded = await waitForTab(tab.id);
+    if (!isAllowedChatOrigin(loaded.url)) {
+      throw new BridgeRoutingError("conversation_unavailable", "l'onglet créé n'est pas sur une origine ChatGPT");
+    }
     conversationRegistry.set(conversation.id, {
-      external_locator: null,
       tab_id: loaded.id,
       window_id: loaded.windowId,
+      head_turn_id: null,
+      external_locator: null,
       last_verified_at: Date.now(),
     });
     persistConversationRegistry();
     return loaded;
   }
-  if (!validChatLocator(conversation.external_locator)) {
-    throw new Error("locator de conversation absent ou invalide");
+
+  // mode === "continue"
+  if (!conversation.expected_turn_id) {
+    throw new BridgeRoutingError("conversation_unavailable", "expected_turn_id requis pour continuer");
   }
-  if (known?.external_locator && known.external_locator !== conversation.external_locator) {
-    throw new Error("locator incohérent avec le registre applicatif");
+  const known = conversationRegistry.get(conversation.id);
+  if (!known) {
+    throw new BridgeRoutingError("conversation_unavailable", "aucune session live pour cette conversation");
   }
-  const tabs = await chrome.tabs.query({
-    url: ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-  });
-  let tab = tabs.find((candidate) => candidate.url === conversation.external_locator);
-  if (!tab) {
-    tab = await chrome.tabs.create({ url: conversation.external_locator, active: false });
+  if (known.head_turn_id !== conversation.expected_turn_id) {
+    throw new BridgeRoutingError(
+      "conversation_unavailable",
+      "expected_turn_id ne correspond pas au dernier tour connu de la session live",
+    );
   }
-  if (busyTabs.has(tab.id)) throw new Error("onglet de conversation déjà occupé");
-  const loaded = await waitForTab(tab.id);
-  if (loaded.url !== conversation.external_locator) {
-    throw new Error("la navigation ne correspond pas au locator demandé");
+  let tab;
+  try {
+    tab = await chrome.tabs.get(known.tab_id);
+  } catch {
+    // Onglet disparu : la session live est perdue, jamais reconstruite à
+    // partir d'une URL ou de l'historique ChatGPT.
+    conversationRegistry.delete(conversation.id);
+    persistConversationRegistry();
+    throw new BridgeRoutingError("conversation_unavailable", "l'onglet de la session live n'existe plus");
   }
-  conversationRegistry.set(conversation.id, {
-    external_locator: conversation.external_locator,
-    tab_id: loaded.id,
-    window_id: loaded.windowId,
-    last_verified_at: Date.now(),
-  });
-  persistConversationRegistry();
-  return loaded;
+  if (!isAllowedChatOrigin(tab.url)) {
+    conversationRegistry.delete(conversation.id);
+    persistConversationRegistry();
+    throw new BridgeRoutingError("conversation_unavailable", "l'onglet a quitté l'origine ChatGPT");
+  }
+  if (busyTabs.has(tab.id)) {
+    throw new BridgeRoutingError("conversation_busy", "l'onglet de cette conversation traite déjà une requête");
+  }
+  return tab;
 }
 
 async function routeTab(msg) {
@@ -340,7 +398,7 @@ async function sendToTab(tabId, msg) {
 }
 
 async function handlePrompt(msg) {
-  await Promise.all([requestStatesReady, conversationRegistryReady]);
+  await Promise.all([requestStatesReady, replayMetadataReady, conversationRegistryReady]);
   const known = requestStates.get(msg.id);
   if (known) {
     send({ type: "ack", id: msg.id, state: known, duplicate: true });
@@ -376,7 +434,7 @@ async function handlePrompt(msg) {
   } catch (err) {
     requestStates.set(msg.id, "failed");
     persistRequestStates();
-    send({ type: "error", id: msg.id, code: "conversation_unavailable", message: err.message });
+    send({ type: "error", id: msg.id, code: err.code || "bridge_server_error", message: err.message });
     return;
   }
   if (!tab) {
@@ -462,10 +520,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       };
       requestConversationBindings.set(msg.id, binding);
       msg = { ...msg, conversation: binding };
+      const existing = conversationRegistry.get(msg.conversation.id);
       conversationRegistry.set(msg.conversation.id, {
-        external_locator: msg.conversation.external_locator,
         tab_id: sender.tab?.id || null,
         window_id: sender.tab?.windowId || null,
+        head_turn_id: existing ? existing.head_turn_id : null,
+        // Diagnostic uniquement : jamais utilisé pour router ou rouvrir un onglet.
+        external_locator: msg.conversation.external_locator ?? existing?.external_locator ?? null,
         last_verified_at: Date.now(),
       });
       persistConversationRegistry();
@@ -484,10 +545,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       );
       if (msg.type === "done" && msg.conversation?.id) {
         requestConversationResults.set(msg.id, msg.conversation);
+        const existing = conversationRegistry.get(msg.conversation.id);
         conversationRegistry.set(msg.conversation.id, {
-          external_locator: msg.conversation.external_locator,
-          tab_id: sender.tab?.id || null,
-          window_id: sender.tab?.windowId || null,
+          tab_id: sender.tab?.id || existing?.tab_id || null,
+          window_id: sender.tab?.windowId || existing?.window_id || null,
+          // Le tour externe vérifié devient la nouvelle tête : c'est ce qui
+          // autorise un futur CONTINUE (KEEP) sur exactement cet onglet.
+          head_turn_id: msg.conversation.turn_id || existing?.head_turn_id || null,
+          external_locator: msg.conversation.external_locator ?? existing?.external_locator ?? null,
           last_verified_at: Date.now(),
         });
         persistConversationRegistry();
@@ -506,20 +571,48 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           requestConversationResults.set(msg.id, completedBinding);
         }
         if (msg.metadata) requestExtensionMetadata.set(msg.id, msg.metadata);
-        persistConversationRegistry();
+        persistReplayMetadata();
       }
       if (msg.type === "done" && msg.metadata) {
         requestExtensionMetadata.set(msg.id, msg.metadata);
       }
       if (msg.type === "done" && typeof msg.text === "string")
         requestFinalOutputs.set(msg.id, msg.text);
-      if (msg.type === "done") persistConversationRegistry();
+      if (msg.type === "done") persistReplayMetadata();
       persistRequestStates();
     }
     send({ ...msg, event_id: `${msg.id}:${sequence}` });
   }
   sendResponse({ ok: true });
   return true;
+});
+
+// Nettoyage proactif : un onglet fermé ou parti hors origine ChatGPT ne doit
+// jamais laisser un binding vivant pointer dans le vide.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  let changed = false;
+  for (const [id, entry] of conversationRegistry.entries()) {
+    if (entry.tab_id === tabId) {
+      conversationRegistry.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) persistConversationRegistry();
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  // Seul un changement d'origine invalide le binding : une navigation à
+  // l'intérieur de chatgpt.com (query/path) ne le fait jamais, l'URL n'étant
+  // pas l'identité de la conversation.
+  if (!changeInfo.url || isAllowedChatOrigin(changeInfo.url)) return;
+  let changed = false;
+  for (const [id, entry] of conversationRegistry.entries()) {
+    if (entry.tab_id === tabId) {
+      conversationRegistry.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) persistConversationRegistry();
 });
 
 // Réveils : le service worker MV3 peut être arrêté quand il est inactif.

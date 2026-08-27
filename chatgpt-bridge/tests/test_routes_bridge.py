@@ -43,14 +43,14 @@ def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation(
     conversation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     fresh = BridgeRunRequest(
         input="A1",
-        conversation={"mode": "fresh", "id": conversation_id, "external_locator": None},
+        conversation={"mode": "fresh", "id": conversation_id},
     )
     continued = BridgeRunRequest(
         input="A2",
         conversation={
             "mode": "continue",
             "id": conversation_id,
-            "external_locator": "https://chatgpt.com/opaque/conversation-a",
+            "expected_turn_id": "external-turn-1",
         },
     )
 
@@ -60,19 +60,32 @@ def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation(
     assert not _response_chat_request(
         runtime.bridge_routes._bridge_response_request(continued)
     ).new_chat
+    # fresh forbids a pre-existing expected_turn_id.
     with pytest.raises(ValidationError):
         BridgeRunRequest(
-            input="attaque SSRF",
+            input="fresh avec cible",
             conversation={
-                "mode": "continue",
+                "mode": "fresh",
                 "id": conversation_id,
-                "external_locator": "https://example.org/internal",
+                "expected_turn_id": "external-turn-1",
             },
         )
     with pytest.raises(ValidationError):
         BridgeRunRequest(
             input="continuation sans cible",
             conversation={"mode": "continue", "id": conversation_id},
+        )
+    # external_locator is not a routing field at all: any input under that key
+    # is rejected as an unexpected extra field, not silently accepted.
+    with pytest.raises(ValidationError):
+        BridgeRunRequest(
+            input="locator arbitraire",
+            conversation={
+                "mode": "continue",
+                "id": conversation_id,
+                "expected_turn_id": "external-turn-1",
+                "external_locator": "https://example.org/internal",
+            },
         )
 
 
@@ -117,16 +130,19 @@ async def test_fake_extension_routes_a_b_a_and_retry_clicks_once(
     a2_target = {
         "mode": "continue",
         "id": conversation_a,
-        "external_locator": a1["metadata"]["conversation"]["external_locator"],
+        "expected_turn_id": a1["metadata"]["conversation"]["turn_id"],
     }
     a2 = await send("a2", a2_target)
     replay = await send("a2", a2_target)
 
     assert a2["metadata"]["conversation"]["id"] == conversation_a
+    # A/B/A routing is by id + expected_turn_id, never by a locator: both
+    # simulated conversations may legitimately share the same diagnostic URL.
     assert (
         a2["metadata"]["conversation"]["external_locator"]
-        != b1["metadata"]["conversation"]["external_locator"]
+        == b1["metadata"]["conversation"]["external_locator"]
     )
+    assert a1["metadata"]["conversation"]["turn_id"] != b1["metadata"]["conversation"]["turn_id"]
     assert replay == a2
     assert extension.prompt_count == 3
 
@@ -249,10 +265,12 @@ async def test_conversation_binding_precedes_incomplete_and_survives_restart(
             self.prompt_count += 1
             conversation = {
                 "id": conversation_id,
+                "expected_turn_id": None,
                 "external_locator": locator,
                 "assistant_turns_before": 2,
                 "initial_assistant_turn_id": "assistant-before",
                 "verified": True,
+                "ephemeral": True,
                 "verified_at": "2026-08-13T10:00:00.000Z",
             }
             self.runtime.bridge.dispatch(

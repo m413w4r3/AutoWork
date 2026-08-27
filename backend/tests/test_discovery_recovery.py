@@ -48,7 +48,9 @@ from tests.test_discovery import (
 
 _CONVERSATION = {
     "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-    "external_locator": "https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "initial_assistant_turn_id": "external-turn-before-incomplete",
+    # Diagnostic only: never used to route or reopen the conversation.
+    "external_locator": "https://chatgpt.com/?temporary-chat=true",
 }
 
 
@@ -373,14 +375,14 @@ async def test_completion_recovery_child_id_is_deterministic_from_parent() -> No
     assert submitted.conversation is not None
     assert submitted.conversation.mode == "continue"
     assert submitted.conversation.id == UUID(_CONVERSATION["id"])
-    assert submitted.conversation.external_locator == _CONVERSATION["external_locator"]
+    assert submitted.conversation.expected_turn_id == _CONVERSATION["initial_assistant_turn_id"]
 
 
-async def test_completion_recovery_requires_conversation_id_and_external_locator() -> None:
+async def test_completion_recovery_requires_conversation_id_and_expected_turn_id() -> None:
     # Distinct axes so the two parents get distinct deterministic ModelRun
     # ids and cannot shadow each other in model_uow.
     params_a = parameters(axis="missing-conversation")
-    params_b = parameters(axis="missing-external-locator")
+    params_b = parameters(axis="missing-expected-turn-id")
     adapter = TransientResearchAdapter()
     gateway, model_uow, _ = gateway_for_adapter(adapter)
 
@@ -391,16 +393,16 @@ async def test_completion_recovery_requires_conversation_id_and_external_locator
             InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway
         ).start_completion_recovery(params_a, missing_conversation.id)
 
-    missing_locator = _needs_review_parent(
+    missing_turn_id = _needs_review_parent(
         params_b, conversation={"id": _CONVERSATION["id"]}
     )
-    model_uow.state[missing_locator.id] = missing_locator
+    model_uow.state[missing_turn_id.id] = missing_turn_id
     with pytest.raises(ModelGatewayError, match="conversation is unavailable"):
         await DiscoveryService(
             InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway
-        ).start_completion_recovery(params_b, missing_locator.id)
+        ).start_completion_recovery(params_b, missing_turn_id.id)
 
-    assert missing_conversation.id != missing_locator.id
+    assert missing_conversation.id != missing_turn_id.id
     assert adapter.calls == []
 
 

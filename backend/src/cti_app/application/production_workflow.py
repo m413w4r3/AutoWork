@@ -111,7 +111,6 @@ _TRANSIENT_CODES = {
 # turn cannot help, but nothing is broken either.
 _REVIEW_CODES = {
     "conversation_unavailable",
-    "conversation_locator_invalid",
     "conversation_profile_mismatch",
     "conversation_busy",
     "external_llm_blocked",

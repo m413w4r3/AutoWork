@@ -88,8 +88,40 @@ response text can never change what conversation is opened or closed.
 - **heartbeat** = liveness signal only, never carries user content.
 - **idle timeout** ≠ **total timeout**: idle detects stalls; total caps duration.
 - **No timeout resubmits** the prompt.
-- **conversation_id + external_locator** remain strict (no inference, no recovery search).
+- **conversation_id + exact live tab binding + expected_turn_id** remain strict
+  (no inference, no recovery search, no URL-based reopening).
+  `external_locator` is diagnostic only and is never used to route or reopen
+  a conversation — it may be identical across multiple live conversations.
 - **needs_review** never triggers implicit replay.
+
+## Temporary Chat browser session identity
+
+Every conversation the bridge opens fresh is a ChatGPT Temporary Chat
+(`https://chatgpt.com/?temporary-chat=true`), positively confirmed by
+`ensureTemporaryChat()` before Send — never best-effort. Browser identity is:
+
+    application conversation UUID -> exact Chrome tab_id -> last verified
+    external assistant turn id (expected_turn_id)
+
+`background.js` keeps this binding in `chrome.storage.session`
+(`bridgeConversationRegistry`), never in `chrome.storage.local`: a
+service-worker suspension/restart reloads it, but a browser restart or
+extension reload destroys it intentionally — Temporary Chat cannot be
+reconstructed from ChatGPT history afterward, so a lost session surfaces as
+`conversation_unavailable`, never a fabricated new conversation.
+
+- **KEEP**: after a successful turn, the exact Temporary Chat tab and its
+  registry binding stay alive so a later CONTINUE can reuse them.
+- **DELETE_ON_SUCCESS**: after a successful bounded operation, the bridge
+  closes that exact tab and deletes the binding. There is no ChatGPT-history
+  deletion pipeline — see "Ephemeral conversations" above.
+
+A CONTINUE request must carry the same `conversation.id` and an
+`expected_turn_id` equal to the conversation's last successful external turn.
+The extension looks up the binding by id, requires
+`binding.head_turn_id == expected_turn_id`, retrieves the exact tab via
+`chrome.tabs.get`, and never creates a replacement tab or falls back to a URL
+match.
 
 ## Validation
 

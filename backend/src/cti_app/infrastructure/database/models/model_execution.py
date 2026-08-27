@@ -33,11 +33,6 @@ CONVERSATION_STATUS_VALUES_SQL = (
     "'pending', 'ready', 'busy', 'needs_review', 'unavailable', 'archived'"
 )
 CONVERSATION_TURN_STATUS_VALUES_SQL = "'running', 'succeeded', 'failed', 'needs_review', 'blocked'"
-CONVERSATION_POLICY_VALUES_SQL = "'keep', 'delete_on_success'"
-CONVERSATION_LIFECYCLE_STATUS_VALUES_SQL = (
-    "'active', 'released', 'delete_pending', 'deleting', 'deleted', 'cleanup_failed', 'retained'"
-)
-CONVERSATION_RELEASE_OUTCOME_VALUES_SQL = "'success', 'failure', 'needs_review', 'cancelled'"
 
 
 class ModelRunRow(Base):
@@ -243,40 +238,3 @@ class ModelConversationTurnRow(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
-class ConversationLifecycleRow(Base):
-    __tablename__ = "conversation_lifecycles"
-    __table_args__ = (
-        CheckConstraint(
-            f"policy IN ({CONVERSATION_POLICY_VALUES_SQL})",
-            name="ck_conv_lifecycle_policy",
-        ),
-        CheckConstraint(
-            f"status IN ({CONVERSATION_LIFECYCLE_STATUS_VALUES_SQL})",
-            name="ck_conv_lifecycle_status",
-        ),
-        CheckConstraint(
-            "release_outcome IS NULL OR release_outcome IN "
-            f"({CONVERSATION_RELEASE_OUTCOME_VALUES_SQL})",
-            name="ck_conv_lifecycle_outcome",
-        ),
-        CheckConstraint("cleanup_attempt_count >= 0", name="ck_conv_lifecycle_attempts"),
-        Index("ix_conversation_lifecycles_conversation_id", "conversation_id"),
-        Index("ix_conversation_lifecycles_status", "status"),
-        Index("ix_conversation_lifecycles_created_at", "created_at"),
-    )
-
-    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
-    conversation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False, unique=True)
-    policy: Mapped[str] = mapped_column(String(32), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
-    release_outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    cleanup_attempt_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
-    last_cleanup_attempt_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    last_cleanup_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    version: Mapped[int] = mapped_column(BigInteger, default=1, nullable=False)

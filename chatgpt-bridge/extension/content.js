@@ -1192,65 +1192,105 @@ async function streamAnswer(job, locator, before) {
   };
 }
 
-function verifiedLocator() {
-  const url = new URL(window.location.href);
-  if (
-    url.protocol !== "https:" ||
-    !["chatgpt.com", "chat.openai.com"].includes(url.hostname) ||
-    url.username ||
-    url.password ||
-    url.hash ||
-    url.pathname === "/"
-  ) {
-    return null;
+/** Erreur de content script typée : `.code` traverse jusqu'au client, jamais aplati. */
+class BridgeError extends Error {
+  constructor(code, message) {
+    super(message || code);
+    this.code = code;
   }
-  return url.toString();
 }
 
-// Active la bascule « Temporary chat » sur une conversation neuve. Toute
-// conversation créée par le bridge doit être éphémère : c'est ce qui évite le
-// pipeline de suppression (jamais fiable en pratique — voir chatgpt-bridge/AGENTS.md,
-// section « Destructive actions »). Non bloquant : si le sélecteur ne trouve
-// rien, on logue bruyamment mais on laisse le prompt partir, plutôt que de
-// bloquer toute génération pour un changement d'UI côté OpenAI.
-async function ensureTemporaryChat() {
-  const toggle = $(SELECTORS.temporaryChatToggle);
-  if (!toggle) {
-    console.error(
-      "❌ Bouton 'Temporary chat' introuvable — la conversation NE sera PAS éphémère " +
-        "et restera dans l'historique ChatGPT tant que ce sélecteur n'est pas mis à jour.",
-    );
-    return false;
+/**
+ * URL courante, si — et seulement si — elle appartient à une origine ChatGPT
+ * autorisée. Diagnostic uniquement : jamais awaité, jamais comparée pour
+ * router ou reconnaître une conversation. La racine `/` et la query
+ * `?temporary-chat=true` sont des valeurs valides.
+ */
+function diagnosticLocator() {
+  try {
+    const url = new URL(window.location.href);
+    if (
+      url.protocol !== "https:" ||
+      !["chatgpt.com", "chat.openai.com"].includes(url.hostname) ||
+      url.username ||
+      url.password
+    ) {
+      return null;
+    }
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return null;
   }
+}
 
-  const isActive = () => {
+/** Identifiant externe stable d'un tour assistant : jamais son index ou son compte. */
+function turnExternalId(turn) {
+  const container = closestOf(turn, SELECTORS.turnContainer);
+  return (
+    (container && container.getAttribute("data-testid")) ||
+    turn.getAttribute("data-message-id") ||
+    null
+  );
+}
+
+/** Retrouve le tour assistant portant exactement `externalId`, jamais par position. */
+function findAssistantTurnByExternalId(externalId) {
+  const turns = document.querySelectorAll(SELECTORS.assistant);
+  for (const turn of turns) {
+    if (turnExternalId(turn) === externalId) return turn;
+  }
+  return null;
+}
+
+// Active la bascule « Temporary chat ». Toute conversation ouverte par le
+// bridge doit être éphémère : c'est ce qui évite le pipeline de suppression
+// (jamais fiable en pratique — voir chatgpt-bridge/AGENTS.md, section
+// « Ephemeral conversations »). Fail-closed : si le mode ne peut pas être
+// positivement confirmé, on lève plutôt que d'envoyer un prompt qui finirait
+// dans l'historique ChatGPT.
+async function ensureTemporaryChat() {
+  const findToggle = () => $(SELECTORS.temporaryChatToggle);
+  const isActive = (toggle) => {
+    if (!toggle) return false;
     const checkedIcon = toggle.querySelector(SELECTORS.temporaryChatCheckedIcon.join(", "));
     const checkedSvg = checkedIcon?.closest("svg");
     if (checkedSvg) return !checkedSvg.classList.contains("opacity-0");
     return toggle.getAttribute("aria-pressed") === "true";
   };
 
-  if (isActive()) {
+  const toggle = await waitFor(
+    findToggle,
+    15000,
+    "bascule 'Temporary chat' introuvable",
+  ).catch(() => null);
+  if (!toggle) {
+    throw new BridgeError(
+      "bridge_ui_timeout",
+      "bascule 'Temporary chat' introuvable — la conversation ne sera pas envoyée",
+    );
+  }
+
+  if (isActive(toggle)) {
     console.log("🕶️ Temporary chat déjà actif sur cet onglet");
-    return true;
+    return;
   }
 
   toggle.click();
-  try {
-    await waitFor(
-      () => (isActive() ? true : null),
-      3000,
-      "activation de 'Temporary chat' non confirmée",
+  // Chaque scrutation reinterroge le DOM (findToggle()) plutôt que de fermer
+  // sur `toggle` : un rerendu React peut remplacer le nœud après le clic.
+  const confirmed = await waitFor(
+    () => (isActive(findToggle()) ? true : null),
+    5000,
+    "activation de 'Temporary chat' non confirmée",
+  ).catch(() => null);
+  if (!confirmed) {
+    throw new BridgeError(
+      "bridge_ui_timeout",
+      "clic sur 'Temporary chat' envoyé mais l'activation n'a pas pu être confirmée",
     );
-    console.log("🕶️ Temporary chat activé — conversation éphémère (aucun historique ChatGPT)");
-    return true;
-  } catch (err) {
-    console.error(
-      "❌ Clic sur 'Temporary chat' envoyé mais l'activation n'a pas pu être confirmée : " +
-        err.message,
-    );
-    return false;
   }
+  console.log("🕶️ Temporary chat activé — conversation éphémère (aucun historique ChatGPT)");
 }
 
 async function handlePrompt({
@@ -1269,12 +1309,6 @@ async function handlePrompt({
   currentJob = job;
 
   try {
-    if (
-      conversation?.mode === "continue" &&
-      window.location.href !== conversation.external_locator
-    ) {
-      throw new Error("la page ne correspond pas au locator demandé");
-    }
     if (newChat) {
       const link = $(SELECTORS.newChat);
       if (link) {
@@ -1285,11 +1319,33 @@ async function handlePrompt({
       await sleep(1200);
     }
 
-    // Toute conversation neuve créée par le bridge (newChat explicite, ou
-    // conversation.mode === "fresh" — un onglet chatgpt.com/ vierge ouvert par
-    // background.js) doit être éphémère : voir ensureTemporaryChat() ci-dessus.
-    const wantsEphemeral = Boolean(newChat) || conversation?.mode === "fresh";
-    const ephemeralApplied = wantsEphemeral ? await ensureTemporaryChat() : null;
+    // Toute conversation liée au bridge (fresh, continue, ou newChat
+    // explicite) doit être un Temporary Chat, positivement confirmé avant
+    // Send — jamais best-effort. Voir ensureTemporaryChat() ci-dessus.
+    if (conversation || newChat) {
+      await ensureTemporaryChat();
+    }
+
+    // CONTINUE : le tour précédent attendu doit exister exactement dans cet
+    // onglet, par identité stable — jamais par index ou par comptage — avant
+    // qu'on touche au composer. Un onglet repris manuellement où ce tour est
+    // absent est rejeté ici, avant tout envoi.
+    let baselineTurn = null;
+    if (conversation?.mode === "continue") {
+      if (!conversation.expected_turn_id) {
+        throw new BridgeError(
+          "conversation_unavailable",
+          "expected_turn_id requis pour continuer une conversation",
+        );
+      }
+      baselineTurn = findAssistantTurnByExternalId(conversation.expected_turn_id);
+      if (!baselineTurn) {
+        throw new BridgeError(
+          "conversation_unavailable",
+          "le tour attendu est absent de cet onglet : session non fiable",
+        );
+      }
+    }
 
     const composer = await waitFor(
       () => $(SELECTORS.composer),
@@ -1297,9 +1353,9 @@ async function handlePrompt({
       "composer introuvable",
     );
     const before = document.querySelectorAll(SELECTORS.assistant).length;
-    const baselineTurn = before
-      ? document.querySelectorAll(SELECTORS.assistant)[before - 1]
-      : null;
+    if (!baselineTurn && before) {
+      baselineTurn = document.querySelectorAll(SELECTORS.assistant)[before - 1];
+    }
 
     if (files && files.length) await attachFiles(files);
     if (prompt) typePrompt(composer, prompt);
@@ -1318,29 +1374,19 @@ async function handlePrompt({
     );
     sendBtn.click();
 
-    const externalLocator = conversation
-      ? await waitFor(
-          () => verifiedLocator(),
-          15000,
-          "locator de conversation non attribué",
-        )
-      : null;
-
     if (conversation) {
       reply({
         type: "conversation_bound",
         id,
         conversation: {
           id: conversation.id,
-          external_locator: externalLocator,
+          expected_turn_id: conversation.expected_turn_id ?? null,
           assistant_turns_before: before,
-          initial_assistant_turn_id: baselineTurn
-            ? turnLocator(baselineTurn) ||
-              baselineTurn.getAttribute("data-message-id")
-            : null,
+          initial_assistant_turn_id: baselineTurn ? turnExternalId(baselineTurn) : null,
           verified: true,
           verified_at: new Date().toISOString(),
-          ephemeral: ephemeralApplied,
+          ephemeral: true,
+          external_locator: diagnosticLocator(),
         },
       });
     }
@@ -1357,11 +1403,7 @@ async function handlePrompt({
     const serialized = await streamAnswer(job, turnLocator(premier), before);
 
     if (!job.aborted) {
-      const container = closestOf(premier, SELECTORS.turnContainer);
-      const externalTurnId =
-        container?.getAttribute("data-testid") ||
-        premier.getAttribute("data-message-id") ||
-        null;
+      const externalTurnId = turnExternalId(premier);
       reply({
         type: serialized.incomplete ? "incomplete" : "done",
         id,
@@ -1382,20 +1424,24 @@ async function handlePrompt({
         conversation: conversation
           ? {
               id: conversation.id,
-              // Read again at completion: right after submission ChatGPT still
-              // exposes an optimistic `/c/WEB:<id>` URL, which it replaces with
-              // the canonical one once the turn is persisted. Storing the early
-              // value made every follow-up turn open a new tab and fail.
-              external_locator: verifiedLocator() || externalLocator,
-              turn_id: externalTurnId || `bridge-${id}`,
               mode: conversation.mode,
+              turn_id: externalTurnId || `bridge-${id}`,
               verified: true,
+              ephemeral: true,
+              external_locator: diagnosticLocator(),
             }
           : null,
       });
     }
   } catch (err) {
-    if (!job.aborted) reply({ type: "error", id, message: err.message });
+    if (!job.aborted) {
+      reply({
+        type: "error",
+        id,
+        code: err.code || "bridge_server_error",
+        message: err.message,
+      });
+    }
   } finally {
     if (currentJob === job) currentJob = null;
   }
@@ -1422,7 +1468,7 @@ async function captureLaterResponse(msg) {
       id: msg.id,
       text: serialized.text,
       conversation_id: msg.conversation.id,
-      external_locator: verifiedLocator(),
+      external_locator: diagnosticLocator(),
       turn_id:
         container?.getAttribute("data-testid") ||
         turn.getAttribute("data-message-id") ||

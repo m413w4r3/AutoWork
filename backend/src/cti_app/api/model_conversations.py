@@ -282,7 +282,6 @@ def _raise(exc: Exception) -> NoReturn:
         if code
         in {
             "external_llm_blocked",
-            "conversation_locator_invalid",
             "conversation_unavailable",
             "conversation_profile_mismatch",
         }

@@ -38,11 +38,6 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
 )
 from cti_app.domain.jobs import JobStatus
-from cti_app.domain.model_conversations import (
-    ConversationLifecycleStatus,
-    ConversationPolicy,
-    ConversationReleaseOutcome,
-)
 from cti_app.domain.model_runs import (
     ModelProvider,
     ModelRole,
@@ -78,15 +73,15 @@ class FakeBridgeCapabilities:
 
 class OrderTrackingBridgeCapabilities:
     """Records, at the moment archive_conversation is called, whether the batch
-    was already persisted and what the lifecycle status already was — the only
-    way to check orchestration order through DiscoveryService's public surface
-    instead of reading private implementation lines."""
+    was already persisted — the only way to check orchestration order through
+    DiscoveryService's public surface instead of reading private implementation
+    lines. The bridge conversation itself is a live browser session with no
+    application-side lifecycle row: only the durable batch state is checked."""
 
     def __init__(self, discovery_uow: InMemoryDiscoveryUnitOfWorkFactory) -> None:
         self._discovery_uow = discovery_uow
         self.archive_calls: list[UUID] = []
         self.archive_call_batch_persisted: list[bool] = []
-        self.archive_call_lifecycle_status: list[ConversationLifecycleStatus | None] = []
 
     async def capabilities(self) -> dict[str, object]:
         return {"web_search": True, "native_sources": False, "visible_citations": True}
@@ -94,8 +89,6 @@ class OrderTrackingBridgeCapabilities:
     async def archive_conversation(self, conversation_id: UUID) -> None:
         self.archive_calls.append(conversation_id)
         self.archive_call_batch_persisted.append(bool(self._discovery_uow.state))
-        lifecycle = self._discovery_uow.conversation_lifecycles.get(conversation_id)
-        self.archive_call_lifecycle_status.append(lifecycle.status if lifecycle else None)
 
     async def preview_visible_recovery(self, bridge_run_id: str) -> dict[str, object]:
         del bridge_run_id
@@ -433,10 +426,11 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     assert grouped_editions == [params.edition_id, params.edition_id]
 
 
-async def test_successful_discovery_releases_lifecycle_only_after_batch_persisted() -> None:
-    """Orchestration boundary domain tests can't cover: the batch must be durably
-    persisted, then the lifecycle released with SUCCESS, before the external
-    conversation is ever requested for archival."""
+async def test_successful_discovery_archives_conversation_once_after_batch_persisted() -> None:
+    """Orchestration boundary domain tests can't cover: the batch must be
+    durably persisted as the canonical successful result before the exact live
+    Temporary Chat browser session is ever requested for closure — and closed
+    exactly once."""
     fake = FakeModelAdapter(research_text=research_markdown_fixture())
     gateway, _, _ = gateway_for_adapter(fake)
     discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
@@ -468,22 +462,14 @@ async def test_successful_discovery_releases_lifecycle_only_after_batch_persiste
     completed = await jobs.get(job.id)
     assert completed.status is JobStatus.SUCCEEDED
 
-    # Same conversation id used for the model request and for the lifecycle row.
+    # Same conversation id used for the model request and for the archive call.
     assert fake.calls[0].conversation is not None
     assert fake.calls[0].conversation.id == expected_conversation_id
 
-    lifecycle = discovery_uow.conversation_lifecycles[expected_conversation_id]
-    assert lifecycle.policy is ConversationPolicy.DELETE_ON_SUCCESS
-    assert lifecycle.release_outcome is ConversationReleaseOutcome.SUCCESS
-    assert lifecycle.status is ConversationLifecycleStatus.DELETE_PENDING
-
+    # The archive request fires exactly once, and only once the batch is durably
+    # persisted as the canonical successful result.
     assert capabilities.archive_calls == [expected_conversation_id]
-    # The archive request fires exactly once, and only once the batch is
-    # persisted and the lifecycle already reflects its SUCCESS release.
     assert capabilities.archive_call_batch_persisted == [True]
-    assert capabilities.archive_call_lifecycle_status == [
-        ConversationLifecycleStatus.DELETE_PENDING
-    ]
 
 
 async def test_failed_research_never_deletes_conversation_or_batch() -> None:
@@ -520,14 +506,9 @@ async def test_failed_research_never_deletes_conversation_or_batch() -> None:
     failed = await jobs.get(job.id)
     assert failed.status is JobStatus.FAILED
     assert await discovery.list_batches(params.edition_id) == []
+    # SUCCESS was never reached, so the temporary browser session is never
+    # requested for closure — it stays alive for inspection/recovery.
     assert capabilities.archive_calls == []
-
-    assert len(discovery_uow.conversation_lifecycles) == 1
-    lifecycle = next(iter(discovery_uow.conversation_lifecycles.values()))
-    # Not released at all: SUCCESS was never reached, so DELETE_ON_SUCCESS
-    # never gets a chance to schedule a deletion.
-    assert lifecycle.release_outcome is None
-    assert lifecycle.status is ConversationLifecycleStatus.ACTIVE
 
 
 async def test_needs_review_keeps_conversation_recoverable_without_archiving() -> None:
@@ -566,12 +547,9 @@ async def test_needs_review_keeps_conversation_recoverable_without_archiving() -
     first = await jobs.get(job.id)
     assert first.status is JobStatus.WAITING_HUMAN
     assert await discovery.list_batches(params.edition_id) == []
+    # A NEEDS_REVIEW outcome is not success: the temporary browser session
+    # stays available for a human to resume it, never closed here.
     assert capabilities.archive_calls == []
-
-    assert len(discovery_uow.conversation_lifecycles) == 1
-    lifecycle = next(iter(discovery_uow.conversation_lifecycles.values()))
-    assert lifecycle.release_outcome is None
-    assert lifecycle.status is ConversationLifecycleStatus.ACTIVE
 
 
 async def test_discovery_renews_job_heartbeat_while_bridge_remains_running() -> None:
@@ -814,7 +792,9 @@ async def test_controlled_completion_is_idempotent_and_keeps_exact_conversation(
         details={
             "conversation": {
                 "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-                "external_locator": ("https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                "initial_assistant_turn_id": "external-turn-before-incomplete",
+                # Diagnostic only: never used to route or reopen the conversation.
+                "external_locator": "https://chatgpt.com/?temporary-chat=true",
             }
         },
     )
@@ -835,9 +815,7 @@ async def test_controlled_completion_is_idempotent_and_keeps_exact_conversation(
     assert submitted.conversation is not None
     assert submitted.conversation.mode == "continue"
     assert submitted.conversation.id == UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-    assert submitted.conversation.external_locator == (
-        "https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-    )
+    assert submitted.conversation.expected_turn_id == "external-turn-before-incomplete"
     assert submitted.parameters["bridge_recovery"] is True
     details = model_uow.state[parent.id].error_details
     assert details is not None

@@ -88,11 +88,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         workspace_root=settings.subject_workspace_root,
     )
     production_diagnostics = DiagnosticsLog.from_env(settings.diagnostics_log_root)
+    # Exactly one bridge capabilities provider for this process: it also
+    # doubles as the ConversationSessionCloser (archive_conversation) that
+    # closes the exact live Temporary Chat browser session — construct it
+    # once and inject the same instance everywhere it's needed.
+    bridge_provider = create_bridge_capabilities_provider(settings)
     cumulative_discovery_service = CumulativeDiscoveryService(
         uow_factory,
         planner=ChatGptMergePlanner(
             model_gateway,
-            bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
+            bridge_capabilities_provider=bridge_provider,
         ),
         after_activation=editorial_service.synchronize,
         diagnostics=production_diagnostics,
@@ -163,7 +168,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory,
         model_gateway,
         archive=model_gateway,
-        bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
+        bridge_capabilities_provider=bridge_provider,
         after_persisted_batch=enqueue_discovery_reconciliation,
         background_poll_interval_seconds=settings.discovery_bridge_poll_interval_seconds,
     )
@@ -200,6 +205,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model_gateway,
         blob_store,
         retention_days=settings.model_conversation_retention_days,
+        conversation_session_closer=bridge_provider,
     )
 
     subject_production_service = SubjectProductionService(uow_factory)

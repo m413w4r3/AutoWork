@@ -26,9 +26,16 @@ Usage :
 
 Configuration : BRIDGE_URL (défaut http://127.0.0.1:8001), BRIDGE_API_KEY.
 
+Identité de routage : `conversation.id` (UUID applicatif) + `expected_turn_id`
+pour une continuation — jamais un `external_locator`/URL, qui n'est qu'une
+métadonnée diagnostique optionnelle et peut être identique entre plusieurs
+conversations Temporary Chat simultanées (elles partagent toutes
+`https://chatgpt.com/?temporary-chat=true`).
+
 Ce script NE PEUT PAS vérifier lui-même que la conversation n'apparaît pas
 dans l'historique ChatGPT (il n'a pas accès visuel à la page) : il affiche
-l'URL (`external_locator`) à la fin et demande une vérification humaine.
+l'URL diagnostique (`external_locator`, si présente) à la fin et demande une
+vérification humaine.
 """
 
 from __future__ import annotations
@@ -143,34 +150,79 @@ def main() -> int:
     # L'info de conversation vit sous metadata.conversation dans la réponse
     # au format Responses API — pas à la racine.
     conversation_info = (response.get("metadata") or {}).get("conversation") or {}
-    external_locator = conversation_info.get("external_locator")
+    reported_id = conversation_info.get("id")
+    verified = conversation_info.get("verified")
     ephemeral = conversation_info.get("ephemeral")
+    turn_id = conversation_info.get("turn_id")
+    output_text = response.get("output_text")
+    # Diagnostic only — a Temporary Chat URL may be shared by many
+    # conversations, so it is never required to be unique, nor required at all.
+    external_locator = conversation_info.get("external_locator")
     log.event(
         "conversation_created",
         conversation_id=conversation_id,
-        external_locator=external_locator,
+        reported_id=reported_id,
+        verified=verified,
         ephemeral=ephemeral,
+        turn_id=turn_id,
+        external_locator=external_locator,
     )
-    if not external_locator:
+    if reported_id != conversation_id or verified is not True or ephemeral is not True:
         log.event(
             "audit_aborted",
-            reason="aucun external_locator retourné — conversation non ouverte",
+            reason=(
+                "la conversation retournée n'est pas vérifiée/éphémère, ou son id ne "
+                "correspond pas à celui demandé"
+            ),
+        )
+        log.close()
+        return 1
+    if not turn_id or not output_text:
+        log.event(
+            "audit_aborted",
+            reason="aucun turn_id ou aucune sortie retournés — conversation non fonctionnelle",
         )
         log.close()
         return 1
 
-    if ephemeral is not True:
+    # 2. Continuation réelle, sur le même onglet exact : identité de routage
+    #    conversation.id + expected_turn_id (le turn_id vérifié ci-dessus),
+    #    jamais un locator/URL.
+    continue_payload = {
+        "input": "Réponds uniquement par le mot: bien",
+        "conversation": {
+            "mode": "continue",
+            "id": conversation_id,
+            "expected_turn_id": turn_id,
+        },
+    }
+    log.event("conversation_continue_requested", payload=continue_payload)
+    status, continue_response = _call(
+        "POST", "/v1/bridge/runs", continue_payload, timeout=120.0
+    )
+    log.event("conversation_continue_completed", status=status, body=continue_response)
+    if status != 200 or not isinstance(continue_response, dict):
         log.event(
-            "ephemeral_not_confirmed",
-            severity="warning",
-            message=(
-                "ensureTemporaryChat() n'a pas confirmé l'activation de 'Temporary chat' "
-                "(voir la console du service worker de l'extension pour le détail) — "
-                "cette conversation risque de rester dans l'historique ChatGPT."
-            ),
+            "audit_aborted",
+            reason="échec de la continuation sur le même onglet (expected_turn_id)",
         )
+        log.close()
+        return 1
+    continue_info = (continue_response.get("metadata") or {}).get("conversation") or {}
+    if (
+        continue_info.get("id") != conversation_id
+        or continue_info.get("verified") is not True
+        or continue_info.get("ephemeral") is not True
+        or not continue_info.get("turn_id")
+    ):
+        log.event(
+            "audit_aborted",
+            reason="la continuation n'a pas rejoint l'onglet exact déjà vérifié",
+        )
+        log.close()
+        return 1
 
-    # 2. Chemin de fermeture EXACT emprunté par le backend en production :
+    # 3. Chemin de fermeture EXACT emprunté par le backend en production :
     #    _archive_ephemeral_conversation() -> DELETE /v1/bridge/conversations/{id}.
     #    Voir backend/src/cti_app/application/discovery/service.py:482
     log.event(
@@ -185,10 +237,12 @@ def main() -> int:
     log.event(
         "manual_verification_required",
         message=(
-            "Ouvre l'historique ChatGPT (barre latérale de chatgpt.com) et vérifie que la "
-            "conversation à l'URL ci-dessous n'y figure PAS. Si elle y figure, 'Temporary "
-            "chat' n'a pas été activé correctement — défaut à investiguer."
+            "Ouvre l'historique ChatGPT (barre latérale de chatgpt.com) et vérifie qu'aucune "
+            "conversation issue de ce run n'y figure. Si l'une y figure, 'Temporary chat' n'a "
+            "pas été activé correctement — défaut à investiguer. external_locator, si présent, "
+            "n'est qu'un indice diagnostique : il peut être partagé par plusieurs conversations."
         ),
+        conversation_id=conversation_id,
         external_locator=external_locator,
     )
 
@@ -196,8 +250,8 @@ def main() -> int:
     log.close()
     print(f"\nJournal d'audit complet : {AUDIT_PATH}")
     print(
-        "Vérifie manuellement que cette conversation N'EST PAS dans l'historique : "
-        f"{external_locator}"
+        "Vérifie manuellement que la conversation "
+        f"{conversation_id} N'EST PAS dans l'historique ChatGPT."
     )
     return 0
 

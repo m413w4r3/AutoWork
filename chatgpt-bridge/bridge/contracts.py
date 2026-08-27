@@ -2,7 +2,6 @@
 
 import uuid
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -25,32 +24,27 @@ class FileAttachment(BaseModel):
 
 
 class BridgeConversationTarget(BaseModel):
-    """Cible applicative explicite ; le locator reste opaque après validation d'origine."""
+    """Cible de routage d'une conversation : identité applicative + tour attendu.
+
+    L'URL/locator n'est jamais un champ de routage ici — voir
+    `external_locator` sur les résultats/réponses, qui reste une métadonnée
+    diagnostique séparée et n'entre jamais dans ce modèle de requête.
+    """
 
     mode: str
     id: uuid.UUID
-    external_locator: Optional[str] = None
+    expected_turn_id: Optional[str] = Field(default=None, max_length=512)
+
+    model_config = {"extra": "forbid"}
 
     @model_validator(mode="after")
     def validate_target(self):
         if self.mode not in {"fresh", "continue"}:
             raise ValueError("conversation.mode doit valoir fresh ou continue")
-        if self.mode == "fresh" and self.external_locator is not None:
-            raise ValueError("fresh interdit un locator préexistant")
-        if self.mode == "continue" and not self.external_locator:
-            raise ValueError("continue exige external_locator")
-        if self.external_locator:
-            parsed = urlsplit(self.external_locator)
-            if (
-                parsed.scheme != "https"
-                or parsed.hostname not in {"chatgpt.com", "chat.openai.com"}
-                or parsed.username
-                or parsed.password
-                or parsed.port not in {None, 443}
-                or parsed.fragment
-                or parsed.path in {"", "/"}
-            ):
-                raise ValueError("locator hors des origines ChatGPT autorisées")
+        if self.mode == "fresh" and self.expected_turn_id is not None:
+            raise ValueError("fresh interdit un expected_turn_id préexistant")
+        if self.mode == "continue" and not self.expected_turn_id:
+            raise ValueError("continue exige expected_turn_id")
         return self
 
 

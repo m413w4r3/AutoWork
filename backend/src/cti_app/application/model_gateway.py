@@ -14,9 +14,6 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ValidationError
 
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.domain.model_conversations import (
-    ConversationPolicy,
-)
 from cti_app.domain.model_runs import (
     ModelOutputRejection,
     ModelProvider,
@@ -91,7 +88,9 @@ class AdapterResultStatus(StrEnum):
 class ConversationContext:
     mode: str
     id: UUID
-    external_locator: str | None = None
+    # Proves the bound browser tab still holds the expected conversation head.
+    # This — not external_locator — is the CONTINUE routing precondition.
+    expected_turn_id: str | None = None
     parent_turn_id: UUID | None = None
     previous_head_hash: str | None = None
     expected_profile: str | None = None
@@ -101,14 +100,16 @@ class ConversationContext:
     def __post_init__(self) -> None:
         if self.mode not in {"fresh", "continue"}:
             raise ValueError("Conversation mode must be fresh or continue")
-        if self.mode == "continue" and not self.external_locator:
-            raise ValueError("Continue mode requires an external locator")
+        if self.mode == "fresh" and self.expected_turn_id is not None:
+            raise ValueError("Fresh mode must not carry an expected_turn_id")
+        if self.mode == "continue" and not self.expected_turn_id:
+            raise ValueError("Continue mode requires expected_turn_id")
 
     def bridge_payload(self) -> dict[str, str | None]:
         return {
             "mode": self.mode,
             "id": str(self.id),
-            "external_locator": self.external_locator,
+            "expected_turn_id": self.expected_turn_id,
         }
 
 
@@ -119,17 +120,6 @@ class ConversationResult:
     external_locator: str | None
     turn_id: str | None
     verified: bool
-
-
-@dataclass(frozen=True, slots=True)
-class ConversationLifecycleSpec:
-    """Explicit lifecycle policy for a new conversation.
-
-    This is a first-order control data, not metadata. Every ModelRequest
-    creating a fresh conversation MUST provide this.
-    """
-
-    policy: ConversationPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,9 +140,6 @@ class ModelRequest:
     provider: ModelProvider | None = None
     # Stateless requests (bulk extraction, drafting) carry no conversation at all.
     conversation: ConversationContext | None = None
-    # Mandatory whenever `conversation.mode == "fresh"`: opening a conversation
-    # without declaring how it is disposed of leaks it on the ChatGPT side.
-    conversation_lifecycle: ConversationLifecycleSpec | None = None
     run_id: UUID | None = None
     # A failed request is never retried implicitly.  This escape hatch is only
     # for a caller that has proved no provider submission took place.
@@ -167,13 +154,6 @@ class ModelRequest:
             raise ValueError("evidence_pack_hash must be a lowercase SHA-256")
         if _contains_binary(self.metadata) or _contains_binary(self.parameters):
             raise BinaryModelInputError("Binary values cannot be sent to a model")
-        # Invariant: fresh requires an explicit policy, continue reuses the existing one.
-        if (
-            self.conversation is not None
-            and self.conversation.mode == "fresh"
-            and self.conversation_lifecycle is None
-        ):
-            raise ValueError("A fresh conversation requires an explicit conversation_lifecycle")
 
 
 @dataclass(frozen=True, slots=True)
@@ -925,7 +905,7 @@ def sanitize_model_request(request: ModelRequest) -> SafeModelRequest:
         "evidence_pack_hash": request.evidence_pack_hash,
         "conversation_id": str(request.conversation.id) if request.conversation else None,
         "conversation_mode": request.conversation.mode if request.conversation else "fresh",
-        "external_locator": request.conversation.external_locator if request.conversation else None,
+        "expected_turn_id": request.conversation.expected_turn_id if request.conversation else None,
         "parent_turn_id": (
             str(request.conversation.parent_turn_id) if request.conversation else None
         ),

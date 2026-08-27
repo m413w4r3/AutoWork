@@ -30,7 +30,6 @@ from cti_app.application.discovery.cumulative.validation import validate_merge_p
 from cti_app.application.discovery.ports import BridgeCapabilitiesProvider
 from cti_app.application.model_gateway import (
     ConversationContext,
-    ConversationLifecycleSpec,
     DraftingModel,
     ExternalModelBlockedError,
     ModelRequest,
@@ -43,7 +42,6 @@ from cti_app.domain.discovery_cumulative import (
     MergeValidationStatus,
     canonical_sha256,
 )
-from cti_app.domain.model_conversations import ConversationPolicy
 from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.logging import get_correlation_id
 
@@ -164,9 +162,6 @@ class ChatGptMergePlanner:
                 },
                 parameters={"temperature": 0},
                 conversation=ConversationContext(mode="fresh", id=initial_conversation_id),
-                conversation_lifecycle=ConversationLifecycleSpec(
-                    policy=ConversationPolicy.DELETE_ON_SUCCESS,
-                ),
                 run_id=uuid5(NAMESPACE_URL, f"discovery-merge-model-run:{merge_input_hash}"),
             ),
             DiscoveryMergePlanV1,
@@ -217,9 +212,6 @@ class ChatGptMergePlanner:
                     metadata={"defer_validation": True, "repair_of": str(initial.run.id)},
                     parameters={"temperature": 0},
                     conversation=ConversationContext(mode="fresh", id=repair_conversation_id),
-                    conversation_lifecycle=ConversationLifecycleSpec(
-                        policy=ConversationPolicy.DELETE_ON_SUCCESS,
-                    ),
                     run_id=uuid5(NAMESPACE_URL, f"discovery-merge-repair-run:{repair_hash}"),
                 ),
                 DiscoveryMergePlanV1,

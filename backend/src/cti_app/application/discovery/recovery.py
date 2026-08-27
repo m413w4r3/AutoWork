@@ -248,12 +248,21 @@ class DiscoveryRecoveryCoordinator:
             if isinstance(source_id, str):
                 return UUID(source_id)
         conversation = details.get("conversation") if isinstance(details, dict) else None
+        # The routing precondition is the last verified external turn id, never
+        # a locator/URL: `initial_assistant_turn_id` is the exact prior turn
+        # the extension bound before the incomplete attempt started.
+        expected_turn_id = (
+            conversation.get("initial_assistant_turn_id")
+            if isinstance(conversation, dict)
+            else None
+        )
         if (
             parent is None
             or parent.status is not ModelRunStatus.NEEDS_REVIEW
             or not isinstance(conversation, dict)
             or not isinstance(conversation.get("id"), str)
-            or not isinstance(conversation.get("external_locator"), str)
+            or not isinstance(expected_turn_id, str)
+            or not expected_turn_id
         ):
             raise ModelGatewayError("Verified discovery conversation is unavailable")
         child_id = uuid5(NAMESPACE_URL, f"{parent_run_id}:complete-initial-response:v1")
@@ -278,7 +287,7 @@ class DiscoveryRecoveryCoordinator:
             conversation=ConversationContext(
                 mode="continue",
                 id=UUID(conversation["id"]),
-                external_locator=conversation["external_locator"],
+                expected_turn_id=expected_turn_id,
             ),
             run_id=child_id,
         )

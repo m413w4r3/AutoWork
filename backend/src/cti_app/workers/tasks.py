@@ -147,11 +147,15 @@ async def _execute_job(job_id: UUID) -> int | None:
         production_diagnostics = DiagnosticsLog.from_env(settings.diagnostics_log_root)
         model_gateway = create_model_gateway(settings, uow_factory)
         editorial_service = EditorialGroupingService(uow_factory)
+        # Exactly one bridge capabilities provider for this worker execution
+        # context; it also doubles as the ConversationSessionCloser that
+        # closes the exact live Temporary Chat browser session.
+        bridge_provider = create_bridge_capabilities_provider(settings)
         cumulative_discovery_service = CumulativeDiscoveryService(
             uow_factory,
             planner=ChatGptMergePlanner(
                 model_gateway,
-                bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
+                bridge_capabilities_provider=bridge_provider,
             ),
             after_activation=editorial_service.synchronize,
             diagnostics=production_diagnostics,
@@ -199,7 +203,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             uow_factory,
             model_gateway,
             archive=model_gateway,
-            bridge_capabilities_provider=create_bridge_capabilities_provider(settings),
+            bridge_capabilities_provider=bridge_provider,
             after_persisted_batch=enqueue_discovery_reconciliation,
             background_poll_interval_seconds=settings.discovery_bridge_poll_interval_seconds,
         )
@@ -238,6 +242,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             model_gateway,
             blob_store,
             retention_days=settings.model_conversation_retention_days,
+            conversation_session_closer=bridge_provider,
         )
         # Production stage jobs run here, so the worker needs the production
         # registrations and a bound chain to queue the following stage.

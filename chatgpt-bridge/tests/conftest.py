@@ -41,7 +41,9 @@ class FakeExtension:
         self.sent: list[dict[str, Any]] = []
         self.tasks: set[asyncio.Task[None]] = set()
         self.closed: tuple[int, str] | None = None
-        self.locators: dict[str, str] = {}
+        # Live session state, by conversation id: last verified external turn.
+        # Identity is id + expected_turn_id — never a locator/URL.
+        self.turn_ids: dict[str, str] = {}
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         self.sent.append(payload)
@@ -87,23 +89,39 @@ class FakeExtension:
             conversation = None
             if target:
                 if target["mode"] == "fresh":
-                    self.locators[target["id"]] = f"https://chatgpt.com/simulated/{target['id']}"
-                elif self.locators.get(target["id"]) != target.get("external_locator"):
+                    if target["id"] in self.turn_ids:
+                        self.runtime.bridge.dispatch(
+                            {
+                                "type": "error",
+                                "id": payload["id"],
+                                "event_id": "2",
+                                "code": "conversation_unavailable",
+                                "message": "une session live existe déjà pour cet id",
+                            }
+                        )
+                        return
+                elif self.turn_ids.get(target["id"]) != target.get("expected_turn_id"):
                     self.runtime.bridge.dispatch(
                         {
                             "type": "error",
                             "id": payload["id"],
                             "event_id": "2",
+                            "code": "conversation_unavailable",
                             "message": "conversation simulée introuvable",
                         }
                     )
                     return
+                new_turn_id = f"turn-{self.prompt_count}"
+                self.turn_ids[target["id"]] = new_turn_id
                 conversation = {
                     "id": target["id"],
-                    "external_locator": self.locators[target["id"]],
-                    "turn_id": f"turn-{self.prompt_count}",
+                    "turn_id": new_turn_id,
                     "mode": target["mode"],
                     "verified": True,
+                    "ephemeral": True,
+                    # Diagnostic only: every simulated conversation shares this
+                    # URL on purpose, to prove routing never depends on it.
+                    "external_locator": "https://chatgpt.com/?temporary-chat=true",
                 }
             self.runtime.bridge.dispatch(
                 {

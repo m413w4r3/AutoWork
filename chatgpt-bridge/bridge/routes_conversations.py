@@ -39,13 +39,16 @@ class ConversationRoutes:
         )
 
     async def archive_bridge_conversation(self, conversation_id: uuid.UUID):
-        # NOTE: this endpoint only closes the local browser tab and drops the
-        # extension's in-memory conversation_id -> tab mapping (see background.js
-        # handleConversationArchive). That is sufficient because every conversation
-        # the bridge opens fresh is put in ChatGPT's "Temporary chat" mode by
-        # content.js's ensureTemporaryChat() before the first prompt is sent — it is
-        # never written to ChatGPT's own history, so there is nothing left to delete
-        # server-side once the tab is gone.
+        # NOTE: this closes the exact live Temporary Chat browser session bound
+        # to this conversation id — the extension resolves conversation_id to
+        # its own tab binding (see background.js handleConversationArchive),
+        # never to an external_locator/URL. It does not delete ChatGPT history:
+        # every conversation the bridge opens fresh is put in ChatGPT's
+        # "Temporary chat" mode by content.js's ensureTemporaryChat() before the
+        # first prompt is sent, so it was never written to ChatGPT's own
+        # history in the first place — closing the tab is the entire cleanup.
+        # external_locator plays no part in this: identity here is
+        # conversation_id -> tab binding only.
         logger.info("conversation_archive_requested conversation_id=%s", conversation_id)
         if not self.bridge.online:
             logger.warning(

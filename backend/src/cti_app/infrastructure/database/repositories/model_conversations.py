@@ -5,11 +5,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.domain.model_conversations import (
-    ConversationLifecycle,
-    ConversationLifecycleStatus,
-    ConversationPolicy,
     ConversationPurpose,
-    ConversationReleaseOutcome,
     ConversationStatus,
     ConversationTransport,
     ConversationTurnStatus,
@@ -18,7 +14,6 @@ from cti_app.domain.model_conversations import (
 )
 from cti_app.domain.model_runs import ModelProvider
 from cti_app.infrastructure.database.models.model_execution import (
-    ConversationLifecycleRow,
     ModelConversationRow,
     ModelConversationTurnRow,
 )
@@ -121,65 +116,6 @@ class SqlAlchemyModelConversationTurnRepository:
         await self._session.flush()
 
 
-class SqlAlchemyConversationLifecycleRepository:
-    def __init__(self, session: AsyncSession) -> None:
-        self._session = session
-
-    async def add(self, lifecycle: ConversationLifecycle) -> None:
-        self._session.add(
-            ConversationLifecycleRow(**_conversation_lifecycle_values(lifecycle))
-        )
-        await self._session.flush()
-
-    async def get(self, lifecycle_id: UUID) -> ConversationLifecycle | None:
-        row = await self._session.get(ConversationLifecycleRow, lifecycle_id)
-        return _conversation_lifecycle_from_row(row) if row else None
-
-    async def get_by_conversation_id(self, conversation_id: UUID) -> ConversationLifecycle | None:
-        row = await self._session.scalar(
-            select(ConversationLifecycleRow).where(
-                ConversationLifecycleRow.conversation_id == conversation_id
-            )
-        )
-        return _conversation_lifecycle_from_row(row) if row else None
-
-    async def save(self, lifecycle: ConversationLifecycle) -> None:
-        values = _conversation_lifecycle_values(lifecycle)
-        values.pop("id")
-        result = await self._session.execute(
-            update(ConversationLifecycleRow)
-            .where(
-                ConversationLifecycleRow.id == lifecycle.id,
-                ConversationLifecycleRow.version == lifecycle.version - 1,
-            )
-            .values(**values)
-        )
-        if getattr(result, "rowcount", 0) != 1:
-            raise LookupError(f"Conversation lifecycle {lifecycle.id} not found or stale version")
-
-    async def list_delete_pending(self) -> Sequence[ConversationLifecycle]:
-        rows = await self._session.scalars(
-            select(ConversationLifecycleRow)
-            .where(
-                ConversationLifecycleRow.status
-                == ConversationLifecycleStatus.DELETE_PENDING.value
-            )
-            .order_by(ConversationLifecycleRow.created_at)
-        )
-        return [_conversation_lifecycle_from_row(row) for row in rows]
-
-    async def list_cleanup_failed(self) -> Sequence[ConversationLifecycle]:
-        rows = await self._session.scalars(
-            select(ConversationLifecycleRow)
-            .where(
-                ConversationLifecycleRow.status
-                == ConversationLifecycleStatus.CLEANUP_FAILED.value
-            )
-            .order_by(ConversationLifecycleRow.last_cleanup_attempt_at)
-        )
-        return [_conversation_lifecycle_from_row(row) for row in rows]
-
-
 def _model_conversation_values(conversation: ModelConversation) -> dict[str, object]:
     return {
         "id": conversation.id,
@@ -273,41 +209,4 @@ def _model_conversation_turn_from_row(
         created_at=row.created_at,
         started_at=row.started_at,
         finished_at=row.finished_at,
-    )
-
-
-def _conversation_lifecycle_values(lifecycle: ConversationLifecycle) -> dict[str, object]:
-    return {
-        "id": lifecycle.id,
-        "conversation_id": lifecycle.id,  # TODO: lifecycle.id doubles as conversation_id
-        "policy": lifecycle.policy.value,
-        "status": lifecycle.status.value,
-        "release_outcome": lifecycle.release_outcome.value if lifecycle.release_outcome else None,
-        "released_at": lifecycle.released_at,
-        "deleted_at": lifecycle.deleted_at,
-        "cleanup_attempt_count": lifecycle.cleanup_attempt_count,
-        "last_cleanup_attempt_at": lifecycle.last_cleanup_attempt_at,
-        "last_cleanup_error_code": lifecycle.last_cleanup_error_code,
-        "created_at": lifecycle.created_at,
-        "updated_at": lifecycle.updated_at,
-        "version": lifecycle.version,
-    }
-
-
-def _conversation_lifecycle_from_row(row: ConversationLifecycleRow) -> ConversationLifecycle:
-    return ConversationLifecycle(
-        id=row.id,
-        policy=ConversationPolicy(row.policy),
-        status=ConversationLifecycleStatus(row.status),
-        release_outcome=(
-            ConversationReleaseOutcome(row.release_outcome) if row.release_outcome else None
-        ),
-        released_at=row.released_at,
-        deleted_at=row.deleted_at,
-        cleanup_attempt_count=row.cleanup_attempt_count,
-        last_cleanup_attempt_at=row.last_cleanup_attempt_at,
-        last_cleanup_error_code=row.last_cleanup_error_code,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
-        version=row.version,
     )

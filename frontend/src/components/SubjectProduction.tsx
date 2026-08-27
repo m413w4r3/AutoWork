@@ -61,7 +61,6 @@ const CONVERSATION_ERROR_CODES = new Set([
   "bridge_idle_timeout",
   "bridge_total_timeout",
   "conversation_unavailable",
-  "conversation_locator_invalid",
   "conversation_profile_mismatch",
   "conversation_busy",
 ]);

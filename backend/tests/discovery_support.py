@@ -5,15 +5,10 @@ from types import TracebackType
 from uuid import UUID
 
 from cti_app.application.persistence import (
-    ConversationLifecycleRepository,
     DiscoveryBatchRepository,
     DiscoveryUnitOfWork,
 )
 from cti_app.domain.discovery import DiscoveryBatch
-from cti_app.domain.model_conversations import (
-    ConversationLifecycle,
-    ConversationLifecycleStatus,
-)
 
 
 class InMemoryDiscoveryBatchRepository:
@@ -55,55 +50,11 @@ class InMemoryDiscoveryBatchRepository:
         self._state[batch.id] = deepcopy(batch)
 
 
-class InMemoryConversationLifecycleRepository:
-    def __init__(self, state: dict[UUID, ConversationLifecycle]) -> None:
-        self._state = state
-
-    async def add(self, lifecycle: ConversationLifecycle) -> None:
-        self._state[lifecycle.id] = lifecycle
-
-    async def get(self, lifecycle_id: UUID) -> ConversationLifecycle | None:
-        return self._state.get(lifecycle_id)
-
-    async def get_by_conversation_id(
-        self, conversation_id: UUID
-    ) -> ConversationLifecycle | None:
-        return next(
-            (item for item in self._state.values() if item.id == conversation_id),
-            None,
-        )
-
-    async def save(self, lifecycle: ConversationLifecycle) -> None:
-        if lifecycle.id not in self._state:
-            raise LookupError(lifecycle.id)
-        self._state[lifecycle.id] = lifecycle
-
-    async def list_delete_pending(self) -> list[ConversationLifecycle]:
-        return [
-            item
-            for item in self._state.values()
-            if item.status is ConversationLifecycleStatus.DELETE_PENDING
-        ]
-
-    async def list_cleanup_failed(self) -> list[ConversationLifecycle]:
-        return [
-            item
-            for item in self._state.values()
-            if item.status is ConversationLifecycleStatus.CLEANUP_FAILED
-        ]
-
-
 class InMemoryDiscoveryUnitOfWork:
     discovery_batches: DiscoveryBatchRepository
-    conversation_lifecycles: ConversationLifecycleRepository
 
-    def __init__(
-        self,
-        state: dict[UUID, DiscoveryBatch],
-        lifecycles: dict[UUID, ConversationLifecycle],
-    ) -> None:
+    def __init__(self, state: dict[UUID, DiscoveryBatch]) -> None:
         self.discovery_batches = InMemoryDiscoveryBatchRepository(state)
-        self.conversation_lifecycles = InMemoryConversationLifecycleRepository(lifecycles)
 
     async def __aenter__(self) -> InMemoryDiscoveryUnitOfWork:
         return self
@@ -126,7 +77,6 @@ class InMemoryDiscoveryUnitOfWork:
 class InMemoryDiscoveryUnitOfWorkFactory:
     def __init__(self) -> None:
         self.state: dict[UUID, DiscoveryBatch] = {}
-        self.conversation_lifecycles: dict[UUID, ConversationLifecycle] = {}
 
     def __call__(self) -> DiscoveryUnitOfWork:
-        return InMemoryDiscoveryUnitOfWork(self.state, self.conversation_lifecycles)
+        return InMemoryDiscoveryUnitOfWork(self.state)

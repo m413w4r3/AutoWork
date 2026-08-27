@@ -229,3 +229,138 @@ const WATCHED = `document.querySelector("[data-testid='conversation-turn-3'] [da
   console.error(err);
   process.exit(1);
 });
+
+// --------------------------------------------------------------------------- //
+// Temporary Chat : confirmation positive avant Send, jamais best-effort ; et
+// identité du tour précédent pour CONTINUE, jamais par index/comptage.
+// --------------------------------------------------------------------------- //
+function temporaryChatToggleMarkup(active) {
+  return `
+    <button aria-label="Temporary chat">
+      <svg class="${active ? "" : "opacity-0"}"><use href="#chat-temp-checked"></use></svg>
+    </button>`;
+}
+
+/** Contourne les délais réels de waitFor()/sleep() : chaque setTimeout avance
+ * une horloge virtuelle et relance immédiatement le callback. */
+function useVirtualClock(window) {
+  let clock = 0;
+  window.Date.now = () => clock;
+  window.setTimeout = (fn, ms) => {
+    clock += ms || 0;
+    queueMicrotask(fn);
+    return 0;
+  };
+}
+
+(async () => {
+  // 1. Temporary Chat déjà actif -> succès immédiat, aucun clic.
+  {
+    const { window, run } = loadExtension(
+      `<main>${temporaryChatToggleMarkup(true)}</main>`,
+    );
+    useVirtualClock(window);
+    let clicked = false;
+    window.document
+      .querySelector("button[aria-label='Temporary chat']")
+      .addEventListener("click", () => {
+        clicked = true;
+      });
+    await run("ensureTemporaryChat()");
+    assert.equal(clicked, false, "un toggle déjà actif ne doit jamais être cliqué");
+  }
+
+  // 2. Clic puis remplacement du nœud (rendu React) -> la vérification doit
+  //    re-interroger le DOM, pas fermer sur l'ancien nœud.
+  {
+    const { window, run } = loadExtension(
+      `<main>${temporaryChatToggleMarkup(false)}</main>`,
+    );
+    useVirtualClock(window);
+    window.document.addEventListener("click", (evt) => {
+      const target = evt.target;
+      if (
+        target &&
+        target.matches &&
+        target.matches("button[aria-label='Temporary chat']")
+      ) {
+        const replacement = window.document.createElement("button");
+        replacement.setAttribute("aria-label", "Temporary chat");
+        replacement.innerHTML = '<svg><use href="#chat-temp-checked"></use></svg>';
+        target.replaceWith(replacement);
+      }
+    });
+    await run("ensureTemporaryChat()");
+    const stillOpacityZero = run(
+      "document.querySelector(\"button[aria-label='Temporary chat'] svg\").classList.contains('opacity-0')",
+    );
+    assert.equal(
+      stillOpacityZero,
+      false,
+      "après rerendu, la vérification doit lire le nouveau nœud actif",
+    );
+  }
+
+  // 3. Bascule introuvable -> échec typé avant tout Send, jamais un
+  //    repli silencieux.
+  {
+    const { window, run } = loadExtension(`<main></main>`);
+    useVirtualClock(window);
+    await assert.rejects(
+      run("ensureTemporaryChat()"),
+      (err) => err.code === "bridge_ui_timeout",
+      "bascule introuvable : doit lever bridge_ui_timeout, jamais réussir silencieusement",
+    );
+  }
+
+  // 4. Bascule trouvée mais l'activation n'est jamais confirmée après le clic.
+  {
+    const { window, run } = loadExtension(
+      `<main>${temporaryChatToggleMarkup(false)}</main>`,
+    );
+    useVirtualClock(window);
+    // Aucun listener de clic : le toggle ne passe jamais actif.
+    await assert.rejects(
+      run("ensureTemporaryChat()"),
+      (err) => err.code === "bridge_ui_timeout",
+      "activation non confirmée : bridge_ui_timeout, jamais un faux succès",
+    );
+  }
+
+  // 5. CONTINUE : le tour externe attendu existe -> trouvé par identité stable.
+  {
+    const { run } = loadExtension(page({ actions: true }));
+    const found = run(
+      `findAssistantTurnByExternalId("conversation-turn-3") !== null`,
+    );
+    assert.equal(found, true, "le tour attendu doit être retrouvé par son identifiant stable");
+  }
+
+  // 6. CONTINUE : le tour externe attendu est absent -> aucune correspondance,
+  //    jamais un repli sur le dernier tour visible ou un index.
+  {
+    const { run } = loadExtension(page({ actions: true }));
+    const found = run(
+      `findAssistantTurnByExternalId("conversation-turn-does-not-exist")`,
+    );
+    assert.equal(found, null, "aucun tour ne doit correspondre à un identifiant inconnu");
+  }
+
+  // 7. Aucune attente de 15s sur un locator de conversation ne subsiste.
+  {
+    const source = fs.readFileSync(path.join(EXTENSION, "content.js"), "utf8");
+    assert.ok(
+      !source.includes("locator de conversation non attribué"),
+      "l'ancienne attente de locator de conversation ne doit plus exister",
+    );
+    assert.ok(
+      !source.includes("verifiedLocator"),
+      "verifiedLocator ne doit plus exister en tant que concept d'identité",
+    );
+  }
+
+  console.log("temporary chat + continuation identity contract: ok");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

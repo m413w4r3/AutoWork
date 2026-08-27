@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 from starlette.requests import Request
 
 from bridge.app import BridgeApplication
@@ -63,7 +64,7 @@ def test_recovery_message_is_forwarded_exactly_without_discovery_preamble(
         conversation={
             "mode": "continue",
             "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            "external_locator": ("https://chatgpt.com/c/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            "expected_turn_id": "external-turn-1",
         },
     )
 
@@ -73,6 +74,48 @@ def test_recovery_message_is_forwarded_exactly_without_discovery_preamble(
     assert chat_request.messages[0].role == "user"
     assert chat_request.messages[0].content == message
     assert chat_request.new_chat is False
+
+
+def test_native_translation_accepts_fresh_id_only_conversation(
+    runtime: BridgeApplication,
+) -> None:
+    from bridge.contracts import BridgeRunRequest
+
+    request = BridgeRunRequest(
+        input="mission",
+        conversation={"mode": "fresh", "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+    )
+
+    chat_request = _response_chat_request(runtime.bridge_routes._bridge_response_request(request))
+
+    assert chat_request.new_chat is True
+
+
+def test_native_translation_continuation_needs_expected_turn_id_not_a_locator(
+    runtime: BridgeApplication,
+) -> None:
+    from bridge.contracts import BridgeRunRequest
+
+    request = BridgeRunRequest(
+        input="suite",
+        conversation={
+            "mode": "continue",
+            "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "expected_turn_id": "external-turn-1",
+        },
+    )
+
+    chat_request = _response_chat_request(runtime.bridge_routes._bridge_response_request(request))
+
+    assert chat_request.new_chat is False
+    with pytest.raises(ValidationError):
+        BridgeRunRequest(
+            input="suite sans cible",
+            conversation={
+                "mode": "continue",
+                "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            },
+        )
 
 
 async def test_responses_facade_completes_background_request_without_network(

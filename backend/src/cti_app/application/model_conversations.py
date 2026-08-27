@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel
@@ -13,7 +14,6 @@ from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.model_gateway import (
     ConversationContext,
-    ConversationLifecycleSpec,
     ModelExecution,
     ModelGateway,
     ModelRequest,
@@ -38,9 +38,22 @@ from cti_app.domain.model_runs import (
     ModelSubmissionState,
 )
 
+logger = logging.getLogger("cti_app.model_conversations")
+
 NO_EVIDENCE_PACK_HASH = hashlib.sha256(b"model-conversation:no-evidence-pack").hexdigest()
 CONVERSATION_PROMPT_ID = "analyst-conversation"
 CONVERSATION_PROMPT_VERSION = "1"
+
+
+class ConversationSessionCloser(Protocol):
+    """Closes the exact live browser Temporary Chat session for a conversation.
+
+    Implemented by the bridge capabilities provider. Only CHATGPT_BRIDGE
+    transport conversations ever call this — other transports have no
+    browser session to close.
+    """
+
+    async def archive_conversation(self, conversation_id: UUID) -> None: ...
 
 
 class ModelConversationError(RuntimeError):
@@ -93,12 +106,14 @@ class ModelConversationService:
         blob_store: BlobStore,
         *,
         retention_days: int = 90,
+        conversation_session_closer: ConversationSessionCloser | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._gateway = gateway
         self._blob_store = blob_store
         self._catalog = BlobCatalogService(blob_store, uow_factory)
         self.retention_days = retention_days
+        self._conversation_session_closer = conversation_session_closer
 
     async def create(
         self,
@@ -309,6 +324,12 @@ class ModelConversationService:
                 if conversation.head_turn_id
                 else None
             )
+            if mode is ConversationMode.CONTINUE and (
+                parent is None or not parent.external_turn_id
+            ):
+                raise ConversationPolicyError(
+                    "Aucun tour externe vérifié à poursuivre pour cette conversation"
+                )
             try:
                 conversation.start_turn(mode=mode)
             except ValueError as exc:
@@ -318,9 +339,11 @@ class ModelConversationService:
             context = ConversationContext(
                 mode=mode.value,
                 id=conversation.id,
-                external_locator=conversation.external_locator
-                if mode is ConversationMode.CONTINUE
-                else None,
+                expected_turn_id=(
+                    parent.external_turn_id
+                    if mode is ConversationMode.CONTINUE and parent
+                    else None
+                ),
                 parent_turn_id=(
                     conversation.head_turn_id if mode is ConversationMode.CONTINUE else None
                 ),
@@ -330,15 +353,6 @@ class ModelConversationService:
                 expected_profile=conversation.expected_profile,
                 requested_model=conversation.requested_model,
                 external_id=conversation.external_id,
-            )
-            # Provide explicit lifecycle policy for fresh conversations to avoid leaking
-            # them on the ChatGPT side. Multi-turn subject production conversations
-            # (Q1/Q4) default to KEEP; a caller with a bounded, per-chunk conversation
-            # (Q2) may ask for DELETE_ON_SUCCESS instead.
-            conversation_lifecycle = (
-                ConversationLifecycleSpec(policy=lifecycle_policy)
-                if mode is ConversationMode.FRESH
-                else None
             )
             request = ModelRequest(
                 text=message,
@@ -352,7 +366,6 @@ class ModelConversationService:
                 web_search=web_search,
                 provider=conversation.provider,
                 conversation=context,
-                conversation_lifecycle=conversation_lifecycle,
                 run_id=run_id,
             )
             run = self._gateway.build_run(request, _role(conversation.purpose))
@@ -384,6 +397,10 @@ class ModelConversationService:
                 raise ModelConversationError("Le bridge n'a pas vérifié la conversation cible")
             output_reference = execution.run.output_references[0]
             output_sha256 = hashlib.sha256(execution.output_text.encode()).hexdigest()
+            should_close_session = (
+                lifecycle_policy is ConversationPolicy.DELETE_ON_SUCCESS
+                and conversation.transport is ConversationTransport.CHATGPT_BRIDGE
+            )
             async with self._uow_factory() as uow:
                 persisted_conversation = await uow.model_conversations.get_for_update(
                     conversation.id
@@ -400,10 +417,29 @@ class ModelConversationService:
                     persisted_turn.id,
                     external_locator=metadata.external_locator if metadata else None,
                 )
+                # KEEP: durable output first, conversation stays READY, browser
+                # session stays alive for a future CONTINUE. DELETE_ON_SUCCESS:
+                # durable output first, then archive the application conversation
+                # — the browser session itself is only closed after this commit,
+                # never while holding the row lock.
+                if should_close_session:
+                    persisted_conversation.archive()
                 await uow.model_conversation_turns.save(persisted_turn)
                 await uow.model_conversations.save(persisted_conversation)
                 await uow.commit()
-                return persisted_turn
+
+            if should_close_session and self._conversation_session_closer is not None:
+                try:
+                    await self._conversation_session_closer.archive_conversation(conversation.id)
+                except Exception:
+                    # A close failure never rewrites the already-successful model
+                    # output as failed — it is only logged.
+                    logger.warning(
+                        "conversation_session_close_failed conversation_id=%s",
+                        conversation.id,
+                        exc_info=True,
+                    )
+            return persisted_turn
         except Exception as exc:
             uncertain = bool(getattr(exc, "retryable", False)) or getattr(exc, "code", "") in {
                 "bridge_server_error",
@@ -498,17 +534,45 @@ class ModelConversationService:
     async def archive(
         self, conversation_id: UUID, *, context_subject_id: UUID | None = None
     ) -> ModelConversation:
+        """Archive the application conversation, then close its browser session.
+
+        Domain state is made durable first so new turns are blocked
+        immediately. A repeated call is safe: it does not re-archive an
+        already-archived conversation, but it does retry closing the exact
+        external tab. A close failure surfaces as an honest error without
+        reactivating the (already durable) archived conversation.
+        """
         async with self._uow_factory() as uow:
             conversation = await uow.model_conversations.get_for_update(conversation_id)
             self._ensure_visible(conversation, context_subject_id)
             assert conversation is not None
+            if conversation.status is not ConversationStatus.ARCHIVED:
+                try:
+                    conversation.archive()
+                except ValueError as exc:
+                    raise ConversationBusyError(str(exc)) from exc
+                await uow.model_conversations.save(conversation)
+                await uow.commit()
+            transport = conversation.transport
+
+        # No row lock is held here: the closer performs external HTTP/browser I/O.
+        if transport is ConversationTransport.CHATGPT_BRIDGE:
+            if self._conversation_session_closer is None:
+                raise ModelConversationError(
+                    "Aucun mécanisme de fermeture de session bridge n'est configuré"
+                )
             try:
-                conversation.archive()
-            except ValueError as exc:
-                raise ConversationBusyError(str(exc)) from exc
-            await uow.model_conversations.save(conversation)
-            await uow.commit()
-            return conversation
+                await self._conversation_session_closer.archive_conversation(conversation_id)
+            except Exception as exc:
+                logger.warning(
+                    "conversation_session_close_failed conversation_id=%s",
+                    conversation_id,
+                    exc_info=True,
+                )
+                raise ModelConversationError(
+                    "La conversation est archivée mais sa session navigateur n'a pas pu être fermée"
+                ) from exc
+        return conversation
 
     async def reconcile(
         self, conversation_id: UUID, *, available: bool, context_subject_id: UUID | None = None

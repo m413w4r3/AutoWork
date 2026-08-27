@@ -365,10 +365,10 @@ class BridgeRoutes:
                     "message": str(packet["error"]),
                 },
             )
-        if (
-            packet.get("conversation_id") != conversation.get("id")
-            or packet.get("external_locator") != conversation.get("external_locator")
-        ):
+        # L'identité de récupération est conversation_id -> binding d'onglet
+        # exact (résolu côté extension) : external_locator n'y participe pas,
+        # ce n'est qu'une métadonnée diagnostique portée par la conversation.
+        if packet.get("conversation_id") != conversation.get("id"):
             raise HTTPException(status_code=409, detail="Conversation de récupération incohérente")
         text = packet.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -376,7 +376,7 @@ class BridgeRoutes:
         preview = {
             "bridge_run_id": response_id,
             "conversation_id": conversation["id"],
-            "external_locator": conversation["external_locator"],
+            "external_locator": conversation.get("external_locator"),
             "turn_id": packet.get("turn_id"),
             "text": text,
             "metadata": packet.get("metadata") if isinstance(packet.get("metadata"), dict) else {},

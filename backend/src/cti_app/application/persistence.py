@@ -31,7 +31,6 @@ from cti_app.domain.editorial import AnalystDecision, EditorialGroup, HumanDecis
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics
 from cti_app.domain.model_conversations import (
-    ConversationLifecycle,
     ConversationPurpose,
     ConversationStatus,
     ModelConversation,
@@ -212,22 +211,6 @@ class ModelConversationTurnRepository(Protocol):
     ) -> Sequence[ModelConversationTurn]: ...
 
     async def save(self, turn: ModelConversationTurn) -> None: ...
-
-
-class ConversationLifecycleRepository(Protocol):
-    async def add(self, lifecycle: ConversationLifecycle) -> None: ...
-
-    async def get(self, lifecycle_id: UUID) -> ConversationLifecycle | None: ...
-
-    async def get_by_conversation_id(
-        self, conversation_id: UUID
-    ) -> ConversationLifecycle | None: ...
-
-    async def save(self, lifecycle: ConversationLifecycle) -> None: ...
-
-    async def list_delete_pending(self) -> Sequence[ConversationLifecycle]: ...
-
-    async def list_cleanup_failed(self) -> Sequence[ConversationLifecycle]: ...
 
 
 class DiscoveryBatchRepository(Protocol):
@@ -433,7 +416,6 @@ class UnitOfWork(Protocol):
     model_output_rejections: ModelOutputRejectionRepository
     model_conversations: ModelConversationRepository
     model_conversation_turns: ModelConversationTurnRepository
-    conversation_lifecycles: ConversationLifecycleRepository
     discovery_batches: DiscoveryBatchRepository
     discovery_intakes: DiscoveryIntakeRepository
     discovery_subject_identities: DiscoverySubjectIdentityRepository
@@ -522,7 +504,6 @@ class EditionUnitOfWorkFactory(Protocol):
 
 class DiscoveryUnitOfWork(Protocol):
     discovery_batches: DiscoveryBatchRepository
-    conversation_lifecycles: ConversationLifecycleRepository
 
     async def __aenter__(self) -> Self: ...
 

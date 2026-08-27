@@ -216,6 +216,30 @@ def _visible_citations(value: object) -> list[dict[str, Any]]:
     return result
 
 
+_ALLOWED_LOCATOR_HOSTS = {"chatgpt.com", "chat.openai.com"}
+
+
+def _sanitize_diagnostic_locator(value: object) -> Optional[str]:
+    """Nettoie un `external_locator` reçu de l'extension : diagnostic pur.
+
+    external_locator n'est plus une donnée de contrôle : une valeur invalide
+    est simplement écartée (None), jamais une cause d'échec de génération.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in _ALLOWED_LOCATOR_HOSTS
+        or parsed.username
+        or parsed.password
+        or parsed.port not in {None, 443}
+        or parsed.fragment
+    ):
+        return None
+    return value[:2048]
+
+
 # État privé de progression en direct, exposé uniquement via generation_progress().
 _live_progress: Dict[str, dict[str, Any]] = {}
 
@@ -366,17 +390,23 @@ async def run_generation(
                     continue
                 if reported.get("id") != str(conversation.id):
                     raise UpstreamError("rattachement de conversation incohérent")
-                try:
-                    BridgeConversationTarget(
-                        mode="continue",
-                        id=conversation.id,
-                        external_locator=reported.get("external_locator"),
+                if reported.get("verified") is not True:
+                    raise UpstreamError("conversation non vérifiée par l'extension")
+                if reported.get("ephemeral") is not True:
+                    raise UpstreamError("conversation non éphémère (Temporary Chat requis)")
+                if conversation.mode == "continue" and reported.get(
+                    "expected_turn_id"
+                ) != conversation.expected_turn_id:
+                    raise UpstreamError(
+                        "rattachement de conversation incohérent : expected_turn_id ne correspond pas"
                     )
-                except ValueError as exc:
-                    raise UpstreamError("locator de conversation invalide") from exc
+                sanitized = dict(reported)
+                sanitized["external_locator"] = _sanitize_diagnostic_locator(
+                    reported.get("external_locator")
+                )
                 if conversation_result is not None:
-                    conversation_result.update(reported)
-                registry.bind_conversation(request_id, reported)
+                    conversation_result.update(sanitized)
+                registry.bind_conversation(request_id, sanitized)
                 logger.info(
                     "bridge_conversation_bound bridge_run_id=%s conversation_id=%s",
                     request_id,
@@ -467,21 +497,16 @@ async def run_generation(
                         raise UpstreamError("métadonnées de conversation absentes ou incohérentes")
                     if reported.get("verified") is not True:
                         raise UpstreamError("conversation non vérifiée par l'extension")
-                    try:
-                        BridgeConversationTarget(
-                            mode="continue",
-                            id=conversation.id,
-                            external_locator=reported.get("external_locator"),
-                        )
-                    except ValueError as exc:
-                        raise UpstreamError("locator retourné par l'extension invalide") from exc
-                    if (
-                        conversation.mode == "continue"
-                        and reported.get("external_locator") != conversation.external_locator
-                    ):
-                        raise UpstreamError("l'extension a changé de conversation cible")
+                    if reported.get("ephemeral") is not True:
+                        raise UpstreamError("conversation non éphémère (Temporary Chat requis)")
+                    # Pour continue, expected_turn_id a déjà été validé au moment
+                    # de conversation_bound : pas de revérification ici.
+                    sanitized = dict(reported)
+                    sanitized["external_locator"] = _sanitize_diagnostic_locator(
+                        reported.get("external_locator")
+                    )
                     if conversation_result is not None:
-                        conversation_result.update(reported)
+                        conversation_result.update(sanitized)
                 logger.info("bridge_run_phase bridge_run_id=%s phase=response_retrieval", request_id)
                 if final_text:
                     yield final_text
@@ -490,8 +515,9 @@ async def run_generation(
                 code = str(packet.get("code", "bridge_server_error"))
                 if code not in {
                     "conversation_unavailable",
+                    "conversation_busy",
                     "conversation_profile_mismatch",
-                    "conversation_locator_invalid",
+                    "bridge_ui_timeout",
                 }:
                     code = "bridge_server_error"
                 raise UpstreamError(
