@@ -23,6 +23,7 @@ from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
 from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
 from cti_app.domain.reference_corpus import ReferenceLabelSource, ReferenceMember, ReferenceMemberDispute
+from cti_app.domain.capabilities import Capability, CapabilitySet, CapabilitySetStatus
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
     VirusTotalFileView,
@@ -42,6 +43,7 @@ from cti_app.infrastructure.database.models.core import (
     InvestigationGoodwareBaselineRow,
     ReferenceMemberDisputeRow,
     ReferenceMemberRow,
+    CapabilitySetRow,
     ProvenanceEventRow,
     SampleRow,
     SampleFeatureIndexRow,
@@ -141,6 +143,7 @@ class SqlAlchemyBlobRepository:
         feature_set_count = await self._session.scalar(select(func.count()).select_from(SampleFeatureSetRow).where(SampleFeatureSetRow.blob_id == blob_id))
         feature_payload_count = await self._session.scalar(select(func.count()).select_from(SampleFeatureSetRow).where(SampleFeatureSetRow.feature_blob_id == blob_id))
         goodware_source_count = await self._session.scalar(select(func.count()).select_from(GoodwareBaselineSourceRow).where(GoodwareBaselineSourceRow.blob_id == blob_id))
+        capability_set_count = await self._session.scalar(select(func.count()).select_from(CapabilitySetRow).where(CapabilitySetRow.blob_id == blob_id))
         return (
             int(document_count or 0)
             + int(decoded_document_count or 0)
@@ -155,7 +158,38 @@ class SqlAlchemyBlobRepository:
             + int(feature_set_count or 0)
             + int(feature_payload_count or 0)
             + int(goodware_source_count or 0)
+            + int(capability_set_count or 0)
         )
+
+
+class SqlAlchemyCapabilitySetRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self, sample_id: UUID, tool_version: str, ruleset_sha256: str, parameters_sha256: str) -> CapabilitySet | None:
+        row = await self._session.scalar(select(CapabilitySetRow).where(CapabilitySetRow.sample_id == sample_id, CapabilitySetRow.tool_version == tool_version, CapabilitySetRow.ruleset_sha256 == ruleset_sha256, CapabilitySetRow.parameters_sha256 == parameters_sha256))
+        if row is None:
+            return None
+        return _capability_set_from_row(row)
+
+    async def add_if_absent(self, capability_set: CapabilitySet, blob_id: UUID) -> bool:
+        from sqlalchemy.dialects.postgresql import insert
+        statement = insert(CapabilitySetRow).values(id=uuid4(), sample_id=capability_set.sample_id, blob_id=blob_id, tool_name=capability_set.tool_name, tool_version=capability_set.tool_version, ruleset_sha256=capability_set.ruleset_sha256, parameters_sha256=capability_set.parameters_sha256, status=capability_set.status.value, capabilities=[{"rule_id": item.rule_id, "name": item.name, "namespace": item.namespace, "attack": list(item.attack), "mbc": list(item.mbc), "function_addresses": list(item.function_addresses)} for item in capability_set.capabilities], errors=list(capability_set.errors)).on_conflict_do_nothing(constraint="uq_capability_sets_replay")
+        result = await self._session.execute(statement)
+        await self._session.flush()
+        return bool(result.rowcount)
+
+    async def index(self, capability_set: CapabilitySet) -> None:
+        row = await self._session.scalar(select(CapabilitySetRow).where(CapabilitySetRow.sample_id == capability_set.sample_id, CapabilitySetRow.tool_version == capability_set.tool_version, CapabilitySetRow.ruleset_sha256 == capability_set.ruleset_sha256, CapabilitySetRow.parameters_sha256 == capability_set.parameters_sha256))
+        if row is None:
+            raise RuntimeError("capability set is missing")
+        for capability in capability_set.capabilities:
+            self._session.add(SampleFeatureIndexRow(id=uuid4(), sample_id=capability_set.sample_id, capability_set_id=row.id, feature_kind="capability", normalized_value=capability.rule_id.lower(), occurrence_count=1))
+        await self._session.flush()
+
+
+def _capability_set_from_row(row: CapabilitySetRow) -> CapabilitySet:
+    return CapabilitySet(sample_id=row.sample_id, tool_name=row.tool_name, tool_version=row.tool_version, ruleset_sha256=row.ruleset_sha256, parameters_sha256=row.parameters_sha256, status=CapabilitySetStatus(row.status), capabilities=tuple(Capability(**item) for item in row.capabilities), errors=tuple(row.errors))
 
 
 class SqlAlchemyGoodwareBaselineRepository:

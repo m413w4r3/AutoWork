@@ -50,6 +50,7 @@ from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 from cti_app.domain.analysis import SampleFeatureSetV1
 from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
+from cti_app.domain.capabilities import CapabilitySet
 
 
 class BlobRepository(Protocol):
@@ -86,6 +87,12 @@ class ReferenceMemberRepository(Protocol):
     async def list_feature_members(self, feature_kind: str, normalized_value: str) -> Sequence[tuple[UUID, str]]: ...
     async def count_benign_feature_occurrences(self, feature_kind: str, normalized_value: str) -> int: ...
     async def count_eligible_malware_samples(self) -> int: ...
+
+
+class CapabilitySetRepository(Protocol):
+    async def get(self, sample_id: UUID, tool_version: str, ruleset_sha256: str, parameters_sha256: str) -> CapabilitySet | None: ...
+    async def add_if_absent(self, capability_set: CapabilitySet, blob_id: UUID) -> bool: ...
+    async def index(self, capability_set: CapabilitySet) -> None: ...
 
 
 class SubjectRepository(Protocol):
@@ -447,6 +454,7 @@ class UnitOfWork(Protocol):
     goodware_baselines: GoodwareBaselineRepository
     investigation_goodware_baselines: InvestigationGoodwareBaselineRepository
     reference_members: ReferenceMemberRepository
+    capability_sets: CapabilitySetRepository
     subjects: SubjectRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository

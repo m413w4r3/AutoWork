@@ -121,6 +121,10 @@ class Settings(BaseSettings):
     analysis_string_min_length: int = Field(default=4, ge=1, le=1024)
     analysis_max_strings: int = Field(default=10_000, ge=1, le=1_000_000)
     analysis_max_sample_bytes: int = Field(default=200 * 1024 * 1024, gt=0)
+    analysis_capa_rules_path: Path = Path("rules/capa")
+    analysis_capa_timeout_seconds: float = Field(default=60.0, gt=0, le=3600)
+    analysis_capa_max_output_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    analysis_capa_max_memory_bytes: int = Field(default=512 * 1024 * 1024, gt=0)
 
 
 @lru_cache

@@ -24,6 +24,7 @@ dependencies = [
 
 [dependency-groups]
 analysis = [
+  "flare-capa==9.4.0",
   "pefile==2024.8.26",
   "pyelftools==0.33",
   "ppdeep==20260221",

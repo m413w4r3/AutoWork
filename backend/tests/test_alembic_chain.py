@@ -15,6 +15,7 @@ EXPECTED_CHAIN = (
     "0006_static_analysis",
     "0007_goodware_baselines",
     "0008_reference_corpus",
+    "0009_capability_sets",
 )
 
 
@@ -41,4 +42,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0006_static_analysis": "0005_sample_acquisition",
         "0007_goodware_baselines": "0006_static_analysis",
         "0008_reference_corpus": "0007_goodware_baselines",
+        "0009_capability_sets": "0008_reference_corpus",
     }
