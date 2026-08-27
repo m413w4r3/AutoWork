@@ -36,6 +36,7 @@ from cti_app.application.persistence import (
     RejectedModelProposalRepository,
     SampleAcquisitionAttemptRepository,
     SampleRepository,
+    SampleFeatureSetRepository,
     SourceCollectionRepository,
     SourceDocumentRepository,
     SubjectContributionRepository,
@@ -62,6 +63,7 @@ from cti_app.infrastructure.database.repositories.core import (
     SqlAlchemyBlobRepository,
     SqlAlchemyProvenanceRepository,
     SqlAlchemySampleRepository,
+    SqlAlchemySampleFeatureSetRepository,
     SqlAlchemySourceDocumentRepository,
     SqlAlchemySubjectRepository,
     SqlAlchemyVirusTotalFileViewRepository,
@@ -115,6 +117,7 @@ class SqlAlchemyUnitOfWork:
     subjects: SubjectRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository
+    sample_feature_sets: SampleFeatureSetRepository
     sample_acquisition_attempts: SampleAcquisitionAttemptRepository
     provenance: ProvenanceRepository
     virustotal_observations: VirusTotalObservationRepository
@@ -164,6 +167,7 @@ class SqlAlchemyUnitOfWork:
         self.subjects = SqlAlchemySubjectRepository(self._session)
         self.source_documents = SqlAlchemySourceDocumentRepository(self._session)
         self.samples = SqlAlchemySampleRepository(self._session)
+        self.sample_feature_sets = SqlAlchemySampleFeatureSetRepository(self._session)
         self.sample_acquisition_attempts = SqlAlchemySampleAcquisitionAttemptRepository(
             self._session
         )

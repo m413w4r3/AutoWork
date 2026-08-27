@@ -179,6 +179,30 @@ class SampleRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class SampleFeatureSetRow(Base):
+    __tablename__ = "sample_feature_sets"
+    __table_args__ = (UniqueConstraint("sample_id", "extractor_version", "parameters_sha256", name="uq_sample_feature_sets_replay"), Index("ix_sample_feature_sets_blob_id", "blob_id"))
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    sample_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False)
+    blob_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False)
+    feature_blob_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False)
+    extractor_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    parameters_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SampleFeatureIndexRow(Base):
+    __tablename__ = "sample_feature_index"
+    __table_args__ = (UniqueConstraint("feature_set_id", "feature_kind", "normalized_value", name="uq_sample_feature_index_value"), Index("ix_sample_feature_index_sample_kind", "sample_id", "feature_kind"))
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    sample_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False)
+    feature_set_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("sample_feature_sets.id", ondelete="RESTRICT"), nullable=False)
+    feature_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    normalized_value: Mapped[str] = mapped_column(Text, nullable=False)
+    occurrence_count: Mapped[int] = mapped_column(nullable=False)
+
+
 class ProvenanceEventRow(Base):
     __tablename__ = "provenance_events"
     __table_args__ = (

@@ -101,6 +101,7 @@ services:
       retries: 10
       start_period: 5s
     restart: unless-stopped
+    networks: [default, analysis-internal]
 
   postgres-test:
     profiles: ["integration-test"]
@@ -132,6 +133,7 @@ services:
       timeout: 3s
       retries: 10
     restart: unless-stopped
+    networks: [default, analysis-internal]
 
   minio:
     image: minio/minio:RELEASE.2025-07-23T15-54-02Z
@@ -151,6 +153,7 @@ services:
       retries: 10
       start_period: 5s
     restart: unless-stopped
+    networks: [default, analysis-internal]
 
   minio-init:
     image: minio/mc:RELEASE.2025-07-21T05-28-08Z
@@ -348,6 +351,41 @@ services:
       retries: 6
     restart: unless-stopped
 
+  analysis-worker:
+    build:
+      context: .
+      dockerfile: infra/analysis-worker.Dockerfile
+    command: ["dramatiq", "cti_app.workers.analysis_tasks"]
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      POSTGRES_DSN: postgresql+asyncpg://${POSTGRES_USER:-cti_app}:${POSTGRES_PASSWORD:-local-postgres-only}@postgres:5432/${POSTGRES_DB:-cti_app}
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-local-minio-user}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-local-minio-password}
+      S3_BUCKET: ${S3_BUCKET:-cti-local}
+      S3_SECURE: "false"
+      JOB_RETRY_BASE_SECONDS: ${JOB_RETRY_BASE_SECONDS:-1}
+      JOB_RETRY_MAX_SECONDS: ${JOB_RETRY_MAX_SECONDS:-300}
+      JOB_HEARTBEAT_TIMEOUT_SECONDS: ${JOB_HEARTBEAT_TIMEOUT_SECONDS:-120}
+      JOB_RECOVERY_INTERVAL_SECONDS: ${JOB_RECOVERY_INTERVAL_SECONDS:-30}
+      JOB_ACTOR_TIME_LIMIT_SECONDS: ${JOB_ACTOR_TIME_LIMIT_SECONDS:-4500}
+      ANALYSIS_STRING_MIN_LENGTH: ${ANALYSIS_STRING_MIN_LENGTH:-4}
+      ANALYSIS_MAX_STRINGS: ${ANALYSIS_MAX_STRINGS:-10000}
+      ANALYSIS_MAX_SAMPLE_BYTES: ${ANALYSIS_MAX_SAMPLE_BYTES:-209715200}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    networks: [analysis-internal]
+    restart: unless-stopped
+
   frontend:
     build:
       context: .
@@ -373,3 +411,7 @@ volumes:
   minio_data:
   bridge_data:
   subject_workspaces:
+
+networks:
+  analysis-internal:
+    internal: true

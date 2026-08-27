@@ -3,7 +3,7 @@ foundational entities every other bounded context references. Owns the only
 row/domain mappers for these rows."""
 
 from collections.abc import Sequence
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +20,7 @@ from cti_app.domain.entities import (
     Subject,
 )
 from cti_app.domain.errors import EntityNotFoundError
+from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
     VirusTotalFileView,
@@ -35,6 +36,8 @@ from cti_app.infrastructure.database.models.core import (
     BlobRow,
     ProvenanceEventRow,
     SampleRow,
+    SampleFeatureIndexRow,
+    SampleFeatureSetRow,
     SourceDocumentRow,
     SubjectRow,
     VirusTotalFileViewRow,
@@ -127,6 +130,8 @@ class SqlAlchemyBlobRepository:
             .select_from(VirusTotalObservationRow)
             .where(VirusTotalObservationRow.blob_id == blob_id)
         )
+        feature_set_count = await self._session.scalar(select(func.count()).select_from(SampleFeatureSetRow).where(SampleFeatureSetRow.blob_id == blob_id))
+        feature_payload_count = await self._session.scalar(select(func.count()).select_from(SampleFeatureSetRow).where(SampleFeatureSetRow.feature_blob_id == blob_id))
         return (
             int(document_count or 0)
             + int(decoded_document_count or 0)
@@ -138,7 +143,33 @@ class SqlAlchemyBlobRepository:
             + int(conversation_input_count or 0)
             + int(conversation_output_count or 0)
             + int(virustotal_observation_count or 0)
+            + int(feature_set_count or 0)
+            + int(feature_payload_count or 0)
         )
+
+
+class SqlAlchemySampleFeatureSetRepository:
+    def __init__(self, session: AsyncSession) -> None: self._session = session
+    async def get(self, sample_id: UUID, extractor_version: str, parameters_sha256: str) -> SampleFeatureSetV1 | None:
+        row = await self._session.scalar(select(SampleFeatureSetRow).where(SampleFeatureSetRow.sample_id == sample_id, SampleFeatureSetRow.extractor_version == extractor_version, SampleFeatureSetRow.parameters_sha256 == parameters_sha256))
+        return _feature_from_payload(row.payload) if row else None
+    async def add_if_absent(self, feature_set: SampleFeatureSetV1, feature_blob_id: UUID) -> bool:
+        if await self.get(feature_set.sample_id, feature_set.extractor_version, feature_set.parameters_sha256): return False
+        self._session.add(SampleFeatureSetRow(id=uuid4(), sample_id=feature_set.sample_id, blob_id=feature_set.blob_id, feature_blob_id=feature_blob_id, extractor_version=feature_set.extractor_version, parameters_sha256=feature_set.parameters_sha256, payload=feature_set.as_json(), created_at=__import__('datetime').datetime.now(__import__('datetime').UTC)))
+        await self._session.flush(); return True
+    async def index(self, feature_set: SampleFeatureSetV1) -> None:
+        row = await self._session.scalar(select(SampleFeatureSetRow).where(SampleFeatureSetRow.sample_id == feature_set.sample_id, SampleFeatureSetRow.extractor_version == feature_set.extractor_version, SampleFeatureSetRow.parameters_sha256 == feature_set.parameters_sha256))
+        if row is None: raise RuntimeError("feature set is missing")
+        values = [("string", item["value"], item["occurrence_count"]) for item in feature_set.strings] + [("import", item, 1) for item in feature_set.imports] + [("export", item, 1) for item in feature_set.exports] + [("section", item["name"], 1) for item in feature_set.sections] + [("imphash", feature_set.imphash, 1)] * bool(feature_set.imphash) + [("opcode_fragment16", item, 1) for item in feature_set.opcode_fragment16]
+        for kind, value, count in values:
+            if not await self._session.scalar(select(SampleFeatureIndexRow.id).where(SampleFeatureIndexRow.feature_set_id == row.id, SampleFeatureIndexRow.feature_kind == kind, SampleFeatureIndexRow.normalized_value == value)):
+                self._session.add(SampleFeatureIndexRow(id=uuid4(), sample_id=feature_set.sample_id, feature_set_id=row.id, feature_kind=kind, normalized_value=value.lower(), occurrence_count=count))
+        await self._session.flush()
+
+
+def _feature_from_payload(data: dict) -> SampleFeatureSetV1:
+    from uuid import UUID
+    return SampleFeatureSetV1(**{**data, "sample_id": UUID(data["sample_id"]), "blob_id": UUID(data["blob_id"]), "format": SampleFormat(data["format"]), "tlp": TLP(data["tlp"]), **{key: tuple(data[key]) for key in ("strings", "sections", "imports", "exports", "resources", "opcode_fragment16", "partial_errors")}})
 
     async def delete(self, blob_id: UUID) -> None:
         row = await self._session.get(BlobRow, blob_id)

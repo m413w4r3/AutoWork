@@ -118,6 +118,9 @@ class Settings(BaseSettings):
     investigation_max_hits_acquired: int = Field(default=0, ge=0)
     investigation_max_new_samples: int = Field(default=0, ge=0)
     investigation_max_vt_read_units: int = Field(default=0, ge=0)
+    analysis_string_min_length: int = Field(default=4, ge=1, le=1024)
+    analysis_max_strings: int = Field(default=10_000, ge=1, le=1_000_000)
+    analysis_max_sample_bytes: int = Field(default=200 * 1024 * 1024, gt=0)
 
 
 @lru_cache

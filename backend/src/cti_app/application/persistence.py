@@ -47,6 +47,7 @@ from cti_app.domain.production import (
     SubjectProductionRun,
 )
 from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
+from cti_app.domain.analysis import SampleFeatureSetV1
 
 
 class BlobRepository(Protocol):
@@ -85,6 +86,13 @@ class SampleRepository(Protocol):
     async def list_for_subject(self, subject_id: UUID) -> Sequence[Sample]: ...
 
     async def get_by_subject_and_blob(self, subject_id: UUID, blob_id: UUID) -> Sample | None: ...
+    async def save(self, sample: Sample) -> None: ...
+
+
+class SampleFeatureSetRepository(Protocol):
+    async def get(self, sample_id: UUID, extractor_version: str, parameters_sha256: str) -> SampleFeatureSetV1 | None: ...
+    async def add_if_absent(self, feature_set: SampleFeatureSetV1, feature_blob_id: UUID) -> bool: ...
+    async def index(self, feature_set: SampleFeatureSetV1) -> None: ...
 
 
 class SampleAcquisitionAttemptRepository(Protocol):
@@ -413,6 +421,7 @@ class UnitOfWork(Protocol):
     subjects: SubjectRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository
+    sample_feature_sets: SampleFeatureSetRepository
     sample_acquisition_attempts: SampleAcquisitionAttemptRepository
     provenance: ProvenanceRepository
     virustotal_observations: VirusTotalObservationRepository

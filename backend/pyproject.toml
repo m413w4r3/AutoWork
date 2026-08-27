@@ -23,6 +23,12 @@ dependencies = [
 ]
 
 [dependency-groups]
+analysis = [
+  "pefile==2024.8.26",
+  "pyelftools==0.33",
+  "ppdeep==20260221",
+  "py-tlsh==5.0.0",
+]
 dev = [
   "aiosqlite>=0.20,<1",
   "mypy>=1.17,<2",
