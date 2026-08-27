@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "20";
+const VERSION = "21";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -111,6 +111,7 @@ const MOTS_PLUS_MODELES = /plus de mod|autres mod|more models|legacy models/;
 
 const POLL_MS = 120;
 const APPEAR_TIMEOUT_MS = 30000; // délai d'apparition de la bulle de réponse
+const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 5000;
 const UPLOAD_TIMEOUT_MS = 120000; // upload des pièces jointes
 
 const SETTLE_MS = 2000; // fin UI confirmée
@@ -187,6 +188,75 @@ async function waitFor(fn, timeout, label) {
     await sleep(100);
   }
   throw new Error(`Timeout : ${label}`);
+}
+
+function composerText(el) {
+  if (!el) return "";
+  if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") return el.value || "";
+  return el.innerText || el.textContent || "";
+}
+
+function isSendButtonReady(button) {
+  if (!button || button.disabled === true) return false;
+  return button.getAttribute("aria-disabled") !== "true";
+}
+
+function submissionForm(composer, sendBtn) {
+  const form = sendBtn?.form || sendBtn?.closest("form") || composer?.closest("form");
+  if (!form) return null;
+  if (typeof form.requestSubmit !== "function") return null;
+  if (!(form === sendBtn.form || form.contains(sendBtn))) return null;
+  return form;
+}
+
+function triggerComposerSubmission(composer, sendBtn) {
+  const form = submissionForm(composer, sendBtn);
+  const method = form ? "requestSubmit" : "click";
+  console.log("bridge_run_phase", {
+    phase: "send_ready",
+    button_id: sendBtn.id || null,
+    aria_disabled: sendBtn.getAttribute("aria-disabled"),
+    disabled: sendBtn.disabled,
+    has_form: Boolean(form),
+    submission_method: method,
+  });
+  if (form) form.requestSubmit(sendBtn);
+  else sendBtn.click();
+  return method;
+}
+
+async function waitForSubmissionConfirmation(composer, assistantTurnsBefore, method) {
+  const deadline = Date.now() + SUBMISSION_CONFIRMATION_TIMEOUT_MS;
+  const form = composer?.closest("form");
+  while (Date.now() < deadline) {
+    const turns = document.querySelectorAll(SELECTORS.assistant).length;
+    const stopRoot = form || composer?.parentElement || composer;
+    const stop = stopRoot ? $in(stopRoot, SELECTORS.stop) : null;
+    let signal = null;
+    if (!composerText(composer).trim()) signal = "composer_cleared";
+    else if (stop) signal = "stop_button";
+    else if (turns > assistantTurnsBefore) signal = "assistant_turn";
+    if (signal) {
+      console.log("bridge_run_phase", { phase: "submission_confirmed", signal });
+      return signal;
+    }
+    await sleep(100);
+  }
+  const turnsAfter = document.querySelectorAll(SELECTORS.assistant).length;
+  const stopRoot = form || composer?.parentElement || composer;
+  const stopFound = Boolean(stopRoot && $in(stopRoot, SELECTORS.stop));
+  console.warn("submission_confirmation_failed", {
+    method,
+    composer_still_has_text: Boolean(composerText(composer).trim()),
+    stop_found: stopFound,
+    assistant_turns_before: assistantTurnsBefore,
+    assistant_turns_after: turnsAfter,
+    content_script_version: VERSION,
+  });
+  throw new BridgeError(
+    "bridge_ui_timeout",
+    "soumission du prompt non confirmée par l'interface ChatGPT",
+  );
 }
 
 /**
@@ -1320,7 +1390,8 @@ async function handlePrompt({
   }
   if (currentJob) currentJob.aborted = true;
   const job = { id, aborted: false };
-  let sendStarted = false;
+  let submissionAttempted = false;
+  let submissionConfirmed = false;
   currentJob = job;
 
   try {
@@ -1387,23 +1458,30 @@ async function handlePrompt({
 
     if (files && files.length) await attachFiles(files);
     if (prompt) typePrompt(composer, prompt);
+    if (!composerText(composer).trim()) {
+      throw new BridgeError("bridge_ui_timeout", "composer vide avant la soumission");
+    }
 
     // Le bouton d'envoi ne devient actif qu'après le rendu de la saisie — et,
     // s'il y a des pièces jointes, qu'une fois leur upload terminé (bien plus long).
     const sendBtn = await waitFor(
       () => {
         const b = $(SELECTORS.send);
-        return b && !b.disabled ? b : null;
+        return isSendButtonReady(b) ? b : null;
       },
       files && files.length ? UPLOAD_TIMEOUT_MS : 8000,
       files && files.length
         ? "upload des pièces jointes non terminé"
         : "bouton d'envoi jamais actif",
     );
-    sendStarted = true;
-    console.log("bridge_run_phase", { phase: "send" });
-    sendBtn.click();
-    console.log("send_clicked", { content_script_version: VERSION });
+    submissionAttempted = true;
+    const submissionMethod = triggerComposerSubmission(composer, sendBtn);
+    console.log("bridge_run_phase", {
+      phase: "submission_attempted",
+      method: submissionMethod,
+    });
+    await waitForSubmissionConfirmation(composer, before, submissionMethod);
+    submissionConfirmed = true;
 
     if (conversation) {
       reply({
@@ -1481,7 +1559,11 @@ async function handlePrompt({
         conversation: conversation
           ? { id: conversation.id, mode: conversation.mode }
           : null,
-        submission_state: sendStarted ? "post_submission" : "pre_submission",
+        submission_state: submissionConfirmed
+          ? "post_submission"
+          : submissionAttempted
+            ? "submission_attempted"
+            : "pre_submission",
       });
     }
   } finally {

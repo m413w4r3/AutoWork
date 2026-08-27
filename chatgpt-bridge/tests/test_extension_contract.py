@@ -10,14 +10,14 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def test_extension_reserves_request_before_real_send_click() -> None:
+def test_extension_reserves_request_before_real_send_trigger() -> None:
     root = Path(__file__).parents[1] / "extension"
     background = (root / "background.js").read_text()
     content = (root / "content.js").read_text()
 
     assert 'requestStates.set(msg.id, "received")' in background
     assert "requestStatesReady" in background and "conversationRegistryReady" in background
-    assert content.index("await claimPrompt(id)") < content.index("sendBtn.click()")
+    assert content.index("await claimPrompt(id)") < content.index("const submissionMethod = triggerComposerSubmission(composer, sendBtn)")
     assert "submittedRequestIds" in content
     assert "bridgeConversationRegistry" in background
     assert (

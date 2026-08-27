@@ -326,15 +326,22 @@ function useVirtualClock(window) {
   // Temporary, le composer existe et l'ancien markup SVG est absent. Le prompt
   // doit atteindre Send sans aucun contrôle Temporary.
   {
-    const body = `<textarea data-id="prompt"></textarea><button data-testid="send-button">Send</button><button data-testid="create-new-chat-button">New chat</button>`;
+    const body = `<form id="composer-form">
+      <textarea data-id="prompt"></textarea>
+      <button aria-disabled="false" id="composer-submit-button" aria-label="Send prompt" data-testid="send-button">Send</button>
+    </form><button data-testid="create-new-chat-button">New chat</button>`;
     const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
     useVirtualClock(window);
     const sent = [];
     window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
     let sendClicks = 0;
+    let submitEvents = 0;
     let newChatClicks = 0;
-    window.document.querySelector("button[data-testid='send-button']").addEventListener("click", () => {
-      sendClicks += 1;
+    window.document.querySelector("button[data-testid='send-button']").addEventListener("click", () => { sendClicks += 1; });
+    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      window.document.querySelector("textarea[data-id='prompt']").value = "";
       window.document.body.insertAdjacentHTML("beforeend", `
         <article data-testid="conversation-turn-1">
           <div data-message-author-role="assistant" data-message-id="msg-A1">
@@ -347,11 +354,69 @@ function useVirtualClock(window) {
       newChatClicks += 1;
     });
     await run(`handlePrompt({ id: "req-A", prompt: "bonjour", new_chat: true, conversation: { id: "conv-A", mode: "fresh" } })`);
-    assert.equal(window.document.querySelector("textarea[data-id='prompt']").value, "bonjour");
+    assert.equal(window.document.querySelector("textarea[data-id='prompt']").value, "");
     assert.equal(newChatClicks, 0, "une conversation explicite ne doit jamais cliquer New Chat");
-    assert.equal(sendClicks, 1, "le chemin fresh doit cliquer Send exactement une fois");
+    assert.equal(submitEvents, 1, "le formulaire doit être soumis exactement une fois");
+    assert.equal(sendClicks, 0, "requestSubmit ne doit pas dépendre d'un click synthétique");
     assert.equal(sent.some((message) => message.type === "error"), false, "aucune erreur pre_submission");
     assert.equal(sent.some((message) => message.type === "done"), true, "le chemin comportemental doit terminer");
+  }
+
+  // 10b. Un click observé sans effet de soumission ne suffit jamais : aucune
+  // seconde méthode ne doit être tentée après l'échec de confirmation.
+  {
+    const body = `<form id="composer-form">
+      <textarea data-id="prompt"></textarea>
+      <button aria-disabled="false" id="composer-submit-button" aria-label="Send prompt" data-testid="send-button">Send</button>
+    </form>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    let submitEvents = 0;
+    let sendClicks = 0;
+    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+    });
+    window.document.querySelector("button[data-testid='send-button']").addEventListener("click", () => { sendClicks += 1; });
+    await run(`handlePrompt({ id: "req-no-confirm", prompt: "bonjour", conversation: { id: "conv-A", mode: "fresh" } })`);
+    const error = sent.find((message) => message.type === "error");
+    assert.equal(submitEvents, 1);
+    assert.equal(sendClicks, 0);
+    assert.equal(error?.code, "bridge_ui_timeout");
+    assert.equal(error?.submission_state, "submission_attempted");
+  }
+
+  // 10c. Un bouton disabled avant tout trigger reste un échec pre_submission.
+  {
+    const body = `<form><textarea data-id="prompt"></textarea>
+      <button aria-disabled="true" id="composer-submit-button" aria-label="Send prompt" data-testid="send-button">Send</button></form>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    await run(`handlePrompt({ id: "req-pre", prompt: "bonjour", conversation: { id: "conv-A", mode: "fresh" } })`);
+    assert.equal(sent.find((message) => message.type === "error")?.submission_state, "pre_submission");
+  }
+
+  // 10d. Une soumission confirmée puis une panne de génération est post_submission.
+  {
+    const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
+      <button aria-disabled="false" id="composer-submit-button" aria-label="Send prompt" data-testid="send-button">Send</button></form>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    let submitEvents = 0;
+    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      window.document.querySelector("textarea[data-id='prompt']").value = "";
+    });
+    await run(`handlePrompt({ id: "req-post", prompt: "bonjour", conversation: { id: "conv-A", mode: "fresh" } })`);
+    assert.equal(submitEvents, 1);
+    assert.equal(sent.find((message) => message.type === "error")?.submission_state, "post_submission");
   }
 
   // 11. CONTINUE sur une navigation /c/... : refus avant toute saisie/envoi.
