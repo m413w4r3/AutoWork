@@ -54,6 +54,21 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
                     object_key=f"synthetic/{blob_id}",
                     created_at=now,
                 ),
+                GoodwareBaselineRow(
+                    id=baseline_id,
+                    source_set_sha256="b" * 64,
+                    records_sha256="c" * 64,
+                    record_count=1001,
+                    occurrence_sum=1001,
+                    pattern_version="synthetic-v1",
+                    created_at=now,
+                ),
+            ]
+        )
+        await session.flush()
+
+        session.add(
+
                 SampleRow(
                     id=sample_id,
                     subject_id=subject_id,
@@ -67,15 +82,11 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
                     external_llm_allowed=False,
                     created_at=now,
                 ),
-                GoodwareBaselineRow(
-                    id=baseline_id,
-                    source_set_sha256="b" * 64,
-                    records_sha256="c" * 64,
-                    record_count=1001,
-                    occurrence_sum=1001,
-                    pattern_version="synthetic-v1",
-                    created_at=now,
-                ),
+        )
+        await session.flush()
+
+        session.add_all(
+        [
                 SampleFeatureSetRow(
                     id=sample_feature_set_id,
                     sample_id=sample_id,

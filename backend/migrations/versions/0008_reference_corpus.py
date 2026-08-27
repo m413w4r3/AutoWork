@@ -28,12 +28,34 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), primary_key=True),
         sa.Column("reason", sa.Text(), nullable=False), sa.Column("actor_id", sa.String(255), nullable=False),
     )
-    op.execute("""
-    CREATE FUNCTION forbid_reference_mutation() RETURNS trigger LANGUAGE plpgsql AS $$
-    BEGIN RAISE EXCEPTION 'reference corpus rows are append-only'; END; $$;
-    CREATE TRIGGER reference_members_immutable BEFORE UPDATE OR DELETE ON reference_members FOR EACH ROW EXECUTE FUNCTION forbid_reference_mutation();
-    CREATE TRIGGER reference_member_disputes_immutable BEFORE UPDATE OR DELETE ON reference_member_disputes FOR EACH ROW EXECUTE FUNCTION forbid_reference_mutation();
-    """)
+    op.execute(
+        """
+        CREATE FUNCTION forbid_reference_mutation()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            RAISE EXCEPTION 'reference corpus rows are append-only';
+        END;
+        $$;
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER reference_members_immutable
+        BEFORE UPDATE OR DELETE ON reference_members
+        FOR EACH ROW
+        EXECUTE FUNCTION forbid_reference_mutation()
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER reference_member_disputes_immutable
+        BEFORE UPDATE OR DELETE ON reference_member_disputes
+        FOR EACH ROW
+        EXECUTE FUNCTION forbid_reference_mutation()
+        """
+    )
 
 
 def downgrade() -> None:
