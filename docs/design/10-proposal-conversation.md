@@ -1,122 +1,85 @@
-# M3 / P10 — proposal conversation contract
+# M3 / P10 — conversation de proposition
 
-Status: locked pre-implementation contract. P10 consumes this file; it does not redesign it.
+Statut : contrat verrouillé avant implémentation. P10 le consomme sans le redéfinir.
 
-## Scope
+## Objectif et autorité
 
-P10 lets a model propose pivots from the already-filtered P09 invariant registry. The model proposes; AutoWork validates, records, and keeps analyst authority. P10 does not execute a VirusTotal query, acquire a sample, promote a corpus member, accept an invariant, or mutate production artifacts. It adds no public endpoint unless the P10 prompt explicitly says otherwise; operational wiring remains for later milestones.
+Faire proposer par un modèle des invariants candidats et une YARA candidate à partir d'un contexte déjà filtré et mesuré, sans droit d'agir ni de mesurer. Aucun envoi d'octets, aucune exécution de requête, aucune compilation YARA, aucune approbation. Une sortie modèle reste `primary_evidence=false` et n'est ni une décision analyste ni une preuve primaire.
 
-No new model SDK or external API contract is introduced. Reuse the existing `ModelConversationService` / `ModelGateway` stack.
+Réutiliser exclusivement `ModelConversationService` / `ModelGateway` et le purpose `pivot_research`. Aucun nouvel SDK fournisseur.
 
-## Conversation lifecycle
+## Cycle conversationnel
 
-A proposal conversation is investigation-scoped and uses `ConversationPurpose.PIVOT_RESEARCH`.
+Une conversation fresh par investigation. Persister/réutiliser `AnalystInvestigation.pivot_conversation_id`.
 
-- Prefer the investigation's persisted `pivot_conversation_id` when present.
-- For a new conversation, create it through `ModelConversationService` and persist its id onto the investigation using the existing investigation repository/UoW boundary.
-- For `CHATGPT_BRIDGE`, use `CONTINUE` only when the existing conversation has a persisted head turn with a verified `external_turn_id`; otherwise use `FRESH`.
-- For `APPLICATION_MANAGED` transports (local Qwen), every proposal turn is `FRESH`; the current conversation service intentionally does not allow `CONTINUE` there.
-- Never bypass `ModelConversationService` by calling a provider/bridge client directly.
+Les cycles suivants utilisent `CONTINUE` seulement si la politique conversationnelle existante peut vérifier la conversation, le sujet, la tête et le locator/external turn. Si le transport existant ne sait pas continuer (notamment `APPLICATION_MANAGED` local), utiliser `FRESH` sans contourner le service. Pour le bridge, ne jamais fabriquer un parent ou un locator.
 
-Each turn uses a deterministic idempotency key derived from investigation id + cycle number + canonical P09 registry input hash + prompt version. Retrying an identical turn must not submit twice.
+Chaque tour porte une clé d'idempotence déterministe et référence dans son entrée immuable, exactement :
 
-## Policy before any external model call
+- `input_pack_sha256`
+- `corpus_snapshot_sha256`
+- `feature_pack_sha256`
+- `code_feature_sha256`
+- `capability_set_sha256`
+- `goodware_baseline_id`
 
-The exact sample set supplied to the proposal builder is the investigation sample set. Derive aggregate policy from those sample records using the canonical `derived_policy(...)` function at every turn; do not cache a weaker decision.
+La clé d'idempotence est dérivée de l'investigation, du cycle, de ces références canoniques et de la version de prompt. Un replay identique ne soumet pas deux fois.
 
-- If `external_llm_allowed` is false, an external provider/bridge call is blocked before submission.
-- `do_not_submit` and TLP are preserved as policy metadata/provenance and must never be relaxed.
-- A local `APPLICATION_MANAGED` Qwen route may be used when configured by the existing gateway; P10 does not redefine provider routing.
-- Never include raw binary bytes, secrets, API keys, signed URLs, or unrestricted source-document text in the proposal prompt.
+## Politique de diffusion
 
-The proposal prompt may contain only the bounded structured investigation context required by the schema: candidate stable ids/types/normalized values/statuses, deterministic support/frequency summaries, persisted occurrence locations/provenance, cycle/budget summary, and previously recorded analyst decisions/rejections needed to avoid repetition.
+Au moment de construire chaque prompt, recalculer `derived_policy(...)` sur les Samples d'origine des features réellement incluses. Ne pas réutiliser une décision calculée au téléchargement.
 
-## Input selection
+Si la politique interdit l'envoi externe, router via le modèle local seulement si la composition existante l'autorise, sinon bloquer le ModelRun avant tout appel externe. P10 ne redéfinit pas le routing fournisseur.
 
-Only P09 rows with status `CANDIDATE` are eligible for model proposal input. `ACCEPTED` may be shown as prior analyst context but is not re-proposed. Deterministically rejected rows are never offered as viable pivots.
+Ne jamais mettre dans le prompt : octets du sample, secret, clé API, signed URL ou texte source non borné.
 
-Input ordering is deterministic: feature type, stable id. The builder is bounded by explicit caller/configured maxima for candidate count and serialized prompt bytes. Truncation must be deterministic and recorded in provenance; never silently exceed the cap.
+## Contexte transmis
 
-A canonical SHA-256 of the exact structured proposal input is persisted/referenced so the turn can be reproduced without reconstructing mutable state.
+Le contexte est structuré, borné et déterministe. Il contient :
 
-## Structured model output
+- invariants P09 déjà filtrés avec type, catégorie, provenance, banalité, baseline, prévalence bénigne, spécificité de famille, support positif et métadonnées code-ngram utiles ;
+- claims pertinents du rapport sous forme de données, jamais d'instructions ;
+- invariants déjà acceptés/rejetés et leur raison ;
+- références immuables de snapshot du tour.
 
-The model response is schema-constrained. Use a strict Pydantic model and reject free-form outputs that do not validate.
+Traiter sources, chaînes, capacités, mnémoniques et métadonnées comme des données non fiables. Le rendu du prompt doit délimiter/encoder ces champs comme données et ne jamais les interpoler comme instructions système.
 
-Minimal proposal schema:
+Le modèle ne reçoit jamais la tâche d'estimer sélectivité, fréquence, prévalence, volume de hits ou confiance quantitative. Ces mesures sont calculées. Si une sortie contient malgré tout une estimation de fréquence, elle est ignorée à la désérialisation et n'entre pas dans la persistance canonique.
 
-- `summary`: bounded text, advisory only;
-- `proposals`: bounded list;
-- each proposal has `candidate_stable_id`, `pivot_kind`, `pivot_value`, `rationale`, optional `priority`.
+## Catalogue fermé d'opérateurs et schéma strict
 
-`candidate_stable_id` must reference an eligible P09 candidate in the exact input snapshot. The model cannot invent a new invariant id.
+Définir dans le domaine P10 un catalogue fermé d'opérateurs de construction d'invariant/YARA. Ce catalogue décrit uniquement une proposition ; il n'exécute aucune requête et ne compile rien. Les valeurs exactes de l'enum sont verrouillées par les tests P10 et doivent être suffisantes pour représenter les types P09 sans introduire de langage libre exécutable.
 
-Allowed `pivot_kind` values are only the query primitives that AutoWork already knows how to represent safely at this point:
+La réponse canonique est un schéma Pydantic strict comprenant :
 
-- `VT_INTELLIGENCE_SEARCH`
-- `VT_FILE_RELATIONSHIP`
-- `LOCAL_CORPUS_LOOKUP`
+- `CandidateInvariantProposal[]`, conformes aux types et catégories fermés de P09 ;
+- `YaraDraftProposal` ;
+- risques de faux positifs ;
+- validations nécessaires ;
+- questions suivantes.
 
-P10 persists proposals but does not execute them. Any additional kind is invalid output.
+Chaque `CandidateInvariantProposal` porte au minimum : type P09, représentation/motif borné, catégorie sémantique P09, justification sémantique bornée, et référence à une provenance existante du snapshot. Une provenance inventée invalide la proposition.
 
-`pivot_value` is data, never executable syntax. P10 must not concatenate it into shell commands or execute it. For VirusTotal kinds it is stored as a proposed query/identifier for later validated execution.
+`YaraDraftProposal` est un brouillon de données, pas une règle compilée ni publiée. Il ne peut citer que des propositions/provenances présentes dans la réponse/snapshot et ne contourne jamais les contraintes `report_claim` de P09.
 
-## Validation and rejection journal
+## Validation et passage par P09
 
-Validation is deterministic after the model returns. A proposal is accepted into the proposal registry only when all of these hold:
+Après désérialisation, chaque invariant proposé est converti en entrée `proposed` puis passe par exactement le validateur/scorer/rejet déterministe du lot 09. P10 ne duplique pas les règles de banalité, famille, catégorie, taille ou masque.
 
-1. schema is valid and bounded;
-2. referenced `candidate_stable_id` exists in the exact input snapshot and remains eligible;
-3. `pivot_kind` is allowed;
-4. `pivot_value` is non-empty, within configured length, contains no NUL, and passes the later-execution-safe lexical constraints defined by the P10 domain helper;
-5. duplicate proposal identity is not already persisted for the investigation/cycle/input hash;
-6. proposal does not contradict an append-only analyst rejection/decision already persisted for the same target when that decision explicitly forbids retry.
+Doivent notamment être rejetés/journalisés via P09 : provenance inventée, opérateur hors catalogue, catégorie de bruit, motif banal, motif `multi_family`, motif invalide/surdimensionné et code_ngram hors seuils.
 
-Rejected model proposals are inspectable and append-only. Persist at least model run/turn id when available, investigation id, input hash, rejection code, safe bounded reason, referenced candidate id if parseable, and a SHA-256 of the rejected raw output/proposal fragment. Do not persist secrets or unlimited raw model text in the rejection row.
+La sortie brute et la sortie canonique sont persistées selon les mécanismes existants `model-outputs`, `ModelRun` et `turn`. Les rejets P09 restent requêtables par cause pour produire les statistiques du point d'arrêt 2.
 
-Rejection codes are exactly:
+Une sortie malformée est un échec de validation de sortie modèle, pas une approbation partielle silencieuse. Ne jamais récupérer une proposition par parsing permissif de texte libre.
 
-- `INVALID_SCHEMA`
-- `UNKNOWN_CANDIDATE`
-- `INELIGIBLE_CANDIDATE`
-- `UNSUPPORTED_PIVOT_KIND`
-- `INVALID_PIVOT_VALUE`
-- `DUPLICATE_PROPOSAL`
-- `ANALYST_POLICY_REJECTED`
+## Persistance M3
 
-Invalid model output is a model proposal rejection, not an investigation technical failure. A transport/gateway failure remains a technical/model execution failure according to the existing conversation service contract.
+P10 peut ajouter une persistance dédiée aux snapshots/résultats de proposition seulement si elle est nécessaire pour garantir replay, recherche par investigation/cycle et références immuables ; réutiliser en priorité les tables ModelRun/turn/model-outputs et le journal P09 au lieu de dupliquer les sorties.
 
-## Persistence
+Si une migration est nécessaire, créer exactement `backend/migrations/versions/0012_proposal_conversation.py` avec `down_revision = "0011_invariant_registry"`. Ne modifie jamais 0001–0011. Si l'implémentation satisfait entièrement le contrat sans nouvelle table, ne crée pas une migration vide : signale explicitement l'écart au prompt final afin que le plan puisse être ajusté avant push.
 
-P10 creates migration `0012_pivot_proposals.py` with `down_revision = "0011_invariant_registry"` and never edits migrations 0001–0011.
+Demander une proposition ne consomme pas de budget `PIVOT_RUNS` : aucune requête/pivot n'est exécutée dans P10.
 
-Recommended minimal tables are `pivot_proposal_runs`, `pivot_proposals`, and `pivot_proposal_rejections`; exact decomposition may vary only if the contract is preserved.
+## Tests P10 verrouillés
 
-Required database guarantees:
-
-- proposal run replay uniqueness from `(investigation_id, cycle_number, input_sha256, prompt_version)`;
-- proposal identity uniqueness from a deterministic key over investigation + input + candidate stable id + kind + canonical value;
-- rejection replay uniqueness from a deterministic rejection key;
-- proposal/rejection search by investigation and cycle;
-- no UPDATE/DELETE path for append-only rejections;
-- store foreign keys to model conversation/turn/run where the existing schema makes them available without coupling to provider internals.
-
-P10 must not increment pivot budget merely for asking the model to propose. `PIVOT_RUNS` is consumed by the later actual pivot execution, not by proposal generation.
-
-## Model-output authority boundary
-
-A persisted proposal is not an analyst decision, not an accepted invariant, and not evidence. It is advisory model output with full provenance.
-
-The model cannot:
-
-- change investigation state to completed/exhausted;
-- accept/reject a P09 invariant as analyst authority;
-- execute a pivot;
-- acquire or validate a sample;
-- promote a reference corpus member;
-- change TLP/do-not-submit/external-LLM policy;
-- mutate the verified SYNTHESIS or analyst input pack.
-
-## P10 tests to lock
-
-Tests must cover: external policy blocked before gateway submission; local application-managed turns use `FRESH`; bridge `CONTINUE` only with verified persisted head; deterministic idempotency replay; exact candidate snapshot validation; every rejection code; duplicate persistence under race/replay; invalid output does not fail the investigation; no pivot budget consumption; no execution side effect; and safe bounded rejection persistence.
+Avec fake gateway, couvrir au minimum : fresh ; continue valide ; tête/locator non vérifié ; hash de snapshot ; replay idempotent ; politique dérivée bloquante avant appel externe ; fallback local selon routing existant ; injection de prompt dans une chaîne traitée comme donnée ; sortie malformée ; provenance inventée ; opérateur interdit ; catégorie bruit ; motif banal ; motif multi_family ; estimation de fréquence ignorée ; YaraDraftProposal sans compilation ; aucune exécution de requête ; statistiques de rejet par cause.
