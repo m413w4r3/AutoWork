@@ -1,132 +1,119 @@
-# M3 / P09 — invariant registry contract
+# M3 / P09 — registre d'invariants multi-provenance
 
-Status: locked pre-implementation contract. P09 consumes this file; it does not redesign it.
+Statut : contrat verrouillé avant implémentation. Le lot 09 l'implémente sans le redéfinir.
 
-## Scope
+## Périmètre
 
-P09 turns already-persisted M2 analysis outputs into an investigation-scoped registry of deterministic candidate invariants. It does not rerun static analysis, capa, SMDA, VirusTotal, a model, or a worker. It adds no endpoint.
+P09 construit et persiste un registre d'invariants candidats depuis les sorties déjà persistées des lots 06, 07, 07B, 08 et 08B. Aucun appel modèle, VirusTotal, compilation YARA ou approbation. Ne relance pas les extracteurs M2 et n'ouvre pas les binaires pour recalculer une feature déjà persistée.
 
-The exact public feature taxonomy is:
+## Taxonomies fermées
 
-- `string`
-- `import`
-- `export`
-- `section`
-- `imphash`
-- `ssdeep`
-- `tlsh`
-- `rich_header_hash`
-- `icon_hash`
-- `vhash`
-- `capability`
-- `function_hash`
+Types d'invariant, exactement :
+
+- `literal_string`
+- `hex_pattern`
 - `code_ngram`
+- `opcode_sequence`
+- `import_name`
+- `export_name`
+- `section_name`
+- `capability`
+- `similarity_hash`
+- `structural_metadata`
+- `relation`
 
-`function_hash` is reserved by the M3 taxonomy but M2 currently produces no function hash. P09 must not synthesize one. `icon_hash` is the M3 name for the current `Sample.main_icon_dhash` value. `opcode_fragment16` is a goodware lookup source/helper, not a public M3 candidate type.
+Catégories sémantiques, exactement :
 
-## Canonical sources
+- `c2_indicator`
+- `mutex_or_event`
+- `pdb_or_build_path`
+- `config_marker`
+- `crypto_constant`
+- `custom_protocol`
+- `ransom_or_ui_text`
+- `code_sequence`
+- `capability_pattern`
+- `similarity_key`
+- `library_noise`
+- `packer_artifact`
+- `compiler_artifact`
+- `generic_winapi`
+- `unknown`
 
-Use PostgreSQL only. Do not open sample binaries or feature blobs in P09.
+Statuts, exactement : `proposed`, `approved_for_pivot`, `validated`, `rejected`, `unselective`, `shared_component`. Le statut initial est toujours `proposed`. Toute transition de statut porte acteur, date et raison ; P09 n'approuve rien automatiquement.
 
-- `sample_feature_index` supplies `string`, `import`, `export`, `section`, `imphash`, `capability`, and `code_ngram` values and support counts. Its three source-id columns identify the originating static/capa/code feature set.
-- `samples` supplies scalar similarity values `ssdeep`, `tlsh`, `rich_header_hash`, `vhash`, and `main_icon_dhash` together with their LOCAL/VT source marker when present.
-- The JSONB payloads already stored on `sample_feature_sets`, `capability_sets`, and `code_feature_sets` supply source locations and tool/version provenance. They may be queried in PostgreSQL; do not fetch MinIO blobs.
-- Static string locations come from the stored string `offset`; section locations from RVA/address metadata when present; capa locations from `function_addresses`; code-ngram locations from `function_offset` and `start_offset`. Imports/exports/imphash/similarity hashes may legitimately have no byte offset; record an explicit location kind such as `sample` rather than inventing an offset.
+## Provenances typées
 
-Candidate generation is limited to samples explicitly belonging to the caller-provided investigation sample set. Never scan every sample globally to discover investigation membership.
+Chaque provenance est validée selon son type et ne peut pas emprunter les champs d'un autre type :
 
-## Identity and normalization
+- `sample_feature` : `sample_sha256`, `feature_id`, `offsets` ;
+- `code_feature` : `sample_sha256`, adresse de fonction, décalage, version du désassembleur ;
+- `tool_output` : `sample_sha256`, outil, version, identifiant interne à l'outil ;
+- `capability` : `sample_sha256`, `capability_id`, adresses ;
+- `report_claim` : `claim_id`, document source, sans octets ni offsets ;
+- `analyst_manual` : acteur, date, motif.
 
-M3 never invents a second normalization algorithm. Use the canonical normalized values already persisted by M2. Scalar similarity values are trimmed and lower-cased only where M2 already treats the value case-insensitively.
+La persistance doit conserver assez d'identifiants pour remonter à la ligne/source M2 exacte. Une provenance inexistante ou incomplète est rejetée avant création de l'invariant.
 
-`stable_id` is a lowercase SHA-256 hex string over the UTF-8 bytes of:
+## Mapping M2 -> taxonomie M3
 
-`autowork-invariant-v1\n<feature_type>\n<normalized_value>`
+Ne crée pas une seconde taxonomie publique. Les sorties M2 servent ainsi :
 
-The database uniqueness boundary is `(investigation_id, stable_id)`. The stable id is intentionally feature-global while status/support/provenance are investigation-scoped. A replay of the same investigation input must resolve to the same row and stable id.
+- chaînes persistées -> `literal_string` ;
+- imports -> `import_name` ; exports -> `export_name` ; sections -> `section_name` ;
+- capa -> `capability` avec `capability_id` et adresses ;
+- n-grammes SMDA -> `code_ngram`, avec motif masqué et compteurs déjà calculés ;
+- `imphash`, `ssdeep`, `tlsh`, `rich_header_hash`, `vhash`, `main_icon_dhash` -> `similarity_hash`, la sous-espèce est portée dans la valeur/métadonnée canonique sans créer un nouveau type ;
+- `opcode_fragment16` peut alimenter `hex_pattern`/`opcode_sequence` seulement si la provenance M2 permet de représenter honnêtement le motif demandé ; ne synthétise pas d'information absente ;
+- `structural_metadata` et `relation` ne sont créés que depuis une sortie persistée qui porte réellement cette sémantique ; jamais par inférence opportuniste.
 
-## CandidateInvariant contract
+Le registre travaille sur le jeu de samples explicitement fourni pour l'investigation ; il ne découvre pas l'appartenance à l'investigation par scan global.
 
-A candidate exposes at minimum:
+## Mesures calculées avant modèle
 
-- `investigation_id`
-- `stable_id`
-- `feature_type`
-- `normalized_value`
-- `sample_support`: distinct investigation samples containing the value
-- `family_support`: deterministic sorted family/count mapping from eligible ReferenceCorpus malware members
-- `goodware_frequency`: integer when measurable, otherwise `None`; `None` never means zero
-- `reference_corpus_frequency`: distinct eligible malware samples containing the value when measurable, otherwise `None`
-- `benign_reference_frequency`: distinct eligible benign reference samples containing the value when measurable, otherwise `None`
-- `occurrence_locations`: persisted provenance occurrences, not a model-generated summary
-- `confidence`: `float | None`; if non-null it must be deterministic and in `[0, 1]`. P09 must not invent opaque weights merely to fill this field.
-- `status`
+Chaque invariant persistant porte :
 
-Statuses are exactly:
+- score/verdict de banalité du lot 07 et identifiant de la baseline utilisée ;
+- verdict de spécificité du lot 07B et liste déterministe des familles concernées ;
+- prévalence dans le corpus bénin ;
+- support positif dans le snapshot courant ;
+- provenance(s) typée(s).
 
-- `CANDIDATE`
-- `REJECTED_BANAL`
-- `REJECTED_MULTI_FAMILY`
-- `REJECTED_INSUFFICIENT_SUPPORT`
-- `ACCEPTED`
+`UNKNOWN`/non mesurable reste inconnu et n'est jamais transformé en zéro. Les seuils de `BanalityScorer` sont injectés explicitement depuis la configuration M3 ; P09 ne les invente pas.
 
-P09 never sets `ACCEPTED` automatically. Acceptance remains an explicit later analyst/application decision.
+Pour `code_ngram`, persiste aussi le motif masqué, `byte_count`, `fixed_byte_count`, `masked_byte_count`, `longest_fixed_run` et le drapeau `likely_packed` de l'échantillon d'origine. `likely_packed` est une décision déterministe P09 construite à partir des signaux de packing M2 et de seuils/configuration explicitement fournis ; si ces seuils ne sont pas configurés, arrête au lieu de les inventer.
 
-## Deterministic filtering
+## Rejets déterministes avant persistance
 
-Apply deterministic filtering before any model involvement, in this order:
+Chaque rejet est consigné dans une table suivant le motif du `rejected_model_proposals` existant, avec cause requêtable. Appliquer avant persistance d'un invariant :
 
-1. malformed/unresolvable source provenance: do not create a candidate; append a `MALFORMED` rejection journal entry;
-2. measured goodware verdict `BANAL`: `REJECTED_BANAL`;
-3. ReferenceCorpus verdict `MULTI_FAMILY`: `REJECTED_MULTI_FAMILY`;
-4. ReferenceCorpus verdict `CORPUS_TOO_SMALL`: `REJECTED_INSUFFICIENT_SUPPORT`;
-5. otherwise: `CANDIDATE`.
+1. provenance inexistante ou incomplète pour son type ;
+2. catégorie hors enum ;
+3. catégorie `library_noise`, `packer_artifact`, `compiler_artifact` ou `generic_winapi` ;
+4. banalité `banal` ;
+5. spécificité `multi_family` ;
+6. motif vide ou surdimensionné ;
+7. pour `code_ngram`, ratio `masked_byte_count / byte_count` strictement supérieur à `CODE_NGRAM_MAX_MASK_RATIO` ;
+8. pour `code_ngram`, `longest_fixed_run < CODE_NGRAM_MIN_CONTIGUOUS`.
 
-A `SUSPICIOUS_COMMON` goodware result is evidence, not an automatic banality rejection. Goodware `UNKNOWN` is unknown, not zero.
+Les limites de taille de motif et les deux constantes code-ngram sont des paramètres M3 explicites. Elles ne sont pas déduites du code ni choisies par le modèle.
 
-Goodware measurement is valid only for mappings already supported by M2:
+Le journal expose au minimum des statistiques par cause, notamment banalité goodware, non-spécificité de famille et ratio de masquage, afin d'alimenter le point d'arrêt manuel 2.
 
-- `string` -> goodware `string`
-- `export` -> goodware `export`
-- `imphash` -> goodware `imphash`
-- `code_ngram` -> only the M2 exact fixed-byte 8–16-byte `opcode_fragment16` lookup rule; masked/out-of-range ngrams remain unmeasured/unknown
+## Cas report_claim et saisie manuelle
 
-Other M3 types have `goodware_frequency=None` unless a later version adds an explicit measured mapping. Do not project a generic zero.
+Une provenance `report_claim` peut entrer dans le registre et être utilisée comme pivot, mais reste interdite dans une règle YARA publiée tant qu'elle n'est pas confirmée par au moins un sample du corpus positif. Persiste un champ de confirmation explicite et teste cette règle.
 
-ReferenceCorpus measurement uses exact values and distinct sample counts. Existing `sample_feature_index` supports `string`, `import`, `export`, `section`, `imphash`, `capability`, and `code_ngram`. For scalar similarity fields not present in that index, P09 may add bounded repository queries joining eligible ReferenceCorpus members to `samples`; it must not rewrite M2 indexing.
+Expose un chemin applicatif de saisie manuelle par un analyste identifié. Une saisie `analyst_manual` passe par exactement le même scoring, les mêmes rejets et la même persistance que toute autre proposition ; elle ne contourne jamais les filtres.
 
-## Provenance
+## Identité, idempotence et persistance
 
-Each occurrence is durable and inspectable. Record at least:
+L'identité de replay doit être déterministe à partir de l'investigation, du type, de la représentation canonique du motif et de la provenance canonique pertinente. La contrainte d'idempotence est protégée en PostgreSQL, pas seulement par un pre-check Python.
 
-- origin `sample_id`;
-- source kind (`static`, `sample_similarity`, `capa`, `smda_code`);
-- source row id when one exists;
-- analysis tool name and version when applicable;
-- source `blob_id` / feature blob id reference when applicable;
-- concrete locations available from the persisted payload;
-- source marker such as LOCAL/VT for scalar similarity values;
-- parameters/ruleset/compatibility hashes needed to identify the exact M2 analysis run.
+Créer exactement `backend/migrations/versions/0011_invariant_registry.py` avec `down_revision = "0010_code_features"`. Ne modifie jamais 0001–0010.
 
-No candidate may be sent to a model unless it has at least one valid persisted occurrence. Model text is never provenance.
+La décomposition SQLAlchemy peut suivre l'architecture existante, mais elle doit rendre requêtables : invariants, provenances, transitions de statut et journal de rejets. Si une nouvelle table possède un vrai `blob_id` FK, l'ajouter au comptage de références de `BlobRepository`.
 
-## Persistence
+## Tests P09 verrouillés
 
-P09 creates migration `0011_invariant_registry.py` with `down_revision = "0010_code_features"` and never edits migrations 0001–0010.
-
-Recommended minimal tables are `candidate_invariants`, `candidate_invariant_occurrences`, and `invariant_rejections`; exact SQLAlchemy decomposition may vary only if the externally visible contract above is preserved.
-
-Required database guarantees:
-
-- unique `(investigation_id, stable_id)`;
-- indexed search by investigation, feature type, status, and stable id;
-- occurrence replay uniqueness backed by a canonical database key, not a Python pre-check;
-- rejection replay uniqueness backed by a deterministic rejection key;
-- rejection rows are append-only/inspectable;
-- if an occurrence table contains a real `blob_id` foreign key, add it to `BlobRepository.count_references`.
-
-No transaction remains open while external I/O occurs; P09 should perform no external I/O at all.
-
-## P09 tests to lock
-
-Tests must cover: stable id replay, each deterministic rejection class, `SUSPICIOUS_COMMON` not auto-rejected, unknown goodware not treated as zero, multi-family precedence after banality, complete source provenance for static/capa/code/scalar similarity examples, reserved `function_hash` not fabricated, exact search filters, database-backed replay, and rejection journal inspection.
+Couvrir au minimum : toutes les taxonomies fermées ; validation des champs obligatoires de chaque provenance ; statut initial `proposed` ; transition acteur/date/raison ; banalité + baseline ; spécificité + familles ; prévalence bénigne ; support snapshot ; code-ngram et seuils ; chaque cause de rejet ; statistiques par cause ; report_claim non confirmé ; confirmation positive ; saisie analyste scorée ; replay concurrent/idempotent DB ; aucun appel modèle/VT/YARA.
