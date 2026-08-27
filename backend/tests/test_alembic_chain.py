@@ -17,6 +17,7 @@ EXPECTED_CHAIN = (
     "0008_reference_corpus",
     "0009_capability_sets",
     "0010_code_features",
+    "0011_invariant_registry",
 )
 
 
@@ -45,4 +46,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0008_reference_corpus": "0007_goodware_baselines",
         "0009_capability_sets": "0008_reference_corpus",
         "0010_code_features": "0009_capability_sets",
+        "0011_invariant_registry": "0010_code_features",
     }

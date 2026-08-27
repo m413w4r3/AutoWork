@@ -28,6 +28,7 @@ from cti_app.application.persistence import (
     GoodwareBaselineRepository,
     HumanDecisionRepository,
     IndicatorRepository,
+    InvariantRepository,
     InvestigationGoodwareBaselineRepository,
     JobEventRepository,
     JobRepository,
@@ -110,6 +111,9 @@ from cti_app.infrastructure.database.repositories.model_runs import (
     SqlAlchemyModelOutputRejectionRepository,
     SqlAlchemyModelRunRepository,
 )
+from cti_app.infrastructure.database.repositories.invariants import (
+    SqlAlchemyInvariantRepository,
+)
 from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemyAnalystDecisionRepository,
     SqlAlchemyAnalystInputPackRepository,
@@ -129,6 +133,7 @@ class SqlAlchemyUnitOfWork:
     reference_members: ReferenceMemberRepository
     capability_sets: CapabilitySetRepository
     code_feature_sets: CodeFeatureSetRepository
+    invariants: InvariantRepository
     subjects: SubjectRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository
@@ -186,6 +191,7 @@ class SqlAlchemyUnitOfWork:
         self.reference_members = SqlAlchemyReferenceMemberRepository(self._session)
         self.capability_sets = SqlAlchemyCapabilitySetRepository(self._session)
         self.code_feature_sets = SqlAlchemyCodeFeatureSetRepository(self._session)
+        self.invariants = SqlAlchemyInvariantRepository(self._session)
         self.subjects = SqlAlchemySubjectRepository(self._session)
         self.source_documents = SqlAlchemySourceDocumentRepository(self._session)
         self.samples = SqlAlchemySampleRepository(self._session)

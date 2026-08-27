@@ -33,6 +33,18 @@ from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import AnalystDecision, EditorialGroup, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
+from cti_app.domain.invariants import (
+    CandidateInvariant,
+    FeatureMeasurements,
+    InvariantCategory,
+    InvariantRejection,
+    InvariantRejectionCause,
+    InvariantStatus,
+    InvariantTransition,
+    ResolvedFeature,
+    InvariantProvenance,
+    InvariantType,
+)
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics
 from cti_app.domain.model_conversations import (
     ConversationPurpose,
@@ -130,6 +142,67 @@ class CodeFeatureSetRepository(Protocol):
     async def add_if_absent(self, feature_set: CodeFeatureSet, feature_blob_id: UUID) -> bool: ...
 
     async def index(self, feature_set: CodeFeatureSet) -> None: ...
+
+
+class InvariantRepository(Protocol):
+    async def resolve_provenance(
+        self,
+        *,
+        provenance: InvariantProvenance,
+        invariant_type: InvariantType,
+        pattern: str,
+    ) -> ResolvedFeature | None: ...
+
+    async def measure_feature(
+        self,
+        *,
+        feature_kind: str,
+        normalized_value: str,
+        snapshot_sample_ids: Sequence[UUID],
+    ) -> FeatureMeasurements: ...
+
+    async def add_invariant(self, invariant: CandidateInvariant) -> CandidateInvariant: ...
+
+    async def get_invariant(self, invariant_id: UUID) -> CandidateInvariant | None: ...
+
+    async def get_invariant_by_proposal_key(
+        self, proposal_key: str
+    ) -> CandidateInvariant | None: ...
+
+    async def list_invariants(
+        self,
+        *,
+        investigation_id: UUID | None = None,
+        status: InvariantStatus | None = None,
+        invariant_type: InvariantType | None = None,
+        category: InvariantCategory | None = None,
+    ) -> Sequence[CandidateInvariant]: ...
+
+    async def add_rejection(self, rejection: InvariantRejection) -> InvariantRejection: ...
+
+    async def transition(
+        self,
+        *,
+        invariant_id: UUID,
+        to_status: InvariantStatus,
+        actor_id: str,
+        occurred_at: datetime,
+        reason: str,
+    ) -> CandidateInvariant: ...
+
+    async def list_transitions(self, invariant_id: UUID) -> Sequence[InvariantTransition]: ...
+
+    async def list_rejections(
+        self,
+        *,
+        investigation_id: UUID | None = None,
+        cycle_number: int | None = None,
+        cause: InvariantRejectionCause | None = None,
+    ) -> Sequence[InvariantRejection]: ...
+
+    async def rejection_statistics(
+        self, *, investigation_id: UUID | None = None, cycle_number: int | None = None
+    ) -> Mapping[str, int]: ...
 
 
 class SubjectRepository(Protocol):
@@ -497,6 +570,7 @@ class UnitOfWork(Protocol):
     reference_members: ReferenceMemberRepository
     capability_sets: CapabilitySetRepository
     code_feature_sets: CodeFeatureSetRepository
+    invariants: InvariantRepository
     subjects: SubjectRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository
