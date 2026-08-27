@@ -22,6 +22,7 @@ from cti_app.domain.entities import (
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
 from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
+from cti_app.domain.reference_corpus import ReferenceLabelSource, ReferenceMember, ReferenceMemberDispute
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
     VirusTotalFileView,
@@ -39,6 +40,8 @@ from cti_app.infrastructure.database.models.core import (
     GoodwareBaselineSourceRow,
     GoodwareFeatureRow,
     InvestigationGoodwareBaselineRow,
+    ReferenceMemberDisputeRow,
+    ReferenceMemberRow,
     ProvenanceEventRow,
     SampleRow,
     SampleFeatureIndexRow,
@@ -193,6 +196,65 @@ class SqlAlchemyInvestigationGoodwareBaselineRepository:
     async def add(self, investigation_id: UUID, baseline_id: UUID) -> None:
         self._session.add(InvestigationGoodwareBaselineRow(investigation_id=investigation_id, baseline_id=baseline_id))
         await self._session.flush()
+
+
+class SqlAlchemyReferenceMemberRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def append(self, member: ReferenceMember) -> ReferenceMember:
+        from sqlalchemy.dialects.postgresql import insert
+        stmt = insert(ReferenceMemberRow).values(
+            id=member.id, sample_id=member.sample_id, sample_sha256=member.sample_sha256,
+            family_label=member.family_label, origin_investigation_id=member.origin_investigation_id,
+            promoted_at=member.promoted_at, actor_id=member.actor_id, label_source=member.label_source.value,
+        ).on_conflict_do_nothing(constraint="uq_reference_members_sample_label")
+        await self._session.execute(stmt)
+        await self._session.flush()
+        row = await self._session.scalar(select(ReferenceMemberRow).where(ReferenceMemberRow.sample_id == member.sample_id, ReferenceMemberRow.family_label == member.family_label))
+        return _reference_member_from_row(row)  # type: ignore[arg-type]
+
+    async def get(self, member_id: UUID) -> ReferenceMember | None:
+        row = await self._session.get(ReferenceMemberRow, member_id)
+        return _reference_member_from_row(row) if row else None
+
+    async def list(self) -> Sequence[ReferenceMember]:
+        rows = await self._session.scalars(select(ReferenceMemberRow).order_by(ReferenceMemberRow.promoted_at, ReferenceMemberRow.id))
+        return [_reference_member_from_row(row) for row in rows]
+
+    async def append_dispute(self, dispute: ReferenceMemberDispute) -> None:
+        self._session.add(ReferenceMemberDisputeRow(member_id=dispute.member_id, reason=dispute.reason, actor_id=dispute.actor_id, created_at=dispute.created_at))
+        await self._session.flush()
+
+    async def get_dispute(self, member_id: UUID) -> ReferenceMemberDispute | None:
+        row = await self._session.scalar(select(ReferenceMemberDisputeRow).where(ReferenceMemberDisputeRow.member_id == member_id).order_by(ReferenceMemberDisputeRow.created_at))
+        return _reference_dispute_from_row(row) if row else None
+
+    async def list_disputes(self, member_id: UUID) -> Sequence[ReferenceMemberDispute]:
+        rows = await self._session.scalars(select(ReferenceMemberDisputeRow).where(ReferenceMemberDisputeRow.member_id == member_id).order_by(ReferenceMemberDisputeRow.created_at))
+        return [_reference_dispute_from_row(row) for row in rows]
+
+    async def count_eligible_malware_samples(self) -> int:
+        count = await self._session.scalar(select(func.count(func.distinct(ReferenceMemberRow.sample_id))).where(ReferenceMemberRow.family_label.not_in(("benign", "unlabeled")), ~select(ReferenceMemberDisputeRow.member_id).where(ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id).exists()))
+        return int(count or 0)
+
+    async def list_feature_members(self, feature_kind: str, normalized_value: str) -> Sequence[tuple[UUID, str]]:
+        dispute = select(ReferenceMemberDisputeRow.member_id).where(ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id)
+        result = await self._session.execute(select(ReferenceMemberRow.sample_id, ReferenceMemberRow.family_label).join(SampleFeatureIndexRow, SampleFeatureIndexRow.sample_id == ReferenceMemberRow.sample_id).where(SampleFeatureIndexRow.feature_kind == feature_kind, SampleFeatureIndexRow.normalized_value == normalized_value.lower(), ReferenceMemberRow.family_label.not_in(("benign", "unlabeled")), ~dispute.exists()).distinct())
+        return list(result.all())
+
+    async def count_benign_feature_occurrences(self, feature_kind: str, normalized_value: str) -> int:
+        dispute = select(ReferenceMemberDisputeRow.member_id).where(ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id)
+        count = await self._session.scalar(select(func.count(func.distinct(ReferenceMemberRow.sample_id))).select_from(ReferenceMemberRow).join(SampleFeatureIndexRow, SampleFeatureIndexRow.sample_id == ReferenceMemberRow.sample_id).where(SampleFeatureIndexRow.feature_kind == feature_kind, SampleFeatureIndexRow.normalized_value == normalized_value.lower(), ReferenceMemberRow.family_label == "benign", ~dispute.exists()))
+        return int(count or 0)
+
+
+def _reference_member_from_row(row: ReferenceMemberRow) -> ReferenceMember:
+    return ReferenceMember(id=row.id, sample_id=row.sample_id, sample_sha256=row.sample_sha256, family_label=row.family_label, origin_investigation_id=row.origin_investigation_id, promoted_at=row.promoted_at, actor_id=row.actor_id, label_source=ReferenceLabelSource(row.label_source))
+
+
+def _reference_dispute_from_row(row: ReferenceMemberDisputeRow) -> ReferenceMemberDispute:
+    return ReferenceMemberDispute(member_id=row.member_id, reason=row.reason, actor_id=row.actor_id, created_at=row.created_at)
 
 
 class SqlAlchemySampleFeatureSetRepository:

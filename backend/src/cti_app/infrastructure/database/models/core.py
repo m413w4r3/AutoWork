@@ -85,6 +85,31 @@ class InvestigationGoodwareBaselineRow(Base):
     baseline_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("goodware_baselines.id", ondelete="RESTRICT"), nullable=False)
 
 
+class ReferenceMemberRow(Base):
+    __tablename__ = "reference_members"
+    __table_args__ = (
+        UniqueConstraint("sample_id", "family_label", name="uq_reference_members_sample_label"),
+        CheckConstraint("label_source IN ('ANALYST','OPERATOR_IMPORT')", name="ck_reference_members_source"),
+        Index("ix_reference_members_sample_id", "sample_id"),
+    )
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    sample_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False)
+    sample_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    family_label: Mapped[str] = mapped_column(Text, nullable=False)
+    origin_investigation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("analyst_investigations.id", ondelete="RESTRICT"))
+    promoted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    label_source: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class ReferenceMemberDisputeRow(Base):
+    __tablename__ = "reference_member_disputes"
+    member_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("reference_members.id", ondelete="RESTRICT"), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
+
+
 class SubjectRow(Base):
     __tablename__ = "subjects"
     __table_args__ = (
