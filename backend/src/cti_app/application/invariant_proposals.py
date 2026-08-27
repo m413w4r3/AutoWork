@@ -23,6 +23,7 @@ from cti_app.application.invariants import InvariantProposalResult, InvariantReg
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.classification import DerivedPolicy, derived_policy
+from cti_app.domain.goodware import Banality
 from cti_app.domain.invariant_proposals import (
     CandidateInvariantProposal,
     ProposalInputSnapshot,
@@ -32,8 +33,18 @@ from cti_app.domain.invariant_proposals import (
     strip_known_estimate_fields,
 )
 from cti_app.domain.invariants import (
+    AnalystManualProvenance,
+    CapabilityProvenance,
+    CodeFeatureProvenance,
+    FeatureMeasurements,
+    InvariantCategory,
     InvariantProvenance,
+    InvariantType,
+    ReportClaimProvenance,
+    SampleFeatureProvenance,
+    ToolOutputProvenance,
     canonical_provenance,
+    m2_feature_kind,
 )
 from cti_app.domain.model_conversations import (
     ConversationMode,
@@ -46,13 +57,24 @@ from cti_app.domain.model_conversations import (
     ModelConversationTurn,
 )
 from cti_app.domain.model_runs import ModelProvider
+from cti_app.domain.reference_corpus import ReferenceCorpusVerdict, assess_reference_feature
 
 P10_PROMPT_TEMPLATE_ID = "invariant-proposal-conversation"
 P10_PROMPT_VERSION = "1"
 _CONVERSATION_NAMESPACE = UUID("0f52a3a8-6cc8-5f4d-8ed5-1c2c3d4e5f60")
 _MAX_CONTEXT_CHARS = 200_000
 _MAX_STRING_CHARS = 2_048
+_MAX_CANDIDATE_RECORDS = 256
+_MAX_AUXILIARY_CONTEXT_RECORDS = 64
 _MISSING = object()
+_NOISE_CATEGORIES = frozenset(
+    {
+        "library_noise",
+        "packer_artifact",
+        "compiler_artifact",
+        "generic_winapi",
+    }
+)
 
 
 class ProposalConversationError(RuntimeError):
@@ -120,13 +142,10 @@ class ProposalConversationService:
         investigation_id: UUID,
         cycle_number: int | None = None,
         correlation_id: str | None = None,
-        provenance_catalog: Mapping[str, InvariantProvenance] | None = None,
     ) -> ProposalConversationResult:
         """Ask the model for proposals and pass each candidate through P09."""
 
-        loaded = await self._load_snapshot(
-            investigation_id, provenance_catalog=provenance_catalog
-        )
+        loaded = await self._load_snapshot(investigation_id)
         investigation = loaded[0]
         snapshot = loaded[1]
         policy = loaded[2]
@@ -150,6 +169,55 @@ class ProposalConversationService:
             snapshot=snapshot,
             prompt_version=self._prompt_version,
         )
+
+        existing_turn = await self._successful_turn_for_key(
+            idempotency_key=idempotency_key,
+            conversation=conversation,
+            subject_id=investigation.subject_id,
+            investigation_id=investigation_id,
+        )
+        if existing_turn is not None:
+            content = await self._persisted_turn_content(
+                conversation.id, existing_turn, investigation.subject_id
+            )
+            persisted_snapshot = _snapshot_from_prompt(content.input_text)
+            if make_proposal_turn_idempotency_key(
+                investigation_id=investigation_id,
+                cycle_number=effective_cycle,
+                snapshot=persisted_snapshot,
+                prompt_version=self._prompt_version,
+            ) != idempotency_key:
+                raise ProposalConversationError(
+                    "The persisted proposal turn does not match its idempotency key"
+                )
+            persisted_provenances = _snapshot_provenance_catalog(persisted_snapshot)
+            if content.output_text is None:
+                raise ProposalOutputValidationError("The proposal turn has no persisted output")
+            response = _parse_proposal_response(content.output_text)
+            _validate_yara_references(
+                response.yara_draft,
+                response.candidate_invariants,
+                persisted_provenances,
+            )
+            results = await self._pass_candidates_to_p09(
+                investigation_id=investigation_id,
+                cycle_number=effective_cycle,
+                sample_ids=_snapshot_origin_sample_ids(persisted_snapshot),
+                candidates=response.candidate_invariants,
+                provenance_by_ref=persisted_provenances,
+            )
+            return ProposalConversationResult(
+                investigation_id=investigation_id,
+                cycle_number=effective_cycle,
+                mode=mode,
+                conversation_id=conversation.id,
+                idempotency_key=idempotency_key,
+                snapshot=persisted_snapshot,
+                response=response,
+                turn=existing_turn,
+                invariant_results=tuple(results),
+            )
+
         prompt = _render_prompt(snapshot)
         turn = await self._model_conversations.add_turn(
             conversation.id,
@@ -188,8 +256,6 @@ class ProposalConversationService:
     async def _load_snapshot(
         self,
         investigation_id: UUID,
-        *,
-        provenance_catalog: Mapping[str, InvariantProvenance] | None,
     ) -> tuple[
         Any,
         ProposalInputSnapshot,
@@ -215,33 +281,46 @@ class ProposalConversationService:
             )
             if not samples:
                 raise ProposalContractError("The proposal snapshot has no origin Samples")
-            # This is intentionally recalculated on every call, including an
-            # idempotent replay.  The model policy is never copied from a prior turn.
-            policy = derived_policy(samples)
-            sample_ids = tuple(sample.id for sample in samples)
-            sample_context = await self._sample_context(uow, samples)
+            all_sample_ids = tuple(sample.id for sample in samples)
+            all_sample_context = await self._sample_context(uow, samples)
+            sample_by_id = {sample.id: sample for sample in samples}
+            sample_context_by_id = {
+                UUID(item["sample_id"]): item for item in all_sample_context
+            }
 
             members = await _optional_call(
                 getattr(uow, "reference_members", None), "list"
             )
             corpus_state = await self._corpus_context(uow, members)
             static_features = await _feature_records(
-                getattr(uow, "sample_feature_sets", None), sample_ids, "list_for_samples"
+                getattr(uow, "sample_feature_sets", None),
+                all_sample_ids,
+                "list_for_samples",
             )
             code_features = await _feature_records(
-                getattr(uow, "code_feature_sets", None), sample_ids, "list_for_samples"
+                getattr(uow, "code_feature_sets", None),
+                all_sample_ids,
+                "list_for_samples",
             )
             capabilities = await _feature_records(
-                getattr(uow, "capability_sets", None), sample_ids, "list_for_samples"
+                getattr(uow, "capability_sets", None),
+                all_sample_ids,
+                "list_for_samples",
             )
             static_features = tuple(
-                item for item in static_features if _record_belongs_to_samples(item, sample_ids)
+                item
+                for item in static_features
+                if _record_belongs_to_samples(item, all_sample_ids)
             )
             code_features = tuple(
-                item for item in code_features if _record_belongs_to_samples(item, sample_ids)
+                item
+                for item in code_features
+                if _record_belongs_to_samples(item, all_sample_ids)
             )
             capabilities = tuple(
-                item for item in capabilities if _record_belongs_to_samples(item, sample_ids)
+                item
+                for item in capabilities
+                if _record_belongs_to_samples(item, all_sample_ids)
             )
             invariants = await _optional_call(
                 getattr(uow, "invariants", None),
@@ -265,40 +344,125 @@ class ProposalConversationService:
             capabilities = tuple(sorted(capabilities, key=lambda item: _canonical_json(item)))
             invariants = tuple(
                 sorted(invariants, key=lambda item: _canonical_json(_invariant_context(item)))
-            )
+            )[:_MAX_AUXILIARY_CONTEXT_RECORDS]
             rejections = tuple(
                 sorted(rejections, key=lambda item: _canonical_json(_rejection_context(item)))
+            )[:_MAX_AUXILIARY_CONTEXT_RECORDS]
+            claims = tuple(sorted(claims, key=lambda item: _canonical_json(item)))[
+                :_MAX_AUXILIARY_CONTEXT_RECORDS
+            ]
+
+            candidate_records: list[dict[str, Any]] = []
+            for item in static_features:
+                candidate_records.extend(
+                    _static_candidate_records(item, sample_context_by_id)
+                )
+            for item in code_features:
+                candidate_records.extend(
+                    _code_candidate_records(item, sample_context_by_id)
+                )
+            for item in capabilities:
+                candidate_records.extend(
+                    _capability_candidate_records(item, sample_context_by_id)
+                )
+            candidate_records.sort(key=_candidate_sort_key)
+
+            measured_candidates = []
+            for candidate in candidate_records:
+                measured = await self._measure_candidate(
+                    uow, candidate, all_sample_ids, baseline_id
+                )
+                if not _exclude_before_model(measured):
+                    measured_candidates.append(measured)
+            selected_candidates = _select_candidate_records(measured_candidates)
+
+            origin_ids = _candidate_origin_sample_ids(selected_candidates)
+            origin_ids.update(_technical_origin_sample_ids(invariants, sample_context_by_id))
+            retained_samples = tuple(
+                sample_by_id[sample_id]
+                for sample_id in sorted(origin_ids, key=str)
+                if sample_id in sample_by_id
             )
-            claims = tuple(sorted(claims, key=lambda item: _canonical_json(item)))
+            if not retained_samples:
+                raise ProposalContractError(
+                    "The proposal snapshot has no retained technical origin Samples"
+                )
+            # This is intentionally recalculated on every call, including an
+            # idempotent replay. The policy is based only on retained origins.
+            policy = derived_policy(retained_samples)
+
+            # Positive support is snapshot-scoped, so recalculate it only after
+            # deterministic selection has fixed the origin sample set.
+            selected_candidates = [
+                await self._measure_candidate(
+                    uow, candidate, tuple(origin_ids), baseline_id
+                )
+                for candidate in selected_candidates
+            ]
+            origin_ids = _candidate_origin_sample_ids(selected_candidates)
+            origin_ids.update(_technical_origin_sample_ids(invariants, sample_context_by_id))
+            retained_samples = tuple(
+                sample_by_id[sample_id]
+                for sample_id in sorted(origin_ids, key=str)
+                if sample_id in sample_by_id
+            )
+            if not retained_samples:
+                raise ProposalContractError(
+                    "The proposal snapshot has no retained technical origin Samples"
+                )
+            policy = derived_policy(retained_samples)
 
             provenance_by_ref = _provenance_catalog(invariants)
-            if provenance_catalog:
-                provenance_by_ref.update(provenance_catalog)
+            for candidate in selected_candidates:
+                provenance = candidate["provenance"]
+                provenance_by_ref[_provenance_ref(provenance)] = provenance
+            provenance_by_ref = {
+                ref: provenance
+                for ref, provenance in provenance_by_ref.items()
+                if ref == _provenance_ref(provenance)
+            }
+            static_candidates = [
+                candidate
+                for candidate in selected_candidates
+                if candidate["source_kind"] == "static_features"
+            ]
+            code_candidates = [
+                candidate
+                for candidate in selected_candidates
+                if candidate["source_kind"] == "code_features"
+            ]
+            capability_candidates = [
+                candidate
+                for candidate in selected_candidates
+                if candidate["source_kind"] == "capabilities"
+            ]
+            corpus_hash = _sha256_json(corpus_state)
+            feature_hash = _sha256_json(
+                _candidate_persisted_references(static_candidates)
+            )
+            code_hash = _sha256_json(_candidate_persisted_references(code_candidates))
+            capability_hash = _sha256_json(
+                _candidate_persisted_references(capability_candidates)
+            )
             context = {
                 "snapshot_references": {
                     "input_pack_sha256": investigation.input_sha256,
-                    "corpus_snapshot_sha256": _sha256_json(corpus_state),
-                    "feature_pack_sha256": _sha256_json(
-                        _persisted_references(static_features, "sample_feature_set")
-                    ),
-                    "code_feature_sha256": _sha256_json(
-                        _persisted_references(code_features, "code_feature_set")
-                    ),
-                    "capability_set_sha256": _sha256_json(
-                        _persisted_references(capabilities, "capability_set")
-                    ),
+                    "corpus_snapshot_sha256": corpus_hash,
+                    "feature_pack_sha256": feature_hash,
+                    "code_feature_sha256": code_hash,
+                    "capability_set_sha256": capability_hash,
                     "goodware_baseline_id": str(baseline_id),
                 },
-                "origin_samples": sample_context,
+                "origin_samples": [
+                    sample_context_by_id[sample_id]
+                    for sample_id in sorted(origin_ids, key=str)
+                    if sample_id in sample_context_by_id
+                ],
                 "reference_corpus": corpus_state,
-                "static_features": [
-                    _bounded_json(item, drop_timestamps=True) for item in static_features
-                ],
-                "code_features": [
-                    _bounded_json(item, drop_timestamps=True) for item in code_features
-                ],
+                "static_features": [_candidate_context(item) for item in static_candidates],
+                "code_features": [_candidate_context(item) for item in code_candidates],
                 "capabilities": [
-                    _bounded_json(item, drop_timestamps=True) for item in capabilities
+                    _candidate_context(item) for item in capability_candidates
                 ],
                 "existing_invariants": [_invariant_context(item) for item in invariants],
                 "prior_rejections": [_rejection_context(item) for item in rejections],
@@ -312,14 +476,6 @@ class ProposalConversationService:
                 ],
             }
             context = _bound_context(context)
-            corpus_hash = _sha256_json(corpus_state)
-            feature_hash = _sha256_json(
-                _persisted_references(static_features, "sample_feature_set")
-            )
-            code_hash = _sha256_json(_persisted_references(code_features, "code_feature_set"))
-            capability_hash = _sha256_json(
-                _persisted_references(capabilities, "capability_set")
-            )
             snapshot = ProposalInputSnapshot(
                 input_pack_sha256=investigation.input_sha256,
                 corpus_snapshot_sha256=corpus_hash,
@@ -329,7 +485,63 @@ class ProposalConversationService:
                 goodware_baseline_id=baseline_id,
                 context=context,
             )
-            return investigation, snapshot, policy, provenance_by_ref, samples
+            return investigation, snapshot, policy, provenance_by_ref, retained_samples
+
+    async def _measure_candidate(
+        self,
+        uow: Any,
+        candidate: dict[str, Any],
+        sample_ids: Sequence[UUID],
+        baseline_id: UUID,
+    ) -> dict[str, Any]:
+        result = dict(candidate)
+        invariant_type = InvariantType(candidate["invariant_type"])
+        descriptor = m2_feature_kind(invariant_type, candidate["pattern"])
+        repository = getattr(uow, "invariants", None)
+        measure = getattr(repository, "measure_feature", None)
+        measurement: FeatureMeasurements | None = None
+        if measure is not None and descriptor is not None:
+            measured = await measure(
+                feature_kind=descriptor[0],
+                normalized_value=descriptor[1],
+                snapshot_sample_ids=sample_ids,
+            )
+            if isinstance(measured, FeatureMeasurements):
+                measurement = measured
+
+        if measurement is not None:
+            result["benign_prevalence"] = measurement.benign_prevalence
+            result["positive_support"] = measurement.positive_support
+            assessment = _assessment_from_measurements(measurement, descriptor)
+            result["corpus_verdict"] = assessment.verdict.value
+            result["corpus_malware_sample_count"] = assessment.malware_sample_count
+            result["family_labels"] = sorted(assessment.family_sample_counts)
+
+        occurrence: int | None = None
+        goodware = getattr(uow, "goodware_baselines", None)
+        get_occurrence = getattr(goodware, "get_feature_occurrence", None)
+        if get_occurrence is not None and descriptor is not None:
+            measured_occurrence = await get_occurrence(
+                baseline_id, descriptor[0], descriptor[1]
+            )
+            if measured_occurrence is not None and int(measured_occurrence) > 0:
+                occurrence = int(measured_occurrence)
+        if occurrence is None:
+            raw_occurrence = candidate.get("goodware_occurrence_count")
+            if isinstance(raw_occurrence, int) and raw_occurrence > 0:
+                occurrence = raw_occurrence
+        result["goodware_baseline_id"] = str(baseline_id)
+        result["banality_occurrence_count"] = occurrence
+        scorer = getattr(self._invariant_registry, "_banality_scorer", None)
+        if scorer is not None and hasattr(scorer, "score"):
+            result["banality"] = scorer.score(occurrence).value
+        elif result.get("banality") not in {item.value for item in Banality}:
+            result["banality"] = Banality.UNKNOWN.value
+
+        result["corpus_too_small"] = (
+            result.get("corpus_verdict") == ReferenceCorpusVerdict.CORPUS_TOO_SMALL.value
+        )
+        return result
 
     async def _sample_context(self, uow: Any, samples: Sequence[Any]) -> list[dict[str, Any]]:
         result = []
@@ -529,6 +741,54 @@ class ProposalConversationService:
             raise ProposalOutputValidationError("The proposal turn has no persisted output")
         return content.output_text
 
+    async def _successful_turn_for_key(
+        self,
+        *,
+        idempotency_key: str,
+        conversation: ModelConversation,
+        subject_id: UUID,
+        investigation_id: UUID,
+    ) -> ModelConversationTurn | None:
+        """Read the durable turn before rendering a new message.
+
+        The current P09 state is deliberately not consulted here. The key is
+        made only from the immutable P10 references, so a successful turn can
+        be replayed after P09 has changed.
+        """
+        async with self._uow_factory() as uow:
+            repository = getattr(uow, "model_conversation_turns", None)
+            get_by_key = getattr(repository, "get_by_idempotency_key", None)
+            if get_by_key is None:
+                return None
+            turn = await get_by_key(idempotency_key)
+            if turn is None:
+                return None
+            stored_conversation = await uow.model_conversations.get(turn.conversation_id)
+            if (
+                stored_conversation is None
+                or turn.conversation_id != conversation.id
+                or stored_conversation.subject_id != subject_id
+                or stored_conversation.purpose is not ConversationPurpose.PIVOT_RESEARCH
+                or stored_conversation.expected_profile != f"p10:{investigation_id}"
+            ):
+                raise ProposalConversationError(
+                    "The persisted proposal turn is not owned by this P10 subject"
+                )
+            if turn.status is ConversationTurnStatus.SUCCEEDED:
+                return turn
+            return None
+
+    async def _persisted_turn_content(
+        self, conversation_id: UUID, turn: ModelConversationTurn, subject_id: UUID
+    ) -> Any:
+        contents = await self._model_conversations.turns(
+            conversation_id, context_subject_id=subject_id
+        )
+        content = next((item for item in contents if item.turn.id == turn.id), None)
+        if content is None:
+            raise ProposalOutputValidationError("The persisted proposal turn cannot be read")
+        return content
+
     async def _pass_candidates_to_p09(
         self,
         *,
@@ -605,7 +865,7 @@ def _parse_proposal_response(output_text: str) -> ProposalResponse:
             object_pairs_hook=_reject_duplicate_json_keys,
             parse_constant=_reject_non_finite_json,
         )
-    except (TypeError, json.JSONDecodeError) as exc:
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ProposalOutputValidationError("The model output is not valid JSON") from exc
     if not isinstance(decoded, dict):
         raise ProposalOutputValidationError("The model output must be a JSON object")
@@ -679,6 +939,699 @@ async def _member_dispute(repository: Any, member_id: UUID) -> Any | None:
         disputes = await list_disputes(member_id)
         return disputes[-1] if disputes else None
     return None
+
+
+def _sample_identity(
+    record: Any, sample_context_by_id: Mapping[UUID, Mapping[str, Any]]
+) -> tuple[UUID, str] | None:
+    sample_id = _value(record, "sample_id", _MISSING)
+    if sample_id is _MISSING or sample_id is None:
+        return None
+    try:
+        sample_uuid = sample_id if isinstance(sample_id, UUID) else UUID(str(sample_id))
+    except (TypeError, ValueError):
+        return None
+    sample_context = sample_context_by_id.get(sample_uuid)
+    if sample_context is None:
+        return None
+    sample_sha256 = _value(record, "blob_sha256")
+    if not isinstance(sample_sha256, str):
+        sample_sha256 = sample_context.get("sample_sha256")
+    if not isinstance(sample_sha256, str) or len(sample_sha256) != 64:
+        return None
+    return sample_uuid, sample_sha256
+
+
+def _record_payload(record: Any) -> Mapping[str, Any]:
+    payload = _value(record, "payload", _MISSING)
+    if payload is _MISSING:
+        payload = _mapping_or_attrs(record)
+    if isinstance(payload, Mapping):
+        return payload
+    return {}
+
+
+def _record_id(record: Any) -> str | None:
+    value = _value(record, "id", _MISSING)
+    if value is _MISSING or value is None:
+        return None
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _bounded_pattern(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    value = value.strip()
+    if not value or len(value) > _MAX_STRING_CHARS:
+        return None
+    return value
+
+
+def _candidate_category(
+    feature: Any, record: Any, default: str
+) -> str:
+    value = _value(feature, "category", _value(record, "category", default))
+    value = _enum_value(value)
+    try:
+        return InvariantCategory(value).value
+    except (TypeError, ValueError):
+        return default
+
+
+def _known_noise(feature: Any, record: Any) -> bool:
+    return any(
+        bool(_value(source, key, False))
+        for source in (feature, record)
+        for key in ("known_noise", "non_discriminant", "non_selective", "is_non_selective")
+    )
+
+
+def _offsets(feature: Any) -> tuple[int, ...] | None:
+    value = _value(feature, "offsets", _MISSING)
+    if value is _MISSING:
+        value = _value(feature, "offset", _MISSING)
+    if value is _MISSING or value is None:
+        return None
+    values = (value,) if isinstance(value, int) else value
+    if not isinstance(values, (list, tuple)) or not values:
+        return None
+    try:
+        normalized = tuple(int(item) for item in values)
+    except (TypeError, ValueError):
+        return None
+    if any(item < 0 for item in normalized):
+        return None
+    return normalized
+
+
+def _feature_value(feature: Any, *, name: str = "value") -> Any:
+    if isinstance(feature, Mapping):
+        return feature.get(name, feature.get("name"))
+    return feature
+
+
+def _source_reference(record: Any, source_kind: str) -> dict[str, Any]:
+    source_id = _record_id(record)
+    selected: dict[str, Any] = {"kind": source_kind, "id": source_id}
+    for key in (
+        "sample_id",
+        "blob_id",
+        "blob_sha256",
+        "feature_blob_id",
+        "feature_blob_sha256",
+        "extractor_version",
+        "tool_version",
+        "escaper_compatibility_version",
+        "intel_pic_hash_escape_version",
+        "parameters_sha256",
+        "ruleset_sha256",
+    ):
+        value = _value(record, key, _MISSING)
+        if value is not _MISSING and value is not None:
+            selected[key] = _bounded_json(value, drop_timestamps=True)
+    return selected
+
+
+def _make_candidate(
+    *,
+    record: Any,
+    source_kind: str,
+    sample_id: UUID,
+    sample_sha256: str,
+    invariant_type: InvariantType,
+    category: str,
+    pattern: str,
+    provenance: InvariantProvenance,
+    feature_kind: str,
+    normalized_value: str,
+    feature: Any,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    source = _source_reference(record, source_kind)
+    source["sample_id"] = str(sample_id)
+    source["sample_sha256"] = sample_sha256
+    persisted_reference = {
+        **source,
+        "feature_kind": feature_kind,
+        "normalized_value": normalized_value,
+        "provenance": canonical_provenance(provenance),
+    }
+    result: dict[str, Any] = {
+        "source_kind": source_kind,
+        "source_id": source.get("id"),
+        "sample_id": str(sample_id),
+        "sample_sha256": sample_sha256,
+        "invariant_type": invariant_type.value,
+        "category": category,
+        "pattern": pattern,
+        "provenance": provenance,
+        "provenance_refs": [_provenance_ref(provenance)],
+        "feature_kind": feature_kind,
+        "normalized_value": normalized_value,
+        "persisted_reference": persisted_reference,
+        "known_noise": _known_noise(feature, record),
+        "banality": Banality.UNKNOWN.value,
+        "banality_occurrence_count": None,
+        "goodware_baseline_id": None,
+        "benign_prevalence": None,
+        "positive_support": None,
+        "corpus_verdict": ReferenceCorpusVerdict.UNKNOWN.value,
+        "corpus_too_small": False,
+        "corpus_malware_sample_count": None,
+        "family_labels": [],
+    }
+    if extra:
+        result.update(extra)
+    for key in (
+        "banality",
+        "banality_occurrence_count",
+        "benign_prevalence",
+        "positive_support",
+        "corpus_verdict",
+        "corpus_malware_sample_count",
+        "family_labels",
+        "goodware_verdict",
+        "goodware_occurrence_count",
+        "likely_packed",
+    ):
+        value = _value(feature, key, _value(record, key, _MISSING))
+        if value is not _MISSING:
+            result[key] = _enum_value(value)
+    return result
+
+
+def _static_candidate_records(
+    record: Any, sample_context_by_id: Mapping[UUID, Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    identity = _sample_identity(record, sample_context_by_id)
+    source_id = _record_id(record)
+    if identity is None or source_id is None:
+        return []
+    sample_id, sample_sha256 = identity
+    payload = _record_payload(record)
+    result: list[dict[str, Any]] = []
+    specifications = (
+        ("strings", "string", InvariantType.LITERAL_STRING, "unknown"),
+        ("imports", "import", InvariantType.IMPORT_NAME, "unknown"),
+        ("exports", "export", InvariantType.EXPORT_NAME, "unknown"),
+        ("sections", "section", InvariantType.SECTION_NAME, "unknown"),
+        ("opcode_fragment16", "opcode_fragment16", InvariantType.HEX_PATTERN, "unknown"),
+    )
+    for field_name, feature_kind, invariant_type, default_category in specifications:
+        values = payload.get(field_name, ())
+        if not isinstance(values, (list, tuple)):
+            continue
+        for feature in values:
+            value = _bounded_pattern(_feature_value(feature))
+            if value is None:
+                continue
+            offsets = _offsets(feature)
+            try:
+                if offsets is not None:
+                    provenance = SampleFeatureProvenance(
+                        sample_sha256=sample_sha256,
+                        feature_id=source_id,
+                        offsets=offsets,
+                    )
+                else:
+                    provenance = ToolOutputProvenance(
+                        sample_sha256=sample_sha256,
+                        tool="sample_feature_set",
+                        version=str(_value(record, "extractor_version", "unknown")),
+                        internal_id=source_id,
+                    )
+            except ValueError:
+                continue
+            normalized = value.lower()
+            result.append(
+                _make_candidate(
+                    record=record,
+                    source_kind="static_features",
+                    sample_id=sample_id,
+                    sample_sha256=sample_sha256,
+                    invariant_type=invariant_type,
+                    category=_candidate_category(feature, record, default_category),
+                    pattern=value,
+                    provenance=provenance,
+                    feature_kind=feature_kind,
+                    normalized_value=normalized,
+                    feature=feature,
+                    extra={
+                        "offsets": list(offsets) if offsets is not None else None,
+                        "occurrence_count": _value(feature, "occurrence_count"),
+                    },
+                )
+            )
+
+    imphash = _bounded_pattern(payload.get("imphash"))
+    if imphash is not None:
+        try:
+            provenance = ToolOutputProvenance(
+                sample_sha256=sample_sha256,
+                tool="sample_feature_set",
+                version=str(_value(record, "extractor_version", "unknown")),
+                internal_id=source_id,
+            )
+        except ValueError:
+            provenance = None
+        if provenance is not None:
+            result.append(
+                _make_candidate(
+                    record=record,
+                    source_kind="static_features",
+                    sample_id=sample_id,
+                    sample_sha256=sample_sha256,
+                    invariant_type=InvariantType.SIMILARITY_HASH,
+                    category=_candidate_category(
+                        {"category": "similarity_key"}, record, "similarity_key"
+                    ),
+                    pattern=f"imphash:{imphash}",
+                    provenance=provenance,
+                    feature_kind="imphash",
+                    normalized_value=imphash.lower(),
+                    feature={"value": imphash},
+                )
+            )
+    return result
+
+
+def _code_candidate_records(
+    record: Any, sample_context_by_id: Mapping[UUID, Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    identity = _sample_identity(record, sample_context_by_id)
+    source_id = _record_id(record)
+    if identity is None or source_id is None:
+        return []
+    if _enum_value(_value(record, "status")) not in {None, "SUCCEEDED"}:
+        return []
+    sample_id, sample_sha256 = identity
+    payload = _record_payload(record)
+    ngrams = payload.get("ngrams", _value(record, "ngrams", ()))
+    if not isinstance(ngrams, (list, tuple)):
+        return []
+    tool_version = _value(record, "tool_version", payload.get("tool_version"))
+    if not isinstance(tool_version, str) or not tool_version.strip():
+        return []
+    packing = payload.get("packing", _value(record, "packing"))
+    result: list[dict[str, Any]] = []
+    for ngram in ngrams:
+        pattern = _bounded_pattern(_value(ngram, "pattern"))
+        function_address = _value(ngram, "function_offset", _MISSING)
+        start_offset = _value(ngram, "start_offset", _MISSING)
+        if (
+            pattern is None
+            or function_address is _MISSING
+            or start_offset is _MISSING
+            or not isinstance(function_address, int)
+            or not isinstance(start_offset, int)
+            or function_address < 0
+            or start_offset < 0
+        ):
+            continue
+        try:
+            provenance = CodeFeatureProvenance(
+                sample_sha256=sample_sha256,
+                function_address=function_address,
+                offset=start_offset,
+                disassembler_version=tool_version,
+            )
+        except ValueError:
+            continue
+        extra = {
+            key: _bounded_json(_value(ngram, key), drop_timestamps=True)
+            for key in (
+                "instruction_count",
+                "byte_count",
+                "fixed_byte_count",
+                "masked_byte_count",
+                "longest_fixed_run",
+                "occurrence_count",
+                "goodware_verdict",
+                "goodware_occurrence_count",
+                "corpus_verdict",
+                "corpus_malware_sample_count",
+                "corpus_family_sample_counts",
+                "corpus_benign_sample_occurrences",
+                "mnemonics",
+            )
+            if _value(ngram, key, _MISSING) is not _MISSING
+        }
+        extra["packing"] = _bounded_json(packing, drop_timestamps=True)
+        extra["likely_packed"] = _value(ngram, "likely_packed")
+        result.append(
+            _make_candidate(
+                record=record,
+                source_kind="code_features",
+                sample_id=sample_id,
+                sample_sha256=sample_sha256,
+                invariant_type=InvariantType.CODE_NGRAM,
+                category=_candidate_category(ngram, record, "code_sequence"),
+                pattern=pattern,
+                provenance=provenance,
+                feature_kind="code_ngram",
+                normalized_value=pattern.lower(),
+                feature=ngram,
+                extra=extra,
+            )
+        )
+    return result
+
+
+def _capability_candidate_records(
+    record: Any, sample_context_by_id: Mapping[UUID, Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    identity = _sample_identity(record, sample_context_by_id)
+    source_id = _record_id(record)
+    if identity is None or source_id is None:
+        return []
+    if _enum_value(_value(record, "status")) not in {None, "SUCCEEDED"}:
+        return []
+    sample_id, sample_sha256 = identity
+    payload = _record_payload(record)
+    capabilities = payload.get("capabilities", _value(record, "capabilities", ()))
+    if not isinstance(capabilities, (list, tuple)):
+        return []
+    result: list[dict[str, Any]] = []
+    for capability in capabilities:
+        rule_id = _bounded_pattern(_value(capability, "rule_id"))
+        addresses = _value(capability, "function_addresses", ())
+        if rule_id is None or not isinstance(addresses, (list, tuple)) or not addresses:
+            continue
+        address_values = tuple(str(address) for address in addresses)
+        try:
+            provenance = CapabilityProvenance(
+                sample_sha256=sample_sha256,
+                capability_id=rule_id,
+                addresses=address_values,
+            )
+        except ValueError:
+            continue
+        result.append(
+            _make_candidate(
+                record=record,
+                source_kind="capabilities",
+                sample_id=sample_id,
+                sample_sha256=sample_sha256,
+                invariant_type=InvariantType.CAPABILITY,
+                category=_candidate_category(capability, record, "capability_pattern"),
+                pattern=rule_id,
+                provenance=provenance,
+                feature_kind="capability",
+                normalized_value=rule_id.lower(),
+                feature=capability,
+                extra={"addresses": list(address_values)},
+            )
+        )
+    return result
+
+
+def _candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[str, ...]:
+    return (
+        str(candidate.get("source_kind", "")),
+        str(candidate.get("sample_sha256", "")),
+        str(candidate.get("invariant_type", "")),
+        str(candidate.get("pattern", "")),
+        str(candidate.get("source_id", "")),
+        str(candidate.get("provenance_refs", ())),
+    )
+
+
+def _candidate_origin_sample_ids(candidates: Sequence[Mapping[str, Any]]) -> set[UUID]:
+    result: set[UUID] = set()
+    for candidate in candidates:
+        value = candidate.get("sample_id")
+        try:
+            result.add(value if isinstance(value, UUID) else UUID(str(value)))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _technical_origin_sample_ids(
+    invariants: Sequence[Any], sample_context_by_id: Mapping[UUID, Mapping[str, Any]]
+) -> set[UUID]:
+    sample_ids: set[UUID] = set()
+    sample_by_sha = {
+        str(context.get("sample_sha256")): sample_id
+        for sample_id, context in sample_context_by_id.items()
+        if context.get("sample_sha256")
+    }
+    for invariant in invariants:
+        for provenance in getattr(invariant, "provenances", ()):
+            sample_sha256 = _value(provenance, "sample_sha256", _MISSING)
+            if sample_sha256 is not _MISSING and sample_sha256 in sample_by_sha:
+                sample_ids.add(sample_by_sha[sample_sha256])
+    return sample_ids
+
+
+def _candidate_context(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    context: dict[str, Any] = {}
+    for key in (
+        "source_kind",
+        "source_id",
+        "sample_id",
+        "sample_sha256",
+        "invariant_type",
+        "category",
+        "pattern",
+        "provenance_refs",
+        "feature_kind",
+        "normalized_value",
+        "offsets",
+        "addresses",
+        "known_noise",
+        "banality",
+        "banality_occurrence_count",
+        "goodware_baseline_id",
+        "benign_prevalence",
+        "positive_support",
+        "corpus_verdict",
+        "corpus_too_small",
+        "corpus_malware_sample_count",
+        "family_labels",
+        "goodware_verdict",
+        "packing",
+        "likely_packed",
+        "instruction_count",
+        "byte_count",
+        "fixed_byte_count",
+        "masked_byte_count",
+        "longest_fixed_run",
+        "occurrence_count",
+        "goodware_occurrence_count",
+        "corpus_family_sample_counts",
+        "corpus_benign_sample_occurrences",
+        "mnemonics",
+    ):
+        if key in candidate:
+            context[key] = _bounded_json(candidate[key], drop_timestamps=True)
+    context["persisted_reference"] = _bounded_json(
+        candidate["persisted_reference"], drop_timestamps=True
+    )
+    return context
+
+
+def _candidate_persisted_references(
+    candidates: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    values = [dict(candidate["persisted_reference"]) for candidate in candidates]
+    return sorted(values, key=_canonical_json)
+
+
+def _select_candidate_records(
+    candidates: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=_candidate_sort_key):
+        if len(selected) >= _MAX_CANDIDATE_RECORDS:
+            break
+        trial = [*selected, dict(candidate)]
+        groups = {
+            "static_features": [
+                _candidate_context(item)
+                for item in trial
+                if item["source_kind"] == "static_features"
+            ],
+            "code_features": [
+                _candidate_context(item)
+                for item in trial
+                if item["source_kind"] == "code_features"
+            ],
+            "capabilities": [
+                _candidate_context(item)
+                for item in trial
+                if item["source_kind"] == "capabilities"
+            ],
+        }
+        if len(_canonical_json(groups)) > _MAX_CONTEXT_CHARS // 2:
+            continue
+        selected.append(dict(candidate))
+    return selected
+
+
+def _exclude_before_model(candidate: Mapping[str, Any]) -> bool:
+    if candidate.get("banality") == Banality.BANAL.value:
+        return True
+    if candidate.get("corpus_verdict") == ReferenceCorpusVerdict.MULTI_FAMILY.value:
+        return True
+    if candidate.get("category") in _NOISE_CATEGORIES:
+        return True
+    return bool(candidate.get("known_noise"))
+
+
+def _assessment_from_measurements(
+    measurements: FeatureMeasurements,
+    descriptor: tuple[str, str] | None,
+) -> Any:
+    if descriptor is None:
+        return None
+    if measurements.benign_prevalence is None:
+        family_counts: dict[str, set[UUID]] = {}
+        for sample_id, family in measurements.reference_members:
+            family_counts.setdefault(family, set()).add(sample_id)
+        return _unknown_assessment(
+            descriptor,
+            sum(len(samples) for samples in family_counts.values()),
+            {family: len(samples) for family, samples in family_counts.items()},
+        )
+    return assess_reference_feature(
+        feature_kind=descriptor[0],
+        normalized_value=descriptor[1],
+        malware_members=measurements.reference_members,
+        benign_sample_occurrences=measurements.benign_prevalence,
+        total_eligible_samples_by_family=measurements.eligible_samples_by_family,
+    )
+
+
+def _unknown_assessment(
+    descriptor: tuple[str, str], malware_count: int, family_counts: Mapping[str, int]
+) -> Any:
+    from cti_app.domain.reference_corpus import ReferenceCorpusAssessment
+
+    return ReferenceCorpusAssessment(
+        verdict=ReferenceCorpusVerdict.UNKNOWN,
+        feature_kind=descriptor[0],
+        normalized_value=descriptor[1],
+        malware_sample_count=malware_count,
+        family_sample_counts=dict(family_counts),
+        benign_sample_occurrences=0,
+    )
+
+
+def _snapshot_from_prompt(input_text: str) -> ProposalInputSnapshot:
+    start_marker = "BEGIN_P10_SNAPSHOT_DATA\n"
+    end_marker = "\nEND_P10_SNAPSHOT_DATA"
+    start = input_text.find(start_marker)
+    if start < 0:
+        raise ProposalOutputValidationError("The persisted proposal input has no snapshot")
+    start += len(start_marker)
+    end = input_text.find(end_marker, start)
+    if end < 0:
+        raise ProposalOutputValidationError(
+            "The persisted proposal input has no snapshot terminator"
+        )
+    encoded = input_text[start:end]
+    try:
+        decoded = json.loads(
+            encoded,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_non_finite_json,
+        )
+        return ProposalInputSnapshot.model_validate(decoded)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ProposalOutputValidationError("The persisted proposal snapshot is invalid") from exc
+
+
+def _snapshot_provenance_catalog(
+    snapshot: ProposalInputSnapshot,
+) -> dict[str, InvariantProvenance]:
+    values = snapshot.context.get("provenances", ())
+    if not isinstance(values, list):
+        raise ProposalOutputValidationError("The persisted snapshot has no provenance catalogue")
+    result: dict[str, InvariantProvenance] = {}
+    for item in values:
+        if not isinstance(item, Mapping):
+            raise ProposalOutputValidationError("The persisted provenance catalogue is invalid")
+        ref = item.get("provenance_ref")
+        payload = {key: value for key, value in item.items() if key != "provenance_ref"}
+        if not isinstance(ref, str):
+            raise ProposalOutputValidationError("The persisted provenance reference is invalid")
+        try:
+            provenance = _provenance_from_payload(payload)
+            if _provenance_ref(provenance) != ref:
+                raise ValueError("provenance reference mismatch")
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ProposalOutputValidationError(
+                "The persisted provenance catalogue is not canonical"
+            ) from exc
+        if ref in result:
+            raise ProposalOutputValidationError("The persisted provenance catalogue has duplicates")
+        result[ref] = provenance
+    return result
+
+
+def _snapshot_origin_sample_ids(snapshot: ProposalInputSnapshot) -> tuple[UUID, ...]:
+    values = snapshot.context.get("origin_samples", ())
+    if not isinstance(values, list):
+        raise ProposalOutputValidationError("The persisted snapshot has invalid origin Samples")
+    result: set[UUID] = set()
+    for item in values:
+        if not isinstance(item, Mapping) or "sample_id" not in item:
+            raise ProposalOutputValidationError("The persisted snapshot has invalid origin Samples")
+        try:
+            result.add(UUID(str(item["sample_id"])))
+        except (TypeError, ValueError) as exc:
+            raise ProposalOutputValidationError(
+                "The persisted snapshot has an invalid origin Sample id"
+            ) from exc
+    return tuple(sorted(result, key=str))
+
+
+def _provenance_from_payload(payload: Mapping[str, Any]) -> InvariantProvenance:
+    kind = payload["kind"]
+    if kind == "sample_feature":
+        return SampleFeatureProvenance(
+            sample_sha256=str(payload["sample_sha256"]),
+            feature_id=str(payload["feature_id"]),
+            offsets=tuple(payload["offsets"]),
+        )
+    if kind == "code_feature":
+        return CodeFeatureProvenance(
+            sample_sha256=str(payload["sample_sha256"]),
+            function_address=payload["function_address"],
+            offset=int(payload["offset"]),
+            disassembler_version=str(payload["disassembler_version"]),
+        )
+    if kind == "tool_output":
+        return ToolOutputProvenance(
+            sample_sha256=str(payload["sample_sha256"]),
+            tool=str(payload["tool"]),
+            version=str(payload["version"]),
+            internal_id=str(payload["internal_id"]),
+        )
+    if kind == "capability":
+        return CapabilityProvenance(
+            sample_sha256=str(payload["sample_sha256"]),
+            capability_id=str(payload["capability_id"]),
+            addresses=tuple(str(item) for item in payload["addresses"]),
+        )
+    if kind == "report_claim":
+        return ReportClaimProvenance(
+            claim_id=str(payload["claim_id"]),
+            source_document=str(payload["source_document"]),
+        )
+    if kind == "analyst_manual":
+        return AnalystManualProvenance(
+            actor_id=str(payload["actor_id"]),
+            occurred_at=datetime.fromisoformat(str(payload["occurred_at"])),
+            motif=str(payload["motif"]),
+        )
+    raise ValueError("persisted P10 provenance is not technical")
 
 
 def _provenance_catalog(invariants: Sequence[Any]) -> dict[str, InvariantProvenance]:
@@ -773,9 +1726,6 @@ def _bound_context(value: dict[str, Any]) -> dict[str, Any]:
             "report_claims",
             "prior_rejections",
             "existing_invariants",
-            "capabilities",
-            "code_features",
-            "static_features",
         )
         for key in optional:
             if isinstance(context.get(key), list):
@@ -808,7 +1758,6 @@ def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) 
             if drop_timestamps and key_text.lower() in {
                 "created_at",
                 "updated_at",
-                "occurred_at",
                 "acquired_at",
                 "promoted_at",
             }:
@@ -817,7 +1766,11 @@ def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) 
                 (
                     key_text,
                     _bounded_json(
-                        item, drop_timestamps=drop_timestamps, depth=depth + 1
+                        item,
+                        drop_timestamps=(
+                            drop_timestamps and key_text.lower() != "occurred_at"
+                        ),
+                        depth=depth + 1,
                     ),
                 )
             )
