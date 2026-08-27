@@ -59,12 +59,25 @@ def main(path: Path) -> None:
     output = {
         "smda_version": importlib.metadata.version("smda"),
         "escaper_compatibility_version": str(SmdaConfig.ESCAPER_DOWNWARD_COMPATIBILITY),
-        "intel_pic_hash_escape_version": str(SmdaFunction.INTEL_PIC_HASH_ESCAPE_VERSION),
+        "intel_pic_hash_escape_version": _canonical_version(
+            SmdaFunction.INTEL_PIC_HASH_ESCAPE_VERSION
+        ),
         "architecture": architecture,
         "functions": functions,
     }
     json.dump(output, sys.stdout, separators=(",", ":"), sort_keys=True)
     sys.stdout.write("\n")
+
+
+def _canonical_version(value: Any) -> str:
+    if isinstance(value, (list, tuple)) and value and all(
+        isinstance(component, int) and not isinstance(component, bool) and component >= 0
+        for component in value
+    ):
+        return ".".join(str(component) for component in value)
+    if isinstance(value, str) and value.strip():
+        return value
+    raise ValueError("SMDA version must be a non-empty string or integer components")
 
 
 def _infer_intel_architecture(path: Path) -> str | None:

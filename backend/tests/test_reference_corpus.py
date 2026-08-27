@@ -31,6 +31,7 @@ def test_specificity_counts_distinct_samples() -> None:
         normalized_value="x",
         malware_members=[(sample, "luna"), (sample, "luna"), (uuid4(), "luna")],
         benign_sample_occurrences=0,
+        total_eligible_samples_by_family={"luna": 2},
         min_family_samples=2,
     )
     assert result.verdict is ReferenceCorpusVerdict.FAMILY_SPECIFIC
@@ -43,5 +44,30 @@ def test_two_families_win_when_corpus_is_small() -> None:
         normalized_value="x",
         malware_members=[(uuid4(), "luna"), (uuid4(), "other")],
         benign_sample_occurrences=1,
+        total_eligible_samples_by_family={"luna": 1, "other": 1},
     )
     assert result.verdict is ReferenceCorpusVerdict.MULTI_FAMILY
+
+
+def test_motif_occurrences_do_not_supply_family_maturity() -> None:
+    result = assess_reference_feature(
+        feature_kind="string",
+        normalized_value="x",
+        malware_members=[(uuid4(), "luna") for _ in range(5)],
+        benign_sample_occurrences=0,
+        total_eligible_samples_by_family={"luna": 1},
+        min_family_samples=5,
+    )
+    assert result.verdict is ReferenceCorpusVerdict.CORPUS_TOO_SMALL
+
+
+def test_unknown_uses_total_eligible_corpus_without_feature_matches() -> None:
+    result = assess_reference_feature(
+        feature_kind="string",
+        normalized_value="x",
+        malware_members=[],
+        benign_sample_occurrences=0,
+        total_eligible_samples_by_family={"luna": 3, "other": 2},
+        min_family_samples=5,
+    )
+    assert result.verdict is ReferenceCorpusVerdict.UNKNOWN

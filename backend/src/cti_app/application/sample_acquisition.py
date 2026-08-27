@@ -19,6 +19,7 @@ from __future__ import annotations
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import BinaryIO, cast
 from uuid import UUID
 
 from cti_app.application.blobs import BlobCatalogService
@@ -201,8 +202,11 @@ class VirusTotalSampleAcquisitionService:
         policy: SampleAcquisitionPolicy,
         actor_id: str,
     ) -> SampleAcquisitionResult:
-        spool = tempfile.SpooledTemporaryFile(
-            max_size=SAMPLE_ACQUISITION_SPOOL_MAX_MEMORY_BYTES, mode="w+b"
+        spool = cast(
+            BinaryIO,
+            tempfile.SpooledTemporaryFile(
+                max_size=SAMPLE_ACQUISITION_SPOOL_MAX_MEMORY_BYTES, mode="w+b"
+            ),
         )
         try:
             # Hash verification against the requested family happens inside

@@ -168,6 +168,7 @@ class CodeFeatureService:
             max_per_sample=code_ngram_max_per_sample,
         )
         async with self._uow_factory() as uow:
+            family_sizes = await uow.reference_members.count_eligible_malware_samples_by_family()
             scored = []
             for ngram in ngrams:
                 occurrence = None
@@ -183,7 +184,6 @@ class CodeFeatureService:
                 benign = await uow.reference_members.count_benign_feature_occurrences(
                     "code_ngram", ngram.pattern
                 )
-                corpus_size = await uow.reference_members.count_eligible_malware_samples()
                 scored.append(
                     apply_corpus_assessment(
                         scored_ngram,
@@ -192,7 +192,7 @@ class CodeFeatureService:
                             normalized_value=ngram.pattern,
                             malware_members=members,
                             benign_sample_occurrences=benign,
-                            malware_corpus_size=corpus_size,
+                            total_eligible_samples_by_family=family_sizes,
                             min_family_samples=min_family_samples,
                         ),
                     )

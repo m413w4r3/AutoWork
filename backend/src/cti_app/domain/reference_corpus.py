@@ -83,8 +83,7 @@ def assess_reference_feature(
     normalized_value: str,
     malware_members: Iterable[tuple[UUID, str]],
     benign_sample_occurrences: int,
-    malware_corpus_size: int | None = None,
-    total_eligible_samples_by_family: Mapping[str, int] | None = None,
+    total_eligible_samples_by_family: Mapping[str, int],
     min_family_samples: int = 5,
 ) -> ReferenceCorpusAssessment:
     if min_family_samples < 1:
@@ -98,24 +97,14 @@ def assess_reference_feature(
         verdict = ReferenceCorpusVerdict.MULTI_FAMILY
     elif len(family_counts) == 1:
         family = next(iter(family_counts))
-        family_size = (
-            total_eligible_samples_by_family.get(family, 0)
-            if total_eligible_samples_by_family is not None
-            else malware_count
-        )
+        family_size = total_eligible_samples_by_family.get(family, 0)
         verdict = (
             ReferenceCorpusVerdict.FAMILY_SPECIFIC
             if family_size >= min_family_samples
             else ReferenceCorpusVerdict.CORPUS_TOO_SMALL
         )
     else:
-        total_eligible = (
-            sum(total_eligible_samples_by_family.values())
-            if total_eligible_samples_by_family is not None
-            else malware_corpus_size
-            if malware_corpus_size is not None
-            else malware_count
-        )
+        total_eligible = sum(total_eligible_samples_by_family.values())
         verdict = (
             ReferenceCorpusVerdict.UNKNOWN
             if total_eligible >= min_family_samples

@@ -89,6 +89,9 @@ async def test_real_smda_45_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
     assert result.status == "SUCCEEDED", result.error
     assert result.extraction is not None
+    assert result.extraction.smda_version == "4.5.0"
+    assert result.extraction.escaper_compatibility_version == "4.4.5"
+    assert result.extraction.intel_pic_hash_escape_version == "4.3.5"
     assert result.extraction.architecture == "x64"
     assert result.extraction.functions
     instructions = [

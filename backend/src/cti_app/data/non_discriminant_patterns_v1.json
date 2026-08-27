@@ -1,0 +1,25 @@
+{
+  "schema_version": "non-discriminant-patterns-v1",
+  "categories": {
+    "standard_sections": [
+      {"feature_kind":"section","normalized_value":".text"},
+      {"feature_kind":"section","normalized_value":".data"},
+      {"feature_kind":"section","normalized_value":".rdata"},
+      {"feature_kind":"section","normalized_value":".pdata"},
+      {"feature_kind":"section","normalized_value":".rsrc"},
+      {"feature_kind":"section","normalized_value":".reloc"}
+    ],
+    "go_runtime": [],
+    "msvc_crt": [],
+    "dotnet_metadata": [
+      {"feature_kind":"import","normalized_value":"mscoree.dll!_corexemain"},
+      {"feature_kind":"import","normalized_value":"mscoree.dll!_cordllmain"}
+    ],
+    "upx": [
+      {"feature_kind":"section","normalized_value":"upx0"},
+      {"feature_kind":"section","normalized_value":"upx1"},
+      {"feature_kind":"section","normalized_value":"upx2"}
+    ],
+    "delphi": []
+  }
+}

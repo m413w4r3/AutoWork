@@ -1,7 +1,11 @@
+from dataclasses import replace
+from io import BytesIO
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
+from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.code_features import (
     CodeFunction,
     CodeInstruction,
@@ -14,6 +18,7 @@ from cti_app.domain.code_features import (
     validate_ngram_sizes,
 )
 from cti_app.domain.reference_corpus import assess_reference_feature
+from cti_app.infrastructure.smda import SmdaAdapterResult, SmdaExtraction
 
 
 def _function() -> CodeFunction:
@@ -126,6 +131,111 @@ def test_corpus_assessment_preserves_small_and_unknown_states() -> None:
         normalized_value=ngram.pattern,
         malware_members=((uuid4(), "luna"),),
         benign_sample_occurrences=0,
-        malware_corpus_size=1,
+        total_eligible_samples_by_family={"luna": 1},
     )
     assert apply_corpus_assessment(ngram, assessment).corpus_verdict == "CORPUS_TOO_SMALL"
+
+
+class _FakeReferenceMembers:
+    async def count_eligible_malware_samples_by_family(self) -> dict[str, int]:
+        return {}
+
+
+class _FakeCodeFeatureSets:
+    def __init__(self) -> None:
+        self.stored = None
+
+    async def get(self, *args: object):
+        return self.stored
+
+    async def add_if_absent(self, feature_set, feature_blob_id) -> bool:
+        self.stored = replace(feature_set, feature_blob_id=feature_blob_id)
+        return True
+
+    async def index(self, feature_set) -> None:
+        return None
+
+
+class _FakeUow:
+    def __init__(self, blob_id, code_feature_sets: _FakeCodeFeatureSets) -> None:
+        self.samples = SimpleNamespace(
+            get=self._get_sample,
+        )
+        self.reference_members = _FakeReferenceMembers()
+        self.code_feature_sets = code_feature_sets
+        self._blob_id = blob_id
+        self.commits = 0
+
+    async def _get_sample(self, sample_id):
+        return SimpleNamespace(blob_id=self._blob_id)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        return None
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
+class _FakeBlobs:
+    def __init__(self, blob: BlobRecord) -> None:
+        self.blob = blob
+        self.read_calls = 0
+        self.ingest_calls = 0
+
+    async def read(self, blob_id, *, max_bytes):
+        self.read_calls += 1
+        return b"payload"
+
+    async def ingest(self, handle: BytesIO, *, logical_bucket: str, mime_type: str):
+        self.ingest_calls += 1
+        handle.read()
+        return self.blob
+
+
+class _FakeSmda:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def extract(self, payload: bytes, **kwargs) -> SmdaAdapterResult:
+        self.calls += 1
+        return SmdaAdapterResult(
+            status="SUCCEEDED",
+            extraction=SmdaExtraction(
+                smda_version="4.5.0",
+                escaper_compatibility_version="4.4.5",
+                intel_pic_hash_escape_version="4.3.5",
+                architecture="x64",
+                functions=(),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_idempotence_uses_persisted_smda_versions_before_adapter() -> None:
+    from cti_app.application.code_features import CodeFeatureService
+
+    sample_id = uuid4()
+    blob = BlobRecord(
+        descriptor=BlobDescriptor(
+            sha256="a" * 64,
+            size=7,
+            mime_type="application/octet-stream",
+            logical_bucket="samples",
+        )
+    )
+    blobs = _FakeBlobs(blob)
+    smda = _FakeSmda()
+    code_feature_sets = _FakeCodeFeatureSets()
+    uow = _FakeUow(blob.id, code_feature_sets)
+    service = CodeFeatureService(blobs, lambda: uow, smda)
+
+    first = await service.extract(sample_id=sample_id, parameters_sha256="parameters")
+    second = await service.extract(sample_id=sample_id, parameters_sha256="parameters")
+
+    assert second == first
+    assert smda.calls == 1
+    assert blobs.read_calls == 1
+    assert blobs.ingest_calls == 1
