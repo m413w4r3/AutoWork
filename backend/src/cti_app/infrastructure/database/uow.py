@@ -7,14 +7,11 @@ from cti_app.application.persistence import (
     AnalystInputPackRepository,
     AnalystInvestigationRepository,
     BlobRepository,
-    CapabilitySetRepository,
-    CodeFeatureSetRepository,
-    GoodwareBaselineRepository,
-    InvestigationGoodwareBaselineRepository,
-    ReferenceMemberRepository,
     BriefDraftRepository,
     BriefEvidencePackRepository,
+    CapabilitySetRepository,
     ClaimRepository,
+    CodeFeatureSetRepository,
     CollectionAttemptRepository,
     CollectionPolicySnapshotRepository,
     DerivedArtifactRepository,
@@ -28,8 +25,10 @@ from cti_app.application.persistence import (
     EditionProductionBatchRepository,
     EditionRepository,
     EditorialGroupRepository,
+    GoodwareBaselineRepository,
     HumanDecisionRepository,
     IndicatorRepository,
+    InvestigationGoodwareBaselineRepository,
     JobEventRepository,
     JobRepository,
     ModelConversationRepository,
@@ -38,10 +37,11 @@ from cti_app.application.persistence import (
     ModelRunRepository,
     ProductionArtifactRepository,
     ProvenanceRepository,
+    ReferenceMemberRepository,
     RejectedModelProposalRepository,
     SampleAcquisitionAttemptRepository,
-    SampleRepository,
     SampleFeatureSetRepository,
+    SampleRepository,
     SourceCollectionRepository,
     SourceDocumentRepository,
     SubjectContributionRepository,
@@ -70,10 +70,10 @@ from cti_app.infrastructure.database.repositories.core import (
     SqlAlchemyCodeFeatureSetRepository,
     SqlAlchemyGoodwareBaselineRepository,
     SqlAlchemyInvestigationGoodwareBaselineRepository,
-    SqlAlchemyReferenceMemberRepository,
     SqlAlchemyProvenanceRepository,
-    SqlAlchemySampleRepository,
+    SqlAlchemyReferenceMemberRepository,
     SqlAlchemySampleFeatureSetRepository,
+    SqlAlchemySampleRepository,
     SqlAlchemySourceDocumentRepository,
     SqlAlchemySubjectRepository,
     SqlAlchemyVirusTotalFileViewRepository,
@@ -180,7 +180,9 @@ class SqlAlchemyUnitOfWork:
         self._session = self._session_factory()
         self.blobs = SqlAlchemyBlobRepository(self._session)
         self.goodware_baselines = SqlAlchemyGoodwareBaselineRepository(self._session)
-        self.investigation_goodware_baselines = SqlAlchemyInvestigationGoodwareBaselineRepository(self._session)
+        self.investigation_goodware_baselines = SqlAlchemyInvestigationGoodwareBaselineRepository(
+            self._session
+        )
         self.reference_members = SqlAlchemyReferenceMemberRepository(self._session)
         self.capability_sets = SqlAlchemyCapabilitySetRepository(self._session)
         self.code_feature_sets = SqlAlchemyCodeFeatureSetRepository(self._session)

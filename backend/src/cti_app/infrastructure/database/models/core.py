@@ -47,7 +47,9 @@ class BlobRow(Base):
 
 class GoodwareBaselineRow(Base):
     __tablename__ = "goodware_baselines"
-    __table_args__ = (UniqueConstraint("source_set_sha256", name="uq_goodware_baselines_source_set"),)
+    __table_args__ = (
+        UniqueConstraint("source_set_sha256", name="uq_goodware_baselines_source_set"),
+    )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     source_set_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     records_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -59,21 +61,33 @@ class GoodwareBaselineRow(Base):
 
 class GoodwareBaselineSourceRow(Base):
     __tablename__ = "goodware_baseline_sources"
-    __table_args__ = (UniqueConstraint("baseline_id", "filename", name="uq_goodware_baseline_sources_filename"),)
+    __table_args__ = (
+        UniqueConstraint("baseline_id", "filename", name="uq_goodware_baseline_sources_filename"),
+    )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
-    baseline_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("goodware_baselines.id", ondelete="RESTRICT"), nullable=False)
+    baseline_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("goodware_baselines.id", ondelete="RESTRICT"), nullable=False
+    )
     filename: Mapped[str] = mapped_column(Text, nullable=False)
     feature_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     size: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    blob_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False)
+    blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
 
 
 class GoodwareFeatureRow(Base):
     __tablename__ = "goodware_features"
-    __table_args__ = (UniqueConstraint("baseline_id", "feature_kind", "normalized_value", name="uq_goodware_features_value"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "baseline_id", "feature_kind", "normalized_value", name="uq_goodware_features_value"
+        ),
+    )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
-    baseline_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("goodware_baselines.id", ondelete="RESTRICT"), nullable=False)
+    baseline_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("goodware_baselines.id", ondelete="RESTRICT"), nullable=False
+    )
     feature_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     normalized_value: Mapped[str] = mapped_column(Text, nullable=False)
     occurrence_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -81,22 +95,34 @@ class GoodwareFeatureRow(Base):
 
 class InvestigationGoodwareBaselineRow(Base):
     __tablename__ = "investigation_goodware_baselines"
-    investigation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("analyst_investigations.id", ondelete="RESTRICT"), primary_key=True)
-    baseline_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("goodware_baselines.id", ondelete="RESTRICT"), nullable=False)
+    investigation_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("analyst_investigations.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    baseline_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("goodware_baselines.id", ondelete="RESTRICT"), nullable=False
+    )
 
 
 class ReferenceMemberRow(Base):
     __tablename__ = "reference_members"
     __table_args__ = (
         UniqueConstraint("sample_id", "family_label", name="uq_reference_members_sample_label"),
-        CheckConstraint("label_source IN ('ANALYST','OPERATOR_IMPORT')", name="ck_reference_members_source"),
+        CheckConstraint(
+            "label_source IN ('ANALYST','OPERATOR_IMPORT')", name="ck_reference_members_source"
+        ),
         Index("ix_reference_members_sample_id", "sample_id"),
     )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
-    sample_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False)
+    sample_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False
+    )
     sample_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     family_label: Mapped[str] = mapped_column(Text, nullable=False)
-    origin_investigation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("analyst_investigations.id", ondelete="RESTRICT"))
+    origin_investigation_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("analyst_investigations.id", ondelete="RESTRICT")
+    )
     promoted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
     label_source: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -104,7 +130,11 @@ class ReferenceMemberRow(Base):
 
 class ReferenceMemberDisputeRow(Base):
     __tablename__ = "reference_member_disputes"
-    member_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("reference_members.id", ondelete="RESTRICT"), primary_key=True)
+    member_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("reference_members.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -113,12 +143,22 @@ class ReferenceMemberDisputeRow(Base):
 class CapabilitySetRow(Base):
     __tablename__ = "capability_sets"
     __table_args__ = (
-        UniqueConstraint("sample_id", "tool_version", "ruleset_sha256", "parameters_sha256", name="uq_capability_sets_replay"),
+        UniqueConstraint(
+            "sample_id",
+            "tool_version",
+            "ruleset_sha256",
+            "parameters_sha256",
+            name="uq_capability_sets_replay",
+        ),
         Index("ix_capability_sets_blob_id", "blob_id"),
     )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
-    sample_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False)
-    blob_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False)
+    sample_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False
+    )
+    blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
     tool_name: Mapped[str] = mapped_column(String(32), nullable=False)
     tool_version: Mapped[str] = mapped_column(String(64), nullable=False)
     ruleset_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -300,11 +340,25 @@ class SampleRow(Base):
 
 class SampleFeatureSetRow(Base):
     __tablename__ = "sample_feature_sets"
-    __table_args__ = (UniqueConstraint("sample_id", "extractor_version", "parameters_sha256", name="uq_sample_feature_sets_replay"), Index("ix_sample_feature_sets_blob_id", "blob_id"))
+    __table_args__ = (
+        UniqueConstraint(
+            "sample_id",
+            "extractor_version",
+            "parameters_sha256",
+            name="uq_sample_feature_sets_replay",
+        ),
+        Index("ix_sample_feature_sets_blob_id", "blob_id"),
+    )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
-    sample_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False)
-    blob_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False)
-    feature_blob_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False)
+    sample_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False
+    )
+    blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    feature_blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
     extractor_version: Mapped[str] = mapped_column(String(64), nullable=False)
     parameters_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
@@ -313,12 +367,28 @@ class SampleFeatureSetRow(Base):
 
 class SampleFeatureIndexRow(Base):
     __tablename__ = "sample_feature_index"
-    __table_args__ = (UniqueConstraint("feature_set_id", "feature_kind", "normalized_value", name="uq_sample_feature_index_value"), Index("ix_sample_feature_index_sample_kind", "sample_id", "feature_kind"))
+    __table_args__ = (
+        UniqueConstraint(
+            "feature_set_id",
+            "feature_kind",
+            "normalized_value",
+            name="uq_sample_feature_index_value",
+        ),
+        Index("ix_sample_feature_index_sample_kind", "sample_id", "feature_kind"),
+    )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
-    sample_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False)
-    feature_set_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("sample_feature_sets.id", ondelete="RESTRICT"))
-    capability_set_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("capability_sets.id", ondelete="RESTRICT"))
-    code_feature_set_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("code_feature_sets.id", ondelete="RESTRICT"))
+    sample_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False
+    )
+    feature_set_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("sample_feature_sets.id", ondelete="RESTRICT")
+    )
+    capability_set_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("capability_sets.id", ondelete="RESTRICT")
+    )
+    code_feature_set_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("code_feature_sets.id", ondelete="RESTRICT")
+    )
     feature_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     normalized_value: Mapped[str] = mapped_column(Text, nullable=False)
     occurrence_count: Mapped[int] = mapped_column(nullable=False)
