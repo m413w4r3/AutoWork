@@ -125,6 +125,11 @@ class Settings(BaseSettings):
     analysis_capa_timeout_seconds: float = Field(default=60.0, gt=0, le=3600)
     analysis_capa_max_output_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     analysis_capa_max_memory_bytes: int = Field(default=512 * 1024 * 1024, gt=0)
+    code_ngram_sizes: tuple[int, ...] = (4, 6, 8)
+    code_ngram_max_per_sample: int = Field(default=100_000, gt=0)
+    smda_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
+    smda_max_output_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
+    smda_max_memory_bytes: int = Field(default=1024 * 1024 * 1024, gt=0)
 
 
 @lru_cache

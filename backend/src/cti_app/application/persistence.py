@@ -51,6 +51,7 @@ from cti_app.domain.analysis import SampleFeatureSetV1
 from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
 from cti_app.domain.capabilities import CapabilitySet
+from cti_app.domain.code_features import CodeFeatureSet
 
 
 class BlobRepository(Protocol):
@@ -67,6 +68,9 @@ class BlobRepository(Protocol):
 
 class GoodwareBaselineRepository(Protocol):
     async def get_by_source_set_sha256(self, source_set_sha256: str) -> GoodwareBaseline | None: ...
+    async def get_feature_occurrence(
+        self, baseline_id: UUID, feature_kind: str, normalized_value: str
+    ) -> int | None: ...
     async def add(self, baseline: GoodwareBaseline) -> None: ...
     async def add_sources(self, baseline_id: UUID, sources: Sequence[GoodwareSource]) -> None: ...
     async def add_features(self, baseline_id: UUID, features: Iterable[GoodwareFeature]) -> None: ...
@@ -93,6 +97,21 @@ class CapabilitySetRepository(Protocol):
     async def get(self, sample_id: UUID, tool_version: str, ruleset_sha256: str, parameters_sha256: str) -> CapabilitySet | None: ...
     async def add_if_absent(self, capability_set: CapabilitySet, blob_id: UUID) -> bool: ...
     async def index(self, capability_set: CapabilitySet) -> None: ...
+
+
+class CodeFeatureSetRepository(Protocol):
+    async def get(
+        self,
+        sample_id: UUID,
+        tool_version: str,
+        escaper_compatibility_version: str,
+        intel_pic_hash_escape_version: str,
+        parameters_sha256: str,
+    ) -> CodeFeatureSet | None: ...
+
+    async def add_if_absent(self, feature_set: CodeFeatureSet, feature_blob_id: UUID) -> bool: ...
+
+    async def index(self, feature_set: CodeFeatureSet) -> None: ...
 
 
 class SubjectRepository(Protocol):
@@ -455,6 +474,7 @@ class UnitOfWork(Protocol):
     investigation_goodware_baselines: InvestigationGoodwareBaselineRepository
     reference_members: ReferenceMemberRepository
     capability_sets: CapabilitySetRepository
+    code_feature_sets: CodeFeatureSetRepository
     subjects: SubjectRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository

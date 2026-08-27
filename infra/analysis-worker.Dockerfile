@@ -9,6 +9,7 @@ FROM python:3.12-slim-bookworm
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY backend/src ./src
+COPY backend/tools ./tools
 RUN useradd --system --uid 10001 analysis
 USER analysis
 ENV PATH="/app/.venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1

@@ -8,6 +8,7 @@ from cti_app.application.persistence import (
     AnalystInvestigationRepository,
     BlobRepository,
     CapabilitySetRepository,
+    CodeFeatureSetRepository,
     GoodwareBaselineRepository,
     InvestigationGoodwareBaselineRepository,
     ReferenceMemberRepository,
@@ -66,6 +67,7 @@ from cti_app.infrastructure.database.repositories.collection import (
 from cti_app.infrastructure.database.repositories.core import (
     SqlAlchemyBlobRepository,
     SqlAlchemyCapabilitySetRepository,
+    SqlAlchemyCodeFeatureSetRepository,
     SqlAlchemyGoodwareBaselineRepository,
     SqlAlchemyInvestigationGoodwareBaselineRepository,
     SqlAlchemyReferenceMemberRepository,
@@ -126,6 +128,7 @@ class SqlAlchemyUnitOfWork:
     investigation_goodware_baselines: InvestigationGoodwareBaselineRepository
     reference_members: ReferenceMemberRepository
     capability_sets: CapabilitySetRepository
+    code_feature_sets: CodeFeatureSetRepository
     subjects: SubjectRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository
@@ -180,6 +183,7 @@ class SqlAlchemyUnitOfWork:
         self.investigation_goodware_baselines = SqlAlchemyInvestigationGoodwareBaselineRepository(self._session)
         self.reference_members = SqlAlchemyReferenceMemberRepository(self._session)
         self.capability_sets = SqlAlchemyCapabilitySetRepository(self._session)
+        self.code_feature_sets = SqlAlchemyCodeFeatureSetRepository(self._session)
         self.subjects = SqlAlchemySubjectRepository(self._session)
         self.source_documents = SqlAlchemySourceDocumentRepository(self._session)
         self.samples = SqlAlchemySampleRepository(self._session)

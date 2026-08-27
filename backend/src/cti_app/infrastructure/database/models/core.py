@@ -128,6 +128,42 @@ class CapabilitySetRow(Base):
     errors: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
 
 
+class CodeFeatureSetRow(Base):
+    __tablename__ = "code_feature_sets"
+    __table_args__ = (
+        UniqueConstraint(
+            "sample_id",
+            "tool_version",
+            "escaper_compatibility_version",
+            "intel_pic_hash_escape_version",
+            "parameters_sha256",
+            name="uq_code_feature_sets_replay",
+        ),
+        Index("ix_code_feature_sets_blob_id", "blob_id"),
+        Index("ix_code_feature_sets_feature_blob_id", "feature_blob_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    sample_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False
+    )
+    blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    feature_blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    tool_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    escaper_compatibility_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    intel_pic_hash_escape_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    parameters_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    architecture: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    errors: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class SubjectRow(Base):
     __tablename__ = "subjects"
     __table_args__ = (
@@ -282,6 +318,7 @@ class SampleFeatureIndexRow(Base):
     sample_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False)
     feature_set_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("sample_feature_sets.id", ondelete="RESTRICT"))
     capability_set_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("capability_sets.id", ondelete="RESTRICT"))
+    code_feature_set_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("code_feature_sets.id", ondelete="RESTRICT"))
     feature_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     normalized_value: Mapped[str] = mapped_column(Text, nullable=False)
     occurrence_count: Mapped[int] = mapped_column(nullable=False)

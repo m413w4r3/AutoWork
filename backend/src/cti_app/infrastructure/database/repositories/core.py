@@ -24,6 +24,13 @@ from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
 from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
 from cti_app.domain.reference_corpus import ReferenceLabelSource, ReferenceMember, ReferenceMemberDispute
 from cti_app.domain.capabilities import Capability, CapabilitySet, CapabilitySetStatus
+from cti_app.domain.code_features import (
+    CodeFeatureSet,
+    CodeFeatureStatus,
+    CodeNgram,
+    GoodwareVerdict,
+    PackingSignals,
+)
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
     VirusTotalFileView,
@@ -44,6 +51,7 @@ from cti_app.infrastructure.database.models.core import (
     ReferenceMemberDisputeRow,
     ReferenceMemberRow,
     CapabilitySetRow,
+    CodeFeatureSetRow,
     ProvenanceEventRow,
     SampleRow,
     SampleFeatureIndexRow,
@@ -144,6 +152,8 @@ class SqlAlchemyBlobRepository:
         feature_payload_count = await self._session.scalar(select(func.count()).select_from(SampleFeatureSetRow).where(SampleFeatureSetRow.feature_blob_id == blob_id))
         goodware_source_count = await self._session.scalar(select(func.count()).select_from(GoodwareBaselineSourceRow).where(GoodwareBaselineSourceRow.blob_id == blob_id))
         capability_set_count = await self._session.scalar(select(func.count()).select_from(CapabilitySetRow).where(CapabilitySetRow.blob_id == blob_id))
+        code_feature_set_count = await self._session.scalar(select(func.count()).select_from(CodeFeatureSetRow).where(CodeFeatureSetRow.blob_id == blob_id))
+        code_feature_payload_count = await self._session.scalar(select(func.count()).select_from(CodeFeatureSetRow).where(CodeFeatureSetRow.feature_blob_id == blob_id))
         return (
             int(document_count or 0)
             + int(decoded_document_count or 0)
@@ -159,6 +169,8 @@ class SqlAlchemyBlobRepository:
             + int(feature_payload_count or 0)
             + int(goodware_source_count or 0)
             + int(capability_set_count or 0)
+            + int(code_feature_set_count or 0)
+            + int(code_feature_payload_count or 0)
         )
 
 
@@ -207,6 +219,17 @@ class SqlAlchemyGoodwareBaselineRepository:
         from datetime import UTC, datetime
         self._session.add(GoodwareBaselineRow(id=baseline.id, source_set_sha256=baseline.source_set_sha256, records_sha256=baseline.records_sha256, record_count=baseline.record_count, occurrence_sum=baseline.occurrence_sum, pattern_version=baseline.pattern_version, created_at=datetime.now(UTC)))
         await self._session.flush()
+
+    async def get_feature_occurrence(
+        self, baseline_id: UUID, feature_kind: str, normalized_value: str
+    ) -> int | None:
+        return await self._session.scalar(
+            select(GoodwareFeatureRow.occurrence_count).where(
+                GoodwareFeatureRow.baseline_id == baseline_id,
+                GoodwareFeatureRow.feature_kind == feature_kind,
+                GoodwareFeatureRow.normalized_value == normalized_value,
+            )
+        )
 
     async def add_sources(self, baseline_id: UUID, sources: Sequence[GoodwareSource]) -> None:
         for source in sources:
@@ -289,6 +312,126 @@ def _reference_member_from_row(row: ReferenceMemberRow) -> ReferenceMember:
 
 def _reference_dispute_from_row(row: ReferenceMemberDisputeRow) -> ReferenceMemberDispute:
     return ReferenceMemberDispute(member_id=row.member_id, reason=row.reason, actor_id=row.actor_id, created_at=row.created_at)
+
+
+class SqlAlchemyCodeFeatureSetRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(
+        self,
+        sample_id: UUID,
+        tool_version: str,
+        escaper_compatibility_version: str,
+        intel_pic_hash_escape_version: str,
+        parameters_sha256: str,
+    ) -> CodeFeatureSet | None:
+        row = await self._session.scalar(
+            select(CodeFeatureSetRow).where(
+                CodeFeatureSetRow.sample_id == sample_id,
+                CodeFeatureSetRow.tool_version == tool_version,
+                CodeFeatureSetRow.escaper_compatibility_version == escaper_compatibility_version,
+                CodeFeatureSetRow.intel_pic_hash_escape_version == intel_pic_hash_escape_version,
+                CodeFeatureSetRow.parameters_sha256 == parameters_sha256,
+            )
+        )
+        return _code_feature_set_from_row(row) if row else None
+
+    async def add_if_absent(self, feature_set: CodeFeatureSet, feature_blob_id: UUID) -> bool:
+        from sqlalchemy.dialects.postgresql import insert
+
+        statement = (
+            insert(CodeFeatureSetRow)
+            .values(
+                id=feature_set.id,
+                sample_id=feature_set.sample_id,
+                blob_id=feature_set.blob_id,
+                feature_blob_id=feature_blob_id,
+                tool_version=feature_set.tool_version,
+                escaper_compatibility_version=feature_set.escaper_compatibility_version,
+                intel_pic_hash_escape_version=feature_set.intel_pic_hash_escape_version,
+                parameters_sha256=feature_set.parameters_sha256,
+                architecture=feature_set.architecture,
+                status=feature_set.status.value,
+                payload=feature_set.as_json(),
+                errors=list(feature_set.errors),
+                created_at=__import__("datetime").datetime.now(__import__("datetime").UTC),
+            )
+            .on_conflict_do_nothing(constraint="uq_code_feature_sets_replay")
+        )
+        result = await self._session.execute(statement)
+        await self._session.flush()
+        return bool(result.rowcount)
+
+    async def index(self, feature_set: CodeFeatureSet) -> None:
+        row = await self._session.scalar(
+            select(CodeFeatureSetRow).where(
+                CodeFeatureSetRow.sample_id == feature_set.sample_id,
+                CodeFeatureSetRow.tool_version == feature_set.tool_version,
+                CodeFeatureSetRow.escaper_compatibility_version
+                == feature_set.escaper_compatibility_version,
+                CodeFeatureSetRow.intel_pic_hash_escape_version
+                == feature_set.intel_pic_hash_escape_version,
+                CodeFeatureSetRow.parameters_sha256 == feature_set.parameters_sha256,
+            )
+        )
+        if row is None:
+            raise RuntimeError("code feature set is missing")
+        for ngram in feature_set.ngrams:
+            exists = await self._session.scalar(
+                select(SampleFeatureIndexRow.id).where(
+                    SampleFeatureIndexRow.code_feature_set_id == row.id,
+                    SampleFeatureIndexRow.feature_kind == "code_ngram",
+                    SampleFeatureIndexRow.normalized_value == ngram.pattern,
+                )
+            )
+            if exists is None:
+                self._session.add(
+                    SampleFeatureIndexRow(
+                        id=uuid4(),
+                        sample_id=feature_set.sample_id,
+                        feature_set_id=None,
+                        capability_set_id=None,
+                        code_feature_set_id=row.id,
+                        feature_kind="code_ngram",
+                        normalized_value=ngram.pattern,
+                        occurrence_count=ngram.occurrence_count,
+                    )
+                )
+        await self._session.flush()
+
+
+def _code_feature_set_from_row(row: CodeFeatureSetRow) -> CodeFeatureSet:
+    payload = row.payload
+    ngrams = tuple(
+        CodeNgram(
+            **{
+                **item,
+                "mnemonics": tuple(item["mnemonics"]),
+                "goodware_verdict": GoodwareVerdict(item["goodware_verdict"]),
+                "corpus_family_sample_counts": tuple(
+                    (str(pair[0]), int(pair[1])) for pair in item["corpus_family_sample_counts"]
+                ),
+            }
+        )
+        for item in payload["ngrams"]
+    )
+    packing = PackingSignals(**payload["packing"])
+    return CodeFeatureSet(
+        id=row.id,
+        sample_id=row.sample_id,
+        blob_id=row.blob_id,
+        feature_blob_id=row.feature_blob_id,
+        tool_version=row.tool_version,
+        escaper_compatibility_version=row.escaper_compatibility_version,
+        intel_pic_hash_escape_version=row.intel_pic_hash_escape_version,
+        parameters_sha256=row.parameters_sha256,
+        architecture=row.architecture,
+        status=CodeFeatureStatus(row.status),
+        ngrams=ngrams,
+        packing=packing,
+        errors=tuple(row.errors),
+    )
 
 
 class SqlAlchemySampleFeatureSetRepository:
