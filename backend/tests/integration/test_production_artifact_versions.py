@@ -115,12 +115,12 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
 async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
     uow_factory: UnitOfWorkFactory, tmp_path: Path
 ) -> None:
-    """The parent flush makes the input-pack FK valid before commit ordering matters."""
+    """Parent flushes make both analyst FKs valid before commit ordering matters."""
     edition = Edition(
         country="France",
         country_code="FR",
-        period_start=date(2026, 8, 1),
-        period_end=date(2026, 8, 31),
+        period_start=date(2026, 12, 1),
+        period_end=date(2026, 12, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
         target_major_articles=1,
@@ -152,29 +152,32 @@ async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
         await uow.subjects.add(subject)
         await uow.subject_production_runs.add(run)
         await uow.production_artifacts.append(synthesis)
-        await uow.commit()
-
-    investigation = AnalystInvestigation.from_verified_synthesis(
-        synthesis=synthesis,
-        budget=LoopBudget(),
-        input_pack_blob_id=blob.id,
-        input_sha256=sha256,
-    )
-    pack = AnalystInputPack(
-        investigation_id=investigation.id,
-        blob_id=blob.id,
-        sha256=sha256,
-        schema_version="analyst-input-pack-v1",
-    )
-    async with uow_factory() as uow:
+        investigation = AnalystInvestigation.from_verified_synthesis(
+            synthesis=synthesis,
+            budget=LoopBudget(),
+            input_pack_blob_id=blob.id,
+            input_sha256=sha256,
+        )
         await uow.analyst_investigations.add(investigation)
+        pack = AnalystInputPack(
+            investigation_id=investigation.id,
+            blob_id=blob.id,
+            sha256=sha256,
+            schema_version="analyst-input-pack-v1",
+        )
         await uow.analyst_input_packs.append(pack)
         await uow.commit()
 
     async with uow_factory() as uow:
+        persisted_run = await uow.subject_production_runs.get(run.id)
+        persisted_synthesis = await uow.production_artifacts.get(synthesis.id)
         persisted = await uow.analyst_investigations.get(investigation.id)
         persisted_pack = await uow.analyst_input_packs.get_for_investigation(investigation.id)
-    assert persisted is not None and persisted.input_pack_blob_id == blob.id
+    assert persisted_run is not None
+    assert persisted_synthesis is not None
+    assert persisted is not None
+    assert persisted.synthesis_artifact_id == persisted_synthesis.id
+    assert persisted.input_pack_blob_id == blob.id
     assert persisted_pack == pack
 
 
@@ -284,6 +287,136 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
         reference_report_from_json(refs),
         technical_extraction_from_json(extraction),
     ).usable
+
+
+@pytest.mark.asyncio
+async def test_major_assisted_import_creates_handoff_without_llm_on_real_postgres(
+    uow_factory: UnitOfWorkFactory, tmp_path: Path
+) -> None:
+    """Import a valid checkpoint and persist the analyst handoff in one UoW."""
+    edition = Edition(
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 11, 1),
+        period_end=date(2026, 11, 30),
+        tlp=TLP.AMBER,
+        languages=("fr",),
+        target_major_articles=1,
+        target_briefs=1,
+        source_profile="test",
+    )
+    source = Subject(
+        external_id="SUBJ-MAJOR-IMPORT-SOURCE", slug="major-import-source", tlp=TLP.AMBER
+    )
+    target = Subject(
+        external_id="SUBJ-MAJOR-IMPORT-TARGET", slug="major-import-target", tlp=TLP.AMBER
+    )
+    store = ProductionArtifactStore(
+        BlobCatalogService(FilesystemBlobStore(tmp_path / "blobs"), uow_factory)
+    )
+    refs: dict[str, Any] = {
+        "sources": [
+            {
+                "id": "S1",
+                "title": "Source",
+                "url": "https://example.test/source",
+                "canonical_url": "https://example.test/source",
+            }
+        ],
+        "events": [],
+    }
+    extraction: dict[str, Any] = {"items": [], "uncertainties": []}
+    run = SubjectProductionRun(
+        subject_id=source.id,
+        edition_id=edition.id,
+        profile=ProductionProfile.BRIEF_AUTO,
+        research_date=date(2026, 11, 12),
+    )
+    run.start_running()
+    run.current_stage = SubjectProductionStage.ASSEMBLY
+    run.mark_needs_review(code="seed", message="seed")
+    ref_blob = await store.store_stage_payloads(canonical=refs)
+    extraction_blob = await store.store_stage_payloads(canonical=extraction)
+    synthesis_blob = await store.store_stage_payloads(rendered="Fait [S1]")
+
+    async with uow_factory() as uow:
+        assert await uow.editions.add_if_absent(edition)
+        await uow.subjects.add(source)
+        await uow.subjects.add(target)
+        await uow.subject_production_runs.add(run)
+        await uow.production_artifacts.append(
+            ProductionArtifact(
+                production_run_id=run.id,
+                subject_id=source.id,
+                stage=ProductionArtifactStage.REFERENCES,
+                version=1,
+                input_hash="a" * 64,
+                status=ProductionArtifactStatus.VERIFIED,
+                canonical_blob_id=ref_blob[1],
+            )
+        )
+        await uow.production_artifacts.append(
+            ProductionArtifact(
+                production_run_id=run.id,
+                subject_id=source.id,
+                stage=ProductionArtifactStage.EXTRACTION,
+                version=1,
+                input_hash="b" * 64,
+                status=ProductionArtifactStatus.VERIFIED,
+                canonical_blob_id=extraction_blob[1],
+            )
+        )
+        await uow.production_artifacts.append(
+            ProductionArtifact(
+                production_run_id=run.id,
+                subject_id=source.id,
+                stage=ProductionArtifactStage.SYNTHESIS,
+                version=1,
+                input_hash="c" * 64,
+                status=ProductionArtifactStatus.VERIFIED,
+                rendered_blob_id=synthesis_blob[2],
+            )
+        )
+        await uow.commit()
+
+    service = ProductionStateService(uow_factory, store)
+    snapshot = await service.export_state(subject_id=source.id, subject_title="Source")
+    result = await service.import_state(
+        subject_id=target.id,
+        edition_id=edition.id,
+        payload=snapshot.model_dump(mode="json"),
+        profile=ProductionProfile.MAJOR_ASSISTED,
+    )
+
+    assert result.status == "running"
+    assert result.current_stage == "analyst_research"
+    async with uow_factory() as uow:
+        imported_run = await uow.subject_production_runs.get(result.run_id)
+        assert imported_run is not None
+        imported_artifacts = await uow.production_artifacts.list_for_run(imported_run.id)
+        imported_investigation = await uow.analyst_investigations.get_for_run(imported_run.id)
+        assert imported_investigation is not None
+        imported_pack = await uow.analyst_input_packs.get_for_investigation(
+            imported_investigation.id
+        )
+    synthesis_artifacts = [
+        artifact
+        for artifact in imported_artifacts
+        if artifact.stage is ProductionArtifactStage.SYNTHESIS
+    ]
+    assert imported_run.status.value == "running"
+    assert imported_run.current_stage is SubjectProductionStage.ANALYST_RESEARCH
+    assert [(artifact.version, artifact.status.value) for artifact in synthesis_artifacts] == [
+        (1, "verified")
+    ]
+    assert imported_pack is not None
+    assert imported_investigation.synthesis_artifact_id == synthesis_artifacts[0].id
+    assert imported_investigation.input_pack_blob_id == imported_pack.blob_id
+    assert imported_investigation.input_sha256 == imported_pack.sha256
+    assert all(artifact.model_run_id is None for artifact in imported_artifacts)
+    assert imported_run.references_conversation_id is None
+    assert imported_run.synthesis_conversation_id is None
+    assert imported_investigation.pivot_conversation_id is None
 
 
 @pytest.mark.asyncio

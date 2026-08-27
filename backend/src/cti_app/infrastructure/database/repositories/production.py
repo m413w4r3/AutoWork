@@ -246,6 +246,9 @@ class SqlAlchemyProductionArtifactRepository:
             created_at=artifact.created_at,
         )
         self._session.add(row)
+        # Materialize the artifact before it can become an FK parent.
+        # AnalystInvestigation.synthesis_artifact_id may reference it immediately.
+        await self._session.flush()
 
     async def get(self, artifact_id: UUID) -> ProductionArtifact | None:
         row = await self._session.get(ProductionArtifactRow, artifact_id)
