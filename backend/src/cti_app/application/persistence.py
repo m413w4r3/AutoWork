@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import date, datetime
 from types import TracebackType
 from typing import Protocol, Self
@@ -48,6 +48,7 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 from cti_app.domain.analysis import SampleFeatureSetV1
+from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
 
 
 class BlobRepository(Protocol):
@@ -60,6 +61,18 @@ class BlobRepository(Protocol):
     async def count_references(self, blob_id: UUID) -> int: ...
 
     async def delete(self, blob_id: UUID) -> None: ...
+
+
+class GoodwareBaselineRepository(Protocol):
+    async def get_by_source_set_sha256(self, source_set_sha256: str) -> GoodwareBaseline | None: ...
+    async def add(self, baseline: GoodwareBaseline) -> None: ...
+    async def add_sources(self, baseline_id: UUID, sources: Sequence[GoodwareSource]) -> None: ...
+    async def add_features(self, baseline_id: UUID, features: Iterable[GoodwareFeature]) -> None: ...
+
+
+class InvestigationGoodwareBaselineRepository(Protocol):
+    async def get(self, investigation_id: UUID) -> UUID | None: ...
+    async def add(self, investigation_id: UUID, baseline_id: UUID) -> None: ...
 
 
 class SubjectRepository(Protocol):
@@ -418,6 +431,8 @@ class BriefDraftRepository(Protocol):
 
 class UnitOfWork(Protocol):
     blobs: BlobRepository
+    goodware_baselines: GoodwareBaselineRepository
+    investigation_goodware_baselines: InvestigationGoodwareBaselineRepository
     subjects: SubjectRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository

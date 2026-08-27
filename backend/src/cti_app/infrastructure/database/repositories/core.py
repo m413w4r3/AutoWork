@@ -2,7 +2,7 @@
 foundational entities every other bounded context references. Owns the only
 row/domain mappers for these rows."""
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
@@ -21,6 +21,7 @@ from cti_app.domain.entities import (
 )
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
+from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
     VirusTotalFileView,
@@ -34,6 +35,10 @@ from cti_app.infrastructure.database.models.collection import (
 )
 from cti_app.infrastructure.database.models.core import (
     BlobRow,
+    GoodwareBaselineRow,
+    GoodwareBaselineSourceRow,
+    GoodwareFeatureRow,
+    InvestigationGoodwareBaselineRow,
     ProvenanceEventRow,
     SampleRow,
     SampleFeatureIndexRow,
@@ -132,6 +137,7 @@ class SqlAlchemyBlobRepository:
         )
         feature_set_count = await self._session.scalar(select(func.count()).select_from(SampleFeatureSetRow).where(SampleFeatureSetRow.blob_id == blob_id))
         feature_payload_count = await self._session.scalar(select(func.count()).select_from(SampleFeatureSetRow).where(SampleFeatureSetRow.feature_blob_id == blob_id))
+        goodware_source_count = await self._session.scalar(select(func.count()).select_from(GoodwareBaselineSourceRow).where(GoodwareBaselineSourceRow.blob_id == blob_id))
         return (
             int(document_count or 0)
             + int(decoded_document_count or 0)
@@ -145,7 +151,48 @@ class SqlAlchemyBlobRepository:
             + int(virustotal_observation_count or 0)
             + int(feature_set_count or 0)
             + int(feature_payload_count or 0)
+            + int(goodware_source_count or 0)
         )
+
+
+class SqlAlchemyGoodwareBaselineRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_by_source_set_sha256(self, source_set_sha256: str) -> GoodwareBaseline | None:
+        row = await self._session.scalar(select(GoodwareBaselineRow).where(GoodwareBaselineRow.source_set_sha256 == source_set_sha256))
+        if row is None:
+            return None
+        sources = await self._session.scalars(select(GoodwareBaselineSourceRow).where(GoodwareBaselineSourceRow.baseline_id == row.id).order_by(GoodwareBaselineSourceRow.filename))
+        return GoodwareBaseline(id=row.id, source_set_sha256=row.source_set_sha256, records_sha256=row.records_sha256, record_count=row.record_count, occurrence_sum=row.occurrence_sum, pattern_version=row.pattern_version, sources=tuple(GoodwareSource(filename=s.filename, feature_kind=s.feature_kind, sha256=s.sha256, size=s.size, blob_id=s.blob_id) for s in sources))
+
+    async def add(self, baseline: GoodwareBaseline) -> None:
+        from datetime import UTC, datetime
+        self._session.add(GoodwareBaselineRow(id=baseline.id, source_set_sha256=baseline.source_set_sha256, records_sha256=baseline.records_sha256, record_count=baseline.record_count, occurrence_sum=baseline.occurrence_sum, pattern_version=baseline.pattern_version, created_at=datetime.now(UTC)))
+        await self._session.flush()
+
+    async def add_sources(self, baseline_id: UUID, sources: Sequence[GoodwareSource]) -> None:
+        for source in sources:
+            self._session.add(GoodwareBaselineSourceRow(id=uuid4(), baseline_id=baseline_id, filename=source.filename, feature_kind=source.feature_kind, sha256=source.sha256, size=source.size, blob_id=source.blob_id))
+        await self._session.flush()
+
+    async def add_features(self, baseline_id: UUID, features: Iterable[GoodwareFeature]) -> None:
+        for feature in features:
+            self._session.add(GoodwareFeatureRow(id=uuid4(), baseline_id=baseline_id, feature_kind=feature.feature_kind, normalized_value=feature.normalized_value, occurrence_count=feature.occurrence_count))
+        await self._session.flush()
+
+
+class SqlAlchemyInvestigationGoodwareBaselineRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self, investigation_id: UUID) -> UUID | None:
+        row = await self._session.get(InvestigationGoodwareBaselineRow, investigation_id)
+        return row.baseline_id if row else None
+
+    async def add(self, investigation_id: UUID, baseline_id: UUID) -> None:
+        self._session.add(InvestigationGoodwareBaselineRow(investigation_id=investigation_id, baseline_id=baseline_id))
+        await self._session.flush()
 
 
 class SqlAlchemySampleFeatureSetRepository:

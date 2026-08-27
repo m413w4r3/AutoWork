@@ -45,6 +45,46 @@ class BlobRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class GoodwareBaselineRow(Base):
+    __tablename__ = "goodware_baselines"
+    __table_args__ = (UniqueConstraint("source_set_sha256", name="uq_goodware_baselines_source_set"),)
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    source_set_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    records_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    record_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    occurrence_sum: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    pattern_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class GoodwareBaselineSourceRow(Base):
+    __tablename__ = "goodware_baseline_sources"
+    __table_args__ = (UniqueConstraint("baseline_id", "filename", name="uq_goodware_baseline_sources_filename"),)
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    baseline_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("goodware_baselines.id", ondelete="RESTRICT"), nullable=False)
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    feature_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    blob_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False)
+
+
+class GoodwareFeatureRow(Base):
+    __tablename__ = "goodware_features"
+    __table_args__ = (UniqueConstraint("baseline_id", "feature_kind", "normalized_value", name="uq_goodware_features_value"),)
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    baseline_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("goodware_baselines.id", ondelete="RESTRICT"), nullable=False)
+    feature_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    normalized_value: Mapped[str] = mapped_column(Text, nullable=False)
+    occurrence_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class InvestigationGoodwareBaselineRow(Base):
+    __tablename__ = "investigation_goodware_baselines"
+    investigation_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("analyst_investigations.id", ondelete="RESTRICT"), primary_key=True)
+    baseline_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("goodware_baselines.id", ondelete="RESTRICT"), nullable=False)
+
+
 class SubjectRow(Base):
     __tablename__ = "subjects"
     __table_args__ = (

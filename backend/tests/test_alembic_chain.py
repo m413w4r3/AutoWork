@@ -13,6 +13,7 @@ EXPECTED_CHAIN = (
     "0004_sample_lifecycle",
     "0005_sample_acquisition",
     "0006_static_analysis",
+    "0007_goodware_baselines",
 )
 
 
@@ -37,4 +38,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0004_sample_lifecycle": "0003_analyst_workflow",
         "0005_sample_acquisition": "0004_sample_lifecycle",
         "0006_static_analysis": "0005_sample_acquisition",
+        "0007_goodware_baselines": "0006_static_analysis",
     }
