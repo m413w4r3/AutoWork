@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,6 +52,21 @@ from cti_app.infrastructure.database.models.invariants import (
 class SqlAlchemyInvariantRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def lock_proposal(self, proposal_key: str) -> None:
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:proposal_key, 0))"),
+            {"proposal_key": proposal_key},
+        )
+
+    async def get_proposal_outcome(
+        self, proposal_key: str
+    ) -> tuple[CandidateInvariant | None, InvariantRejection | None]:
+        invariant = await self.get_invariant_by_proposal_key(proposal_key)
+        rejection = await self.get_rejection_by_proposal_key(proposal_key)
+        if invariant is not None and rejection is not None:
+            raise RuntimeError("proposal key has both an invariant and a rejection")
+        return invariant, rejection
 
     async def resolve_provenance(
         self,
@@ -167,6 +182,16 @@ class SqlAlchemyInvariantRepository:
             )
         )
         return await self._candidate_from_row(row) if row is not None else None
+
+    async def get_rejection_by_proposal_key(
+        self, proposal_key: str
+    ) -> InvariantRejection | None:
+        row = await self._session.scalar(
+            select(InvariantRejectionRow).where(
+                InvariantRejectionRow.proposal_key == proposal_key
+            )
+        )
+        return _rejection_from_row(row) if row is not None else None
 
     async def list_invariants(
         self,

@@ -41,6 +41,12 @@ class FakeInvariantRepository:
         self.rejections = {}
         self.transitions = []
 
+    async def lock_proposal(self, proposal_key: str) -> None:
+        return None
+
+    async def get_proposal_outcome(self, proposal_key: str):
+        return self.invariants.get(proposal_key), self.rejections.get(proposal_key)
+
     async def resolve_provenance(self, **kwargs: object) -> ResolvedFeature | None:
         return self.resolved
 
@@ -198,6 +204,7 @@ async def test_surviving_manual_proposal_is_proposed_and_scored() -> None:
         type=InvariantType.LITERAL_STRING,
         category=InvariantCategory.C2_INDICATOR,
         motif="CreateMutexW",
+        pattern="CreateMutexW",
         actor_id="analyst-1",
         occurred_at=NOW,
     )
@@ -302,6 +309,9 @@ async def test_banal_and_multi_family_are_rejected_but_small_corpus_survives() -
         positive_support=0,
     )
     uow.goodware_baselines.occurrence = 10
+    uow.invariants.resolved = ResolvedFeature(
+        source_id="manual", sample_sha256=None, feature_kind="string", normalized_value="banal"
+    )
     banal = await service.propose(
         investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
         category=InvariantCategory.UNKNOWN, pattern="banal", provenance=_manual("banal", NOW),
@@ -309,6 +319,9 @@ async def test_banal_and_multi_family_are_rejected_but_small_corpus_survives() -
     assert banal.rejection and banal.rejection.cause is InvariantRejectionCause.BANAL
 
     uow.goodware_baselines.occurrence = None
+    uow.invariants.resolved = ResolvedFeature(
+        source_id="manual", sample_sha256=None, feature_kind="string", normalized_value="multi"
+    )
     multi = await service.propose(
         investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
         category=InvariantCategory.UNKNOWN,
@@ -319,6 +332,9 @@ async def test_banal_and_multi_family_are_rejected_but_small_corpus_survives() -
 
     uow.invariants.measurements = FeatureMeasurements(
         eligible_samples_by_family={"luna": 1}, benign_prevalence=0, positive_support=0
+    )
+    uow.invariants.resolved = ResolvedFeature(
+        source_id="manual", sample_sha256=None, feature_kind="string", normalized_value="small"
     )
     small = await service.propose(
         investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
@@ -342,6 +358,7 @@ async def test_unknown_measurements_are_not_stored_as_zero() -> None:
         type=InvariantType.STRUCTURAL_METADATA,
         category=InvariantCategory.UNKNOWN,
         motif="metadata",
+        pattern="metadata",
         actor_id="analyst",
         occurred_at=NOW.replace(microsecond=5),
     )
@@ -368,6 +385,25 @@ def _ngram(*, masked: int, longest: int) -> CodeNgram:
     )
 
 
+def _code_provenance(moment: datetime = NOW) -> CodeFeatureProvenance:
+    return CodeFeatureProvenance(
+        sample_sha256="a" * 64,
+        function_address=0x1000,
+        offset=moment.microsecond,
+        disassembler_version="smda",
+    )
+
+
+def _packing() -> PackingSignals:
+    return PackingSignals(
+        max_executable_section_entropy=0.0,
+        executable_bytes=0,
+        recovered_function_count=0,
+        executable_bytes_per_function=0,
+        known_packer_marker_hits=(),
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("ngram", "cause"),
@@ -380,26 +416,27 @@ async def test_code_ngram_thresholds_are_strict_at_the_boundary(ngram, cause) ->
     service, uow = _service()
     uow.invariants.resolved = ResolvedFeature(
         source_id="code", sample_sha256="a" * 64, feature_kind="code_ngram",
-        normalized_value=ngram.pattern.lower(), code_ngram=ngram,
+        normalized_value=ngram.pattern.strip().lower(), code_ngram=ngram, packing=_packing(),
     )
     uow.invariants.measurements = FeatureMeasurements(benign_prevalence=0)
     result = await service.propose(
         investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.CODE_NGRAM,
         category=InvariantCategory.CODE_SEQUENCE,
         pattern=ngram.pattern,
-        provenance=_manual(ngram.pattern),
+            provenance=_code_provenance(),
     )
     assert result.rejection and result.rejection.cause is cause
 
     if cause is InvariantRejectionCause.CODE_NGRAM_MASK_RATIO:
         uow.invariants.resolved = ResolvedFeature(
             source_id="code", sample_sha256="a" * 64, feature_kind="code_ngram",
-            normalized_value=ngram.pattern.lower(), code_ngram=_ngram(masked=2, longest=8),
+            normalized_value=ngram.pattern.strip().lower(), code_ngram=_ngram(masked=2, longest=8),
+            packing=_packing(),
         )
         result = await service.propose(
             investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.CODE_NGRAM,
             category=InvariantCategory.CODE_SEQUENCE, pattern=ngram.pattern,
-            provenance=_manual(ngram.pattern, NOW.replace(microsecond=3)),
+            provenance=_code_provenance(NOW.replace(microsecond=3)),
         )
         assert result.accepted
 
@@ -474,6 +511,7 @@ async def test_manual_and_regular_paths_share_scorer_and_transition_audit() -> N
     result = await service.propose_manual(
         investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
         category=InvariantCategory.UNKNOWN, motif="x", actor_id="analyst", occurred_at=NOW,
+        pattern="x",
     )
     assert result.invariant and result.invariant.banality is Banality.SUSPICIOUS_COMMON
     transitioned = await service.transition(
@@ -494,10 +532,12 @@ async def test_replay_and_rejection_statistics_are_idempotent() -> None:
     first = await service.propose_manual(
         investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
         category=InvariantCategory.UNKNOWN, motif="x", actor_id="analyst", occurred_at=NOW,
+        pattern="x",
     )
     second = await service.propose_manual(
         investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
         category=InvariantCategory.UNKNOWN, motif="x", actor_id="analyst", occurred_at=NOW,
+        pattern="x",
     )
     assert first.invariant == second.invariant
     assert len(uow.invariants.invariants) == 1
@@ -517,3 +557,104 @@ def test_replay_key_is_canonical_and_stable() -> None:
         pattern="x", provenance=provenance,
     )
     assert first == second
+
+
+def test_provenance_order_does_not_change_replay_key() -> None:
+    manual = _manual("analyst note")
+    report = ReportClaimProvenance(claim_id="claim", source_document="document")
+    first = make_proposal_key(
+        investigation_id=INVESTIGATION_ID,
+        invariant_type=InvariantType.LITERAL_STRING,
+        pattern="x",
+        provenances=(manual, report),
+    )
+    second = make_proposal_key(
+        investigation_id=INVESTIGATION_ID,
+        invariant_type=InvariantType.LITERAL_STRING,
+        pattern="x",
+        provenances=(report, manual),
+    )
+    assert first == second
+
+
+@pytest.mark.asyncio
+async def test_manual_pattern_is_not_its_motif() -> None:
+    service, uow = _service()
+    uow.invariants.resolved = ResolvedFeature(
+        source_id="manual", sample_sha256=None, feature_kind="string", normalized_value="x"
+    )
+    uow.invariants.measurements = FeatureMeasurements(benign_prevalence=0)
+    result = await service.propose_manual(
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.LITERAL_STRING,
+        category=InvariantCategory.UNKNOWN,
+        motif="analyst explanation",
+        pattern="x",
+        actor_id="analyst",
+        occurred_at=NOW.replace(microsecond=6),
+    )
+    assert result.invariant is not None
+    assert result.invariant.pattern == "x"
+    assert isinstance(result.invariant.provenances[0], AnalystManualProvenance)
+    assert result.invariant.provenances[0].motif == "analyst explanation"
+
+
+@pytest.mark.asyncio
+async def test_manual_code_ngram_without_technical_origin_is_rejected() -> None:
+    service, uow = _service()
+    ngram = _ngram(masked=0, longest=10)
+    uow.invariants.resolved = ResolvedFeature(
+        source_id="manual",
+        sample_sha256="a" * 64,
+        feature_kind="code_ngram",
+        normalized_value=ngram.pattern.strip().lower(),
+        code_ngram=ngram,
+        packing=_packing(),
+    )
+    result = await service.propose_manual(
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.CODE_NGRAM,
+        category=InvariantCategory.CODE_SEQUENCE,
+        motif="analyst explanation",
+        pattern=ngram.pattern,
+        actor_id="analyst",
+        occurred_at=NOW.replace(microsecond=7),
+    )
+    assert result.rejection is not None
+    assert result.rejection.cause is InvariantRejectionCause.PROVENANCE_INVALID
+
+
+@pytest.mark.asyncio
+async def test_invalid_member_rejects_the_whole_multi_provenance_proposal() -> None:
+    service, uow = _service()
+    result = await service.propose(
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.LITERAL_STRING,
+        category=InvariantCategory.UNKNOWN,
+        pattern="x",
+        provenances=(_manual("x"), None),  # type: ignore[arg-type]
+    )
+    assert result.invariant is None
+    assert result.rejection is not None
+    assert result.rejection.cause is InvariantRejectionCause.PROVENANCE_INVALID
+    assert not uow.invariants.invariants
+
+
+@pytest.mark.asyncio
+async def test_duplicate_provenance_member_is_rejected_deterministically() -> None:
+    service, uow = _service()
+    manual = _manual("duplicate")
+    result = await service.propose(
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.LITERAL_STRING,
+        category=InvariantCategory.UNKNOWN,
+        pattern="duplicate",
+        provenances=(manual, manual),
+    )
+    assert result.rejection is not None
+    assert result.rejection.cause is InvariantRejectionCause.PROVENANCE_INVALID
+    assert not uow.invariants.invariants

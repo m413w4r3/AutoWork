@@ -37,13 +37,13 @@ from cti_app.domain.invariants import (
     CandidateInvariant,
     FeatureMeasurements,
     InvariantCategory,
+    InvariantProvenance,
     InvariantRejection,
     InvariantRejectionCause,
     InvariantStatus,
     InvariantTransition,
-    ResolvedFeature,
-    InvariantProvenance,
     InvariantType,
+    ResolvedFeature,
 )
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics
 from cti_app.domain.model_conversations import (
@@ -145,6 +145,12 @@ class CodeFeatureSetRepository(Protocol):
 
 
 class InvariantRepository(Protocol):
+    async def lock_proposal(self, proposal_key: str) -> None: ...
+
+    async def get_proposal_outcome(
+        self, proposal_key: str
+    ) -> tuple[CandidateInvariant | None, InvariantRejection | None]: ...
+
     async def resolve_provenance(
         self,
         *,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -295,10 +295,34 @@ def parse_similarity_hash_pattern(pattern: str) -> tuple[str, str] | None:
 
 
 def canonical_provenance(provenance: InvariantProvenance) -> dict[str, Any]:
+    if not isinstance(
+        provenance,
+        (
+            SampleFeatureProvenance,
+            CodeFeatureProvenance,
+            ToolOutputProvenance,
+            CapabilityProvenance,
+            ReportClaimProvenance,
+            AnalystManualProvenance,
+        ),
+    ):
+        raise ValueError("invalid invariant provenance")
     try:
         return provenance.as_canonical_dict()
     except AttributeError as exc:
         raise ValueError("invalid invariant provenance") from exc
+
+
+def canonical_provenances(
+    provenances: Sequence[InvariantProvenance],
+) -> tuple[InvariantProvenance, ...]:
+    items = [(canonical_provenance(item), item) for item in provenances]
+    items.sort(
+        key=lambda item: json.dumps(
+            item[0], ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+    )
+    return tuple(item for _, item in items)
 
 
 def make_proposal_key(
@@ -306,13 +330,26 @@ def make_proposal_key(
     investigation_id: UUID,
     invariant_type: InvariantType,
     pattern: str,
-    provenance: InvariantProvenance,
+    provenances: Sequence[InvariantProvenance] | None = None,
+    provenance: InvariantProvenance | None = None,
 ) -> str:
+    if provenances is None:
+        if provenance is None:
+            raise ValueError("provenances cannot be empty")
+        provenances = (provenance,)
+    elif provenance is not None:
+        raise ValueError("provide provenances or provenance, not both")
+    canonical_set = sorted(
+        (canonical_provenance(item) for item in provenances),
+        key=lambda item: json.dumps(
+            item, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ),
+    )
     payload = {
         "investigation_id": str(investigation_id),
         "type": InvariantType(invariant_type).value,
         "pattern": canonical_pattern(pattern),
-        "provenance": canonical_provenance(provenance),
+        "provenances": canonical_set,
     }
     encoded = json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
@@ -407,8 +444,21 @@ class CandidateInvariant:
             raise ValueError("invariant measurements cannot be negative")
         if not self.provenances:
             raise ValueError("at least one provenance is required")
-        for provenance in self.provenances:
-            canonical_provenance(provenance)
+        canonical_items = [
+            (canonical_provenance(provenance), provenance) for provenance in self.provenances
+        ]
+        canonical_items.sort(
+            key=lambda item: json.dumps(
+                item[0], ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            )
+        )
+        canonical_json = [
+            json.dumps(item[0], ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            for item in canonical_items
+        ]
+        if len(canonical_json) != len(set(canonical_json)):
+            raise ValueError("duplicate invariant provenance")
+        object.__setattr__(self, "provenances", tuple(item[1] for item in canonical_items))
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("created_at must be timezone-aware")
 

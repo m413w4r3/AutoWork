@@ -13,6 +13,8 @@ from cti_app.domain.goodware import Banality, BanalityScorer, BanalityThresholds
 from cti_app.domain.invariants import (
     AnalystManualProvenance,
     CandidateInvariant,
+    CapabilityProvenance,
+    CodeFeatureProvenance,
     FeatureMeasurements,
     InvariantCategory,
     InvariantProvenance,
@@ -22,6 +24,8 @@ from cti_app.domain.invariants import (
     InvariantType,
     ReportClaimProvenance,
     ResolvedFeature,
+    SampleFeatureProvenance,
+    ToolOutputProvenance,
     canonical_pattern,
     likely_packed,
     m2_feature_kind,
@@ -69,7 +73,8 @@ class InvariantRegistryService:
         type: InvariantType | str,
         category: InvariantCategory | str,
         pattern: str,
-        provenance: InvariantProvenance,
+        provenances: Sequence[InvariantProvenance] | None = None,
+        provenance: InvariantProvenance | None = None,
         cycle_number: int | None = None,
         positive_sample_confirmed: bool = False,
         occurred_at: datetime | None = None,
@@ -78,26 +83,43 @@ class InvariantRegistryService:
             invariant_type = InvariantType(type)
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid invariant type") from exc
+        if provenances is None:
+            provenances = (provenance,) if provenance is not None else ()
+        elif provenance is not None:
+            raise ValueError("provide provenances or provenance, not both")
+        try:
+            provenance_items = tuple(provenances)
+        except TypeError:
+            provenance_items = ()
         canonical = canonical_pattern(pattern)
         try:
             proposal_key = make_proposal_key(
                 investigation_id=investigation_id,
                 invariant_type=invariant_type,
                 pattern=canonical,
-                provenance=provenance,
+                provenances=provenance_items,
             )
         except ValueError:
             proposal_key = _invalid_provenance_key(
                 investigation_id=investigation_id,
                 invariant_type=invariant_type,
                 pattern=canonical,
-                provenance=provenance,
+                provenances=provenance_items,
             )
         moment = occurred_at or datetime.now(UTC)
         if moment.tzinfo is None or moment.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
 
         async with self._uow_factory() as uow:
+            await uow.invariants.lock_proposal(proposal_key)
+            existing_invariant, existing_rejection = await uow.invariants.get_proposal_outcome(
+                proposal_key
+            )
+            if existing_invariant is not None:
+                return InvariantProposalResult(invariant=existing_invariant, rejection=None)
+            if existing_rejection is not None:
+                return InvariantProposalResult(invariant=None, rejection=existing_rejection)
+
             investigation = await uow.analyst_investigations.get(investigation_id)
             if investigation is None:
                 raise ValueError(f"Investigation {investigation_id} does not exist")
@@ -105,7 +127,7 @@ class InvariantRegistryService:
                 cycle_number if cycle_number is not None else investigation.cycle_number
             )
 
-            provenance_cause = _validate_provenance(provenance, canonical)
+            provenance_cause = _validate_provenances(provenance_items)
             if provenance_cause is not None:
                 return await self._reject(
                     uow=uow,
@@ -178,12 +200,36 @@ class InvariantRegistryService:
                     occurred_at=moment,
                 )
 
-            resolved = await uow.invariants.resolve_provenance(
-                provenance=provenance,
-                invariant_type=invariant_type,
-                pattern=canonical,
+            resolved_features: list[tuple[InvariantProvenance, ResolvedFeature]] = []
+            for item in provenance_items:
+                try:
+                    resolved = await uow.invariants.resolve_provenance(
+                        provenance=item,
+                        invariant_type=invariant_type,
+                        pattern=canonical,
+                    )
+                except (KeyError, TypeError, ValueError):
+                    resolved = None
+                if resolved is None:
+                    return await self._reject(
+                        uow=uow,
+                        investigation_id=investigation_id,
+                        cycle_number=effective_cycle,
+                        proposal_key=proposal_key,
+                        invariant_type=invariant_type,
+                        category=invariant_category,
+                        pattern=canonical,
+                        cause=InvariantRejectionCause.PROVENANCE_INVALID,
+                        reason="provenance does not resolve to a persisted M2 output",
+                        occurred_at=moment,
+                    )
+                if resolved is not None:
+                    resolved_features.append((item, resolved))
+
+            descriptor = _resolved_descriptor(
+                invariant_type, canonical, [resolved for _, resolved in resolved_features]
             )
-            if resolved is None:
+            if descriptor is _INVALID_DESCRIPTOR:
                 return await self._reject(
                     uow=uow,
                     investigation_id=investigation_id,
@@ -193,11 +239,49 @@ class InvariantRegistryService:
                     category=invariant_category,
                     pattern=canonical,
                     cause=InvariantRejectionCause.PROVENANCE_INVALID,
-                    reason="provenance does not resolve to a persisted M2 output",
+                    reason="resolved feature descriptor does not match the proposed type/pattern",
                     occurred_at=moment,
                 )
-
-            descriptor = _feature_descriptor(invariant_type, canonical, resolved)
+            if not resolved_features and not provenance_items:
+                descriptor = None
+            ngram = next(
+                (
+                    feature.code_ngram
+                    for item, feature in resolved_features
+                    if _is_technical_provenance(item) and feature.code_ngram is not None
+                ),
+                None,
+            )
+            packing = next(
+                (
+                    feature.packing
+                    for item, feature in resolved_features
+                    if (
+                        _is_technical_provenance(item)
+                        and feature.code_ngram is not None
+                        and feature.packing is not None
+                    )
+                ),
+                None,
+            )
+            if invariant_type is InvariantType.CODE_NGRAM and (
+                ngram is None or packing is None
+            ):
+                return await self._reject(
+                    uow=uow,
+                    investigation_id=investigation_id,
+                    cycle_number=effective_cycle,
+                    proposal_key=proposal_key,
+                    invariant_type=invariant_type,
+                    category=invariant_category,
+                    pattern=canonical,
+                    cause=InvariantRejectionCause.PROVENANCE_INVALID,
+                    reason=(
+                        "code_ngram requires a resolvable persisted M2 origin with counters "
+                        "and packing signals"
+                    ),
+                    occurred_at=moment,
+                )
             measurements = (
                 await uow.invariants.measure_feature(
                     feature_kind=descriptor[0],
@@ -245,7 +329,6 @@ class InvariantRegistryService:
                     occurred_at=moment,
                 )
 
-            ngram = resolved.code_ngram
             if ngram is not None:
                 ratio = ngram.masked_byte_count / ngram.byte_count
                 if ratio > self._settings.code_ngram_max_mask_ratio:
@@ -276,7 +359,7 @@ class InvariantRegistryService:
                     )
 
             packed = likely_packed(
-                resolved.packing,
+                packing,
                 max_executable_section_entropy_gte=(
                     self._settings.likely_packed_max_executable_section_entropy_gte
                 ),
@@ -286,7 +369,7 @@ class InvariantRegistryService:
                 known_packer_marker_hit=self._settings.likely_packed_known_packer_marker_hit,
             )
             confirmed = bool(
-                isinstance(provenance, ReportClaimProvenance)
+                any(isinstance(item, ReportClaimProvenance) for item in provenance_items)
                 and positive_sample_confirmed
                 and measurements.positive_support is not None
                 and measurements.positive_support > 0
@@ -297,7 +380,7 @@ class InvariantRegistryService:
                 category=invariant_category,
                 pattern=canonical,
                 proposal_key=proposal_key,
-                provenances=(provenance,),
+                provenances=provenance_items,
                 banality=banality,
                 banality_occurrence_count=measured_occurrence_count,
                 goodware_baseline_id=baseline_id,
@@ -329,6 +412,7 @@ class InvariantRegistryService:
         type: InvariantType | str,
         category: InvariantCategory | str,
         motif: str,
+        pattern: str,
         actor_id: str,
         occurred_at: datetime,
         positive_sample_confirmed: bool = False,
@@ -344,8 +428,8 @@ class InvariantRegistryService:
             sample_ids=sample_ids,
             type=type,
             category=category,
-            pattern=motif,
-            provenance=provenance,
+            pattern=pattern,
+            provenances=(provenance,),
             cycle_number=cycle_number,
             positive_sample_confirmed=positive_sample_confirmed,
             occurred_at=occurred_at,
@@ -422,48 +506,78 @@ class InvariantRegistryService:
         return InvariantProposalResult(invariant=None, rejection=stored)
 
 
-def _validate_provenance(provenance: object, pattern: str) -> str | None:
-    if not isinstance(
-        provenance,
-        (
-            AnalystManualProvenance,
-            # The remaining variants are listed explicitly to keep the union strict.
-            # Importing through the domain alias would not provide runtime checking.
-            ReportClaimProvenance,
-        ),
-    ):
-        from cti_app.domain.invariants import (
-            CapabilityProvenance,
-            CodeFeatureProvenance,
-            SampleFeatureProvenance,
-            ToolOutputProvenance,
-        )
+_PROVENANCE_TYPES = (
+    SampleFeatureProvenance,
+    CodeFeatureProvenance,
+    ToolOutputProvenance,
+    CapabilityProvenance,
+    ReportClaimProvenance,
+    AnalystManualProvenance,
+)
+_INVALID_DESCRIPTOR = object()
 
-        if not isinstance(
-            provenance,
-            (
-                SampleFeatureProvenance,
-                CodeFeatureProvenance,
-                ToolOutputProvenance,
-                CapabilityProvenance,
-            ),
-        ):
+
+def _validate_provenances(provenances: Sequence[object]) -> str | None:
+    if not provenances:
+        return "at least one provenance is required"
+    canonical_values: list[str] = []
+    for provenance in provenances:
+        if not isinstance(provenance, _PROVENANCE_TYPES):
             return "provenance is missing or is not a P09 provenance type"
-    if isinstance(provenance, AnalystManualProvenance) and (
-        canonical_pattern(provenance.motif) != pattern
-    ):
-        return "analyst_manual motif must equal the proposed pattern"
+        try:
+            canonical_values.append(
+                json.dumps(
+                    provenance.as_canonical_dict(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+        except (AttributeError, TypeError, ValueError):
+            return "provenance is incomplete or invalid"
+    if len(canonical_values) != len(set(canonical_values)):
+        return "duplicate provenance members are not allowed"
     return None
 
 
+def _is_technical_provenance(provenance: object) -> bool:
+    return isinstance(
+        provenance,
+        (
+            SampleFeatureProvenance,
+            CodeFeatureProvenance,
+            ToolOutputProvenance,
+            CapabilityProvenance,
+        ),
+    )
+
+
 def _invalid_provenance_key(
-    *, investigation_id: UUID, invariant_type: InvariantType, pattern: str, provenance: object
+    *,
+    investigation_id: UUID,
+    invariant_type: InvariantType,
+    pattern: str,
+    provenances: Sequence[object],
 ) -> str:
+    canonical_values = []
+    for provenance in provenances:
+        try:
+            value = provenance.as_canonical_dict()  # type: ignore[union-attr]
+        except (AttributeError, TypeError, ValueError):
+            value = {
+                "invalid_type": f"{type(provenance).__module__}.{type(provenance).__qualname__}"
+            }
+        canonical_values.append(value)
+    canonical_values.sort(
+        key=lambda value: json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+    )
     payload = {
         "investigation_id": str(investigation_id),
         "type": invariant_type.value,
         "pattern": pattern,
-        "provenance_type": type(provenance).__qualname__,
+        "provenances": canonical_values,
     }
     return hashlib.sha256(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -486,12 +600,24 @@ def _category_rejection_cause(
     }.get(category)
 
 
-def _feature_descriptor(
-    invariant_type: InvariantType, pattern: str, resolved: ResolvedFeature
-) -> tuple[str, str] | None:
-    if resolved.feature_kind is not None and resolved.normalized_value is not None:
-        return resolved.feature_kind, resolved.normalized_value
-    return m2_feature_kind(invariant_type, pattern)
+def _resolved_descriptor(
+    invariant_type: InvariantType,
+    pattern: str,
+    resolved_features: Sequence[ResolvedFeature],
+) -> tuple[str, str] | object | None:
+    expected = m2_feature_kind(invariant_type, pattern)
+    descriptors: list[tuple[str, str]] = []
+    for resolved in resolved_features:
+        if (resolved.feature_kind is None) != (resolved.normalized_value is None):
+            return _INVALID_DESCRIPTOR
+        if resolved.feature_kind is not None and resolved.normalized_value is not None:
+            descriptor = (resolved.feature_kind, resolved.normalized_value)
+            if expected is None or descriptor != expected:
+                return _INVALID_DESCRIPTOR
+            descriptors.append(descriptor)
+    if descriptors and any(descriptor != descriptors[0] for descriptor in descriptors[1:]):
+        return _INVALID_DESCRIPTOR
+    return descriptors[0] if descriptors else expected
 
 
 def _reference_assessment(

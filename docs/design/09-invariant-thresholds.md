@@ -18,5 +18,5 @@ likely_packed:
   operator: ALL
   max_executable_section_entropy_gte: 7.2
   executable_bytes_per_function_gte: 1200
-  known_packer_marker_hit: false
+  known_packer_marker_hit: true
 ```
