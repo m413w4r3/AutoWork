@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 from uuid import UUID, uuid4
 
 from cti_app.domain.code_features import CodeNgram, PackingSignals
@@ -536,9 +536,10 @@ def m2_feature_kind(invariant_type: InvariantType, pattern: str) -> tuple[str, s
 def likely_packed(
     packing: PackingSignals | None,
     *,
+    operator: Literal["ALL", "ANY"],
     max_executable_section_entropy_gte: float,
     executable_bytes_per_function_gte: int,
-    known_packer_marker_hit: bool = False,
+    known_packer_marker_hit: bool,
 ) -> bool | None:
     if packing is None:
         return None
@@ -547,10 +548,13 @@ def likely_packed(
         or packing.executable_bytes_per_function is None
     ):
         return None
-    return all(
-        (
-            packing.max_executable_section_entropy >= max_executable_section_entropy_gte,
-            packing.executable_bytes_per_function >= executable_bytes_per_function_gte,
-            bool(packing.known_packer_marker_hits) == known_packer_marker_hit,
-        )
+    signals = (
+        packing.max_executable_section_entropy >= max_executable_section_entropy_gte,
+        packing.executable_bytes_per_function >= executable_bytes_per_function_gte,
+        bool(packing.known_packer_marker_hits) == known_packer_marker_hit,
     )
+    if operator == "ALL":
+        return all(signals)
+    if operator == "ANY":
+        return any(signals)
+    raise ValueError("likely_packed operator must be ALL or ANY")

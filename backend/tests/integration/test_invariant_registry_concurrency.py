@@ -126,7 +126,7 @@ async def test_concurrent_replay_has_one_durable_outcome(migrated_postgres_url: 
                 service.propose_manual(
                     investigation_id=investigation.id,
                     sample_ids=(),
-                    type=InvariantType.STRUCTURAL_METADATA,
+                    type=InvariantType.LITERAL_STRING,
                     category=InvariantCategory.UNKNOWN,
                     motif="analyst note",
                     pattern="metadata-key",
@@ -153,7 +153,7 @@ async def test_accept_reject_race_has_one_durable_outcome(migrated_postgres_url:
     kwargs = {
         "investigation_id": investigation.id,
         "sample_ids": (),
-        "type": InvariantType.STRUCTURAL_METADATA,
+        "type": InvariantType.LITERAL_STRING,
         "category": InvariantCategory.UNKNOWN,
         "motif": "analyst note",
         "pattern": "race-key",
@@ -187,7 +187,7 @@ async def test_multi_provenance_persists_and_reloads_canonically(
         result = await service.propose(
             investigation_id=investigation.id,
             sample_ids=(),
-            type=InvariantType.STRUCTURAL_METADATA,
+            type=InvariantType.LITERAL_STRING,
             category=InvariantCategory.UNKNOWN,
             pattern="metadata-key",
             provenances=(first, second),

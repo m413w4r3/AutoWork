@@ -347,27 +347,39 @@ async def test_banal_and_multi_family_are_rejected_but_small_corpus_survives() -
 
 
 @pytest.mark.asyncio
-async def test_unknown_measurements_are_not_stored_as_zero() -> None:
+@pytest.mark.parametrize(
+    "invariant_type", [InvariantType.STRUCTURAL_METADATA, InvariantType.RELATION]
+)
+@pytest.mark.parametrize(
+    "provenances",
+    [
+        (_manual("metadata"),),
+        (ReportClaimProvenance(claim_id="claim", source_document="document"),),
+        (
+            _manual("metadata"),
+            ReportClaimProvenance(claim_id="claim", source_document="document"),
+        ),
+    ],
+)
+async def test_structural_types_require_technical_provenance(
+    invariant_type, provenances
+) -> None:
     service, uow = _service()
     uow.invariants.resolved = ResolvedFeature(
         source_id="manual", sample_sha256=None, feature_kind=None, normalized_value=None
     )
-    result = await service.propose_manual(
+    result = await service.propose(
         investigation_id=INVESTIGATION_ID,
         sample_ids=(),
-        type=InvariantType.STRUCTURAL_METADATA,
+        type=invariant_type,
         category=InvariantCategory.UNKNOWN,
-        motif="metadata",
         pattern="metadata",
-        actor_id="analyst",
+        provenances=provenances,
         occurred_at=NOW.replace(microsecond=5),
     )
-    assert result.invariant
-    assert result.invariant.banality is Banality.UNKNOWN
-    assert result.invariant.banality_occurrence_count is None
-    assert result.invariant.corpus_malware_sample_count is None
-    assert result.invariant.benign_prevalence is None
-    assert result.invariant.positive_support is None
+    assert result.invariant is None
+    assert result.rejection
+    assert result.rejection.cause is InvariantRejectionCause.PROVENANCE_INVALID
 
 
 def _ngram(*, masked: int, longest: int) -> CodeNgram:
@@ -443,8 +455,10 @@ async def test_code_ngram_thresholds_are_strict_at_the_boundary(ngram, cause) ->
 
 def test_likely_packed_uses_all_human_signals() -> None:
     thresholds = {
+        "operator": "ALL",
         "max_executable_section_entropy_gte": 7.2,
         "executable_bytes_per_function_gte": 1200,
+        "known_packer_marker_hit": True,
     }
     assert likely_packed(
         PackingSignals(
@@ -452,7 +466,7 @@ def test_likely_packed_uses_all_human_signals() -> None:
             executable_bytes=1200,
             recovered_function_count=1,
             executable_bytes_per_function=1200,
-            known_packer_marker_hits=(),
+            known_packer_marker_hits=("upx",),
         ), **thresholds
     ) is True
     assert likely_packed(
@@ -461,7 +475,7 @@ def test_likely_packed_uses_all_human_signals() -> None:
             executable_bytes=1200,
             recovered_function_count=1,
             executable_bytes_per_function=1200,
-            known_packer_marker_hits=("upx",),
+            known_packer_marker_hits=(),
         ), **thresholds
     ) is False
     assert likely_packed(
@@ -473,6 +487,19 @@ def test_likely_packed_uses_all_human_signals() -> None:
             known_packer_marker_hits=(),
         ), **thresholds
     ) is None
+    assert likely_packed(
+        PackingSignals(
+            max_executable_section_entropy=1.0,
+            executable_bytes=1,
+            recovered_function_count=1,
+            executable_bytes_per_function=1,
+            known_packer_marker_hits=("upx",),
+        ),
+        operator="ANY",
+        max_executable_section_entropy_gte=7.2,
+        executable_bytes_per_function_gte=1200,
+        known_packer_marker_hit=True,
+    ) is True
 
 
 @pytest.mark.asyncio

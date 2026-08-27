@@ -132,9 +132,10 @@ class Settings(BaseSettings):
     code_ngram_max_per_sample: int = Field(default=100_000, gt=0)
     code_ngram_max_mask_ratio: float = Field(default=0.20, ge=0, le=1)
     code_ngram_min_contiguous_fixed_bytes: int = Field(default=6, ge=0)
+    likely_packed_operator: Literal["ALL", "ANY"] = "ALL"
     likely_packed_max_executable_section_entropy_gte: float = Field(default=7.2, ge=0)
     likely_packed_executable_bytes_per_function_gte: int = Field(default=1200, ge=0)
-    likely_packed_known_packer_marker_hit: bool = False
+    likely_packed_known_packer_marker_hit: bool = True
     smda_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
     smda_max_output_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
     smda_max_memory_bytes: int = Field(default=1024 * 1024 * 1024, gt=0)

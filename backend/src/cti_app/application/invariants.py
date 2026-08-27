@@ -242,6 +242,30 @@ class InvariantRegistryService:
                     reason="resolved feature descriptor does not match the proposed type/pattern",
                     occurred_at=moment,
                 )
+            if invariant_type in {InvariantType.STRUCTURAL_METADATA, InvariantType.RELATION}:
+                has_technical_descriptor = any(
+                    _is_technical_provenance(item)
+                    and feature.sample_sha256 is not None
+                    and feature.feature_kind is not None
+                    and feature.normalized_value is not None
+                    for item, feature in resolved_features
+                )
+                if not has_technical_descriptor:
+                    return await self._reject(
+                        uow=uow,
+                        investigation_id=investigation_id,
+                        cycle_number=effective_cycle,
+                        proposal_key=proposal_key,
+                        invariant_type=invariant_type,
+                        category=invariant_category,
+                        pattern=canonical,
+                        cause=InvariantRejectionCause.PROVENANCE_INVALID,
+                        reason=(
+                            "structural_metadata and relation require a resolvable persisted "
+                            "technical provenance with a semantic descriptor"
+                        ),
+                        occurred_at=moment,
+                    )
             if not resolved_features and not provenance_items:
                 descriptor = None
             ngram = next(
@@ -360,6 +384,7 @@ class InvariantRegistryService:
 
             packed = likely_packed(
                 packing,
+                operator=self._settings.likely_packed_operator,
                 max_executable_section_entropy_gte=(
                     self._settings.likely_packed_max_executable_section_entropy_gte
                 ),
@@ -612,11 +637,17 @@ def _resolved_descriptor(
             return _INVALID_DESCRIPTOR
         if resolved.feature_kind is not None and resolved.normalized_value is not None:
             descriptor = (resolved.feature_kind, resolved.normalized_value)
-            if expected is None or descriptor != expected:
+            if (
+                expected is None
+                and invariant_type
+                not in {InvariantType.STRUCTURAL_METADATA, InvariantType.RELATION}
+            ) or (expected is not None and descriptor != expected):
                 return _INVALID_DESCRIPTOR
             descriptors.append(descriptor)
     if descriptors and any(descriptor != descriptors[0] for descriptor in descriptors[1:]):
         return _INVALID_DESCRIPTOR
+    if invariant_type in {InvariantType.STRUCTURAL_METADATA, InvariantType.RELATION}:
+        return descriptors[0] if descriptors else None
     return descriptors[0] if descriptors else expected
 
 
