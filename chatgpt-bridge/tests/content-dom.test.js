@@ -331,9 +331,11 @@ function useVirtualClock(window) {
   {
     const { run } = loadExtension(page({ actions: true }));
     const found = run(
-      `findAssistantTurnByExternalId("conversation-turn-3") !== null`,
+      `findAssistantTurnByExternalId("m3") !== null`,
     );
     assert.equal(found, true, "le tour attendu doit être retrouvé par son identifiant stable");
+    assert.equal(run(`turnExternalId(document.querySelector("[data-testid='conversation-turn-3'] [data-message-author-role='assistant']"))`), "m3");
+    assert.equal(run(`turnLocator(document.querySelector("[data-testid='conversation-turn-3'] [data-message-author-role='assistant']"))`), "conversation-turn-3");
   }
 
   // 6. CONTINUE : le tour externe attendu est absent -> aucune correspondance,
@@ -344,6 +346,16 @@ function useVirtualClock(window) {
       `findAssistantTurnByExternalId("conversation-turn-does-not-exist")`,
     );
     assert.equal(found, null, "aucun tour ne doit correspondre à un identifiant inconnu");
+  }
+
+  // A DOM locator without data-message-id is not a continuation identity.
+  {
+    const { run } = loadExtension(`
+      <article data-testid="conversation-turn-9">
+        <div data-message-author-role="assistant"><div class="markdown">réponse</div></div>
+      </article>`);
+    assert.equal(run(`turnExternalId(document.querySelector("[data-message-author-role='assistant']"))`), null);
+    assert.equal(run(`findAssistantTurnByExternalId("conversation-turn-9")`), null);
   }
 
   // 7. Aucune attente de 15s sur un locator de conversation ne subsiste.

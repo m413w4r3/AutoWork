@@ -268,6 +268,8 @@ class ModelConversationService:
         message = message.strip()
         if not message:
             raise ConversationPolicyError("Le message est vide")
+        duplicate_success: ModelConversationTurn | None = None
+        duplicate_conversation: ModelConversation | None = None
         async with self._uow_factory() as uow:
             duplicate = await uow.model_conversation_turns.get_by_idempotency_key(idempotency_key)
             if duplicate is not None:
@@ -285,15 +287,32 @@ class ModelConversationService:
                 # ended badly: returning a failed turn as if it succeeded would
                 # have the caller look for an output that will never exist.
                 if duplicate.status is ConversationTurnStatus.SUCCEEDED:
-                    return duplicate
-                if duplicate.status is ConversationTurnStatus.RUNNING:
+                    duplicate_success = duplicate
+                    duplicate_conversation = conversation
+                elif duplicate.status is ConversationTurnStatus.RUNNING:
                     # Resume the existing turn rather than re-sending the prompt.
                     return duplicate
-                raise ConversationTurnFailedError(
-                    duplicate.error_message or "Le tour précédent n'a pas abouti",
-                    code=duplicate.error_code or "conversation_turn_failed",
-                    status=duplicate.status,
-                )
+                else:
+                    raise ConversationTurnFailedError(
+                        duplicate.error_message or "Le tour précédent n'a pas abouti",
+                        code=duplicate.error_code or "conversation_turn_failed",
+                        status=duplicate.status,
+                    )
+
+        if duplicate_success is not None:
+            # The durable result may have committed while the process crashed
+            # before closing the exact live tab. Replay must never submit again,
+            # but it must retry that idempotent external close for archived
+            # DELETE_ON_SUCCESS conversations.
+            if (
+                lifecycle_policy is ConversationPolicy.DELETE_ON_SUCCESS
+                and duplicate_conversation is not None
+                and duplicate_conversation.status is ConversationStatus.ARCHIVED
+                and duplicate_conversation.transport is ConversationTransport.CHATGPT_BRIDGE
+                and self._conversation_session_closer is not None
+            ):
+                await self._conversation_session_closer.archive_conversation(conversation_id)
+            return duplicate_success
 
         input_bytes = message.encode()
         input_blob = await self._catalog.ingest(
@@ -392,7 +411,10 @@ class ModelConversationService:
                 raise ModelConversationError("Le modèle n'a pas produit de réponse finale")
             metadata = execution.conversation
             if conversation.transport is ConversationTransport.CHATGPT_BRIDGE and (
-                metadata is None or metadata.id != str(conversation.id) or not metadata.verified
+                metadata is None
+                or metadata.id != str(conversation.id)
+                or not metadata.verified
+                or not metadata.turn_id
             ):
                 raise ModelConversationError("Le bridge n'a pas vérifié la conversation cible")
             output_reference = execution.run.output_references[0]

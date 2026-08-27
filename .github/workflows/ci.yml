@@ -65,6 +65,7 @@ jobs:
       - run: node ../chatgpt-bridge/tests/completion.test.js
       - run: node ../chatgpt-bridge/tests/final-output.test.js
       - run: node ../chatgpt-bridge/tests/content-dom.test.js
+      - run: node ../chatgpt-bridge/tests/background-conversation.test.js
       - run: node --check ../chatgpt-bridge/extension/content.js
       - run: node --check ../chatgpt-bridge/extension/background.js
       - run: pnpm build

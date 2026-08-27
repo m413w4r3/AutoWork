@@ -1227,11 +1227,9 @@ function diagnosticLocator() {
 /** Identifiant externe stable d'un tour assistant : jamais son index ou son compte. */
 function turnExternalId(turn) {
   const container = closestOf(turn, SELECTORS.turnContainer);
-  return (
-    (container && container.getAttribute("data-testid")) ||
-    turn.getAttribute("data-message-id") ||
-    null
-  );
+  // data-testid conversation-turn-N is only a local DOM locator. Persisting it
+  // would turn a position/counter into a false continuation identity.
+  return turn.getAttribute("data-message-id") || container?.getAttribute("data-message-id") || null;
 }
 
 /** Retrouve le tour assistant portant exactement `externalId`, jamais par position. */
@@ -1306,6 +1304,7 @@ async function handlePrompt({
   }
   if (currentJob) currentJob.aborted = true;
   const job = { id, aborted: false };
+  let sendStarted = false;
   currentJob = job;
 
   try {
@@ -1372,6 +1371,7 @@ async function handlePrompt({
         ? "upload des pièces jointes non terminé"
         : "bouton d'envoi jamais actif",
     );
+    sendStarted = true;
     sendBtn.click();
 
     if (conversation) {
@@ -1404,6 +1404,12 @@ async function handlePrompt({
 
     if (!job.aborted) {
       const externalTurnId = turnExternalId(premier);
+      if (!externalTurnId) {
+        throw new BridgeError(
+          "conversation_unavailable",
+          "aucun identifiant externe data-message-id stable pour le tour assistant",
+        );
+      }
       reply({
         type: serialized.incomplete ? "incomplete" : "done",
         id,
@@ -1419,13 +1425,13 @@ async function handlePrompt({
             globalThis.ChatGPTBridgeFinalOutput.outputChars(serialized.text),
           visible_citation_count: serialized.visible_citations.length,
           content_script_version: VERSION,
-          initial_turn_id: externalTurnId || serialized.turn_locator || null,
+          initial_turn_id: externalTurnId,
         },
         conversation: conversation
           ? {
               id: conversation.id,
               mode: conversation.mode,
-              turn_id: externalTurnId || `bridge-${id}`,
+              turn_id: externalTurnId,
               verified: true,
               ephemeral: true,
               external_locator: diagnosticLocator(),
@@ -1440,6 +1446,10 @@ async function handlePrompt({
         id,
         code: err.code || "bridge_server_error",
         message: err.message,
+        conversation: conversation
+          ? { id: conversation.id, mode: conversation.mode }
+          : null,
+        submission_state: sendStarted ? "post_submission" : "pre_submission",
       });
     }
   } finally {

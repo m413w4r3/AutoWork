@@ -809,15 +809,14 @@ def _response_metadata(raw: dict[str, Any]) -> dict[str, Any]:
             if key
             in {
                 "id",
+                "mode",
+                "turn_id",
                 "external_locator",
                 "assistant_turns_before",
                 "initial_assistant_turn_id",
-                "tab_id",
-                "window_id",
-                "bridge_run_id",
-                "model_run_id",
                 "verified",
                 "verified_at",
+                "ephemeral",
             }
             and isinstance(value, (str, int, bool, type(None)))
         }

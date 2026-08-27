@@ -323,11 +323,22 @@ async function resolveConversationTab(conversation) {
   await conversationRegistryReady;
 
   if (conversation.mode === "fresh") {
-    if (conversationRegistry.has(conversation.id)) {
-      throw new BridgeRoutingError(
-        "conversation_unavailable",
-        "une session live existe déjà pour cette conversation : fresh refusé",
-      );
+    const existing = conversationRegistry.get(conversation.id);
+    if (existing) {
+      if (existing.state !== "reserved") {
+        throw new BridgeRoutingError(
+          "conversation_unavailable",
+          "une session live existe déjà pour cette conversation : fresh refusé",
+        );
+      }
+      try {
+        const reserved = await chrome.tabs.get(existing.tab_id);
+        if (!isAllowedChatOrigin(reserved.url)) throw new Error("origine invalide");
+        return reserved;
+      } catch {
+        conversationRegistry.delete(conversation.id);
+        persistConversationRegistry();
+      }
     }
     const tab = await chrome.tabs.create({ url: TEMPORARY_CHAT_URL, active: false });
     const loaded = await waitForTab(tab.id);
@@ -338,6 +349,7 @@ async function resolveConversationTab(conversation) {
       tab_id: loaded.id,
       window_id: loaded.windowId,
       head_turn_id: null,
+      state: "reserved",
       external_locator: null,
       last_verified_at: Date.now(),
     });
@@ -445,6 +457,13 @@ async function handlePrompt(msg) {
   }
   inflight.set(msg.id, tab.id);
   busyTabs.add(tab.id);
+  if (msg.conversation?.mode === "fresh") {
+    const binding = conversationRegistry.get(msg.conversation.id);
+    if (binding?.state === "reserved") {
+      conversationRegistry.set(msg.conversation.id, { ...binding, state: "submitted", bridge_run_id: msg.id });
+      persistConversationRegistry();
+    }
+  }
   requestStates.set(msg.id, "running");
   persistRequestStates();
   try {
@@ -486,7 +505,7 @@ async function handleUiRequest(msg) {
 }
 
 // Remontée des paquets du content script vers le serveur.
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
   if (msg?.type === "status") {
     sendResponse(status);
     return true;
@@ -512,19 +531,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const sequence = (eventCounters.get(msg.id) || 0) + 1;
     eventCounters.set(msg.id, sequence);
     if (msg.type === "conversation_bound" && msg.conversation?.id) {
-      const binding = {
-        ...msg.conversation,
-        tab_id: sender.tab?.id || null,
-        window_id: sender.tab?.windowId || null,
-        bridge_run_id: msg.id,
-      };
-      requestConversationBindings.set(msg.id, binding);
-      msg = { ...msg, conversation: binding };
+      const serverBinding = { ...msg.conversation };
+      requestConversationBindings.set(msg.id, serverBinding);
       const existing = conversationRegistry.get(msg.conversation.id);
       conversationRegistry.set(msg.conversation.id, {
         tab_id: sender.tab?.id || null,
         window_id: sender.tab?.windowId || null,
         head_turn_id: existing ? existing.head_turn_id : null,
+        state: "submitted",
         // Diagnostic uniquement : jamais utilisé pour router ou rouvrir un onglet.
         external_locator: msg.conversation.external_locator ?? existing?.external_locator ?? null,
         last_verified_at: Date.now(),
@@ -552,6 +566,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // Le tour externe vérifié devient la nouvelle tête : c'est ce qui
           // autorise un futur CONTINUE (KEEP) sur exactement cet onglet.
           head_turn_id: msg.conversation.turn_id || existing?.head_turn_id || null,
+          state: "live",
           external_locator: msg.conversation.external_locator ?? existing?.external_locator ?? null,
           last_verified_at: Date.now(),
         });
@@ -559,13 +574,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       if (msg.type === "incomplete") {
         const binding = requestConversationBindings.get(msg.id);
+        const live = binding && conversationRegistry.get(binding.id);
+        const initialTurnId = msg.metadata?.initial_turn_id;
+        if (live && typeof initialTurnId === "string" && initialTurnId) {
+          conversationRegistry.set(binding.id, {
+            ...live,
+            state: "live",
+            head_turn_id: initialTurnId,
+            last_verified_at: Date.now(),
+          });
+          persistConversationRegistry();
+        }
         if (binding) {
           const completedBinding = {
             ...binding,
-            initial_assistant_turn_id:
-              msg.metadata?.initial_turn_id ||
-              binding.initial_assistant_turn_id ||
-              null,
+            initial_assistant_turn_id: initialTurnId || binding.initial_assistant_turn_id || null,
           };
           requestConversationBindings.set(msg.id, completedBinding);
           requestConversationResults.set(msg.id, completedBinding);
@@ -579,6 +602,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.type === "done" && typeof msg.text === "string")
         requestFinalOutputs.set(msg.id, msg.text);
       if (msg.type === "done") persistReplayMetadata();
+      if (msg.type === "error" && msg.conversation?.id && msg.submission_state === "pre_submission") {
+        const binding = conversationRegistry.get(msg.conversation.id);
+        if (binding?.state === "submitted" && binding.bridge_run_id === msg.id) {
+          await chrome.tabs.remove(binding.tab_id).catch(() => {});
+          conversationRegistry.delete(msg.conversation.id);
+          persistConversationRegistry();
+        }
+      }
       persistRequestStates();
     }
     send({ ...msg, event_id: `${msg.id}:${sequence}` });

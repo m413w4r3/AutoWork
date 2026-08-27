@@ -41,6 +41,7 @@ function makeChromeMock() {
   const localStore = {};
   const removedListeners = [];
   const updatedListeners = [];
+  const messageListeners = [];
 
   const chrome = {
     storage: {
@@ -88,14 +89,14 @@ function makeChromeMock() {
     },
     scripting: { executeScript: async () => {} },
     runtime: {
-      onMessage: { addListener: () => {} },
+      onMessage: { addListener: (fn) => messageListeners.push(fn) },
       onStartup: { addListener: () => {} },
       onInstalled: { addListener: () => {} },
     },
     alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
   };
 
-  return { chrome, tabsById, sessionStore, localStore, removedListeners, updatedListeners };
+  return { chrome, tabsById, sessionStore, localStore, removedListeners, updatedListeners, messageListeners };
 }
 
 /** Loads background.js fresh into its own vm context. Passing the *same*
@@ -118,6 +119,22 @@ async function main() {
 
     assert.equal(tab.url, "https://chatgpt.com/?temporary-chat=true");
     assert.equal(tab.active, false);
+    assert.equal(mock.tabsById.size, 1);
+  }
+
+  // 1b. UI preflight and the first prompt share the reserved fresh tab; a
+  // second prompt after submission is refused without opening another tab.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const first = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    const preflight = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    assert.equal(preflight.id, first.id);
+    await run('conversationRegistry.set("conv-A", { ...conversationRegistry.get("conv-A"), state: "live" })');
+    await assert.rejects(
+      run('resolveConversationTab({ mode: "fresh", id: "conv-A" })'),
+      (err) => err.code === "conversation_unavailable",
+    );
     assert.equal(mock.tabsById.size, 1);
   }
 
@@ -171,6 +188,29 @@ async function main() {
     );
     assert.equal(continued.id, tabA.id);
     assert.notEqual(continued.id, tabB.id);
+  }
+
+  // 4b. An incomplete assistant turn becomes the live head and recovery uses
+  // that exact external identity on the same tab.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    const listener = mock.messageListeners[0];
+    const response = () => {};
+    await listener(
+      { type: "conversation_bound", id: "req-1", conversation: { id: "conv-A", mode: "fresh", verified: true, ephemeral: true } },
+      { tab: { id: tab.id, windowId: tab.windowId } },
+      response,
+    );
+    await listener(
+      { type: "incomplete", id: "req-1", metadata: { initial_turn_id: "turn-X" } },
+      { tab: { id: tab.id, windowId: tab.windowId } },
+      response,
+    );
+    const resumed = await run('resolveConversationTab({ mode: "continue", id: "conv-A", expected_turn_id: "turn-X" })');
+    assert.equal(resumed.id, tab.id);
+    assert.equal(await run('conversationRegistry.get("conv-A").head_turn_id'), "turn-X");
   }
 
   // 5. A's tab is closed: CONTINUE A returns conversation_unavailable, and
