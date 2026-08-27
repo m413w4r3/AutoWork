@@ -4,9 +4,10 @@ import pytest
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
-from cti_app.domain.goodware import NON_DISCRIMINANT_CATEGORIES, load_non_discriminant_patterns
+from cti_app.domain.goodware import NON_DISCRIMINANT_CATEGORIES
 from cti_app.domain.reference_corpus import ReferenceCorpusVerdict, assess_reference_feature
 from cti_app.infrastructure.database.repositories.core import SqlAlchemyBlobRepository
+from cti_app.infrastructure.non_discriminant_patterns import load_non_discriminant_patterns
 
 
 class _BlobRepository:

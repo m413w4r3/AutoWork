@@ -6,8 +6,11 @@ from types import TracebackType
 from typing import Protocol, Self
 from uuid import UUID
 
+from cti_app.domain.analysis import SampleFeatureSetV1
 from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.briefs import BriefDraft, BriefEvidencePack
+from cti_app.domain.capabilities import CapabilitySet
+from cti_app.domain.code_features import CodeFeatureSet
 from cti_app.domain.collection import (
     Claim,
     CollectionAttempt,
@@ -29,6 +32,7 @@ from cti_app.domain.discovery_cumulative import (
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import AnalystDecision, EditorialGroup, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
+from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics
 from cti_app.domain.model_conversations import (
     ConversationPurpose,
@@ -46,12 +50,8 @@ from cti_app.domain.production import (
     SampleAcquisitionAttempt,
     SubjectProductionRun,
 )
-from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
-from cti_app.domain.analysis import SampleFeatureSetV1
-from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
-from cti_app.domain.capabilities import CapabilitySet
-from cti_app.domain.code_features import CodeFeatureSet
+from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 
 
 class BlobRepository(Protocol):
@@ -71,9 +71,14 @@ class GoodwareBaselineRepository(Protocol):
     async def get_feature_occurrence(
         self, baseline_id: UUID, feature_kind: str, normalized_value: str
     ) -> int | None: ...
+    async def get_feature_occurrences(
+        self, baseline_id: UUID, feature_kind: str, normalized_values: Sequence[str]
+    ) -> Mapping[str, int]: ...
     async def add_if_absent(self, baseline: GoodwareBaseline) -> bool: ...
     async def add_sources(self, baseline_id: UUID, sources: Sequence[GoodwareSource]) -> None: ...
-    async def add_features(self, baseline_id: UUID, features: Iterable[GoodwareFeature]) -> None: ...
+    async def add_features(
+        self, baseline_id: UUID, features: Iterable[GoodwareFeature]
+    ) -> None: ...
 
 
 class InvestigationGoodwareBaselineRepository(Protocol):
@@ -88,14 +93,26 @@ class ReferenceMemberRepository(Protocol):
     async def append_dispute(self, dispute: ReferenceMemberDispute) -> None: ...
     async def get_dispute(self, member_id: UUID) -> ReferenceMemberDispute | None: ...
     async def list_disputes(self, member_id: UUID) -> Sequence[ReferenceMemberDispute]: ...
-    async def list_feature_members(self, feature_kind: str, normalized_value: str) -> Sequence[tuple[UUID, str]]: ...
-    async def count_benign_feature_occurrences(self, feature_kind: str, normalized_value: str) -> int: ...
+    async def list_feature_members(
+        self, feature_kind: str, normalized_value: str
+    ) -> Sequence[tuple[UUID, str]]: ...
+    async def count_benign_feature_occurrences(
+        self, feature_kind: str, normalized_value: str
+    ) -> int: ...
+    async def list_feature_members_bulk(
+        self, feature_kind: str, normalized_values: Sequence[str]
+    ) -> Mapping[str, Sequence[tuple[UUID, str]]]: ...
+    async def count_benign_feature_occurrences_bulk(
+        self, feature_kind: str, normalized_values: Sequence[str]
+    ) -> Mapping[str, int]: ...
     async def count_eligible_malware_samples(self) -> int: ...
     async def count_eligible_malware_samples_by_family(self) -> Mapping[str, int]: ...
 
 
 class CapabilitySetRepository(Protocol):
-    async def get(self, sample_id: UUID, tool_version: str, ruleset_sha256: str, parameters_sha256: str) -> CapabilitySet | None: ...
+    async def get(
+        self, sample_id: UUID, tool_version: str, ruleset_sha256: str, parameters_sha256: str
+    ) -> CapabilitySet | None: ...
     async def add_if_absent(self, capability_set: CapabilitySet, blob_id: UUID) -> bool: ...
     async def index(self, capability_set: CapabilitySet) -> None: ...
 
@@ -143,8 +160,12 @@ class SampleRepository(Protocol):
 
 
 class SampleFeatureSetRepository(Protocol):
-    async def get(self, sample_id: UUID, extractor_version: str, parameters_sha256: str) -> SampleFeatureSetV1 | None: ...
-    async def add_if_absent(self, feature_set: SampleFeatureSetV1, feature_blob_id: UUID) -> bool: ...
+    async def get(
+        self, sample_id: UUID, extractor_version: str, parameters_sha256: str
+    ) -> SampleFeatureSetV1 | None: ...
+    async def add_if_absent(
+        self, feature_set: SampleFeatureSetV1, feature_blob_id: UUID
+    ) -> bool: ...
     async def index(self, feature_set: SampleFeatureSetV1) -> None: ...
 
 

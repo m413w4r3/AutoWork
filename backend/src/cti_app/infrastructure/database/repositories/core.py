@@ -3,11 +3,14 @@ foundational entities every other bounded context references. Owns the only
 row/domain mappers for these rows."""
 
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.selectable import FromClause, TableClause
 
 from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
@@ -74,6 +77,22 @@ from cti_app.infrastructure.database.models.model_execution import (
 
 def _insert_succeeded(result: object) -> bool:
     return bool(getattr(result, "rowcount", 0))
+
+
+async def _execute_insert_chunks(
+    session: AsyncSession,
+    table: FromClause,
+    rows: Iterable[dict[str, object]],
+) -> None:
+    statement = insert(cast(TableClause, table))
+    batch: list[dict[str, object]] = []
+    for row in rows:
+        batch.append(row)
+        if len(batch) == 1000:
+            await session.execute(statement, batch)
+            batch = []
+    if batch:
+        await session.execute(statement, batch)
 
 
 class SqlAlchemyBlobRepository:
@@ -232,8 +251,6 @@ class SqlAlchemyCapabilitySetRepository:
         return _capability_set_from_row(row)
 
     async def add_if_absent(self, capability_set: CapabilitySet, blob_id: UUID) -> bool:
-        from sqlalchemy.dialects.postgresql import insert
-
         statement = (
             insert(CapabilitySetRow)
             .values(
@@ -275,17 +292,27 @@ class SqlAlchemyCapabilitySetRepository:
         )
         if row is None:
             raise RuntimeError("capability set is missing")
+        values: dict[tuple[str, str], int] = {}
         for capability in capability_set.capabilities:
-            self._session.add(
-                SampleFeatureIndexRow(
-                    id=uuid4(),
-                    sample_id=capability_set.sample_id,
-                    capability_set_id=row.id,
-                    feature_kind="capability",
-                    normalized_value=capability.rule_id.lower(),
-                    occurrence_count=1,
-                )
-            )
+            key = ("capability", capability.rule_id.lower())
+            values.setdefault(key, 1)
+        await _execute_insert_chunks(
+            self._session,
+            SampleFeatureIndexRow.__table__,
+            (
+                {
+                    "id": uuid4(),
+                    "sample_id": capability_set.sample_id,
+                    "feature_set_id": None,
+                    "capability_set_id": row.id,
+                    "code_feature_set_id": None,
+                    "feature_kind": kind,
+                    "normalized_value": value,
+                    "occurrence_count": count,
+                }
+                for (kind, value), count in values.items()
+            ),
+        )
         await self._session.flush()
 
 
@@ -338,25 +365,7 @@ class SqlAlchemyGoodwareBaselineRepository:
             ),
         )
 
-    async def add(self, baseline: GoodwareBaseline) -> None:
-        from datetime import UTC, datetime
-
-        self._session.add(
-            GoodwareBaselineRow(
-                id=baseline.id,
-                source_set_sha256=baseline.source_set_sha256,
-                records_sha256=baseline.records_sha256,
-                record_count=baseline.record_count,
-                occurrence_sum=baseline.occurrence_sum,
-                pattern_version=baseline.pattern_version,
-                created_at=datetime.now(UTC),
-            )
-        )
-        await self._session.flush()
-
     async def add_if_absent(self, baseline: GoodwareBaseline) -> bool:
-        from sqlalchemy.dialects.postgresql import insert
-
         statement = (
             insert(GoodwareBaselineRow)
             .values(
@@ -366,7 +375,7 @@ class SqlAlchemyGoodwareBaselineRepository:
                 record_count=baseline.record_count,
                 occurrence_sum=baseline.occurrence_sum,
                 pattern_version=baseline.pattern_version,
-                created_at=__import__("datetime").datetime.now(__import__("datetime").UTC),
+                created_at=datetime.now(UTC),
             )
             .on_conflict_do_nothing(constraint="uq_goodware_baselines_source_set")
         )
@@ -386,6 +395,21 @@ class SqlAlchemyGoodwareBaselineRepository:
         )
         return int(value) if value is not None else None
 
+    async def get_feature_occurrences(
+        self, baseline_id: UUID, feature_kind: str, normalized_values: Sequence[str]
+    ) -> Mapping[str, int]:
+        values = tuple(dict.fromkeys(normalized_values))
+        if not values:
+            return {}
+        result = await self._session.execute(
+            select(GoodwareFeatureRow.normalized_value, GoodwareFeatureRow.occurrence_count).where(
+                GoodwareFeatureRow.baseline_id == baseline_id,
+                GoodwareFeatureRow.feature_kind == feature_kind,
+                GoodwareFeatureRow.normalized_value.in_(values),
+            )
+        )
+        return {value: int(count) for value, count in result.all()}
+
     async def add_sources(self, baseline_id: UUID, sources: Sequence[GoodwareSource]) -> None:
         for source in sources:
             self._session.add(
@@ -402,16 +426,20 @@ class SqlAlchemyGoodwareBaselineRepository:
         await self._session.flush()
 
     async def add_features(self, baseline_id: UUID, features: Iterable[GoodwareFeature]) -> None:
-        for feature in features:
-            self._session.add(
-                GoodwareFeatureRow(
-                    id=uuid4(),
-                    baseline_id=baseline_id,
-                    feature_kind=feature.feature_kind,
-                    normalized_value=feature.normalized_value,
-                    occurrence_count=feature.occurrence_count,
-                )
-            )
+        await _execute_insert_chunks(
+            self._session,
+            GoodwareFeatureRow.__table__,
+            (
+                {
+                    "id": uuid4(),
+                    "baseline_id": baseline_id,
+                    "feature_kind": feature.feature_kind,
+                    "normalized_value": feature.normalized_value,
+                    "occurrence_count": feature.occurrence_count,
+                }
+                for feature in features
+            ),
+        )
         await self._session.flush()
 
 
@@ -423,17 +451,7 @@ class SqlAlchemyInvestigationGoodwareBaselineRepository:
         row = await self._session.get(InvestigationGoodwareBaselineRow, investigation_id)
         return row.baseline_id if row else None
 
-    async def add(self, investigation_id: UUID, baseline_id: UUID) -> None:
-        self._session.add(
-            InvestigationGoodwareBaselineRow(
-                investigation_id=investigation_id, baseline_id=baseline_id
-            )
-        )
-        await self._session.flush()
-
     async def add_if_absent(self, investigation_id: UUID, baseline_id: UUID) -> bool:
-        from sqlalchemy.dialects.postgresql import insert
-
         statement = (
             insert(InvestigationGoodwareBaselineRow)
             .values(
@@ -454,8 +472,6 @@ class SqlAlchemyReferenceMemberRepository:
         self._session = session
 
     async def append(self, member: ReferenceMember) -> ReferenceMember:
-        from sqlalchemy.dialects.postgresql import insert
-
         stmt = (
             insert(ReferenceMemberRow)
             .values(
@@ -547,6 +563,38 @@ class SqlAlchemyReferenceMemberRepository:
         )
         return {family: int(count) for family, count in result.all()}
 
+    async def list_feature_members_bulk(
+        self, feature_kind: str, normalized_values: Sequence[str]
+    ) -> Mapping[str, Sequence[tuple[UUID, str]]]:
+        values = tuple(dict.fromkeys(value.lower() for value in normalized_values))
+        if not values:
+            return {}
+        dispute = select(ReferenceMemberDisputeRow.member_id).where(
+            ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id
+        )
+        result = await self._session.execute(
+            select(
+                SampleFeatureIndexRow.normalized_value,
+                ReferenceMemberRow.sample_id,
+                ReferenceMemberRow.family_label,
+            )
+            .join(
+                ReferenceMemberRow,
+                SampleFeatureIndexRow.sample_id == ReferenceMemberRow.sample_id,
+            )
+            .where(
+                SampleFeatureIndexRow.feature_kind == feature_kind,
+                SampleFeatureIndexRow.normalized_value.in_(values),
+                ReferenceMemberRow.family_label.not_in(("benign", "unlabeled")),
+                ~dispute.exists(),
+            )
+            .distinct()
+        )
+        members: dict[str, list[tuple[UUID, str]]] = {value: [] for value in values}
+        for value, sample_id, family in result.all():
+            members[value].append((sample_id, family))
+        return {value: tuple(items) for value, items in members.items()}
+
     async def list_feature_members(
         self, feature_kind: str, normalized_value: str
     ) -> Sequence[tuple[UUID, str]]:
@@ -590,6 +638,37 @@ class SqlAlchemyReferenceMemberRepository:
             )
         )
         return int(count or 0)
+
+    async def count_benign_feature_occurrences_bulk(
+        self, feature_kind: str, normalized_values: Sequence[str]
+    ) -> Mapping[str, int]:
+        values = tuple(dict.fromkeys(value.lower() for value in normalized_values))
+        if not values:
+            return {}
+        dispute = select(ReferenceMemberDisputeRow.member_id).where(
+            ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id
+        )
+        result = await self._session.execute(
+            select(
+                SampleFeatureIndexRow.normalized_value,
+                func.count(func.distinct(ReferenceMemberRow.sample_id)),
+            )
+            .select_from(ReferenceMemberRow)
+            .join(
+                SampleFeatureIndexRow,
+                SampleFeatureIndexRow.sample_id == ReferenceMemberRow.sample_id,
+            )
+            .where(
+                SampleFeatureIndexRow.feature_kind == feature_kind,
+                SampleFeatureIndexRow.normalized_value.in_(values),
+                ReferenceMemberRow.family_label == "benign",
+                ~dispute.exists(),
+            )
+            .group_by(SampleFeatureIndexRow.normalized_value)
+        )
+        counts = {value: 0 for value in values}
+        counts.update({value: int(count) for value, count in result.all()})
+        return counts
 
 
 def _reference_member_from_row(row: ReferenceMemberRow) -> ReferenceMember:
@@ -635,8 +714,6 @@ class SqlAlchemyCodeFeatureSetRepository:
         return _code_feature_set_from_row(row) if row else None
 
     async def add_if_absent(self, feature_set: CodeFeatureSet, feature_blob_id: UUID) -> bool:
-        from sqlalchemy.dialects.postgresql import insert
-
         statement = (
             insert(CodeFeatureSetRow)
             .values(
@@ -652,7 +729,7 @@ class SqlAlchemyCodeFeatureSetRepository:
                 status=feature_set.status.value,
                 payload=feature_set.as_json(),
                 errors=list(feature_set.errors),
-                created_at=__import__("datetime").datetime.now(__import__("datetime").UTC),
+                created_at=datetime.now(UTC),
             )
             .on_conflict_do_nothing(constraint="uq_code_feature_sets_replay")
         )
@@ -674,27 +751,27 @@ class SqlAlchemyCodeFeatureSetRepository:
         )
         if row is None:
             raise RuntimeError("code feature set is missing")
+        values: dict[tuple[str, str], int] = {}
         for ngram in feature_set.ngrams:
-            exists = await self._session.scalar(
-                select(SampleFeatureIndexRow.id).where(
-                    SampleFeatureIndexRow.code_feature_set_id == row.id,
-                    SampleFeatureIndexRow.feature_kind == "code_ngram",
-                    SampleFeatureIndexRow.normalized_value == ngram.pattern,
-                )
-            )
-            if exists is None:
-                self._session.add(
-                    SampleFeatureIndexRow(
-                        id=uuid4(),
-                        sample_id=feature_set.sample_id,
-                        feature_set_id=None,
-                        capability_set_id=None,
-                        code_feature_set_id=row.id,
-                        feature_kind="code_ngram",
-                        normalized_value=ngram.pattern,
-                        occurrence_count=ngram.occurrence_count,
-                    )
-                )
+            key = ("code_ngram", ngram.pattern.lower())
+            values.setdefault(key, ngram.occurrence_count)
+        await _execute_insert_chunks(
+            self._session,
+            SampleFeatureIndexRow.__table__,
+            (
+                {
+                    "id": uuid4(),
+                    "sample_id": feature_set.sample_id,
+                    "feature_set_id": None,
+                    "capability_set_id": None,
+                    "code_feature_set_id": row.id,
+                    "feature_kind": kind,
+                    "normalized_value": value,
+                    "occurrence_count": count,
+                }
+                for (kind, value), count in values.items()
+            ),
+        )
         await self._session.flush()
 
 
@@ -748,8 +825,6 @@ class SqlAlchemySampleFeatureSetRepository:
         return _feature_from_payload(row.payload) if row else None
 
     async def add_if_absent(self, feature_set: SampleFeatureSetV1, feature_blob_id: UUID) -> bool:
-        from sqlalchemy.dialects.postgresql import insert
-
         statement = (
             insert(SampleFeatureSetRow)
             .values(
@@ -760,7 +835,7 @@ class SqlAlchemySampleFeatureSetRepository:
                 extractor_version=feature_set.extractor_version,
                 parameters_sha256=feature_set.parameters_sha256,
                 payload=feature_set.as_json(),
-                created_at=__import__("datetime").datetime.now(__import__("datetime").UTC),
+                created_at=datetime.now(UTC),
             )
             .on_conflict_do_nothing(constraint="uq_sample_feature_sets_replay")
         )
@@ -778,32 +853,37 @@ class SqlAlchemySampleFeatureSetRepository:
         )
         if row is None:
             raise RuntimeError("feature set is missing")
-        values = (
-            [("string", item["value"], item["occurrence_count"]) for item in feature_set.strings]
-            + [("import", item, 1) for item in feature_set.imports]
-            + [("export", item, 1) for item in feature_set.exports]
-            + [("section", item["name"], 1) for item in feature_set.sections]
-            + [("imphash", feature_set.imphash, 1)] * bool(feature_set.imphash)
-            + [("opcode_fragment16", item, 1) for item in feature_set.opcode_fragment16]
+        values: dict[tuple[str, str], int] = {}
+        candidates = (
+            (("string", item["value"], item["occurrence_count"]) for item in feature_set.strings),
+            (("import", item, 1) for item in feature_set.imports),
+            (("export", item, 1) for item in feature_set.exports),
+            (("section", item["name"], 1) for item in feature_set.sections),
+            (("opcode_fragment16", item, 1) for item in feature_set.opcode_fragment16),
         )
-        for kind, value, count in values:
-            if not await self._session.scalar(
-                select(SampleFeatureIndexRow.id).where(
-                    SampleFeatureIndexRow.feature_set_id == row.id,
-                    SampleFeatureIndexRow.feature_kind == kind,
-                    SampleFeatureIndexRow.normalized_value == value,
-                )
-            ):
-                self._session.add(
-                    SampleFeatureIndexRow(
-                        id=uuid4(),
-                        sample_id=feature_set.sample_id,
-                        feature_set_id=row.id,
-                        feature_kind=kind,
-                        normalized_value=value.lower(),
-                        occurrence_count=count,
-                    )
-                )
+        for candidate_group in candidates:
+            for kind, value, count in candidate_group:
+                normalized = value.lower()
+                values.setdefault((kind, normalized), count)
+        if feature_set.imphash:
+            values.setdefault(("imphash", feature_set.imphash.lower()), 1)
+        await _execute_insert_chunks(
+            self._session,
+            SampleFeatureIndexRow.__table__,
+            (
+                {
+                    "id": uuid4(),
+                    "sample_id": feature_set.sample_id,
+                    "feature_set_id": row.id,
+                    "capability_set_id": None,
+                    "code_feature_set_id": None,
+                    "feature_kind": kind,
+                    "normalized_value": value,
+                    "occurrence_count": count,
+                }
+                for (kind, value), count in values.items()
+            ),
+        )
         await self._session.flush()
 
 

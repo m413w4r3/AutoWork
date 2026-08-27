@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import replace
 from io import BytesIO
 from typing import Protocol
@@ -12,6 +13,7 @@ from cti_app.domain.code_features import (
     CodeFeatureSet,
     CodeFeatureStatus,
     CodeFunction,
+    CodeNgram,
     GoodwareVerdict,
     PackingSignals,
     apply_corpus_assessment,
@@ -169,34 +171,48 @@ class CodeFeatureService:
         )
         async with self._uow_factory() as uow:
             family_sizes = await uow.reference_members.count_eligible_malware_samples_by_family()
-            scored = []
-            for ngram in ngrams:
-                occurrence = None
-                lookup = opcode_fragment16_lookup_value(ngram)
-                if lookup is not None and goodware_baseline_id is not None:
-                    occurrence = await uow.goodware_baselines.get_feature_occurrence(
-                        goodware_baseline_id, "opcode_fragment16", lookup
+            scored: list[CodeNgram] = []
+            for start in range(0, len(ngrams), 500):
+                chunk = ngrams[start : start + 500]
+                patterns = tuple(ngram.pattern.lower() for ngram in chunk)
+                goodware_occurrences: Mapping[str, int] = {}
+                if goodware_baseline_id is not None:
+                    lookups = tuple(
+                        lookup
+                        for ngram in chunk
+                        if (lookup := opcode_fragment16_lookup_value(ngram)) is not None
                     )
-                scored_ngram = compare_goodware(ngram, occurrence)
-                members = await uow.reference_members.list_feature_members(
-                    "code_ngram", ngram.pattern
+                    if lookups:
+                        goodware_occurrences = await uow.goodware_baselines.get_feature_occurrences(
+                            goodware_baseline_id, "opcode_fragment16", lookups
+                        )
+                members_by_pattern = await uow.reference_members.list_feature_members_bulk(
+                    "code_ngram", patterns
                 )
-                benign = await uow.reference_members.count_benign_feature_occurrences(
-                    "code_ngram", ngram.pattern
-                )
-                scored.append(
-                    apply_corpus_assessment(
-                        scored_ngram,
-                        assess_reference_feature(
-                            feature_kind="code_ngram",
-                            normalized_value=ngram.pattern,
-                            malware_members=members,
-                            benign_sample_occurrences=benign,
-                            total_eligible_samples_by_family=family_sizes,
-                            min_family_samples=min_family_samples,
-                        ),
+                benign_by_pattern = (
+                    await uow.reference_members.count_benign_feature_occurrences_bulk(
+                        "code_ngram", patterns
                     )
                 )
+                for ngram in chunk:
+                    lookup = opcode_fragment16_lookup_value(ngram)
+                    occurrence = goodware_occurrences.get(lookup) if lookup is not None else None
+                    scored_ngram = compare_goodware(ngram, occurrence)
+                    scored.append(
+                        apply_corpus_assessment(
+                            scored_ngram,
+                            assess_reference_feature(
+                                feature_kind="code_ngram",
+                                normalized_value=ngram.pattern,
+                                malware_members=members_by_pattern.get(ngram.pattern.lower(), ()),
+                                benign_sample_occurrences=benign_by_pattern.get(
+                                    ngram.pattern.lower(), 0
+                                ),
+                                total_eligible_samples_by_family=family_sizes,
+                                min_family_samples=min_family_samples,
+                            ),
+                        )
+                    )
         return CodeFeatureSet(
             sample_id=sample_id,
             blob_id=blob_id,

@@ -14,7 +14,7 @@ from elftools.elf.elffile import ELFFile
 from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
 from cti_app.domain.classification import TLP
 from cti_app.domain.code_features import PackingSignals
-from cti_app.domain.goodware import load_non_discriminant_patterns
+from cti_app.infrastructure.non_discriminant_patterns import load_non_discriminant_patterns
 
 _ASCII = re.compile(rb"[ -~]{4,}")
 _WIDE = re.compile(rb"(?:[ -~]\x00){4,}")
@@ -89,7 +89,6 @@ class StaticFeatureExtractor:
         max_strings: int,
         min_string_length: int,
     ) -> SampleFeatureSetV1:
-        payload = payload
         strings = self._strings(payload, min_string_length, max_strings)
         kwargs: dict[str, Any] = {
             "sections": (),

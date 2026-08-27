@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
+from types import MappingProxyType
 from uuid import UUID
 
 
@@ -97,10 +96,21 @@ NON_DISCRIMINANT_CATEGORIES = (
 )
 
 
+@dataclass(frozen=True, slots=True)
 class NonDiscriminantPatternRegistry:
-    def __init__(self, entries: tuple[DeclaredNonDiscriminant, ...]) -> None:
-        self.entries = entries
-        self._lookup = {(entry.feature_kind, entry.normalized_value): entry for entry in entries}
+    entries: tuple[DeclaredNonDiscriminant, ...]
+    _lookup: Mapping[tuple[str, str], DeclaredNonDiscriminant] = field(
+        init=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_lookup",
+            MappingProxyType(
+                {(entry.feature_kind, entry.normalized_value): entry for entry in self.entries}
+            ),
+        )
 
     def lookup(self, feature_kind: str, normalized_value: str) -> DeclaredNonDiscriminant | None:
         return self._lookup.get((feature_kind, normalized_value))
@@ -112,16 +122,9 @@ class NonDiscriminantPatternRegistry:
         return iter(self.entries)
 
 
-def load_non_discriminant_patterns(
-    path: Path | None = None,
+def validate_non_discriminant_pattern_document(
+    document: object,
 ) -> NonDiscriminantPatternRegistry:
-    pattern_path = (
-        path or Path(__file__).resolve().parents[1] / "data" / "non_discriminant_patterns_v1.json"
-    )
-    try:
-        document = json.loads(pattern_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise GoodwareBaselineError("invalid non-discriminant pattern registry") from exc
     if (
         not isinstance(document, dict)
         or set(document) != {"schema_version", "categories"}
