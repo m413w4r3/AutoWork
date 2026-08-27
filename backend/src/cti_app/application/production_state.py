@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from cti_app.application.analyst_handoff import (
     AnalystPostSynthesisService,
     analyst_handoff_policy_from_sources,
+    loop_budget_from_settings,
 )
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
@@ -34,6 +35,7 @@ from cti_app.application.production_parsers import (
     technical_extraction_from_json,
     validate_synthesis,
 )
+from cti_app.config import get_settings
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -257,7 +259,9 @@ class ProductionStateService:
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
-        self._analyst_handoff = AnalystPostSynthesisService(uow_factory, artifact_store)
+        self._analyst_handoff = AnalystPostSynthesisService(
+            uow_factory, artifact_store, lambda: loop_budget_from_settings(get_settings())
+        )
 
     async def export_state(
         self, *, subject_id: UUID, subject_title: str

@@ -11,6 +11,7 @@ EXPECTED_CHAIN = (
     "0002_virustotal",
     "0003_analyst_workflow",
     "0004_sample_lifecycle",
+    "0005_sample_acquisition",
 )
 
 
@@ -33,4 +34,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0002_virustotal": "0001_baseline",
         "0003_analyst_workflow": "0002_virustotal",
         "0004_sample_lifecycle": "0003_analyst_workflow",
+        "0005_sample_acquisition": "0004_sample_lifecycle",
     }

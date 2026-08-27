@@ -103,6 +103,7 @@ class SourceDocumentRow(Base):
 class SampleRow(Base):
     __tablename__ = "samples"
     __table_args__ = (
+        UniqueConstraint("subject_id", "blob_id", name="uq_samples_subject_blob"),
         CheckConstraint(f"tlp IN ({TLP_VALUES_SQL})", name="ck_samples_tlp"),
         CheckConstraint(
             "origin_kind IN ('source_seed','vt_seed','vt_hunt_hit','benign_reference','manual')",

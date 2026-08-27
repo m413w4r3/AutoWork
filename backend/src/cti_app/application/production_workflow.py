@@ -14,6 +14,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from cti_app.application.analyst_handoff import (
     AnalystHandoffPolicy,
     AnalystPostSynthesisService,
+    loop_budget_from_settings,
 )
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SupplementalSource
@@ -63,6 +64,7 @@ from cti_app.application.production_stages import (
     SynthesisService,
     compute_input_hash,
 )
+from cti_app.config import get_settings
 from cti_app.domain.collection import SourceOriginKind
 from cti_app.domain.model_conversations import (
     ConversationMode,
@@ -162,7 +164,11 @@ class ProductionWorkflowOrchestrator:
         self._qa = ProductionQAService(uow_factory)
         self._seed_enrichment = seed_enrichment
         self._analyst_handoff = (
-            AnalystPostSynthesisService(uow_factory, artifact_store)
+            AnalystPostSynthesisService(
+                uow_factory,
+                artifact_store,
+                lambda: loop_budget_from_settings(get_settings()),
+            )
             if artifact_store is not None
             else None
         )

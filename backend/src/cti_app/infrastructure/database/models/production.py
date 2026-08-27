@@ -12,6 +12,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -42,6 +43,9 @@ ANALYST_DECISION_VALUES_SQL = (
 ANALYST_DECISION_TARGET_VALUES_SQL = (
     "'member', 'feature', 'tool', 'invariant', 'pivot', 'corpus', 'detection', 'note'"
 )
+SAMPLE_ACQUISITION_REASON_VALUES_SQL = "'seed', 'hit_review'"
+SAMPLE_ACQUISITION_OUTCOME_VALUES_SQL = "'success', 'error'"
+SAMPLE_ACQUISITION_HASH_FAMILY_VALUES_SQL = "'md5', 'sha1', 'sha256'"
 
 
 class SubjectProductionRunRow(Base):
@@ -267,6 +271,65 @@ class AnalystInputPackRow(Base):
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SampleAcquisitionAttemptRow(Base):
+    """Append-only ledger of VT byte-pull attempts, one row per attempt.
+
+    A `SUCCESS` row is the canonical, DB-enforced replay marker for its
+    `(investigation_id, requested_hash)` pair: at most one may exist per
+    pair (partial unique index below), independent of any Python pre-check.
+    """
+
+    __tablename__ = "sample_acquisition_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            f"reason IN ({SAMPLE_ACQUISITION_REASON_VALUES_SQL})",
+            name="ck_sample_acquisition_reason",
+        ),
+        CheckConstraint(
+            f"outcome IN ({SAMPLE_ACQUISITION_OUTCOME_VALUES_SQL})",
+            name="ck_sample_acquisition_outcome",
+        ),
+        CheckConstraint(
+            f"hash_family IN ({SAMPLE_ACQUISITION_HASH_FAMILY_VALUES_SQL})",
+            name="ck_sample_acquisition_hash_family",
+        ),
+        CheckConstraint(
+            "requested_hash ~ '^[0-9a-f]{32}$' OR requested_hash ~ '^[0-9a-f]{40}$' "
+            "OR requested_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_sample_acquisition_requested_hash",
+        ),
+        CheckConstraint(
+            "(outcome = 'success' AND sample_id IS NOT NULL AND error_code IS NULL) OR "
+            "(outcome = 'error' AND sample_id IS NULL AND error_code IS NOT NULL)",
+            name="ck_sample_acquisition_outcome_shape",
+        ),
+        Index(
+            "uq_sample_acquisition_success_replay",
+            "investigation_id",
+            "requested_hash",
+            unique=True,
+            postgresql_where=text("outcome = 'success'"),
+        ),
+        Index("ix_sample_acquisition_attempts_investigation", "investigation_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    investigation_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("analyst_investigations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    requested_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    hash_family: Mapped[str] = mapped_column(String(8), nullable=False)
+    reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    sample_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("samples.id", ondelete="RESTRICT")
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class EditionProductionBatchRow(Base):

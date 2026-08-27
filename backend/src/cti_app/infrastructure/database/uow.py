@@ -34,6 +34,7 @@ from cti_app.application.persistence import (
     ProductionArtifactRepository,
     ProvenanceRepository,
     RejectedModelProposalRepository,
+    SampleAcquisitionAttemptRepository,
     SampleRepository,
     SourceCollectionRepository,
     SourceDocumentRepository,
@@ -104,6 +105,7 @@ from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemyEditionProductionBatchItemRepository,
     SqlAlchemyEditionProductionBatchRepository,
     SqlAlchemyProductionArtifactRepository,
+    SqlAlchemySampleAcquisitionAttemptRepository,
     SqlAlchemySubjectProductionRunRepository,
 )
 
@@ -113,6 +115,7 @@ class SqlAlchemyUnitOfWork:
     subjects: SubjectRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository
+    sample_acquisition_attempts: SampleAcquisitionAttemptRepository
     provenance: ProvenanceRepository
     virustotal_observations: VirusTotalObservationRepository
     virustotal_file_views: VirusTotalFileViewRepository
@@ -161,6 +164,9 @@ class SqlAlchemyUnitOfWork:
         self.subjects = SqlAlchemySubjectRepository(self._session)
         self.source_documents = SqlAlchemySourceDocumentRepository(self._session)
         self.samples = SqlAlchemySampleRepository(self._session)
+        self.sample_acquisition_attempts = SqlAlchemySampleAcquisitionAttemptRepository(
+            self._session
+        )
         self.provenance = SqlAlchemyProvenanceRepository(self._session)
         self.virustotal_observations = SqlAlchemyVirusTotalObservationRepository(self._session)
         self.virustotal_file_views = SqlAlchemyVirusTotalFileViewRepository(self._session)

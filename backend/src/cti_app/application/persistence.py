@@ -43,6 +43,7 @@ from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
     ProductionArtifact,
+    SampleAcquisitionAttempt,
     SubjectProductionRun,
 )
 from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
@@ -82,6 +83,16 @@ class SampleRepository(Protocol):
     async def get(self, sample_id: UUID) -> Sample | None: ...
 
     async def list_for_subject(self, subject_id: UUID) -> Sequence[Sample]: ...
+
+    async def get_by_subject_and_blob(self, subject_id: UUID, blob_id: UUID) -> Sample | None: ...
+
+
+class SampleAcquisitionAttemptRepository(Protocol):
+    async def find_successful(
+        self, investigation_id: UUID, requested_hash: str
+    ) -> SampleAcquisitionAttempt | None: ...
+
+    async def append(self, attempt: SampleAcquisitionAttempt) -> None: ...
 
 
 class ProvenanceRepository(Protocol):
@@ -402,6 +413,7 @@ class UnitOfWork(Protocol):
     subjects: SubjectRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository
+    sample_acquisition_attempts: SampleAcquisitionAttemptRepository
     provenance: ProvenanceRepository
     virustotal_observations: VirusTotalObservationRepository
     virustotal_file_views: VirusTotalFileViewRepository

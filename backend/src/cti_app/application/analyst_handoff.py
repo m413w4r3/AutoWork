@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -24,6 +24,21 @@ from cti_app.domain.production import (
     ProductionProfile,
     SubjectProductionRun,
 )
+
+
+def loop_budget_from_settings(settings: Any) -> LoopBudget:
+    """Build a new investigation's `LoopBudget` from configured caps.
+
+    `settings` is typed loosely to keep this module free of a hard import
+    on `cti_app.config`; callers pass their already-loaded `Settings`.
+    """
+    return LoopBudget(
+        max_cycles=settings.investigation_max_cycles,
+        max_pivot_runs=settings.investigation_max_pivot_runs,
+        max_hits_acquired=settings.investigation_max_hits_acquired,
+        max_new_samples=settings.investigation_max_new_samples,
+        max_vt_read_units=settings.investigation_max_vt_read_units,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,9 +106,15 @@ class AnalystPostSynthesisService:
         self,
         uow_factory: ProductionUnitOfWorkFactory,
         artifact_store: ProductionArtifactStore,
+        loop_budget_factory: Callable[[], LoopBudget] | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
+        # Never read Settings here: the caller builds and injects the caps a
+        # new investigation starts with.  Falling back to LoopBudget()'s own
+        # zero business caps keeps existing callers behaviorally unchanged
+        # until they are updated to inject the configured factory.
+        self._loop_budget_factory = loop_budget_factory or (lambda: LoopBudget())
 
     async def ensure_for_verified_synthesis(
         self,
@@ -168,7 +189,7 @@ class AnalystPostSynthesisService:
 
         investigation = AnalystInvestigation.from_verified_synthesis(
             synthesis=synthesis,
-            budget=LoopBudget(),
+            budget=self._loop_budget_factory(),
         )
         pack = build_analyst_input_pack_v1(
             run=run,

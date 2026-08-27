@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import ssl
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
 import httpx
@@ -16,6 +17,10 @@ from cti_app.application.virustotal import (
     VirusTotalCapabilities,
     VirusTotalCapabilityDisabledError,
     VirusTotalConfigurationError,
+    VirusTotalDownloadHashMismatchError,
+    VirusTotalDownloadHostNotAllowedError,
+    VirusTotalDownloadResult,
+    VirusTotalDownloadTooLargeError,
     VirusTotalError,
     VirusTotalFile,
     VirusTotalFileReport,
@@ -35,6 +40,7 @@ from cti_app.application.virustotal import (
     VirusTotalSearchResult,
     VirusTotalTransportError,
     VirusTotalUnexpectedRedirectError,
+    file_hash_family,
     normalize_file_hash,
     validate_search_query,
 )
@@ -119,6 +125,11 @@ class VirusTotalHttpAdapter(VirusTotalPort):
         max_page_size: int = 100,
         max_pages: int = 10,
         max_results: int = 1000,
+        file_download_enabled: bool = False,
+        download_allowed_hosts: frozenset[str] = frozenset(),
+        download_max_bytes: int = 200 * 1024 * 1024,
+        download_timeout_seconds: float = 120.0,
+        download_client_factory: Callable[[], httpx.AsyncClient] | None = None,
     ) -> None:
         self._client = client
         self._base_url = _validate_base_url(base_url)
@@ -141,12 +152,23 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             api_key=self._api_key,
             proxy_fallback_enabled=file_report_proxy_fallback_enabled,
             legacy_fallback_enabled=file_report_legacy_fallback_enabled,
+            file_download_enabled=file_download_enabled,
         )
         self._max_response_bytes = _positive(max_response_bytes, "max_response_bytes")
         self._default_page_size = _bounded(default_page_size, 1, max_page_size, "default_page_size")
         self._max_page_size = _positive(max_page_size, "max_page_size")
         self._max_pages = _positive(max_pages, "max_pages")
         self._max_results = _positive(max_results, "max_results")
+        self._download_allowed_hosts = download_allowed_hosts
+        self._download_max_bytes = _positive(download_max_bytes, "download_max_bytes")
+        self._download_timeout_seconds = _positive_float(
+            download_timeout_seconds, "download_timeout_seconds"
+        )
+        # Tests inject a mock-transport factory here; production never
+        # overrides it, so the real download always uses a bare,
+        # headerless, non-redirecting client — never the proxy or direct
+        # client, which may carry credentials.
+        self._download_client_factory = download_client_factory
 
     async def file_report(self, file_hash: str) -> VirusTotalFileReport:
         self._require(VirusTotalCapability.FILE_REPORT)
@@ -168,6 +190,37 @@ class VirusTotalHttpAdapter(VirusTotalPort):
             transport=step.transport,
             api_generation=step.variant,
         )
+
+    async def file_download(self, file_hash: str, *, sink: BinaryIO) -> VirusTotalDownloadResult:
+        self._require(VirusTotalCapability.FILE_DOWNLOAD)
+        normalized = normalize_file_hash(file_hash)
+        family = file_hash_family(normalized)
+        self._resolve_route(VirusTotalCapability.FILE_DOWNLOAD)
+        ticket = await self._get(f"/files/{normalized}/download_url")
+        payload = _json_object(ticket.body)
+        signed_url = payload.get("data")
+        if not isinstance(signed_url, str) or not signed_url:
+            raise VirusTotalPayloadError(
+                "VirusTotal n'a pas renvoyé d'URL de téléchargement signée."
+            )
+        _validate_signed_download_url(signed_url, self._download_allowed_hosts)
+        # The signed URL itself is never logged, persisted, or re-derived.
+        return await _stream_signed_download(
+            signed_url,
+            sink=sink,
+            expected_hash=normalized,
+            expected_family=family,
+            max_bytes=self._download_max_bytes,
+            client=self._download_client(),
+        )
+
+    def _download_client(self) -> httpx.AsyncClient:
+        if self._download_client_factory is not None:
+            return self._download_client_factory()
+        timeout = httpx.Timeout(
+            self._download_timeout_seconds, connect=self._download_timeout_seconds
+        )
+        return httpx.AsyncClient(follow_redirects=False, timeout=timeout, trust_env=False)
 
     async def _file_report_request(
         self, step: VirusTotalRouteStep, file_hash: str
@@ -410,6 +463,7 @@ def _default_routing_policy(
     api_key: str | None,
     proxy_fallback_enabled: bool,
     legacy_fallback_enabled: bool,
+    file_download_enabled: bool = False,
 ) -> VirusTotalRoutingPolicy:
     """Build the deny-by-default policy this adapter ships with.
 
@@ -441,15 +495,16 @@ def _default_routing_policy(
     proxy_only = VirusTotalOperationRoute(
         primary=VirusTotalRouteStep(VirusTotalTransportKind.PROXY, VirusTotalEndpointVariant.V3)
     )
-    return VirusTotalRoutingPolicy(
-        routes={
-            VirusTotalCapability.FILE_REPORT: VirusTotalOperationRoute(
-                primary=file_report_primary, fallbacks=tuple(file_report_fallbacks)
-            ),
-            VirusTotalCapability.FILE_RELATIONSHIPS: proxy_only,
-            VirusTotalCapability.INTELLIGENCE_SEARCH: proxy_only,
-        }
-    )
+    routes = {
+        VirusTotalCapability.FILE_REPORT: VirusTotalOperationRoute(
+            primary=file_report_primary, fallbacks=tuple(file_report_fallbacks)
+        ),
+        VirusTotalCapability.FILE_RELATIONSHIPS: proxy_only,
+        VirusTotalCapability.INTELLIGENCE_SEARCH: proxy_only,
+    }
+    if file_download_enabled:
+        routes[VirusTotalCapability.FILE_DOWNLOAD] = proxy_only
+    return VirusTotalRoutingPolicy(routes=routes)
 
 
 def _validate_base_url(value: str) -> str:
@@ -482,6 +537,89 @@ def _positive(value: int, name: str) -> int:
     if value < 1:
         raise ValueError(f"{name} doit être positif")
     return value
+
+
+def _positive_float(value: float, name: str) -> float:
+    if value <= 0:
+        raise ValueError(f"{name} doit être positif")
+    return value
+
+
+def _validate_signed_download_url(url: str, allowed_hosts: frozenset[str]) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme != "https":
+        raise VirusTotalDownloadHostNotAllowedError(
+            "L'URL de téléchargement signée doit être HTTPS."
+        )
+    if parsed.username or parsed.password:
+        raise VirusTotalDownloadHostNotAllowedError(
+            "L'URL de téléchargement signée ne doit pas contenir d'identifiants."
+        )
+    hostname = parsed.hostname
+    if not hostname or hostname not in allowed_hosts:
+        raise VirusTotalDownloadHostNotAllowedError(
+            "L'hôte de l'URL de téléchargement signée n'est pas autorisé."
+        )
+
+
+async def _stream_signed_download(
+    url: str,
+    *,
+    sink: BinaryIO,
+    expected_hash: str,
+    expected_family: str,
+    max_bytes: int,
+    client: httpx.AsyncClient,
+) -> VirusTotalDownloadResult:
+    md5 = hashlib.md5()
+    sha1 = hashlib.sha1()
+    sha256 = hashlib.sha256()
+    size = 0
+    # A dedicated, ephemeral, headerless client: it must never carry
+    # x-apikey or any other VT client authentication header, and it never
+    # follows redirects away from the validated signed host.
+    async with client:
+        try:
+            async with client.stream("GET", url) as response:
+                if 300 <= response.status_code < 400:
+                    raise VirusTotalUnexpectedRedirectError(
+                        "Le téléchargement signé VirusTotal a été redirigé.",
+                        status_code=response.status_code,
+                    )
+                if response.status_code >= 400:
+                    raise _http_error(response.status_code, None)
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise VirusTotalDownloadTooLargeError(
+                            "Le téléchargement VirusTotal dépasse la limite configurée."
+                        )
+                    md5.update(chunk)
+                    sha1.update(chunk)
+                    sha256.update(chunk)
+                    sink.write(chunk)
+        except VirusTotalError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise VirusTotalTransportError(
+                "Le téléchargement VirusTotal a expiré.",
+                code="virustotal_download_timeout",
+                retryable=True,
+            ) from exc
+        except httpx.TransportError as exc:
+            raise VirusTotalTransportError(
+                "Le flux de téléchargement VirusTotal a échoué ou a été tronqué.",
+                code="virustotal_download_transport_error",
+                retryable=True,
+            ) from exc
+    computed = {"md5": md5.hexdigest(), "sha1": sha1.hexdigest(), "sha256": sha256.hexdigest()}
+    if computed[expected_family] != expected_hash:
+        raise VirusTotalDownloadHashMismatchError(
+            "Les octets téléchargés ne correspondent pas au hash demandé."
+        )
+    return VirusTotalDownloadResult(
+        md5=computed["md5"], sha1=computed["sha1"], sha256=computed["sha256"], size=size
+    )
 
 
 def _bounded(value: int, lower: int, upper: int, name: str) -> int:

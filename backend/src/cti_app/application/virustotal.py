@@ -4,7 +4,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol
 
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
@@ -80,6 +80,24 @@ class VirusTotalResponseTooLargeError(VirusTotalError):
 
 class VirusTotalUnexpectedRedirectError(VirusTotalError):
     code = "virustotal_unexpected_redirect"
+
+
+class VirusTotalDownloadHostNotAllowedError(VirusTotalError):
+    """The signed download URL's scheme/host is not on the configured allowlist.
+
+    Also raised for userinfo in the URL or a missing hostname.  Nothing is
+    fetched before this check runs.
+    """
+
+    code = "virustotal_download_host_not_allowed"
+
+
+class VirusTotalDownloadTooLargeError(VirusTotalError):
+    code = "virustotal_download_too_large"
+
+
+class VirusTotalDownloadHashMismatchError(VirusTotalError):
+    code = "virustotal_download_hash_mismatch"
 
 
 class VirusTotalHttpError(VirusTotalError):
@@ -246,8 +264,26 @@ class VirusTotalSearchResult:
     api_generation: VirusTotalEndpointVariant
 
 
+@dataclass(frozen=True, slots=True)
+class VirusTotalDownloadResult:
+    """The verified outcome of one streamed file download.
+
+    Carries the three hashes computed while streaming and the observed
+    size; never the signed URL, which is never persisted or logged.
+    """
+
+    md5: str
+    sha1: str
+    sha256: str
+    size: int
+
+
 class VirusTotalPort(Protocol):
     async def file_report(self, file_hash: str) -> VirusTotalFileReport: ...
+
+    async def file_download(
+        self, file_hash: str, *, sink: BinaryIO
+    ) -> VirusTotalDownloadResult: ...
 
     async def file_relationship(
         self,
@@ -277,6 +313,17 @@ def normalize_file_hash(value: str) -> str:
     if not _HASH_RE.fullmatch(candidate):
         raise VirusTotalInvalidInputError("Le hash fichier VirusTotal est invalide.")
     return candidate
+
+
+_HASH_FAMILY_BY_LENGTH = {32: "md5", 40: "sha1", 64: "sha256"}
+
+
+def file_hash_family(normalized_hash: str) -> str:
+    """Return "md5" | "sha1" | "sha256" for an already-normalized hash."""
+    try:
+        return _HASH_FAMILY_BY_LENGTH[len(normalized_hash)]
+    except KeyError as exc:
+        raise VirusTotalInvalidInputError("Le hash fichier VirusTotal est invalide.") from exc
 
 
 def validate_search_query(value: str) -> str:

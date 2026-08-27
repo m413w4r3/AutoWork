@@ -15,6 +15,9 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionProfile,
+    SampleAcquisitionAttempt,
+    SampleAcquisitionOutcome,
+    SampleAcquisitionReason,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -26,6 +29,7 @@ from cti_app.infrastructure.database.models.production import (
     EditionProductionBatchItemRow,
     EditionProductionBatchRow,
     ProductionArtifactRow,
+    SampleAcquisitionAttemptRow,
     SubjectProductionRunRow,
 )
 
@@ -118,6 +122,55 @@ class SqlAlchemyAnalystInputPackRepository:
                 created_at=value.created_at,
             )
         )
+
+
+class SqlAlchemySampleAcquisitionAttemptRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def find_successful(
+        self, investigation_id: UUID, requested_hash: str
+    ) -> SampleAcquisitionAttempt | None:
+        row = await self._session.scalar(
+            select(SampleAcquisitionAttemptRow).where(
+                SampleAcquisitionAttemptRow.investigation_id == investigation_id,
+                SampleAcquisitionAttemptRow.requested_hash == requested_hash,
+                SampleAcquisitionAttemptRow.outcome == SampleAcquisitionOutcome.SUCCESS.value,
+            )
+        )
+        return _sample_acquisition_attempt_from_row(row) if row else None
+
+    async def append(self, attempt: SampleAcquisitionAttempt) -> None:
+        self._session.add(
+            SampleAcquisitionAttemptRow(
+                id=attempt.id,
+                investigation_id=attempt.investigation_id,
+                requested_hash=attempt.requested_hash,
+                hash_family=attempt.hash_family,
+                reason=attempt.reason.value,
+                outcome=attempt.outcome.value,
+                sample_id=attempt.sample_id,
+                error_code=attempt.error_code,
+                occurred_at=attempt.occurred_at,
+            )
+        )
+        await self._session.flush()
+
+
+def _sample_acquisition_attempt_from_row(
+    row: SampleAcquisitionAttemptRow,
+) -> SampleAcquisitionAttempt:
+    return SampleAcquisitionAttempt(
+        id=row.id,
+        investigation_id=row.investigation_id,
+        requested_hash=row.requested_hash,
+        hash_family=row.hash_family,
+        reason=SampleAcquisitionReason(row.reason),
+        outcome=SampleAcquisitionOutcome(row.outcome),
+        sample_id=row.sample_id,
+        error_code=row.error_code,
+        occurred_at=row.occurred_at,
+    )
 
 
 class SqlAlchemySubjectProductionRunRepository:

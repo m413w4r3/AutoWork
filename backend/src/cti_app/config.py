@@ -98,6 +98,26 @@ class Settings(BaseSettings):
     virustotal_max_page_size: int = Field(default=100, ge=1, le=100)
     virustotal_max_pages: int = Field(default=10, ge=1, le=100)
     virustotal_max_results: int = Field(default=1000, ge=1, le=100_000)
+    # File bytes are never fetched unless this is explicitly turned on; the
+    # capability flag alone does not enable the download route (see
+    # application.virustotal.VirusTotalRoutingPolicy).
+    virustotal_file_download_enabled: bool = False
+    virustotal_download_max_bytes: int = Field(
+        default=200 * 1024 * 1024, gt=0, le=2 * 1024 * 1024 * 1024
+    )
+    virustotal_download_timeout_seconds: float = Field(default=120.0, gt=0, le=1800)
+    # Exact hostnames the signed download URL is allowed to target. Empty by
+    # default: deny-by-default until an operator explicitly configures it.
+    virustotal_download_allowed_hosts: str = ""
+
+    # An investigation's loop budget is read exclusively from here — never
+    # from a domain default — so the deployed limits are the sole source of
+    # truth for how far an analyst investigation may run.
+    investigation_max_cycles: int = Field(default=3, ge=1, le=100)
+    investigation_max_pivot_runs: int = Field(default=0, ge=0)
+    investigation_max_hits_acquired: int = Field(default=0, ge=0)
+    investigation_max_new_samples: int = Field(default=0, ge=0)
+    investigation_max_vt_read_units: int = Field(default=0, ge=0)
 
 
 @lru_cache

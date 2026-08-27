@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
@@ -457,6 +458,60 @@ class AnalystInputPack:
     def __post_init__(self) -> None:
         if len(self.sha256) != 64 or any(c not in "0123456789abcdef" for c in self.sha256):
             raise ValueError("sha256 must be lowercase SHA-256")
+
+
+class SampleAcquisitionReason(StrEnum):
+    """Why bytes were pulled from VirusTotal for the investigation.
+
+    `HIT_REVIEW` is reachable from the domain/service today, but the API
+    only exposes it starting at a later batch; nothing here anticipates
+    that endpoint.
+    """
+
+    SEED = "seed"
+    HIT_REVIEW = "hit_review"
+
+
+class SampleAcquisitionOutcome(StrEnum):
+    SUCCESS = "success"
+    ERROR = "error"
+
+
+_ACQUISITION_HASH_RE = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SampleAcquisitionAttempt:
+    """Append-only, investigation-scoped ledger entry for one VT byte pull.
+
+    A prior `SUCCESS` row for the same `(investigation_id, requested_hash)`
+    pair is the canonical replay marker: finding one means no budget is
+    consumed and no network call is made.  The DB enforces at most one such
+    row per pair (see the 0005 migration); this dataclass only enforces the
+    shape of a single row.
+    """
+
+    investigation_id: UUID
+    requested_hash: str
+    hash_family: str
+    reason: SampleAcquisitionReason
+    outcome: SampleAcquisitionOutcome
+    sample_id: UUID | None = None
+    error_code: str | None = None
+    id: UUID = field(default_factory=uuid4)
+    occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        if not _ACQUISITION_HASH_RE.fullmatch(self.requested_hash):
+            raise ValueError("requested_hash must be a lowercase MD5, SHA-1, or SHA-256")
+        if self.hash_family not in ("md5", "sha1", "sha256"):
+            raise ValueError("hash_family must be md5, sha1, or sha256")
+        if self.outcome is SampleAcquisitionOutcome.SUCCESS and self.sample_id is None:
+            raise ValueError("a successful acquisition must reference a sample")
+        if self.outcome is SampleAcquisitionOutcome.ERROR and not self.error_code:
+            raise ValueError("a failed acquisition must record an error_code")
+        if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
 
 
 @dataclass(slots=True, kw_only=True)

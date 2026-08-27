@@ -242,6 +242,14 @@ class SqlAlchemySampleRepository:
         )
         return [_sample_from_row(row) for row in rows]
 
+    async def get_by_subject_and_blob(self, subject_id: UUID, blob_id: UUID) -> Sample | None:
+        row = await self._session.scalar(
+            select(SampleRow).where(
+                SampleRow.subject_id == subject_id, SampleRow.blob_id == blob_id
+            )
+        )
+        return _sample_from_row(row) if row else None
+
 
 class SqlAlchemyProvenanceRepository:
     def __init__(self, session: AsyncSession) -> None:
