@@ -46,6 +46,14 @@ class SampleFeatureSetV1:
         data["blob_id"] = str(self.blob_id)
         data["format"] = self.format.value
         data["tlp"] = self.tlp.value
-        for key in ("strings", "sections", "imports", "exports", "resources", "opcode_fragment16", "partial_errors"):
+        for key in (
+            "strings",
+            "sections",
+            "imports",
+            "exports",
+            "resources",
+            "opcode_fragment16",
+            "partial_errors",
+        ):
             data[key] = list(data[key])
         return data

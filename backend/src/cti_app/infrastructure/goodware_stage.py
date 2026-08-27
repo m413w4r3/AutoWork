@@ -1,5 +1,3 @@
-# ruff: noqa: E501
-
 from __future__ import annotations
 
 import hashlib
@@ -20,7 +18,9 @@ class GoodwareStageError(ValueError):
 
 
 def _canonical(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
+    return json.dumps(
+        value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -53,10 +53,24 @@ class GoodwareStage:
                     record = json.loads(raw_line)
                 except json.JSONDecodeError as exc:
                     raise GoodwareStageError(f"invalid records.jsonl line {number}") from exc
-                if not isinstance(record, dict) or set(record) != {"feature_kind", "normalized_value", "occurrence_count"}:
+                if not isinstance(record, dict) or set(record) != {
+                    "feature_kind",
+                    "normalized_value",
+                    "occurrence_count",
+                }:
                     raise GoodwareStageError("records.jsonl entry has unexpected fields")
-                kind, value, count = record["feature_kind"], record["normalized_value"], record["occurrence_count"]
-                if not isinstance(kind, str) or not isinstance(value, str) or isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                kind, value, count = (
+                    record["feature_kind"],
+                    record["normalized_value"],
+                    record["occurrence_count"],
+                )
+                if (
+                    not isinstance(kind, str)
+                    or not isinstance(value, str)
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count < 1
+                ):
                     raise GoodwareStageError("invalid records.jsonl feature")
                 canonical = (_canonical(record) + "\n").encode()
                 if raw_line != canonical:
@@ -65,7 +79,9 @@ class GoodwareStage:
                 if previous is not None and key <= previous:
                     raise GoodwareStageError("records.jsonl is not strictly sorted")
                 previous = key
-                yield GoodwareFeature(feature_kind=kind, normalized_value=value, occurrence_count=count)
+                yield GoodwareFeature(
+                    feature_kind=kind, normalized_value=value, occurrence_count=count
+                )
 
 
 def load_stage(stage_dir: Path, source_dir: Path) -> GoodwareStage:
@@ -85,19 +101,41 @@ def load_stage(stage_dir: Path, source_dir: Path) -> GoodwareStage:
     stable_sources: list[dict[str, object]] = []
     listed_filenames: set[str] = set()
     for source in sources:
-        if not isinstance(source, dict) or not all(key in source for key in ("filename", "feature_kind", "sha256", "size")):
+        if not isinstance(source, dict) or not all(
+            key in source for key in ("filename", "feature_kind", "sha256", "size")
+        ):
             raise GoodwareStageError("invalid source manifest entry")
         filename, expected_sha, expected_size = source["filename"], source["sha256"], source["size"]
-        if not isinstance(filename, str) or not isinstance(expected_sha, str) or not isinstance(expected_size, int) or expected_size < 0:
+        if (
+            not isinstance(filename, str)
+            or not isinstance(expected_sha, str)
+            or not isinstance(expected_size, int)
+            or expected_size < 0
+        ):
             raise GoodwareStageError("invalid source manifest values")
         if filename in listed_filenames:
             raise GoodwareStageError("duplicate source manifest filename")
         listed_filenames.add(filename)
         path = _safe_source(source_dir, filename)
-        if not path.is_file() or path.stat().st_size != expected_size or _sha256(path) != expected_sha:
+        if (
+            not path.is_file()
+            or path.stat().st_size != expected_size
+            or _sha256(path) != expected_sha
+        ):
             raise GoodwareStageError(f"source does not match manifest: {filename}")
-        stable_sources.append({"filename": filename, "feature_kind": source["feature_kind"], "sha256": expected_sha, "size": expected_size})
-    actual_filenames = {path.name for path in source_dir.iterdir() if path.is_file() and path.suffix.lower() == ".db"}
+        stable_sources.append(
+            {
+                "filename": filename,
+                "feature_kind": source["feature_kind"],
+                "sha256": expected_sha,
+                "size": expected_size,
+            }
+        )
+    actual_filenames = {
+        path.name
+        for path in source_dir.iterdir()
+        if path.is_file() and path.suffix.lower() == ".db"
+    }
     if actual_filenames != listed_filenames:
         raise GoodwareStageError("manifest does not cover every source .db")
     source_set = hashlib.sha256(_canonical(stable_sources).encode()).hexdigest()
@@ -118,6 +156,8 @@ def load_stage(stage_dir: Path, source_dir: Path) -> GoodwareStage:
             occurrence_sum += value
     if digest.hexdigest() != manifest.get("records_sha256"):
         raise GoodwareStageError("records.jsonl SHA-256 does not match manifest")
-    if record_count != manifest.get("record_count") or occurrence_sum != manifest.get("occurrence_sum"):
+    if record_count != manifest.get("record_count") or occurrence_sum != manifest.get(
+        "occurrence_sum"
+    ):
         raise GoodwareStageError("record_count/occurrence_sum do not match manifest")
     return GoodwareStage(stage_dir=stage_dir, source_dir=source_dir, manifest=manifest)

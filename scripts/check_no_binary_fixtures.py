@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 DEFAULT_PATH = Path("backend/tests/fixtures")
-TEXT_SUFFIXES = {".py", ".md", ".txt", ".json", ".toml", ".yaml", ".yml"}
+EXECUTABLE_SUFFIXES = {".exe", ".dll", ".sys", ".scr", ".com", ".elf", ".bin", ".so"}
 
 
 def find_binary_files(root: Path) -> list[Path]:
@@ -18,16 +18,9 @@ def find_binary_files(root: Path) -> list[Path]:
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
-        if path.suffix.lower() not in TEXT_SUFFIXES:
-            failures.append(path)
+        if "__pycache__" in path.parts or path.suffix.lower() == ".pyc":
             continue
-        try:
-            payload = path.read_bytes()
-            if b"\x00" in payload:
-                failures.append(path)
-                continue
-            payload.decode("utf-8")
-        except (OSError, UnicodeDecodeError):
+        if path.suffix.lower() in EXECUTABLE_SUFFIXES:
             failures.append(path)
     return failures
 

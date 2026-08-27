@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime
 from uuid import UUID
 
 import dramatiq
@@ -23,10 +24,43 @@ async def _execute_analysis_job(job_id: UUID) -> None:
     settings = get_settings()
     engine = create_postgres_engine(settings.postgres_dsn)
     sessions = create_session_factory(engine)
-    def factory() -> SqlAlchemyUnitOfWork: return SqlAlchemyUnitOfWork(sessions)
+
+    def factory() -> SqlAlchemyUnitOfWork:
+        return SqlAlchemyUnitOfWork(sessions)
+
     try:
-        store = MinioBlobStore(Minio(settings.s3_endpoint, access_key=settings.s3_access_key, secret_key=settings.s3_secret_key, secure=settings.s3_secure), physical_bucket=settings.s3_bucket)
-        service = StaticAnalysisService(BlobCatalogService(store, factory), factory, max_sample_bytes=settings.analysis_max_sample_bytes, string_min_length=settings.analysis_string_min_length, max_strings=settings.analysis_max_strings)
-        await JobExecutor(factory, create_analysis_job_registry(service), retry_base_seconds=settings.job_retry_base_seconds, retry_max_seconds=settings.job_retry_max_seconds).execute(job_id)
+        store = MinioBlobStore(
+            Minio(
+                settings.s3_endpoint,
+                access_key=settings.s3_access_key,
+                secret_key=settings.s3_secret_key,
+                secure=settings.s3_secure,
+            ),
+            physical_bucket=settings.s3_bucket,
+        )
+        service = StaticAnalysisService(
+            BlobCatalogService(store, factory),
+            factory,
+            max_sample_bytes=settings.analysis_max_sample_bytes,
+            string_min_length=settings.analysis_string_min_length,
+            max_strings=settings.analysis_max_strings,
+        )
+        executor = JobExecutor(
+            factory,
+            create_analysis_job_registry(service),
+            retry_base_seconds=settings.job_retry_base_seconds,
+            retry_max_seconds=settings.job_retry_max_seconds,
+        )
+        result = await executor.execute(job_id)
+        if (
+            result is not None
+            and getattr(getattr(result, "status", None), "value", None) == "QUEUED"
+            and result.next_retry_at is not None
+        ):
+            delay_ms = max(
+                0,
+                int((result.next_retry_at - datetime.now(UTC)).total_seconds() * 1000),
+            )
+            execute_analysis_job.send_with_options(args=(str(job_id),), delay=delay_ms)
     finally:
         await engine.dispose()

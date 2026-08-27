@@ -1,5 +1,3 @@
-# ruff: noqa: E501
-
 import hashlib
 import json
 from pathlib import Path
@@ -18,14 +16,36 @@ def _stage(tmp_path: Path, records: bytes, source: bytes = b"database") -> tuple
     manifest = {
         "schema_version": "autowork-goodware-stage-v1",
         "source_format": "yargen-gzip-json-counter-v1",
-        "source_set_sha256": hashlib.sha256(json.dumps([{"filename": "good-strings.db", "feature_kind": "string", "sha256": hashlib.sha256(source).hexdigest(), "size": len(source)}], separators=(",", ":"), sort_keys=True).encode()).hexdigest(),
+        "source_set_sha256": hashlib.sha256(
+            json.dumps(
+                [
+                    {
+                        "filename": "good-strings.db",
+                        "feature_kind": "string",
+                        "sha256": hashlib.sha256(source).hexdigest(),
+                        "size": len(source),
+                    }
+                ],
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest(),
         "records_sha256": hashlib.sha256(records).hexdigest(),
         "record_count": 1,
         "occurrence_sum": 2,
-        "sources": [{"filename": "good-strings.db", "feature_kind": "string", "sha256": hashlib.sha256(source).hexdigest(), "size": len(source)}],
+        "sources": [
+            {
+                "filename": "good-strings.db",
+                "feature_kind": "string",
+                "sha256": hashlib.sha256(source).hexdigest(),
+                "size": len(source),
+            }
+        ],
     }
     (stage_dir / "records.jsonl").write_bytes(records)
-    (stage_dir / "manifest.json").write_text(json.dumps(manifest, separators=(",", ":"), sort_keys=True) + "\n")
+    (stage_dir / "manifest.json").write_text(
+        json.dumps(manifest, separators=(",", ":"), sort_keys=True) + "\n"
+    )
     return stage_dir, source_dir
 
 
@@ -37,7 +57,9 @@ def test_stage_validates_and_streams_records(tmp_path: Path) -> None:
 
 
 def test_stage_rejects_path_traversal(tmp_path: Path) -> None:
-    stage, source = _stage(tmp_path, b'{"feature_kind":"string","normalized_value":"hello","occurrence_count":2}\n')
+    stage, source = _stage(
+        tmp_path, b'{"feature_kind":"string","normalized_value":"hello","occurrence_count":2}\n'
+    )
     manifest = json.loads((stage / "manifest.json").read_text())
     manifest["sources"][0]["filename"] = "../good-strings.db"
     (stage / "manifest.json").write_text(json.dumps(manifest))

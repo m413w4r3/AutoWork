@@ -2,14 +2,24 @@
 foundational entities every other bounded context references. Owns the only
 row/domain mappers for these rows."""
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
+from cti_app.domain.capabilities import Capability, CapabilitySet, CapabilitySetStatus
 from cti_app.domain.classification import TLP
+from cti_app.domain.code_features import (
+    CodeFeatureSet,
+    CodeFeatureStatus,
+    CodeNgram,
+    GoodwareVerdict,
+    PackingSignals,
+)
 from cti_app.domain.entities import (
     ProvenanceEvent,
     Sample,
@@ -20,16 +30,11 @@ from cti_app.domain.entities import (
     Subject,
 )
 from cti_app.domain.errors import EntityNotFoundError
-from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
 from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
-from cti_app.domain.reference_corpus import ReferenceLabelSource, ReferenceMember, ReferenceMemberDispute
-from cti_app.domain.capabilities import Capability, CapabilitySet, CapabilitySetStatus
-from cti_app.domain.code_features import (
-    CodeFeatureSet,
-    CodeFeatureStatus,
-    CodeNgram,
-    GoodwareVerdict,
-    PackingSignals,
+from cti_app.domain.reference_corpus import (
+    ReferenceLabelSource,
+    ReferenceMember,
+    ReferenceMemberDispute,
 )
 from cti_app.domain.virustotal import (
     VirusTotalCapability,
@@ -44,18 +49,18 @@ from cti_app.infrastructure.database.models.collection import (
 )
 from cti_app.infrastructure.database.models.core import (
     BlobRow,
+    CapabilitySetRow,
+    CodeFeatureSetRow,
     GoodwareBaselineRow,
     GoodwareBaselineSourceRow,
     GoodwareFeatureRow,
     InvestigationGoodwareBaselineRow,
+    ProvenanceEventRow,
     ReferenceMemberDisputeRow,
     ReferenceMemberRow,
-    CapabilitySetRow,
-    CodeFeatureSetRow,
-    ProvenanceEventRow,
-    SampleRow,
     SampleFeatureIndexRow,
     SampleFeatureSetRow,
+    SampleRow,
     SourceDocumentRow,
     SubjectRow,
     VirusTotalFileViewRow,
@@ -65,6 +70,10 @@ from cti_app.infrastructure.database.models.model_execution import (
     ModelConversationTurnRow,
     ModelRunRow,
 )
+
+
+def _insert_succeeded(result: object) -> bool:
+    return bool(getattr(result, "rowcount", 0))
 
 
 class SqlAlchemyBlobRepository:
@@ -148,12 +157,36 @@ class SqlAlchemyBlobRepository:
             .select_from(VirusTotalObservationRow)
             .where(VirusTotalObservationRow.blob_id == blob_id)
         )
-        feature_set_count = await self._session.scalar(select(func.count()).select_from(SampleFeatureSetRow).where(SampleFeatureSetRow.blob_id == blob_id))
-        feature_payload_count = await self._session.scalar(select(func.count()).select_from(SampleFeatureSetRow).where(SampleFeatureSetRow.feature_blob_id == blob_id))
-        goodware_source_count = await self._session.scalar(select(func.count()).select_from(GoodwareBaselineSourceRow).where(GoodwareBaselineSourceRow.blob_id == blob_id))
-        capability_set_count = await self._session.scalar(select(func.count()).select_from(CapabilitySetRow).where(CapabilitySetRow.blob_id == blob_id))
-        code_feature_set_count = await self._session.scalar(select(func.count()).select_from(CodeFeatureSetRow).where(CodeFeatureSetRow.blob_id == blob_id))
-        code_feature_payload_count = await self._session.scalar(select(func.count()).select_from(CodeFeatureSetRow).where(CodeFeatureSetRow.feature_blob_id == blob_id))
+        feature_set_count = await self._session.scalar(
+            select(func.count())
+            .select_from(SampleFeatureSetRow)
+            .where(SampleFeatureSetRow.blob_id == blob_id)
+        )
+        feature_payload_count = await self._session.scalar(
+            select(func.count())
+            .select_from(SampleFeatureSetRow)
+            .where(SampleFeatureSetRow.feature_blob_id == blob_id)
+        )
+        goodware_source_count = await self._session.scalar(
+            select(func.count())
+            .select_from(GoodwareBaselineSourceRow)
+            .where(GoodwareBaselineSourceRow.blob_id == blob_id)
+        )
+        capability_set_count = await self._session.scalar(
+            select(func.count())
+            .select_from(CapabilitySetRow)
+            .where(CapabilitySetRow.blob_id == blob_id)
+        )
+        code_feature_set_count = await self._session.scalar(
+            select(func.count())
+            .select_from(CodeFeatureSetRow)
+            .where(CodeFeatureSetRow.blob_id == blob_id)
+        )
+        code_feature_payload_count = await self._session.scalar(
+            select(func.count())
+            .select_from(CodeFeatureSetRow)
+            .where(CodeFeatureSetRow.feature_blob_id == blob_id)
+        )
         return (
             int(document_count or 0)
             + int(decoded_document_count or 0)
@@ -173,35 +206,100 @@ class SqlAlchemyBlobRepository:
             + int(code_feature_payload_count or 0)
         )
 
+    async def delete(self, blob_id: UUID) -> None:
+        row = await self._session.get(BlobRow, blob_id)
+        if row is not None:
+            await self._session.delete(row)
+
 
 class SqlAlchemyCapabilitySetRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def get(self, sample_id: UUID, tool_version: str, ruleset_sha256: str, parameters_sha256: str) -> CapabilitySet | None:
-        row = await self._session.scalar(select(CapabilitySetRow).where(CapabilitySetRow.sample_id == sample_id, CapabilitySetRow.tool_version == tool_version, CapabilitySetRow.ruleset_sha256 == ruleset_sha256, CapabilitySetRow.parameters_sha256 == parameters_sha256))
+    async def get(
+        self, sample_id: UUID, tool_version: str, ruleset_sha256: str, parameters_sha256: str
+    ) -> CapabilitySet | None:
+        row = await self._session.scalar(
+            select(CapabilitySetRow).where(
+                CapabilitySetRow.sample_id == sample_id,
+                CapabilitySetRow.tool_version == tool_version,
+                CapabilitySetRow.ruleset_sha256 == ruleset_sha256,
+                CapabilitySetRow.parameters_sha256 == parameters_sha256,
+            )
+        )
         if row is None:
             return None
         return _capability_set_from_row(row)
 
     async def add_if_absent(self, capability_set: CapabilitySet, blob_id: UUID) -> bool:
         from sqlalchemy.dialects.postgresql import insert
-        statement = insert(CapabilitySetRow).values(id=uuid4(), sample_id=capability_set.sample_id, blob_id=blob_id, tool_name=capability_set.tool_name, tool_version=capability_set.tool_version, ruleset_sha256=capability_set.ruleset_sha256, parameters_sha256=capability_set.parameters_sha256, status=capability_set.status.value, capabilities=[{"rule_id": item.rule_id, "name": item.name, "namespace": item.namespace, "attack": list(item.attack), "mbc": list(item.mbc), "function_addresses": list(item.function_addresses)} for item in capability_set.capabilities], errors=list(capability_set.errors)).on_conflict_do_nothing(constraint="uq_capability_sets_replay")
+
+        statement = (
+            insert(CapabilitySetRow)
+            .values(
+                id=uuid4(),
+                sample_id=capability_set.sample_id,
+                blob_id=blob_id,
+                tool_name=capability_set.tool_name,
+                tool_version=capability_set.tool_version,
+                ruleset_sha256=capability_set.ruleset_sha256,
+                parameters_sha256=capability_set.parameters_sha256,
+                status=capability_set.status.value,
+                capabilities=[
+                    {
+                        "rule_id": item.rule_id,
+                        "name": item.name,
+                        "namespace": item.namespace,
+                        "attack": list(item.attack),
+                        "mbc": list(item.mbc),
+                        "function_addresses": list(item.function_addresses),
+                    }
+                    for item in capability_set.capabilities
+                ],
+                errors=list(capability_set.errors),
+            )
+            .on_conflict_do_nothing(constraint="uq_capability_sets_replay")
+        )
         result = await self._session.execute(statement)
         await self._session.flush()
-        return bool(result.rowcount)
+        return _insert_succeeded(result)
 
     async def index(self, capability_set: CapabilitySet) -> None:
-        row = await self._session.scalar(select(CapabilitySetRow).where(CapabilitySetRow.sample_id == capability_set.sample_id, CapabilitySetRow.tool_version == capability_set.tool_version, CapabilitySetRow.ruleset_sha256 == capability_set.ruleset_sha256, CapabilitySetRow.parameters_sha256 == capability_set.parameters_sha256))
+        row = await self._session.scalar(
+            select(CapabilitySetRow).where(
+                CapabilitySetRow.sample_id == capability_set.sample_id,
+                CapabilitySetRow.tool_version == capability_set.tool_version,
+                CapabilitySetRow.ruleset_sha256 == capability_set.ruleset_sha256,
+                CapabilitySetRow.parameters_sha256 == capability_set.parameters_sha256,
+            )
+        )
         if row is None:
             raise RuntimeError("capability set is missing")
         for capability in capability_set.capabilities:
-            self._session.add(SampleFeatureIndexRow(id=uuid4(), sample_id=capability_set.sample_id, capability_set_id=row.id, feature_kind="capability", normalized_value=capability.rule_id.lower(), occurrence_count=1))
+            self._session.add(
+                SampleFeatureIndexRow(
+                    id=uuid4(),
+                    sample_id=capability_set.sample_id,
+                    capability_set_id=row.id,
+                    feature_kind="capability",
+                    normalized_value=capability.rule_id.lower(),
+                    occurrence_count=1,
+                )
+            )
         await self._session.flush()
 
 
 def _capability_set_from_row(row: CapabilitySetRow) -> CapabilitySet:
-    return CapabilitySet(sample_id=row.sample_id, tool_name=row.tool_name, tool_version=row.tool_version, ruleset_sha256=row.ruleset_sha256, parameters_sha256=row.parameters_sha256, status=CapabilitySetStatus(row.status), capabilities=tuple(Capability(**item) for item in row.capabilities), errors=tuple(row.errors))
+    return CapabilitySet(
+        sample_id=row.sample_id,
+        tool_name=row.tool_name,
+        tool_version=row.tool_version,
+        ruleset_sha256=row.ruleset_sha256,
+        parameters_sha256=row.parameters_sha256,
+        status=CapabilitySetStatus(row.status),
+        capabilities=tuple(Capability(**item) for item in row.capabilities),
+        errors=tuple(row.errors),
+    )
 
 
 class SqlAlchemyGoodwareBaselineRepository:
@@ -209,36 +307,111 @@ class SqlAlchemyGoodwareBaselineRepository:
         self._session = session
 
     async def get_by_source_set_sha256(self, source_set_sha256: str) -> GoodwareBaseline | None:
-        row = await self._session.scalar(select(GoodwareBaselineRow).where(GoodwareBaselineRow.source_set_sha256 == source_set_sha256))
+        row = await self._session.scalar(
+            select(GoodwareBaselineRow).where(
+                GoodwareBaselineRow.source_set_sha256 == source_set_sha256
+            )
+        )
         if row is None:
             return None
-        sources = await self._session.scalars(select(GoodwareBaselineSourceRow).where(GoodwareBaselineSourceRow.baseline_id == row.id).order_by(GoodwareBaselineSourceRow.filename))
-        return GoodwareBaseline(id=row.id, source_set_sha256=row.source_set_sha256, records_sha256=row.records_sha256, record_count=row.record_count, occurrence_sum=row.occurrence_sum, pattern_version=row.pattern_version, sources=tuple(GoodwareSource(filename=s.filename, feature_kind=s.feature_kind, sha256=s.sha256, size=s.size, blob_id=s.blob_id) for s in sources))
+        sources = await self._session.scalars(
+            select(GoodwareBaselineSourceRow)
+            .where(GoodwareBaselineSourceRow.baseline_id == row.id)
+            .order_by(GoodwareBaselineSourceRow.filename)
+        )
+        return GoodwareBaseline(
+            id=row.id,
+            source_set_sha256=row.source_set_sha256,
+            records_sha256=row.records_sha256,
+            record_count=row.record_count,
+            occurrence_sum=row.occurrence_sum,
+            pattern_version=row.pattern_version,
+            sources=tuple(
+                GoodwareSource(
+                    filename=s.filename,
+                    feature_kind=s.feature_kind,
+                    sha256=s.sha256,
+                    size=s.size,
+                    blob_id=s.blob_id,
+                )
+                for s in sources
+            ),
+        )
 
     async def add(self, baseline: GoodwareBaseline) -> None:
         from datetime import UTC, datetime
-        self._session.add(GoodwareBaselineRow(id=baseline.id, source_set_sha256=baseline.source_set_sha256, records_sha256=baseline.records_sha256, record_count=baseline.record_count, occurrence_sum=baseline.occurrence_sum, pattern_version=baseline.pattern_version, created_at=datetime.now(UTC)))
+
+        self._session.add(
+            GoodwareBaselineRow(
+                id=baseline.id,
+                source_set_sha256=baseline.source_set_sha256,
+                records_sha256=baseline.records_sha256,
+                record_count=baseline.record_count,
+                occurrence_sum=baseline.occurrence_sum,
+                pattern_version=baseline.pattern_version,
+                created_at=datetime.now(UTC),
+            )
+        )
         await self._session.flush()
+
+    async def add_if_absent(self, baseline: GoodwareBaseline) -> bool:
+        from sqlalchemy.dialects.postgresql import insert
+
+        statement = (
+            insert(GoodwareBaselineRow)
+            .values(
+                id=baseline.id,
+                source_set_sha256=baseline.source_set_sha256,
+                records_sha256=baseline.records_sha256,
+                record_count=baseline.record_count,
+                occurrence_sum=baseline.occurrence_sum,
+                pattern_version=baseline.pattern_version,
+                created_at=__import__("datetime").datetime.now(__import__("datetime").UTC),
+            )
+            .on_conflict_do_nothing(constraint="uq_goodware_baselines_source_set")
+        )
+        result = await self._session.execute(statement)
+        await self._session.flush()
+        return _insert_succeeded(result)
 
     async def get_feature_occurrence(
         self, baseline_id: UUID, feature_kind: str, normalized_value: str
     ) -> int | None:
-        return await self._session.scalar(
+        value = await self._session.scalar(
             select(GoodwareFeatureRow.occurrence_count).where(
                 GoodwareFeatureRow.baseline_id == baseline_id,
                 GoodwareFeatureRow.feature_kind == feature_kind,
                 GoodwareFeatureRow.normalized_value == normalized_value,
             )
         )
+        return int(value) if value is not None else None
 
     async def add_sources(self, baseline_id: UUID, sources: Sequence[GoodwareSource]) -> None:
         for source in sources:
-            self._session.add(GoodwareBaselineSourceRow(id=uuid4(), baseline_id=baseline_id, filename=source.filename, feature_kind=source.feature_kind, sha256=source.sha256, size=source.size, blob_id=source.blob_id))
+            self._session.add(
+                GoodwareBaselineSourceRow(
+                    id=uuid4(),
+                    baseline_id=baseline_id,
+                    filename=source.filename,
+                    feature_kind=source.feature_kind,
+                    sha256=source.sha256,
+                    size=source.size,
+                    blob_id=source.blob_id,
+                )
+            )
         await self._session.flush()
 
     async def add_features(self, baseline_id: UUID, features: Iterable[GoodwareFeature]) -> None:
         for feature in features:
-            self._session.add(GoodwareFeatureRow(id=uuid4(), baseline_id=baseline_id, feature_kind=feature.feature_kind, normalized_value=feature.normalized_value, occurrence_count=feature.occurrence_count))
+            self._session.add(
+                GoodwareFeatureRow(
+                    id=uuid4(),
+                    baseline_id=baseline_id,
+                    feature_kind=feature.feature_kind,
+                    normalized_value=feature.normalized_value,
+                    occurrence_count=feature.occurrence_count,
+                )
+            )
         await self._session.flush()
 
 
@@ -251,8 +424,29 @@ class SqlAlchemyInvestigationGoodwareBaselineRepository:
         return row.baseline_id if row else None
 
     async def add(self, investigation_id: UUID, baseline_id: UUID) -> None:
-        self._session.add(InvestigationGoodwareBaselineRow(investigation_id=investigation_id, baseline_id=baseline_id))
+        self._session.add(
+            InvestigationGoodwareBaselineRow(
+                investigation_id=investigation_id, baseline_id=baseline_id
+            )
+        )
         await self._session.flush()
+
+    async def add_if_absent(self, investigation_id: UUID, baseline_id: UUID) -> bool:
+        from sqlalchemy.dialects.postgresql import insert
+
+        statement = (
+            insert(InvestigationGoodwareBaselineRow)
+            .values(
+                investigation_id=investigation_id,
+                baseline_id=baseline_id,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[InvestigationGoodwareBaselineRow.investigation_id]
+            )
+        )
+        result = await self._session.execute(statement)
+        await self._session.flush()
+        return _insert_succeeded(result)
 
 
 class SqlAlchemyReferenceMemberRepository:
@@ -261,14 +455,29 @@ class SqlAlchemyReferenceMemberRepository:
 
     async def append(self, member: ReferenceMember) -> ReferenceMember:
         from sqlalchemy.dialects.postgresql import insert
-        stmt = insert(ReferenceMemberRow).values(
-            id=member.id, sample_id=member.sample_id, sample_sha256=member.sample_sha256,
-            family_label=member.family_label, origin_investigation_id=member.origin_investigation_id,
-            promoted_at=member.promoted_at, actor_id=member.actor_id, label_source=member.label_source.value,
-        ).on_conflict_do_nothing(constraint="uq_reference_members_sample_label")
+
+        stmt = (
+            insert(ReferenceMemberRow)
+            .values(
+                id=member.id,
+                sample_id=member.sample_id,
+                sample_sha256=member.sample_sha256,
+                family_label=member.family_label,
+                origin_investigation_id=member.origin_investigation_id,
+                promoted_at=member.promoted_at,
+                actor_id=member.actor_id,
+                label_source=member.label_source.value,
+            )
+            .on_conflict_do_nothing(constraint="uq_reference_members_sample_label")
+        )
         await self._session.execute(stmt)
         await self._session.flush()
-        row = await self._session.scalar(select(ReferenceMemberRow).where(ReferenceMemberRow.sample_id == member.sample_id, ReferenceMemberRow.family_label == member.family_label))
+        row = await self._session.scalar(
+            select(ReferenceMemberRow).where(
+                ReferenceMemberRow.sample_id == member.sample_id,
+                ReferenceMemberRow.family_label == member.family_label,
+            )
+        )
         return _reference_member_from_row(row)  # type: ignore[arg-type]
 
     async def get(self, member_id: UUID) -> ReferenceMember | None:
@@ -276,42 +485,130 @@ class SqlAlchemyReferenceMemberRepository:
         return _reference_member_from_row(row) if row else None
 
     async def list(self) -> Sequence[ReferenceMember]:
-        rows = await self._session.scalars(select(ReferenceMemberRow).order_by(ReferenceMemberRow.promoted_at, ReferenceMemberRow.id))
+        rows = await self._session.scalars(
+            select(ReferenceMemberRow).order_by(
+                ReferenceMemberRow.promoted_at, ReferenceMemberRow.id
+            )
+        )
         return [_reference_member_from_row(row) for row in rows]
 
     async def append_dispute(self, dispute: ReferenceMemberDispute) -> None:
-        self._session.add(ReferenceMemberDisputeRow(member_id=dispute.member_id, reason=dispute.reason, actor_id=dispute.actor_id, created_at=dispute.created_at))
+        self._session.add(
+            ReferenceMemberDisputeRow(
+                member_id=dispute.member_id,
+                reason=dispute.reason,
+                actor_id=dispute.actor_id,
+                created_at=dispute.created_at,
+            )
+        )
         await self._session.flush()
 
     async def get_dispute(self, member_id: UUID) -> ReferenceMemberDispute | None:
-        row = await self._session.scalar(select(ReferenceMemberDisputeRow).where(ReferenceMemberDisputeRow.member_id == member_id).order_by(ReferenceMemberDisputeRow.created_at))
+        row = await self._session.scalar(
+            select(ReferenceMemberDisputeRow)
+            .where(ReferenceMemberDisputeRow.member_id == member_id)
+            .order_by(ReferenceMemberDisputeRow.created_at)
+        )
         return _reference_dispute_from_row(row) if row else None
 
     async def list_disputes(self, member_id: UUID) -> Sequence[ReferenceMemberDispute]:
-        rows = await self._session.scalars(select(ReferenceMemberDisputeRow).where(ReferenceMemberDisputeRow.member_id == member_id).order_by(ReferenceMemberDisputeRow.created_at))
+        rows = await self._session.scalars(
+            select(ReferenceMemberDisputeRow)
+            .where(ReferenceMemberDisputeRow.member_id == member_id)
+            .order_by(ReferenceMemberDisputeRow.created_at)
+        )
         return [_reference_dispute_from_row(row) for row in rows]
 
     async def count_eligible_malware_samples(self) -> int:
-        count = await self._session.scalar(select(func.count(func.distinct(ReferenceMemberRow.sample_id))).where(ReferenceMemberRow.family_label.not_in(("benign", "unlabeled")), ~select(ReferenceMemberDisputeRow.member_id).where(ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id).exists()))
+        count = await self._session.scalar(
+            select(func.count(func.distinct(ReferenceMemberRow.sample_id))).where(
+                ReferenceMemberRow.family_label.not_in(("benign", "unlabeled")),
+                ~select(ReferenceMemberDisputeRow.member_id)
+                .where(ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id)
+                .exists(),
+            )
+        )
         return int(count or 0)
 
-    async def list_feature_members(self, feature_kind: str, normalized_value: str) -> Sequence[tuple[UUID, str]]:
-        dispute = select(ReferenceMemberDisputeRow.member_id).where(ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id)
-        result = await self._session.execute(select(ReferenceMemberRow.sample_id, ReferenceMemberRow.family_label).join(SampleFeatureIndexRow, SampleFeatureIndexRow.sample_id == ReferenceMemberRow.sample_id).where(SampleFeatureIndexRow.feature_kind == feature_kind, SampleFeatureIndexRow.normalized_value == normalized_value.lower(), ReferenceMemberRow.family_label.not_in(("benign", "unlabeled")), ~dispute.exists()).distinct())
-        return list(result.all())
+    async def count_eligible_malware_samples_by_family(self) -> Mapping[str, int]:
+        dispute = select(ReferenceMemberDisputeRow.member_id).where(
+            ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id
+        )
+        result = await self._session.execute(
+            select(
+                ReferenceMemberRow.family_label,
+                func.count(func.distinct(ReferenceMemberRow.sample_id)),
+            )
+            .where(
+                ReferenceMemberRow.family_label.not_in(("benign", "unlabeled")),
+                ~dispute.exists(),
+            )
+            .group_by(ReferenceMemberRow.family_label)
+        )
+        return {family: int(count) for family, count in result.all()}
 
-    async def count_benign_feature_occurrences(self, feature_kind: str, normalized_value: str) -> int:
-        dispute = select(ReferenceMemberDisputeRow.member_id).where(ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id)
-        count = await self._session.scalar(select(func.count(func.distinct(ReferenceMemberRow.sample_id))).select_from(ReferenceMemberRow).join(SampleFeatureIndexRow, SampleFeatureIndexRow.sample_id == ReferenceMemberRow.sample_id).where(SampleFeatureIndexRow.feature_kind == feature_kind, SampleFeatureIndexRow.normalized_value == normalized_value.lower(), ReferenceMemberRow.family_label == "benign", ~dispute.exists()))
+    async def list_feature_members(
+        self, feature_kind: str, normalized_value: str
+    ) -> Sequence[tuple[UUID, str]]:
+        dispute = select(ReferenceMemberDisputeRow.member_id).where(
+            ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id
+        )
+        result = await self._session.execute(
+            select(ReferenceMemberRow.sample_id, ReferenceMemberRow.family_label)
+            .join(
+                SampleFeatureIndexRow,
+                SampleFeatureIndexRow.sample_id == ReferenceMemberRow.sample_id,
+            )
+            .where(
+                SampleFeatureIndexRow.feature_kind == feature_kind,
+                SampleFeatureIndexRow.normalized_value == normalized_value.lower(),
+                ReferenceMemberRow.family_label.not_in(("benign", "unlabeled")),
+                ~dispute.exists(),
+            )
+            .distinct()
+        )
+        return [(sample_id, family) for sample_id, family in result.all()]
+
+    async def count_benign_feature_occurrences(
+        self, feature_kind: str, normalized_value: str
+    ) -> int:
+        dispute = select(ReferenceMemberDisputeRow.member_id).where(
+            ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id
+        )
+        count = await self._session.scalar(
+            select(func.count(func.distinct(ReferenceMemberRow.sample_id)))
+            .select_from(ReferenceMemberRow)
+            .join(
+                SampleFeatureIndexRow,
+                SampleFeatureIndexRow.sample_id == ReferenceMemberRow.sample_id,
+            )
+            .where(
+                SampleFeatureIndexRow.feature_kind == feature_kind,
+                SampleFeatureIndexRow.normalized_value == normalized_value.lower(),
+                ReferenceMemberRow.family_label == "benign",
+                ~dispute.exists(),
+            )
+        )
         return int(count or 0)
 
 
 def _reference_member_from_row(row: ReferenceMemberRow) -> ReferenceMember:
-    return ReferenceMember(id=row.id, sample_id=row.sample_id, sample_sha256=row.sample_sha256, family_label=row.family_label, origin_investigation_id=row.origin_investigation_id, promoted_at=row.promoted_at, actor_id=row.actor_id, label_source=ReferenceLabelSource(row.label_source))
+    return ReferenceMember(
+        id=row.id,
+        sample_id=row.sample_id,
+        sample_sha256=row.sample_sha256,
+        family_label=row.family_label,
+        origin_investigation_id=row.origin_investigation_id,
+        promoted_at=row.promoted_at,
+        actor_id=row.actor_id,
+        label_source=ReferenceLabelSource(row.label_source),
+    )
 
 
 def _reference_dispute_from_row(row: ReferenceMemberDisputeRow) -> ReferenceMemberDispute:
-    return ReferenceMemberDispute(member_id=row.member_id, reason=row.reason, actor_id=row.actor_id, created_at=row.created_at)
+    return ReferenceMemberDispute(
+        member_id=row.member_id, reason=row.reason, actor_id=row.actor_id, created_at=row.created_at
+    )
 
 
 class SqlAlchemyCodeFeatureSetRepository:
@@ -361,7 +658,7 @@ class SqlAlchemyCodeFeatureSetRepository:
         )
         result = await self._session.execute(statement)
         await self._session.flush()
-        return bool(result.rowcount)
+        return _insert_succeeded(result)
 
     async def index(self, feature_set: CodeFeatureSet) -> None:
         row = await self._session.scalar(
@@ -435,32 +732,105 @@ def _code_feature_set_from_row(row: CodeFeatureSetRow) -> CodeFeatureSet:
 
 
 class SqlAlchemySampleFeatureSetRepository:
-    def __init__(self, session: AsyncSession) -> None: self._session = session
-    async def get(self, sample_id: UUID, extractor_version: str, parameters_sha256: str) -> SampleFeatureSetV1 | None:
-        row = await self._session.scalar(select(SampleFeatureSetRow).where(SampleFeatureSetRow.sample_id == sample_id, SampleFeatureSetRow.extractor_version == extractor_version, SampleFeatureSetRow.parameters_sha256 == parameters_sha256))
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(
+        self, sample_id: UUID, extractor_version: str, parameters_sha256: str
+    ) -> SampleFeatureSetV1 | None:
+        row = await self._session.scalar(
+            select(SampleFeatureSetRow).where(
+                SampleFeatureSetRow.sample_id == sample_id,
+                SampleFeatureSetRow.extractor_version == extractor_version,
+                SampleFeatureSetRow.parameters_sha256 == parameters_sha256,
+            )
+        )
         return _feature_from_payload(row.payload) if row else None
+
     async def add_if_absent(self, feature_set: SampleFeatureSetV1, feature_blob_id: UUID) -> bool:
-        if await self.get(feature_set.sample_id, feature_set.extractor_version, feature_set.parameters_sha256): return False
-        self._session.add(SampleFeatureSetRow(id=uuid4(), sample_id=feature_set.sample_id, blob_id=feature_set.blob_id, feature_blob_id=feature_blob_id, extractor_version=feature_set.extractor_version, parameters_sha256=feature_set.parameters_sha256, payload=feature_set.as_json(), created_at=__import__('datetime').datetime.now(__import__('datetime').UTC)))
-        await self._session.flush(); return True
+        from sqlalchemy.dialects.postgresql import insert
+
+        statement = (
+            insert(SampleFeatureSetRow)
+            .values(
+                id=uuid4(),
+                sample_id=feature_set.sample_id,
+                blob_id=feature_set.blob_id,
+                feature_blob_id=feature_blob_id,
+                extractor_version=feature_set.extractor_version,
+                parameters_sha256=feature_set.parameters_sha256,
+                payload=feature_set.as_json(),
+                created_at=__import__("datetime").datetime.now(__import__("datetime").UTC),
+            )
+            .on_conflict_do_nothing(constraint="uq_sample_feature_sets_replay")
+        )
+        result = await self._session.execute(statement)
+        await self._session.flush()
+        return _insert_succeeded(result)
+
     async def index(self, feature_set: SampleFeatureSetV1) -> None:
-        row = await self._session.scalar(select(SampleFeatureSetRow).where(SampleFeatureSetRow.sample_id == feature_set.sample_id, SampleFeatureSetRow.extractor_version == feature_set.extractor_version, SampleFeatureSetRow.parameters_sha256 == feature_set.parameters_sha256))
-        if row is None: raise RuntimeError("feature set is missing")
-        values = [("string", item["value"], item["occurrence_count"]) for item in feature_set.strings] + [("import", item, 1) for item in feature_set.imports] + [("export", item, 1) for item in feature_set.exports] + [("section", item["name"], 1) for item in feature_set.sections] + [("imphash", feature_set.imphash, 1)] * bool(feature_set.imphash) + [("opcode_fragment16", item, 1) for item in feature_set.opcode_fragment16]
+        row = await self._session.scalar(
+            select(SampleFeatureSetRow).where(
+                SampleFeatureSetRow.sample_id == feature_set.sample_id,
+                SampleFeatureSetRow.extractor_version == feature_set.extractor_version,
+                SampleFeatureSetRow.parameters_sha256 == feature_set.parameters_sha256,
+            )
+        )
+        if row is None:
+            raise RuntimeError("feature set is missing")
+        values = (
+            [("string", item["value"], item["occurrence_count"]) for item in feature_set.strings]
+            + [("import", item, 1) for item in feature_set.imports]
+            + [("export", item, 1) for item in feature_set.exports]
+            + [("section", item["name"], 1) for item in feature_set.sections]
+            + [("imphash", feature_set.imphash, 1)] * bool(feature_set.imphash)
+            + [("opcode_fragment16", item, 1) for item in feature_set.opcode_fragment16]
+        )
         for kind, value, count in values:
-            if not await self._session.scalar(select(SampleFeatureIndexRow.id).where(SampleFeatureIndexRow.feature_set_id == row.id, SampleFeatureIndexRow.feature_kind == kind, SampleFeatureIndexRow.normalized_value == value)):
-                self._session.add(SampleFeatureIndexRow(id=uuid4(), sample_id=feature_set.sample_id, feature_set_id=row.id, feature_kind=kind, normalized_value=value.lower(), occurrence_count=count))
+            if not await self._session.scalar(
+                select(SampleFeatureIndexRow.id).where(
+                    SampleFeatureIndexRow.feature_set_id == row.id,
+                    SampleFeatureIndexRow.feature_kind == kind,
+                    SampleFeatureIndexRow.normalized_value == value,
+                )
+            ):
+                self._session.add(
+                    SampleFeatureIndexRow(
+                        id=uuid4(),
+                        sample_id=feature_set.sample_id,
+                        feature_set_id=row.id,
+                        feature_kind=kind,
+                        normalized_value=value.lower(),
+                        occurrence_count=count,
+                    )
+                )
         await self._session.flush()
 
 
-def _feature_from_payload(data: dict) -> SampleFeatureSetV1:
+def _feature_from_payload(data: dict[str, Any]) -> SampleFeatureSetV1:
     from uuid import UUID
-    return SampleFeatureSetV1(**{**data, "sample_id": UUID(data["sample_id"]), "blob_id": UUID(data["blob_id"]), "format": SampleFormat(data["format"]), "tlp": TLP(data["tlp"]), **{key: tuple(data[key]) for key in ("strings", "sections", "imports", "exports", "resources", "opcode_fragment16", "partial_errors")}})
 
-    async def delete(self, blob_id: UUID) -> None:
-        row = await self._session.get(BlobRow, blob_id)
-        if row is not None:
-            await self._session.delete(row)
+    return SampleFeatureSetV1(
+        **{
+            **data,
+            "sample_id": UUID(data["sample_id"]),
+            "blob_id": UUID(data["blob_id"]),
+            "format": SampleFormat(data["format"]),
+            "tlp": TLP(data["tlp"]),
+            **{
+                key: tuple(data[key])
+                for key in (
+                    "strings",
+                    "sections",
+                    "imports",
+                    "exports",
+                    "resources",
+                    "opcode_fragment16",
+                    "partial_errors",
+                )
+            },
+        }
+    )
 
 
 class SqlAlchemySubjectRepository:
@@ -566,6 +936,43 @@ class SqlAlchemySampleRepository:
             )
         )
         return _sample_from_row(row) if row else None
+
+    async def save(self, sample: Sample) -> None:
+        row = await self._session.get(SampleRow, sample.id)
+        if row is None:
+            raise EntityNotFoundError(f"Sample {sample.id} does not exist")
+        values = _sample_to_row(sample)
+        for column in (
+            "original_name",
+            "origin",
+            "acquired_at",
+            "license_restriction",
+            "tlp",
+            "do_not_submit",
+            "external_llm_allowed",
+            "origin_kind",
+            "state",
+            "source_service",
+            "source_object_id",
+            "expected_hash",
+            "validation_actor",
+            "validation_date",
+            "validation_reason",
+            "imphash",
+            "ssdeep",
+            "tlsh",
+            "rich_header_hash",
+            "vhash",
+            "main_icon_dhash",
+            "imphash_source",
+            "ssdeep_source",
+            "tlsh_source",
+            "rich_header_hash_source",
+            "vhash_source",
+            "main_icon_dhash_source",
+        ):
+            setattr(row, column, getattr(values, column))
+        await self._session.flush()
 
 
 class SqlAlchemyProvenanceRepository:

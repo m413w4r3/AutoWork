@@ -3,13 +3,29 @@ from uuid import uuid4
 from cti_app.domain.classification import TLP
 from cti_app.infrastructure.static_analysis import StaticFeatureExtractor
 from tests.fixtures.binary_factory import (
-    FIXTURE_ASCII_STRING, RICH_CLEAR_MD5, build_elf64, build_pe64, build_rtf,
-    build_truncated_pe, build_unknown, expected_opcode_fragments,
+    FIXTURE_ASCII_STRING,
+    RICH_CLEAR_MD5,
+    build_elf64,
+    build_pe64,
+    build_rtf,
+    build_truncated_pe,
+    build_unknown,
+    expected_opcode_fragments,
 )
 
 
 def _extract(payload: bytes):
-    return StaticFeatureExtractor().extract(sample_id=uuid4(), blob_id=uuid4(), payload=payload, parameters_sha256="a" * 64, tlp=TLP.GREEN, do_not_submit=False, external_llm_allowed=True, max_strings=100, min_string_length=4)
+    return StaticFeatureExtractor().extract(
+        sample_id=uuid4(),
+        blob_id=uuid4(),
+        payload=payload,
+        parameters_sha256="a" * 64,
+        tlp=TLP.GREEN,
+        do_not_submit=False,
+        external_llm_allowed=True,
+        max_strings=100,
+        min_string_length=4,
+    )
 
 
 def test_static_formats_hashes_strings_and_fragments() -> None:

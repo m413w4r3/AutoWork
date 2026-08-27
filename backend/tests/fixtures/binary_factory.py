@@ -58,13 +58,7 @@ def _rich_encoded_data() -> bytes:
 
 def _overlay() -> bytes:
     """Strings live outside executable sections so code-fragment tests stay stable."""
-    return (
-        b"\x00"
-        + FIXTURE_ASCII_STRING
-        + b"\x00"
-        + FIXTURE_UTF16LE_STRING
-        + b"\x00\x00"
-    )
+    return b"\x00" + FIXTURE_ASCII_STRING + b"\x00" + FIXTURE_UTF16LE_STRING + b"\x00\x00"
 
 
 def build_pe64(*, rich_header: bool = True) -> bytes:
@@ -85,7 +79,7 @@ def build_pe64(*, rich_header: bool = True) -> bytes:
 
     if rich_header:
         rich = _rich_encoded_data()
-        dos[0xA0 : 0xA0 + len(rich)] = rich
+        dos[0x80 : 0x80 + len(rich)] = rich
 
     coff = struct.pack(
         "<HHIIIHH",
@@ -233,15 +227,9 @@ def build_elf64() -> bytes:
     payload[text_offset : text_offset + len(_TEXT_BYTES)] = _TEXT_BYTES
     payload[shstr_offset : shstr_offset + len(shstr)] = shstr
 
-    payload[
-        section_table_offset : section_table_offset + 64
-    ] = null_section
-    payload[
-        section_table_offset + 64 : section_table_offset + 128
-    ] = text_section
-    payload[
-        section_table_offset + 128 : section_table_offset + 192
-    ] = shstr_section
+    payload[section_table_offset : section_table_offset + 64] = null_section
+    payload[section_table_offset + 64 : section_table_offset + 128] = text_section
+    payload[section_table_offset + 128 : section_table_offset + 192] = shstr_section
 
     payload.extend(_overlay())
     return bytes(payload)

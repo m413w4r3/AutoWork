@@ -121,6 +121,16 @@ class FixtureGuardTests(unittest.TestCase):
             (root / "sample.bin").write_bytes(b"MZ\x00\x01")
             self.assertEqual(fixture_guard.find_binary_files(root), [root / "sample.bin"])
 
+    def test_historical_documents_are_allowed_and_pyc_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            (root / "fixture.pdf").write_bytes(b"%PDF\x00")
+            (root / "fixture.html").write_text("<html></html>", encoding="utf-8")
+            cache = root / "__pycache__"
+            cache.mkdir()
+            (cache / "x.pyc").write_bytes(b"\x00\x01")
+            self.assertEqual(fixture_guard.find_binary_files(root), [])
+
 
 if __name__ == "__main__":
     unittest.main()
