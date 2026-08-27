@@ -12,6 +12,7 @@ from cti_app.application.production_state import (
     ProductionStateSnapshotV1,
     compute_production_state_checksum,
 )
+from cti_app.domain.production import ProductionProfile
 
 
 def _payload() -> dict[str, Any]:
@@ -104,6 +105,22 @@ async def test_import_rejects_bad_checksum_without_side_effects() -> None:
             subject_id=uuid4(), edition_id=uuid4(), payload=payload
         )
     assert exc_info.value.code == "production_state_checksum_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_major_import_requires_frozen_research_date_before_side_effects() -> None:
+    payload = _payload()
+    payload["origin"]["research_date"] = None
+    snapshot = ProductionStateSnapshotV1.model_validate(payload)
+    payload["content_sha256"] = compute_production_state_checksum(snapshot)
+    with pytest.raises(ProductionStateError) as exc_info:
+        await ProductionStateService(_FailingFactory(), cast(Any, object())).import_state(
+            subject_id=uuid4(),
+            edition_id=uuid4(),
+            payload=payload,
+            profile=ProductionProfile.MAJOR_ASSISTED,
+        )
+    assert exc_info.value.code == "production_state_research_date_required"
 
 
 def test_checksum_is_deterministic_and_excludes_checksum_field() -> None:

@@ -11,10 +11,9 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from cti_app.application.analyst_input_pack import (
-    ANALYST_INPUT_PACK_BUCKET,
-    ANALYST_INPUT_PACK_SCHEMA_VERSION,
-    build_analyst_input_pack_v1,
+from cti_app.application.analyst_handoff import (
+    AnalystHandoffPolicy,
+    AnalystPostSynthesisService,
 )
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SupplementalSource
@@ -74,8 +73,6 @@ from cti_app.domain.model_conversations import (
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole
 from cti_app.domain.production import (
-    AnalystInvestigation,
-    LoopBudget,
     ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
@@ -164,6 +161,11 @@ class ProductionWorkflowOrchestrator:
         self._assembly = BriefAssemblyService(uow_factory, artifact_store)
         self._qa = ProductionQAService(uow_factory)
         self._seed_enrichment = seed_enrichment
+        self._analyst_handoff = (
+            AnalystPostSynthesisService(uow_factory, artifact_store)
+            if artifact_store is not None
+            else None
+        )
 
     async def execute_stage(
         self,
@@ -1138,7 +1140,7 @@ class ProductionWorkflowOrchestrator:
                     },
                 )
 
-                analyst_investigation_id = await self._create_analyst_input_pack(
+                analyst_handoff = await self._ensure_analyst_handoff(
                     run=run,
                     synthesis=artifact,
                     extraction=extraction,
@@ -1153,13 +1155,14 @@ class ProductionWorkflowOrchestrator:
                     "word_count": len(output_text.split()),
                     "repair_actions": parsed.repair_actions,
                 }
-                if analyst_investigation_id is not None:
-                    result["analyst_investigation_id"] = str(analyst_investigation_id)
+                if analyst_handoff is not None:
+                    result["analyst_investigation_id"] = str(analyst_handoff.investigation_id)
+                    await self._enrich_analyst_handoff(run, synthesis_ctx, analyst_handoff)
                 return result
             except Exception as e:
                 return self._handle_stage_exception(run, "synthesis", e)
 
-    async def _create_analyst_input_pack(
+    async def _ensure_analyst_handoff(
         self,
         *,
         run: SubjectProductionRun,
@@ -1167,108 +1170,39 @@ class ProductionWorkflowOrchestrator:
         extraction: Any,
         extraction_payload: Any,
         policy: Any,
-    ) -> UUID | None:
-        """Create the internal major-assisted hand-off once, after SYNTHESIS.
-
-        The production job advances the run to ANALYST_RESEARCH through its
-        normal profile state machine.  Nothing here exposes a public
-        major_assisted route.
-        """
+    ) -> Any | None:
+        """Persist the major handoff; seed enrichment is deliberately separate."""
         if run.profile is not ProductionProfile.MAJOR_ASSISTED:
             return None
-        if self._artifact_store is None:
+        if self._analyst_handoff is None:
             raise ValueError("Analyst input pack requires the production artifact store")
-
-        async with self._uow_factory() as uow:
-            existing = await uow.analyst_investigations.get_for_run(run.id)
-            if existing is not None:
-                persisted_pack = await uow.analyst_input_packs.get_for_investigation(existing.id)
-                if (
-                    persisted_pack is None
-                    or existing.input_pack_blob_id != persisted_pack.blob_id
-                    or existing.input_sha256 != persisted_pack.sha256
-                ):
-                    raise ValueError("Analyst investigation input pack reference is inconsistent")
-                if self._seed_enrichment is not None:
-                    payload = await self._artifact_store.read_json(persisted_pack.blob_id)
-                    for indicator in payload.get("file_indicators", []):
-                        value = indicator["value"]
-                        await self._seed_enrichment.enrich(
-                            value,
-                            subject_id=run.subject_id,
-                            external_lookup_allowed=bool(
-                                getattr(policy, "external_llm_allowed", False)
-                            ),
-                            has_bytes=False,
-                            checkpoint_id=(
-                                f"analyst-input-pack:{existing.id}:{persisted_pack.sha256}:{value}"
-                            ),
-                        )
-                return UUID(str(existing.id))
-
-            investigation = AnalystInvestigation.from_verified_synthesis(
-                synthesis=synthesis,
-                budget=LoopBudget(),
-            )
-            items = []
-            for item in extraction_payload.items:
-                artifact_type = getattr(item, "artifact_type", None)
-                indicator_status = getattr(item, "indicator_status", None)
-                items.append(
-                    {
-                        "id": getattr(item, "local_id", None),
-                        "value": getattr(item, "value", None),
-                        "normalized_value": getattr(item, "normalized_value", None),
-                        "artifact_type": getattr(artifact_type, "value", artifact_type),
-                        "indicator_status": getattr(indicator_status, "value", indicator_status),
-                        "source_ids": list(getattr(item, "source_ids", ())),
-                        "supported": getattr(item, "supported", False),
-                    }
-                )
-            research_date = run.research_date
-            if research_date is None:
-                raise ValueError("Analyst input pack requires frozen research_date")
-            pack = build_analyst_input_pack_v1(
-                run=run,
-                investigation=investigation,
-                synthesis=synthesis,
-                extraction_artifacts=(extraction,),
-                extraction_items=items,
+        return await self._analyst_handoff.ensure_for_verified_synthesis(
+            run=run,
+            synthesis=synthesis,
+            extraction_artifacts=(extraction,),
+            extraction_items=extraction_payload.items,
+            policy=AnalystHandoffPolicy(
                 tlp=getattr(policy, "tlp", None),
                 do_not_submit=bool(getattr(policy, "do_not_submit", False)),
                 external_llm_allowed=bool(getattr(policy, "external_llm_allowed", False)),
-                research_date=research_date,
-            )
-            blob_id, sha256 = await self._artifact_store.put_canonical_json(
-                pack.payload, bucket=ANALYST_INPUT_PACK_BUCKET
-            )
-            investigation.input_pack_blob_id = blob_id
-            investigation.input_sha256 = sha256
-            from cti_app.domain.production import AnalystInputPack
+            ),
+        )
 
-            await uow.analyst_investigations.add(investigation)
-            await uow.analyst_input_packs.append(
-                AnalystInputPack(
-                    investigation_id=investigation.id,
-                    blob_id=blob_id,
-                    sha256=sha256,
-                    schema_version=ANALYST_INPUT_PACK_SCHEMA_VERSION,
-                )
+    async def _enrich_analyst_handoff(
+        self, run: SubjectProductionRun, policy: Any, handoff: Any
+    ) -> None:
+        if self._seed_enrichment is None:
+            return
+        for value in handoff.file_indicators:
+            await self._seed_enrichment.enrich(
+                value,
+                subject_id=run.subject_id,
+                external_lookup_allowed=bool(getattr(policy, "external_llm_allowed", False)),
+                has_bytes=False,
+                checkpoint_id=(
+                    f"analyst-input-pack:{handoff.investigation_id}:{handoff.input_sha256}:{value}"
+                ),
             )
-            await uow.commit()
-            if self._seed_enrichment is not None:
-                for indicator in pack.payload["file_indicators"]:
-                    value = indicator["value"]
-                    await self._seed_enrichment.enrich(
-                        value,
-                        subject_id=run.subject_id,
-                        external_lookup_allowed=bool(
-                            getattr(policy, "external_llm_allowed", False)
-                        ),
-                        has_bytes=False,
-                        checkpoint_id=f"analyst-input-pack:{investigation.id}:{sha256}:{value}",
-                    )
-            return investigation.id
 
     async def _execute_assembly_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
         """Deterministic: pure rendering from artifacts, no LLM call."""

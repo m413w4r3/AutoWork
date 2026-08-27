@@ -48,6 +48,10 @@ class SqlAlchemyAnalystInvestigationRepository:
 
     async def add(self, value: AnalystInvestigation) -> None:
         self._session.add(_analyst_investigation_row(value))
+        # AnalystInputPackRow has no ORM relationship to order its insert
+        # after this parent.  A handoff persists both in one UoW, so materialize
+        # the parent before an FK child can be added.
+        await self._session.flush()
 
     async def save(self, value: AnalystInvestigation) -> None:
         result = await self._session.execute(

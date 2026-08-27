@@ -8,6 +8,7 @@ offer a start button based on a 404, so these endpoints must answer 404 — neve
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from collections.abc import AsyncIterator, Sequence
 from types import SimpleNamespace
@@ -36,6 +37,8 @@ from cti_app.domain.editorial import (
     GroupingOutcome,
 )
 from cti_app.domain.production import (
+    AnalystInputPack,
+    AnalystInvestigation,
     EditionProductionBatch,
     EditionProductionBatchItem,
     ProductionArtifact,
@@ -222,6 +225,43 @@ class _SourceCollections:
         return [SimpleNamespace(state=CollectionState.ARCHIVED)]
 
 
+class _Investigations:
+    def __init__(self) -> None:
+        self.items: dict[UUID, AnalystInvestigation] = {}
+
+    async def get(self, investigation_id: UUID) -> AnalystInvestigation | None:
+        return self.items.get(investigation_id)
+
+    async def get_for_run(self, run_id: UUID) -> AnalystInvestigation | None:
+        return next(
+            (item for item in self.items.values() if item.production_run_id == run_id), None
+        )
+
+    async def add(self, investigation: AnalystInvestigation) -> None:
+        self.items[investigation.id] = investigation
+
+    async def save(self, investigation: AnalystInvestigation) -> None:
+        self.items[investigation.id] = investigation
+
+
+class _InputPacks:
+    def __init__(self) -> None:
+        self.items: dict[UUID, AnalystInputPack] = {}
+
+    async def get_for_investigation(self, investigation_id: UUID) -> AnalystInputPack | None:
+        return next(
+            (
+                item
+                for item in self.items.values()
+                if item.investigation_id == investigation_id
+            ),
+            None,
+        )
+
+    async def append(self, pack: AnalystInputPack) -> None:
+        self.items[pack.id] = pack
+
+
 class _Uow:
     """Single shared in-memory unit of work; commit is a no-op."""
 
@@ -232,6 +272,8 @@ class _Uow:
         self.edition_production_batch_items = _BatchItems()
         self.production_artifacts = _Artifacts()
         self.source_collections = _SourceCollections()
+        self.analyst_investigations = _Investigations()
+        self.analyst_input_packs = _InputPacks()
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -268,6 +310,13 @@ class _Dispatcher:
         self.dispatched.append(job_id)
 
 
+class _FailingModel:
+    """Import must never reach a model service or gateway."""
+
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"model must not be called during state import: {name}")
+
+
 class _ArtifactStore:
     def __init__(self) -> None:
         self.payloads: dict[UUID, object] = {}
@@ -298,6 +347,15 @@ class _ArtifactStore:
         assert isinstance(value, str)
         return value
 
+    async def put_canonical_json(self, payload: dict[str, Any], *, bucket: str) -> tuple[UUID, str]:
+        del bucket
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        blob_id = uuid4()
+        self.payloads[blob_id] = payload
+        return blob_id, hashlib.sha256(encoded).hexdigest()
+
 
 @pytest.fixture
 def uow() -> _Uow:
@@ -312,6 +370,8 @@ def production_app(uow: _Uow) -> FastAPI:
     application.state.job_service = _Jobs()
     application.state.job_dispatcher = _Dispatcher()
     application.state.production_artifact_store = _ArtifactStore()
+    application.state.model_service = _FailingModel()
+    application.state.model_gateway = _FailingModel()
     return application
 
 
@@ -743,6 +803,8 @@ async def test_production_state_export_import_is_transparent(
     assert imported.json()["current_stage"] == "assembly"
     assert imported.json()["imported_stages"] == ["references", "extraction", "synthesis"]
     assert len(production_app.state.job_service.submitted) == submitted
+    assert not uow.analyst_investigations.items
+    assert not uow.analyst_input_packs.items
 
     production = await api.get(f"/api/subjects/{imported_subject}/production")
     assert production.json()["status"] == "needs_review"
@@ -799,6 +861,75 @@ async def test_production_state_import_has_no_generation_side_effects(
     assert response.status_code == 200
     assert len(jobs.submitted) == before_jobs
     assert len(uow.subject_production_runs.items) == before_runs + 1
+
+
+async def test_production_state_import_major_creates_handoff_without_model_or_synthesis_rerun(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cti_app.api.production as production_api
+
+    monkeypatch.setattr(
+        production_api,
+        "get_settings",
+        lambda: SimpleNamespace(production_major_assisted_enabled=True),
+    )
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Major", subject_id))
+    snapshot = _state_payload()
+    item = snapshot["artifacts"]["extraction"]["canonical_content"]["items"][0]
+    item.update(
+        {
+            "id": "I-hash",
+            "value": "a" * 64,
+            "normalized_value": "a" * 64,
+            "artifact_type": "hash",
+            "indicator_status": "confirmed_ioc",
+            "supported": True,
+        }
+    )
+    snapshot_model = ProductionStateSnapshotV1.model_validate(snapshot)
+    snapshot["content_sha256"] = compute_production_state_checksum(snapshot_model)
+
+    response = await api.post(
+        f"/api/subjects/{subject_id}/production/state/import?profile=major_assisted",
+        json=snapshot,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "running"
+    assert response.json()["current_stage"] == "analyst_research"
+
+    run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+    assert run is not None
+    assert run.profile is ProductionProfile.MAJOR_ASSISTED
+    assert run.current_stage is SubjectProductionStage.ANALYST_RESEARCH
+    assert len(await uow.production_artifacts.list_for_run(run.id)) == 3
+    investigation = await uow.analyst_investigations.get_for_run(run.id)
+    assert investigation is not None and investigation.input_sha256 is not None
+    pack = await uow.analyst_input_packs.get_for_investigation(investigation.id)
+    assert pack is not None and pack.sha256 == investigation.input_sha256
+    visible = await api.get(f"/api/subjects/{subject_id}/investigation")
+    assert visible.status_code == 200
+    assert [item["value"] for item in visible.json()["file_indicators"]] == ["a" * 64]
+
+
+async def test_production_state_import_major_obeys_feature_flag(
+    api: AsyncClient, uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cti_app.api.production as production_api
+
+    monkeypatch.setattr(
+        production_api,
+        "get_settings",
+        lambda: SimpleNamespace(production_major_assisted_enabled=False),
+    )
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Major", subject_id))
+    response = await api.post(
+        f"/api/subjects/{subject_id}/production/state/import?profile=major_assisted",
+        json=_state_payload(),
+    )
+    assert response.status_code == 501
+    assert not uow.subject_production_runs.items
 
 
 async def test_production_state_export_import_export_preserves_business_content(

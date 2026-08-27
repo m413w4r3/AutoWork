@@ -196,6 +196,23 @@ class SubjectProductionRun:
         self.updated_at = self.started_at
         self.version += 1
 
+    def resume_verified_import_at_analyst_research(self, *, now: datetime | None = None) -> None:
+        """Resume imported verified artifacts at the major manual checkpoint."""
+        if self.profile is not ProductionProfile.MAJOR_ASSISTED:
+            raise ValueError("Only major_assisted runs have an analyst checkpoint")
+        if self.status is not SubjectProductionStatus.QUEUED:
+            raise ValueError("Imported run must start from QUEUED status")
+        if self.current_stage is not SubjectProductionStage.SOURCES:
+            raise ValueError("Imported run must start from SOURCES stage")
+        if self.research_date is None:
+            raise ValueError("Analyst handoff requires frozen research_date")
+        moment = now or datetime.now(UTC)
+        self.status = SubjectProductionStatus.RUNNING
+        self.current_stage = SubjectProductionStage.ANALYST_RESEARCH
+        self.started_at = moment
+        self.updated_at = moment
+        self.version += 1
+
     def advance_stage(self, *, now: datetime | None = None) -> None:
         successor = next_stage(self.profile, self.current_stage)
         if successor is not None:

@@ -17,6 +17,10 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from cti_app.application.analyst_handoff import (
+    AnalystPostSynthesisService,
+    analyst_handoff_policy_from_sources,
+)
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
     MAX_ARTIFACT_BYTES,
@@ -56,6 +60,7 @@ _ERROR_CODES = {
     "production_state_invalid",
     "production_state_checksum_mismatch",
     "production_state_too_large",
+    "production_state_research_date_required",
 }
 _HASH = r"^[0-9a-f]{64}$"
 
@@ -129,8 +134,8 @@ class ProductionStateImportResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     run_id: UUID
-    status: Literal["needs_review"]
-    current_stage: Literal["assembly"]
+    status: Literal["needs_review", "running"]
+    current_stage: Literal["assembly", "analyst_research"]
     imported_stages: tuple[Literal["references"], Literal["extraction"], Literal["synthesis"]]
     schema_version: Literal[1]
     content_sha256: str = Field(pattern=_HASH)
@@ -252,6 +257,7 @@ class ProductionStateService:
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
+        self._analyst_handoff = AnalystPostSynthesisService(uow_factory, artifact_store)
 
     async def export_state(
         self, *, subject_id: UUID, subject_title: str
@@ -327,9 +333,19 @@ class ProductionStateService:
         return snapshot.model_copy(update={"content_sha256": checksum})
 
     async def import_state(
-        self, *, subject_id: UUID, edition_id: UUID, payload: dict[str, Any]
+        self,
+        *,
+        subject_id: UUID,
+        edition_id: UUID,
+        payload: dict[str, Any],
+        profile: ProductionProfile = ProductionProfile.BRIEF_AUTO,
     ) -> ProductionStateImportResult:
         snapshot = _validate_snapshot(payload)
+        if profile is ProductionProfile.MAJOR_ASSISTED and snapshot.origin.research_date is None:
+            raise ProductionStateError(
+                code="production_state_research_date_required",
+                message="major_assisted import requires a frozen research_date",
+            )
         now = datetime.now(UTC)
 
         async with self._uow_factory() as uow:
@@ -397,15 +413,27 @@ class ProductionStateService:
             run = SubjectProductionRun(
                 subject_id=subject_id,
                 edition_id=edition_id,
-                profile=ProductionProfile.BRIEF_AUTO,
-                status=SubjectProductionStatus.NEEDS_REVIEW,
-                current_stage=SubjectProductionStage.ASSEMBLY,
+                profile=profile,
+                status=(
+                    SubjectProductionStatus.NEEDS_REVIEW
+                    if profile is ProductionProfile.BRIEF_AUTO
+                    else SubjectProductionStatus.QUEUED
+                ),
+                current_stage=(
+                    SubjectProductionStage.ASSEMBLY
+                    if profile is ProductionProfile.BRIEF_AUTO
+                    else SubjectProductionStage.SOURCES
+                ),
                 run_number=next_run_number,
                 research_date=snapshot.origin.research_date,
                 error_code=IMPORTED_RUN_ERROR_CODE,
                 error_message=(
                     "État importé : références, extraction et synthèse restaurées ; "
-                    "assemblage non rejoué."
+                    + (
+                        "assemblage non rejoué."
+                        if profile is ProductionProfile.BRIEF_AUTO
+                        else "reprise au checkpoint analyste."
+                    )
                 ),
                 started_at=now,
                 finished_at=now,
@@ -413,48 +441,61 @@ class ProductionStateService:
                 updated_at=now,
                 version=1,
             )
+            if profile is ProductionProfile.MAJOR_ASSISTED:
+                run.resume_verified_import_at_analyst_research(now=now)
             await uow.subject_production_runs.add(run)
-            await uow.production_artifacts.append(
-                ProductionArtifact(
-                    production_run_id=run.id,
-                    subject_id=subject_id,
-                    stage=ProductionArtifactStage.REFERENCES,
-                    version=1,
-                    input_hash=snapshot.artifacts.references.input_hash,
-                    status=ProductionArtifactStatus.VERIFIED,
-                    canonical_blob_id=refs_canonical,
-                    metadata=refs_meta,
-                )
+            refs = ProductionArtifact(
+                production_run_id=run.id,
+                subject_id=subject_id,
+                stage=ProductionArtifactStage.REFERENCES,
+                version=1,
+                input_hash=snapshot.artifacts.references.input_hash,
+                status=ProductionArtifactStatus.VERIFIED,
+                canonical_blob_id=refs_canonical,
+                metadata=refs_meta,
             )
-            await uow.production_artifacts.append(
-                ProductionArtifact(
-                    production_run_id=run.id,
-                    subject_id=subject_id,
-                    stage=ProductionArtifactStage.EXTRACTION,
-                    version=1,
-                    input_hash=snapshot.artifacts.extraction.input_hash,
-                    status=ProductionArtifactStatus.VERIFIED,
-                    canonical_blob_id=extraction_canonical,
-                    metadata=extraction_meta,
-                )
+            await uow.production_artifacts.append(refs)
+            extraction = ProductionArtifact(
+                production_run_id=run.id,
+                subject_id=subject_id,
+                stage=ProductionArtifactStage.EXTRACTION,
+                version=1,
+                input_hash=snapshot.artifacts.extraction.input_hash,
+                status=ProductionArtifactStatus.VERIFIED,
+                canonical_blob_id=extraction_canonical,
+                metadata=extraction_meta,
             )
-            await uow.production_artifacts.append(
-                ProductionArtifact(
-                    production_run_id=run.id,
-                    subject_id=subject_id,
-                    stage=ProductionArtifactStage.SYNTHESIS,
-                    version=1,
-                    input_hash=snapshot.artifacts.synthesis.input_hash,
-                    status=ProductionArtifactStatus.VERIFIED,
-                    rendered_blob_id=synthesis_rendered,
-                    metadata=synthesis_meta,
-                )
+            await uow.production_artifacts.append(extraction)
+            synthesis = ProductionArtifact(
+                production_run_id=run.id,
+                subject_id=subject_id,
+                stage=ProductionArtifactStage.SYNTHESIS,
+                version=1,
+                input_hash=snapshot.artifacts.synthesis.input_hash,
+                status=ProductionArtifactStatus.VERIFIED,
+                rendered_blob_id=synthesis_rendered,
+                metadata=synthesis_meta,
             )
+            await uow.production_artifacts.append(synthesis)
+            if profile is ProductionProfile.MAJOR_ASSISTED:
+                policy = analyst_handoff_policy_from_sources(
+                    await uow.source_collections.list_for_subject(subject_id)
+                )
+                await self._analyst_handoff.ensure_for_verified_synthesis(
+                    run=run,
+                    synthesis=synthesis,
+                    extraction_artifacts=(extraction,),
+                    extraction_items=extraction_content.get("items", []),
+                    policy=policy,
+                    uow=uow,
+                )
             await uow.commit()
         return ProductionStateImportResult(
             run_id=run.id,
-            status="needs_review",
-            current_stage="assembly",
+            status=("needs_review" if profile is ProductionProfile.BRIEF_AUTO else "running"),
+            current_stage=(
+                "assembly" if profile is ProductionProfile.BRIEF_AUTO else "analyst_research"
+            ),
             imported_stages=("references", "extraction", "synthesis"),
             schema_version=1,
             content_sha256=snapshot.content_sha256,

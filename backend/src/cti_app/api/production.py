@@ -156,6 +156,7 @@ def _production_state_error(exc: ProductionStateError) -> HTTPException:
         "production_state_version_unsupported": status.HTTP_400_BAD_REQUEST,
         "production_state_invalid": status.HTTP_400_BAD_REQUEST,
         "production_state_checksum_mismatch": status.HTTP_400_BAD_REQUEST,
+        "production_state_research_date_required": status.HTTP_400_BAD_REQUEST,
     }
     return HTTPException(
         status_code=code_to_status[exc.code],
@@ -274,7 +275,7 @@ async def start_subject_production(
     body: StartSubjectProductionRequest | None = None,
     user: str = "system",
 ) -> dict[str, Any]:
-    # brief_auto: full automatic pipeline. major_assisted: not yet implemented.
+    # brief_auto is fully automatic; major_assisted is available behind its feature flag.
     # Edition is resolved from the subject's editorial group.
     payload = body or StartSubjectProductionRequest()
     profile = payload.profile
@@ -346,14 +347,24 @@ async def import_subject_production_state(
     subject_id: UUID,
     request: Request,
     payload: dict[str, Any],
+    profile: ProductionProfile = ProductionProfile.BRIEF_AUTO,
 ) -> ProductionStateImportResult:
     group = await _selected_brief_group(request, subject_id)
+    if (
+        profile is ProductionProfile.MAJOR_ASSISTED
+        and not get_settings().production_major_assisted_enabled
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="major_assisted production is disabled",
+        )
     service = _production_state_service(request)
     try:
         return await service.import_state(
             subject_id=subject_id,
             edition_id=group.edition_id,
             payload=payload,
+            profile=profile,
         )
     except ProductionStateError as exc:
         raise _production_state_error(exc) from exc

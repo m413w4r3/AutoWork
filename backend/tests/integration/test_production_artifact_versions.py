@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import date
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,9 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
+    AnalystInputPack,
+    AnalystInvestigation,
+    LoopBudget,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -105,6 +109,73 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
         ("references", 2, "stale"),
         ("references", 3, "verified"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
+    uow_factory: UnitOfWorkFactory, tmp_path: Path
+) -> None:
+    """The parent flush makes the input-pack FK valid before commit ordering matters."""
+    edition = Edition(
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        tlp=TLP.AMBER,
+        languages=("fr",),
+        target_major_articles=1,
+        target_briefs=1,
+        source_profile="test",
+    )
+    subject = Subject(external_id="SUBJ-ANALYST-FK", slug="analyst-fk", tlp=TLP.AMBER)
+    run = SubjectProductionRun(
+        subject_id=subject.id, edition_id=edition.id, profile=ProductionProfile.MAJOR_ASSISTED
+    )
+    run.start_running()
+    synthesis = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=subject.id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=1,
+        input_hash="a" * 64,
+    )
+    catalog = BlobCatalogService(FilesystemBlobStore(tmp_path / "blobs"), uow_factory)
+    blob = await catalog.ingest(
+        BytesIO(b'{"schema_version":"analyst-input-pack-v1"}'),
+        logical_bucket="analyst-input-packs",
+        mime_type="application/json",
+    )
+    sha256 = blob.descriptor.sha256
+
+    async with uow_factory() as uow:
+        assert await uow.editions.add_if_absent(edition)
+        await uow.subjects.add(subject)
+        await uow.subject_production_runs.add(run)
+        await uow.production_artifacts.append(synthesis)
+        await uow.commit()
+
+    investigation = AnalystInvestigation.from_verified_synthesis(
+        synthesis=synthesis,
+        budget=LoopBudget(),
+        input_pack_blob_id=blob.id,
+        input_sha256=sha256,
+    )
+    pack = AnalystInputPack(
+        investigation_id=investigation.id,
+        blob_id=blob.id,
+        sha256=sha256,
+        schema_version="analyst-input-pack-v1",
+    )
+    async with uow_factory() as uow:
+        await uow.analyst_investigations.add(investigation)
+        await uow.analyst_input_packs.append(pack)
+        await uow.commit()
+
+    async with uow_factory() as uow:
+        persisted = await uow.analyst_investigations.get(investigation.id)
+        persisted_pack = await uow.analyst_input_packs.get_for_investigation(investigation.id)
+    assert persisted is not None and persisted.input_pack_blob_id == blob.id
+    assert persisted_pack == pack
 
 
 @pytest.mark.asyncio
