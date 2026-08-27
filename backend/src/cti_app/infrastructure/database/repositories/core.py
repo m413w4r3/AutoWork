@@ -315,6 +315,34 @@ class SqlAlchemyCapabilitySetRepository:
         )
         await self._session.flush()
 
+    async def list_for_samples(self, sample_ids: Sequence[UUID]) -> Sequence[Mapping[str, object]]:
+        ids = tuple(dict.fromkeys(sample_ids))
+        if not ids:
+            return ()
+        rows = await self._session.scalars(
+            select(CapabilitySetRow)
+            .where(CapabilitySetRow.sample_id.in_(ids))
+            .order_by(CapabilitySetRow.sample_id, CapabilitySetRow.id)
+        )
+        result: list[Mapping[str, object]] = []
+        for row in rows:
+            result.append(
+                {
+                    "id": str(row.id),
+                    "sample_id": str(row.sample_id),
+                    "blob_id": str(row.blob_id),
+                    "blob_sha256": await _blob_sha256(self._session, row.blob_id),
+                    "tool_name": row.tool_name,
+                    "tool_version": row.tool_version,
+                    "ruleset_sha256": row.ruleset_sha256,
+                    "parameters_sha256": row.parameters_sha256,
+                    "status": row.status,
+                    "capabilities": row.capabilities,
+                    "errors": row.errors,
+                }
+            )
+        return result
+
 
 def _capability_set_from_row(row: CapabilitySetRow) -> CapabilitySet:
     return CapabilitySet(
@@ -774,6 +802,39 @@ class SqlAlchemyCodeFeatureSetRepository:
         )
         await self._session.flush()
 
+    async def list_for_samples(self, sample_ids: Sequence[UUID]) -> Sequence[Mapping[str, object]]:
+        ids = tuple(dict.fromkeys(sample_ids))
+        if not ids:
+            return ()
+        rows = await self._session.scalars(
+            select(CodeFeatureSetRow)
+            .where(CodeFeatureSetRow.sample_id.in_(ids))
+            .order_by(CodeFeatureSetRow.sample_id, CodeFeatureSetRow.id)
+        )
+        result: list[Mapping[str, object]] = []
+        for row in rows:
+            result.append(
+                {
+                    "id": str(row.id),
+                    "sample_id": str(row.sample_id),
+                    "blob_id": str(row.blob_id),
+                    "feature_blob_id": str(row.feature_blob_id),
+                    "blob_sha256": await _blob_sha256(self._session, row.blob_id),
+                    "feature_blob_sha256": await _blob_sha256(
+                        self._session, row.feature_blob_id
+                    ),
+                    "tool_version": row.tool_version,
+                    "escaper_compatibility_version": row.escaper_compatibility_version,
+                    "intel_pic_hash_escape_version": row.intel_pic_hash_escape_version,
+                    "parameters_sha256": row.parameters_sha256,
+                    "architecture": row.architecture,
+                    "status": row.status,
+                    "payload": row.payload,
+                    "errors": row.errors,
+                }
+            )
+        return result
+
 
 def _code_feature_set_from_row(row: CodeFeatureSetRow) -> CodeFeatureSet:
     payload = row.payload
@@ -885,6 +946,34 @@ class SqlAlchemySampleFeatureSetRepository:
             ),
         )
         await self._session.flush()
+
+    async def list_for_samples(self, sample_ids: Sequence[UUID]) -> Sequence[Mapping[str, object]]:
+        ids = tuple(dict.fromkeys(sample_ids))
+        if not ids:
+            return ()
+        rows = await self._session.scalars(
+            select(SampleFeatureSetRow)
+            .where(SampleFeatureSetRow.sample_id.in_(ids))
+            .order_by(SampleFeatureSetRow.sample_id, SampleFeatureSetRow.id)
+        )
+        result: list[Mapping[str, object]] = []
+        for row in rows:
+            result.append(
+                {
+                    "id": str(row.id),
+                    "sample_id": str(row.sample_id),
+                    "blob_id": str(row.blob_id),
+                    "feature_blob_id": str(row.feature_blob_id),
+                    "blob_sha256": await _blob_sha256(self._session, row.blob_id),
+                    "feature_blob_sha256": await _blob_sha256(
+                        self._session, row.feature_blob_id
+                    ),
+                    "extractor_version": row.extractor_version,
+                    "parameters_sha256": row.parameters_sha256,
+                    "payload": row.payload,
+                }
+            )
+        return result
 
 
 def _feature_from_payload(data: dict[str, Any]) -> SampleFeatureSetV1:
@@ -1204,6 +1293,11 @@ def _blob_from_row(row: BlobRow) -> BlobRecord:
         ),
         created_at=row.created_at,
     )
+
+
+async def _blob_sha256(session: AsyncSession, blob_id: UUID) -> str | None:
+    row = await session.get(BlobRow, blob_id)
+    return row.sha256 if row is not None else None
 
 
 def _source_document_to_row(document: SourceDocument) -> SourceDocumentRow:

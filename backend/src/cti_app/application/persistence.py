@@ -128,6 +128,10 @@ class CapabilitySetRepository(Protocol):
     async def add_if_absent(self, capability_set: CapabilitySet, blob_id: UUID) -> bool: ...
     async def index(self, capability_set: CapabilitySet) -> None: ...
 
+    async def list_for_samples(
+        self, sample_ids: Sequence[UUID]
+    ) -> Sequence[Mapping[str, object]]: ...
+
 
 class CodeFeatureSetRepository(Protocol):
     async def get(
@@ -142,6 +146,10 @@ class CodeFeatureSetRepository(Protocol):
     async def add_if_absent(self, feature_set: CodeFeatureSet, feature_blob_id: UUID) -> bool: ...
 
     async def index(self, feature_set: CodeFeatureSet) -> None: ...
+
+    async def list_for_samples(
+        self, sample_ids: Sequence[UUID]
+    ) -> Sequence[Mapping[str, object]]: ...
 
 
 class InvariantRepository(Protocol):
@@ -246,6 +254,10 @@ class SampleFeatureSetRepository(Protocol):
         self, feature_set: SampleFeatureSetV1, feature_blob_id: UUID
     ) -> bool: ...
     async def index(self, feature_set: SampleFeatureSetV1) -> None: ...
+
+    async def list_for_samples(
+        self, sample_ids: Sequence[UUID]
+    ) -> Sequence[Mapping[str, object]]: ...
 
 
 class SampleAcquisitionAttemptRepository(Protocol):
