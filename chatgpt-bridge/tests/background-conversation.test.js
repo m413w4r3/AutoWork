@@ -111,6 +111,12 @@ function loadBackground(chrome) {
 }
 
 async function main() {
+  assert.doesNotMatch(
+    BACKGROUND_SOURCE,
+    /chrome\.runtime\.onMessage\.addListener\(async/,
+    "runtime.onMessage listener must remain synchronous",
+  );
+
   // 1. FRESH A creates exactly one inactive tab at the Temporary Chat URL.
   {
     const mock = makeChromeMock();
@@ -285,6 +291,88 @@ async function main() {
     for (const fn of mock.updatedListeners) fn(tabA.id, { url: "https://example.com/" });
 
     assert.equal(await run('conversationRegistry.has("conv-A")'), false);
+  }
+
+  // 9. A completely failed FRESH delivery removes the reservation and allows
+  // a clean retry without leaving an orphaned submitted binding.
+  {
+    const mock = makeChromeMock();
+    let sendMessageCalls = 0;
+    mock.chrome.tabs.sendMessage = async () => {
+      sendMessageCalls += 1;
+      throw new Error("content script unavailable");
+    };
+    mock.chrome.scripting.executeScript = async () => {
+      throw new Error("injection unavailable");
+    };
+    const { run } = loadBackground(mock.chrome);
+    const fresh = {
+      id: "req-1",
+      prompt: "hello",
+      conversation: { mode: "fresh", id: "conv-A" },
+    };
+
+    await run(`handlePrompt(${JSON.stringify(fresh)})`);
+    assert.equal(await run('requestStates.get("req-1")'), "failed");
+    assert.equal(await run('conversationRegistry.has("conv-A")'), false);
+    assert.equal(mock.tabsById.size, 0);
+
+    mock.chrome.tabs.sendMessage = async () => {
+      sendMessageCalls += 1;
+      return {};
+    };
+    await run(
+      `handlePrompt(${JSON.stringify({ ...fresh, id: "req-2" })})`,
+    );
+    assert.equal(mock.tabsById.size, 1, "retry FRESH must create one new tab");
+    assert.equal(await run('conversationRegistry.get("conv-A").state'), "submitted");
+    assert.equal(sendMessageCalls, 2, "failed delivery rejects, then retry sends once");
+  }
+
+  // 10. A content-script pre-submission error closes the exact reserved tab.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    await run(
+      `conversationRegistry.set("conv-A", { tab_id: ${tab.id}, state: "submitted", bridge_run_id: "req-1" })`,
+    );
+    mock.messageListeners[0](
+      {
+        type: "error",
+        id: "req-1",
+        conversation: { id: "conv-A", mode: "fresh" },
+        submission_state: "pre_submission",
+      },
+      { tab: { id: tab.id, windowId: tab.windowId } },
+      () => {},
+    );
+    await Promise.resolve();
+    assert.equal(mock.tabsById.has(tab.id), false);
+    assert.equal(await run('conversationRegistry.has("conv-A")'), false);
+  }
+
+  // 11. A post-submission error preserves the live binding for recovery.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    await run(
+      `conversationRegistry.set("conv-A", { tab_id: ${tab.id}, state: "submitted", bridge_run_id: "req-1" })`,
+    );
+    mock.messageListeners[0](
+      {
+        type: "error",
+        id: "req-1",
+        conversation: { id: "conv-A", mode: "fresh" },
+        submission_state: "post_submission",
+      },
+      { tab: { id: tab.id, windowId: tab.windowId } },
+      () => {},
+    );
+    await Promise.resolve();
+    assert.equal(mock.tabsById.has(tab.id), true);
+    assert.equal(await run('conversationRegistry.get("conv-A").state'), "submitted");
   }
 
   console.log("background conversation routing contract: ok");

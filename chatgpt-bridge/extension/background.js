@@ -409,6 +409,15 @@ async function sendToTab(tabId, msg) {
   }
 }
 
+async function cleanupFreshReservationAfterDeliveryFailure(msg) {
+  if (msg.conversation?.mode !== "fresh") return;
+  const binding = conversationRegistry.get(msg.conversation.id);
+  if (binding?.state !== "submitted" || binding.bridge_run_id !== msg.id) return;
+  await chrome.tabs.remove(binding.tab_id).catch(() => {});
+  conversationRegistry.delete(msg.conversation.id);
+  persistConversationRegistry();
+}
+
 async function handlePrompt(msg) {
   await Promise.all([requestStatesReady, replayMetadataReady, conversationRegistryReady]);
   const known = requestStates.get(msg.id);
@@ -471,9 +480,15 @@ async function handlePrompt(msg) {
   } catch (err) {
     inflight.delete(msg.id);
     busyTabs.delete(tab.id);
+    await cleanupFreshReservationAfterDeliveryFailure(msg);
     requestStates.set(msg.id, "failed");
     persistRequestStates();
-    send({ type: "error", id: msg.id, message: `Onglet injoignable : ${err.message}` });
+    send({
+      type: "error",
+      id: msg.id,
+      code: "bridge_server_error",
+      message: `Onglet injoignable : ${err.message}`,
+    });
   }
 }
 
@@ -505,7 +520,7 @@ async function handleUiRequest(msg) {
 }
 
 // Remontée des paquets du content script vers le serveur.
-chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "status") {
     sendResponse(status);
     return true;
@@ -605,7 +620,7 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
       if (msg.type === "error" && msg.conversation?.id && msg.submission_state === "pre_submission") {
         const binding = conversationRegistry.get(msg.conversation.id);
         if (binding?.state === "submitted" && binding.bridge_run_id === msg.id) {
-          await chrome.tabs.remove(binding.tab_id).catch(() => {});
+          chrome.tabs.remove(binding.tab_id).catch(() => {});
           conversationRegistry.delete(msg.conversation.id);
           persistConversationRegistry();
         }

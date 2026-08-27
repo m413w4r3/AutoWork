@@ -311,7 +311,14 @@ class ModelConversationService:
                 and duplicate_conversation.transport is ConversationTransport.CHATGPT_BRIDGE
                 and self._conversation_session_closer is not None
             ):
-                await self._conversation_session_closer.archive_conversation(conversation_id)
+                try:
+                    await self._conversation_session_closer.archive_conversation(conversation_id)
+                except Exception:
+                    logger.warning(
+                        "conversation_session_close_failed conversation_id=%s",
+                        conversation_id,
+                        exc_info=True,
+                    )
             return duplicate_success
 
         input_bytes = message.encode()

@@ -262,6 +262,15 @@ class _FailingSessionCloser:
         raise RuntimeError("simulated close failure")
 
 
+class _RecordingFailingSessionCloser:
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    async def archive_conversation(self, conversation_id: Any) -> None:
+        self.calls.append(conversation_id)
+        raise RuntimeError("simulated close failure")
+
+
 def _build_service(
     adapter: _ScriptedBridgeAdapter,
     tmp_path: Path,
@@ -414,6 +423,40 @@ async def test_delete_on_success_does_not_close_on_failure_or_needs_review(
         )
 
     assert closer.calls == []
+
+
+async def test_duplicate_delete_on_success_returns_succeeded_when_retry_close_fails(
+    tmp_path: Path,
+) -> None:
+    adapter = _ScriptedBridgeAdapter("Réponse")
+    closer = _RecordingFailingSessionCloser()
+    service, _ = _build_service(adapter, tmp_path, conversation_session_closer=closer)
+    conversation = await _fresh_conversation(service)
+
+    first = await service.add_turn(
+        conversation.id,
+        message="Question",
+        mode=ConversationMode.FRESH,
+        external_llm_allowed=True,
+        idempotency_key="delete-on-success-replay-key",
+        correlation_id="corr-dos-replay",
+        lifecycle_policy=ConversationPolicy.DELETE_ON_SUCCESS,
+    )
+    replay = await service.add_turn(
+        conversation.id,
+        message="Question",
+        mode=ConversationMode.FRESH,
+        external_llm_allowed=True,
+        idempotency_key="delete-on-success-replay-key",
+        correlation_id="corr-dos-replay-2",
+        lifecycle_policy=ConversationPolicy.DELETE_ON_SUCCESS,
+    )
+
+    assert first.status is ConversationTurnStatus.SUCCEEDED
+    assert replay.id == first.id
+    assert replay.status is ConversationTurnStatus.SUCCEEDED
+    assert len(adapter.calls) == 1
+    assert closer.calls == [conversation.id, conversation.id]
 
 
 async def test_explicit_archive_closes_bridge_session(tmp_path: Path) -> None:
