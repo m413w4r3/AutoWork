@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "18";
+const VERSION = "19";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -101,9 +101,6 @@ const SELECTORS = {
     "button[aria-label*='Temporary chat']",
     "button[aria-label*='temporaire']",
   ],
-  // Icône affichée quand la bascule est active (le second <use> de la paire
-  // superposée perd sa classe opacity-0).
-  temporaryChatCheckedIcon: ["use[href$='#chat-temp-checked']"],
 };
 
 // Libellés reconnus comme « recherche web » dans un menu d'outils (FR/EN).
@@ -921,6 +918,7 @@ async function applyControls(controls) {
 /** Requête de contrôle/lecture venue du serveur : toujours une réponse typée. */
 async function handleUi(msg) {
   try {
+    console.log("bridge_run_phase", { phase: "ui_controls" });
     const applied =
       msg.type === "ui_control"
         ? await applyControls(msg.controls || {})
@@ -1241,54 +1239,72 @@ function findAssistantTurnByExternalId(externalId) {
   return null;
 }
 
-// Active la bascule « Temporary chat ». Toute conversation ouverte par le
-// bridge doit être éphémère : c'est ce qui évite le pipeline de suppression
-// (jamais fiable en pratique — voir chatgpt-bridge/AGENTS.md, section
-// « Ephemeral conversations »). Fail-closed : si le mode ne peut pas être
-// positivement confirmé, on lève plutôt que d'envoyer un prompt qui finirait
-// dans l'historique ChatGPT.
+// Vérifie la surface de confidentialité sans jamais muter l'UI. L'URL est
+// utilisée uniquement comme propriété de la surface : elle ne sert ni
+// d'identité ni de routage de conversation.
+const TEMPORARY_CHAT_ORIGINS = new Set([
+  "https://chatgpt.com",
+  "https://chat.openai.com",
+]);
+const TEMPORARY_SURFACE_TIMEOUT_MS = 15000;
+
+function temporaryVerificationFailure(reason, url, composerFound, toggleFound) {
+  console.warn("temporary_chat_verification_failed", {
+    reason,
+    origin: url?.origin ?? null,
+    pathname: url?.pathname ?? null,
+    temporary_param: url?.searchParams.get("temporary-chat") ?? null,
+    composer_found: composerFound,
+    toggle_found: toggleFound,
+    content_script_version: VERSION,
+  });
+}
+
 async function ensureTemporaryChat() {
-  const findToggle = () => $(SELECTORS.temporaryChatToggle);
-  const isActive = (toggle) => {
-    if (!toggle) return false;
-    const checkedIcon = toggle.querySelector(SELECTORS.temporaryChatCheckedIcon.join(", "));
-    const checkedSvg = checkedIcon?.closest("svg");
-    if (checkedSvg) return !checkedSvg.classList.contains("opacity-0");
-    return toggle.getAttribute("aria-pressed") === "true";
-  };
+  const deadline = Date.now() + TEMPORARY_SURFACE_TIMEOUT_MS;
+  let lastReason = "temporary_surface_origin_invalid";
+  while (Date.now() < deadline) {
+    let url;
+    try {
+      url = new URL(window.location.href);
+    } catch {
+      temporaryVerificationFailure(lastReason, null, false, false);
+      throw new BridgeError("conversation_unavailable", "surface Temporary Chat invalide");
+    }
 
-  const toggle = await waitFor(
-    findToggle,
-    15000,
-    "bascule 'Temporary chat' introuvable",
-  ).catch(() => null);
-  if (!toggle) {
-    throw new BridgeError(
-      "bridge_ui_timeout",
-      "bascule 'Temporary chat' introuvable — la conversation ne sera pas envoyée",
-    );
+    const composer = $(SELECTORS.composer);
+    const toggleFound = Boolean($(SELECTORS.temporaryChatToggle));
+    if (!TEMPORARY_CHAT_ORIGINS.has(url.origin)) {
+      lastReason = "temporary_surface_origin_invalid";
+    } else if (url.pathname !== "/") {
+      lastReason = "temporary_surface_path_invalid";
+    } else if (!url.searchParams.has("temporary-chat")) {
+      lastReason = "temporary_query_missing";
+    } else if (url.searchParams.get("temporary-chat") !== "true") {
+      lastReason = "temporary_query_not_true";
+    } else if (!composer) {
+      lastReason = "temporary_composer_missing";
+    } else {
+      console.log("bridge_run_phase", { phase: "temporary_verification", state: "verified", content_script_version: VERSION });
+      return composer;
+    }
+
+    // Origin/path/query violations are deterministic and must not become a
+    // generic 15s timeout. Only a missing composer can be an SPA load race.
+    if (lastReason !== "temporary_composer_missing") {
+      temporaryVerificationFailure(lastReason, url, Boolean(composer), toggleFound);
+      throw new BridgeError(
+        lastReason === "temporary_surface_path_invalid" ? "conversation_unavailable" : "bridge_ui_timeout",
+        `vérification Temporary Chat refusée (${lastReason})`,
+      );
+    }
+    await sleep(100);
   }
 
-  if (isActive(toggle)) {
-    console.log("🕶️ Temporary chat déjà actif sur cet onglet");
-    return;
-  }
-
-  toggle.click();
-  // Chaque scrutation reinterroge le DOM (findToggle()) plutôt que de fermer
-  // sur `toggle` : un rerendu React peut remplacer le nœud après le clic.
-  const confirmed = await waitFor(
-    () => (isActive(findToggle()) ? true : null),
-    5000,
-    "activation de 'Temporary chat' non confirmée",
-  ).catch(() => null);
-  if (!confirmed) {
-    throw new BridgeError(
-      "bridge_ui_timeout",
-      "clic sur 'Temporary chat' envoyé mais l'activation n'a pas pu être confirmée",
-    );
-  }
-  console.log("🕶️ Temporary chat activé — conversation éphémère (aucun historique ChatGPT)");
+  let url = null;
+  try { url = new URL(window.location.href); } catch { /* diagnostic below */ }
+  temporaryVerificationFailure(lastReason, url, Boolean($(SELECTORS.composer)), Boolean($(SELECTORS.temporaryChatToggle)));
+  throw new BridgeError("bridge_ui_timeout", "composer Temporary Chat introuvable");
 }
 
 async function handlePrompt({
@@ -1308,6 +1324,7 @@ async function handlePrompt({
   currentJob = job;
 
   try {
+    console.log("bridge_run_phase", { phase: "prompt_received" });
     if (newChat) {
       const link = $(SELECTORS.newChat);
       if (link) {
@@ -1321,9 +1338,7 @@ async function handlePrompt({
     // Toute conversation liée au bridge (fresh, continue, ou newChat
     // explicite) doit être un Temporary Chat, positivement confirmé avant
     // Send — jamais best-effort. Voir ensureTemporaryChat() ci-dessus.
-    if (conversation || newChat) {
-      await ensureTemporaryChat();
-    }
+    if (conversation || newChat) await ensureTemporaryChat();
 
     // CONTINUE : le tour précédent attendu doit exister exactement dans cet
     // onglet, par identité stable — jamais par index ou par comptage — avant
@@ -1351,6 +1366,7 @@ async function handlePrompt({
       15000,
       "composer introuvable",
     );
+    console.log("bridge_run_phase", { phase: "composer" });
     const before = document.querySelectorAll(SELECTORS.assistant).length;
     if (!baselineTurn && before) {
       baselineTurn = document.querySelectorAll(SELECTORS.assistant)[before - 1];
@@ -1372,7 +1388,9 @@ async function handlePrompt({
         : "bouton d'envoi jamais actif",
     );
     sendStarted = true;
+    console.log("bridge_run_phase", { phase: "send" });
     sendBtn.click();
+    console.log("send_clicked", { content_script_version: VERSION });
 
     if (conversation) {
       reply({
@@ -1404,6 +1422,7 @@ async function handlePrompt({
 
     if (!job.aborted) {
       const externalTurnId = turnExternalId(premier);
+      console.log("bridge_run_phase", { phase: "generation" });
       if (!externalTurnId) {
         throw new BridgeError(
           "conversation_unavailable",

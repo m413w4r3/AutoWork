@@ -30,9 +30,10 @@ try {
  * Charge les scripts de l'extension dans un DOM simulé et rend leurs fonctions
  * de haut niveau appelables depuis le test.
  */
-function loadExtension(body) {
+function loadExtension(body, url = "https://chatgpt.com/") {
   const dom = new JSDOM(`<!doctype html><html><body>${body}</body></html>`, {
     runScripts: "outside-only",
+    url,
   });
   const { window } = dom;
 
@@ -234,13 +235,6 @@ const WATCHED = `document.querySelector("[data-testid='conversation-turn-3'] [da
 // Temporary Chat : confirmation positive avant Send, jamais best-effort ; et
 // identité du tour précédent pour CONTINUE, jamais par index/comptage.
 // --------------------------------------------------------------------------- //
-function temporaryChatToggleMarkup(active) {
-  return `
-    <button aria-label="Temporary chat">
-      <svg class="${active ? "" : "opacity-0"}"><use href="#chat-temp-checked"></use></svg>
-    </button>`;
-}
-
 /** Contourne les délais réels de waitFor()/sleep() : chaque setTimeout avance
  * une horloge virtuelle et relance immédiatement le callback. */
 function useVirtualClock(window) {
@@ -254,77 +248,120 @@ function useVirtualClock(window) {
 }
 
 (async () => {
-  // 1. Temporary Chat déjà actif -> succès immédiat, aucun clic.
+  const temporaryComposer = `<div id="prompt-textarea" contenteditable="true"></div>`;
+
+  // 1. URL Temporary + composer, sans toggle : le markup de l'UI n'est pas
+  // une preuve de confidentialité et n'est jamais requis.
+  {
+    const { run } = loadExtension(temporaryComposer, "https://chatgpt.com/?temporary-chat=true");
+    await run("ensureTemporaryChat()");
+  }
+
+  // 2. Toggle au markup inconnu : accepté, sans clic.
   {
     const { window, run } = loadExtension(
-      `<main>${temporaryChatToggleMarkup(true)}</main>`,
+      `${temporaryComposer}<button aria-label="Temporary chat"><svg><use href="#unknown"></use></svg></button>`,
+      "https://chatgpt.com/?temporary-chat=true",
     );
     useVirtualClock(window);
     let clicked = false;
-    window.document
-      .querySelector("button[aria-label='Temporary chat']")
-      .addEventListener("click", () => {
-        clicked = true;
-      });
+    window.document.querySelector("button[aria-label='Temporary chat']").addEventListener("click", () => { clicked = true; });
     await run("ensureTemporaryChat()");
-    assert.equal(clicked, false, "un toggle déjà actif ne doit jamais être cliqué");
+    assert.equal(clicked, false, "un toggle au markup inconnu ne doit jamais être cliqué");
   }
 
-  // 2. Clic puis remplacement du nœud (rendu React) -> la vérification doit
-  //    re-interroger le DOM, pas fermer sur l'ancien nœud.
+  // 3. aria-pressed=false ne doit pas provoquer de mutation.
   {
     const { window, run } = loadExtension(
-      `<main>${temporaryChatToggleMarkup(false)}</main>`,
+      `${temporaryComposer}<button aria-label="Temporary chat" aria-pressed="false"></button>`,
+      "https://chatgpt.com/?temporary-chat=true",
     );
     useVirtualClock(window);
-    window.document.addEventListener("click", (evt) => {
-      const target = evt.target;
-      if (
-        target &&
-        target.matches &&
-        target.matches("button[aria-label='Temporary chat']")
-      ) {
-        const replacement = window.document.createElement("button");
-        replacement.setAttribute("aria-label", "Temporary chat");
-        replacement.innerHTML = '<svg><use href="#chat-temp-checked"></use></svg>';
-        target.replaceWith(replacement);
-      }
+    let clicked = false;
+    window.document.querySelector("button[aria-label='Temporary chat']").addEventListener("click", () => { clicked = true; });
+    await run("ensureTemporaryChat()");
+    assert.equal(clicked, false, "aria-pressed=false ne doit jamais être cliqué");
+  }
+
+  // 4-7. URL non temporaire ou navigation persistante : échec immédiat.
+  {
+    const { run } = loadExtension(temporaryComposer, "https://chatgpt.com/");
+    await assert.rejects(run("ensureTemporaryChat()"), (err) => err.code === "bridge_ui_timeout");
+  }
+  {
+    const { run } = loadExtension(temporaryComposer, "https://chatgpt.com/?temporary-chat=false");
+    await assert.rejects(run("ensureTemporaryChat()"), (err) => err.code === "bridge_ui_timeout");
+  }
+  {
+    const { run } = loadExtension(temporaryComposer, "https://chatgpt.com/c/abc123");
+    await assert.rejects(run("ensureTemporaryChat()"), (err) => err.code === "conversation_unavailable");
+  }
+  {
+    const { run } = loadExtension(temporaryComposer, "https://example.com/?temporary-chat=true");
+    await assert.rejects(run("ensureTemporaryChat()"), (err) => err.code === "bridge_ui_timeout");
+  }
+
+  // 8. URL correcte mais composer jamais rendu : timeout de chargement, avec
+  // relecture du DOM à chaque poll.
+  {
+    const { window, run } = loadExtension("", "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    await assert.rejects(
+      run("ensureTemporaryChat()"),
+      (err) => err.code === "bridge_ui_timeout",
+      "composer absent : bridge_ui_timeout",
+    );
+  }
+
+  // 9. Composer rendu après plusieurs polls : le DOM est relu, sans conserver
+  // un nœud obsolète.
+  {
+    const { window, run } = loadExtension("", "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    window.setTimeout(() => { window.document.body.innerHTML = temporaryComposer; }, 300);
+    await run("ensureTemporaryChat()");
+  }
+
+  // 10. Chemin comportemental réel : l'onglet est créé directement sur l'URL
+  // Temporary, le composer existe et l'ancien markup SVG est absent. Le prompt
+  // doit atteindre Send sans aucun contrôle Temporary.
+  {
+    const body = `<textarea data-id="prompt"></textarea><button data-testid="send-button">Send</button>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    let sendClicks = 0;
+    window.document.querySelector("button[data-testid='send-button']").addEventListener("click", () => {
+      sendClicks += 1;
+      window.document.body.insertAdjacentHTML("beforeend", `
+        <article data-testid="conversation-turn-1">
+          <div data-message-author-role="assistant" data-message-id="msg-A1">
+            <div class="markdown"><p>réponse finale</p></div>
+          </div>
+          ${copyButton}
+        </article>`);
     });
-    await run("ensureTemporaryChat()");
-    const stillOpacityZero = run(
-      "document.querySelector(\"button[aria-label='Temporary chat'] svg\").classList.contains('opacity-0')",
-    );
-    assert.equal(
-      stillOpacityZero,
-      false,
-      "après rerendu, la vérification doit lire le nouveau nœud actif",
-    );
+    await run(`handlePrompt({ id: "req-A", prompt: "bonjour", conversation: { id: "conv-A", mode: "fresh" } })`);
+    assert.equal(window.document.querySelector("textarea[data-id='prompt']").value, "bonjour");
+    assert.equal(sendClicks, 1, "le chemin fresh doit cliquer Send exactement une fois");
+    assert.equal(sent.some((message) => message.type === "error"), false, "aucune erreur pre_submission");
+    assert.equal(sent.some((message) => message.type === "done"), true, "le chemin comportemental doit terminer");
   }
 
-  // 3. Bascule introuvable -> échec typé avant tout Send, jamais un
-  //    repli silencieux.
+  // 11. CONTINUE sur une navigation /c/... : refus avant toute saisie/envoi.
   {
-    const { window, run } = loadExtension(`<main></main>`);
+    const body = `${temporaryComposer}<button data-testid="send-button">Send</button>
+      <article data-testid="conversation-turn-1"><div data-message-author-role="assistant" data-message-id="msg-A1"><div class="markdown">ancien</div></div></article>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/c/abc123");
     useVirtualClock(window);
-    await assert.rejects(
-      run("ensureTemporaryChat()"),
-      (err) => err.code === "bridge_ui_timeout",
-      "bascule introuvable : doit lever bridge_ui_timeout, jamais réussir silencieusement",
-    );
-  }
-
-  // 4. Bascule trouvée mais l'activation n'est jamais confirmée après le clic.
-  {
-    const { window, run } = loadExtension(
-      `<main>${temporaryChatToggleMarkup(false)}</main>`,
-    );
-    useVirtualClock(window);
-    // Aucun listener de clic : le toggle ne passe jamais actif.
-    await assert.rejects(
-      run("ensureTemporaryChat()"),
-      (err) => err.code === "bridge_ui_timeout",
-      "activation non confirmée : bridge_ui_timeout, jamais un faux succès",
-    );
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    let sendClicks = 0;
+    window.document.querySelector("button[data-testid='send-button']").addEventListener("click", () => { sendClicks += 1; });
+    await run(`handlePrompt({ id: "req-continue", prompt: "suite", conversation: { id: "conv-A", mode: "continue", expected_turn_id: "msg-A1" } })`);
+    assert.equal(sendClicks, 0, "une navigation /c/... interdit tout envoi");
+    assert.equal(sent.find((message) => message.type === "error")?.code, "conversation_unavailable");
   }
 
   // 5. CONTINUE : le tour externe attendu existe -> trouvé par identité stable.
@@ -361,6 +398,8 @@ function useVirtualClock(window) {
   // 7. Aucune attente de 15s sur un locator de conversation ne subsiste.
   {
     const source = fs.readFileSync(path.join(EXTENSION, "content.js"), "utf8");
+    assert.equal(source.includes("toggle.click()"), false, "le bridge ne doit jamais cliquer le toggle Temporary");
+    assert.equal(source.includes("temporaryChatCheckedIcon"), false, "l'ancien signal SVG ne doit plus exister");
     assert.ok(
       !source.includes("locator de conversation non attribué"),
       "l'ancienne attente de locator de conversation ne doit plus exister",

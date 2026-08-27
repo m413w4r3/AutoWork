@@ -471,6 +471,8 @@ async function handlePrompt(msg) {
     if (binding?.state === "reserved") {
       conversationRegistry.set(msg.conversation.id, { ...binding, state: "submitted", bridge_run_id: msg.id });
       persistConversationRegistry();
+      console.log("bridge_run_phase", { phase: "conversation_reserved", conversation_id: msg.conversation.id, tab_id: tab.id });
+      console.log("bridge_run_phase", { phase: "conversation_submitted", conversation_id: msg.conversation.id, tab_id: tab.id });
     }
   }
   requestStates.set(msg.id, "running");
@@ -559,6 +561,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         last_verified_at: Date.now(),
       });
       persistConversationRegistry();
+      console.log("bridge_run_phase", { phase: "conversation_bound", conversation_id: msg.conversation.id, tab_id: sender.tab?.id || null });
     }
     if (["done", "incomplete", "error"].includes(msg.type)) {
       const tabId = inflight.get(msg.id);
