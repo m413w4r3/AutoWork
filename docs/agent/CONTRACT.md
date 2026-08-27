@@ -46,3 +46,56 @@ Utilise pytest -q --tb=short. Pas de make test.
 Rapport final : maximum 25 lignes, cinq rubriques seulement :
 Fichiers modifiés ; Décisions ; Tests ; Écarts ; Risques.
 Pas de citation du code, pas de diff recopié. Pas de commit, push ou PR.
+
+## Discipline M3
+
+La pré-localisation et les contrats M3 sont déjà faits. Pour chaque lot M3, lis
+uniquement les chemins explicitement listés par son prompt. Pas de ctx.py, rg,
+find, tree, recherche web ni exploration de confort. Si une abstraction requise
+n'existe pas dans ces fichiers, STOP avec le chemin/symbole manquant ; ne cherche
+pas un substitut ailleurs.
+
+Les migrations 0001 à 0010 sont immuables. Le lot 09 crée uniquement la migration
+nommée par son prompt. Le lot 10 ne réécrit jamais cette migration et ne crée une
+migration supplémentaire que si son prompt l'autorise explicitement.
+
+M3 consomme les sorties persistées de M2. Le lot 09 ne relance ni analyse statique,
+ni capa, ni SMDA, ni VirusTotal, ni modèle. Il ne relit pas les octets d'un sample
+pour recalculer une feature déjà disponible en base.
+
+Les taxonomies, provenances, règles de rejet et tests de P09 sont définis dans
+`docs/design/09-invariant-registry.md`. Les contrats conversationnels et de sortie
+P10 sont définis dans `docs/design/10-proposal-conversation.md`. Ne crée pas une
+taxonomie parallèle et ne remplace pas une valeur inconnue/non mesurable par zéro.
+
+Les seuils M3 sont des entrées de configuration/contrat humain. Aucun agent ne
+choisit silencieusement une valeur pour la banalité, la longueur maximale de motif,
+le ratio maximal d'octets masqués, la longueur fixe minimale ou `likely_packed`.
+Si un seuil requis n'est pas fourni, STOP au lieu d'inventer un défaut.
+
+Toute idempotence M3 est protégée par PostgreSQL ou par une primitive persistante
+canonique existante. Les journaux de rejets et décisions restent inspectables et
+append-only selon leur contrat. Une sortie modèle n'est jamais une approbation,
+une preuve primaire ni une autorité analyste.
+
+P10 réutilise `ModelConversationService`/`ModelGateway`. Ne contacte jamais un
+provider ou le bridge directement. Recalcule `derived_policy` sur les Samples
+réellement inclus à chaque tour. Une politique qui interdit l'externe doit être
+bloquée avant l'appel externe ou utiliser le routing local déjà autorisé ; elle
+n'est jamais affaiblie.
+
+Ne garde jamais une transaction PostgreSQL ouverte pendant un appel modèle ou
+réseau. Aucun octet de sample, secret, API key ou signed URL dans prompt, log,
+erreur, provenance ou paramètre de job.
+
+P10 propose seulement : aucune requête VT, acquisition, compilation YARA,
+validation/approbation d'invariant, promotion de corpus ou consommation de budget
+`PIVOT_RUNS`. Les propositions repassent par les rejets déterministes P09.
+
+Pas de frontend, endpoint public, worker, queue ou wiring anticipé si le prompt du
+lot ne le demande pas. Pas de refactor transverse de confort.
+
+Exécute uniquement les tests/checks listés dans le prompt, avec pytest -q
+--tb=short. Pas de suite globale ni make test. Rapport final : maximum 25 lignes,
+cinq rubriques : Fichiers modifiés ; Décisions ; Tests ; Écarts ; Risques. Pas de
+commit, push ou PR.
