@@ -50,8 +50,10 @@ def test_manifest_is_deterministic_and_has_no_mtime(tmp_path: Path) -> None:
 def test_parser_normalizes_and_ignores_upstream_extra_fields() -> None:
     payload = (
         b'{"rules":{"z":{"meta":{"name":"Z","namespace":"n",'
-        b'"attack":["T2","T1","T1"],"mbc":["B"]},'
-        b'"matches":[{"locations":["0x2","0x1"],"extra":true}],"extra":1}}}'
+        b'"att&ck":[{"id":"T2"},{"id":"T1"},{"id":"T1"}],'
+        b'"mbc":[{"id":"B"}]},"source":"fixture",'
+        b'"matches":[[{"type":"absolute","value":2},{"statement":{},"extra":true}],'
+        b'[{"type":"relative","value":1},{"statement":{}}]],"extra":1}}}'
     )
     values, errors = parse_capa_output(payload)
     assert not errors

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 from cti_app.domain.code_features import CodeFunction, CodeInstruction
@@ -52,18 +54,27 @@ class SmdaAdapter:
         runner: Runner = run_analysis_subprocess,
         python_executable: str = sys.executable,
     ) -> None:
-        self.wrapper_path = wrapper_path
+        backend_root = Path(__file__).resolve().parents[3]
+        if wrapper_path == Path("tools/smda_extract.py"):
+            wrapper_path = backend_root / wrapper_path
+        self.wrapper_path = wrapper_path.resolve()
         self._runner = runner
         self._python_executable = python_executable
 
     async def extract(
         self,
-        sample_path: Path,
+        sample: bytes,
         *,
         timeout_seconds: float,
         output_limit: int,
         memory_limit_bytes: int,
     ) -> SmdaAdapterResult:
+        try:
+            with NamedTemporaryFile(prefix="cti-smda-", delete=False) as handle:
+                handle.write(sample)
+                sample_path = Path(handle.name)
+        except OSError as exc:
+            return SmdaAdapterResult(status="UNAVAILABLE", error=type(exc).__name__)
         try:
             result = await self._runner(
                 [self._python_executable, str(self.wrapper_path), str(sample_path)],
@@ -73,6 +84,11 @@ class SmdaAdapter:
             )
         except (OSError, FileNotFoundError) as exc:
             return SmdaAdapterResult(status="UNAVAILABLE", error=type(exc).__name__)
+        finally:
+            try:
+                os.unlink(sample_path)
+            except FileNotFoundError:
+                pass
         if result.status is not AnalysisSubprocessStatus.SUCCEEDED:
             status = (
                 "INVALID_OUTPUT"
@@ -154,8 +170,24 @@ def _parse_function(data: Any) -> CodeFunction:
 
 def _architecture(value: Any) -> str:
     architecture = _string(value, "architecture").lower()
-    aliases = {"intel.32bit": "x86", "intel.64bit": "x64", "x86": "x86", "x64": "x64"}
-    return aliases.get(architecture, architecture)
+    aliases = {
+        "intel.32bit": "x86",
+        "intel.64bit": "x64",
+        "architecture.intel.32bit": "x86",
+        "architecture.intel.64bit": "x64",
+        "x86": "x86",
+        "x64": "x64",
+        "x86_64": "x64",
+        "x86-64": "x64",
+        "amd64": "x64",
+    }
+    if architecture in aliases:
+        return aliases[architecture]
+    if "intel" in architecture and "64" in architecture:
+        return "x64"
+    if "intel" in architecture and "32" in architecture:
+        return "x86"
+    return architecture
 
 
 def _list(value: Any, name: str) -> list[Any]:
@@ -173,7 +205,7 @@ def _string(value: Any, name: str) -> str:
 def _integer(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise SmdaOutputError(f"{name} must be a non-negative integer")
-    return value
+    return int(value)
 
 
 def _bytes(value: Any, name: str) -> bytes:

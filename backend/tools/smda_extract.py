@@ -19,7 +19,19 @@ from smda.SmdaConfig import SmdaConfig
 def main(path: Path) -> None:
     report = Disassembler().disassembleFile(str(path))
     architecture = str(getattr(report, "architecture", ""))
+    if architecture.lower() == "intel":
+        architecture = _infer_intel_architecture(path) or architecture
     escaper = report.getInstructionEscaper()
+    base_addr = getattr(report, "base_addr", None)
+    binary_size = getattr(report, "binary_size", None)
+    escaped_bounds = None
+    if (
+        isinstance(base_addr, int)
+        and not isinstance(base_addr, bool)
+        and isinstance(binary_size, int)
+        and not isinstance(binary_size, bool)
+    ):
+        escaped_bounds = (base_addr, base_addr + binary_size)
     functions = []
     for function in report.getFunctions():
         blocks = []
@@ -27,13 +39,19 @@ def main(path: Path) -> None:
             instructions = []
             for instruction in block.getInstructions():
                 raw_bytes = _json_bytes(instruction.bytes)
-                escaped = escaper.escapeBinary(instruction.bytes, instruction.offset)
+                escaped_kwargs = {}
+                if escaped_bounds is not None:
+                    escaped_kwargs = {
+                        "lower_addr": escaped_bounds[0],
+                        "upper_addr": escaped_bounds[1],
+                    }
+                escaped = instruction.getEscapedBinary(escaper, **escaped_kwargs)
                 instructions.append(
                     {
                         "offset": int(instruction.offset),
                         "bytes": raw_bytes,
                         "mnemonic": str(instruction.mnemonic),
-                        "escaped_bytes": _json_escaped_bytes(escaped),
+                        "escaped_bytes": _json_escaped_bytes(escaped, bytes(raw_bytes)),
                     }
                 )
             blocks.append({"offset": int(block.offset), "instructions": instructions})
@@ -49,41 +67,50 @@ def main(path: Path) -> None:
     sys.stdout.write("\n")
 
 
+def _infer_intel_architecture(path: Path) -> str | None:
+    payload = path.read_bytes()
+    if payload.startswith(b"MZ") and len(payload) >= 0x40:
+        pe_offset = int.from_bytes(payload[0x3C:0x40], "little")
+        optional_magic_offset = pe_offset + 24
+        if len(payload) >= optional_magic_offset + 2:
+            optional_magic = int.from_bytes(
+                payload[optional_magic_offset : optional_magic_offset + 2], "little"
+            )
+            if optional_magic == 0x20B:
+                return "intel.64bit"
+            if optional_magic == 0x10B:
+                return "intel.32bit"
+    if payload.startswith(b"\x7fELF") and len(payload) >= 20:
+        machine = int.from_bytes(payload[18:20], "little")
+        if machine == 0x3E:
+            return "intel.64bit" if payload[4] == 2 else None
+        if machine == 0x03:
+            return "intel.32bit" if payload[4] == 1 else None
+    return None
+
+
 def _json_bytes(value: Any) -> list[int]:
     if isinstance(value, str):
         return list(bytes.fromhex(value))
     return list(bytes(value))
 
 
-def _json_escaped_bytes(value: Any) -> list[Any]:
-    if isinstance(value, str):
-        parts = value.split()
-        if len(parts) > 1:
-            return [_escaped_token(part) for part in parts]
-        if len(value) % 2 == 0:
-            try:
-                return list(bytes.fromhex(value))
-            except ValueError:
-                pass
-        return [_escaped_token(value)]
-    if isinstance(value, (bytes, bytearray)):
-        return list(value)
-    return [_json_escaped_token(item) for item in value]
-
-
-def _json_escaped_token(value: Any) -> Any:
-    if isinstance(value, (bytes, bytearray)) and len(value) == 1:
-        return value[0]
-    return value
-
-
-def _escaped_token(value: str) -> Any:
-    value = value.strip()
-    if value in {"?", "??", "*", "masked", "MASKED"}:
-        return "??"
-    if len(value) == 2:
-        return int(value, 16)
-    return value
+def _json_escaped_bytes(value: Any, raw_bytes: bytes) -> list[Any]:
+    if not isinstance(value, str):
+        raise ValueError("SMDA escaped bytes must be a string")
+    if len(value) != 2 * len(raw_bytes):
+        raise ValueError("SMDA escaped bytes length does not match raw bytes")
+    output: list[Any] = []
+    for index in range(0, len(value), 2):
+        pair = value[index : index + 2]
+        if pair == "??":
+            output.append("??")
+            continue
+        try:
+            output.append(int(pair, 16))
+        except ValueError as exc:
+            raise ValueError("SMDA escaped bytes contain an unexpected character") from exc
+    return output
 
 
 if __name__ == "__main__":

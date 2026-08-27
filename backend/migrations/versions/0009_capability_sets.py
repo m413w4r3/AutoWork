@@ -30,6 +30,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute(
+        sa.text("DELETE FROM sample_feature_index WHERE capability_set_id IS NOT NULL")
+    )
     op.alter_column("sample_feature_index", "feature_set_id", existing_type=postgresql.UUID(as_uuid=True), nullable=False)
     op.drop_constraint("fk_sample_feature_index_capability_set", "sample_feature_index", type_="foreignkey")
     op.drop_column("sample_feature_index", "capability_set_id")

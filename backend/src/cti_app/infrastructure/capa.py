@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from cti_app.infrastructure.analysis_subprocess import (
     AnalysisSubprocessResult,
@@ -30,20 +30,32 @@ class SubprocessRunner(Protocol):
 class CapaMeta(BaseModel):
     model_config = ConfigDict(extra="ignore")
     name: StrictStr
-    namespace: StrictStr = ""
-    attack: list[StrictStr] = Field(default_factory=list)
-    mbc: list[StrictStr] = Field(default_factory=list)
+    namespace: StrictStr | None
+    attack: list[CapaAttackSpec] = Field(alias="att&ck")
+    mbc: list[CapaMbcSpec]
 
 
-class CapaMatch(BaseModel):
+class CapaAttackSpec(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    locations: list[Any] = Field(default_factory=list)
+    id: StrictStr
+
+
+class CapaMbcSpec(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: StrictStr
+
+
+class CapaAddress(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    type: StrictStr
+    value: StrictInt | list[StrictInt] | None
 
 
 class CapaRule(BaseModel):
     model_config = ConfigDict(extra="ignore")
     meta: CapaMeta
-    matches: list[CapaMatch] = Field(default_factory=list)
+    source: StrictStr
+    matches: list[tuple[CapaAddress, dict[str, Any]]]
 
 
 class CapaOutput(BaseModel):
@@ -65,6 +77,10 @@ def ruleset_manifest(rules_path: Path) -> str | None:
     return hashlib.sha256("".join(lines).encode()).hexdigest()
 
 
+def _absolute_path(path: Path) -> Path:
+    return path.resolve()
+
+
 def _strings(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
         return (value,)
@@ -78,22 +94,33 @@ def parse_capa_output(payload: bytes) -> tuple[tuple[dict[str, Any], ...], tuple
         parsed = CapaOutput.model_validate_json(payload)
     except Exception as exc:
         return (), (f"invalid capa JSON: {type(exc).__name__}",)
-    capabilities = []
+    capabilities: list[dict[str, Any]] = []
     for rule_id, rule in parsed.rules.items():
-        addresses = []
-        for match in rule.matches:
-            addresses.extend(str(location) for location in match.locations)
+        addresses = sorted(
+            {
+                hex(address.value)
+                for address, _match in rule.matches
+                if address.type in {"absolute", "relative"}
+                and isinstance(address.value, int)
+                and not isinstance(address.value, bool)
+            },
+            key=lambda value: int(value, 16),
+        )
+        attack = sorted(
+            {spec.id.strip() for spec in rule.meta.attack if spec.id.strip()}
+        )
+        mbc = sorted({spec.id.strip() for spec in rule.meta.mbc if spec.id.strip()})
         capabilities.append(
             {
                 "rule_id": rule_id,
                 "name": rule.meta.name,
-                "namespace": rule.meta.namespace,
-                "attack": tuple(sorted(set(rule.meta.attack))),
-                "mbc": tuple(sorted(set(rule.meta.mbc))),
-                "function_addresses": tuple(sorted(set(addresses))),
+                "namespace": rule.meta.namespace or "",
+                "attack": tuple(attack),
+                "mbc": tuple(mbc),
+                "function_addresses": tuple(addresses),
             }
         )
-    capabilities.sort(key=lambda item: (item["rule_id"], item["name"], item["namespace"]))
+    capabilities.sort(key=lambda item: item["rule_id"])
     return tuple(capabilities), ()
 
 
@@ -110,6 +137,7 @@ class CapaRunner:
         output_limit: int,
         memory_limit_bytes: int,
     ) -> tuple[str, AnalysisSubprocessResult]:
+        rules_path = _absolute_path(rules_path)
         with tempfile.NamedTemporaryFile(prefix="cti-capa-", delete=False) as handle:
             handle.write(sample)
             sample_path = handle.name

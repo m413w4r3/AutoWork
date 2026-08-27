@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
 from io import BytesIO
+from math import log2
 from typing import Any, cast
 from uuid import UUID
 
@@ -11,9 +13,66 @@ from elftools.elf.elffile import ELFFile
 
 from cti_app.domain.analysis import SampleFeatureSetV1, SampleFormat
 from cti_app.domain.classification import TLP
+from cti_app.domain.code_features import PackingSignals
+from cti_app.domain.goodware import load_non_discriminant_patterns
 
 _ASCII = re.compile(rb"[ -~]{4,}")
 _WIDE = re.compile(rb"(?:[ -~]\x00){4,}")
+
+
+def build_packing_signals(payload: bytes, recovered_function_count: int) -> PackingSignals:
+    executable_sections: list[bytes] = []
+    section_names: set[str] = set()
+    try:
+        if payload.startswith(b"MZ"):
+            pe = pefile.PE(data=payload, fast_load=False)
+            for section in pe.sections:
+                name = section.Name.rstrip(b"\0").decode("ascii", "replace").strip().lower()
+                section_names.add(name)
+                if section.Characteristics & 0x20000000:
+                    data = section.get_data()
+                    if data:
+                        executable_sections.append(data)
+        elif payload.startswith(b"\x7fELF"):
+            elf = ELFFile(BytesIO(payload))
+            for section in elf.iter_sections():
+                name = str(section.name).strip().lower()
+                section_names.add(name)
+                if section["sh_flags"] & 0x4:
+                    data = section.data()
+                    if data:
+                        executable_sections.append(data)
+    except Exception:
+        executable_sections = []
+        section_names = set()
+
+    executable_bytes = sum(len(data) for data in executable_sections)
+    entropy = (
+        max(_shannon_entropy(data) for data in executable_sections)
+        if executable_sections
+        else None
+    )
+    registry = load_non_discriminant_patterns()
+    marker_hits: list[str] = []
+    for name in section_names:
+        entry = registry.lookup("section", name)
+        if entry is not None and entry.category == "upx":
+            marker_hits.append(name)
+    return PackingSignals(
+        max_executable_section_entropy=entropy,
+        executable_bytes=executable_bytes,
+        recovered_function_count=recovered_function_count,
+        executable_bytes_per_function=(
+            executable_bytes / recovered_function_count if recovered_function_count > 0 else None
+        ),
+        known_packer_marker_hits=tuple(sorted(marker_hits)),
+    )
+
+
+def _shannon_entropy(data: bytes) -> float:
+    counts = Counter(data)
+    size = len(data)
+    return -sum((count / size) * log2(count / size) for count in counts.values())
 
 
 class StaticFeatureExtractor:

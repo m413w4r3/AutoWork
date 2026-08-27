@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
@@ -201,7 +201,7 @@ def build_code_ngrams(
     sizes = validate_ngram_sizes(sizes)
     if max_per_sample < 1:
         raise ValueError("max_per_sample must be positive")
-    output: list[CodeNgram] = []
+    output: dict[str, CodeNgram] = {}
     for function in sorted(functions, key=lambda item: item.offset):
         for run in _instruction_runs(function):
             for start in range(len(run)):
@@ -216,8 +216,13 @@ def build_code_ngrams(
                     )
                     pattern = escaped_pattern(tokens)
                     fixed = sum(not _escaped_is_masked(token) for token in tokens)
-                    output.append(
-                        CodeNgram(
+                    current = output.get(pattern)
+                    if current is not None:
+                        output[pattern] = replace(
+                            current, occurrence_count=current.occurrence_count + 1
+                        )
+                    elif len(output) < max_per_sample:
+                        output[pattern] = CodeNgram(
                             pattern=pattern,
                             instruction_count=size,
                             byte_count=len(tokens),
@@ -228,16 +233,18 @@ def build_code_ngrams(
                             start_offset=selected[0].offset,
                             mnemonics=tuple(instruction.mnemonic for instruction in selected),
                         )
-                    )
-                    if len(output) >= max_per_sample:
-                        return tuple(output)
-    return tuple(output)
+    return tuple(
+        sorted(
+            output.values(),
+            key=lambda item: (item.function_offset, item.start_offset, item.pattern),
+        )
+    )
 
 
 def compare_goodware(ngram: CodeNgram, occurrence_count: int | None) -> CodeNgram:
     if ngram.masked_byte_count or not 8 <= ngram.byte_count <= 16:
         return ngram
-    verdict = GoodwareVerdict.PRESENT if occurrence_count is not None else GoodwareVerdict.ABSENT
+    verdict = GoodwareVerdict.PRESENT if occurrence_count is not None else GoodwareVerdict.UNKNOWN
     return CodeNgram(
         **{
             **{name: getattr(ngram, name) for name in ngram.__dataclass_fields__},

@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 import pytest
 
@@ -49,7 +48,7 @@ async def test_fake_runner_success_and_unsupported_architecture() -> None:
 
     adapter = SmdaAdapter(runner=runner)
     result = await adapter.extract(
-        Path("sample"), timeout_seconds=1, output_limit=1000, memory_limit_bytes=1000
+        b"sample", timeout_seconds=1, output_limit=1000, memory_limit_bytes=1000
     )
     assert result.status == "SUCCEEDED"
     assert result.extraction is not None
@@ -64,7 +63,7 @@ async def test_fake_runner_success_and_unsupported_architecture() -> None:
         )
 
     result = await SmdaAdapter(runner=unsupported).extract(
-        Path("sample"), timeout_seconds=1, output_limit=1000, memory_limit_bytes=1000
+        b"sample", timeout_seconds=1, output_limit=1000, memory_limit_bytes=1000
     )
     assert result.status == "UNAVAILABLE"
 
@@ -80,7 +79,7 @@ async def test_fake_runner_maps_output_errors_to_invalid_output() -> None:
         )
 
     result = await SmdaAdapter(runner=runner).extract(
-        Path("sample"), timeout_seconds=1, output_limit=1, memory_limit_bytes=1000
+        b"sample", timeout_seconds=1, output_limit=1, memory_limit_bytes=1000
     )
     assert result.status == "INVALID_OUTPUT"
 
