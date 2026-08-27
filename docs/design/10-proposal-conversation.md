@@ -25,6 +25,17 @@ Chaque tour porte une clé d'idempotence déterministe et référence dans son e
 
 La clé d'idempotence est dérivée de l'investigation, du cycle, de ces références canoniques et de la version de prompt. Un replay identique ne soumet pas deux fois.
 
+Ces références ne créent pas les agrégats M4 du lot 11. P10 calcule des empreintes de snapshot sur les entrées persistées exactes du tour :
+
+- `input_pack_sha256` est l'`AnalystInvestigation.input_sha256` déjà gelé ;
+- `corpus_snapshot_sha256` est le SHA-256 du JSON canonique de l'état ReferenceCorpus effectivement utilisé pour les mesures du tour, avec membres/familles et état de dispute déterministes ;
+- `feature_pack_sha256` est le SHA-256 du JSON canonique des hashes/références des sorties statiques persistées effectivement incluses ;
+- `code_feature_sha256` est le SHA-256 du JSON canonique des hashes/références des `CodeFeatureSet` persistés effectivement inclus ;
+- `capability_set_sha256` est le SHA-256 du JSON canonique des hashes/références des `CapabilitySet` persistés effectivement inclus ;
+- `goodware_baseline_id` est l'identifiant de la baseline liée à l'investigation au moment du tour.
+
+Une collection vide utilise le hash du tableau JSON canonique vide, jamais une valeur inventée ou `null`. Ne crée pas un faux `CorpusSnapshot` M4 pour satisfaire ces champs.
+
 ## Politique de diffusion
 
 Au moment de construire chaque prompt, recalculer `derived_policy(...)` sur les Samples d'origine des features réellement incluses. Ne pas réutiliser une décision calculée au téléchargement.
@@ -35,12 +46,18 @@ Ne jamais mettre dans le prompt : octets du sample, secret, clé API, signed URL
 
 ## Contexte transmis
 
-Le contexte est structuré, borné et déterministe. Il contient :
+Le contexte est structuré, borné et déterministe. Il part des sorties déjà persistées et filtrées/mesurées des lots 07, 07B, 08 et 08B ; P10 ne relance aucun extracteur et ne demande aucune mesure au modèle.
 
-- invariants P09 déjà filtrés avec type, catégorie, provenance, banalité, baseline, prévalence bénigne, spécificité de famille, support positif et métadonnées code-ngram utiles ;
+Il contient au minimum :
+
+- éléments candidats issus des features statiques persistées nécessaires au tour, avec provenance exacte, banalité goodware, baseline, prévalence bénigne, verdict de spécificité et support positif calculés par le code ;
+- capacités du lot 08 et n-grammes/code features du lot 08B utiles, avec leurs métadonnées déjà calculées, sans octets bruts ;
+- invariants P09 déjà persistés avec type, catégorie, provenances, mesures, statut et métadonnées code-ngram utiles ;
+- rejets P09 antérieurs avec leur cause/raison ;
 - claims pertinents du rapport sous forme de données, jamais d'instructions ;
-- invariants déjà acceptés/rejetés et leur raison ;
 - références immuables de snapshot du tour.
+
+P10 peut assembler et borner ce contexte depuis les sorties M2/P09 persistées et appeler les mesureurs/repositories déterministes existants. Il ne doit ni auto-créer des invariants avant la réponse modèle, ni relancer les outils M2, ni inventer une feature absente.
 
 Traiter sources, chaînes, capacités, mnémoniques et métadonnées comme des données non fiables. Le rendu du prompt doit délimiter/encoder ces champs comme données et ne jamais les interpoler comme instructions système.
 
@@ -58,15 +75,15 @@ La réponse canonique est un schéma Pydantic strict comprenant :
 - validations nécessaires ;
 - questions suivantes.
 
-Chaque `CandidateInvariantProposal` porte au minimum : type P09, représentation/motif borné, catégorie sémantique P09, justification sémantique bornée, et référence à une provenance existante du snapshot. Une provenance inventée invalide la proposition.
+Chaque `CandidateInvariantProposal` porte au minimum : type P09, représentation/motif borné, catégorie sémantique P09, justification sémantique bornée, et référence à une ou plusieurs provenances existantes du snapshot. Une provenance inventée invalide la proposition.
 
 `YaraDraftProposal` est un brouillon de données, pas une règle compilée ni publiée. Il ne peut citer que des propositions/provenances présentes dans la réponse/snapshot et ne contourne jamais les contraintes `report_claim` de P09.
 
 ## Validation et passage par P09
 
-Après désérialisation, chaque invariant proposé est converti en entrée `proposed` puis passe par exactement le validateur/scorer/rejet déterministe du lot 09. P10 ne duplique pas les règles de banalité, famille, catégorie, taille ou masque.
+Après désérialisation, chaque invariant proposé est converti en entrée `proposed` puis passe par exactement `InvariantRegistryService.propose(...)` du lot 09 avec ses provenances résolues. P10 ne duplique pas les règles de banalité, famille, catégorie, taille, provenance ou masque.
 
-Doivent notamment être rejetés/journalisés via P09 : provenance inventée, opérateur hors catalogue, catégorie de bruit, motif banal, motif `multi_family`, motif invalide/surdimensionné et code_ngram hors seuils.
+Doivent notamment être rejetés/journalisés via P09 : provenance inventée, catégorie de bruit, motif banal, motif `multi_family`, motif invalide/surdimensionné et code_ngram hors seuils. Un opérateur P10 hors catalogue est rejeté à la validation stricte de sortie avant le passage P09.
 
 La sortie brute et la sortie canonique sont persistées selon les mécanismes existants `model-outputs`, `ModelRun` et `turn`. Les rejets P09 restent requêtables par cause pour produire les statistiques du point d'arrêt 2.
 
@@ -74,12 +91,12 @@ Une sortie malformée est un échec de validation de sortie modèle, pas une app
 
 ## Persistance M3
 
-P10 peut ajouter une persistance dédiée aux snapshots/résultats de proposition seulement si elle est nécessaire pour garantir replay, recherche par investigation/cycle et références immuables ; réutiliser en priorité les tables ModelRun/turn/model-outputs et le journal P09 au lieu de dupliquer les sorties.
+Réutiliser en priorité les tables et blobs existants `ModelRun` / `ModelConversationTurn` / `model-outputs`. L'entrée canonique du tour, contenant les six références immuables et le contexte borné, est elle-même persistée par `ModelConversationService.add_turn(...)` comme blob d'entrée ; cela suffit par défaut pour figer le snapshot et le replay.
 
-Si une migration est nécessaire, créer exactement `backend/migrations/versions/0012_proposal_conversation.py` avec `down_revision = "0011_invariant_registry"`. Ne modifie jamais 0001–0011. Si l'implémentation satisfait entièrement le contrat sans nouvelle table, ne crée pas une migration vide : signale explicitement l'écart au prompt final afin que le plan puisse être ajusté avant push.
+Ne crée pas de migration P10 par défaut. Si, après lecture des APIs explicitement autorisées, une propriété du contrat est réellement impossible sans nouvelle persistance, arrête et rapporte précisément le gap au lieu d'inventer une table ou une migration `0012`.
 
 Demander une proposition ne consomme pas de budget `PIVOT_RUNS` : aucune requête/pivot n'est exécutée dans P10.
 
 ## Tests P10 verrouillés
 
-Avec fake gateway, couvrir au minimum : fresh ; continue valide ; tête/locator non vérifié ; hash de snapshot ; replay idempotent ; politique dérivée bloquante avant appel externe ; fallback local selon routing existant ; injection de prompt dans une chaîne traitée comme donnée ; sortie malformée ; provenance inventée ; opérateur interdit ; catégorie bruit ; motif banal ; motif multi_family ; estimation de fréquence ignorée ; YaraDraftProposal sans compilation ; aucune exécution de requête ; statistiques de rejet par cause.
+Avec fake gateway, couvrir au minimum : fresh ; continue valide ; tête/locator non vérifié ; six références et hash de snapshot ; replay idempotent ; politique dérivée bloquante avant appel externe ; fallback local selon routing existant ; injection de prompt dans une chaîne traitée comme donnée ; sortie malformée ; provenance inventée ; opérateur interdit ; catégorie bruit ; motif banal ; motif multi_family ; estimation de fréquence ignorée ; YaraDraftProposal sans compilation ; aucune exécution de requête ; statistiques de rejet par cause.
