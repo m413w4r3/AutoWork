@@ -76,7 +76,7 @@ def test_recovery_message_is_forwarded_exactly_without_discovery_preamble(
     assert chat_request.new_chat is False
 
 
-def test_native_translation_accepts_fresh_id_only_conversation(
+def test_native_fresh_conversation_does_not_request_ui_new_chat(
     runtime: BridgeApplication,
 ) -> None:
     from bridge.contracts import BridgeRunRequest
@@ -88,7 +88,7 @@ def test_native_translation_accepts_fresh_id_only_conversation(
 
     chat_request = _response_chat_request(runtime.bridge_routes._bridge_response_request(request))
 
-    assert chat_request.new_chat is True
+    assert chat_request.new_chat is False
 
 
 def test_native_translation_continuation_needs_expected_turn_id_not_a_locator(

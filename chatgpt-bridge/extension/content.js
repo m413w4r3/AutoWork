@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "19";
+const VERSION = "20";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -1325,7 +1325,20 @@ async function handlePrompt({
 
   try {
     console.log("bridge_run_phase", { phase: "prompt_received" });
-    if (newChat) {
+    const willClickNewChat = Boolean(newChat && !conversation);
+    console.log("bridge_prompt_navigation", {
+      conversation_mode: conversation?.mode ?? null,
+      has_conversation: Boolean(conversation),
+      requested_new_chat: Boolean(newChat),
+      will_click_new_chat: willClickNewChat,
+    });
+    if (newChat && conversation) {
+      console.warn("conversation_new_chat_ignored", {
+        conversation_id: conversation.id,
+        mode: conversation.mode,
+      });
+    }
+    if (willClickNewChat) {
       const link = $(SELECTORS.newChat);
       if (link) {
         link.click();

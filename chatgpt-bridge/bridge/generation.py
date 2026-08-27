@@ -578,7 +578,7 @@ def _response_chat_request(req: ResponseRequest) -> ChatRequest:
         model=req.model,
         messages=messages,
         stream=False,
-        new_chat=req.conversation is None or req.conversation.mode == "fresh",
+        new_chat=req.conversation is None,
     )
 
 

@@ -54,7 +54,7 @@ def test_conversation_contract_is_explicit_and_rejects_arbitrary_navigation(
         },
     )
 
-    assert _response_chat_request(
+    assert not _response_chat_request(
         runtime.bridge_routes._bridge_response_request(fresh)
     ).new_chat
     assert not _response_chat_request(

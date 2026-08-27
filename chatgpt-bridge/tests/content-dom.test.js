@@ -326,12 +326,13 @@ function useVirtualClock(window) {
   // Temporary, le composer existe et l'ancien markup SVG est absent. Le prompt
   // doit atteindre Send sans aucun contrôle Temporary.
   {
-    const body = `<textarea data-id="prompt"></textarea><button data-testid="send-button">Send</button>`;
+    const body = `<textarea data-id="prompt"></textarea><button data-testid="send-button">Send</button><button data-testid="create-new-chat-button">New chat</button>`;
     const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
     useVirtualClock(window);
     const sent = [];
     window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
     let sendClicks = 0;
+    let newChatClicks = 0;
     window.document.querySelector("button[data-testid='send-button']").addEventListener("click", () => {
       sendClicks += 1;
       window.document.body.insertAdjacentHTML("beforeend", `
@@ -342,8 +343,12 @@ function useVirtualClock(window) {
           ${copyButton}
         </article>`);
     });
-    await run(`handlePrompt({ id: "req-A", prompt: "bonjour", conversation: { id: "conv-A", mode: "fresh" } })`);
+    window.document.querySelector("button[data-testid='create-new-chat-button']").addEventListener("click", () => {
+      newChatClicks += 1;
+    });
+    await run(`handlePrompt({ id: "req-A", prompt: "bonjour", new_chat: true, conversation: { id: "conv-A", mode: "fresh" } })`);
     assert.equal(window.document.querySelector("textarea[data-id='prompt']").value, "bonjour");
+    assert.equal(newChatClicks, 0, "une conversation explicite ne doit jamais cliquer New Chat");
     assert.equal(sendClicks, 1, "le chemin fresh doit cliquer Send exactement une fois");
     assert.equal(sent.some((message) => message.type === "error"), false, "aucune erreur pre_submission");
     assert.equal(sent.some((message) => message.type === "done"), true, "le chemin comportemental doit terminer");
