@@ -2,6 +2,7 @@
 foundational entities every other bounded context references. Owns the only
 row/domain mappers for these rows."""
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -453,22 +454,37 @@ class SqlAlchemyGoodwareBaselineRepository:
             )
         await self._session.flush()
 
-    async def add_features(self, baseline_id: UUID, features: Iterable[GoodwareFeature]) -> None:
-        await _execute_insert_chunks(
-            self._session,
-            GoodwareFeatureRow.__table__,
-            (
-                {
-                    "id": uuid4(),
-                    "baseline_id": baseline_id,
-                    "feature_kind": feature.feature_kind,
-                    "normalized_value": feature.normalized_value,
-                    "occurrence_count": feature.occurrence_count,
-                }
+    async def add_features(self, baseline_id: UUID, features: Iterable[GoodwareFeature]) -> int:
+        connection = await self._session.connection()
+        raw_connection = await connection.get_raw_connection()
+        driver_connection = raw_connection.driver_connection
+        copy_records_to_table = getattr(driver_connection, "copy_records_to_table", None)
+        if not callable(copy_records_to_table):
+            raise RuntimeError("PostgreSQL asyncpg COPY capability is unavailable")
+        status = await copy_records_to_table(
+            "goodware_features",
+            columns=(
+                "id",
+                "baseline_id",
+                "feature_kind",
+                "normalized_value",
+                "occurrence_count",
+            ),
+            records=(
+                (
+                    uuid4(),
+                    baseline_id,
+                    feature.feature_kind,
+                    feature.normalized_value,
+                    feature.occurrence_count,
+                )
                 for feature in features
             ),
         )
-        await self._session.flush()
+        match = re.fullmatch(r"COPY ([0-9]+)", status) if isinstance(status, str) else None
+        if match is None:
+            raise RuntimeError(f"unexpected PostgreSQL COPY status: {status!r}")
+        return int(match.group(1))
 
 
 class SqlAlchemyInvestigationGoodwareBaselineRepository:

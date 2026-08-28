@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -21,10 +22,43 @@ class _InsertResult:
     rowcount = 1
 
 
+class _CopyDriver:
+    def __init__(self, status: str | None = None) -> None:
+        self.status = status
+        self.columns: tuple[str, ...] | None = None
+        self.records: object | None = None
+        self.rows: list[tuple[object, ...]] = []
+
+    async def copy_records_to_table(
+        self,
+        table: str,
+        *,
+        columns: tuple[str, ...],
+        records: Iterable[tuple[object, ...]],
+    ) -> str:
+        assert table == "goodware_features"
+        assert not isinstance(records, (list, tuple))
+        self.columns = columns
+        self.records = records
+        self.rows = list(records)
+        return self.status or f"COPY {len(self.rows)}"
+
+
 class _Session:
-    def __init__(self) -> None:
+    def __init__(self, copy_driver: object | None = None) -> None:
         self.scalar_calls = 0
+        self.execute_calls = 0
         self.batches: list[list[dict[str, object]]] = []
+        self.copy_driver = copy_driver
+
+    async def connection(self) -> SimpleNamespace:
+        if self.copy_driver is None:
+            raise AssertionError("this session should not use a PostgreSQL COPY connection")
+
+        async def get_raw_connection() -> SimpleNamespace:
+            return SimpleNamespace(driver_connection=self.copy_driver)
+
+        return SimpleNamespace(get_raw_connection=get_raw_connection)
 
     async def scalar(self, statement: object) -> SimpleNamespace:
         self.scalar_calls += 1
@@ -33,6 +67,7 @@ class _Session:
     async def execute(
         self, statement: object, parameters: list[dict[str, object]] | None = None
     ) -> _InsertResult:
+        self.execute_calls += 1
         if parameters is not None:
             self.batches.append(list(parameters))
         return _InsertResult()
@@ -45,9 +80,11 @@ class _Session:
 
 
 @pytest.mark.asyncio
-async def test_goodware_features_are_streamed_in_bounded_core_batches() -> None:
-    session = _Session()
+async def test_goodware_features_use_lazy_postgresql_copy() -> None:
+    copy_driver = _CopyDriver()
+    session = _Session(copy_driver)
     repository = SqlAlchemyGoodwareBaselineRepository(session)
+    baseline_id = uuid4()
 
     features = (
         GoodwareFeature(
@@ -57,10 +94,51 @@ async def test_goodware_features_are_streamed_in_bounded_core_batches() -> None:
         )
         for index in range(2001)
     )
-    await repository.add_features(uuid4(), features)
+    copied = await repository.add_features(baseline_id, features)
 
-    assert [len(batch) for batch in session.batches] == [1000, 1000, 1]
-    assert max(len(batch) for batch in session.batches) <= 1000
+    assert copied == 2001
+    assert copy_driver.columns == (
+        "id",
+        "baseline_id",
+        "feature_kind",
+        "normalized_value",
+        "occurrence_count",
+    )
+    assert copy_driver.records is not None
+    assert len(copy_driver.rows) == 2001
+    assert all(row[1] == baseline_id for row in copy_driver.rows)
+    assert copy_driver.rows[0][2:] == ("string", "value-0", 1)
+    assert copy_driver.rows[-1][2:] == ("string", "value-2000", 1)
+    assert isinstance(copy_driver.rows[0][0], UUID)
+    assert session.execute_calls == 0
+    assert session.batches == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status, expected", [("COPY 0", 0), ("COPY 2001", 2001)])
+async def test_goodware_copy_status_is_strictly_parsed(status: str, expected: int) -> None:
+    copy_driver = _CopyDriver(status)
+    repository = SqlAlchemyGoodwareBaselineRepository(_Session(copy_driver))
+
+    assert await repository.add_features(uuid4(), iter(())) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["INSERT 0 2001", "COPY nope", "COPY -1", "unexpected"])
+async def test_goodware_copy_rejects_unexpected_status(status: str) -> None:
+    copy_driver = _CopyDriver(status)
+    repository = SqlAlchemyGoodwareBaselineRepository(_Session(copy_driver))
+
+    with pytest.raises(RuntimeError, match="unexpected PostgreSQL COPY status"):
+        await repository.add_features(uuid4(), iter(()))
+
+
+@pytest.mark.asyncio
+async def test_goodware_copy_fails_closed_without_driver_capability() -> None:
+    repository = SqlAlchemyGoodwareBaselineRepository(_Session(SimpleNamespace()))
+
+    with pytest.raises(RuntimeError, match="COPY capability is unavailable"):
+        await repository.add_features(uuid4(), iter(()))
 
 
 @pytest.mark.asyncio

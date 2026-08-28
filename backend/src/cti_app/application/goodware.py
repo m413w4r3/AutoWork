@@ -17,6 +17,7 @@ class GoodwareService:
     async def import_stage(self, stage_dir: Path, source_dir: Path) -> GoodwareBaseline:
         stage = load_stage(stage_dir, source_dir)
         source_set_sha256 = cast(str, stage.manifest["source_set_sha256"])
+        record_count = cast(int, stage.manifest["record_count"])
         async with self._uow_factory() as uow:
             existing = await uow.goodware_baselines.get_by_source_set_sha256(source_set_sha256)
             if existing is not None:
@@ -58,7 +59,12 @@ class GoodwareService:
                     raise RuntimeError("goodware baseline conflict without row")
                 return existing
             await uow.goodware_baselines.add_sources(baseline.id, baseline.sources)
-            await uow.goodware_baselines.add_features(baseline.id, stage.iter_features())
+            copied = await uow.goodware_baselines.add_features(baseline.id, stage.iter_features())
+            if copied != record_count:
+                raise RuntimeError(
+                    "goodware feature COPY row count mismatch: "
+                    f"manifest={record_count}, copied={copied}"
+                )
             await uow.commit()
             return baseline
 
