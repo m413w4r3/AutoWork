@@ -53,6 +53,7 @@ from cti_app.application.persistence import (
     VirusTotalFileViewRepository,
     VirusTotalObservationRepository,
 )
+from cti_app.application.production_read_model import BatchStatusReadRepository
 from cti_app.infrastructure.database.repositories.briefs import (
     SqlAlchemyBriefDraftRepository,
     SqlAlchemyBriefEvidencePackRepository,
@@ -119,6 +120,7 @@ from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemyAnalystDecisionRepository,
     SqlAlchemyAnalystInputPackRepository,
     SqlAlchemyAnalystInvestigationRepository,
+    SqlAlchemyBatchStatusReadRepository,
     SqlAlchemyEditionProductionBatchItemRepository,
     SqlAlchemyEditionProductionBatchRepository,
     SqlAlchemyProductionArtifactRepository,
@@ -178,6 +180,7 @@ class SqlAlchemyUnitOfWork:
     analyst_input_packs: AnalystInputPackRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
+    batch_status_read_model: BatchStatusReadRepository
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -245,6 +248,7 @@ class SqlAlchemyUnitOfWork:
         self.edition_production_batch_items = SqlAlchemyEditionProductionBatchItemRepository(
             self._session
         )
+        self.batch_status_read_model = SqlAlchemyBatchStatusReadRepository(self._session)
         self._committed = False
         return self
 

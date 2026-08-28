@@ -18,6 +18,7 @@ from cti_app.application.production_jobs import (
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.production_read_model import BatchStatusReadService
 from cti_app.application.production_stage_status import (
     build_stage_statuses,
     completed_stage_count,
@@ -103,7 +104,8 @@ class BatchItemDetail(BaseModel):
     run_id: str
     status: str
     current_stage: str
-    auto_recovery_count: int = 0
+    pipeline_generation: int
+    auto_recovery_count: int
     error_code: str | None = None
     error_message: str | None = None
 
@@ -122,8 +124,8 @@ class BatchStatus(BaseModel):
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
-    phase: str = "initial"
-    next_dispatch_at: str | None = None
+    phase: str
+    next_dispatch_at: str | None
 
 
 def _runtime(request: Request) -> tuple[UnitOfWorkFactory, JobService, JobDispatcher]:
@@ -231,43 +233,32 @@ def _run_view(
 
 
 async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
-    """Build a batch response from persisted batch and run state."""
-    items = await uow.edition_production_batch_items.list_for_batch(batch.id)
+    """Build a batch response from the UI-optimized read model."""
+    items = await BatchStatusReadService(uow.batch_status_read_model).list_items(batch.id)
     completed = needs_review = failed = cancelled = 0
     details: list[BatchItemDetail] = []
     for item in items:
-        run = await uow.subject_production_runs.get(item.production_run_id)
-        if run is None:
-            continue
-        if run.status is SubjectProductionStatus.READY:
+        if item.status == SubjectProductionStatus.READY.value:
             completed += 1
-        elif run.status is SubjectProductionStatus.NEEDS_REVIEW:
+        elif item.status == SubjectProductionStatus.NEEDS_REVIEW.value:
             needs_review += 1
-        elif run.status is SubjectProductionStatus.FAILED:
+        elif item.status == SubjectProductionStatus.FAILED.value:
             failed += 1
-        elif run.status is SubjectProductionStatus.CANCELLED:
+        elif item.status == SubjectProductionStatus.CANCELLED.value:
             cancelled += 1
 
-        group = await uow.editorial_groups.get_by_subject(item.subject_id)
-        snapshot_repository = getattr(uow, "production_input_snapshots", None)
-        snapshot = await snapshot_repository.get_by_run(run.id) if snapshot_repository else None
         details.append(
             BatchItemDetail(
                 position=item.position,
                 subject_id=str(item.subject_id),
-                title=(
-                    snapshot.subject_title
-                    if snapshot
-                    else group.title
-                    if group
-                    else str(item.subject_id)
-                ),
-                run_id=str(run.id),
-                status=run.status.value,
-                current_stage=run.current_stage.value,
+                title=item.title,
+                run_id=str(item.run_id),
+                status=item.status,
+                current_stage=item.current_stage,
+                pipeline_generation=item.pipeline_generation,
                 auto_recovery_count=item.auto_recovery_count,
-                error_code=run.error_code,
-                error_message=run.error_message,
+                error_code=item.error_code,
+                error_message=item.error_message,
             )
         )
     return BatchStatus(
@@ -275,7 +266,7 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
         edition_id=str(batch.edition_id),
         profile=batch.profile.value,
         status=batch.status,
-        items=len(items),
+        items=len(details),
         completed=completed,
         needs_review=needs_review,
         failed=failed,

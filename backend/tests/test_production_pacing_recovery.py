@@ -198,6 +198,19 @@ async def test_recovery_runs_candidates_in_editorial_order_and_finishes_review()
 
 
 @pytest.mark.asyncio
+async def test_batch_terminal_handoff_moves_production_edition_to_review() -> None:
+    uow, runs = _batch_uow(["unknown_code"])
+    service = EditionProductionService(lambda: uow)
+
+    result = await service.on_subject_terminal(
+        uow.edition_production_batches.item.id, runs[0].id
+    )
+
+    assert result is None
+    assert uow.editions.edition.status is EditionStatus.REVIEW
+
+
+@pytest.mark.asyncio
 async def test_initial_failure_does_not_block_remaining_subjects_before_recovery() -> None:
     uow, runs = _batch_uow(["bridge_timeout", "unknown_code", "unknown_code"])
     runs[1].status = SubjectProductionStatus.QUEUED

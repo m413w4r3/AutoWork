@@ -5,6 +5,7 @@ from uuid import UUID
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cti_app.application.production_read_model import BatchStatusItem
 from cti_app.domain.editorial import AnalystDecision, AnalystDecisionTargetType, AnalystDecisionType
 from cti_app.domain.production import (
     AnalystInputPack,
@@ -24,6 +25,7 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
+from cti_app.infrastructure.database.models.editorial import EditorialGroupRow
 from cti_app.infrastructure.database.models.production import (
     AnalystDecisionRow,
     AnalystInputPackRow,
@@ -541,6 +543,72 @@ class SqlAlchemyEditionProductionBatchItemRepository:
             .where(EditionProductionBatchItemRow.id == item.id)
             .values(auto_recovery_count=item.auto_recovery_count)
         )
+
+
+class SqlAlchemyBatchStatusReadRepository:
+    """Optimized, UI-only read model for production batch status."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def list_for_batch(self, batch_id: UUID) -> Sequence[BatchStatusItem]:
+        # A subject can have historical editorial-group rows.  The scalar
+        # subquery preserves one result row per batch item while retaining the
+        # same group-title fallback as the transactional API used to have.
+        group_title = (
+            select(EditorialGroupRow.title)
+            .where(EditorialGroupRow.subject_id == EditionProductionBatchItemRow.subject_id)
+            .order_by(EditorialGroupRow.created_at.desc(), EditorialGroupRow.id.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        query = (
+            select(
+                EditionProductionBatchItemRow.position.label("position"),
+                EditionProductionBatchItemRow.subject_id.label("subject_id"),
+                func.coalesce(
+                    ProductionInputSnapshotRow.subject_title,
+                    group_title,
+                ).label("title"),
+                EditionProductionBatchItemRow.production_run_id.label("run_id"),
+                SubjectProductionRunRow.status.label("status"),
+                SubjectProductionRunRow.current_stage.label("current_stage"),
+                SubjectProductionRunRow.pipeline_generation.label("pipeline_generation"),
+                EditionProductionBatchItemRow.auto_recovery_count.label("auto_recovery_count"),
+                SubjectProductionRunRow.error_code.label("error_code"),
+                SubjectProductionRunRow.error_message.label("error_message"),
+            )
+            .select_from(EditionProductionBatchItemRow)
+            .join(
+                SubjectProductionRunRow,
+                SubjectProductionRunRow.id == EditionProductionBatchItemRow.production_run_id,
+            )
+            .outerjoin(
+                ProductionInputSnapshotRow,
+                ProductionInputSnapshotRow.production_run_id
+                == EditionProductionBatchItemRow.production_run_id,
+            )
+            .where(EditionProductionBatchItemRow.batch_id == batch_id)
+            .order_by(EditionProductionBatchItemRow.position)
+        )
+        rows = (await self._session.execute(query)).mappings()
+        return [
+            BatchStatusItem(
+                position=row["position"],
+                subject_id=row["subject_id"],
+                title=(
+                    row["title"] if row["title"] is not None else str(row["subject_id"])
+                ),
+                run_id=row["run_id"],
+                status=row["status"],
+                current_stage=row["current_stage"],
+                pipeline_generation=row["pipeline_generation"],
+                auto_recovery_count=row["auto_recovery_count"],
+                error_code=row["error_code"],
+                error_message=row["error_message"],
+            )
+            for row in rows
+        ]
 
 
 def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectProductionRun:

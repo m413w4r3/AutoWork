@@ -13,6 +13,7 @@ from cti_app.application.editions import (
     EditionNotFoundError,
     EditionPage,
     EditionService,
+    EditionTransitionRequiresUseCaseError,
     PreviousEditionError,
 )
 from cti_app.application.identity import Identity, IdentityProvider
@@ -302,6 +303,11 @@ def _raise_api_error(exc: Exception) -> NoReturn:
                 "code": "stale_edition_version",
                 "message": "L'édition a été modifiée ailleurs. Rechargez-la avant de réessayer.",
             },
+        ) from exc
+    if isinstance(exc, EditionTransitionRequiresUseCaseError):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": str(exc)},
         ) from exc
     if isinstance(exc, (InvalidEditionTransitionError, EditionImmutableError)):
         raise HTTPException(

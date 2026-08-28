@@ -28,6 +28,27 @@ class PreviousEditionError(ValueError):
     pass
 
 
+class EditionTransitionRequiresUseCaseError(ValueError):
+    """Raised when the generic transition API would bypass a workflow use case."""
+
+    code = "edition_transition_requires_use_case"
+
+    def __init__(self, source: EditionStatus, target: EditionStatus) -> None:
+        super().__init__(
+            f"Transition from {source.value} to {target.value} must be performed by its use case"
+        )
+
+
+_USE_CASE_OWNED_TRANSITIONS = {
+    (EditionStatus.SELECTION, EditionStatus.PRODUCTION),
+    (EditionStatus.PRODUCTION, EditionStatus.REVIEW),
+    (EditionStatus.REVIEW, EditionStatus.PRODUCTION),
+    (EditionStatus.REVIEW, EditionStatus.ASSEMBLING),
+    (EditionStatus.ASSEMBLING, EditionStatus.REVIEW),
+    (EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class EditionPage:
     items: list[Edition]
@@ -185,6 +206,8 @@ class EditionService:
                 raise EditionNotFoundError(str(edition_id))
             if edition.version != expected_version:
                 raise EditionConcurrencyError("Edition was modified by another request")
+            if (edition.status, target) in _USE_CASE_OWNED_TRANSITIONS:
+                raise EditionTransitionRequiresUseCaseError(edition.status, target)
             before = edition.snapshot()
             edition.transition(target)
             if not await uow.editions.update(edition, expected_version):

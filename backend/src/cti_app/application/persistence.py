@@ -6,6 +6,7 @@ from types import TracebackType
 from typing import Protocol, Self
 from uuid import UUID
 
+from cti_app.application.production_read_model import BatchStatusReadRepository
 from cti_app.domain.analysis import SampleFeatureSetV1
 from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.briefs import BriefDraft, BriefEvidencePack
@@ -646,6 +647,7 @@ class UnitOfWork(Protocol):
     production_artifacts: ProductionArtifactRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
+    batch_status_read_model: BatchStatusReadRepository
 
     async def __aenter__(self) -> Self: ...
 

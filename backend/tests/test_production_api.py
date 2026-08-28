@@ -22,6 +22,7 @@ from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.production import router
 from cti_app.application.production_parsers import technical_extraction_from_json
+from cti_app.application.production_read_model import BatchStatusItem
 from cti_app.application.production_state import (
     ProductionStateSnapshotV1,
     compute_production_state_checksum,
@@ -166,6 +167,53 @@ class _BatchItems:
         return [i for i in self.items if i.batch_id == batch_id]
 
 
+class _BatchStatusReadModel:
+    """In-memory port double; one call represents one set-based read."""
+
+    def __init__(self, uow: Any) -> None:
+        self._uow = uow
+        self.calls = 0
+        self.snapshots: dict[UUID, SimpleNamespace] = {}
+
+    async def list_for_batch(self, batch_id: UUID) -> Sequence[BatchStatusItem]:
+        self.calls += 1
+        items = [
+            item
+            for item in self._uow.edition_production_batch_items.items
+            if item.batch_id == batch_id
+        ]
+        runs = self._uow.subject_production_runs.items
+        groups = {group.subject_id: group for group in self._uow.editorial_groups._groups}
+        result: list[BatchStatusItem] = []
+        for item in items:
+            run = runs.get(item.production_run_id)
+            if run is None:
+                continue
+            group = groups.get(item.subject_id)
+            snapshot = self.snapshots.get(run.id)
+            result.append(
+                BatchStatusItem(
+                    position=item.position,
+                    subject_id=item.subject_id,
+                    title=(
+                        snapshot.subject_title
+                        if snapshot is not None
+                        else group.title
+                        if group is not None
+                        else str(item.subject_id)
+                    ),
+                    run_id=run.id,
+                    status=run.status.value,
+                    current_stage=run.current_stage.value,
+                    pipeline_generation=run.pipeline_generation,
+                    auto_recovery_count=item.auto_recovery_count,
+                    error_code=run.error_code,
+                    error_message=run.error_message,
+                )
+            )
+        return result
+
+
 class _Artifacts:
     def __init__(self) -> None:
         self.items: list[ProductionArtifact] = []
@@ -269,6 +317,7 @@ class _Uow:
         self.edition_production_batches = _Batches()
         self.edition_production_batch_items = _BatchItems()
         self.production_artifacts = _Artifacts()
+        self.batch_status_read_model = _BatchStatusReadModel(self)
         self.source_collections = _SourceCollections()
         self.analyst_investigations = _Investigations()
         self.analyst_input_packs = _InputPacks()
@@ -552,6 +601,7 @@ async def test_batch_status_exposes_phase_schedule_and_item_error_details(
     item = uow.edition_production_batch_items.items[0]
     item.auto_recovery_count = 1
     run = uow.subject_production_runs.items[item.production_run_id]
+    run.pipeline_generation = 2
     run.mark_failed(code="bridge_timeout", message="bridge stopped")
 
     response = await api.get(f"/api/editions/{edition_id}/production/briefs")
@@ -560,8 +610,38 @@ async def test_batch_status_exposes_phase_schedule_and_item_error_details(
     assert body["phase"] == "recovery"
     assert body["next_dispatch_at"] is not None
     assert body["item_details"][0]["auto_recovery_count"] == 1
+    assert body["item_details"][0]["pipeline_generation"] == 2
     assert body["item_details"][0]["error_code"] == "bridge_timeout"
     assert body["item_details"][0]["error_message"] == "bridge stopped"
+    assert "error_details" not in body["item_details"][0]
+
+
+async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_titles(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id = uuid4()
+    subjects = [uuid4() for _ in range(3)]
+    for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
+        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+
+    started = await api.post(f"/api/editions/{edition_id}/production/briefs", json={})
+    assert started.status_code == 200, started.text
+    uow.batch_status_read_model.calls = 0
+    batch_items = uow.edition_production_batch_items.items
+    first_run = uow.subject_production_runs.items[batch_items[0].production_run_id]
+    first_run.pipeline_generation = 3
+    uow.batch_status_read_model.snapshots[first_run.id] = SimpleNamespace(
+        subject_title="Snapshot title"
+    )
+
+    response = await api.get(f"/api/editions/{edition_id}/production/briefs")
+
+    assert response.status_code == 200, response.text
+    details = response.json()["item_details"]
+    assert [detail["position"] for detail in details] == [1, 2, 3]
+    assert details[0]["title"] == "Snapshot title"
+    assert details[0]["pipeline_generation"] == 3
+    assert uow.batch_status_read_model.calls == 1
 
 
 async def test_start_edition_briefs_rejects_unselected_subject(api: AsyncClient, uow: _Uow) -> None:
