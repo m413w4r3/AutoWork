@@ -102,8 +102,8 @@ class BatchItemDetail(BaseModel):
     subject_id: str
     title: str
     run_id: str
-    status: str
-    current_stage: str
+    status: SubjectProductionStatus
+    current_stage: SubjectProductionStage
     pipeline_generation: int
     auto_recovery_count: int
     error_code: str | None = None
@@ -238,13 +238,13 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
     completed = needs_review = failed = cancelled = 0
     details: list[BatchItemDetail] = []
     for item in items:
-        if item.status == SubjectProductionStatus.READY.value:
+        if item.status is SubjectProductionStatus.READY:
             completed += 1
-        elif item.status == SubjectProductionStatus.NEEDS_REVIEW.value:
+        elif item.status is SubjectProductionStatus.NEEDS_REVIEW:
             needs_review += 1
-        elif item.status == SubjectProductionStatus.FAILED.value:
+        elif item.status is SubjectProductionStatus.FAILED:
             failed += 1
-        elif item.status == SubjectProductionStatus.CANCELLED.value:
+        elif item.status is SubjectProductionStatus.CANCELLED:
             cancelled += 1
 
         details.append(

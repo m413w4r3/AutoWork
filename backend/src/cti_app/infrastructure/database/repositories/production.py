@@ -596,12 +596,10 @@ class SqlAlchemyBatchStatusReadRepository:
             BatchStatusItem(
                 position=row["position"],
                 subject_id=row["subject_id"],
-                title=(
-                    row["title"] if row["title"] is not None else str(row["subject_id"])
-                ),
+                title=(row["title"] if row["title"] is not None else str(row["subject_id"])),
                 run_id=row["run_id"],
-                status=row["status"],
-                current_stage=row["current_stage"],
+                status=SubjectProductionStatus(row["status"]),
+                current_stage=SubjectProductionStage(row["current_stage"]),
                 pipeline_generation=row["pipeline_generation"],
                 auto_recovery_count=row["auto_recovery_count"],
                 error_code=row["error_code"],

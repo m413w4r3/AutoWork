@@ -17,7 +17,11 @@ from tests.edition_support import InMemoryEditionUnitOfWorkFactory
     ("source", "target"),
     (
         (EditionStatus.SELECTION, EditionStatus.PRODUCTION),
+        (EditionStatus.PRODUCTION, EditionStatus.REVIEW),
+        (EditionStatus.REVIEW, EditionStatus.PRODUCTION),
         (EditionStatus.REVIEW, EditionStatus.ASSEMBLING),
+        (EditionStatus.ASSEMBLING, EditionStatus.REVIEW),
+        (EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED),
     ),
 )
 async def test_generic_transition_requires_workflow_use_case(
@@ -37,6 +41,7 @@ async def test_generic_transition_requires_workflow_use_case(
         status=source,
     )
     factory.state[edition.id] = edition
+    initial_version = edition.version
     application = FastAPI()
     application.include_router(router)
     application.state.edition_service = EditionService(factory)
@@ -53,6 +58,42 @@ async def test_generic_transition_requires_workflow_use_case(
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "edition_transition_requires_use_case"
     assert factory.state[edition.id].status is source
+    assert factory.state[edition.id].version == initial_version
+    assert [event.action for event in factory.events] == []
+
+
+async def test_generic_transition_allows_normal_transition() -> None:
+    factory = InMemoryEditionUnitOfWorkFactory()
+    edition = Edition(
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        tlp=TLP.GREEN,
+        languages=("fr",),
+        target_major_articles=0,
+        target_briefs=1,
+        source_profile="default",
+        status=EditionStatus.DRAFT,
+    )
+    factory.state[edition.id] = edition
+    application = FastAPI()
+    application.include_router(router)
+    application.state.edition_service = EditionService(factory)
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/api/editions/{edition.id}/transitions",
+            json={"target_status": EditionStatus.DISCOVERY.value, "version": edition.version},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == EditionStatus.DISCOVERY.value
+    assert response.json()["version"] == 2
+    assert [event.action for event in factory.events] == ["edition.transitioned"]
 
 
 async def test_create_read_update_transition_and_filter_scenario() -> None:

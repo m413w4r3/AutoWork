@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
 
+from cti_app.domain.production import SubjectProductionStage, SubjectProductionStatus
+
 
 @dataclass(frozen=True, slots=True)
 class BatchStatusItem:
@@ -21,8 +23,8 @@ class BatchStatusItem:
     subject_id: UUID
     title: str
     run_id: UUID
-    status: str
-    current_stage: str
+    status: SubjectProductionStatus
+    current_stage: SubjectProductionStage
     pipeline_generation: int
     auto_recovery_count: int
     error_code: str | None

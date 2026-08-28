@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cti_app.domain.production import SubjectProductionStage, SubjectProductionStatus
 from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemyBatchStatusReadRepository,
 )
@@ -57,3 +58,5 @@ async def test_batch_status_sql_read_model_uses_one_query_for_many_items() -> No
     assert [item.position for item in result] == [1, 2, 3]
     assert [item.subject_id for item in result] == subject_ids
     assert [item.pipeline_generation for item in result] == [1, 2, 3]
+    assert [item.status for item in result] == [SubjectProductionStatus.RUNNING] * 3
+    assert [item.current_stage for item in result] == [SubjectProductionStage.SOURCES] * 3

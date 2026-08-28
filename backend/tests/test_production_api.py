@@ -203,8 +203,8 @@ class _BatchStatusReadModel:
                         else str(item.subject_id)
                     ),
                     run_id=run.id,
-                    status=run.status.value,
-                    current_stage=run.current_stage.value,
+                    status=run.status,
+                    current_stage=run.current_stage,
                     pipeline_generation=run.pipeline_generation,
                     auto_recovery_count=item.auto_recovery_count,
                     error_code=run.error_code,
