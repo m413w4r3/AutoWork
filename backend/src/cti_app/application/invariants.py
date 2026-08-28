@@ -11,6 +11,7 @@ from uuid import UUID
 from cti_app.application.goodware import GoodwareMeasurementService, PreparedGoodwareIndex
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.config import Settings
+from cti_app.domain.code_features import opcode_fragment16_lookup_value
 from cti_app.domain.goodware import Banality, BanalityScorer, BanalityThresholds
 from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.invariants import (
@@ -339,9 +340,17 @@ class InvariantRegistryService:
                 if descriptor is not None
                 else FeatureMeasurements()
             )
+            goodware_descriptor = descriptor
+            if ngram is not None:
+                opcode_lookup = opcode_fragment16_lookup_value(ngram)
+                goodware_descriptor = (
+                    ("opcode_fragment16", opcode_lookup)
+                    if opcode_lookup is not None
+                    else None
+                )
             baseline_id, occurrence_count = await self._goodware_measurement(
                 baseline_id=baseline_id,
-                descriptor=descriptor,
+                descriptor=goodware_descriptor,
                 prepared=prepared,
             )
             measured_occurrence_count = (

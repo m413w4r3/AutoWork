@@ -1,30 +1,21 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from dataclasses import replace
 from io import BytesIO
 from typing import Protocol
 from uuid import UUID
 
-from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.code_features import (
     CodeFeatureSet,
     CodeFeatureStatus,
     CodeFunction,
-    CodeNgram,
-    GoodwareVerdict,
     PackingSignals,
-    apply_corpus_assessment,
     build_code_ngrams,
-    compare_goodware,
-    opcode_fragment16_lookup_value,
     validate_ngram_sizes,
 )
-from cti_app.domain.goodware_index import GoodwareMeasurementError
-from cti_app.domain.reference_corpus import assess_reference_feature
 from cti_app.infrastructure.smda import SmdaAdapter, SmdaAdapterResult
 from cti_app.infrastructure.static_analysis import build_packing_signals
 
@@ -43,7 +34,6 @@ class CodeFeatureService:
         blobs: BlobIngestor,
         uow_factory: UnitOfWorkFactory,
         smda: SmdaAdapter,
-        goodware: GoodwareMeasurementService | None = None,
         *,
         tool_version: str = "4.5.0",
         escaper_compatibility_version: str = "4.4.5",
@@ -52,7 +42,6 @@ class CodeFeatureService:
         self._blobs = blobs
         self._uow_factory = uow_factory
         self._smda = smda
-        self._goodware = goodware
         self._tool_version = tool_version
         self._escaper_version = escaper_compatibility_version
         self._pic_version = intel_pic_hash_escape_version
@@ -68,8 +57,6 @@ class CodeFeatureService:
         smda_timeout_seconds: float = 120.0,
         smda_max_output_bytes: int = 32 * 1024 * 1024,
         smda_max_memory_bytes: int = 1024 * 1024 * 1024,
-        goodware_baseline_id: UUID | None = None,
-        min_family_samples: int = 5,
     ) -> CodeFeatureSet:
         validate_ngram_sizes(code_ngram_sizes)
         async with self._uow_factory() as uow:
@@ -115,8 +102,6 @@ class CodeFeatureService:
                 result=result,
                 code_ngram_sizes=code_ngram_sizes,
                 code_ngram_max_per_sample=code_ngram_max_per_sample,
-                goodware_baseline_id=goodware_baseline_id,
-                min_family_samples=min_family_samples,
             )
         else:
             feature_set = CodeFeatureSet(
@@ -163,8 +148,6 @@ class CodeFeatureService:
         result: SmdaAdapterResult,
         code_ngram_sizes: tuple[int, ...],
         code_ngram_max_per_sample: int,
-        goodware_baseline_id: UUID | None,
-        min_family_samples: int,
     ) -> CodeFeatureSet:
         assert result.extraction is not None
         extraction = result.extraction
@@ -173,60 +156,6 @@ class CodeFeatureService:
             code_ngram_sizes,
             max_per_sample=code_ngram_max_per_sample,
         )
-        goodware_occurrences: Mapping[tuple[str, str], int] = {}
-        if goodware_baseline_id is not None:
-            if self._goodware is None:
-                raise GoodwareMeasurementError(
-                    "goodware measurement service is required for a bound baseline"
-                )
-            prepared = await self._goodware.prepare(goodware_baseline_id)
-            lookup_values: set[str] = set()
-            for ngram in ngrams:
-                lookup = opcode_fragment16_lookup_value(ngram)
-                if lookup is not None:
-                    lookup_values.add(lookup)
-            lookups = tuple(
-                ("opcode_fragment16", value)
-                for value in sorted(lookup_values)
-            )
-            goodware_occurrences = await prepared.lookup_batch(lookups)
-        async with self._uow_factory() as uow:
-            family_sizes = await uow.reference_members.count_eligible_malware_samples_by_family()
-            scored: list[CodeNgram] = []
-            for start in range(0, len(ngrams), 500):
-                chunk = ngrams[start : start + 500]
-                patterns = tuple(ngram.pattern.lower() for ngram in chunk)
-                members_by_pattern = await uow.reference_members.list_feature_members_bulk(
-                    "code_ngram", patterns
-                )
-                benign_by_pattern = (
-                    await uow.reference_members.count_benign_feature_occurrences_bulk(
-                        "code_ngram", patterns
-                    )
-                )
-                for ngram in chunk:
-                    lookup = opcode_fragment16_lookup_value(ngram)
-                    occurrence = (
-                        goodware_occurrences.get(("opcode_fragment16", lookup))
-                        if lookup is not None
-                        else None
-                    )
-                    scored_ngram = compare_goodware(ngram, occurrence)
-                    scored.append(
-                        apply_corpus_assessment(
-                            scored_ngram,
-                            assess_reference_feature(
-                                feature_kind="code_ngram",
-                                normalized_value=ngram.pattern,
-                                malware_members=members_by_pattern.get(ngram.pattern.lower(), ()),
-                                benign_sample_occurrences=benign_by_pattern.get(
-                                    ngram.pattern.lower(), 0
-                                ),
-                                total_eligible_samples_by_family=family_sizes,
-                                min_family_samples=min_family_samples,
-                            ),
-                        )
-                    )
         return CodeFeatureSet(
             sample_id=sample_id,
             blob_id=blob_id,
@@ -236,7 +165,7 @@ class CodeFeatureService:
             parameters_sha256=parameters_sha256,
             architecture=extraction.architecture,
             status=CodeFeatureStatus.SUCCEEDED,
-            ngrams=tuple(scored),
+            ngrams=ngrams,
             packing=_packing_signals(payload, extraction.functions),
         )
 
@@ -245,4 +174,4 @@ def _packing_signals(payload: bytes, functions: tuple[CodeFunction, ...]) -> Pac
     return build_packing_signals(payload, len(functions))
 
 
-__all__ = ["CodeFeatureService", "GoodwareVerdict"]
+__all__ = ["CodeFeatureService"]

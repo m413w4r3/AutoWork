@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import StrEnum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 from uuid import UUID
 
 from pydantic import (
@@ -268,7 +268,7 @@ class ProposalInputSnapshot(_StrictModel):
         return value
 
     def canonical_dict(self) -> dict[str, Any]:
-        return _canonical_json_value(self.model_dump(mode="json"))
+        return cast(dict[str, Any], _canonical_json_value(self.model_dump(mode="json")))
 
     def canonical_serialization(self) -> str:
         return json.dumps(

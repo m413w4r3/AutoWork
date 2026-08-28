@@ -425,12 +425,37 @@ class ProposalConversationService:
                     }
                 )
             )
-            goodware_occurrences = await prepared.lookup_batch(descriptors)
+            goodware_descriptors = tuple(
+                sorted(
+                    {
+                        goodware_descriptor
+                        for candidate in candidate_records
+                        if (
+                            descriptor := m2_feature_kind(
+                                InvariantType(candidate["invariant_type"]),
+                                candidate["pattern"],
+                            )
+                        ) is not None
+                        if (
+                            goodware_descriptor := _goodware_descriptor(
+                                candidate, descriptor
+                            )
+                        ) is not None
+                    }
+                )
+            )
+            goodware_occurrences = await prepared.lookup_batch(goodware_descriptors)
+            measurements = await _measure_features_bulk(
+                getattr(uow, "invariants", None), descriptors, all_sample_ids
+            )
 
             measured_candidates = []
             for candidate in candidate_records:
                 measured = await self._measure_candidate(
-                    uow, candidate, all_sample_ids, baseline_id, goodware_occurrences
+                    candidate,
+                    baseline_id,
+                    goodware_occurrences,
+                    measurements,
                 )
                 if not _exclude_before_model(measured):
                     measured_candidates.append(measured)
@@ -453,9 +478,32 @@ class ProposalConversationService:
 
             # Positive support is snapshot-scoped, so recalculate it only after
             # deterministic selection has fixed the origin sample set.
+            selected_descriptors = tuple(
+                sorted(
+                    {
+                        descriptor
+                        for candidate in selected_candidates
+                        if (
+                            descriptor := m2_feature_kind(
+                                InvariantType(candidate["invariant_type"]),
+                                candidate["pattern"],
+                            )
+                        )
+                        is not None
+                    }
+                )
+            )
+            selected_measurements = await _measure_features_bulk(
+                getattr(uow, "invariants", None),
+                selected_descriptors,
+                tuple(sorted(origin_ids, key=str)),
+            )
             selected_candidates = [
                 await self._measure_candidate(
-                    uow, candidate, tuple(origin_ids), baseline_id, goodware_occurrences
+                    candidate,
+                    baseline_id,
+                    goodware_occurrences,
+                    selected_measurements,
                 )
                 for candidate in selected_candidates
             ]
@@ -549,26 +597,15 @@ class ProposalConversationService:
 
     async def _measure_candidate(
         self,
-        uow: Any,
         candidate: dict[str, Any],
-        sample_ids: Sequence[UUID],
         baseline_id: UUID,
         goodware_occurrences: Mapping[tuple[str, str], int],
+        measurements: Mapping[tuple[str, str], FeatureMeasurements],
     ) -> dict[str, Any]:
         result = dict(candidate)
         invariant_type = InvariantType(candidate["invariant_type"])
         descriptor = m2_feature_kind(invariant_type, candidate["pattern"])
-        repository = getattr(uow, "invariants", None)
-        measure = getattr(repository, "measure_feature", None)
-        measurement: FeatureMeasurements | None = None
-        if measure is not None and descriptor is not None:
-            measured = await measure(
-                feature_kind=descriptor[0],
-                normalized_value=descriptor[1],
-                snapshot_sample_ids=sample_ids,
-            )
-            if isinstance(measured, FeatureMeasurements):
-                measurement = measured
+        measurement = measurements.get(descriptor) if descriptor is not None else None
 
         if measurement is not None:
             result["benign_prevalence"] = measurement.benign_prevalence
@@ -577,15 +614,31 @@ class ProposalConversationService:
             result["corpus_verdict"] = assessment.verdict.value
             result["corpus_malware_sample_count"] = assessment.malware_sample_count
             result["family_labels"] = sorted(assessment.family_sample_counts)
+            result["corpus_family_sample_counts"] = [
+                list(item) for item in sorted(assessment.family_sample_counts.items())
+            ]
+            result["corpus_benign_sample_occurrences"] = (
+                assessment.benign_sample_occurrences
+            )
 
+        goodware_descriptor = (
+            _goodware_descriptor(result, descriptor) if descriptor is not None else None
+        )
         measured_occurrence = (
-            goodware_occurrences.get(descriptor) if descriptor is not None else None
+            goodware_occurrences.get(goodware_descriptor)
+            if goodware_descriptor is not None
+            else None
         )
         occurrence = (
             measured_occurrence
             if measured_occurrence is not None and measured_occurrence > 0
             else None
         )
+        if descriptor is not None and descriptor[0] == "code_ngram":
+            result["goodware_verdict"] = (
+                "PRESENT" if measured_occurrence is not None else "UNKNOWN"
+            )
+            result["goodware_occurrence_count"] = measured_occurrence
         result["goodware_baseline_id"] = str(baseline_id)
         result["banality_occurrence_count"] = occurrence
         scorer = getattr(self._invariant_registry, "_banality_scorer", None)
@@ -1032,6 +1085,51 @@ async def _member_dispute(repository: Any, member_id: UUID) -> Any | None:
     return None
 
 
+async def _measure_features_bulk(
+    repository: Any,
+    descriptors: Sequence[tuple[str, str]],
+    sample_ids: Sequence[UUID],
+) -> Mapping[tuple[str, str], FeatureMeasurements]:
+    if not descriptors:
+        return {}
+    measure = getattr(repository, "measure_features_bulk", None)
+    if not callable(measure):
+        return {}
+    measured = await measure(
+        descriptors=descriptors,
+        snapshot_sample_ids=sample_ids,
+    )
+    if not isinstance(measured, Mapping):
+        return {}
+    return {
+        descriptor: value
+        for descriptor, value in measured.items()
+        if isinstance(descriptor, tuple) and isinstance(value, FeatureMeasurements)
+    }
+
+
+def _goodware_descriptor(
+    candidate: Mapping[str, Any], descriptor: tuple[str, str]
+) -> tuple[str, str] | None:
+    feature_kind, normalized_value = descriptor
+    if feature_kind in {"string", "imphash", "export"}:
+        return descriptor
+    if feature_kind == "opcode_fragment16":
+        return feature_kind, "".join(normalized_value.split()).lower()
+    if feature_kind != "code_ngram":
+        return None
+    byte_count = candidate.get("byte_count")
+    masked_byte_count = candidate.get("masked_byte_count")
+    if (
+        not isinstance(byte_count, int)
+        or not isinstance(masked_byte_count, int)
+        or masked_byte_count
+        or not 8 <= byte_count <= 16
+    ):
+        return None
+    return "opcode_fragment16", "".join(normalized_value.split()).lower()
+
+
 def _sample_identity(
     record: Any, sample_context_by_id: Mapping[UUID, Mapping[str, Any]]
 ) -> tuple[UUID, str] | None:
@@ -1197,18 +1295,21 @@ def _make_candidate(
     }
     if extra:
         result.update(extra)
-    for key in (
-        "banality",
-        "banality_occurrence_count",
-        "benign_prevalence",
-        "positive_support",
-        "corpus_verdict",
-        "corpus_malware_sample_count",
-        "family_labels",
-        "goodware_verdict",
-        "goodware_occurrence_count",
-        "likely_packed",
-    ):
+    measurement_keys = (
+        ("likely_packed",)
+        if source_kind == "code_features"
+        else (
+            "banality",
+            "banality_occurrence_count",
+            "benign_prevalence",
+            "positive_support",
+            "corpus_verdict",
+            "corpus_malware_sample_count",
+            "family_labels",
+            "likely_packed",
+        )
+    )
+    for key in measurement_keys:
         value = _value(feature, key, _value(record, key, _MISSING))
         if value is not _MISSING:
             result[key] = _enum_value(value)
@@ -1363,12 +1464,6 @@ def _code_candidate_records(
                 "masked_byte_count",
                 "longest_fixed_run",
                 "occurrence_count",
-                "goodware_verdict",
-                "goodware_occurrence_count",
-                "corpus_verdict",
-                "corpus_malware_sample_count",
-                "corpus_family_sample_counts",
-                "corpus_benign_sample_occurrences",
                 "mnemonics",
             )
             if _value(ngram, key, _MISSING) is not _MISSING

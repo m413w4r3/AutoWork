@@ -2,14 +2,19 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cti_app.domain.code_features import CodeNgram, GoodwareVerdict, PackingSignals
+from cti_app.domain.code_features import (
+    CODE_NGRAM_STRUCTURAL_FIELDS,
+    CodeNgram,
+    PackingSignals,
+)
+from cti_app.domain.goodware import Banality
 from cti_app.domain.invariants import (
     AnalystManualProvenance,
     CandidateInvariant,
@@ -30,6 +35,7 @@ from cti_app.domain.invariants import (
     canonical_provenance,
     m2_feature_kind,
 )
+from cti_app.domain.reference_corpus import ReferenceCorpusVerdict
 from cti_app.infrastructure.database.models.collection import ClaimRow
 from cti_app.infrastructure.database.models.core import (
     BlobRow,
@@ -46,6 +52,29 @@ from cti_app.infrastructure.database.models.invariants import (
     CandidateInvariantRow,
     CandidateInvariantTransitionRow,
     InvariantRejectionRow,
+)
+
+_MEASUREMENT_IN_CHUNK_SIZE = 500
+_HASH_FEATURE_KINDS = frozenset(
+    {
+        "imphash",
+        "ssdeep",
+        "tlsh",
+        "rich_header_hash",
+        "vhash",
+        "main_icon_dhash",
+    }
+)
+_INDEXED_FEATURE_KINDS = frozenset(
+    {
+        "string",
+        "import",
+        "export",
+        "section",
+        "opcode_fragment16",
+        "code_ngram",
+        "capability",
+    }
 )
 
 
@@ -104,26 +133,11 @@ class SqlAlchemyInvariantRepository:
     ) -> FeatureMeasurements:
         sample_ids = tuple(dict.fromkeys(snapshot_sample_ids))
         eligible = await self._eligible_samples_by_family()
-        if feature_kind in {
-            "imphash",
-            "ssdeep",
-            "tlsh",
-            "rich_header_hash",
-            "vhash",
-            "main_icon_dhash",
-        }:
+        if feature_kind in _HASH_FEATURE_KINDS:
             members, benign, support = await self._measure_sample_hash(
                 feature_kind, normalized_value, sample_ids
             )
-        elif feature_kind in {
-            "string",
-            "import",
-            "export",
-            "section",
-            "opcode_fragment16",
-            "code_ngram",
-            "capability",
-        }:
+        elif feature_kind in _INDEXED_FEATURE_KINDS:
             members, benign, support = await self._measure_indexed_feature(
                 feature_kind, normalized_value, sample_ids
             )
@@ -135,6 +149,54 @@ class SqlAlchemyInvariantRepository:
             benign_prevalence=benign,
             positive_support=support,
         )
+
+    async def measure_features_bulk(
+        self,
+        descriptors: Sequence[tuple[str, str]],
+        snapshot_sample_ids: Sequence[UUID],
+    ) -> Mapping[tuple[str, str], FeatureMeasurements]:
+        unique_descriptors = tuple(dict.fromkeys(descriptors))
+        if not unique_descriptors:
+            return {}
+        sample_ids = tuple(dict.fromkeys(snapshot_sample_ids))
+        eligible = await self._eligible_samples_by_family()
+        measurements = {
+            descriptor: FeatureMeasurements(eligible_samples_by_family=eligible)
+            for descriptor in unique_descriptors
+        }
+        grouped: dict[str, dict[str, list[tuple[str, str]]]] = {}
+        for descriptor in unique_descriptors:
+            feature_kind, normalized_value = descriptor
+            if feature_kind in _HASH_FEATURE_KINDS:
+                lookup_value = normalized_value
+            elif feature_kind in _INDEXED_FEATURE_KINDS:
+                lookup_value = normalized_value.lower()
+            else:
+                continue
+            grouped.setdefault(feature_kind, {}).setdefault(lookup_value, []).append(
+                descriptor
+            )
+
+        for feature_kind, values_by_key in grouped.items():
+            values = tuple(values_by_key)
+            if feature_kind in _HASH_FEATURE_KINDS:
+                measured = await self._measure_sample_hash_bulk(
+                    feature_kind, values, sample_ids
+                )
+            else:
+                measured = await self._measure_indexed_feature_bulk(
+                    feature_kind, values, sample_ids
+                )
+            for lookup_value, (members, benign, support) in measured.items():
+                value = FeatureMeasurements(
+                    reference_members=members,
+                    eligible_samples_by_family=eligible,
+                    benign_prevalence=benign,
+                    positive_support=support,
+                )
+                for descriptor in values_by_key[lookup_value]:
+                    measurements[descriptor] = value
+        return measurements
 
     async def add_invariant(self, invariant: CandidateInvariant) -> CandidateInvariant:
         statement = (
@@ -517,10 +579,13 @@ class SqlAlchemyInvariantRepository:
         )
 
     async def _sample_id_for_sha(self, sample_sha256: str) -> UUID | None:
-        return await self._session.scalar(
-            select(SampleRow.id)
-            .join(BlobRow, BlobRow.id == SampleRow.blob_id)
-            .where(BlobRow.sha256 == sample_sha256)
+        return cast(
+            UUID | None,
+            await self._session.scalar(
+                select(SampleRow.id)
+                .join(BlobRow, BlobRow.id == SampleRow.blob_id)
+                .where(BlobRow.sha256 == sample_sha256)
+            ),
         )
 
     async def _eligible_samples_by_family(self) -> Mapping[str, int]:
@@ -539,6 +604,156 @@ class SqlAlchemyInvariantRepository:
             .group_by(ReferenceMemberRow.family_label)
         )
         return {family: int(count) for family, count in result.all()}
+
+    async def _measure_indexed_feature_bulk(
+        self,
+        feature_kind: str,
+        normalized_values: Sequence[str],
+        sample_ids: Sequence[UUID],
+    ) -> Mapping[str, tuple[tuple[tuple[UUID, str], ...], int, int]]:
+        members: dict[str, list[tuple[UUID, str]]] = {
+            value: [] for value in normalized_values
+        }
+        benign: dict[str, int] = {value: 0 for value in normalized_values}
+        support: dict[str, int] = {value: 0 for value in normalized_values}
+        dispute = select(ReferenceMemberDisputeRow.member_id).where(
+            ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id
+        )
+        for start in range(0, len(normalized_values), _MEASUREMENT_IN_CHUNK_SIZE):
+            values = normalized_values[start : start + _MEASUREMENT_IN_CHUNK_SIZE]
+            members_result = await self._session.execute(
+                select(
+                    SampleFeatureIndexRow.normalized_value,
+                    ReferenceMemberRow.sample_id,
+                    ReferenceMemberRow.family_label,
+                )
+                .join(
+                    ReferenceMemberRow,
+                    SampleFeatureIndexRow.sample_id == ReferenceMemberRow.sample_id,
+                )
+                .where(
+                    SampleFeatureIndexRow.feature_kind == feature_kind,
+                    SampleFeatureIndexRow.normalized_value.in_(values),
+                    ReferenceMemberRow.family_label.not_in(("benign", "unlabeled")),
+                    ~dispute.exists(),
+                )
+                .distinct()
+            )
+            for value, sample_id, family in members_result.all():
+                members[str(value).lower()].append((sample_id, family))
+
+            benign_result = await self._session.execute(
+                select(
+                    SampleFeatureIndexRow.normalized_value,
+                    func.count(func.distinct(ReferenceMemberRow.sample_id)),
+                )
+                .select_from(ReferenceMemberRow)
+                .join(
+                    SampleFeatureIndexRow,
+                    SampleFeatureIndexRow.sample_id == ReferenceMemberRow.sample_id,
+                )
+                .where(
+                    SampleFeatureIndexRow.feature_kind == feature_kind,
+                    SampleFeatureIndexRow.normalized_value.in_(values),
+                    ReferenceMemberRow.family_label == "benign",
+                    ~dispute.exists(),
+                )
+                .group_by(SampleFeatureIndexRow.normalized_value)
+            )
+            for value, count in benign_result.all():
+                benign[str(value).lower()] = int(count)
+
+            for sample_start in range(0, len(sample_ids), _MEASUREMENT_IN_CHUNK_SIZE):
+                snapshot_ids = sample_ids[
+                    sample_start : sample_start + _MEASUREMENT_IN_CHUNK_SIZE
+                ]
+                support_result = await self._session.execute(
+                    select(
+                        SampleFeatureIndexRow.normalized_value,
+                        func.count(func.distinct(SampleFeatureIndexRow.sample_id)),
+                    )
+                    .where(
+                        SampleFeatureIndexRow.feature_kind == feature_kind,
+                        SampleFeatureIndexRow.normalized_value.in_(values),
+                        SampleFeatureIndexRow.sample_id.in_(snapshot_ids),
+                    )
+                    .group_by(SampleFeatureIndexRow.normalized_value)
+                )
+                for value, count in support_result.all():
+                    support[str(value).lower()] += int(count)
+        return {
+            value: (
+                tuple(sorted(items, key=lambda item: (str(item[0]), item[1]))),
+                benign[value],
+                support[value],
+            )
+            for value, items in members.items()
+        }
+
+    async def _measure_sample_hash_bulk(
+        self,
+        feature_kind: str,
+        normalized_values: Sequence[str],
+        sample_ids: Sequence[UUID],
+    ) -> Mapping[str, tuple[tuple[tuple[UUID, str], ...], int, int]]:
+        column = getattr(SampleRow, feature_kind)
+        members: dict[str, list[tuple[UUID, str]]] = {
+            value: [] for value in normalized_values
+        }
+        benign: dict[str, int] = {value: 0 for value in normalized_values}
+        support: dict[str, int] = {value: 0 for value in normalized_values}
+        dispute = select(ReferenceMemberDisputeRow.member_id).where(
+            ReferenceMemberDisputeRow.member_id == ReferenceMemberRow.id
+        )
+        for start in range(0, len(normalized_values), _MEASUREMENT_IN_CHUNK_SIZE):
+            values = normalized_values[start : start + _MEASUREMENT_IN_CHUNK_SIZE]
+            members_result = await self._session.execute(
+                select(column, ReferenceMemberRow.sample_id, ReferenceMemberRow.family_label)
+                .join(SampleRow, SampleRow.id == ReferenceMemberRow.sample_id)
+                .where(
+                    column.in_(values),
+                    ReferenceMemberRow.family_label.not_in(("benign", "unlabeled")),
+                    ~dispute.exists(),
+                )
+                .distinct()
+            )
+            for value, sample_id, family in members_result.all():
+                members[value].append((sample_id, family))
+
+            benign_result = await self._session.execute(
+                select(column, func.count(func.distinct(ReferenceMemberRow.sample_id)))
+                .select_from(ReferenceMemberRow)
+                .join(SampleRow, SampleRow.id == ReferenceMemberRow.sample_id)
+                .where(
+                    column.in_(values),
+                    ReferenceMemberRow.family_label == "benign",
+                    ~dispute.exists(),
+                )
+                .group_by(column)
+            )
+            for value, count in benign_result.all():
+                benign[value] = int(count)
+
+            for sample_start in range(0, len(sample_ids), _MEASUREMENT_IN_CHUNK_SIZE):
+                snapshot_ids = sample_ids[
+                    sample_start : sample_start + _MEASUREMENT_IN_CHUNK_SIZE
+                ]
+                support_result = await self._session.execute(
+                    select(column, func.count(func.distinct(SampleRow.id)))
+                    .select_from(SampleRow)
+                    .where(column.in_(values), SampleRow.id.in_(snapshot_ids))
+                    .group_by(column)
+                )
+                for value, count in support_result.all():
+                    support[value] += int(count)
+        return {
+            value: (
+                tuple(sorted(items, key=lambda item: (str(item[0]), item[1]))),
+                benign[value],
+                support[value],
+            )
+            for value, items in members.items()
+        }
 
     async def _measure_indexed_feature(
         self, feature_kind: str, normalized_value: str, sample_ids: Sequence[UUID]
@@ -559,7 +774,12 @@ class SqlAlchemyInvariantRepository:
             )
             .distinct()
         )
-        members = tuple(members_result.all())
+        members = tuple(
+            sorted(
+                ((sample_id, family) for sample_id, family in members_result.all()),
+                key=lambda item: (str(item[0]), item[1]),
+            )
+        )
         benign = await self._session.scalar(
             select(func.count(func.distinct(ReferenceMemberRow.sample_id)))
             .select_from(ReferenceMemberRow)
@@ -601,7 +821,12 @@ class SqlAlchemyInvariantRepository:
             )
             .distinct()
         )
-        members = tuple(members_result.all())
+        members = tuple(
+            sorted(
+                ((sample_id, family) for sample_id, family in members_result.all()),
+                key=lambda item: (str(item[0]), item[1]),
+            )
+        )
         benign = await self._session.scalar(
             select(func.count(func.distinct(ReferenceMemberRow.sample_id)))
             .select_from(ReferenceMemberRow)
@@ -641,10 +866,10 @@ class SqlAlchemyInvariantRepository:
             proposal_key=row.proposal_key,
             provenances=tuple(_provenance_from_payload(item.payload) for item in provenance_rows),
             status=InvariantStatus(row.status),
-            banality=row.banality_verdict,
+            banality=Banality(row.banality_verdict),
             banality_occurrence_count=row.banality_occurrence_count,
             goodware_baseline_id=row.goodware_baseline_id,
-            corpus_verdict=row.corpus_verdict,
+            corpus_verdict=ReferenceCorpusVerdict(row.corpus_verdict),
             corpus_malware_sample_count=row.corpus_malware_sample_count,
             family_labels=tuple(row.family_labels),
             benign_prevalence=row.benign_prevalence,
@@ -753,12 +978,8 @@ def _address_or_none(value: int | str) -> int | None:
 def _code_ngram_from_payload(item: Mapping[str, Any]) -> CodeNgram:
     return CodeNgram(
         **{
-            **dict(item),
+            **{name: item[name] for name in CODE_NGRAM_STRUCTURAL_FIELDS},
             "mnemonics": tuple(item["mnemonics"]),
-            "goodware_verdict": GoodwareVerdict(item["goodware_verdict"]),
-            "corpus_family_sample_counts": tuple(
-                (str(pair[0]), int(pair[1])) for pair in item["corpus_family_sample_counts"]
-            ),
         }
     )
 

@@ -17,10 +17,10 @@ from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.capabilities import Capability, CapabilitySet, CapabilitySetStatus
 from cti_app.domain.classification import TLP
 from cti_app.domain.code_features import (
+    CODE_NGRAM_STRUCTURAL_FIELDS,
     CodeFeatureSet,
     CodeFeatureStatus,
     CodeNgram,
-    GoodwareVerdict,
     PackingSignals,
 )
 from cti_app.domain.entities import (
@@ -866,12 +866,11 @@ def _code_feature_set_from_row(row: CodeFeatureSetRow) -> CodeFeatureSet:
     ngrams = tuple(
         CodeNgram(
             **{
-                **item,
+                **{
+                    name: item[name]
+                    for name in CODE_NGRAM_STRUCTURAL_FIELDS
+                },
                 "mnemonics": tuple(item["mnemonics"]),
-                "goodware_verdict": GoodwareVerdict(item["goodware_verdict"]),
-                "corpus_family_sample_counts": tuple(
-                    (str(pair[0]), int(pair[1])) for pair in item["corpus_family_sample_counts"]
-                ),
             }
         )
         for item in payload["ngrams"]

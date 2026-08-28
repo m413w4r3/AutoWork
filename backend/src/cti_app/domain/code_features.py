@@ -14,6 +14,8 @@ class CodeFeatureStatus(StrEnum):
 
 
 class GoodwareVerdict(StrEnum):
+    """Legacy source-compatibility enum; CodeNgram no longer stores it."""
+
     UNKNOWN = "UNKNOWN"
     PRESENT = "PRESENT"
     ABSENT = "ABSENT"
@@ -46,7 +48,7 @@ class CodeFunction:
             raise ValueError("function offset must be non-negative")
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
+@dataclass(frozen=True, slots=True, kw_only=True, init=False)
 class CodeNgram:
     pattern: str
     instruction_count: int
@@ -58,12 +60,34 @@ class CodeNgram:
     start_offset: int
     mnemonics: tuple[str, ...]
     occurrence_count: int = 1
-    goodware_verdict: GoodwareVerdict = GoodwareVerdict.UNKNOWN
-    goodware_occurrence_count: int | None = None
-    corpus_verdict: str = "UNKNOWN"
-    corpus_malware_sample_count: int | None = None
-    corpus_family_sample_counts: tuple[tuple[str, int], ...] = ()
-    corpus_benign_sample_occurrences: int | None = None
+
+    def __init__(
+        self,
+        *,
+        pattern: str,
+        instruction_count: int,
+        byte_count: int,
+        fixed_byte_count: int,
+        masked_byte_count: int,
+        longest_fixed_run: int,
+        function_offset: int,
+        start_offset: int,
+        mnemonics: tuple[str, ...],
+        occurrence_count: int = 1,
+        **_legacy_fields: object,
+    ) -> None:
+        del _legacy_fields
+        object.__setattr__(self, "pattern", pattern)
+        object.__setattr__(self, "instruction_count", instruction_count)
+        object.__setattr__(self, "byte_count", byte_count)
+        object.__setattr__(self, "fixed_byte_count", fixed_byte_count)
+        object.__setattr__(self, "masked_byte_count", masked_byte_count)
+        object.__setattr__(self, "longest_fixed_run", longest_fixed_run)
+        object.__setattr__(self, "function_offset", function_offset)
+        object.__setattr__(self, "start_offset", start_offset)
+        object.__setattr__(self, "mnemonics", mnemonics)
+        object.__setattr__(self, "occurrence_count", occurrence_count)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if self.instruction_count < 1 or self.byte_count < 1:
@@ -72,6 +96,20 @@ class CodeNgram:
             raise ValueError("fixed and masked byte counts must add up")
         if self.occurrence_count < 1:
             raise ValueError("occurrence_count must be positive")
+
+
+CODE_NGRAM_STRUCTURAL_FIELDS = (
+    "pattern",
+    "instruction_count",
+    "byte_count",
+    "fixed_byte_count",
+    "masked_byte_count",
+    "longest_fixed_run",
+    "function_offset",
+    "start_offset",
+    "mnemonics",
+    "occurrence_count",
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -115,12 +153,11 @@ class CodeFeatureSet:
             "status": self.status.value,
             "ngrams": [
                 {
-                    **{name: getattr(ngram, name) for name in ngram.__dataclass_fields__},
+                    **{
+                        name: getattr(ngram, name)
+                        for name in CODE_NGRAM_STRUCTURAL_FIELDS
+                    },
                     "mnemonics": list(ngram.mnemonics),
-                    "goodware_verdict": ngram.goodware_verdict.value,
-                    "corpus_family_sample_counts": [
-                        list(item) for item in ngram.corpus_family_sample_counts
-                    ],
                 }
                 for ngram in self.ngrams
             ],
@@ -238,32 +275,6 @@ def build_code_ngrams(
             output.values(),
             key=lambda item: (item.function_offset, item.start_offset, item.pattern),
         )
-    )
-
-
-def compare_goodware(ngram: CodeNgram, occurrence_count: int | None) -> CodeNgram:
-    if ngram.masked_byte_count or not 8 <= ngram.byte_count <= 16:
-        return ngram
-    verdict = GoodwareVerdict.PRESENT if occurrence_count is not None else GoodwareVerdict.UNKNOWN
-    return CodeNgram(
-        **{
-            **{name: getattr(ngram, name) for name in ngram.__dataclass_fields__},
-            "goodware_verdict": verdict,
-            "goodware_occurrence_count": occurrence_count,
-        }
-    )
-
-
-def apply_corpus_assessment(ngram: CodeNgram, assessment: Any) -> CodeNgram:
-    family_counts = tuple(sorted(assessment.family_sample_counts.items()))
-    return CodeNgram(
-        **{
-            **{name: getattr(ngram, name) for name in ngram.__dataclass_fields__},
-            "corpus_verdict": assessment.verdict.value,
-            "corpus_malware_sample_count": assessment.malware_sample_count,
-            "corpus_family_sample_counts": family_counts,
-            "corpus_benign_sample_occurrences": assessment.benign_sample_occurrences,
-        }
     )
 
 
