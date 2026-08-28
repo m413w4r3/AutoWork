@@ -7,12 +7,19 @@ from pathlib import Path
 from uuid import UUID
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.jobs import JobExecutionContext, JobParameters, JobRegistry
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.capabilities import Capability, CapabilitySet, CapabilitySetStatus
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.reference_corpus import ReferenceCorpusAssessment
 from cti_app.infrastructure.analysis_subprocess import AnalysisSubprocessStatus
 from cti_app.infrastructure.capa import CapaRunner, parse_capa_output, ruleset_manifest
+
+CAPA_ANALYSIS_JOB_KIND = "sample.capa.v1"
+
+
+class CapaAnalysisJobParameters(JobParameters):
+    sample_id: UUID
 
 
 class CapabilitiesService:
@@ -132,3 +139,17 @@ class CapabilitiesService:
             normalized_value=rule_id,
             min_family_samples=min_family_samples,
         )
+
+
+def register_capa_analysis_job(registry: JobRegistry, service: CapabilitiesService) -> None:
+    async def handler(parameters: JobParameters, context: JobExecutionContext) -> str:
+        if not isinstance(parameters, CapaAnalysisJobParameters):
+            raise TypeError("invalid parameters")
+        result = await service.analyze(parameters.sample_id)
+        await context.report_progress(1, 1, "Analyse CAPA terminée")
+        return (
+            f"capability-sets://{result.sample_id}/"
+            f"{result.parameters_sha256}/{result.ruleset_sha256}"
+        )
+
+    registry.register(CAPA_ANALYSIS_JOB_KIND, CapaAnalysisJobParameters, handler)

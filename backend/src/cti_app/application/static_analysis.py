@@ -6,6 +6,10 @@ from io import BytesIO
 from uuid import UUID
 
 from cti_app.application.blobs import BlobCatalogService
+from cti_app.application.capabilities import (
+    CapabilitiesService,
+    register_capa_analysis_job,
+)
 from cti_app.application.jobs import JobExecutionContext, JobParameters, JobRegistry
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.analysis import SampleFeatureSetV1
@@ -112,7 +116,10 @@ class StaticAnalysisService:
         return features
 
 
-def create_analysis_job_registry(service: StaticAnalysisService) -> JobRegistry:
+def create_analysis_job_registry(
+    service: StaticAnalysisService,
+    capabilities_service: CapabilitiesService | None = None,
+) -> JobRegistry:
     registry = JobRegistry()
 
     async def handler(parameters: JobParameters, context: JobExecutionContext) -> str:
@@ -123,4 +130,6 @@ def create_analysis_job_registry(service: StaticAnalysisService) -> JobRegistry:
         return f"sample-features://{result.sample_id}/{result.parameters_sha256}"
 
     registry.register(STATIC_ANALYSIS_JOB_KIND, StaticAnalysisJobParameters, handler)
+    if capabilities_service is not None:
+        register_capa_analysis_job(registry, capabilities_service)
     return registry
