@@ -4,6 +4,9 @@ from __future__ import annotations
 import gzip
 import importlib.util
 import json
+import os
+import shutil
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +23,9 @@ def _load(name: str, relative: str):
 
 
 goodware = _load("import_goodware", "scripts/import_goodware.py")
-compose_guard = _load("check_analysis_worker_config", "scripts/check_analysis_worker_config.py")
+compose_guard = _load(
+    "check_analysis_worker_config", "scripts/check_analysis_worker_config.py"
+)
 fixture_guard = _load("check_no_binary_fixtures", "scripts/check_no_binary_fixtures.py")
 
 
@@ -38,7 +43,9 @@ class GoodwareStageTests(unittest.TestCase):
             with gzip.open(sources / "good-opcodes-part1.db", "wb") as handle:
                 handle.write(json.dumps({"AABBCCDDEEFF0011": 2}).encode())
             with gzip.open(sources / "good-imphashes-part1.db", "wb") as handle:
-                handle.write(json.dumps({"ABCDEF0123456789ABCDEF0123456789": 1}).encode())
+                handle.write(
+                    json.dumps({"ABCDEF0123456789ABCDEF0123456789": 1}).encode()
+                )
             with gzip.open(sources / "good-exports-part1.db", "wb") as handle:
                 handle.write(json.dumps({"CreateThing": 7}).encode())
 
@@ -48,9 +55,13 @@ class GoodwareStageTests(unittest.TestCase):
 
             records = [
                 json.loads(line)
-                for line in (output / "records.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in (output / "records.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
             ]
-            alpha = next(item for item in records if item["normalized_value"] == "alpha")
+            alpha = next(
+                item for item in records if item["normalized_value"] == "alpha"
+            )
             self.assertEqual(alpha["occurrence_count"], 5)
             self.assertTrue(
                 any(item["normalized_value"] == r"path\name" for item in records)
@@ -74,7 +85,6 @@ class GoodwareStageTests(unittest.TestCase):
                 handle.write(json.dumps({"alpha": 0}).encode())
             with self.assertRaises(goodware.GoodwareImportError):
                 goodware.build_stage(sources, root / "stage")
-
 
     def test_yargen_empty_imphash_sentinel_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
@@ -184,8 +194,6 @@ class GoodwareStageTests(unittest.TestCase):
             with self.assertRaises(goodware.GoodwareImportError):
                 goodware.build_stage(sources, root / "stage")
 
-
-
     def test_verify_does_not_reapply_lossy_yargen_string_unescaping(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)
@@ -219,6 +227,201 @@ class GoodwareStageTests(unittest.TestCase):
             self.assertEqual(records[0]["normalized_value"], expected_value)
             self.assertEqual(records[0]["occurrence_count"], 3)
 
+
+class GoodwareIndexTests(unittest.TestCase):
+    @staticmethod
+    def _write_source(sources: Path, filename: str, values: dict[str, int]) -> None:
+        with gzip.open(sources / filename, "wb") as handle:
+            handle.write(json.dumps(values).encode())
+
+    def test_v2_normalization_aggregation_and_read_only_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            sources = root / "sources"
+            output = root / "index"
+            sources.mkdir()
+            self._write_source(
+                sources,
+                "good-strings-part1.db",
+                {
+                    "Hello": 2,
+                    "hello": 3,
+                    "UTF16LE:HELLO": 4,
+                    "very-long-" + ("x" * 10000): 1,
+                },
+            )
+            self._write_source(sources, "good-exports-part1.db", {"CreateThing": 5})
+            self._write_source(
+                sources,
+                "good-imphashes-part1.db",
+                {"": 100, " ABCDEF0123456789ABCDEF0123456789 ": 2},
+            )
+
+            manifest = goodware.build_index(sources, output)
+            self.assertEqual(goodware.verify_index(output, sources), manifest)
+            self.assertEqual(goodware.deep_verify_index(output), manifest)
+            self.assertEqual(
+                {path.name for path in output.iterdir()},
+                {goodware.INDEX_FILENAME, goodware.MANIFEST_FILENAME},
+            )
+            self.assertEqual(goodware.lookup_feature(output, "string", "hello"), 9)
+            self.assertEqual(
+                goodware.lookup_count(
+                    output,
+                    "string",
+                    "very-long-" + ("x" * 10000),
+                ),
+                1,
+            )
+            self.assertIsNone(
+                goodware.lookup_feature(output, "string", "absent-feature")
+            )
+            self.assertEqual(
+                goodware.lookup_feature(output, "export", "creatething"), 5
+            )
+            self.assertEqual(
+                goodware.lookup_feature(
+                    output,
+                    "imphash",
+                    "abcdef0123456789abcdef0123456789",
+                ),
+                2,
+            )
+            self.assertEqual(manifest["record_count"], 4)
+            self.assertEqual(manifest["occurrence_sum"], 17)
+
+            index_path = output / goodware.INDEX_FILENAME
+            self.assertFalse(os.access(index_path, os.W_OK))
+            connection = sqlite3.connect(f"{index_path.as_uri()}?mode=ro", uri=True)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("CREATE TABLE unexpected(value TEXT)")
+            finally:
+                connection.close()
+
+    def test_v2_normalization_contract_and_golden_vectors(self) -> None:
+        self.assertEqual(goodware.normalize_value("string", "HELLO"), "hello")
+        self.assertEqual(goodware.normalize_value("string", "UTF16LE:HELLO"), "hello")
+        self.assertEqual(
+            goodware.normalize_value("export", "CreateThing"), "creatething"
+        )
+        self.assertEqual(
+            goodware.normalize_value("opcode_fragment16", "AA BB CC DD EE FF 00 11"),
+            "aabbccddeeff0011",
+        )
+        with self.assertRaises(goodware.GoodwareImportError):
+            goodware.normalize_value("string", "")
+        with self.assertRaises(goodware.GoodwareImportError):
+            goodware.normalize_value("imphash", "   ")
+        with self.assertRaises(goodware.GoodwareImportError):
+            goodware.normalize_value("imphash", "not-an-imphash")
+
+        vectors = {
+            (
+                "string",
+                "abc",
+            ): "b8256d9306818d46c10e2eefc5aaa6c6e19d0456313703cab0f8201928f94e78",
+            (
+                "opcode_fragment16",
+                "aabbccddeeff0011",
+            ): "2b36722201be82a9087bbf4bd6b914479e892e65028015405d4824e492dc9d8c",
+            (
+                "imphash",
+                "abcdef0123456789abcdef0123456789",
+            ): "0e7eb14094332976109049787b98093ca695b9806144997506c39a7f9c2cf387",
+            (
+                "export",
+                "createfilew",
+            ): "7ca816bdfa9e2a6e0c23bb9cd990a36b7e465444012e5e923052ebe922f58784",
+        }
+        for (kind, value), expected in vectors.items():
+            self.assertEqual(goodware.lookup_key(kind, value).hex(), expected)
+
+        source_set = "a" * 64
+        expected_fingerprint = (
+            "7c3e47d47fc74f5aba473dec864a88c70bcdd477498a603c715501794dc07692"
+        )
+        self.assertEqual(
+            goodware.baseline_fingerprint_sha256(source_set), expected_fingerprint
+        )
+        self.assertEqual(
+            goodware.baseline_fingerprint_sha256(source_set), expected_fingerprint
+        )
+
+    def test_v2_ingestion_is_batched_and_rebuild_is_logically_deterministic(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            sources = root / "sources"
+            first = root / "first"
+            second = root / "second"
+            sources.mkdir()
+            self._write_source(
+                sources,
+                "good-strings-many.db",
+                {f"value-{number}": 1 for number in range(7)},
+            )
+
+            original_batch_size = goodware.INGEST_BATCH_SIZE
+            original_insert = goodware._insert_stage_rows
+            batches: list[int] = []
+
+            def record_batch(connection, rows):
+                batches.append(len(rows))
+                return original_insert(connection, rows)
+
+            goodware.INGEST_BATCH_SIZE = 2
+            goodware._insert_stage_rows = record_batch
+            try:
+                first_manifest = goodware.build_index(sources, first)
+                second_manifest = goodware.build_index(sources, second)
+            finally:
+                goodware.INGEST_BATCH_SIZE = original_batch_size
+                goodware._insert_stage_rows = original_insert
+
+            self.assertGreater(len(batches), 2)
+            self.assertLessEqual(max(batches), 2)
+            self.assertEqual(first_manifest, second_manifest)
+            self.assertEqual(
+                goodware.lookup_feature(first, "string", "value-3"),
+                goodware.lookup_feature(second, "string", "value-3"),
+            )
+
+    def test_v2_manifest_index_and_source_corruption_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            sources = root / "sources"
+            output = root / "index"
+            sources.mkdir()
+            self._write_source(sources, "good-strings-part1.db", {"alpha": 1})
+            goodware.build_index(sources, output)
+
+            manifest_path = output / goodware.MANIFEST_FILENAME
+            original_manifest = manifest_path.read_bytes()
+            manifest = json.loads(original_manifest)
+            manifest["normalization_version"] = "unknown"
+            manifest_path.chmod(0o644)
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(goodware.GoodwareImportError):
+                goodware.verify_index(output)
+            manifest_path.write_bytes(original_manifest)
+            manifest_path.chmod(0o444)
+
+            self._write_source(sources, "good-strings-part1.db", {"changed": 1})
+            with self.assertRaises(goodware.GoodwareImportError):
+                goodware.verify_index(output, sources)
+
+            shutil.copytree(output, root / "corrupt-index")
+            corrupt_index = root / "corrupt-index" / goodware.INDEX_FILENAME
+            corrupt_index.chmod(0o644)
+            with corrupt_index.open("ab") as handle:
+                handle.write(b"corrupt")
+            with self.assertRaises(goodware.GoodwareImportError):
+                goodware.verify_index(root / "corrupt-index")
 
 
 class ComposeGuardTests(unittest.TestCase):
@@ -264,7 +467,9 @@ class FixtureGuardTests(unittest.TestCase):
             (root / "fixture.py").write_text("DATA = b'generated'\n", encoding="utf-8")
             self.assertEqual(fixture_guard.find_binary_files(root), [])
             (root / "sample.bin").write_bytes(b"MZ\x00\x01")
-            self.assertEqual(fixture_guard.find_binary_files(root), [root / "sample.bin"])
+            self.assertEqual(
+                fixture_guard.find_binary_files(root), [root / "sample.bin"]
+            )
 
     def test_historical_documents_are_allowed_and_pyc_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
