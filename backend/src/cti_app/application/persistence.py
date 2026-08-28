@@ -59,6 +59,7 @@ from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
     ProductionArtifact,
+    ProductionInputSnapshot,
     SampleAcquisitionAttempt,
     SubjectProductionRun,
 )
@@ -329,6 +330,8 @@ class EditionRepository(Protocol):
     async def add_if_absent(self, edition: Edition) -> bool: ...
 
     async def get(self, edition_id: UUID) -> Edition | None: ...
+
+    async def get_for_update(self, edition_id: UUID) -> Edition | None: ...
 
     async def get_by_logical_key(
         self, country_code: str, period_start: date, period_end: date
@@ -639,6 +642,7 @@ class UnitOfWork(Protocol):
     brief_drafts: BriefDraftRepository
     # Defined further down in this module.
     subject_production_runs: SubjectProductionRunRepository
+    production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
@@ -756,6 +760,14 @@ class ProductionArtifactRepository(Protocol):
     async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]: ...
 
 
+class ProductionInputSnapshotRepository(Protocol):
+    async def add(self, snapshot: ProductionInputSnapshot) -> None: ...
+
+    async def get(self, snapshot_id: UUID) -> ProductionInputSnapshot | None: ...
+
+    async def get_by_run(self, production_run_id: UUID) -> ProductionInputSnapshot | None: ...
+
+
 class AnalystInvestigationRepository(Protocol):
     async def get(self, investigation_id: UUID) -> AnalystInvestigation | None: ...
     async def get_for_run(self, run_id: UUID) -> AnalystInvestigation | None: ...
@@ -796,11 +808,17 @@ class EditionProductionBatchItemRepository(Protocol):
 
 
 class ProductionUnitOfWork(Protocol):
+    jobs: JobRepository
+    editions: EditionRepository
+    edition_audit: EditionAuditRepository
     subject_production_runs: SubjectProductionRunRepository
+    production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     analyst_investigations: AnalystInvestigationRepository
     analyst_decisions: AnalystDecisionRepository
     analyst_input_packs: AnalystInputPackRepository
+    discovery_batches: DiscoveryBatchRepository
+    editorial_groups: EditorialGroupRepository
     source_collections: SourceCollectionRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository

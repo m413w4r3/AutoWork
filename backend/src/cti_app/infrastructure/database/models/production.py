@@ -30,6 +30,7 @@ PRODUCTION_ARTIFACT_STATUS_VALUES_SQL = "'verified', 'stale', 'needs_review'"
 PRODUCTION_BATCH_STATUS_VALUES_SQL = (
     "'queued', 'running', 'completed', 'completed_with_issues', 'cancelled'"
 )
+PRODUCTION_BATCH_PHASE_VALUES_SQL = "'initial', 'recovery', 'review'"
 ANALYST_INVESTIGATION_STATUS_VALUES_SQL = (
     "'queued', 'running', 'awaiting_review', 'completed', 'exhausted', 'failed', 'cancelled'"
 )
@@ -339,6 +340,7 @@ class EditionProductionBatchRow(Base):
             f"status IN ({PRODUCTION_BATCH_STATUS_VALUES_SQL})", name="ck_batch_status"
         ),
         CheckConstraint(f"profile IN ({PRODUCTION_PROFILE_VALUES_SQL})", name="ck_batch_profile"),
+        CheckConstraint(f"phase IN ({PRODUCTION_BATCH_PHASE_VALUES_SQL})", name="ck_batch_phase"),
         Index("ix_edition_production_batches_edition_id_status", "edition_id", "status"),
     )
 
@@ -348,6 +350,8 @@ class EditionProductionBatchRow(Base):
     )
     profile: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    phase: Mapped[str] = mapped_column(String(16), nullable=False, server_default="initial")
+    next_dispatch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -360,6 +364,9 @@ class EditionProductionBatchItemRow(Base):
         UniqueConstraint("batch_id", "position", name="uq_batch_position"),
         UniqueConstraint("batch_id", "subject_id", name="uq_batch_subject"),
         CheckConstraint("position >= 1", name="ck_batch_item_position"),
+        CheckConstraint(
+            "auto_recovery_count BETWEEN 0 AND 1", name="ck_batch_item_auto_recovery_count"
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -377,4 +384,48 @@ class EditionProductionBatchItemRow(Base):
         nullable=False,
     )
     position: Mapped[int] = mapped_column(nullable=False)
+    auto_recovery_count: Mapped[int] = mapped_column(nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ProductionInputSnapshotRow(Base):
+    __tablename__ = "production_input_snapshots"
+    __table_args__ = (
+        UniqueConstraint("production_run_id", name="uq_production_input_snapshots_run"),
+        CheckConstraint("editorial_group_version >= 1", name="ck_production_input_group_version"),
+        CheckConstraint("period_start <= period_end", name="ck_production_input_period_order"),
+        CheckConstraint(
+            "jsonb_typeof(core_sources) = 'array'", name="ck_production_input_sources_array"
+        ),
+        CheckConstraint(
+            "char_length(input_hash) = 64 AND input_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_production_input_hash",
+        ),
+        Index("ix_production_input_snapshots_subject", "subject_id", "captured_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    production_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("subject_production_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subject_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
+    )
+    edition_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
+    )
+    editorial_group_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editorial_groups.id", ondelete="RESTRICT"), nullable=False
+    )
+    editorial_group_version: Mapped[int] = mapped_column(nullable=False)
+    subject_title: Mapped[str] = mapped_column(Text, nullable=False)
+    subject_description: Mapped[str] = mapped_column(Text, nullable=False)
+    actor_or_campaign: Mapped[str] = mapped_column(Text, nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    research_date: Mapped[date] = mapped_column(Date, nullable=False)
+    core_sources: Mapped[list[dict[str, object]]] = mapped_column(JSONB, nullable=False)
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

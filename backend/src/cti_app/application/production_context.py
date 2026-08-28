@@ -13,6 +13,7 @@ from uuid import UUID
 
 from cti_app.application.persistence import UnitOfWork
 from cti_app.domain.collection import CollectionState, SourceOriginKind
+from cti_app.domain.production import ProductionInputSnapshot
 
 _ARCHIVED_STATES = {
     CollectionState.ARCHIVED,
@@ -43,7 +44,7 @@ def _describe(source: object) -> str:
     title = getattr(source, "title", None) or ""
     publisher = getattr(source, "publisher", None) or ""
     published_at = getattr(source, "published_at", None)
-    role = getattr(source, "proposed_role", None)
+    role = getattr(source, "proposed_role", getattr(source, "role", None))
     parts = [part for part in (title, publisher) if part]
     if published_at is not None:
         parts.append(str(published_at))
@@ -56,27 +57,50 @@ def _describe(source: object) -> str:
 async def build_subject_production_context(
     uow: UnitOfWork,
     subject_id: UUID,
-    research_date: date,
+    research_date: date | ProductionInputSnapshot | None = None,
+    snapshot: ProductionInputSnapshot | None = None,
 ) -> SubjectProductionContext:
     """Assemble the prompt context from what the editorial phase established."""
-    group = await uow.editorial_groups.get_by_subject(subject_id)
-    title = group.title if group else str(subject_id)
-    description = group.grouping_justification if group else ""
+    if isinstance(research_date, ProductionInputSnapshot):
+        snapshot = research_date
+        research_date = snapshot.research_date
+    elif snapshot is not None:
+        research_date = snapshot.research_date
+    if research_date is None:
+        raise ValueError("research_date or production input snapshot is required")
 
-    period_start = ""
-    period_end = ""
-    if group is not None:
+    group = await uow.editorial_groups.get_by_subject(subject_id)
+    title = snapshot.subject_title if snapshot else (group.title if group else str(subject_id))
+    description = (
+        snapshot.subject_description if snapshot else group.grouping_justification if group else ""
+    )
+
+    period_start = snapshot.period_start.isoformat() if snapshot else ""
+    period_end = snapshot.period_end.isoformat() if snapshot else ""
+    if snapshot is None and group is not None:
         edition = await uow.editions.get(group.edition_id)
         if edition is not None:
             period_start = edition.period_start.isoformat()
             period_end = edition.period_end.isoformat()
 
     collections = list(await uow.source_collections.list_for_subject(subject_id))
-    core_sources_text = "\n".join(
-        _describe(item)
-        for item in collections
-        if item.origin_kind in {SourceOriginKind.DISCOVERY, SourceOriginKind.MANUAL}
-    )
+    if snapshot is not None:
+        core_sources = [
+            _describe(source)
+            for source in snapshot.core_sources
+        ]
+        core_sources.extend(
+            _describe(item)
+            for item in collections
+            if item.origin_kind is SourceOriginKind.MANUAL
+        )
+        core_sources_text = "\n".join(dict.fromkeys(core_sources))
+    else:
+        core_sources_text = "\n".join(
+            _describe(item)
+            for item in collections
+            if item.origin_kind in {SourceOriginKind.DISCOVERY, SourceOriginKind.MANUAL}
+        )
     supporting_sources_text = "\n".join(
         _describe(item)
         for item in collections
@@ -98,8 +122,8 @@ async def build_subject_production_context(
         else "Aucune publication archivée pour l'instant."
     )
 
-    actor_info = ""
-    if group is not None:
+    actor_info = snapshot.actor_or_campaign if snapshot else ""
+    if snapshot is None and group is not None:
         actor_info = getattr(group, "actor_or_campaign", "") or ""
 
     return SubjectProductionContext(

@@ -35,6 +35,7 @@ from cti_app.application.production_parsers import (
     technical_extraction_from_json,
     validate_synthesis,
 )
+from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.config import get_settings
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.production import (
@@ -447,6 +448,19 @@ class ProductionStateService:
             if profile is ProductionProfile.MAJOR_ASSISTED:
                 run.resume_verified_import_at_analyst_research(now=now)
             await uow.subject_production_runs.add(run)
+            snapshot_repository = getattr(uow, "production_input_snapshots", None)
+            editorial_group = await uow.editorial_groups.get_by_subject(subject_id)
+            if snapshot_repository is not None and editorial_group is not None:
+                assert run.research_date is not None
+                input_snapshot = await capture_production_input_snapshot(
+                    uow,
+                    production_run_id=run.id,
+                    subject_id=subject_id,
+                    edition_id=edition_id,
+                    research_date=run.research_date,
+                    captured_at=now,
+                )
+                await snapshot_repository.add(input_snapshot)
             refs = ProductionArtifact(
                 production_run_id=run.id,
                 subject_id=subject_id,

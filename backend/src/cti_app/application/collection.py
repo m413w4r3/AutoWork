@@ -44,6 +44,7 @@ from cti_app.domain.collection import (
 from cti_app.domain.discovery import SourceCandidate, SourceRole, canonicalize_http_url
 from cti_app.domain.editorial import EditorialGroupStatus
 from cti_app.domain.entities import ProvenanceEvent, SourceDocument
+from cti_app.domain.production import ProductionInputSnapshot, ProductionInputSource
 from cti_app.logging import get_correlation_id
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,37 @@ class SubjectCollectionService:
                     )
             await uow.commit()
         return await self.list_sources(subject_id)
+
+    async def initialize_from_snapshot(
+        self, subject_id: UUID, snapshot: ProductionInputSnapshot
+    ) -> list[SourceCollection]:
+        """Initialize production sources from the run's immutable input."""
+        if snapshot.subject_id != subject_id:
+            raise CollectionNotAllowedError("Production snapshot does not belong to the subject")
+
+        snapshot_urls = {source.canonical_url for source in snapshot.core_sources}
+        async with self._uow_factory() as uow:
+            current = list(await uow.source_collections.list_for_subject(subject_id))
+            seen_urls = {item.canonical_url for item in current}
+            for source in snapshot.core_sources:
+                if source.canonical_url in seen_urls:
+                    continue
+                await uow.source_collections.add_if_absent(
+                    _new_snapshot_collection(snapshot, subject_id, source)
+                )
+                seen_urls.add(source.canonical_url)
+            await uow.commit()
+            current = list(await uow.source_collections.list_for_subject(subject_id))
+
+        # Q1 may add reference-research sources after SOURCES. They remain
+        # eligible, while a newly discovered current candidate does not.
+        return [
+            item
+            for item in current
+            if item.canonical_url in snapshot_urls
+            or item.origin_kind
+            in {SourceOriginKind.REFERENCE_RESEARCH, SourceOriginKind.MANUAL}
+        ]
 
     async def add_supplemental_sources(
         self,
@@ -386,8 +418,13 @@ class SubjectCollectionService:
         context: JobExecutionContext,
         *,
         collection_id: UUID | None = None,
+        snapshot: ProductionInputSnapshot | None = None,
     ) -> str:
-        sources = await self.initialize(subject_id)
+        sources = (
+            await self.initialize_from_snapshot(subject_id, snapshot)
+            if snapshot is not None
+            else await self.initialize(subject_id)
+        )
         if collection_id is not None:
             sources = [item for item in sources if item.id == collection_id]
             if not sources:
@@ -396,7 +433,7 @@ class SubjectCollectionService:
         await context.report_progress(0, len(sources), "Préparation de la collecte")
         for index, source in enumerate(sources, start=1):
             await context.check_cancelled()
-            candidate = await self._candidate_for(source)
+            candidate = await self._candidate_for(source, snapshot=snapshot)
             await context.report_progress(
                 index - 1,
                 len(sources),
@@ -443,6 +480,7 @@ class SubjectCollectionService:
                     job_id,
                     context=context,
                     position=(index, len(sources)),
+                    candidate=candidate,
                 )
             summary.record(state, already_archived=already_archived)
             state_label = _state_label(state)
@@ -496,6 +534,7 @@ class SubjectCollectionService:
         *,
         context: JobExecutionContext | None = None,
         position: tuple[int, int] | None = None,
+        candidate: SourceCandidate | None = None,
     ) -> CollectionState:
         operation_started = time.monotonic()
         async with self._uow_factory() as uow:
@@ -563,7 +602,7 @@ class SubjectCollectionService:
                     position[1],
                     f"Archivage de la source {position[0]}/{position[1]}",
                 )
-        await self._archive(collection.id, job_id, started_at, response)
+        await self._archive(collection.id, job_id, started_at, response, candidate=candidate)
         self._log_source_result(
             collection,
             job_id,
@@ -573,7 +612,21 @@ class SubjectCollectionService:
         )
         return CollectionState.ARCHIVED
 
-    async def _candidate_for(self, collection: SourceCollection) -> SourceCandidate | None:
+    async def _candidate_for(
+        self,
+        collection: SourceCollection,
+        *,
+        snapshot: ProductionInputSnapshot | None = None,
+    ) -> SourceCandidate | None:
+        if snapshot is not None:
+            return next(
+                (
+                    source.to_source_candidate()
+                    for source in snapshot.core_sources
+                    if source.canonical_url == collection.canonical_url
+                ),
+                None,
+            )
         if collection.batch_id is None or collection.source_candidate_id is None:
             return None
         async with self._uow_factory() as uow:
@@ -730,6 +783,8 @@ class SubjectCollectionService:
         job_id: UUID,
         started_at: datetime,
         response: CollectedResponse,
+        *,
+        candidate: SourceCandidate | None = None,
     ) -> None:
         raw_blob = await self._catalog.ingest(
             BytesIO(response.encoded_body),
@@ -744,8 +799,12 @@ class SubjectCollectionService:
         async with self._uow_factory() as uow:
             collection = await _require_collection(uow, collection_id)
             subject = await uow.subjects.get(collection.subject_id)
-            source = None
-            if collection.batch_id is not None and collection.source_candidate_id is not None:
+            source = candidate
+            if (
+                source is None
+                and collection.batch_id is not None
+                and collection.source_candidate_id is not None
+            ):
                 batch = await uow.discovery_batches.get(collection.batch_id)
                 source = batch.source(collection.source_candidate_id) if batch else None
             if subject is None:
@@ -963,6 +1022,30 @@ def _new_collection(
         group_id=group_id,
         batch_id=batch_id,
         source_candidate_id=source.id,
+        requested_url=source.canonical_url,
+        canonical_url=source.canonical_url,
+        origin_kind=SourceOriginKind.DISCOVERY,
+        proposed_role=source.role,
+        title=source.title,
+        publisher=source.publisher,
+        published_at=source.published_at,
+        source_tlp=source.tlp,
+        sensitivity=source.sensitivity,
+        external_llm_allowed=source.external_llm_allowed,
+    )
+
+
+def _new_snapshot_collection(
+    snapshot: ProductionInputSnapshot,
+    subject_id: UUID,
+    source: ProductionInputSource,
+) -> SourceCollection:
+    return SourceCollection(
+        subject_id=subject_id,
+        edition_id=snapshot.edition_id,
+        group_id=snapshot.editorial_group_id,
+        batch_id=source.batch_id,
+        source_candidate_id=source.source_candidate_id,
         requested_url=source.canonical_url,
         canonical_url=source.canonical_url,
         origin_kind=SourceOriginKind.DISCOVERY,

@@ -85,6 +85,9 @@ class ProductionStatus(BaseModel):
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    error_details: dict[str, Any] | None = None
     # Parser recoveries worth showing to an analyst, never blocking.
     warnings: list[str] = []
     stages: dict[str, StageStatus]
@@ -114,6 +117,8 @@ class BatchStatus(BaseModel):
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
+    phase: str = "initial"
+    next_dispatch_at: str | None = None
 
 
 def _runtime(request: Request) -> tuple[UnitOfWorkFactory, JobService, JobDispatcher]:
@@ -210,6 +215,9 @@ def _run_view(
         "stage": run.current_stage.value,
         "job_id": str(job_id) if job_id else None,
         "created_at": run.created_at.isoformat(),
+        "error_code": run.error_code,
+        "error_message": run.error_message,
+        "error_details": run.error_details,
     }
 
 
@@ -387,6 +395,8 @@ async def get_subject_production(
             )
 
         group = await uow.editorial_groups.get_by_subject(subject_id)
+        snapshot_repository = getattr(uow, "production_input_snapshots", None)
+        snapshot = await snapshot_repository.get_by_run(run.id) if snapshot_repository else None
 
         # Artifacts evidence the stages that produce one; SOURCES does not.
         artifacts = await uow.production_artifacts.list_for_run(run.id)
@@ -399,7 +409,13 @@ async def get_subject_production(
 
         return ProductionStatus(
             subject_id=str(run.subject_id),
-            title=group.title if group else str(run.subject_id),
+            title=(
+                snapshot.subject_title
+                if snapshot
+                else group.title
+                if group
+                else str(run.subject_id)
+            ),
             editorial_type=(
                 group.editorial_type.value
                 if group and group.editorial_type
@@ -420,6 +436,9 @@ async def get_subject_production(
             created_at=run.created_at.isoformat(),
             started_at=run.started_at.isoformat() if run.started_at else None,
             finished_at=run.finished_at.isoformat() if run.finished_at else None,
+            error_code=run.error_code,
+            error_message=run.error_message,
+            error_details=run.error_details,
             warnings=_collect_warnings(artifacts),
             stages={name: StageStatus(**stage) for name, stage in stages.items()},
         )
@@ -741,6 +760,12 @@ async def start_edition_brief_production(
                 finished_at=active_batch.finished_at.isoformat()
                 if active_batch.finished_at
                 else None,
+                phase=active_batch.phase.value,
+                next_dispatch_at=(
+                    active_batch.next_dispatch_at.isoformat()
+                    if active_batch.next_dispatch_at
+                    else None
+                ),
             )
 
         groups = await uow.editorial_groups.list_for_edition(edition_id)
@@ -769,6 +794,8 @@ async def start_edition_brief_production(
             edition_id=edition_id,
             profile=ProductionProfile.BRIEF_AUTO,
             subject_ids=subject_ids,
+            actor_id=user,
+            correlation_id=get_correlation_id(),
         )
 
         # create_batch already made a run per subject and linked items to them;
@@ -811,6 +838,10 @@ async def start_edition_brief_production(
         created_at=batch.created_at.isoformat(),
         started_at=batch.started_at.isoformat() if batch.started_at else None,
         finished_at=None,
+        phase=batch.phase.value,
+        next_dispatch_at=(
+            batch.next_dispatch_at.isoformat() if batch.next_dispatch_at else None
+        ),
     )
 
 
@@ -855,11 +886,23 @@ async def get_edition_brief_production(
                 cancelled += 1
 
             group = await uow.editorial_groups.get_by_subject(item.subject_id)
+            snapshot_repository = getattr(uow, "production_input_snapshots", None)
+            snapshot = (
+                await snapshot_repository.get_by_run(run.id)
+                if snapshot_repository
+                else None
+            )
             details.append(
                 BatchItemDetail(
                     position=item.position,
                     subject_id=str(item.subject_id),
-                    title=group.title if group else str(item.subject_id),
+                    title=(
+                        snapshot.subject_title
+                        if snapshot
+                        else group.title
+                        if group
+                        else str(item.subject_id)
+                    ),
                     run_id=str(run.id),
                     status=run.status.value,
                     current_stage=run.current_stage.value,
@@ -880,6 +923,10 @@ async def get_edition_brief_production(
             created_at=batch.created_at.isoformat(),
             started_at=batch.started_at.isoformat() if batch.started_at else None,
             finished_at=batch.finished_at.isoformat() if batch.finished_at else None,
+            phase=batch.phase.value,
+            next_dispatch_at=(
+                batch.next_dispatch_at.isoformat() if batch.next_dispatch_at else None
+            ),
         )
 
 
@@ -889,7 +936,9 @@ async def cancel_edition_batch(
     batch_id: UUID,
     request: Request,
 ) -> dict[str, Any]:
-    uow_factory, _, _ = _runtime(request)
+    uow_factory, jobs, _ = _runtime(request)
+    current_run_id: UUID | None = None
+    current_subject_id: UUID | None = None
 
     async with uow_factory() as uow:
         batch = await uow.edition_production_batches.get_for_update(batch_id)
@@ -907,10 +956,39 @@ async def cancel_edition_batch(
 
         batch.cancel(now=datetime.now(UTC))
         await uow.edition_production_batches.save(batch)
+        items = await uow.edition_production_batch_items.list_for_batch(batch.id)
+        for item in items:
+            run = await uow.subject_production_runs.get_for_update(item.production_run_id)
+            if run is None:
+                continue
+            if run.status is SubjectProductionStatus.QUEUED:
+                run.mark_cancelled(now=datetime.now(UTC))
+                await uow.subject_production_runs.save(run)
+            elif (
+                run.status is SubjectProductionStatus.RUNNING
+                and current_run_id is None
+            ):
+                current_run_id = run.id
+                current_subject_id = run.subject_id
         await uow.commit()
 
-        return {
-            "action": "cancel",
-            "batch_id": str(batch.id),
-            "status": batch.status,
-        }
+    if current_run_id is not None:
+        list_jobs = getattr(jobs, "list_for_aggregate", None)
+        cancel_job = getattr(jobs, "cancel", None)
+        if list_jobs is not None and cancel_job is not None:
+            for job in await list_jobs("subject", current_subject_id):
+                if (
+                    str(job.input_parameters.get("run_id")) == str(current_run_id)
+                    and not job.is_terminal
+                ):
+                    try:
+                        await cancel_job(job.id, actor_id="system")
+                    except (LookupError, ValueError):
+                        pass
+                    break
+
+    return {
+        "action": "cancel",
+        "batch_id": str(batch.id),
+        "status": batch.status,
+    }

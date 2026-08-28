@@ -14,6 +14,8 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionInputSnapshot,
+    ProductionInputSource,
     ProductionProfile,
     SampleAcquisitionAttempt,
     SampleAcquisitionOutcome,
@@ -29,6 +31,7 @@ from cti_app.infrastructure.database.models.production import (
     EditionProductionBatchItemRow,
     EditionProductionBatchRow,
     ProductionArtifactRow,
+    ProductionInputSnapshotRow,
     SampleAcquisitionAttemptRow,
     SubjectProductionRunRow,
 )
@@ -277,6 +280,45 @@ class SqlAlchemySubjectProductionRunRepository:
         return int(maximum or 0) + 1
 
 
+class SqlAlchemyProductionInputSnapshotRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, snapshot: ProductionInputSnapshot) -> None:
+        self._session.add(
+            ProductionInputSnapshotRow(
+                id=snapshot.id,
+                production_run_id=snapshot.production_run_id,
+                subject_id=snapshot.subject_id,
+                edition_id=snapshot.edition_id,
+                editorial_group_id=snapshot.editorial_group_id,
+                editorial_group_version=snapshot.editorial_group_version,
+                subject_title=snapshot.subject_title,
+                subject_description=snapshot.subject_description,
+                actor_or_campaign=snapshot.actor_or_campaign,
+                period_start=snapshot.period_start,
+                period_end=snapshot.period_end,
+                research_date=snapshot.research_date,
+                core_sources=[source.payload() for source in snapshot.core_sources],
+                input_hash=snapshot.input_hash,
+                captured_at=snapshot.captured_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get(self, snapshot_id: UUID) -> ProductionInputSnapshot | None:
+        row = await self._session.get(ProductionInputSnapshotRow, snapshot_id)
+        return _production_input_snapshot_from_row(row) if row else None
+
+    async def get_by_run(self, production_run_id: UUID) -> ProductionInputSnapshot | None:
+        row = await self._session.scalar(
+            select(ProductionInputSnapshotRow).where(
+                ProductionInputSnapshotRow.production_run_id == production_run_id
+            )
+        )
+        return _production_input_snapshot_from_row(row) if row else None
+
+
 class SqlAlchemyProductionArtifactRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -395,6 +437,8 @@ class SqlAlchemyEditionProductionBatchRepository:
             edition_id=batch.edition_id,
             profile=batch.profile.value,
             status=batch.status,
+            phase=batch.phase.value,
+            next_dispatch_at=batch.next_dispatch_at,
             created_at=batch.created_at,
             started_at=batch.started_at,
             finished_at=batch.finished_at,
@@ -433,6 +477,8 @@ class SqlAlchemyEditionProductionBatchRepository:
             .where(EditionProductionBatchRow.id == batch.id)
             .values(
                 status=batch.status,
+                phase=batch.phase.value,
+                next_dispatch_at=batch.next_dispatch_at,
                 started_at=batch.started_at,
                 finished_at=batch.finished_at,
                 version=batch.version,
@@ -467,6 +513,7 @@ class SqlAlchemyEditionProductionBatchItemRepository:
                 subject_id=item.subject_id,
                 production_run_id=item.production_run_id,
                 position=item.position,
+                auto_recovery_count=item.auto_recovery_count,
                 created_at=item.created_at,
             )
             self._session.add(row)
@@ -639,6 +686,7 @@ def _production_artifact_from_row(row: ProductionArtifactRow) -> ProductionArtif
 def _edition_production_batch_from_row(row: EditionProductionBatchRow) -> EditionProductionBatch:
     from cti_app.domain.production import (
         EditionProductionBatch,
+        ProductionBatchPhase,
         ProductionProfile,
     )
 
@@ -647,6 +695,8 @@ def _edition_production_batch_from_row(row: EditionProductionBatchRow) -> Editio
         edition_id=row.edition_id,
         profile=ProductionProfile(row.profile),
         status=row.status,
+        phase=ProductionBatchPhase(row.phase),
+        next_dispatch_at=row.next_dispatch_at,
         created_at=row.created_at,
         started_at=row.started_at,
         finished_at=row.finished_at,
@@ -665,5 +715,28 @@ def _edition_production_batch_item_from_row(
         subject_id=row.subject_id,
         production_run_id=row.production_run_id,
         position=row.position,
+        auto_recovery_count=row.auto_recovery_count,
         created_at=row.created_at,
+    )
+
+
+def _production_input_snapshot_from_row(
+    row: ProductionInputSnapshotRow,
+) -> ProductionInputSnapshot:
+    return ProductionInputSnapshot(
+        id=row.id,
+        production_run_id=row.production_run_id,
+        subject_id=row.subject_id,
+        edition_id=row.edition_id,
+        editorial_group_id=row.editorial_group_id,
+        editorial_group_version=row.editorial_group_version,
+        subject_title=row.subject_title,
+        subject_description=row.subject_description,
+        actor_or_campaign=row.actor_or_campaign,
+        period_start=row.period_start,
+        period_end=row.period_end,
+        research_date=row.research_date,
+        core_sources=tuple(ProductionInputSource.from_payload(item) for item in row.core_sources),
+        input_hash=row.input_hash,
+        captured_at=row.captured_at,
     )

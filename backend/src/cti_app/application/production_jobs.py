@@ -206,6 +206,8 @@ def register_production_jobs(
         outcome = str(result.get("status", "success"))
         error_code = str(result.get("error_code") or f"{stage.value}_error")
         error_message = str(result.get("error", "unknown error"))
+        details = result.get("details")
+        error_details = details if isinstance(details, dict) else None
 
         # A transient failure must stay retryable and must NOT end the run:
         # the batch keeps its slot and the job is retried.
@@ -220,7 +222,9 @@ def register_production_jobs(
                 async with uow_factory() as uow:
                     ending = await uow.subject_production_runs.get_for_update(parameters.run_id)
                     if ending is not None and ending.status not in _TERMINAL_STATUSES:
-                        ending.mark_needs_review(code=error_code, message=error_message)
+                        ending.mark_needs_review(
+                            code=error_code, message=error_message, details=error_details
+                        )
                         await uow.subject_production_runs.save(ending)
                         await uow.commit()
                 await advance_batch(parameters.run_id, correlation_id)
@@ -238,9 +242,13 @@ def register_production_jobs(
                 ending = await uow.subject_production_runs.get_for_update(parameters.run_id)
                 if ending is not None and ending.status not in _TERMINAL_STATUSES:
                     if outcome == "needs_review":
-                        ending.mark_needs_review(code=error_code, message=error_message)
+                        ending.mark_needs_review(
+                            code=error_code, message=error_message, details=error_details
+                        )
                     else:
-                        ending.mark_failed(code=error_code, message=error_message)
+                        ending.mark_failed(
+                            code=error_code, message=error_message, details=error_details
+                        )
                     await uow.subject_production_runs.save(ending)
                     await uow.commit()
             await advance_batch(parameters.run_id, correlation_id)

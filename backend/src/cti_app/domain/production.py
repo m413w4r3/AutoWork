@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
+
+from cti_app.domain.classification import TLP
+from cti_app.domain.discovery import SourceCandidate, SourceRole
 
 
 class ProductionProfile(StrEnum):
@@ -32,6 +37,157 @@ class SubjectProductionStage(StrEnum):
     ANALYST_RESEARCH = "analyst_research"
     ANALYST_NOTE = "analyst_note"
     ASSEMBLY = "assembly"
+
+
+class ProductionBatchPhase(StrEnum):
+    INITIAL = "initial"
+    RECOVERY = "recovery"
+    REVIEW = "review"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProductionInputSource:
+    """The source-candidate metadata captured for a production run."""
+
+    batch_id: UUID
+    candidate_id: UUID
+    source_candidate_id: UUID
+    canonical_url: str
+    role: SourceRole
+    title: str
+    publisher: str
+    published_at: date | None
+    tlp: TLP
+    sensitivity: str
+    external_llm_allowed: bool
+
+    def __post_init__(self) -> None:
+        if not self.canonical_url.strip():
+            raise ValueError("A production input source requires a canonical URL")
+        if not self.title.strip() or not self.publisher.strip():
+            raise ValueError("A production input source requires title and publisher")
+        if not self.sensitivity.strip():
+            raise ValueError("A production input source requires sensitivity")
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "batch_id": str(self.batch_id),
+            "candidate_id": str(self.candidate_id),
+            "source_candidate_id": str(self.source_candidate_id),
+            "canonical_url": self.canonical_url,
+            "role": self.role.value,
+            "title": self.title,
+            "publisher": self.publisher,
+            "published_at": self.published_at.isoformat() if self.published_at else None,
+            "tlp": self.tlp.value,
+            "sensitivity": self.sensitivity,
+            "external_llm_allowed": self.external_llm_allowed,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> ProductionInputSource:
+        published_at = payload.get("published_at")
+        return cls(
+            batch_id=UUID(str(payload["batch_id"])),
+            candidate_id=UUID(str(payload["candidate_id"])),
+            source_candidate_id=UUID(str(payload["source_candidate_id"])),
+            canonical_url=str(payload["canonical_url"]),
+            role=SourceRole(str(payload["role"])),
+            title=str(payload["title"]),
+            publisher=str(payload["publisher"]),
+            published_at=date.fromisoformat(str(published_at)) if published_at else None,
+            tlp=TLP(str(payload["tlp"])),
+            sensitivity=str(payload["sensitivity"]),
+            external_llm_allowed=bool(payload["external_llm_allowed"]),
+        )
+
+    def to_source_candidate(self) -> SourceCandidate:
+        """Rehydrate only the fields needed by the collection metadata path."""
+        return SourceCandidate(
+            id=self.source_candidate_id,
+            url=self.canonical_url,
+            title=self.title,
+            publisher=self.publisher,
+            role=self.role,
+            published_at=self.published_at,
+            tlp=self.tlp,
+            sensitivity=self.sensitivity,
+            external_llm_allowed=self.external_llm_allowed,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProductionInputSnapshot:
+    """Immutable functional input captured exactly once for a production run."""
+
+    production_run_id: UUID
+    subject_id: UUID
+    edition_id: UUID
+    editorial_group_id: UUID
+    editorial_group_version: int
+    subject_title: str
+    subject_description: str
+    actor_or_campaign: str
+    period_start: date
+    period_end: date
+    research_date: date
+    core_sources: tuple[ProductionInputSource, ...] = ()
+    input_hash: str = ""
+    id: UUID = field(default_factory=uuid4)
+    captured_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "core_sources",
+            tuple(
+                sorted(
+                    self.core_sources,
+                    key=lambda source: (
+                        source.canonical_url,
+                        str(source.batch_id),
+                        str(source.candidate_id),
+                        str(source.source_candidate_id),
+                    ),
+                )
+            ),
+        )
+        if self.editorial_group_version < 1:
+            raise ValueError("editorial_group_version must be >= 1")
+        if self.period_start > self.period_end:
+            raise ValueError("Production input period must be ordered")
+        if not self.subject_title.strip():
+            raise ValueError("A production input snapshot requires a subject title")
+        if self.captured_at.tzinfo is None or self.captured_at.utcoffset() is None:
+            raise ValueError("captured_at must be timezone-aware")
+        computed = self.compute_input_hash()
+        if self.input_hash and self.input_hash != computed:
+            raise ValueError("input_hash does not match the functional snapshot payload")
+        object.__setattr__(self, "input_hash", computed)
+
+    def functional_payload(self) -> dict[str, object]:
+        return {
+            "subject_id": str(self.subject_id),
+            "edition_id": str(self.edition_id),
+            "editorial_group_id": str(self.editorial_group_id),
+            "editorial_group_version": self.editorial_group_version,
+            "subject_title": self.subject_title,
+            "subject_description": self.subject_description,
+            "actor_or_campaign": self.actor_or_campaign,
+            "period_start": self.period_start.isoformat(),
+            "period_end": self.period_end.isoformat(),
+            "research_date": self.research_date.isoformat(),
+            "core_sources": [source.payload() for source in self.core_sources],
+        }
+
+    def compute_input_hash(self) -> str:
+        encoded = json.dumps(
+            self.functional_payload(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 def production_stages(profile: ProductionProfile) -> tuple[SubjectProductionStage, ...]:
@@ -186,6 +342,10 @@ class SubjectProductionRun:
             raise ValueError("run_number and version must be >= 1")
         if self.pipeline_generation < 0:
             raise ValueError("pipeline_generation must be >= 0")
+        if self.research_date is None:
+            # The boundary is frozen at run creation.  In particular, a queued
+            # run must not choose a different date when a worker starts it.
+            self.research_date = self.created_at.date()
 
     def start_running(self, *, now: datetime | None = None) -> None:
         if self.status is not SubjectProductionStatus.QUEUED:
@@ -193,7 +353,7 @@ class SubjectProductionRun:
         self.status = SubjectProductionStatus.RUNNING
         self.started_at = now or datetime.now(UTC)
         if self.research_date is None:
-            self.research_date = self.started_at.date()
+            raise ValueError("research_date must be frozen before a run starts")
         self.updated_at = self.started_at
         self.version += 1
 
@@ -519,6 +679,8 @@ class EditionProductionBatch:
     edition_id: UUID
     profile: ProductionProfile
     status: str  # queued, running, completed, completed_with_issues, cancelled
+    phase: ProductionBatchPhase = ProductionBatchPhase.INITIAL
+    next_dispatch_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -535,6 +697,8 @@ class EditionProductionBatch:
         }
         if self.status not in valid_statuses:
             raise ValueError(f"Invalid status: {self.status}")
+        if not isinstance(self.phase, ProductionBatchPhase):
+            self.phase = ProductionBatchPhase(str(self.phase))
 
     def start(self, *, now: datetime | None = None) -> None:
         if self.status != "queued":
@@ -562,9 +726,12 @@ class EditionProductionBatchItem:
     subject_id: UUID
     production_run_id: UUID
     position: int
+    auto_recovery_count: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     id: UUID = field(default_factory=uuid4)
 
     def __post_init__(self) -> None:
         if self.position < 1:
             raise ValueError("position must be >= 1")
+        if self.auto_recovery_count not in (0, 1):
+            raise ValueError("auto_recovery_count must be between 0 and 1")

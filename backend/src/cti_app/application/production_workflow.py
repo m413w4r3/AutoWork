@@ -75,6 +75,7 @@ from cti_app.domain.model_conversations import (
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole
 from cti_app.domain.production import (
+    ProductionInputSnapshot,
     ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
@@ -134,6 +135,7 @@ def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
         "status": status,
         "error_code": code or f"{stage}_failed",
         "error": str(exc),
+        "details": getattr(exc, "details", None),
     }
 
 
@@ -190,6 +192,12 @@ class ProductionWorkflowOrchestrator:
         # lock, in the job handler.
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get(run_id)
+            snapshot_repository = getattr(uow, "production_input_snapshots", None)
+            snapshot = (
+                await snapshot_repository.get_by_run(run.id)
+                if run is not None and snapshot_repository is not None
+                else None
+            )
         if not run:
             raise ValueError(f"Production run {run_id} not found")
 
@@ -199,15 +207,15 @@ class ProductionWorkflowOrchestrator:
             )
 
         if expected_stage == SubjectProductionStage.SOURCES:
-            result = await self._execute_sources_stage(run, context)
+            result = await self._execute_sources_stage(run, context, snapshot)
         elif expected_stage == SubjectProductionStage.REFERENCES:
-            result = await self._execute_references_stage(run, context)
+            result = await self._execute_references_stage(run, context, snapshot)
         elif expected_stage == SubjectProductionStage.EXTRACTION:
-            result = await self._execute_extraction_stage(run, context)
+            result = await self._execute_extraction_stage(run, context, snapshot)
         elif expected_stage == SubjectProductionStage.SYNTHESIS:
-            result = await self._execute_synthesis_stage(run)
+            result = await self._execute_synthesis_stage(run, snapshot)
         elif expected_stage == SubjectProductionStage.ASSEMBLY:
-            result = await self._execute_assembly_stage(run)
+            result = await self._execute_assembly_stage(run, snapshot)
         else:
             raise ValueError(f"Unknown stage: {expected_stage.value}")
 
@@ -335,6 +343,7 @@ class ProductionWorkflowOrchestrator:
         run: SubjectProductionRun,
         report: ReferenceReport,
         context: JobExecutionContext | None,
+        snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
         """Attach, collect and archive the publications Q1 proposed.
 
@@ -362,7 +371,7 @@ class ProductionWorkflowOrchestrator:
                 new_sources = len(added)
                 if added and context is not None:
                     await self._collection_service.collect_subject(
-                        run.subject_id, context.job_id, context
+                        run.subject_id, context.job_id, context, snapshot=snapshot
                     )
             except Exception as exc:
                 warnings.append(f"supplemental_collection_failed:{exc}")
@@ -457,12 +466,19 @@ class ProductionWorkflowOrchestrator:
             dropped_blocks=result.dropped_blocks,
         )
 
-    async def _subject_context(self, uow: UnitOfWork, subject_id: UUID) -> tuple[str, str]:
+    async def _subject_context(
+        self,
+        uow: UnitOfWork,
+        subject_id: UUID,
+        snapshot: ProductionInputSnapshot | None = None,
+    ) -> tuple[str, str]:
         """Editorial title and context for a subject.
 
         `Subject` itself only carries identifiers; the human-readable title
         lives on the editorial group that selected it.
         """
+        if snapshot is not None:
+            return snapshot.subject_title, snapshot.subject_description
         group = await uow.editorial_groups.get_by_subject(subject_id)
         if group is None:
             return str(subject_id), ""
@@ -500,7 +516,10 @@ class ProductionWorkflowOrchestrator:
         )
 
     async def _execute_sources_stage(
-        self, run: SubjectProductionRun, context: JobExecutionContext | None = None
+        self,
+        run: SubjectProductionRun,
+        context: JobExecutionContext | None = None,
+        snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
         """No LLM. Pulls publications retained at discovery, dedupes by canonical
         URL, downloads and archives them into the subject workspace."""
@@ -522,13 +541,16 @@ class ProductionWorkflowOrchestrator:
                 run.subject_id,
                 context.job_id,
                 context,
+                snapshot=snapshot,
             )
             sources = await self._collection_service.list_sources(run.subject_id)
         except Exception as e:
             return {
                 "stage": "sources",
                 "status": "error",
+                "error_code": str(getattr(e, "code", "") or "sources_error"),
                 "error": str(e),
+                "details": getattr(e, "details", None),
             }
 
         archived = sum(1 for source in sources if source.state in _ARCHIVED_STATES)
@@ -547,7 +569,10 @@ class ProductionWorkflowOrchestrator:
         }
 
     async def _execute_references_stage(
-        self, run: SubjectProductionRun, context: JobExecutionContext | None = None
+        self,
+        run: SubjectProductionRun,
+        context: JobExecutionContext | None = None,
+        snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
         if not self._model_service:
             return {
@@ -558,7 +583,9 @@ class ProductionWorkflowOrchestrator:
 
         async with self._uow_factory() as uow:
             research_date = run.research_date or datetime.now(UTC).date()
-            ctx = await build_subject_production_context(uow, run.subject_id, research_date)
+            ctx = await build_subject_production_context(
+                uow, run.subject_id, research_date, snapshot=snapshot
+            )
             subject_title = ctx.subject_title
 
             # The diffusion policy, not a hardcoded flag, decides whether this
@@ -654,7 +681,7 @@ class ProductionWorkflowOrchestrator:
             # Order matters: the new publications must be attached, downloaded
             # and archived before Q1 is recorded, so extraction only ever sees
             # events backed by a source we actually hold.
-            integration = await self._integrate_reference_sources(run, report, context)
+            integration = await self._integrate_reference_sources(run, report, context, snapshot)
             parsed.warnings.extend(integration["warnings"])
             if not integration["kept_events"]:
                 return {
@@ -692,10 +719,13 @@ class ProductionWorkflowOrchestrator:
         self,
         run: SubjectProductionRun,
         context: JobExecutionContext | None,
+        snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
-        return await self._execute_direct_url_extraction(run)
+        return await self._execute_direct_url_extraction(run, snapshot)
 
-    async def _execute_direct_url_extraction(self, run: SubjectProductionRun) -> dict[str, Any]:
+    async def _execute_direct_url_extraction(
+        self, run: SubjectProductionRun, snapshot: ProductionInputSnapshot | None = None
+    ) -> dict[str, Any]:
         """Q2: exactly one fresh, web-enabled model request per Q1 source."""
         if self._model_gateway is None:
             return {
@@ -720,7 +750,9 @@ class ProductionWorkflowOrchestrator:
                     "error": "Reference report content is not readable",
                 }
             research_date = run.research_date or datetime.now(UTC).date()
-            policy = await build_subject_production_context(uow, run.subject_id, research_date)
+            policy = await build_subject_production_context(
+                uow, run.subject_id, research_date, snapshot=snapshot
+            )
             if not policy.external_llm_allowed:
                 return {
                     "stage": "extraction",
@@ -737,7 +769,7 @@ class ProductionWorkflowOrchestrator:
             existing = await uow.production_artifacts.get_current(run.id, "extraction")
             if existing and existing.input_hash == input_hash:
                 return {"stage": "extraction", "status": "cached", "artifact_id": str(existing.id)}
-            subject_title, _ = await self._subject_context(uow, run.subject_id)
+            subject_title, _ = await self._subject_context(uow, run.subject_id, snapshot)
 
         submissions: list[Q2ProposalSubmission] = []
         url_raw_parts: list[str] = []
@@ -839,14 +871,19 @@ class ProductionWorkflowOrchestrator:
                     duration_ms=int((time.monotonic() - started_at) * 1000),
                 )
         if failed:
-            return {
-                "stage": "extraction",
-                "status": "needs_review",
-                "error_code": "q2_source_coverage_failed",
-                "error": "One or more Q1 sources could not be analysed",
-                "completed_source_ids": completed,
-                "failed_source_ids": failed,
-                "source_failures": failures,
+                return {
+                    "stage": "extraction",
+                    "status": "needs_review",
+                    "error_code": "q2_source_coverage_failed",
+                    "error": "One or more Q1 sources could not be analysed",
+                    "details": {
+                        "completed_source_ids": completed,
+                        "failed_source_ids": failed,
+                        "source_failures": failures,
+                    },
+                    "completed_source_ids": completed,
+                    "failed_source_ids": failed,
+                    "source_failures": failures,
             }
         verification = verify_q2_proposals(submissions)
         extraction = verification.canonical
@@ -976,7 +1013,9 @@ class ProductionWorkflowOrchestrator:
             },
         }
 
-    async def _execute_synthesis_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
+    async def _execute_synthesis_stage(
+        self, run: SubjectProductionRun, snapshot: ProductionInputSnapshot | None = None
+    ) -> dict[str, Any]:
         if not self._model_service:
             return {
                 "stage": "synthesis",
@@ -1002,7 +1041,7 @@ class ProductionWorkflowOrchestrator:
 
             synthesis_research_date = run.research_date or datetime.now(UTC).date()
             synthesis_ctx = await build_subject_production_context(
-                uow, run.subject_id, synthesis_research_date
+                uow, run.subject_id, synthesis_research_date, snapshot=snapshot
             )
             synthesis_policy_allows = synthesis_ctx.external_llm_allowed
             if not synthesis_policy_allows:
@@ -1028,7 +1067,7 @@ class ProductionWorkflowOrchestrator:
             extraction_payload = technical_extraction_from_json(
                 await self._artifact_store.read_json(extraction.canonical_blob_id)
             )
-            subject_title, _ = await self._subject_context(uow, run.subject_id)
+            subject_title, _ = await self._subject_context(uow, run.subject_id, snapshot)
             collections = await uow.source_collections.list_for_subject(run.subject_id)
             source_tiers_by_url: dict[str, str] = {}
             for collection in collections:
@@ -1114,6 +1153,17 @@ class ProductionWorkflowOrchestrator:
                         "status": "needs_review",
                         "error_code": "synthesis_validation_failed",
                         "error": "; ".join(parsed.errors),
+                        "details": {
+                            "violations": [
+                                {
+                                    "code": violation.code,
+                                    "detail": violation.detail,
+                                    "span": violation.span,
+                                }
+                                for violation in parsed.violations
+                            ],
+                            "repair_actions": parsed.repair_actions,
+                        },
                         "violations": [
                             {
                                 "code": violation.code,
@@ -1210,7 +1260,9 @@ class ProductionWorkflowOrchestrator:
                 ),
             )
 
-    async def _execute_assembly_stage(self, run: SubjectProductionRun) -> dict[str, Any]:
+    async def _execute_assembly_stage(
+        self, run: SubjectProductionRun, snapshot: ProductionInputSnapshot | None = None
+    ) -> dict[str, Any]:
         """Deterministic: pure rendering from artifacts, no LLM call."""
         async with self._uow_factory() as uow:
             references = await uow.production_artifacts.get_current(run.id, "references")
@@ -1224,7 +1276,7 @@ class ProductionWorkflowOrchestrator:
                     "error": "Missing upstream artifacts",
                 }
 
-            subject_title, _ = await self._subject_context(uow, run.subject_id)
+            subject_title, _ = await self._subject_context(uow, run.subject_id, snapshot)
             archived_urls = {
                 item.canonical_url
                 for item in await uow.source_collections.list_for_subject(run.subject_id)
@@ -1267,6 +1319,7 @@ class ProductionWorkflowOrchestrator:
                 run.mark_needs_review(
                     code="qa_failed",
                     message="; ".join(qa_result["errors"]),
+                    details=qa_result,
                     now=datetime.now(UTC),
                 )
                 await uow.subject_production_runs.save(run)

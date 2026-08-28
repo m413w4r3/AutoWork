@@ -71,6 +71,12 @@ class SqlAlchemyEditionRepository:
         row = await self._session.get(EditionRow, edition_id)
         return _edition_from_row(row) if row else None
 
+    async def get_for_update(self, edition_id: UUID) -> Edition | None:
+        row = await self._session.scalar(
+            select(EditionRow).where(EditionRow.id == edition_id).with_for_update()
+        )
+        return _edition_from_row(row) if row else None
+
     async def get_by_logical_key(
         self, country_code: str, period_start: date, period_end: date
     ) -> Edition | None:
