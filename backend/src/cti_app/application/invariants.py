@@ -5,11 +5,14 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import cast
 from uuid import UUID
 
+from cti_app.application.goodware import GoodwareMeasurementService, PreparedGoodwareIndex
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.config import Settings
 from cti_app.domain.goodware import Banality, BanalityScorer, BanalityThresholds
+from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.invariants import (
     AnalystManualProvenance,
     CandidateInvariant,
@@ -52,11 +55,13 @@ class InvariantRegistryService:
     def __init__(
         self,
         uow_factory: UnitOfWorkFactory,
+        goodware: GoodwareMeasurementService | None = None,
         *,
         settings: Settings | None = None,
         banality_scorer: BanalityScorer | None = None,
     ) -> None:
         self._uow_factory = uow_factory
+        self._goodware = goodware
         self._settings = settings or Settings()
         self._banality_scorer = banality_scorer or BanalityScorer(
             BanalityThresholds(
@@ -110,6 +115,18 @@ class InvariantRegistryService:
         if moment.tzinfo is None or moment.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
 
+        existing = await self._proposal_outcome(proposal_key)
+        if existing is not None:
+            return existing
+        baseline_id = await self._read_baseline_binding(investigation_id)
+        prepared = None
+        if baseline_id is not None:
+            if self._goodware is None:
+                raise GoodwareMeasurementError(
+                    "goodware measurement service is required for a bound baseline"
+                )
+            prepared = await self._goodware.prepare(baseline_id)
+
         async with self._uow_factory() as uow:
             await uow.invariants.lock_proposal(proposal_key)
             existing_invariant, existing_rejection = await uow.invariants.get_proposal_outcome(
@@ -119,6 +136,12 @@ class InvariantRegistryService:
                 return InvariantProposalResult(invariant=existing_invariant, rejection=None)
             if existing_rejection is not None:
                 return InvariantProposalResult(invariant=None, rejection=existing_rejection)
+
+            current_baseline_id = await uow.investigation_goodware_baselines.get(investigation_id)
+            if current_baseline_id != baseline_id:
+                raise GoodwareMeasurementError(
+                    "investigation goodware baseline binding changed during proposal"
+                )
 
             investigation = await uow.analyst_investigations.get(investigation_id)
             if investigation is None:
@@ -242,6 +265,7 @@ class InvariantRegistryService:
                     reason="resolved feature descriptor does not match the proposed type/pattern",
                     occurred_at=moment,
                 )
+            descriptor = cast(tuple[str, str] | None, descriptor)
             if invariant_type in {InvariantType.STRUCTURAL_METADATA, InvariantType.RELATION}:
                 has_technical_descriptor = any(
                     _is_technical_provenance(item)
@@ -316,7 +340,9 @@ class InvariantRegistryService:
                 else FeatureMeasurements()
             )
             baseline_id, occurrence_count = await self._goodware_measurement(
-                uow, investigation_id, descriptor
+                baseline_id=baseline_id,
+                descriptor=descriptor,
+                prepared=prepared,
             )
             measured_occurrence_count = (
                 occurrence_count if occurrence_count is not None and occurrence_count > 0 else None
@@ -490,16 +516,33 @@ class InvariantRegistryService:
                 )
             )
 
+    async def _proposal_outcome(self, proposal_key: str) -> InvariantProposalResult | None:
+        async with self._uow_factory() as uow:
+            existing_invariant, existing_rejection = await uow.invariants.get_proposal_outcome(
+                proposal_key
+            )
+        if existing_invariant is not None:
+            return InvariantProposalResult(invariant=existing_invariant, rejection=None)
+        if existing_rejection is not None:
+            return InvariantProposalResult(invariant=None, rejection=existing_rejection)
+        return None
+
+    async def _read_baseline_binding(self, investigation_id: UUID) -> UUID | None:
+        async with self._uow_factory() as uow:
+            return await uow.investigation_goodware_baselines.get(investigation_id)
+
     async def _goodware_measurement(
-        self, uow: object, investigation_id: UUID, descriptor: tuple[str, str] | None
+        self,
+        *,
+        baseline_id: UUID | None,
+        descriptor: tuple[str, str] | None,
+        prepared: PreparedGoodwareIndex | None,
     ) -> tuple[UUID | None, int | None]:
-        baseline_id = await uow.investigation_goodware_baselines.get(investigation_id)  # type: ignore[attr-defined]
         if baseline_id is None or descriptor is None:
             return baseline_id, None
-        occurrence = await uow.goodware_baselines.get_feature_occurrence(  # type: ignore[attr-defined]
-            baseline_id, descriptor[0], descriptor[1]
-        )
-        return baseline_id, occurrence
+        if prepared is None:
+            raise GoodwareMeasurementError("goodware baseline was not prepared")
+        return baseline_id, await prepared.lookup(descriptor[0], descriptor[1])
 
     async def _reject(
         self,
@@ -586,9 +629,14 @@ def _invalid_provenance_key(
 ) -> str:
     canonical_values = []
     for provenance in provenances:
-        try:
-            value = provenance.as_canonical_dict()  # type: ignore[union-attr]
-        except (AttributeError, TypeError, ValueError):
+        if isinstance(provenance, _PROVENANCE_TYPES):
+            try:
+                value = provenance.as_canonical_dict()
+            except (AttributeError, TypeError, ValueError):
+                value = {
+                    "invalid_type": f"{type(provenance).__module__}.{type(provenance).__qualname__}"
+                }
+        else:
             value = {
                 "invalid_type": f"{type(provenance).__module__}.{type(provenance).__qualname__}"
             }

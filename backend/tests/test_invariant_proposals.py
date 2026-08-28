@@ -15,6 +15,7 @@ from cti_app.application.invariant_proposals import (
 from cti_app.application.invariants import InvariantProposalResult
 from cti_app.application.model_conversations import ConversationPolicyError
 from cti_app.domain.classification import TLP
+from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.invariant_proposals import ProposalOperator
 from cti_app.domain.invariants import (
     AnalystManualProvenance,
@@ -325,6 +326,28 @@ class _Registry:
         return dict(self.statistics)
 
 
+class _PreparedGoodware:
+    def __init__(self) -> None:
+        self.batches: list[tuple[tuple[str, str], ...]] = []
+
+    async def lookup_batch(
+        self, features: tuple[tuple[str, str], ...]
+    ) -> dict[tuple[str, str], int]:
+        self.batches.append(features)
+        return {}
+
+
+class _GoodwareMeasurement:
+    def __init__(self) -> None:
+        self.prepare_calls = 0
+        self.prepared = _PreparedGoodware()
+
+    async def prepare(self, baseline_id: UUID) -> _PreparedGoodware:
+        del baseline_id
+        self.prepare_calls += 1
+        return self.prepared
+
+
 def _empty_response() -> dict[str, object]:
     return {
         "candidate_invariants": [],
@@ -350,16 +373,55 @@ def _service(
     *,
     conversation: _ConversationService | None = None,
     registry: _Registry | None = None,
-) -> tuple[ProposalConversationService, _State, _ConversationService, _Registry]:
+    goodware: _GoodwareMeasurement | None = None,
+) -> tuple[
+    ProposalConversationService,
+    _State,
+    _ConversationService,
+    _Registry,
+]:
     state = state or _State(invariants=[SimpleNamespace(provenances=(_manual_ref(),))])
     conversation = conversation or _ConversationService()
     registry = registry or _Registry()
+    goodware = goodware or _GoodwareMeasurement()
     service = ProposalConversationService(
         lambda: _Uow(state, conversation),
         conversation,  # type: ignore[arg-type]
         registry,  # type: ignore[arg-type]
+        goodware=goodware,  # type: ignore[arg-type]
     )
     return service, state, conversation, registry
+
+
+@pytest.mark.asyncio
+async def test_p10_batches_goodware_descriptors_once() -> None:
+    sample = _sample(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+    goodware = _GoodwareMeasurement()
+    service, _, _, _ = _service(
+        _State(
+            samples=[sample],
+            static_features=[
+                _static_feature(sample.id, value="first"),
+                _static_feature(sample.id, value="second"),
+            ],
+            invariants=[],
+        ),
+        goodware=goodware,
+    )
+
+    await service.propose(investigation_id=INVESTIGATION_ID)
+
+    assert len(goodware.prepared.batches) == 1
+    assert goodware.prepared.batches[0] == (("string", "first"), ("string", "second"))
+
+
+@pytest.mark.asyncio
+async def test_p10_bound_baseline_without_measurement_service_fails_closed() -> None:
+    service, _, _, _ = _service()
+    service._goodware = None
+
+    with pytest.raises(GoodwareMeasurementError):
+        await service.propose(investigation_id=INVESTIGATION_ID)
 
 
 @pytest.mark.asyncio

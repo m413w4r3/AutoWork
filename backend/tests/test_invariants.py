@@ -10,6 +10,7 @@ from cti_app.application.invariants import InvariantRegistryService
 from cti_app.config import Settings
 from cti_app.domain.code_features import CodeNgram, GoodwareVerdict, PackingSignals
 from cti_app.domain.goodware import Banality
+from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.invariants import (
     AnalystManualProvenance,
     CandidateInvariant,
@@ -34,17 +35,20 @@ SAMPLE_ID = uuid4()
 
 
 class FakeInvariantRepository:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.resolved: ResolvedFeature | None = None
         self.measurements = FeatureMeasurements()
         self.invariants: dict[str, CandidateInvariant] = {}
         self.rejections = {}
         self.transitions = []
+        self.events = events if events is not None else []
 
     async def lock_proposal(self, proposal_key: str) -> None:
+        self.events.append("lock")
         return None
 
     async def get_proposal_outcome(self, proposal_key: str):
+        self.events.append("outcome")
         return self.invariants.get(proposal_key), self.rejections.get(proposal_key)
 
     async def resolve_provenance(self, **kwargs: object) -> ResolvedFeature | None:
@@ -91,16 +95,52 @@ class FakeGoodwareRepository:
         return self.occurrence
 
 
+class FakePreparedGoodware:
+    def __init__(self, repository: FakeGoodwareRepository) -> None:
+        self.repository = repository
+
+    async def lookup(self, *args: object) -> int | None:
+        return self.repository.occurrence
+
+
+class FakeGoodwareMeasurement:
+    def __init__(self, repository: FakeGoodwareRepository, events: list[str] | None = None) -> None:
+        self.repository = repository
+        self.prepare_calls = 0
+        self.events = events if events is not None else []
+        self.prepared = FakePreparedGoodware(repository)
+
+    async def prepare(self, baseline_id: UUID) -> FakePreparedGoodware:
+        del baseline_id
+        self.prepare_calls += 1
+        self.events.append("prepare")
+        return self.prepared
+
+
 class FakeInvestigationBaselineRepository:
+    def __init__(
+        self,
+        events: list[str] | None = None,
+        values: tuple[UUID, ...] | None = None,
+    ) -> None:
+        self.events = events if events is not None else []
+        self.values = values or (UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),)
+        self.calls = 0
+
     async def get(self, investigation_id: UUID) -> UUID:
-        return UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        del investigation_id
+        self.events.append("binding")
+        value = self.values[min(self.calls, len(self.values) - 1)]
+        self.calls += 1
+        return value
 
 
 class FakeUow:
-    def __init__(self) -> None:
-        self.invariants = FakeInvariantRepository()
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.events = events if events is not None else []
+        self.invariants = FakeInvariantRepository(self.events)
         self.goodware_baselines = FakeGoodwareRepository()
-        self.investigation_goodware_baselines = FakeInvestigationBaselineRepository()
+        self.investigation_goodware_baselines = FakeInvestigationBaselineRepository(self.events)
         self.analyst_investigations = SimpleNamespace(
             get=self._get_investigation,
         )
@@ -121,9 +161,11 @@ class FakeUow:
 
 def _service() -> tuple[InvariantRegistryService, FakeUow]:
     uow = FakeUow()
+    goodware = FakeGoodwareMeasurement(uow.goodware_baselines, uow.events)
     return (
         InvariantRegistryService(
             lambda: uow,
+            goodware=goodware,  # type: ignore[arg-type]
             settings=Settings(
                 goodware_suspicious_count=3,
                 goodware_banal_count=10,
@@ -134,6 +176,48 @@ def _service() -> tuple[InvariantRegistryService, FakeUow]:
         ),
         uow,
     )
+
+
+@pytest.mark.asyncio
+async def test_p09_prepares_before_lock_and_replay_skips_prepare() -> None:
+    service, uow = _service()
+    kwargs = {
+        "investigation_id": INVESTIGATION_ID,
+        "sample_ids": (),
+        "type": InvariantType.LITERAL_STRING,
+        "category": InvariantCategory.C2_INDICATOR,
+        "pattern": "x",
+        "provenance": None,
+    }
+
+    await service.propose(**kwargs)  # type: ignore[arg-type]
+    first_prepare_count = uow.events.count("prepare")
+    await service.propose(**kwargs)  # type: ignore[arg-type]
+
+    assert uow.events.index("prepare") < uow.events.index("lock")
+    assert uow.events.count("prepare") == first_prepare_count == 1
+
+
+@pytest.mark.asyncio
+async def test_p09_binding_change_after_prepare_fails_closed() -> None:
+    service, uow = _service()
+    uow.investigation_goodware_baselines.values = (
+        UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+    )
+
+    with pytest.raises(GoodwareMeasurementError):
+        await service.propose(
+            investigation_id=INVESTIGATION_ID,
+            sample_ids=(),
+            type=InvariantType.LITERAL_STRING,
+            category=InvariantCategory.C2_INDICATOR,
+            pattern="x",
+            provenance=None,
+        )
+
+    assert uow.events.count("prepare") == 1
+    assert "lock" in uow.events
 
 
 def _manual(pattern: str = "CreateMutexW", moment: datetime = NOW) -> AnalystManualProvenance:

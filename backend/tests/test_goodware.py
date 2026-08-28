@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -19,6 +20,7 @@ from cti_app.domain.goodware import (
     GoodwareBaseline,
     GoodwareIndexArtifact,
 )
+from cti_app.infrastructure import goodware_index as goodware_index_infrastructure
 from cti_app.infrastructure.goodware_stage import GoodwareStageError, load_stage
 
 
@@ -296,9 +298,14 @@ async def test_measurement_prepares_once_and_reuses_uuid_and_fingerprint(
         cast(Any, store), cast(Any, uow_factory), cache_root=tmp_path / "cache"
     )
 
-    assert await service.lookup(baseline.id, "string", "hello") == 7
+    with pytest.raises(goodware_application.GoodwareMeasurementError):
+        await service.lookup(baseline.id, "string", "hello")
+    prepared = await service.prepare(baseline.id)
+    assert await prepared.lookup("string", "hello") == 7
     counts = (uow_factory.calls, store.reads, store.materializations, dict(verifications))
-    assert await service.lookup(baseline.baseline_fingerprint_sha256, "string", "hello") == 7
+    assert await (await service.prepare(baseline.baseline_fingerprint_sha256)).lookup(
+        "string", "hello"
+    ) == 7
     assert (uow_factory.calls, store.reads, store.materializations, verifications) == counts
 
 
@@ -313,15 +320,48 @@ async def test_measurement_concurrent_first_lookups_prepare_once(tmp_path: Path)
         cast(Any, store), cast(Any, uow_factory), cache_root=tmp_path / "cache"
     )
 
-    assert list(
-        await asyncio.gather(
-            service.lookup(baseline.id, "string", "hello"),
-            service.lookup(baseline.baseline_fingerprint_sha256, "string", "hello"),
-        )
-    ) == [7, 7]
+    prepared = await asyncio.gather(
+        service.prepare(baseline.id),
+        service.prepare(baseline.baseline_fingerprint_sha256),
+    )
+    assert list(await asyncio.gather(*(item.lookup("string", "hello") for item in prepared))) == [
+        7,
+        7,
+    ]
     assert uow_factory.calls == 1
     assert store.reads == 1
     assert store.materializations == 1
+
+
+@pytest.mark.asyncio
+async def test_cached_file_sha_verification_runs_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"cached-goodware-index"
+    descriptor = BlobDescriptor(
+        sha256=hashlib.sha256(payload).hexdigest(),
+        size=len(payload),
+        mime_type="application/vnd.sqlite3",
+        logical_bucket="goodware-indexes",
+    )
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    destination = cache / f"{descriptor.sha256}.sqlite3"
+    destination.write_bytes(payload)
+    main_thread = threading.get_ident()
+    threads: list[int] = []
+    original = goodware_index_infrastructure.sha256_file
+
+    def record_thread(path: Path) -> str:
+        threads.append(threading.get_ident())
+        return original(path)
+
+    monkeypatch.setattr(goodware_index_infrastructure, "sha256_file", record_thread)
+    result = await goodware_index_infrastructure.prepare_cached_index(
+        cast(Any, object()), descriptor, cache
+    )
+    assert result == destination
+    assert threads and all(thread_id != main_thread for thread_id in threads)
 
 
 @pytest.mark.asyncio

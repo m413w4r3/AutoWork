@@ -75,6 +75,7 @@ __all__ = [
     "GoodwareMeasurementService",
     "GoodwareSQLiteReader",
     "GoodwareService",
+    "PreparedGoodwareIndex",
     "_canonical_json",
     "_expected_metadata",
     "_source_set_sha256",
@@ -100,12 +101,28 @@ _verify_sqlite_index = verify_sqlite_index
 
 
 @dataclass(frozen=True, slots=True)
-class _PreparedGoodwareIndex:
+class PreparedGoodwareIndex:
+    """A verified Goodware index whose reads are local SQLite-only."""
+
     baseline_id: UUID
     baseline_fingerprint_sha256: str
     index_descriptor: BlobDescriptor
     manifest_descriptor: BlobDescriptor
     path: Path
+
+    async def lookup(self, feature_kind: str, normalized_value: str) -> int | None:
+        return await asyncio.to_thread(
+            GoodwareSQLiteReader(self.path).lookup,
+            feature_kind,
+            normalized_value,
+        )
+
+    async def lookup_batch(
+        self, features: Sequence[tuple[str, str]]
+    ) -> Mapping[tuple[str, str], int]:
+        if not features:
+            return {}
+        return await asyncio.to_thread(GoodwareSQLiteReader(self.path).lookup_batch, features)
 
 
 class GoodwareService:
@@ -234,8 +251,12 @@ class GoodwareMeasurementService:
         self._cache_root = (
             cache_root if cache_root is not None else get_settings().goodware_cache_root
         )
-        self._prepared_indexes: dict[UUID | str, _PreparedGoodwareIndex] = {}
+        self._prepared_indexes: dict[UUID | str, PreparedGoodwareIndex] = {}
         self._preparation_lock = asyncio.Lock()
+
+    async def prepare(self, baseline_ref: UUID | str) -> PreparedGoodwareIndex:
+        """Resolve, verify, and cache a baseline for local-only measurements."""
+        return await self._prepare_index(baseline_ref)
 
     async def get_feature_occurrence(
         self,
@@ -243,12 +264,7 @@ class GoodwareMeasurementService:
         feature_kind: str,
         normalized_value: str,
     ) -> int | None:
-        index_path = await self._prepare_index(baseline)
-        return await asyncio.to_thread(
-            GoodwareSQLiteReader(index_path).lookup,
-            feature_kind,
-            normalized_value,
-        )
+        return await self._prepared(baseline).lookup(feature_kind, normalized_value)
 
     async def get_feature_occurrences(
         self,
@@ -256,15 +272,19 @@ class GoodwareMeasurementService:
         feature_kind: str,
         normalized_values: Sequence[str],
     ) -> Mapping[str, int]:
+        prepared = self._prepared(baseline)
         values = tuple(dict.fromkeys(normalized_values))
         if not values:
             return {}
-        index_path = await self._prepare_index(baseline)
-        return await asyncio.to_thread(
-            GoodwareSQLiteReader(index_path).lookup_values,
-            feature_kind,
-            values,
-        )
+        return {
+            value: count
+            for (kind, value), count in (
+                await prepared.lookup_batch(
+                    [(feature_kind, value) for value in values]
+                )
+            ).items()
+            if kind == feature_kind
+        }
 
     async def lookup(
         self,
@@ -272,25 +292,28 @@ class GoodwareMeasurementService:
         feature_kind: str,
         normalized_value: str,
     ) -> int | None:
-        return await self.get_feature_occurrence(baseline, feature_kind, normalized_value)
+        return await self._prepared(baseline).lookup(feature_kind, normalized_value)
 
     async def lookup_batch(
         self, baseline: UUID | str, features: Sequence[tuple[str, str]]
     ) -> Mapping[tuple[str, str], int]:
-        if not features:
-            return {}
-        index_path = await self._prepare_index(baseline)
-        return await asyncio.to_thread(GoodwareSQLiteReader(index_path).lookup_batch, features)
+        return await self._prepared(baseline).lookup_batch(features)
 
-    async def _prepare_index(self, baseline_ref: UUID | str) -> Path:
+    def _prepared(self, baseline_ref: UUID | str) -> PreparedGoodwareIndex:
+        prepared = self._prepared_indexes.get(baseline_ref)
+        if prepared is None:
+            raise GoodwareMeasurementError("goodware baseline has not been prepared")
+        return prepared
+
+    async def _prepare_index(self, baseline_ref: UUID | str) -> PreparedGoodwareIndex:
         prepared = self._prepared_indexes.get(baseline_ref)
         if prepared is not None:
-            return prepared.path
+            return prepared
 
         async with self._preparation_lock:
             prepared = self._prepared_indexes.get(baseline_ref)
             if prepared is not None:
-                return prepared.path
+                return prepared
 
             baseline, artifact, index_descriptor, manifest_descriptor = await self._resolve(
                 baseline_ref
@@ -325,7 +348,7 @@ class GoodwareMeasurementService:
                     manifest,
                     pattern_version=baseline.pattern_version,
                 )
-                prepared = _PreparedGoodwareIndex(
+                prepared = PreparedGoodwareIndex(
                     baseline_id=baseline.id,
                     baseline_fingerprint_sha256=baseline.baseline_fingerprint_sha256,
                     index_descriptor=index_descriptor,
@@ -336,7 +359,7 @@ class GoodwareMeasurementService:
             self._prepared_indexes[prepared.baseline_id] = prepared
             self._prepared_indexes[prepared.baseline_fingerprint_sha256] = prepared
             self._prepared_indexes[baseline_ref] = prepared
-            return prepared.path
+            return prepared
 
     async def _resolve(
         self, baseline_ref: UUID | str

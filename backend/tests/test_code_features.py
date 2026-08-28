@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application.code_features import CodeFeatureService
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.code_features import (
     CodeFunction,
@@ -17,6 +18,7 @@ from cti_app.domain.code_features import (
     opcode_fragment16_lookup_value,
     validate_ngram_sizes,
 )
+from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.reference_corpus import assess_reference_feature
 from cti_app.infrastructure.smda import SmdaAdapterResult, SmdaExtraction
 
@@ -137,8 +139,20 @@ def test_corpus_assessment_preserves_small_and_unknown_states() -> None:
 
 
 class _FakeReferenceMembers:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
     async def count_eligible_malware_samples_by_family(self) -> dict[str, int]:
+        self.events.append("reference-family")
         return {}
+
+    async def list_feature_members_bulk(self, feature_kind, normalized_values):
+        self.events.append("reference-members")
+        return {value: () for value in normalized_values}
+
+    async def count_benign_feature_occurrences_bulk(self, feature_kind, normalized_values):
+        self.events.append("reference-benign")
+        return {value: 0 for value in normalized_values}
 
 
 class _FakeCodeFeatureSets:
@@ -157,11 +171,17 @@ class _FakeCodeFeatureSets:
 
 
 class _FakeUow:
-    def __init__(self, blob_id, code_feature_sets: _FakeCodeFeatureSets) -> None:
+    def __init__(
+        self,
+        blob_id,
+        code_feature_sets: _FakeCodeFeatureSets,
+        events: list[str] | None = None,
+    ) -> None:
         self.samples = SimpleNamespace(
             get=self._get_sample,
         )
-        self.reference_members = _FakeReferenceMembers()
+        self.events = events if events is not None else []
+        self.reference_members = _FakeReferenceMembers(self.events)
         self.code_feature_sets = code_feature_sets
         self._blob_id = blob_id
         self.commits = 0
@@ -170,6 +190,7 @@ class _FakeUow:
         return SimpleNamespace(blob_id=self._blob_id)
 
     async def __aenter__(self):
+        self.events.append("uow-enter")
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
@@ -196,8 +217,9 @@ class _FakeBlobs:
 
 
 class _FakeSmda:
-    def __init__(self) -> None:
+    def __init__(self, functions=()) -> None:
         self.calls = 0
+        self.functions = functions
 
     async def extract(self, payload: bytes, **kwargs) -> SmdaAdapterResult:
         self.calls += 1
@@ -208,8 +230,93 @@ class _FakeSmda:
                 escaper_compatibility_version="4.4.5",
                 intel_pic_hash_escape_version="4.3.5",
                 architecture="x64",
-                functions=(),
+                functions=self.functions,
             ),
+        )
+
+
+class _PreparedGoodware:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.batches = []
+
+    async def lookup_batch(self, features):
+        self.events.append("goodware-batch")
+        self.batches.append(tuple(features))
+        return {feature: 2 for feature in features}
+
+
+class _FakeGoodware:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.prepared = _PreparedGoodware(events)
+
+    async def prepare(self, baseline_id):
+        self.events.append("goodware-prepare")
+        return self.prepared
+
+
+def _eight_byte_function() -> CodeFunction:
+    return CodeFunction(
+        offset=0,
+        instructions=tuple(
+            CodeInstruction(
+                offset=index,
+                bytes=b"\x90",
+                mnemonic="nop",
+                escaped_bytes=(index,),
+            )
+            for index in range(8)
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_p08b_prepares_and_batches_before_reference_corpus_uow() -> None:
+    events: list[str] = []
+    blob = BlobRecord(
+        descriptor=BlobDescriptor(
+            sha256="a" * 64,
+            size=7,
+            mime_type="application/octet-stream",
+            logical_bucket="samples",
+        )
+    )
+    code_feature_sets = _FakeCodeFeatureSets()
+    uow = _FakeUow(blob.id, code_feature_sets, events)
+    goodware = _FakeGoodware(events)
+    service = CodeFeatureService(
+        _FakeBlobs(blob),
+        lambda: uow,
+        _FakeSmda((_eight_byte_function(),)),
+        goodware=goodware,  # type: ignore[arg-type]
+    )
+
+    await service.extract(
+        sample_id=uuid4(), parameters_sha256="parameters", goodware_baseline_id=uuid4()
+    )
+
+    assert events.index("goodware-prepare") < events.index("goodware-batch")
+    assert events.index("goodware-batch") < events.index("reference-family")
+    assert len(goodware.prepared.batches) == 1
+
+
+@pytest.mark.asyncio
+async def test_p08b_bound_baseline_without_goodware_service_fails_closed() -> None:
+    blob = BlobRecord(
+        descriptor=BlobDescriptor(
+            sha256="a" * 64,
+            size=7,
+            mime_type="application/octet-stream",
+            logical_bucket="samples",
+        )
+    )
+    uow = _FakeUow(blob.id, _FakeCodeFeatureSets(), [])
+    service = CodeFeatureService(_FakeBlobs(blob), lambda: uow, _FakeSmda())
+
+    with pytest.raises(GoodwareMeasurementError):
+        await service.extract(
+            sample_id=uuid4(), parameters_sha256="parameters", goodware_baseline_id=uuid4()
         )
 
 

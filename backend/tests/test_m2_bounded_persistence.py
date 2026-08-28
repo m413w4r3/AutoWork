@@ -210,13 +210,22 @@ async def test_index_paths_deduplicate_and_do_one_owner_lookup() -> None:
 
 class _ScoringGoodware:
     def __init__(self) -> None:
-        self.chunks: list[tuple[str, ...]] = []
+        self.prepared = _ScoringPreparedGoodware()
 
-    async def get_feature_occurrences(
-        self, baseline_id: UUID, feature_kind: str, normalized_values: tuple[str, ...]
-    ) -> dict[str, int]:
-        self.chunks.append(normalized_values)
-        return {value: 1 for value in normalized_values}
+    async def prepare(self, baseline_id: UUID) -> _ScoringPreparedGoodware:
+        del baseline_id
+        return self.prepared
+
+
+class _ScoringPreparedGoodware:
+    def __init__(self) -> None:
+        self.batches: list[tuple[tuple[str, str], ...]] = []
+
+    async def lookup_batch(
+        self, features: tuple[tuple[str, str], ...]
+    ) -> dict[tuple[str, str], int]:
+        self.batches.append(features)
+        return {feature: 1 for feature in features}
 
 
 class _ScoringReferences:
@@ -243,8 +252,7 @@ class _ScoringReferences:
 
 
 class _ScoringUow:
-    def __init__(self, goodware: _ScoringGoodware, references: _ScoringReferences) -> None:
-        self.goodware_baselines = goodware
+    def __init__(self, references: _ScoringReferences) -> None:
         self.reference_members = references
 
     async def __aenter__(self) -> _ScoringUow:
@@ -276,13 +284,14 @@ def _functions(count: int) -> tuple[CodeFunction, ...]:
 
 
 @pytest.mark.asyncio
-async def test_code_scoring_uses_bulk_calls_per_500_ngram_chunk() -> None:
+async def test_code_scoring_uses_one_prepared_goodware_batch() -> None:
     goodware = _ScoringGoodware()
     references = _ScoringReferences()
     service = CodeFeatureService(
         blobs=SimpleNamespace(),
-        uow_factory=lambda: _ScoringUow(goodware, references),
+        uow_factory=lambda: _ScoringUow(references),
         smda=SimpleNamespace(),
+        goodware=goodware,  # type: ignore[arg-type]
     )
     result = SmdaAdapterResult(
         status="SUCCEEDED",
@@ -308,10 +317,9 @@ async def test_code_scoring_uses_bulk_calls_per_500_ngram_chunk() -> None:
     )
 
     assert len(feature_set.ngrams) == 1001
-    assert [len(chunk) for chunk in goodware.chunks] == [500, 500, 1]
+    assert [len(batch) for batch in goodware.prepared.batches] == [1001]
     assert [len(chunk) for chunk in references.member_chunks] == [500, 500, 1]
     assert [len(chunk) for chunk in references.benign_chunks] == [500, 500, 1]
     assert references.family_calls == 1
-    assert max(map(len, goodware.chunks)) <= 500
     assert max(map(len, references.member_chunks)) <= 500
     assert max(map(len, references.benign_chunks)) <= 500

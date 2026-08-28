@@ -7,6 +7,7 @@ from io import BytesIO
 from typing import Protocol
 from uuid import UUID
 
+from cti_app.application.goodware import GoodwareMeasurementService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.code_features import (
@@ -22,6 +23,7 @@ from cti_app.domain.code_features import (
     opcode_fragment16_lookup_value,
     validate_ngram_sizes,
 )
+from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.reference_corpus import assess_reference_feature
 from cti_app.infrastructure.smda import SmdaAdapter, SmdaAdapterResult
 from cti_app.infrastructure.static_analysis import build_packing_signals
@@ -41,6 +43,7 @@ class CodeFeatureService:
         blobs: BlobIngestor,
         uow_factory: UnitOfWorkFactory,
         smda: SmdaAdapter,
+        goodware: GoodwareMeasurementService | None = None,
         *,
         tool_version: str = "4.5.0",
         escaper_compatibility_version: str = "4.4.5",
@@ -49,6 +52,7 @@ class CodeFeatureService:
         self._blobs = blobs
         self._uow_factory = uow_factory
         self._smda = smda
+        self._goodware = goodware
         self._tool_version = tool_version
         self._escaper_version = escaper_compatibility_version
         self._pic_version = intel_pic_hash_escape_version
@@ -169,23 +173,29 @@ class CodeFeatureService:
             code_ngram_sizes,
             max_per_sample=code_ngram_max_per_sample,
         )
+        goodware_occurrences: Mapping[tuple[str, str], int] = {}
+        if goodware_baseline_id is not None:
+            if self._goodware is None:
+                raise GoodwareMeasurementError(
+                    "goodware measurement service is required for a bound baseline"
+                )
+            prepared = await self._goodware.prepare(goodware_baseline_id)
+            lookup_values: set[str] = set()
+            for ngram in ngrams:
+                lookup = opcode_fragment16_lookup_value(ngram)
+                if lookup is not None:
+                    lookup_values.add(lookup)
+            lookups = tuple(
+                ("opcode_fragment16", value)
+                for value in sorted(lookup_values)
+            )
+            goodware_occurrences = await prepared.lookup_batch(lookups)
         async with self._uow_factory() as uow:
             family_sizes = await uow.reference_members.count_eligible_malware_samples_by_family()
             scored: list[CodeNgram] = []
             for start in range(0, len(ngrams), 500):
                 chunk = ngrams[start : start + 500]
                 patterns = tuple(ngram.pattern.lower() for ngram in chunk)
-                goodware_occurrences: Mapping[str, int] = {}
-                if goodware_baseline_id is not None:
-                    lookups = tuple(
-                        lookup
-                        for ngram in chunk
-                        if (lookup := opcode_fragment16_lookup_value(ngram)) is not None
-                    )
-                    if lookups:
-                        goodware_occurrences = await uow.goodware_baselines.get_feature_occurrences(
-                            goodware_baseline_id, "opcode_fragment16", lookups
-                        )
                 members_by_pattern = await uow.reference_members.list_feature_members_bulk(
                     "code_ngram", patterns
                 )
@@ -196,7 +206,11 @@ class CodeFeatureService:
                 )
                 for ngram in chunk:
                     lookup = opcode_fragment16_lookup_value(ngram)
-                    occurrence = goodware_occurrences.get(lookup) if lookup is not None else None
+                    occurrence = (
+                        goodware_occurrences.get(("opcode_fragment16", lookup))
+                        if lookup is not None
+                        else None
+                    )
                     scored_ngram = compare_goodware(ngram, occurrence)
                     scored.append(
                         apply_corpus_assessment(

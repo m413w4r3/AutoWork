@@ -14,16 +14,18 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid5
 
 from pydantic import ValidationError
 
+from cti_app.application.goodware import GoodwareMeasurementService, PreparedGoodwareIndex
 from cti_app.application.invariants import InvariantProposalResult, InvariantRegistryService
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.classification import DerivedPolicy, derived_policy
 from cti_app.domain.goodware import Banality
+from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.invariant_proposals import (
     CandidateInvariantProposal,
     ProposalInputSnapshot,
@@ -119,6 +121,7 @@ class ProposalConversationService:
         uow_factory: UnitOfWorkFactory,
         model_conversations: ModelConversationService,
         invariant_registry: InvariantRegistryService,
+        goodware: GoodwareMeasurementService | None = None,
         *,
         external_provider: ModelProvider = ModelProvider.OPENAI,
         external_transport: ConversationTransport = ConversationTransport.CHATGPT_BRIDGE,
@@ -130,6 +133,7 @@ class ProposalConversationService:
         self._uow_factory = uow_factory
         self._model_conversations = model_conversations
         self._invariant_registry = invariant_registry
+        self._goodware = goodware
         self._external_provider = ModelProvider(external_provider)
         self._external_transport = ConversationTransport(external_transport)
         self._local_provider = ModelProvider(local_provider)
@@ -146,7 +150,13 @@ class ProposalConversationService:
     ) -> ProposalConversationResult:
         """Ask the model for proposals and pass each candidate through P09."""
 
-        loaded = await self._load_snapshot(investigation_id)
+        baseline_id = await self._resolve_bound_baseline(investigation_id)
+        if self._goodware is None:
+            raise GoodwareMeasurementError(
+                "goodware measurement service is required for a bound baseline"
+            )
+        prepared = await self._goodware.prepare(baseline_id)
+        loaded = await self._load_snapshot(investigation_id, baseline_id, prepared)
         investigation = loaded[0]
         snapshot = loaded[1]
         policy = loaded[2]
@@ -286,6 +296,8 @@ class ProposalConversationService:
     async def _load_snapshot(
         self,
         investigation_id: UUID,
+        baseline_id: UUID,
+        prepared: PreparedGoodwareIndex,
     ) -> tuple[
         Any,
         ProposalInputSnapshot,
@@ -299,9 +311,11 @@ class ProposalConversationService:
                 raise ProposalContractError(f"Investigation {investigation_id} does not exist")
             if not investigation.input_sha256:
                 raise ProposalContractError("The investigation has no immutable input pack SHA-256")
-            baseline_id = await uow.investigation_goodware_baselines.get(investigation_id)
-            if baseline_id is None:
-                raise ProposalContractError("The investigation has no goodware baseline binding")
+            current_baseline_id = await uow.investigation_goodware_baselines.get(investigation_id)
+            if current_baseline_id != baseline_id:
+                raise GoodwareMeasurementError(
+                    "investigation goodware baseline binding changed during snapshot"
+                )
 
             samples = tuple(
                 sorted(
@@ -397,10 +411,26 @@ class ProposalConversationService:
                 )
             candidate_records.sort(key=_candidate_sort_key)
 
+            descriptors = tuple(
+                sorted(
+                    {
+                        descriptor
+                        for candidate in candidate_records
+                        if (
+                            descriptor := m2_feature_kind(
+                                InvariantType(candidate["invariant_type"]), candidate["pattern"]
+                            )
+                        )
+                        is not None
+                    }
+                )
+            )
+            goodware_occurrences = await prepared.lookup_batch(descriptors)
+
             measured_candidates = []
             for candidate in candidate_records:
                 measured = await self._measure_candidate(
-                    uow, candidate, all_sample_ids, baseline_id
+                    uow, candidate, all_sample_ids, baseline_id, goodware_occurrences
                 )
                 if not _exclude_before_model(measured):
                     measured_candidates.append(measured)
@@ -425,7 +455,7 @@ class ProposalConversationService:
             # deterministic selection has fixed the origin sample set.
             selected_candidates = [
                 await self._measure_candidate(
-                    uow, candidate, tuple(origin_ids), baseline_id
+                    uow, candidate, tuple(origin_ids), baseline_id, goodware_occurrences
                 )
                 for candidate in selected_candidates
             ]
@@ -523,6 +553,7 @@ class ProposalConversationService:
         candidate: dict[str, Any],
         sample_ids: Sequence[UUID],
         baseline_id: UUID,
+        goodware_occurrences: Mapping[tuple[str, str], int],
     ) -> dict[str, Any]:
         result = dict(candidate)
         invariant_type = InvariantType(candidate["invariant_type"])
@@ -547,19 +578,14 @@ class ProposalConversationService:
             result["corpus_malware_sample_count"] = assessment.malware_sample_count
             result["family_labels"] = sorted(assessment.family_sample_counts)
 
-        occurrence: int | None = None
-        goodware = getattr(uow, "goodware_baselines", None)
-        get_occurrence = getattr(goodware, "get_feature_occurrence", None)
-        if get_occurrence is not None and descriptor is not None:
-            measured_occurrence = await get_occurrence(
-                baseline_id, descriptor[0], descriptor[1]
-            )
-            if measured_occurrence is not None and int(measured_occurrence) > 0:
-                occurrence = int(measured_occurrence)
-        if occurrence is None:
-            raw_occurrence = candidate.get("goodware_occurrence_count")
-            if isinstance(raw_occurrence, int) and raw_occurrence > 0:
-                occurrence = raw_occurrence
+        measured_occurrence = (
+            goodware_occurrences.get(descriptor) if descriptor is not None else None
+        )
+        occurrence = (
+            measured_occurrence
+            if measured_occurrence is not None and measured_occurrence > 0
+            else None
+        )
         result["goodware_baseline_id"] = str(baseline_id)
         result["banality_occurrence_count"] = occurrence
         scorer = getattr(self._invariant_registry, "_banality_scorer", None)
@@ -572,6 +598,13 @@ class ProposalConversationService:
             result.get("corpus_verdict") == ReferenceCorpusVerdict.CORPUS_TOO_SMALL.value
         )
         return result
+
+    async def _resolve_bound_baseline(self, investigation_id: UUID) -> UUID:
+        async with self._uow_factory() as uow:
+            baseline_id = await uow.investigation_goodware_baselines.get(investigation_id)
+        if baseline_id is None:
+            raise ProposalContractError("The investigation has no goodware baseline binding")
+        return baseline_id
 
     async def _sample_context(self, uow: Any, samples: Sequence[Any]) -> list[dict[str, Any]]:
         result = []
@@ -706,7 +739,7 @@ class ProposalConversationService:
                     and current.provider is provider
                     and current.transport is transport
                 ):
-                    return current
+                    return cast(ModelConversation, current)
             except Exception:
                 # A stale deterministic id must not make a different subject's
                 # conversation visible.  A new id will be bound to this
@@ -715,7 +748,7 @@ class ProposalConversationService:
         create = getattr(self._model_conversations, "create", None)
         if create is None:
             raise ProposalConversationError("Model conversation creation is unavailable")
-        return await create(**kwargs)
+        return cast(ModelConversation, await create(**kwargs))
 
     async def _persist_pivot_conversation(
         self, investigation_id: UUID, conversation_id: UUID
@@ -937,10 +970,10 @@ def _ignored_estimate_fields(original: Any, cleaned: Any) -> set[str]:
             result.update(_ignored_estimate_fields(original[key], cleaned[key]))
         return result
     if isinstance(original, list) and isinstance(cleaned, list):
-        result: set[str] = set()
+        nested_result: set[str] = set()
         for original_item, cleaned_item in zip(original, cleaned, strict=False):
-            result.update(_ignored_estimate_fields(original_item, cleaned_item))
-        return result
+            nested_result.update(_ignored_estimate_fields(original_item, cleaned_item))
+        return nested_result
     return set()
 
 
@@ -1042,12 +1075,11 @@ def _record_id(record: Any) -> str | None:
 def _bounded_pattern(value: Any) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str):
-        value = str(value)
-    value = value.strip()
-    if not value or len(value) > _MAX_STRING_CHARS:
+    text = value if isinstance(value, str) else str(value)
+    text = text.strip()
+    if not text or len(text) > _MAX_STRING_CHARS:
         return None
-    return value
+    return text
 
 
 def _candidate_category(
@@ -1209,6 +1241,7 @@ def _static_candidate_records(
             if value is None:
                 continue
             offsets = _offsets(feature)
+            provenance: InvariantProvenance
             try:
                 if offsets is not None:
                     provenance = SampleFeatureProvenance(
@@ -1248,16 +1281,17 @@ def _static_candidate_records(
 
     imphash = _bounded_pattern(payload.get("imphash"))
     if imphash is not None:
+        imphash_provenance: InvariantProvenance | None
         try:
-            provenance = ToolOutputProvenance(
+            imphash_provenance = ToolOutputProvenance(
                 sample_sha256=sample_sha256,
                 tool="sample_feature_set",
                 version=str(_value(record, "extractor_version", "unknown")),
                 internal_id=source_id,
             )
         except ValueError:
-            provenance = None
-        if provenance is not None:
+            imphash_provenance = None
+        if imphash_provenance is not None:
             result.append(
                 _make_candidate(
                     record=record,
@@ -1269,7 +1303,7 @@ def _static_candidate_records(
                         {"category": "similarity_key"}, record, "similarity_key"
                     ),
                     pattern=f"imphash:{imphash}",
-                    provenance=provenance,
+                    provenance=imphash_provenance,
                     feature_kind="imphash",
                     normalized_value=imphash.lower(),
                     feature={"value": imphash},
@@ -1793,7 +1827,7 @@ def _bound_context(value: dict[str, Any]) -> dict[str, Any]:
                     break
     if len(encoded) > _MAX_CONTEXT_CHARS:
         raise ProposalContractError("The deterministic proposal context exceeds its bound")
-    return context
+    return cast(dict[str, Any], context)
 
 
 def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) -> Any:
@@ -1808,7 +1842,7 @@ def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) 
     if isinstance(value, datetime):
         return "[TIMESTAMP_OMITTED]" if drop_timestamps else value.astimezone(UTC).isoformat()
     if is_dataclass(value):
-        value = asdict(value)
+        value = asdict(cast(Any, value))
     if isinstance(value, Mapping):
         pairs = []
         for key, item in sorted(value.items(), key=lambda pair: str(pair[0])):
@@ -1854,7 +1888,7 @@ def _mapping_or_attrs(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     if is_dataclass(value):
-        return asdict(value)
+        return asdict(cast(Any, value))
     return {
         name: getattr(value, name)
         for name in getattr(value, "__dict__", {})

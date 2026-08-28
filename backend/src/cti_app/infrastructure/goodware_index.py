@@ -281,10 +281,10 @@ async def prepare_cached_index(
         if await asyncio.to_thread(destination.is_symlink):
             raise BlobIntegrityError("Refusing to use a symbolic link as a goodware cache")
         if await asyncio.to_thread(destination.exists):
-            verify(destination, descriptor)
+            await asyncio.to_thread(verify, destination, descriptor)
         else:
             await store.materialize(descriptor, destination)
-            verify(destination, descriptor)
+            await asyncio.to_thread(verify, destination, descriptor)
             await asyncio.to_thread(_make_read_only, destination)
         return destination
     finally:
