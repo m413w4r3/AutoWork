@@ -29,8 +29,10 @@ values:
 The source format accepts the gzip JSON counter files produced by yarGen and
 plain JSON variants used by operators. v2 parses the object incrementally and
 uses bounded `executemany` batches; it does not construct a Python list for a
-whole shard. The default decompressed-source bound is 8 GiB and can be
-lowered with `--max-decompressed-bytes`.
+whole shard. v2 writes lookup keys directly into the final `features` table;
+there is no normalized-value aggregate SQLite table, even temporarily. The v2
+default decompressed-source bound is 8 GiB and can be lowered with
+`--max-decompressed-bytes`; the legacy v1 `build` default remains 256 MiB.
 
 ## Normalization
 
@@ -112,9 +114,10 @@ uv run python scripts/import_goodware.py deep-verify-index ARTIFACT --source-dir
 
 The first verification is the routine structural/integrity check. It validates
 the canonical manifest, source set when supplied, artifact hash and size,
-SQLite schema and object set, metadata, feature key/count types, and aggregate
-counts without a Python pass over all feature rows. `deep-verify-index` adds
-SQLite's full `integrity_check`.
+SQLite schema and object set, and exact metadata without scanning all feature
+rows. `deep-verify-index` additionally checks feature rows, validates
+`COUNT(*)` and `SUM(occurrence_count)` against the manifest, and runs SQLite's
+full `integrity_check`.
 
 The completed SQLite file is reopened through SQLite's read-only URI and is
 made filesystem read-only before promotion. Build output is prepared in a

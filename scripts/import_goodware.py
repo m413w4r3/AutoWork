@@ -36,10 +36,12 @@ INDEX_FORMAT_VERSION = "autowork-goodware-index-v2"
 INDEX_FILENAME = "goodware-index.sqlite3"
 NON_DISCRIMINANT_PATTERN_VERSION = "non-discriminant-patterns-v1"
 
-# This remains a bound, but is high enough for a real multi-million-entry
-# yarGen shard while the v2 parser keeps only one JSON object and one write
-# batch live at a time.
-DEFAULT_MAX_DECOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024
+# These bounds are deliberately independent: v1 retains its historical
+# in-memory parser limit, while v2 streams source objects in bounded batches.
+DEFAULT_V1_MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024
+DEFAULT_V2_MAX_DECOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024
+# Keep the existing name available to callers that used it for the v2 path.
+DEFAULT_MAX_DECOMPRESSED_BYTES = DEFAULT_V2_MAX_DECOMPRESSED_BYTES
 INGEST_BATCH_SIZE = 8192
 MAX_SQLITE_COUNT = (1 << 63) - 1
 
@@ -330,6 +332,23 @@ def _insert_stage_rows(
     )
 
 
+def _insert_feature_rows(
+    connection: sqlite3.Connection,
+    rows: list[tuple[bytes, int]],
+) -> None:
+    if not rows:
+        return
+    connection.executemany(
+        """
+        INSERT INTO features(feature_key, occurrence_count)
+        VALUES (?, ?)
+        ON CONFLICT(feature_key) DO UPDATE SET
+            occurrence_count = features.occurrence_count + excluded.occurrence_count
+        """,
+        rows,
+    )
+
+
 def _aggregate(
     input_dir: Path,
     sqlite_path: Path,
@@ -434,7 +453,7 @@ def build_stage(
     input_dir: Path,
     output_dir: Path,
     *,
-    max_decompressed_bytes: int = DEFAULT_MAX_DECOMPRESSED_BYTES,
+    max_decompressed_bytes: int = DEFAULT_V1_MAX_DECOMPRESSED_BYTES,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Build the already-supported v1 JSONL stage."""
@@ -630,28 +649,21 @@ def _apply_build_pragmas(connection: sqlite3.Connection) -> None:
 
 def _aggregate_v2(
     input_dir: Path,
-    sqlite_path: Path,
+    index_path: Path,
     *,
     max_decompressed_bytes: int,
-) -> list[dict[str, Any]]:
-    connection = sqlite3.connect(sqlite_path)
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Stream v2 sources directly into the final hashed-key table."""
+    connection = sqlite3.connect(index_path)
     _apply_build_pragmas(connection)
-    connection.execute(
-        """
-        CREATE TABLE records (
-            feature_kind TEXT NOT NULL,
-            normalized_value TEXT NOT NULL,
-            occurrence_count INTEGER NOT NULL CHECK (occurrence_count > 0),
-            PRIMARY KEY (feature_kind, normalized_value)
-        ) WITHOUT ROWID
-        """
-    )
+    connection.execute(_FEATURES_SQL)
     sources: list[dict[str, Any]] = []
+    occurrence_sum = 0
     try:
         for path, kind in _iter_v2_sources(input_dir):
             source_occurrences = 0
             entry_count = 0
-            rows: list[tuple[str, str, int]] = []
+            rows: list[tuple[bytes, int]] = []
             for original_value, original_count in _iter_source_items(
                 path,
                 max_decompressed_bytes=max_decompressed_bytes,
@@ -665,13 +677,14 @@ def _aggregate_v2(
                     continue
 
                 normalized = normalize_value(kind, original_value)
-                rows.append((kind, normalized, count))
+                rows.append((lookup_key(kind, normalized), count))
+                occurrence_sum += count
                 if len(rows) >= INGEST_BATCH_SIZE:
                     with connection:
-                        _insert_stage_rows(connection, rows)
+                        _insert_feature_rows(connection, rows)
                     rows.clear()
             with connection:
-                _insert_stage_rows(connection, rows)
+                _insert_feature_rows(connection, rows)
             sources.append(
                 {
                     "filename": path.name,
@@ -682,11 +695,15 @@ def _aggregate_v2(
                     "occurrence_sum": source_occurrences,
                 }
             )
+        row = connection.execute("SELECT COUNT(*) FROM features").fetchone()
+        if row is None:
+            raise GoodwareImportError("cannot count v2 features")
+        record_count = int(row[0])
     except sqlite3.Error as exc:
-        raise GoodwareImportError(f"cannot aggregate goodware sources: {exc}") from exc
+        raise GoodwareImportError(f"cannot write v2 features: {exc}") from exc
     finally:
         connection.close()
-    return sources
+    return sources, record_count, occurrence_sum
 
 
 def _metadata_values(
@@ -711,62 +728,24 @@ def _metadata_values(
 
 
 def _write_v2_index(
-    aggregate_path: Path,
     index_path: Path,
     *,
     metadata: dict[str, str],
-) -> tuple[int, int]:
-    aggregate = sqlite3.connect(aggregate_path)
+) -> None:
     index = sqlite3.connect(index_path)
     _apply_build_pragmas(index)
-    record_count = 0
-    occurrence_sum = 0
     try:
-        index.execute(_FEATURES_SQL)
         index.execute(_METADATA_SQL)
-        rows: list[tuple[bytes, int]] = []
-        cursor = aggregate.execute(
-            """
-            SELECT feature_kind, normalized_value, occurrence_count
-            FROM records
-            ORDER BY feature_kind, normalized_value
-            """
-        )
-        for kind, value, count in cursor:
-            rows.append((lookup_key(kind, value), int(count)))
-            record_count += 1
-            occurrence_sum += int(count)
-            if len(rows) >= INGEST_BATCH_SIZE:
-                try:
-                    with index:
-                        index.executemany(
-                            "INSERT INTO features(feature_key, occurrence_count) VALUES (?, ?)",
-                            rows,
-                        )
-                except sqlite3.Error as exc:
-                    raise GoodwareImportError(
-                        "canonical lookup-key collision or invalid feature row"
-                    ) from exc
-                rows.clear()
         try:
             with index:
                 index.executemany(
-                    "INSERT INTO features(feature_key, occurrence_count) VALUES (?, ?)",
-                    rows,
-                )
-                final_metadata = dict(metadata)
-                final_metadata["record_count"] = str(record_count)
-                final_metadata["occurrence_sum"] = str(occurrence_sum)
-                index.executemany(
                     "INSERT INTO metadata(key, value) VALUES (?, ?)",
-                    sorted(final_metadata.items()),
+                    sorted(metadata.items()),
                 )
         except sqlite3.Error as exc:
             raise GoodwareImportError("cannot write v2 SQLite artifact") from exc
     finally:
-        aggregate.close()
         index.close()
-    return record_count, occurrence_sum
 
 
 def _read_manifest(output_dir: Path) -> dict[str, Any]:
@@ -952,31 +931,6 @@ def _verify_sqlite_index(
             [("key", "TEXT", 1, 1), ("value", "TEXT", 1, 0)],
         )
 
-        bad_row = connection.execute(
-            """
-            SELECT 1 FROM features
-            WHERE typeof(feature_key) != 'blob'
-               OR length(feature_key) != 32
-               OR typeof(occurrence_count) != 'integer'
-               OR occurrence_count <= 0
-            LIMIT 1
-            """
-        ).fetchone()
-        if bad_row is not None:
-            raise GoodwareImportError("SQLite index contains malformed feature rows")
-        try:
-            stats = connection.execute(
-                "SELECT COUNT(*), COALESCE(SUM(occurrence_count), 0) FROM features"
-            ).fetchone()
-        except sqlite3.Error as exc:
-            raise GoodwareImportError("cannot inspect SQLite feature counts") from exc
-        if (
-            stats is None
-            or int(stats[0]) != manifest["record_count"]
-            or int(stats[1]) != manifest["occurrence_sum"]
-        ):
-            raise GoodwareImportError("SQLite feature counts do not match manifest")
-
         expected_metadata = _metadata_values(
             source_set_sha256=manifest["source_set_sha256"],
             record_count=manifest["record_count"],
@@ -993,6 +947,34 @@ def _verify_sqlite_index(
             raise GoodwareImportError("SQLite metadata does not match manifest")
 
         if deep:
+            bad_row = connection.execute(
+                """
+                SELECT 1 FROM features
+                WHERE typeof(feature_key) != 'blob'
+                   OR length(feature_key) != 32
+                   OR typeof(occurrence_count) != 'integer'
+                   OR occurrence_count <= 0
+                LIMIT 1
+                """
+            ).fetchone()
+            if bad_row is not None:
+                raise GoodwareImportError(
+                    "SQLite index contains malformed feature rows"
+                )
+            try:
+                stats = connection.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(occurrence_count), 0) FROM features"
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise GoodwareImportError(
+                    "cannot inspect SQLite feature counts"
+                ) from exc
+            if (
+                stats is None
+                or int(stats[0]) != manifest["record_count"]
+                or int(stats[1]) != manifest["occurrence_sum"]
+            ):
+                raise GoodwareImportError("SQLite feature counts do not match manifest")
             integrity = connection.execute("PRAGMA integrity_check").fetchone()
             if integrity != ("ok",):
                 raise GoodwareImportError("SQLite integrity_check failed")
@@ -1113,7 +1095,7 @@ def build_index(
     input_dir: Path,
     output_dir: Path,
     *,
-    max_decompressed_bytes: int = DEFAULT_MAX_DECOMPRESSED_BYTES,
+    max_decompressed_bytes: int = DEFAULT_V2_MAX_DECOMPRESSED_BYTES,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Build the immutable v2 SQLite artifact directly from yarGen sources."""
@@ -1131,23 +1113,21 @@ def build_index(
         work_dir = Path(temp_name)
         artifact_dir = work_dir / "artifact"
         artifact_dir.mkdir()
-        aggregate_path = work_dir / "aggregate.sqlite3"
         index_path = artifact_dir / INDEX_FILENAME
-        sources = _aggregate_v2(
+        sources, record_count, occurrence_sum = _aggregate_v2(
             input_dir,
-            aggregate_path,
+            index_path,
             max_decompressed_bytes=max_decompressed_bytes,
         )
         source_set = _source_set_sha256(sources)
         # The fingerprint deliberately excludes index_sha256 and index_size.
         baseline = baseline_fingerprint_sha256(source_set)
-        record_count, occurrence_sum = _write_v2_index(
-            aggregate_path,
+        _write_v2_index(
             index_path,
             metadata=_metadata_values(
                 source_set_sha256=source_set,
-                record_count=0,
-                occurrence_sum=0,
+                record_count=record_count,
+                occurrence_sum=occurrence_sum,
                 baseline_fingerprint=baseline,
             ),
         )
@@ -1171,7 +1151,7 @@ def build_index(
         manifest_path.write_text(_canonical_json(manifest) + "\n", encoding="utf-8")
         index_path.chmod(index_path.stat().st_mode & ~0o222)
         manifest_path.chmod(manifest_path.stat().st_mode & ~0o222)
-        verify_index(artifact_dir, input_dir)
+        verify_index(artifact_dir)
         _promote_artifact(artifact_dir, output_dir, overwrite=overwrite)
     return manifest
 
@@ -1194,7 +1174,7 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--max-decompressed-bytes",
         type=int,
-        default=DEFAULT_MAX_DECOMPRESSED_BYTES,
+        default=DEFAULT_V1_MAX_DECOMPRESSED_BYTES,
     )
     build.add_argument("--overwrite", action="store_true")
 
@@ -1209,7 +1189,7 @@ def _parser() -> argparse.ArgumentParser:
     build_index_parser.add_argument(
         "--max-decompressed-bytes",
         type=int,
-        default=DEFAULT_MAX_DECOMPRESSED_BYTES,
+        default=DEFAULT_V2_MAX_DECOMPRESSED_BYTES,
     )
     build_index_parser.add_argument("--overwrite", action="store_true")
 

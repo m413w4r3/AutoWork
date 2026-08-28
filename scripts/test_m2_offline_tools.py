@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -291,6 +292,24 @@ class GoodwareIndexTests(unittest.TestCase):
             self.assertEqual(manifest["occurrence_sum"], 17)
 
             index_path = output / goodware.INDEX_FILENAME
+            connection = sqlite3.connect(index_path)
+            try:
+                objects = list(
+                    connection.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
+                    )
+                )
+                self.assertEqual(objects, [("features",), ("metadata",)])
+                self.assertEqual(
+                    [
+                        row[1]
+                        for row in connection.execute("PRAGMA table_info(features)")
+                    ],
+                    ["feature_key", "occurrence_count"],
+                )
+            finally:
+                connection.close()
             self.assertFalse(os.access(index_path, os.W_OK))
             connection = sqlite3.connect(f"{index_path.as_uri()}?mode=ro", uri=True)
             try:
@@ -364,7 +383,7 @@ class GoodwareIndexTests(unittest.TestCase):
             )
 
             original_batch_size = goodware.INGEST_BATCH_SIZE
-            original_insert = goodware._insert_stage_rows
+            original_insert = goodware._insert_feature_rows
             batches: list[int] = []
 
             def record_batch(connection, rows):
@@ -372,13 +391,13 @@ class GoodwareIndexTests(unittest.TestCase):
                 return original_insert(connection, rows)
 
             goodware.INGEST_BATCH_SIZE = 2
-            goodware._insert_stage_rows = record_batch
+            goodware._insert_feature_rows = record_batch
             try:
                 first_manifest = goodware.build_index(sources, first)
                 second_manifest = goodware.build_index(sources, second)
             finally:
                 goodware.INGEST_BATCH_SIZE = original_batch_size
-                goodware._insert_stage_rows = original_insert
+                goodware._insert_feature_rows = original_insert
 
             self.assertGreater(len(batches), 2)
             self.assertLessEqual(max(batches), 2)
@@ -387,6 +406,83 @@ class GoodwareIndexTests(unittest.TestCase):
                 goodware.lookup_feature(first, "string", "value-3"),
                 goodware.lookup_feature(second, "string", "value-3"),
             )
+
+    def test_v2_build_has_no_normalized_value_sqlite_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            sources = root / "sources"
+            sources.mkdir()
+            self._write_source(sources, "good-strings-part1.db", {"Alpha": 2})
+            statements: list[str] = []
+            original_connect = goodware.sqlite3.connect
+
+            def tracing_connect(*args, **kwargs):
+                connection = original_connect(*args, **kwargs)
+                connection.set_trace_callback(statements.append)
+                return connection
+
+            with patch.object(goodware.sqlite3, "connect", tracing_connect):
+                goodware.build_index(sources, root / "index")
+
+            self.assertFalse(any("CREATE TABLE records" in sql for sql in statements))
+            self.assertFalse(any("normalized_value" in sql for sql in statements))
+
+    def test_routine_verify_skips_feature_scans_deep_verify_runs_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            sources = root / "sources"
+            output = root / "index"
+            sources.mkdir()
+            self._write_source(sources, "good-strings-part1.db", {"alpha": 2})
+            goodware.build_index(sources, output)
+
+            original_connect = goodware.sqlite3.connect
+            routine_sql: list[str] = []
+
+            def trace_routine(*args, **kwargs):
+                connection = original_connect(*args, **kwargs)
+                connection.set_trace_callback(routine_sql.append)
+                return connection
+
+            with patch.object(goodware.sqlite3, "connect", trace_routine):
+                goodware.verify_index(output)
+            self.assertFalse(
+                any("COUNT(*)" in sql or "SUM(" in sql for sql in routine_sql)
+            )
+            self.assertFalse(
+                any("SELECT 1 FROM features" in sql for sql in routine_sql)
+            )
+
+            deep_sql: list[str] = []
+
+            def trace_deep(*args, **kwargs):
+                connection = original_connect(*args, **kwargs)
+                connection.set_trace_callback(deep_sql.append)
+                return connection
+
+            with patch.object(goodware.sqlite3, "connect", trace_deep):
+                goodware.deep_verify_index(output)
+            self.assertTrue(
+                any("COUNT(*)" in sql and "SUM(" in sql for sql in deep_sql)
+            )
+            self.assertTrue(any("PRAGMA integrity_check" in sql for sql in deep_sql))
+
+    def test_v1_and_v2_decompression_defaults_are_independent(self) -> None:
+        self.assertEqual(goodware.DEFAULT_V1_MAX_DECOMPRESSED_BYTES, 256 * 1024 * 1024)
+        self.assertEqual(
+            goodware.DEFAULT_V2_MAX_DECOMPRESSED_BYTES, 8 * 1024 * 1024 * 1024
+        )
+        parser = goodware._parser()
+        self.assertEqual(
+            parser.parse_args(["build", "sources", "output"]).max_decompressed_bytes,
+            goodware.DEFAULT_V1_MAX_DECOMPRESSED_BYTES,
+        )
+        self.assertEqual(
+            parser.parse_args(
+                ["build-index", "sources", "output"]
+            ).max_decompressed_bytes,
+            goodware.DEFAULT_V2_MAX_DECOMPRESSED_BYTES,
+        )
 
     def test_v2_manifest_index_and_source_corruption_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
