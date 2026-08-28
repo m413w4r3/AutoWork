@@ -8,7 +8,7 @@ import pytest
 
 from cti_app.application.invariants import InvariantRegistryService
 from cti_app.config import Settings
-from cti_app.domain.code_features import CodeNgram, GoodwareVerdict, PackingSignals
+from cti_app.domain.code_features import CodeNgram, PackingSignals
 from cti_app.domain.goodware import Banality
 from cti_app.domain.goodware_index import GoodwareMeasurementError
 from cti_app.domain.invariants import (
@@ -477,7 +477,6 @@ def _ngram(*, masked: int, longest: int) -> CodeNgram:
         function_offset=0x1000,
         start_offset=0x1000,
         mnemonics=("nop",),
-        goodware_verdict=GoodwareVerdict.UNKNOWN,
     )
 
 

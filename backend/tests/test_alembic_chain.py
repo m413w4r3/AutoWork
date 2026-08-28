@@ -18,6 +18,7 @@ EXPECTED_CHAIN = (
     "0009_capability_sets",
     "0010_code_features",
     "0011_invariant_registry",
+    "0012_goodware_index_artifacts",
 )
 
 
@@ -47,4 +48,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0009_capability_sets": "0008_reference_corpus",
         "0010_code_features": "0009_capability_sets",
         "0011_invariant_registry": "0010_code_features",
+        "0012_goodware_index_artifacts": "0011_invariant_registry",
     }

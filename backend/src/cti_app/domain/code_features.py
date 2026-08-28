@@ -13,17 +13,6 @@ class CodeFeatureStatus(StrEnum):
     INVALID_OUTPUT = "INVALID_OUTPUT"
 
 
-class GoodwareVerdict(StrEnum):
-    """Legacy source-compatibility enum; CodeNgram no longer stores it."""
-
-    UNKNOWN = "UNKNOWN"
-    PRESENT = "PRESENT"
-    ABSENT = "ABSENT"
-
-
-CodeGoodwareVerdict = GoodwareVerdict
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CodeInstruction:
     offset: int
