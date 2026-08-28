@@ -11,6 +11,7 @@ import dataclasses
 import hashlib
 import json
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -44,6 +45,7 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionBatchPhase,
     ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
@@ -250,11 +252,7 @@ class _InputPacks:
 
     async def get_for_investigation(self, investigation_id: UUID) -> AnalystInputPack | None:
         return next(
-            (
-                item
-                for item in self.items.values()
-                if item.investigation_id == investigation_id
-            ),
+            (item for item in self.items.values() if item.investigation_id == investigation_id),
             None,
         )
 
@@ -305,9 +303,11 @@ class _Jobs:
 class _Dispatcher:
     def __init__(self) -> None:
         self.dispatched: list[UUID] = []
+        self.delays: list[int] = []
 
-    async def dispatch(self, job_id: UUID) -> None:
+    async def dispatch(self, job_id: UUID, *, delay_ms: int = 0) -> None:
         self.dispatched.append(job_id)
+        self.delays.append(delay_ms)
 
 
 class _FailingModel:
@@ -494,6 +494,33 @@ async def test_start_edition_briefs_submits_sources_job_with_standard_retry_poli
     sources_jobs = [job for job in jobs.submitted if job["kind"] == "production.subject.sources"]
     assert len(sources_jobs) == 1
     assert sources_jobs[0]["max_attempts"] == 3
+
+
+async def test_batch_status_exposes_phase_schedule_and_item_error_details(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    started = await api.post(f"/api/editions/{edition_id}/production/briefs", json={})
+    assert started.status_code == 200, started.text
+
+    batch = next(iter(uow.edition_production_batches.items.values()))
+    batch.phase = ProductionBatchPhase.RECOVERY
+    batch.next_dispatch_at = datetime.now(UTC)
+    item = uow.edition_production_batch_items.items[0]
+    item.auto_recovery_count = 1
+    run = uow.subject_production_runs.items[item.production_run_id]
+    run.mark_failed(code="bridge_timeout", message="bridge stopped")
+
+    response = await api.get(f"/api/editions/{edition_id}/production/briefs")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["phase"] == "recovery"
+    assert body["next_dispatch_at"] is not None
+    assert body["item_details"][0]["auto_recovery_count"] == 1
+    assert body["item_details"][0]["error_code"] == "bridge_timeout"
+    assert body["item_details"][0]["error_message"] == "bridge stopped"
 
 
 async def test_start_edition_briefs_rejects_unselected_subject(api: AsyncClient, uow: _Uow) -> None:

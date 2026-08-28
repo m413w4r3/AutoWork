@@ -34,6 +34,7 @@ from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import ProductionStageChain
+from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalRoutingPolicy
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
@@ -135,13 +136,21 @@ async def _execute_job(job_id: UUID) -> int | None:
         )
         seed_enrichment = VirusTotalSeedEnrichmentService(
             vt_adapter,
-            VirusTotalObservationService(BlobCatalogService(
-                MinioBlobStore(
-                    Minio(settings.s3_endpoint, access_key=settings.s3_access_key,
-                         secret_key=settings.s3_secret_key, secure=settings.s3_secure),
-                    physical_bucket=settings.s3_bucket,
-                ), uow_factory
-            ), uow_factory),
+            VirusTotalObservationService(
+                BlobCatalogService(
+                    MinioBlobStore(
+                        Minio(
+                            settings.s3_endpoint,
+                            access_key=settings.s3_access_key,
+                            secret_key=settings.s3_secret_key,
+                            secure=settings.s3_secure,
+                        ),
+                        physical_bucket=settings.s3_bucket,
+                    ),
+                    uow_factory,
+                ),
+                uow_factory,
+            ),
             VirusTotalCapabilities(file_report=settings.virustotal_file_report_enabled),
         )
         production_diagnostics = DiagnosticsLog.from_env(settings.diagnostics_log_root)
@@ -249,7 +258,8 @@ async def _execute_job(job_id: UUID) -> int | None:
         production_artifact_store = ProductionArtifactStore(
             BlobCatalogService(blob_store, uow_factory)
         )
-        production_chain = ProductionStageChain()
+        production_pacing = ProductionPacingPolicy.from_settings(settings)
+        production_chain = ProductionStageChain(production_pacing)
         registry = create_job_registry(
             model_gateway,
             discovery_service,

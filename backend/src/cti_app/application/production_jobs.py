@@ -21,6 +21,7 @@ from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import ModelGateway
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import EditionProductionService
 from cti_app.domain.production import (
@@ -76,9 +77,14 @@ class ProductionStageChain:
     the chain is created first and bound once both are constructed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, pacing: ProductionPacingPolicy | None = None) -> None:
         self._jobs: JobService | None = None
         self._dispatcher: JobDispatcher | None = None
+        self._pacing = pacing or ProductionPacingPolicy.zero()
+
+    @property
+    def pacing(self) -> ProductionPacingPolicy:
+        return self._pacing
 
     def bind(self, jobs: JobService, dispatcher: JobDispatcher) -> None:
         self._jobs = jobs
@@ -95,6 +101,7 @@ class ProductionStageChain:
         stage: SubjectProductionStage,
         correlation_id: str,
         actor_id: str = "system",
+        delay_ms: int | None = None,
     ) -> UUID | None:
         """Worker attempts share a generation; manual retries get a new one."""
         if self._jobs is None or self._dispatcher is None:
@@ -114,7 +121,10 @@ class ProductionStageChain:
             max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
             actor_id=actor_id,
         )
-        await self._dispatcher.dispatch(job.id)
+        await self._dispatcher.dispatch(
+            job.id,
+            delay_ms=(self._pacing.model_delay_ms(stage) if delay_ms is None else max(0, delay_ms)),
+        )
         return job.id
 
 
@@ -129,9 +139,11 @@ def register_production_jobs(
     artifact_store: ProductionArtifactStore | None = None,
     diagnostics: DiagnosticsLog | None = None,
     seed_enrichment: VirusTotalSeedEnrichmentService | None = None,
+    pacing: ProductionPacingPolicy | None = None,
 ) -> None:
     """Register the five production stage jobs."""
     stage_chain = chain or ProductionStageChain()
+    production_pacing = pacing or stage_chain.pacing
 
     async def advance_batch(run_id: UUID, correlation_id: str) -> None:
         """Start the next subject of the batch this run belongs to.
@@ -139,7 +151,7 @@ def register_production_jobs(
         A subject that ends in needs_review or failed must not block the queue,
         so this runs on every terminal outcome, not only on success.
         """
-        batches = EditionProductionService(uow_factory)
+        batches = EditionProductionService(uow_factory, production_pacing)
         async with uow_factory() as uow:
             item = await uow.edition_production_batch_items.get_by_run(run_id)
             if item is None:
@@ -148,13 +160,21 @@ def register_production_jobs(
 
         # The transaction is committed before dispatching, so the worker can
         # never pick the job up before the run is visible as RUNNING.
-        started = await batches.on_subject_terminal(batch_id, run_id)
+        started = await batches.on_subject_terminal(
+            batch_id,
+            run_id,
+            correlation_id=correlation_id,
+        )
         if started is None:
             return
+        subject_delay_ms: int | None = None
+        if started.current_stage is SubjectProductionStage.SOURCES:
+            subject_delay_ms = await batches.next_dispatch_delay_ms(batch_id)
         await stage_chain.submit(
             run=started,
-            stage=SubjectProductionStage.SOURCES,
+            stage=started.current_stage,
             correlation_id=correlation_id,
+            delay_ms=subject_delay_ms,
         )
 
     async def handle_stage(
@@ -169,6 +189,7 @@ def register_production_jobs(
             current = await uow.subject_production_runs.get(parameters.run_id)
         if current is None or current.pipeline_generation != parameters.pipeline_generation:
             return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
+        await EditionProductionService(uow_factory).clear_next_dispatch(parameters.run_id)
         orchestrator = ProductionWorkflowOrchestrator(
             uow_factory,
             model_service=model_service,
@@ -177,6 +198,7 @@ def register_production_jobs(
             artifact_store=artifact_store,
             diagnostics=diagnostics,
             seed_enrichment=seed_enrichment,
+            pacing=production_pacing,
         )
 
         correlation_id = await context.correlation_id()

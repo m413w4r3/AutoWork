@@ -66,3 +66,20 @@ def test_virustotal_settings_are_optional_and_bounded(monkeypatch: pytest.Monkey
     monkeypatch.setenv("VIRUSTOTAL_MAX_PAGE_SIZE", "101")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_production_jitter_bounds_allow_zero_but_reject_inverted_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PRODUCTION_SUBJECT_JITTER_MIN_SECONDS", "0")
+    monkeypatch.setenv("PRODUCTION_SUBJECT_JITTER_MAX_SECONDS", "0")
+    monkeypatch.setenv("PRODUCTION_MODEL_JITTER_MIN_SECONDS", "0")
+    monkeypatch.setenv("PRODUCTION_MODEL_JITTER_MAX_SECONDS", "0")
+    settings = Settings(_env_file=None)
+    assert settings.production_subject_jitter_min_seconds == 0
+    assert settings.production_model_jitter_max_seconds == 0
+
+    monkeypatch.setenv("PRODUCTION_MODEL_JITTER_MIN_SECONDS", "2")
+    monkeypatch.setenv("PRODUCTION_MODEL_JITTER_MAX_SECONDS", "1")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)

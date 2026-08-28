@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -34,6 +35,7 @@ from cti_app.application.production_artifact_verification import (
     verify_q2_proposals,
 )
 from cti_app.application.production_context import build_subject_production_context
+from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_parsers import (
     Q2_MARKDOWN_PARSER_VERSION,
     IndicatorStatus,
@@ -151,6 +153,7 @@ class ProductionWorkflowOrchestrator:
         artifact_store: ProductionArtifactStore | None = None,
         diagnostics: DiagnosticsLog | None = None,
         seed_enrichment: VirusTotalSeedEnrichmentService | None = None,
+        pacing: ProductionPacingPolicy | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._model_service = model_service
@@ -165,6 +168,7 @@ class ProductionWorkflowOrchestrator:
         self._assembly = BriefAssemblyService(uow_factory, artifact_store)
         self._qa = ProductionQAService(uow_factory)
         self._seed_enrichment = seed_enrichment
+        self._pacing = pacing or ProductionPacingPolicy.zero()
         self._analyst_handoff = (
             AnalystPostSynthesisService(
                 uow_factory,
@@ -777,7 +781,11 @@ class ProductionWorkflowOrchestrator:
         completed: list[str] = []
         failed: list[str] = []
         failures: dict[str, dict[str, str]] = {}
-        for source in report.sources:
+        for source_index, source in enumerate(report.sources):
+            if source_index:
+                # Q2 stays one request per source; pacing is between requests,
+                # never before the first source.
+                await asyncio.sleep(self._pacing.model_delay_seconds())
             prompt = ProductionPromptTemplates.get_extraction_prompt(
                 subject_title, source.local_id, source.title, source.canonical_url
             )
@@ -871,19 +879,19 @@ class ProductionWorkflowOrchestrator:
                     duration_ms=int((time.monotonic() - started_at) * 1000),
                 )
         if failed:
-                return {
-                    "stage": "extraction",
-                    "status": "needs_review",
-                    "error_code": "q2_source_coverage_failed",
-                    "error": "One or more Q1 sources could not be analysed",
-                    "details": {
-                        "completed_source_ids": completed,
-                        "failed_source_ids": failed,
-                        "source_failures": failures,
-                    },
+            return {
+                "stage": "extraction",
+                "status": "needs_review",
+                "error_code": "q2_source_coverage_failed",
+                "error": "One or more Q1 sources could not be analysed",
+                "details": {
                     "completed_source_ids": completed,
                     "failed_source_ids": failed,
                     "source_failures": failures,
+                },
+                "completed_source_ids": completed,
+                "failed_source_ids": failed,
+                "source_failures": failures,
             }
         verification = verify_q2_proposals(submissions)
         extraction = verification.canonical

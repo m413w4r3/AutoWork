@@ -806,6 +806,8 @@ class EditionProductionBatchItemRepository(Protocol):
 
     async def get_by_run(self, run_id: UUID) -> EditionProductionBatchItem | None: ...
 
+    async def save(self, item: EditionProductionBatchItem) -> None: ...
+
 
 class ProductionUnitOfWork(Protocol):
     jobs: JobRepository

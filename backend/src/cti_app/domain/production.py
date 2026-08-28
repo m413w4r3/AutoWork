@@ -445,6 +445,16 @@ class SubjectProductionRun:
         self.status = SubjectProductionStatus.RUNNING
         self.current_stage = stage
         self.pipeline_generation += 1
+        if stage is SubjectProductionStage.SOURCES:
+            self.references_conversation_id = None
+            self.synthesis_conversation_id = None
+        elif stage is SubjectProductionStage.REFERENCES:
+            self.references_conversation_id = None
+            self.synthesis_conversation_id = None
+        elif stage is SubjectProductionStage.EXTRACTION:
+            self.synthesis_conversation_id = None
+        elif stage is SubjectProductionStage.SYNTHESIS:
+            self.synthesis_conversation_id = None
         self.error_code = None
         self.error_message = None
         self.error_details = None
@@ -716,7 +726,30 @@ class EditionProductionBatch:
 
     def cancel(self, *, now: datetime | None = None) -> None:
         self.status = "cancelled"
+        self.next_dispatch_at = None
         self.finished_at = now or datetime.now(UTC)
+        self.version += 1
+
+    def schedule_next_dispatch(self, dispatch_at: datetime) -> None:
+        if dispatch_at.tzinfo is None or dispatch_at.utcoffset() is None:
+            raise ValueError("dispatch_at must be timezone-aware")
+        self.next_dispatch_at = dispatch_at
+        self.version += 1
+
+    def clear_next_dispatch(self) -> None:
+        if self.next_dispatch_at is not None:
+            self.next_dispatch_at = None
+            self.version += 1
+
+    def enter_recovery(self) -> None:
+        if self.status != "running":
+            raise ValueError("Can only enter recovery from a running batch")
+        self.phase = ProductionBatchPhase.RECOVERY
+        self.version += 1
+
+    def enter_review(self) -> None:
+        self.phase = ProductionBatchPhase.REVIEW
+        self.next_dispatch_at = None
         self.version += 1
 
 

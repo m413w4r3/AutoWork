@@ -535,6 +535,13 @@ class SqlAlchemyEditionProductionBatchItemRepository:
         row = result.scalars().first()
         return _edition_production_batch_item_from_row(row) if row else None
 
+    async def save(self, item: EditionProductionBatchItem) -> None:
+        await self._session.execute(
+            update(EditionProductionBatchItemRow)
+            .where(EditionProductionBatchItemRow.id == item.id)
+            .values(auto_recovery_count=item.auto_recovery_count)
+        )
+
 
 def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectProductionRun:
     return SubjectProductionRun(

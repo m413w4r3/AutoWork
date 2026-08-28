@@ -16,6 +16,7 @@ from cti_app.application.production_jobs import (
     ProductionStageParameters,
     production_stage_idempotency_key,
 )
+from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_stage_status import (
     build_stage_statuses,
     completed_stage_count,
@@ -101,6 +102,9 @@ class BatchItemDetail(BaseModel):
     run_id: str
     status: str
     current_stage: str
+    auto_recovery_count: int = 0
+    error_code: str | None = None
+    error_message: str | None = None
 
 
 class BatchStatus(BaseModel):
@@ -182,6 +186,10 @@ def _production_state_service(request: Request) -> ProductionStateService:
     return ProductionStateService(request.app.state.uow_factory, artifact_store)
 
 
+def _production_pacing(request: Request) -> ProductionPacingPolicy:
+    return getattr(request.app.state, "production_pacing", ProductionPacingPolicy.zero())
+
+
 def _eligible_brief_subject_ids(groups: Iterable[EditorialGroup]) -> list[UUID]:
     """Subjects of an edition that are selected briefs, in board order."""
     return [
@@ -219,6 +227,65 @@ def _run_view(
         "error_message": run.error_message,
         "error_details": run.error_details,
     }
+
+
+async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
+    """Build a batch response from persisted batch and run state."""
+    items = await uow.edition_production_batch_items.list_for_batch(batch.id)
+    completed = needs_review = failed = cancelled = 0
+    details: list[BatchItemDetail] = []
+    for item in items:
+        run = await uow.subject_production_runs.get(item.production_run_id)
+        if run is None:
+            continue
+        if run.status is SubjectProductionStatus.READY:
+            completed += 1
+        elif run.status is SubjectProductionStatus.NEEDS_REVIEW:
+            needs_review += 1
+        elif run.status is SubjectProductionStatus.FAILED:
+            failed += 1
+        elif run.status is SubjectProductionStatus.CANCELLED:
+            cancelled += 1
+
+        group = await uow.editorial_groups.get_by_subject(item.subject_id)
+        snapshot_repository = getattr(uow, "production_input_snapshots", None)
+        snapshot = await snapshot_repository.get_by_run(run.id) if snapshot_repository else None
+        details.append(
+            BatchItemDetail(
+                position=item.position,
+                subject_id=str(item.subject_id),
+                title=(
+                    snapshot.subject_title
+                    if snapshot
+                    else group.title
+                    if group
+                    else str(item.subject_id)
+                ),
+                run_id=str(run.id),
+                status=run.status.value,
+                current_stage=run.current_stage.value,
+                auto_recovery_count=item.auto_recovery_count,
+                error_code=run.error_code,
+                error_message=run.error_message,
+            )
+        )
+    return BatchStatus(
+        batch_id=str(batch.id),
+        edition_id=str(batch.edition_id),
+        profile=batch.profile.value,
+        status=batch.status,
+        items=len(items),
+        completed=completed,
+        needs_review=needs_review,
+        failed=failed,
+        cancelled=cancelled,
+        item_details=details,
+        created_at=batch.created_at.isoformat(),
+        started_at=batch.started_at.isoformat() if batch.started_at else None,
+        finished_at=batch.finished_at.isoformat() if batch.finished_at else None,
+        phase=batch.phase.value,
+        next_dispatch_at=(batch.next_dispatch_at.isoformat() if batch.next_dispatch_at else None),
+    )
 
 
 async def _create_and_start_run(
@@ -534,7 +601,10 @@ async def retry_production_stage(
         max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
         actor_id=user,
     )
-    await dispatcher.dispatch(job.id)
+    await dispatcher.dispatch(
+        job.id,
+        delay_ms=_production_pacing(request).model_delay_ms(payload.stage),
+    )
     diagnostics = getattr(request.app.state, "production_diagnostics", None)
     if diagnostics is not None:
         diagnostics.record(
@@ -740,33 +810,12 @@ async def start_edition_brief_production(
     # Idempotent: returns the existing active batch if one exists.
     payload = body or StartEditionProductionRequest()
     uow_factory, jobs, dispatcher = _runtime(request)
-    service = EditionProductionService(uow_factory)
+    service = EditionProductionService(uow_factory, _production_pacing(request))
 
     async with uow_factory() as uow:
         active_batch = await uow.edition_production_batches.get_active_for_edition(edition_id)
         if active_batch:
-            items = await uow.edition_production_batch_items.list_for_batch(active_batch.id)
-            return BatchStatus(
-                batch_id=str(active_batch.id),
-                edition_id=str(active_batch.edition_id),
-                profile=active_batch.profile.value,
-                status=active_batch.status,
-                items=len(items),
-                completed=0,
-                needs_review=0,
-                failed=0,
-                created_at=active_batch.created_at.isoformat(),
-                started_at=active_batch.started_at.isoformat() if active_batch.started_at else None,
-                finished_at=active_batch.finished_at.isoformat()
-                if active_batch.finished_at
-                else None,
-                phase=active_batch.phase.value,
-                next_dispatch_at=(
-                    active_batch.next_dispatch_at.isoformat()
-                    if active_batch.next_dispatch_at
-                    else None
-                ),
-            )
+            return await _batch_status_view(uow, active_batch)
 
         groups = await uow.editorial_groups.list_for_edition(edition_id)
         eligible_order = _eligible_brief_subject_ids(groups)
@@ -826,23 +875,9 @@ async def start_edition_brief_production(
             detail=str(e),
         ) from e
 
-    return BatchStatus(
-        batch_id=str(batch.id),
-        edition_id=str(batch.edition_id),
-        profile=batch.profile.value,
-        status=batch.status,
-        items=len(subject_ids),
-        completed=0,
-        needs_review=0,
-        failed=0,
-        created_at=batch.created_at.isoformat(),
-        started_at=batch.started_at.isoformat() if batch.started_at else None,
-        finished_at=None,
-        phase=batch.phase.value,
-        next_dispatch_at=(
-            batch.next_dispatch_at.isoformat() if batch.next_dispatch_at else None
-        ),
-    )
+    async with uow_factory() as uow:
+        persisted_batch = await uow.edition_production_batches.get(batch.id)
+        return await _batch_status_view(uow, persisted_batch or batch)
 
 
 @router.get("/editions/{edition_id}/production/briefs")
@@ -862,72 +897,7 @@ async def get_edition_brief_production(
                 detail=f"No batch found for edition {edition_id}",
             )
 
-        items = await uow.edition_production_batch_items.list_for_batch(batch.id)
-
-        completed = 0
-        needs_review = 0
-        failed = 0
-
-        cancelled = 0
-        details: list[BatchItemDetail] = []
-
-        for item in items:
-            run = await uow.subject_production_runs.get(item.production_run_id)
-            if not run:
-                continue
-
-            if run.status == SubjectProductionStatus.READY:
-                completed += 1
-            elif run.status == SubjectProductionStatus.NEEDS_REVIEW:
-                needs_review += 1
-            elif run.status == SubjectProductionStatus.FAILED:
-                failed += 1
-            elif run.status == SubjectProductionStatus.CANCELLED:
-                cancelled += 1
-
-            group = await uow.editorial_groups.get_by_subject(item.subject_id)
-            snapshot_repository = getattr(uow, "production_input_snapshots", None)
-            snapshot = (
-                await snapshot_repository.get_by_run(run.id)
-                if snapshot_repository
-                else None
-            )
-            details.append(
-                BatchItemDetail(
-                    position=item.position,
-                    subject_id=str(item.subject_id),
-                    title=(
-                        snapshot.subject_title
-                        if snapshot
-                        else group.title
-                        if group
-                        else str(item.subject_id)
-                    ),
-                    run_id=str(run.id),
-                    status=run.status.value,
-                    current_stage=run.current_stage.value,
-                )
-            )
-
-        return BatchStatus(
-            batch_id=str(batch.id),
-            edition_id=str(batch.edition_id),
-            profile=batch.profile.value,
-            status=batch.status,
-            items=len(items),
-            completed=completed,
-            needs_review=needs_review,
-            failed=failed,
-            cancelled=cancelled,
-            item_details=details,
-            created_at=batch.created_at.isoformat(),
-            started_at=batch.started_at.isoformat() if batch.started_at else None,
-            finished_at=batch.finished_at.isoformat() if batch.finished_at else None,
-            phase=batch.phase.value,
-            next_dispatch_at=(
-                batch.next_dispatch_at.isoformat() if batch.next_dispatch_at else None
-            ),
-        )
+        return await _batch_status_view(uow, batch)
 
 
 @router.post("/editions/{edition_id}/production/briefs/{batch_id}/cancel")
@@ -964,10 +934,7 @@ async def cancel_edition_batch(
             if run.status is SubjectProductionStatus.QUEUED:
                 run.mark_cancelled(now=datetime.now(UTC))
                 await uow.subject_production_runs.save(run)
-            elif (
-                run.status is SubjectProductionStatus.RUNNING
-                and current_run_id is None
-            ):
+            elif run.status is SubjectProductionStatus.RUNNING and current_run_id is None:
                 current_run_id = run.id
                 current_subject_id = run.subject_id
         await uow.commit()

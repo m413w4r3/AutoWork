@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,6 +40,10 @@ class Settings(BaseSettings):
     # Doit rester supérieur au BRIDGE_TOTAL_TIMEOUT du bridge : le worker attend
     # la fin de la génération, puis parse, persiste et regroupe.
     job_actor_time_limit_seconds: float = Field(default=4500.0, gt=600, le=86400)
+    production_subject_jitter_min_seconds: float = Field(default=30.0, ge=0)
+    production_subject_jitter_max_seconds: float = Field(default=90.0, ge=0)
+    production_model_jitter_min_seconds: float = Field(default=8.0, ge=0)
+    production_model_jitter_max_seconds: float = Field(default=20.0, ge=0)
     openai_bridge_base_url: str = "http://127.0.0.1:8001/v1"
     openai_bridge_api_key: SecretStr | None = None
     openai_bridge_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
@@ -140,6 +146,14 @@ class Settings(BaseSettings):
     smda_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
     smda_max_output_bytes: int = Field(default=32 * 1024 * 1024, gt=0)
     smda_max_memory_bytes: int = Field(default=1024 * 1024 * 1024, gt=0)
+
+    @model_validator(mode="after")
+    def validate_production_jitter_bounds(self) -> Settings:
+        if self.production_subject_jitter_max_seconds < self.production_subject_jitter_min_seconds:
+            raise ValueError("production subject jitter max must be >= min")
+        if self.production_model_jitter_max_seconds < self.production_model_jitter_min_seconds:
+            raise ValueError("production model jitter max must be >= min")
+        return self
 
 
 @lru_cache

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from collections.abc import Sequence
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -10,6 +11,8 @@ from cti_app.application.persistence import (
     ProductionUnitOfWork,
     ProductionUnitOfWorkFactory,
 )
+from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.domain.editions import EditionAuditEvent, EditionStatus
 from cti_app.domain.production import (
     EditionProductionBatch,
@@ -57,8 +60,7 @@ async def capture_production_input_snapshot(
     batches = {}
     if discovery_batches is not None:
         batches = {
-            batch.id: batch
-            for batch in await discovery_batches.list_for_edition(edition_id)
+            batch.id: batch for batch in await discovery_batches.list_for_edition(edition_id)
         }
 
     candidates: list[object] = []
@@ -114,8 +116,7 @@ async def capture_production_input_snapshot(
                 actor_values.setdefault(cleaned.casefold(), cleaned)
 
     core_sources = tuple(
-        item[1]
-        for item in sorted(by_url.values(), key=lambda value: value[1].canonical_url)
+        item[1] for item in sorted(by_url.values(), key=lambda value: value[1].canonical_url)
     )
     return ProductionInputSnapshot(
         production_run_id=production_run_id,
@@ -273,38 +274,55 @@ class SubjectProductionService:
         self, run_id: UUID, stage: SubjectProductionStage
     ) -> tuple[SubjectProductionRun, list[str]]:
         async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get_for_update(run_id)
-            if not run:
-                raise ValueError(f"Production run {run_id} not found")
-
-            if run.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
-                raise ValueError("retry_not_allowed_while_running")
-            if stage not in production_stages(run.profile):
-                raise ValueError("retry_stage_not_in_profile")
-            if stage is SubjectProductionStage.REFERENCES:
-                sources = await uow.source_collections.list_for_subject(run.subject_id)
-                source_ready = any(
-                    source.state.value in {"archived", "extracted", "completed"}
-                    for source in sources
-                )
-                if not source_ready:
-                    raise ValueError("retry_prerequisite_missing")
-            prerequisite = {
-                SubjectProductionStage.EXTRACTION: "references",
-                SubjectProductionStage.SYNTHESIS: "extraction",
-                SubjectProductionStage.ASSEMBLY: "synthesis",
-            }.get(stage)
-            if prerequisite:
-                artifact = await uow.production_artifacts.get_current(run_id, prerequisite)
-                if artifact is None:
-                    raise ValueError("retry_prerequisite_missing")
-
-            run.retry_from_stage(stage, now=datetime.now(UTC))
-            staled = await uow.production_artifacts.mark_from_stage_stale(run_id, stage.value)
-
-            await uow.subject_production_runs.save(run)
+            run, staled = await self._retry_from_stage_in_uow(uow, run_id, stage)
             await uow.commit()
             return run, staled
+
+    async def _retry_from_stage_in_uow(
+        self,
+        uow: ProductionUnitOfWork,
+        run_id: UUID,
+        stage: SubjectProductionStage,
+    ) -> tuple[SubjectProductionRun, list[str]]:
+        """Shared transaction core for manual and automatic business retries."""
+        run = await uow.subject_production_runs.get_for_update(run_id)
+        if not run:
+            raise ValueError(f"Production run {run_id} not found")
+
+        if run.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
+            raise ValueError("retry_not_allowed_while_running")
+        if stage not in production_stages(run.profile):
+            raise ValueError("retry_stage_not_in_profile")
+        if stage is SubjectProductionStage.REFERENCES:
+            sources = await uow.source_collections.list_for_subject(run.subject_id)
+            source_ready = any(
+                source.state.value in {"archived", "extracted", "completed"} for source in sources
+            )
+            if not source_ready:
+                raise ValueError("retry_prerequisite_missing")
+        prerequisite = {
+            SubjectProductionStage.EXTRACTION: "references",
+            SubjectProductionStage.SYNTHESIS: "extraction",
+            SubjectProductionStage.ASSEMBLY: "synthesis",
+        }.get(stage)
+        if prerequisite:
+            artifacts = getattr(uow, "production_artifacts", None)
+            artifact = (
+                await artifacts.get_current(run_id, prerequisite) if artifacts is not None else None
+            )
+            if artifact is None:
+                raise ValueError("retry_prerequisite_missing")
+
+        run.retry_from_stage(stage, now=datetime.now(UTC))
+        artifacts = getattr(uow, "production_artifacts", None)
+        staled = (
+            await artifacts.mark_from_stage_stale(run_id, stage.value)
+            if artifacts is not None
+            else []
+        )
+
+        await uow.subject_production_runs.save(run)
+        return run, staled
 
 
 _TERMINAL_STATUSES = {
@@ -316,8 +334,13 @@ _TERMINAL_STATUSES = {
 
 
 class EditionProductionService:
-    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        pacing: ProductionPacingPolicy | None = None,
+    ) -> None:
         self._uow_factory = uow_factory
+        self._pacing = pacing or ProductionPacingPolicy.zero()
 
     async def create_batch(
         self,
@@ -436,7 +459,11 @@ class EditionProductionService:
             )
 
     async def _start_next_in_uow(
-        self, uow: ProductionUnitOfWork, batch: EditionProductionBatch
+        self,
+        uow: ProductionUnitOfWork,
+        batch: EditionProductionBatch,
+        *,
+        pace_subject: bool = False,
     ) -> SubjectProductionRun | None:
         """Move the first queued subject of a batch to RUNNING.
 
@@ -459,10 +486,16 @@ class EditionProductionService:
                 # Already in flight: never dispatch a second job for it.
                 return None
             if run.status is SubjectProductionStatus.QUEUED:
-                run.start_running(now=datetime.now(UTC))
+                started_at = datetime.now(UTC)
+                run.start_running(now=started_at)
                 await uow.subject_production_runs.save(run)
                 if batch.status == "queued":
-                    batch.start(now=datetime.now(UTC))
+                    batch.start(now=started_at)
+                if pace_subject:
+                    batch.schedule_next_dispatch(
+                        started_at + timedelta(milliseconds=self._pacing.subject_delay_ms())
+                    )
+                if batch.status == "running":
                     await uow.edition_production_batches.save(batch)
                 return run
         return None
@@ -477,7 +510,12 @@ class EditionProductionService:
             return run
 
     async def on_subject_terminal(
-        self, batch_id: UUID, run_id: UUID
+        self,
+        batch_id: UUID,
+        run_id: UUID,
+        *,
+        actor_id: str = "system",
+        correlation_id: str = "-",
     ) -> SubjectProductionRun | None:
         """Hand the batch over after a subject reached a terminal state.
 
@@ -489,7 +527,7 @@ class EditionProductionService:
             if not batch:
                 raise ValueError(f"Batch {batch_id} not found")
 
-            started = await self._start_next_in_uow(uow, batch)
+            started = await self._start_next_in_uow(uow, batch, pace_subject=True)
             if started is not None:
                 await uow.commit()
                 return started
@@ -502,11 +540,112 @@ class EditionProductionService:
                 run is not None and run.status in _TERMINAL_STATUSES for run in all_runs
             )
             if all_terminal and batch.status in {"queued", "running"}:
-                has_non_ready = any(
-                    run is not None and run.status is not SubjectProductionStatus.READY
-                    for run in all_runs
+                recovery = (
+                    await self._retry_next_recovery_in_uow(uow, batch, items)
+                    if batch.phase is not ProductionBatchPhase.REVIEW
+                    else None
                 )
-                batch.finish(completed_with_issues=has_non_ready, now=datetime.now(UTC))
-                await uow.edition_production_batches.save(batch)
+                if recovery is not None:
+                    await uow.commit()
+                    return recovery
+                await self._finish_batch_in_uow(
+                    uow,
+                    batch,
+                    items,
+                    actor_id=actor_id,
+                    correlation_id=correlation_id,
+                )
             await uow.commit()
             return None
+
+    async def _retry_next_recovery_in_uow(
+        self,
+        uow: ProductionUnitOfWork,
+        batch: EditionProductionBatch,
+        items: Sequence[EditionProductionBatchItem],
+    ) -> SubjectProductionRun | None:
+        """Retry the first eligible terminal item, in editorial order."""
+        for item in sorted(items, key=lambda candidate: candidate.position):
+            run = await uow.subject_production_runs.get(item.production_run_id)
+            if run is None or not ProductionRecoveryPolicyV1.eligible(item, run):
+                continue
+            try:
+                retried, _ = await SubjectProductionService(
+                    self._uow_factory
+                )._retry_from_stage_in_uow(uow, run.id, run.current_stage)
+            except ValueError as exc:
+                # A policy-approved error can still lack the prerequisite
+                # needed for its stage. It is not an automatic recovery case
+                # in that state; leave it for manual review and continue.
+                if str(exc) == "retry_prerequisite_missing":
+                    continue
+                raise
+            item.auto_recovery_count += 1
+            save_item = getattr(uow.edition_production_batch_items, "save", None)
+            if save_item is not None:
+                await save_item(item)
+            if batch.phase is ProductionBatchPhase.INITIAL:
+                batch.enter_recovery()
+            await uow.edition_production_batches.save(batch)
+            return retried
+        return None
+
+    async def _finish_batch_in_uow(
+        self,
+        uow: ProductionUnitOfWork,
+        batch: EditionProductionBatch,
+        items: Sequence[EditionProductionBatchItem],
+        *,
+        actor_id: str,
+        correlation_id: str,
+    ) -> None:
+        runs = [await uow.subject_production_runs.get(item.production_run_id) for item in items]
+        has_non_ready = any(
+            run is not None and run.status is not SubjectProductionStatus.READY for run in runs
+        )
+        now = datetime.now(UTC)
+        batch.enter_review()
+        batch.finish(completed_with_issues=has_non_ready, now=now)
+        await uow.edition_production_batches.save(batch)
+
+        editions = getattr(uow, "editions", None)
+        audit = getattr(uow, "edition_audit", None)
+        if editions is None or audit is None:
+            return
+        edition = await editions.get_for_update(batch.edition_id)
+        if edition is None or edition.status is not EditionStatus.PRODUCTION:
+            return
+        before = edition.snapshot()
+        edition.transition(EditionStatus.REVIEW, now=now)
+        update = getattr(editions, "update", None)
+        if update is not None and not await update(edition, edition.version - 1):
+            raise ValueError("edition_concurrent_update")
+        await audit.append(
+            EditionAuditEvent(
+                edition_id=edition.id,
+                actor_id=actor_id,
+                action="edition.transitioned",
+                before=before,
+                after=edition.snapshot(),
+                correlation_id=correlation_id,
+                occurred_at=now,
+            )
+        )
+
+    async def clear_next_dispatch(self, run_id: UUID) -> None:
+        """Clear the persisted subject schedule when its worker starts."""
+        async with self._uow_factory() as uow:
+            item = await uow.edition_production_batch_items.get_by_run(run_id)
+            if item is None:
+                return
+            batch = await uow.edition_production_batches.get_for_update(item.batch_id)
+            if batch is None:
+                return
+            batch.clear_next_dispatch()
+            await uow.edition_production_batches.save(batch)
+            await uow.commit()
+
+    async def next_dispatch_delay_ms(self, batch_id: UUID) -> int:
+        async with self._uow_factory() as uow:
+            batch = await uow.edition_production_batches.get(batch_id)
+            return self._pacing.delay_until(batch.next_dispatch_at if batch is not None else None)

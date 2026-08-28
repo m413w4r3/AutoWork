@@ -41,6 +41,7 @@ from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import ProductionStageChain
+from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.subject_production import (
     EditionProductionService,
     SubjectProductionService,
@@ -66,6 +67,7 @@ configure_logging(settings.log_level)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     readiness = InfrastructureReadinessChecker(settings)
+    production_pacing = ProductionPacingPolicy.from_settings(settings)
     job_engine = create_postgres_engine(settings.postgres_dsn)
     session_factory = create_session_factory(job_engine)
 
@@ -209,9 +211,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     subject_production_service = SubjectProductionService(uow_factory)
-    edition_production_service = EditionProductionService(uow_factory)
+    edition_production_service = EditionProductionService(uow_factory, production_pacing)
     production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
-    production_chain = ProductionStageChain()
+    production_chain = ProductionStageChain(production_pacing)
     registry = create_job_registry(
         model_gateway,
         discovery_service,
@@ -228,6 +230,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.uow_factory = uow_factory
     app.state.production_artifact_store = production_artifact_store
     app.state.production_diagnostics = production_diagnostics
+    app.state.production_pacing = production_pacing
     job_service = JobService(uow_factory, registry)
     job_dispatcher = DramatiqJobDispatcher()
     # Registry must exist before the service consuming it, so bind only once both are ready.

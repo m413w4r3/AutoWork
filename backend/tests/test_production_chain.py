@@ -141,9 +141,11 @@ class _Jobs:
 class _Dispatcher:
     def __init__(self) -> None:
         self.dispatched: list[UUID] = []
+        self.delays: list[int] = []
 
-    async def dispatch(self, job_id: UUID) -> None:
+    async def dispatch(self, job_id: UUID, *, delay_ms: int = 0) -> None:
         self.dispatched.append(job_id)
+        self.delays.append(delay_ms)
 
 
 class _Context:
