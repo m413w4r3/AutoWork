@@ -99,6 +99,9 @@ from cti_app.infrastructure.database.repositories.editorial import (
     SqlAlchemyEditorialGroupRepository,
     SqlAlchemyHumanDecisionRepository,
 )
+from cti_app.infrastructure.database.repositories.invariants import (
+    SqlAlchemyInvariantRepository,
+)
 from cti_app.infrastructure.database.repositories.jobs import (
     SqlAlchemyJobEventRepository,
     SqlAlchemyJobRepository,
@@ -110,9 +113,6 @@ from cti_app.infrastructure.database.repositories.model_conversations import (
 from cti_app.infrastructure.database.repositories.model_runs import (
     SqlAlchemyModelOutputRejectionRepository,
     SqlAlchemyModelRunRepository,
-)
-from cti_app.infrastructure.database.repositories.invariants import (
-    SqlAlchemyInvariantRepository,
 )
 from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemyAnalystDecisionRepository,

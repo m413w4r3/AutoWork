@@ -48,11 +48,14 @@ class BlobRow(Base):
 class GoodwareBaselineRow(Base):
     __tablename__ = "goodware_baselines"
     __table_args__ = (
-        UniqueConstraint("source_set_sha256", name="uq_goodware_baselines_source_set"),
+        UniqueConstraint(
+            "baseline_fingerprint_sha256", name="uq_goodware_baselines_fingerprint"
+        ),
     )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    baseline_fingerprint_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     source_set_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    records_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    normalization_version: Mapped[str] = mapped_column(String(64), nullable=False)
     record_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
     occurrence_sum: Mapped[int] = mapped_column(BigInteger, nullable=False)
     pattern_version: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -77,20 +80,31 @@ class GoodwareBaselineSourceRow(Base):
     )
 
 
-class GoodwareFeatureRow(Base):
-    __tablename__ = "goodware_features"
+class GoodwareBaselineIndexRow(Base):
+    __tablename__ = "goodware_baseline_indexes"
     __table_args__ = (
         UniqueConstraint(
-            "baseline_id", "feature_kind", "normalized_value", name="uq_goodware_features_value"
+            "baseline_id",
+            "index_format_version",
+            "key_version",
+            name="uq_goodware_baseline_indexes_version",
         ),
+        Index("ix_goodware_baseline_indexes_index_blob_id", "index_blob_id"),
+        Index("ix_goodware_baseline_indexes_manifest_blob_id", "manifest_blob_id"),
     )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     baseline_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("goodware_baselines.id", ondelete="RESTRICT"), nullable=False
     )
-    feature_kind: Mapped[str] = mapped_column(String(32), nullable=False)
-    normalized_value: Mapped[str] = mapped_column(Text, nullable=False)
-    occurrence_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    key_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    index_format_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    index_blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    manifest_blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
 
 
 class InvestigationGoodwareBaselineRow(Base):

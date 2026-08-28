@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from types import TracebackType
 from typing import Protocol, Self
@@ -32,7 +32,7 @@ from cti_app.domain.discovery_cumulative import (
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import AnalystDecision, EditorialGroup, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
-from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
+from cti_app.domain.goodware import GoodwareBaseline, GoodwareIndexArtifact, GoodwareSource
 from cti_app.domain.invariants import (
     CandidateInvariant,
     FeatureMeasurements,
@@ -79,18 +79,23 @@ class BlobRepository(Protocol):
 
 
 class GoodwareBaselineRepository(Protocol):
-    async def get_by_source_set_sha256(self, source_set_sha256: str) -> GoodwareBaseline | None: ...
-    async def get_feature_occurrence(
-        self, baseline_id: UUID, feature_kind: str, normalized_value: str
-    ) -> int | None: ...
-    async def get_feature_occurrences(
-        self, baseline_id: UUID, feature_kind: str, normalized_values: Sequence[str]
-    ) -> Mapping[str, int]: ...
+    async def get_by_baseline_fingerprint_sha256(
+        self, baseline_fingerprint_sha256: str
+    ) -> GoodwareBaseline | None: ...
+
+    async def get(self, baseline_id: UUID) -> GoodwareBaseline | None: ...
+
+    async def get_index_artifact(
+        self,
+        baseline_id: UUID,
+        *,
+        index_format_version: str,
+        key_version: str,
+    ) -> GoodwareIndexArtifact | None: ...
+
     async def add_if_absent(self, baseline: GoodwareBaseline) -> bool: ...
     async def add_sources(self, baseline_id: UUID, sources: Sequence[GoodwareSource]) -> None: ...
-    async def add_features(
-        self, baseline_id: UUID, features: Iterable[GoodwareFeature]
-    ) -> int: ...
+    async def add_index_artifact(self, artifact: GoodwareIndexArtifact) -> None: ...
 
 
 class InvestigationGoodwareBaselineRepository(Protocol):

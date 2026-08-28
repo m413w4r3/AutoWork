@@ -2,7 +2,6 @@
 foundational entities every other bounded context references. Owns the only
 row/domain mappers for these rows."""
 
-import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -34,7 +33,7 @@ from cti_app.domain.entities import (
     Subject,
 )
 from cti_app.domain.errors import EntityNotFoundError
-from cti_app.domain.goodware import GoodwareBaseline, GoodwareFeature, GoodwareSource
+from cti_app.domain.goodware import GoodwareBaseline, GoodwareIndexArtifact, GoodwareSource
 from cti_app.domain.reference_corpus import (
     ReferenceLabelSource,
     ReferenceMember,
@@ -55,9 +54,9 @@ from cti_app.infrastructure.database.models.core import (
     BlobRow,
     CapabilitySetRow,
     CodeFeatureSetRow,
+    GoodwareBaselineIndexRow,
     GoodwareBaselineRow,
     GoodwareBaselineSourceRow,
-    GoodwareFeatureRow,
     InvestigationGoodwareBaselineRow,
     ProvenanceEventRow,
     ReferenceMemberDisputeRow,
@@ -192,6 +191,16 @@ class SqlAlchemyBlobRepository:
             .select_from(GoodwareBaselineSourceRow)
             .where(GoodwareBaselineSourceRow.blob_id == blob_id)
         )
+        goodware_index_blob_count = await self._session.scalar(
+            select(func.count())
+            .select_from(GoodwareBaselineIndexRow)
+            .where(GoodwareBaselineIndexRow.index_blob_id == blob_id)
+        )
+        goodware_manifest_blob_count = await self._session.scalar(
+            select(func.count())
+            .select_from(GoodwareBaselineIndexRow)
+            .where(GoodwareBaselineIndexRow.manifest_blob_id == blob_id)
+        )
         capability_set_count = await self._session.scalar(
             select(func.count())
             .select_from(CapabilitySetRow)
@@ -221,6 +230,8 @@ class SqlAlchemyBlobRepository:
             + int(feature_set_count or 0)
             + int(feature_payload_count or 0)
             + int(goodware_source_count or 0)
+            + int(goodware_index_blob_count or 0)
+            + int(goodware_manifest_blob_count or 0)
             + int(capability_set_count or 0)
             + int(code_feature_set_count or 0)
             + int(code_feature_payload_count or 0)
@@ -362,12 +373,22 @@ class SqlAlchemyGoodwareBaselineRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def get_by_source_set_sha256(self, source_set_sha256: str) -> GoodwareBaseline | None:
+    async def get_by_baseline_fingerprint_sha256(
+        self, baseline_fingerprint_sha256: str
+    ) -> GoodwareBaseline | None:
         row = await self._session.scalar(
             select(GoodwareBaselineRow).where(
-                GoodwareBaselineRow.source_set_sha256 == source_set_sha256
+                GoodwareBaselineRow.baseline_fingerprint_sha256
+                == baseline_fingerprint_sha256
             )
         )
+        return await self._from_row(row)
+
+    async def get(self, baseline_id: UUID) -> GoodwareBaseline | None:
+        row = await self._session.get(GoodwareBaselineRow, baseline_id)
+        return await self._from_row(row)
+
+    async def _from_row(self, row: GoodwareBaselineRow | None) -> GoodwareBaseline | None:
         if row is None:
             return None
         sources = await self._session.scalars(
@@ -377,8 +398,9 @@ class SqlAlchemyGoodwareBaselineRepository:
         )
         return GoodwareBaseline(
             id=row.id,
+            baseline_fingerprint_sha256=row.baseline_fingerprint_sha256,
             source_set_sha256=row.source_set_sha256,
-            records_sha256=row.records_sha256,
+            normalization_version=row.normalization_version,
             record_count=row.record_count,
             occurrence_sum=row.occurrence_sum,
             pattern_version=row.pattern_version,
@@ -399,45 +421,19 @@ class SqlAlchemyGoodwareBaselineRepository:
             insert(GoodwareBaselineRow)
             .values(
                 id=baseline.id,
+                baseline_fingerprint_sha256=baseline.baseline_fingerprint_sha256,
                 source_set_sha256=baseline.source_set_sha256,
-                records_sha256=baseline.records_sha256,
+                normalization_version=baseline.normalization_version,
                 record_count=baseline.record_count,
                 occurrence_sum=baseline.occurrence_sum,
                 pattern_version=baseline.pattern_version,
                 created_at=datetime.now(UTC),
             )
-            .on_conflict_do_nothing(constraint="uq_goodware_baselines_source_set")
+            .on_conflict_do_nothing(constraint="uq_goodware_baselines_fingerprint")
         )
         result = await self._session.execute(statement)
         await self._session.flush()
         return _insert_succeeded(result)
-
-    async def get_feature_occurrence(
-        self, baseline_id: UUID, feature_kind: str, normalized_value: str
-    ) -> int | None:
-        value = await self._session.scalar(
-            select(GoodwareFeatureRow.occurrence_count).where(
-                GoodwareFeatureRow.baseline_id == baseline_id,
-                GoodwareFeatureRow.feature_kind == feature_kind,
-                GoodwareFeatureRow.normalized_value == normalized_value,
-            )
-        )
-        return int(value) if value is not None else None
-
-    async def get_feature_occurrences(
-        self, baseline_id: UUID, feature_kind: str, normalized_values: Sequence[str]
-    ) -> Mapping[str, int]:
-        values = tuple(dict.fromkeys(normalized_values))
-        if not values:
-            return {}
-        result = await self._session.execute(
-            select(GoodwareFeatureRow.normalized_value, GoodwareFeatureRow.occurrence_count).where(
-                GoodwareFeatureRow.baseline_id == baseline_id,
-                GoodwareFeatureRow.feature_kind == feature_kind,
-                GoodwareFeatureRow.normalized_value.in_(values),
-            )
-        )
-        return {value: int(count) for value, count in result.all()}
 
     async def add_sources(self, baseline_id: UUID, sources: Sequence[GoodwareSource]) -> None:
         for source in sources:
@@ -454,37 +450,50 @@ class SqlAlchemyGoodwareBaselineRepository:
             )
         await self._session.flush()
 
-    async def add_features(self, baseline_id: UUID, features: Iterable[GoodwareFeature]) -> int:
-        connection = await self._session.connection()
-        raw_connection = await connection.get_raw_connection()
-        driver_connection = raw_connection.driver_connection
-        copy_records_to_table = getattr(driver_connection, "copy_records_to_table", None)
-        if not callable(copy_records_to_table):
-            raise RuntimeError("PostgreSQL asyncpg COPY capability is unavailable")
-        status = await copy_records_to_table(
-            "goodware_features",
-            columns=(
-                "id",
-                "baseline_id",
-                "feature_kind",
-                "normalized_value",
-                "occurrence_count",
-            ),
-            records=(
-                (
-                    uuid4(),
-                    baseline_id,
-                    feature.feature_kind,
-                    feature.normalized_value,
-                    feature.occurrence_count,
-                )
-                for feature in features
-            ),
+    async def add_index_artifact(self, artifact: GoodwareIndexArtifact) -> None:
+        self._session.add(
+            GoodwareBaselineIndexRow(
+                id=artifact.id,
+                baseline_id=artifact.baseline_id,
+                schema_version=artifact.schema_version,
+                key_version=artifact.key_version,
+                index_format_version=artifact.index_format_version,
+                index_blob_id=artifact.index_blob_id,
+                manifest_blob_id=artifact.manifest_blob_id,
+            )
         )
-        match = re.fullmatch(r"COPY ([0-9]+)", status) if isinstance(status, str) else None
-        if match is None:
-            raise RuntimeError(f"unexpected PostgreSQL COPY status: {status!r}")
-        return int(match.group(1))
+        await self._session.flush()
+
+    async def get_index_artifact(
+        self,
+        baseline_id: UUID,
+        *,
+        index_format_version: str,
+        key_version: str,
+    ) -> GoodwareIndexArtifact | None:
+        row = await self._session.scalar(
+            select(GoodwareBaselineIndexRow).where(
+                GoodwareBaselineIndexRow.baseline_id == baseline_id,
+                GoodwareBaselineIndexRow.index_format_version == index_format_version,
+                GoodwareBaselineIndexRow.key_version == key_version,
+            )
+        )
+        if row is None:
+            return None
+        return GoodwareIndexArtifact(
+            id=row.id,
+            baseline_id=row.baseline_id,
+            schema_version=row.schema_version,
+            key_version=row.key_version,
+            index_format_version=row.index_format_version,
+            index_blob_id=row.index_blob_id,
+            manifest_blob_id=row.manifest_blob_id,
+        )
+
+    async def find_by_baseline_fingerprint_sha256(
+        self, baseline_fingerprint_sha256: str
+    ) -> GoodwareBaseline | None:
+        return await self.get_by_baseline_fingerprint_sha256(baseline_fingerprint_sha256)
 
 
 class SqlAlchemyInvestigationGoodwareBaselineRepository:

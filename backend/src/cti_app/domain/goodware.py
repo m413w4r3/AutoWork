@@ -33,12 +33,24 @@ class GoodwareSource:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GoodwareBaseline:
     id: UUID
+    baseline_fingerprint_sha256: str
     source_set_sha256: str
-    records_sha256: str
+    normalization_version: str
     record_count: int
     occurrence_sum: int
     pattern_version: str
     sources: tuple[GoodwareSource, ...]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GoodwareIndexArtifact:
+    id: UUID
+    baseline_id: UUID
+    schema_version: str
+    key_version: str
+    index_format_version: str
+    index_blob_id: UUID
+    manifest_blob_id: UUID
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
