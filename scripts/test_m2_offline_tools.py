@@ -304,6 +304,38 @@ class GoodwareIndexTests(unittest.TestCase):
 
             self.assertIn(source.name, str(raised.exception))
 
+    def test_v2_yargen_empty_string_sentinel_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            sources = root / "sources"
+            output = root / "index"
+            sources.mkdir()
+
+            self._write_source(
+                sources,
+                "good-strings-part1.db",
+                {
+                    "": 1358,
+                    "Legitimate-Goodware-String": 2,
+                },
+            )
+
+            manifest = goodware.build_index(sources, output)
+
+            self.assertEqual(goodware.verify_index(output, sources), manifest)
+            self.assertEqual(manifest["record_count"], 1)
+            self.assertEqual(manifest["occurrence_sum"], 2)
+            self.assertEqual(
+                goodware.lookup_feature(
+                    output,
+                    "string",
+                    "legitimate-goodware-string",
+                ),
+                2,
+            )
+            self.assertEqual(manifest["sources"][0]["entry_count"], 2)
+            self.assertEqual(manifest["sources"][0]["occurrence_sum"], 1360)
+
     def test_v2_normalization_aggregation_and_read_only_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)

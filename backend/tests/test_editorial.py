@@ -7,7 +7,7 @@ import pytest
 
 from cti_app.application.editorial import EditorialGroupingService
 from cti_app.domain.classification import TLP
-from cti_app.domain.discovery import CandidateTopic, SourceCandidate, SourceRole
+from cti_app.domain.discovery import CandidateTopic, IocPresence, SourceCandidate, SourceRole
 from cti_app.domain.discovery_cumulative import (
     DiscoveryMemberReference,
     DiscoveryPlannerKind,
@@ -136,6 +136,56 @@ async def test_active_snapshot_creates_one_group_per_durable_subject() -> None:
 
     assert {group.discovery_subject_id for group in groups} == {first_id, second_id}
     assert all(len(group.candidate_references) == 1 for group in groups)
+    assert all(group.status is EditorialGroupStatus.PROPOSED for group in groups)
+
+
+@pytest.mark.asyncio
+async def test_ioc_signal_auto_selects_brief_even_above_target_and_audits_once() -> None:
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    edition.target_briefs = 0
+    uow.editions[edition.id] = edition
+    candidate = _candidate("IOC campaign", "https://example.test/ioc")
+    candidate.iocs = ("203.0.113.10",)
+    uow.snapshots[edition.id] = _snapshot(
+        edition.id,
+        [(uuid4(), candidate, (DiscoveryMemberReference(uuid4(), candidate.id),))],
+    )
+    service = EditorialGroupingService(uow)
+
+    first = await service.synchronize(edition.id)
+    second = await service.synchronize(edition.id)
+
+    assert first[0].status is EditorialGroupStatus.SELECTED
+    assert first[0].editorial_type is EditorialType.BRIEF
+    assert second[0].id == first[0].id
+    assert second[0].subject_id == first[0].subject_id
+    assert len(uow.subjects) == 1
+    assert len(uow.decisions) == 1
+    decision = uow.decisions[0]
+    assert decision.actor_id == "system:editorial-auto-selection"
+    assert decision.payload["automatic"] is True
+    assert decision.payload["rule"] == "ioc_signal_v1"
+    assert decision.payload["policy_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_source_ioc_signal_auto_selects_brief() -> None:
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+    candidate = _candidate("Source IOC campaign", "https://example.test/source-ioc")
+    candidate.sources[0].ioc_presence = IocPresence.VISIBLE
+    candidate.sources[0].ioc_visible_count = 1
+    uow.snapshots[edition.id] = _snapshot(
+        edition.id,
+        [(uuid4(), candidate, (DiscoveryMemberReference(uuid4(), candidate.id),))],
+    )
+
+    groups = await EditorialGroupingService(uow).synchronize(edition.id)
+
+    assert groups[0].status is EditorialGroupStatus.SELECTED
+    assert groups[0].editorial_type is EditorialType.BRIEF
 
 
 @pytest.mark.asyncio

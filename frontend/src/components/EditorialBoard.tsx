@@ -79,6 +79,10 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
   const ready = board.data.groups.filter(
     (group) => group.status === "selected",
   );
+  const automaticBriefs = ready.filter(
+    (group) => group.editorial_type === "brief" && hasIocSignal(group),
+  );
+  const otherReady = ready.filter((group) => !automaticBriefs.includes(group));
 
   // Selected briefs are what the batch production can act on.
   const eligibleBriefs = ready.flatMap((group) =>
@@ -148,8 +152,8 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
           </p>
         ) : null}
 
-        <section aria-labelledby="to-review-heading">
-          <h3 id="to-review-heading">À examiner</h3>
+        <section aria-labelledby="other-subjects-heading">
+          <h3 id="other-subjects-heading">Autres sujets</h3>
           {proposed.length === 0 ? (
             <p className="empty-state">Aucun groupe en attente de décision.</p>
           ) : (
@@ -160,6 +164,17 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
                   group={group}
                   decision={drafts[group.id] ?? "undecided"}
                   pending={action.isPending}
+                  onAddToBrief={() =>
+                    action.mutate(() =>
+                      confirmEditorialDecisions(editionId, [
+                        {
+                          group_id: group.id,
+                          version: group.version,
+                          decision: "brief",
+                        },
+                      ]),
+                    )
+                  }
                   onDecision={(decision) =>
                     setDrafts((current) => {
                       if (decision === "undecided") {
@@ -197,6 +212,26 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
         </section>
 
         <section className="ready-subjects" aria-labelledby="ready-heading">
+          {automaticBriefs.length > 0 ? (
+            <div
+              className="automatic-ioc-subjects"
+              aria-labelledby="automatic-ioc-heading"
+            >
+              <h3 id="automatic-ioc-heading">
+                Ajoutées automatiquement — IOC détectés
+              </h3>
+              <p className="ready-indicator">
+                {automaticBriefs.length} brève
+                {automaticBriefs.length > 1 ? "s" : ""} ajoutée
+                {automaticBriefs.length > 1 ? "s" : ""} automatiquement.
+              </p>
+              <SubjectList
+                groups={automaticBriefs}
+                selectedSubjects={selectedSubjects}
+                onToggle={toggleSubject}
+              />
+            </div>
+          ) : null}
           <h3 id="ready-heading">Prêts à traiter</h3>
           <p className="ready-indicator">
             {ready.length} sujets prêts · {board.data.selected_briefs} brève
@@ -207,38 +242,16 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
           </p>
           {ready.length === 0 ? (
             <p className="empty-state">Aucun sujet confirmé pour le moment.</p>
+          ) : otherReady.length === 0 ? (
+            <p className="empty-state">
+              Les sujets sélectionnés automatiquement sont listés ci-dessus.
+            </p>
           ) : (
-            <ul className="ready-subject-list">
-              {ready.map((group) => {
-                const producible =
-                  group.editorial_type === "brief" && group.subject_id;
-                return (
-                  <li key={group.id}>
-                    {producible ? (
-                      <input
-                        type="checkbox"
-                        aria-label={group.title}
-                        checked={selectedSubjects.includes(group.subject_id!)}
-                        onChange={() => toggleSubject(group.subject_id!)}
-                      />
-                    ) : null}
-                    <div>
-                      <strong>{group.title}</strong>
-                      <small>
-                        {group.editorial_type === "brief"
-                          ? "Brève"
-                          : "Article principal + pivots"}
-                      </small>
-                    </div>
-                    {group.subject_id ? (
-                      <a href={`/subjects/${group.subject_id}`}>
-                        Ouvrir le sujet
-                      </a>
-                    ) : null}
-                  </li>
-                );
-              })}
-            </ul>
+            <SubjectList
+              groups={otherReady}
+              selectedSubjects={selectedSubjects}
+              onToggle={toggleSubject}
+            />
           )}
         </section>
 
@@ -288,11 +301,13 @@ function EditorialDecisionCard({
   group,
   decision,
   pending,
+  onAddToBrief,
   onDecision,
 }: {
   group: EditorialGroup;
   decision: DecisionChoice;
   pending: boolean;
+  onAddToBrief: () => void;
   onDecision: (decision: DecisionChoice) => void;
 }) {
   const presentation = group.presentation ?? group.candidates[0]?.summary;
@@ -416,6 +431,13 @@ function EditorialDecisionCard({
           ) : null}
         </div>
       ) : null}
+      <button
+        className="button add-to-brief"
+        disabled={pending}
+        onClick={onAddToBrief}
+      >
+        Ajouter aux brèves
+      </button>
       <fieldset className="decision-options">
         <legend>Décision éditoriale</legend>
         {(
@@ -440,6 +462,55 @@ function EditorialDecisionCard({
         ))}
       </fieldset>
     </article>
+  );
+}
+
+function SubjectList({
+  groups,
+  selectedSubjects,
+  onToggle,
+}: {
+  groups: EditorialGroup[];
+  selectedSubjects: string[];
+  onToggle: (subjectId: string) => void;
+}) {
+  return (
+    <ul className="ready-subject-list">
+      {groups.map((group) => {
+        const producible = group.editorial_type === "brief" && group.subject_id;
+        return (
+          <li key={group.id}>
+            {producible ? (
+              <input
+                type="checkbox"
+                aria-label={group.title}
+                checked={selectedSubjects.includes(group.subject_id!)}
+                onChange={() => onToggle(group.subject_id!)}
+              />
+            ) : null}
+            <div>
+              <strong>{group.title}</strong>
+              <small>
+                {group.editorial_type === "brief"
+                  ? "Brève"
+                  : "Article principal + pivots"}
+              </small>
+            </div>
+            {group.subject_id ? (
+              <a href={`/subjects/${group.subject_id}`}>Ouvrir le sujet</a>
+            ) : null}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function hasIocSignal(group: EditorialGroup): boolean {
+  return (
+    (group.provisional_ioc_count ?? 0) > 0 ||
+    (group.publisher_ioc_count_total ?? 0) > 0 ||
+    (group.publisher_ioc_counts ?? []).some((count) => count > 0)
   );
 }
 

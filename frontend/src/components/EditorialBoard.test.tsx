@@ -271,3 +271,69 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
     },
   ]);
 });
+
+it("ajoute immédiatement un autre sujet aux brèves", async () => {
+  const autoSelected = {
+    ...groups[0],
+    status: "selected" as const,
+    editorial_type: "brief" as const,
+    subject_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+  };
+  const board = {
+    groups: [autoSelected, groups[1]],
+    selected_briefs: 1,
+    selected_major: 0,
+    ignored: 0,
+    undecided: 1,
+    target_briefs: 0,
+    target_major: 2,
+    automatic_selection: false,
+  };
+  const postedBodies: unknown[] = [];
+  const fetchMock = vi.fn(
+    withProductionNotStarted(
+      (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "POST" && typeof init.body === "string") {
+          postedBodies.push(JSON.parse(init.body) as unknown);
+        }
+        return Response.json(board);
+      },
+    ),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  const user = userEvent.setup();
+
+  render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <EditorialBoard editionId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" />
+    </QueryClientProvider>,
+  );
+
+  expect(
+    await screen.findByRole("heading", {
+      name: "Ajoutées automatiquement — IOC détectés",
+    }),
+  ).toBeInTheDocument();
+  const other = screen
+    .getAllByRole("heading", { name: "Campagne B" })[0]!
+    .closest("article")!;
+  await user.click(
+    within(other).getByRole("button", { name: "Ajouter aux brèves" }),
+  );
+
+  expect(postedBodies).toEqual([
+    {
+      decisions: [
+        {
+          group_id: "22222222-2222-4222-8222-222222222222",
+          version: 1,
+          decision: "brief",
+        },
+      ],
+    },
+  ]);
+});

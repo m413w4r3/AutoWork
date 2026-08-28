@@ -682,8 +682,9 @@ def _aggregate_v2(
                 source_occurrences += count
                 entry_count += 1
 
-                # Exactly this raw official-yarGen sentinel is not a feature.
-                if kind == "imphash" and original_value == "":
+                # Raw yarGen empty string/imphash entries are source sentinels,
+                # not usable features. Keep them in per-source metadata only.
+                if kind in {"string", "imphash"} and original_value == "":
                     continue
 
                 normalized = normalize_value(kind, original_value)

@@ -8,14 +8,16 @@ from typing import Protocol
 from uuid import UUID
 
 from cti_app.application.discovery_identity import normalize
-from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    IocPresence,
     SourceRelationshipStatus,
     SourceRole,
 )
+from cti_app.domain.editions import Edition
 from cti_app.domain.editorial import (
     CandidateReference,
     EditorialGroup,
@@ -51,6 +53,18 @@ class EditorialDecisionCommand:
     decision: EditorialDecisionValue
 
 
+@dataclass(frozen=True, slots=True)
+class EditorialAutoSelectionPolicyV1:
+    """Select briefs from editorial IOC signals, independently of quotas."""
+
+    version: int = 1
+    rule: str = "ioc_signal_v1"
+    actor_id: str = "system:editorial-auto-selection"
+
+    def should_select_brief(self, candidates: Sequence[CandidateTopic]) -> bool:
+        return any(_candidate_has_ioc_signal(candidate) for candidate in candidates)
+
+
 class WorkspaceMaterializer(Protocol):
     async def materialize(
         self,
@@ -82,27 +96,45 @@ class EditorialGroupingService:
         *,
         materializer: WorkspaceMaterializer | None = None,
         workspace_root: Path = Path("work/subjects"),
+        auto_selection_policy: EditorialAutoSelectionPolicyV1 | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._materializer = materializer
         self._workspace_root = workspace_root
+        self._auto_selection_policy = auto_selection_policy or EditorialAutoSelectionPolicyV1()
 
     async def synchronize(self, edition_id: UUID) -> list[EditorialGroup]:
         async with self._uow_factory() as uow:
+            edition = await uow.editions.get(edition_id)
+            if edition is None:
+                raise EditorialGroupNotFoundError(str(edition_id))
             existing = list(await uow.editorial_groups.list_for_edition(edition_id))
             snapshot = await uow.discovery_snapshots.get_active(edition_id)
             if snapshot is None:
                 return existing
+            batches = [
+                batch
+                for batch in await uow.discovery_batches.list_for_edition(edition_id)
+                if batch.is_active_revision
+            ]
+            candidates = _candidate_map(batches)
+            snapshot_candidates: dict[UUID, CandidateTopic] = {}
             by_subject = {
                 group.discovery_subject_id: group
                 for group in existing
                 if group.discovery_subject_id is not None
             }
             for subject in snapshot.subjects:
+                snapshot_candidates[subject.subject_id] = subject.candidate
                 references = tuple(
                     CandidateReference(item.batch_id, item.candidate_id)
                     for item in subject.member_references
                 )
+                for reference in references:
+                    # A snapshot candidate is the canonical editorial view. It
+                    # remains a useful fallback when a test/import has no raw
+                    # batch projection for a member reference.
+                    candidates.setdefault(reference, subject.candidate)
                 group = by_subject.get(subject.subject_id)
                 if group is not None:
                     additions = tuple(
@@ -135,6 +167,33 @@ class EditorialGroupingService:
                 )
                 await uow.editorial_groups.add(group)
                 existing.append(group)
+            for group in existing:
+                if group.status is not EditorialGroupStatus.PROPOSED:
+                    continue
+                group_candidates = tuple(
+                    candidates[reference]
+                    for reference in group.candidate_references
+                    if reference in candidates
+                )
+                snapshot_candidate = (
+                    snapshot_candidates.get(group.discovery_subject_id)
+                    if group.discovery_subject_id is not None
+                    else None
+                )
+                if snapshot_candidate is not None:
+                    group_candidates = (*group_candidates, snapshot_candidate)
+                if self._auto_selection_policy.should_select_brief(group_candidates):
+                    await self._select_locked(
+                        uow,
+                        edition,
+                        group,
+                        EditorialType.BRIEF,
+                        actor_id=self._auto_selection_policy.actor_id,
+                        correlation_id=f"editorial-auto-selection-v1:{group.id}",
+                        automatic=True,
+                        rule=self._auto_selection_policy.rule,
+                        policy_version=self._auto_selection_policy.version,
+                    )
             await uow.commit()
             return existing
 
@@ -224,31 +283,14 @@ class EditorialGroupingService:
                     continue
 
                 editorial_type = EditorialType(command.decision.value)
-                subject = Subject(
-                    external_id=f"edition:{edition_id}:group:{group.id}",
-                    slug=_subject_slug(group.title, group.id),
-                    tlp=edition.tlp,
-                )
-                await uow.subjects.add(subject)
-                if self._materializer is not None:
-                    await self._materializer.materialize(subject, (), (), {}, self._workspace_root)
-                group.select(editorial_type, subject.id)
-                await uow.editorial_groups.save(group)
-                await uow.human_decisions.append(
-                    HumanDecision(
-                        edition_id=edition_id,
-                        decision_type=HumanDecisionType.SELECT,
-                        group_ids=(group.id,),
-                        actor_id=actor_id,
-                        correlation_id=correlation_id,
-                        payload={
-                            "editorial_type": editorial_type.value,
-                            "subject_id": str(subject.id),
-                            "score_total": group.score.total,
-                            "automatic": False,
-                            "batch_confirmation": True,
-                        },
-                    )
+                await self._select_locked(
+                    uow,
+                    edition,
+                    group,
+                    editorial_type,
+                    actor_id=actor_id,
+                    correlation_id=correlation_id,
+                    batch_confirmation=True,
                 )
             await uow.commit()
 
@@ -389,33 +431,65 @@ class EditorialGroupingService:
             edition = await uow.editions.get(edition_id)
             if group is None or group.edition_id != edition_id or edition is None:
                 raise EditorialGroupNotFoundError(str(group_id))
-            subject = Subject(
-                external_id=f"edition:{edition_id}:group:{group.id}",
-                slug=_subject_slug(group.title, group.id),
-                tlp=edition.tlp,
-            )
-            await uow.subjects.add(subject)
-            if self._materializer is not None:
-                await self._materializer.materialize(subject, (), (), {}, self._workspace_root)
-            group.select(editorial_type, subject.id)
-            await uow.editorial_groups.save(group)
-            await uow.human_decisions.append(
-                HumanDecision(
-                    edition_id=edition_id,
-                    decision_type=HumanDecisionType.SELECT,
-                    group_ids=(group.id,),
-                    actor_id=actor_id,
-                    correlation_id=correlation_id,
-                    payload={
-                        "editorial_type": editorial_type.value,
-                        "subject_id": str(subject.id),
-                        "score_total": group.score.total,
-                        "automatic": False,
-                    },
-                )
+            await self._select_locked(
+                uow,
+                edition,
+                group,
+                editorial_type,
+                actor_id=actor_id,
+                correlation_id=correlation_id,
             )
             await uow.commit()
             return group
+
+    async def _select_locked(
+        self,
+        uow: UnitOfWork,
+        edition: Edition,
+        group: EditorialGroup,
+        editorial_type: EditorialType,
+        *,
+        actor_id: str,
+        correlation_id: str,
+        automatic: bool = False,
+        rule: str | None = None,
+        policy_version: int | None = None,
+        batch_confirmation: bool = False,
+    ) -> EditorialGroup:
+        # All selection modes share this transaction and mutation sequence.
+        subject = Subject(
+            external_id=f"edition:{group.edition_id}:group:{group.id}",
+            slug=_subject_slug(group.title, group.id),
+            tlp=edition.tlp,
+        )
+        await uow.subjects.add(subject)
+        if self._materializer is not None:
+            await self._materializer.materialize(subject, (), (), {}, self._workspace_root)
+        group.select(editorial_type, subject.id)
+        await uow.editorial_groups.save(group)
+        payload: dict[str, object] = {
+            "editorial_type": editorial_type.value,
+            "subject_id": str(subject.id),
+            "score_total": group.score.total,
+            "automatic": automatic,
+        }
+        if rule is not None:
+            payload["rule"] = rule
+        if policy_version is not None:
+            payload["policy_version"] = policy_version
+        if batch_confirmation:
+            payload["batch_confirmation"] = True
+        await uow.human_decisions.append(
+            HumanDecision(
+                edition_id=group.edition_id,
+                decision_type=HumanDecisionType.SELECT,
+                group_ids=(group.id,),
+                actor_id=actor_id,
+                correlation_id=correlation_id,
+                payload=payload,
+            )
+        )
+        return group
 
     async def decisions(self, edition_id: UUID) -> list[HumanDecision]:
         async with self._uow_factory() as uow:
@@ -429,6 +503,18 @@ def _candidate_map(batches: Sequence[DiscoveryBatch]) -> dict[CandidateReference
         for candidate in batch.candidates
         if candidate.selectable
     }
+
+
+def _candidate_has_ioc_signal(candidate: CandidateTopic) -> bool:
+    if candidate.iocs or candidate.provisional_iocs:
+        return True
+    return any(
+        source.ioc_presence in {IocPresence.DECLARED, IocPresence.VISIBLE}
+        or getattr(source.ioc_presence, "value", source.ioc_presence) == "present"
+        or (source.ioc_declared_count is not None and source.ioc_declared_count > 0)
+        or (source.ioc_visible_count is not None and source.ioc_visible_count > 0)
+        for source in candidate.sources
+    )
 
 
 def _editorial_score(candidate: CandidateTopic) -> EditorialScore:
