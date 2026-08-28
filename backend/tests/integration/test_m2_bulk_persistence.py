@@ -134,7 +134,7 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
             (
                 GoodwareFeature(
                     feature_kind="string",
-                    normalized_value=f"value-{index:04d}",
+                    normalized_value=f"value-{index:05d}",
                     occurrence_count=index + 1,
                 )
                 for index in range(10001)
@@ -202,7 +202,7 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
                 .order_by(Base.metadata.tables["goodware_features"].c.normalized_value)
             )
         ).all()
-        assert goodware_values[0] == ("value-0000", 1)
+        assert goodware_values[0] == ("value-00000", 1)
         assert goodware_values[-1] == ("value-10000", 10001)
 
         index_rows = (
@@ -229,7 +229,7 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
                 (
                     GoodwareFeature(
                         feature_kind="string",
-                        normalized_value="value-0000",
+                        normalized_value="value-00000",
                         occurrence_count=999,
                     ),
                 ),
