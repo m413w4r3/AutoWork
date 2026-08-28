@@ -235,6 +235,75 @@ class GoodwareIndexTests(unittest.TestCase):
         with gzip.open(sources / filename, "wb") as handle:
             handle.write(json.dumps(values).encode())
 
+    def test_streaming_parser_handles_scalar_chunk_boundaries(self) -> None:
+        expected = {
+            "alpha": 1000,
+            "beta": 23,
+            "gamma": 456789,
+            "delta": 1,
+        }
+        payload = json.dumps(expected, separators=(",", ":")).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+
+            for compressed in (False, True):
+                source = root / (
+                    "good-strings-gzip.db"
+                    if compressed
+                    else "good-strings-plain.db"
+                )
+
+                if compressed:
+                    with gzip.open(source, "wb") as handle:
+                        handle.write(payload)
+                else:
+                    source.write_bytes(payload)
+
+                # Size 1 guarantees boundaries inside every multi-digit
+                # integer. Other small sizes exercise keys, separators,
+                # strings and scalar endings at varying boundaries.
+                for chunk_size in range(1, 17):
+                    with self.subTest(
+                        compressed=compressed,
+                        chunk_size=chunk_size,
+                    ):
+                        with patch.object(
+                            goodware._StreamingJsonObject,
+                            "_CHUNK_SIZE",
+                            chunk_size,
+                        ):
+                            actual = dict(
+                                goodware._iter_source_items(
+                                    source,
+                                    max_decompressed_bytes=1024 * 1024,
+                                )
+                            )
+
+                        self.assertEqual(actual, expected)
+
+    def test_streaming_parser_malformed_error_names_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            source = Path(temp_name) / "good-strings-broken.db"
+
+            with gzip.open(source, "wb") as handle:
+                handle.write(b'{"alpha":1000x}')
+
+            with patch.object(
+                goodware._StreamingJsonObject,
+                "_CHUNK_SIZE",
+                3,
+            ):
+                with self.assertRaises(goodware.GoodwareImportError) as raised:
+                    list(
+                        goodware._iter_source_items(
+                            source,
+                            max_decompressed_bytes=1024 * 1024,
+                        )
+                    )
+
+            self.assertIn(source.name, str(raised.exception))
+
     def test_v2_normalization_aggregation_and_read_only_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)

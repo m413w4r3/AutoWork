@@ -566,6 +566,16 @@ class _StreamingJsonObject:
                     raise
                 self._fill()
                 continue
+
+            # A valid JSON scalar can be only a prefix of the real token when
+            # the token is split exactly at the current chunk boundary.
+            # Example: the source contains 1000 but the buffer currently ends
+            # after 10. raw_decode() accepts 10, so read ahead before accepting
+            # any value that reaches the current non-EOF buffer boundary.
+            if end == len(self._buffer) and not self._eof:
+                self._fill()
+                continue
+
             self._position = end
             self._compact()
             return value
@@ -635,8 +645,8 @@ def _iter_source_items(
                 raw,
                 max_decompressed_bytes=max_decompressed_bytes,
             ).items()
-    except GoodwareImportError:
-        raise
+    except GoodwareImportError as exc:
+        raise GoodwareImportError(f"{path.name}: {exc}") from exc
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise GoodwareImportError(f"{path.name}: invalid JSON database") from exc
 
