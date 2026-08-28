@@ -129,6 +129,11 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "subject_contributions",
         "trg_subject_contributions_append_only",
     ): "reject_subject_contributions_mutation",
+    ("reference_members", "reference_members_immutable"): "forbid_reference_mutation",
+    (
+        "reference_member_disputes",
+        "reference_member_disputes_immutable",
+    ): "forbid_reference_mutation",
 }
 EXPECTED_FUNCTIONS = frozenset(EXPECTED_TRIGGERS.values())
 

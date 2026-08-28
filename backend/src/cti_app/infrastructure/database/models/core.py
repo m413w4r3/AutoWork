@@ -66,6 +66,7 @@ class GoodwareBaselineSourceRow(Base):
     __tablename__ = "goodware_baseline_sources"
     __table_args__ = (
         UniqueConstraint("baseline_id", "filename", name="uq_goodware_baseline_sources_filename"),
+        Index("ix_goodware_baseline_sources_blob_id", "blob_id"),
     )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     baseline_id: Mapped[UUID] = mapped_column(
