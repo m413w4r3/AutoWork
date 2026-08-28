@@ -206,6 +206,7 @@ class _ConversationService:
         self.conversations: dict[UUID, ModelConversation] = {}
         self.turns_by_id: dict[UUID, tuple[ModelConversationTurn, str, str]] = {}
         self.turns_by_key: dict[str, ModelConversationTurn] = {}
+        self.normalized_outputs: dict[UUID, dict[str, object]] = {}
         self.modes: list[ConversationMode] = []
         self.external_allowed: list[bool] = []
         self.external_calls = 0
@@ -279,6 +280,24 @@ class _ConversationService:
             ),
         )
         return turn
+
+    async def archive_normalized_output(
+        self,
+        turn: ModelConversationTurn,
+        content: str,
+        *,
+        parser_stage: str,
+        normalization_version: str,
+        transformations: tuple[str, ...] = (),
+    ) -> None:
+        self.normalized_outputs[turn.id] = {
+            "content": content,
+            "reference": f"blob://normalized-{turn.id}",
+            "sha256": hashlib.sha256(content.encode()).hexdigest(),
+            "parser_stage": parser_stage,
+            "normalization_version": normalization_version,
+            "transformations": transformations,
+        }
 
     async def turns(self, conversation_id: UUID, **_: object) -> list[object]:
         from cti_app.application.model_conversations import ConversationTurnContent
@@ -599,6 +618,23 @@ async def test_replay_is_idempotent_and_does_not_call_gateway_twice() -> None:
 
 
 @pytest.mark.asyncio
+async def test_replay_uses_original_turn_before_policy_routing() -> None:
+    service, state, conversation, _ = _service()
+    first = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+    pivot_id = state.investigations.investigation.pivot_conversation_id
+    state._samples[0].external_llm_allowed = False
+
+    replay = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
+
+    assert replay.conversation_id == first.conversation_id == pivot_id
+    assert replay.turn.id == first.turn.id
+    assert replay.mode is ConversationMode.FRESH
+    assert conversation.external_calls == 1
+    assert conversation.local_calls == 0
+    assert state.investigations.investigation.pivot_conversation_id == pivot_id
+
+
+@pytest.mark.asyncio
 async def test_replay_reuses_persisted_input_after_p09_mutation() -> None:
     sample = _sample(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
     feature = _static_feature(sample.id)
@@ -784,9 +820,20 @@ async def test_frequency_estimate_is_ignored_from_canonical_response() -> None:
     output = _empty_response()
     output["frequency_estimate"] = 0.9
     conversation = _ConversationService(output=json.dumps(output))
-    service, _, _, _ = _service(conversation=conversation)
+    service, _, conversation, _ = _service(conversation=conversation)
     result = await service.propose(investigation_id=INVESTIGATION_ID)
     assert "frequency_estimate" not in result.response.model_dump()
+    turn = result.turn
+    raw = conversation.turns_by_id[turn.id][2]
+    normalized = conversation.normalized_outputs[turn.id]
+    assert "frequency_estimate" in raw
+    assert "frequency_estimate" not in str(normalized["content"])
+    assert normalized["reference"] != turn.output_blob_reference
+    assert normalized["sha256"] == hashlib.sha256(
+        str(normalized["content"]).encode()
+    ).hexdigest()
+    assert normalized["parser_stage"] == "p10_strict_proposal"
+    assert normalized["transformations"] == ("ignored estimate fields: frequency_estimate",)
 
 
 @pytest.mark.asyncio

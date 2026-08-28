@@ -61,6 +61,7 @@ from cti_app.domain.reference_corpus import ReferenceCorpusVerdict, assess_refer
 
 P10_PROMPT_TEMPLATE_ID = "invariant-proposal-conversation"
 P10_PROMPT_VERSION = "1"
+P10_PARSER_STAGE = "p10_strict_proposal"
 _CONVERSATION_NAMESPACE = UUID("0f52a3a8-6cc8-5f4d-8ed5-1c2c3d4e5f60")
 _MAX_CONTEXT_CHARS = 200_000
 _MAX_STRING_CHARS = 2_048
@@ -155,28 +156,24 @@ class ProposalConversationService:
         if effective_cycle < 1:
             raise ProposalContractError("cycle_number must be positive")
 
-        conversation, mode = await self._select_conversation(
-            investigation_id=investigation_id,
-            subject_id=investigation.subject_id,
-            cycle_number=effective_cycle,
-            external_allowed=policy.external_llm_allowed,
-        )
-        await self._persist_pivot_conversation(investigation_id, conversation.id)
-
         idempotency_key = make_proposal_turn_idempotency_key(
             investigation_id=investigation_id,
             cycle_number=effective_cycle,
             snapshot=snapshot,
             prompt_version=self._prompt_version,
         )
-
-        existing_turn = await self._successful_turn_for_key(
+        existing = await self._successful_turn_for_key(
             idempotency_key=idempotency_key,
-            conversation=conversation,
             subject_id=investigation.subject_id,
             investigation_id=investigation_id,
         )
-        if existing_turn is not None:
+        if existing is not None:
+            existing_turn, conversation = existing
+            mode = (
+                ConversationMode.CONTINUE
+                if existing_turn.parent_turn_id is not None
+                else ConversationMode.FRESH
+            )
             content = await self._persisted_turn_content(
                 conversation.id, existing_turn, investigation.subject_id
             )
@@ -193,7 +190,10 @@ class ProposalConversationService:
             persisted_provenances = _snapshot_provenance_catalog(persisted_snapshot)
             if content.output_text is None:
                 raise ProposalOutputValidationError("The proposal turn has no persisted output")
-            response = _parse_proposal_response(content.output_text)
+            response, transformations = _parse_proposal_response_details(content.output_text)
+            await self._archive_canonical_output(
+                existing_turn, response, transformations=transformations
+            )
             _validate_yara_references(
                 response.yara_draft,
                 response.candidate_invariants,
@@ -218,6 +218,14 @@ class ProposalConversationService:
                 invariant_results=tuple(results),
             )
 
+        conversation, mode = await self._select_conversation(
+            investigation_id=investigation_id,
+            subject_id=investigation.subject_id,
+            cycle_number=effective_cycle,
+            external_allowed=policy.external_llm_allowed,
+        )
+        await self._persist_pivot_conversation(investigation_id, conversation.id)
+
         prompt = _render_prompt(snapshot)
         turn = await self._model_conversations.add_turn(
             conversation.id,
@@ -230,7 +238,8 @@ class ProposalConversationService:
             lifecycle_policy=ConversationPolicy.KEEP,
         )
         output_text = await self._turn_output(conversation.id, turn)
-        response = _parse_proposal_response(output_text)
+        response, transformations = _parse_proposal_response_details(output_text)
+        await self._archive_canonical_output(turn, response, transformations=transformations)
         _validate_yara_references(
             response.yara_draft, response.candidate_invariants, provenance_by_ref
         )
@@ -251,6 +260,27 @@ class ProposalConversationService:
             response=response,
             turn=turn,
             invariant_results=tuple(results),
+        )
+
+    async def _archive_canonical_output(
+        self,
+        turn: ModelConversationTurn,
+        response: ProposalResponse,
+        *,
+        transformations: tuple[str, ...],
+    ) -> None:
+        canonical = json.dumps(
+            response.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        await self._model_conversations.archive_normalized_output(
+            turn,
+            canonical,
+            parser_stage=P10_PARSER_STAGE,
+            normalization_version=f"{P10_PROMPT_TEMPLATE_ID}:schema:{self._prompt_version}",
+            transformations=transformations,
         )
 
     async def _load_snapshot(
@@ -745,10 +775,9 @@ class ProposalConversationService:
         self,
         *,
         idempotency_key: str,
-        conversation: ModelConversation,
         subject_id: UUID,
         investigation_id: UUID,
-    ) -> ModelConversationTurn | None:
+    ) -> tuple[ModelConversationTurn, ModelConversation] | None:
         """Read the durable turn before rendering a new message.
 
         The current P09 state is deliberately not consulted here. The key is
@@ -766,7 +795,6 @@ class ProposalConversationService:
             stored_conversation = await uow.model_conversations.get(turn.conversation_id)
             if (
                 stored_conversation is None
-                or turn.conversation_id != conversation.id
                 or stored_conversation.subject_id != subject_id
                 or stored_conversation.purpose is not ConversationPurpose.PIVOT_RESEARCH
                 or stored_conversation.expected_profile != f"p10:{investigation_id}"
@@ -775,8 +803,10 @@ class ProposalConversationService:
                     "The persisted proposal turn is not owned by this P10 subject"
                 )
             if turn.status is ConversationTurnStatus.SUCCEEDED:
-                return turn
-            return None
+                return turn, stored_conversation
+            raise ProposalConversationError(
+                turn.error_message or "The persisted proposal turn did not succeed"
+            )
 
     async def _persisted_turn_content(
         self, conversation_id: UUID, turn: ModelConversationTurn, subject_id: UUID
@@ -859,6 +889,13 @@ def _render_prompt(snapshot: ProposalInputSnapshot) -> str:
 
 
 def _parse_proposal_response(output_text: str) -> ProposalResponse:
+    response, _ = _parse_proposal_response_details(output_text)
+    return response
+
+
+def _parse_proposal_response_details(
+    output_text: str,
+) -> tuple[ProposalResponse, tuple[str, ...]]:
     try:
         decoded = json.loads(
             output_text,
@@ -870,6 +907,7 @@ def _parse_proposal_response(output_text: str) -> ProposalResponse:
     if not isinstance(decoded, dict):
         raise ProposalOutputValidationError("The model output must be a JSON object")
     cleaned = strip_known_estimate_fields(decoded)
+    ignored_fields = _ignored_estimate_fields(decoded, cleaned)
     try:
         response = ProposalResponse.model_validate(cleaned)
     except ValidationError as exc:
@@ -883,7 +921,27 @@ def _parse_proposal_response(output_text: str) -> ProposalResponse:
             raise ProposalOutputValidationError("Candidate proposal ids must be unique")
         seen_ids.add(proposal_id)
         candidates.append(candidate.model_copy(update={"proposal_id": proposal_id}))
-    return response.model_copy(update={"candidate_invariants": candidates})
+    response = response.model_copy(update={"candidate_invariants": candidates})
+    transformations = (
+        (f"ignored estimate fields: {', '.join(sorted(ignored_fields))}",)
+        if ignored_fields
+        else ()
+    )
+    return response, transformations
+
+
+def _ignored_estimate_fields(original: Any, cleaned: Any) -> set[str]:
+    if isinstance(original, dict) and isinstance(cleaned, dict):
+        result = {str(key) for key in original if key not in cleaned}
+        for key in original.keys() & cleaned.keys():
+            result.update(_ignored_estimate_fields(original[key], cleaned[key]))
+        return result
+    if isinstance(original, list) and isinstance(cleaned, list):
+        result: set[str] = set()
+        for original_item, cleaned_item in zip(original, cleaned, strict=False):
+            result.update(_ignored_estimate_fields(original_item, cleaned_item))
+        return result
+    return set()
 
 
 def _validate_yara_references(

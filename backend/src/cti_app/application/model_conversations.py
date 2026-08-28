@@ -252,6 +252,38 @@ class ModelConversationService:
             result.append(ConversationTurnContent(turn, input_text, output_text))
         return result
 
+    async def archive_normalized_output(
+        self,
+        turn: ModelConversationTurn,
+        content: str,
+        *,
+        parser_stage: str,
+        normalization_version: str,
+        transformations: tuple[str, ...] = (),
+    ) -> None:
+        """Archive canonical output and attach its diagnostics to the turn run."""
+        if turn.status is not ConversationTurnStatus.SUCCEEDED:
+            raise ModelConversationError("Only a successful turn can archive normalized output")
+        normalized = content.encode("utf-8")
+        digest = hashlib.sha256(normalized).hexdigest()
+        run = await self._gateway.get_run(turn.model_run_id)
+        if run is None or run.status is not ModelRunStatus.SUCCEEDED:
+            raise ModelConversationError("The turn has no successful ModelRun")
+        reference = run.normalized_output_reference
+        if run.normalized_output_sha256 != digest or not reference:
+            reference = await self._gateway.archive_output(
+                normalized, mime_type="application/json; charset=utf-8"
+            )
+        await self._gateway.record_output_diagnostics(
+            turn.model_run_id,
+            normalized_reference=reference,
+            normalized_sha256=digest,
+            parser_stage=parser_stage,
+            normalization_version=normalization_version,
+            transformations=transformations,
+            validation_errors=(),
+        )
+
     async def add_turn(
         self,
         conversation_id: UUID,
