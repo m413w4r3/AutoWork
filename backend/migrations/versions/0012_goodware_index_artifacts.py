@@ -90,6 +90,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    if bind.execute(
+        sa.text("SELECT EXISTS (SELECT 1 FROM goodware_baselines)")
+    ).scalar():
+        raise RuntimeError(
+            "refusing Goodware v2 downgrade while baselines exist; v2 metadata cannot be reconstructed"
+        )
+
     op.drop_index(
         "ix_goodware_baseline_indexes_manifest_blob_id",
         table_name="goodware_baseline_indexes",

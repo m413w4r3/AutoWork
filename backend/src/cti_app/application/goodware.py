@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 from uuid import UUID, uuid4
@@ -79,6 +80,15 @@ class GoodwareImportError(GoodwareBaselineError):
 
 class GoodwareMeasurementError(GoodwareBaselineError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedGoodwareIndex:
+    baseline_id: UUID
+    baseline_fingerprint_sha256: str
+    index_descriptor: BlobDescriptor
+    manifest_descriptor: BlobDescriptor
+    path: Path
 
 
 def _canonical_json(value: object) -> str:
@@ -445,6 +455,17 @@ def _validate_artifact(artifact_dir: Path, source_dir: Path) -> dict[str, Any]:
     return manifest
 
 
+def _ensure_ingested_descriptor(
+    descriptor: BlobDescriptor,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+    label: str,
+) -> None:
+    if descriptor.sha256 != expected_sha256 or descriptor.size != expected_size:
+        raise GoodwareImportError(f"ingested {label} does not match validated artifact")
+
+
 class GoodwareService:
     def __init__(self, blobs: BlobCatalogService, uow_factory: UnitOfWorkFactory) -> None:
         self._blobs, self._uow_factory = blobs, uow_factory
@@ -469,6 +490,12 @@ class GoodwareService:
                     logical_bucket="goodware-baselines",
                     mime_type="application/octet-stream",
                 )
+            _ensure_ingested_descriptor(
+                blob.descriptor,
+                expected_sha256=cast(str, source_value["sha256"]),
+                expected_size=cast(int, source_value["size"]),
+                label=f"source {filename}",
+            )
             sources.append(
                 GoodwareSource(
                     filename=filename,
@@ -485,12 +512,25 @@ class GoodwareService:
                 logical_bucket="goodware-indexes",
                 mime_type="application/vnd.sqlite3",
             )
+        _ensure_ingested_descriptor(
+            index_blob.descriptor,
+            expected_sha256=cast(str, manifest["index_sha256"]),
+            expected_size=cast(int, manifest["index_size"]),
+            label=INDEX_FILENAME,
+        )
+        manifest_bytes = (_canonical_json(manifest) + "\n").encode("utf-8")
         with (artifact_dir / MANIFEST_FILENAME).open("rb") as handle:
             manifest_blob = await self._blobs.ingest(
                 handle,
                 logical_bucket="goodware-index-manifests",
                 mime_type="application/json",
             )
+        _ensure_ingested_descriptor(
+            manifest_blob.descriptor,
+            expected_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+            expected_size=len(manifest_bytes),
+            label=MANIFEST_FILENAME,
+        )
 
         baseline = GoodwareBaseline(
             id=uuid4(),
@@ -628,6 +668,8 @@ class GoodwareMeasurementService:
         self._cache_root = (
             cache_root if cache_root is not None else get_settings().goodware_cache_root
         )
+        self._prepared_indexes: dict[UUID | str, _PreparedGoodwareIndex] = {}
+        self._preparation_lock = asyncio.Lock()
 
     async def get_feature_occurrence(
         self,
@@ -675,36 +717,60 @@ class GoodwareMeasurementService:
         return await asyncio.to_thread(GoodwareSQLiteReader(index_path).lookup_batch, features)
 
     async def _prepare_index(self, baseline_ref: UUID | str) -> Path:
-        baseline, artifact, index_descriptor, manifest_descriptor = await self._resolve(
-            baseline_ref
-        )
-        manifest_bytes = await self._store.read(
-            manifest_descriptor, max_bytes=_MAX_MANIFEST_BYTES
-        )
-        try:
-            manifest = json.loads(manifest_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise GoodwareMeasurementError("invalid stored goodware manifest") from exc
-        try:
-            canonical = (_canonical_json(manifest) + "\n").encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise GoodwareMeasurementError(
-                "stored goodware manifest is not canonical JSON"
-            ) from exc
-        if manifest_bytes != canonical:
-            raise GoodwareMeasurementError("stored goodware manifest is not canonical JSON")
-        manifest = _validate_manifest(manifest)
-        self._validate_runtime_metadata(
-            baseline, artifact, index_descriptor, manifest_descriptor, manifest
-        )
-        index_path = await self._prepare_cached_index(index_descriptor)
-        await asyncio.to_thread(
-            _verify_sqlite_index,
-            index_path,
-            manifest,
-            pattern_version=baseline.pattern_version,
-        )
-        return index_path
+        prepared = self._prepared_indexes.get(baseline_ref)
+        if prepared is not None:
+            return prepared.path
+
+        async with self._preparation_lock:
+            prepared = self._prepared_indexes.get(baseline_ref)
+            if prepared is not None:
+                return prepared.path
+
+            baseline, artifact, index_descriptor, manifest_descriptor = await self._resolve(
+                baseline_ref
+            )
+            prepared = self._prepared_indexes.get(baseline.id)
+            if prepared is None:
+                prepared = self._prepared_indexes.get(baseline.baseline_fingerprint_sha256)
+            if prepared is None:
+                manifest_bytes = await self._store.read(
+                    manifest_descriptor, max_bytes=_MAX_MANIFEST_BYTES
+                )
+                try:
+                    manifest = json.loads(manifest_bytes.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise GoodwareMeasurementError("invalid stored goodware manifest") from exc
+                try:
+                    canonical = (_canonical_json(manifest) + "\n").encode("utf-8")
+                except (TypeError, ValueError) as exc:
+                    raise GoodwareMeasurementError(
+                        "stored goodware manifest is not canonical JSON"
+                    ) from exc
+                if manifest_bytes != canonical:
+                    raise GoodwareMeasurementError("stored goodware manifest is not canonical JSON")
+                manifest = _validate_manifest(manifest)
+                self._validate_runtime_metadata(
+                    baseline, artifact, index_descriptor, manifest_descriptor, manifest
+                )
+                index_path = await self._prepare_cached_index(index_descriptor)
+                await asyncio.to_thread(
+                    _verify_sqlite_index,
+                    index_path,
+                    manifest,
+                    pattern_version=baseline.pattern_version,
+                )
+                prepared = _PreparedGoodwareIndex(
+                    baseline_id=baseline.id,
+                    baseline_fingerprint_sha256=baseline.baseline_fingerprint_sha256,
+                    index_descriptor=index_descriptor,
+                    manifest_descriptor=manifest_descriptor,
+                    path=index_path,
+                )
+
+            self._prepared_indexes[prepared.baseline_id] = prepared
+            self._prepared_indexes[prepared.baseline_fingerprint_sha256] = prepared
+            self._prepared_indexes[baseline_ref] = prepared
+            return prepared.path
 
     async def _resolve(
         self, baseline_ref: UUID | str
