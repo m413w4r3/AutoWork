@@ -76,6 +76,151 @@ class GoodwareStageTests(unittest.TestCase):
                 goodware.build_stage(sources, root / "stage")
 
 
+    def test_yargen_empty_imphash_sentinel_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            sources = root / "sources"
+            output = root / "stage"
+            sources.mkdir()
+
+            with gzip.open(sources / "good-imphashes-part1.db", "wb") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "": 1358,
+                            "ABCDEF0123456789ABCDEF0123456789": 2,
+                        }
+                    ).encode()
+                )
+
+            manifest = goodware.build_stage(sources, output)
+            verified = goodware.verify_stage(output)
+
+            self.assertEqual(manifest, verified)
+
+            records = [
+                json.loads(line)
+                for line in (output / "records.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+            self.assertEqual(
+                records,
+                [
+                    {
+                        "feature_kind": "imphash",
+                        "normalized_value": "abcdef0123456789abcdef0123456789",
+                        "occurrence_count": 2,
+                    }
+                ],
+            )
+
+            # Aggregate feature statistics exclude the empty sentinel.
+            self.assertEqual(manifest["record_count"], 1)
+            self.assertEqual(manifest["occurrence_sum"], 2)
+
+            # Source statistics still describe the original yarGen shard.
+            self.assertEqual(manifest["sources"][0]["entry_count"], 2)
+            self.assertEqual(manifest["sources"][0]["occurrence_sum"], 1360)
+
+    def test_yargen_empty_string_sentinel_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            sources = root / "sources"
+            output = root / "stage"
+            sources.mkdir()
+
+            with gzip.open(sources / "good-strings-part1.db", "wb") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "": 1358,
+                            "legitimate-goodware-string": 2,
+                        }
+                    ).encode()
+                )
+
+            manifest = goodware.build_stage(sources, output)
+            verified = goodware.verify_stage(output)
+
+            self.assertEqual(manifest, verified)
+
+            records = [
+                json.loads(line)
+                for line in (output / "records.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+            self.assertEqual(
+                records,
+                [
+                    {
+                        "feature_kind": "string",
+                        "normalized_value": "legitimate-goodware-string",
+                        "occurrence_count": 2,
+                    }
+                ],
+            )
+
+            # The empty sentinel is not a usable baseline feature.
+            self.assertEqual(manifest["record_count"], 1)
+            self.assertEqual(manifest["occurrence_sum"], 2)
+
+            # But source metadata still describes the original yarGen shard.
+            self.assertEqual(manifest["sources"][0]["entry_count"], 2)
+            self.assertEqual(manifest["sources"][0]["occurrence_sum"], 1360)
+
+    def test_nonempty_invalid_imphash_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            sources = root / "sources"
+            sources.mkdir()
+
+            with gzip.open(sources / "good-imphashes-part1.db", "wb") as handle:
+                handle.write(json.dumps({"not-an-imphash": 1}).encode())
+
+            with self.assertRaises(goodware.GoodwareImportError):
+                goodware.build_stage(sources, root / "stage")
+
+
+
+    def test_verify_does_not_reapply_lossy_yargen_string_unescaping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            sources = root / "sources"
+            output = root / "stage"
+            sources.mkdir()
+
+            # Four literal backslashes in the yarGen source become two in the
+            # normalized stage. Re-running yarGen unescaping during verify
+            # would incorrectly collapse those two to one.
+            source_value = "prefix" + ("\\" * 4) + "suffix"
+            expected_value = "prefix" + ("\\" * 2) + "suffix"
+
+            with gzip.open(sources / "good-strings-part1.db", "wb") as handle:
+                handle.write(json.dumps({source_value: 3}).encode())
+
+            manifest = goodware.build_stage(sources, output)
+            verified = goodware.verify_stage(output)
+
+            self.assertEqual(manifest, verified)
+
+            records = [
+                json.loads(line)
+                for line in (output / "records.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["feature_kind"], "string")
+            self.assertEqual(records[0]["normalized_value"], expected_value)
+            self.assertEqual(records[0]["occurrence_count"], 3)
+
+
+
 class ComposeGuardTests(unittest.TestCase):
     def test_good_analysis_worker_passes(self) -> None:
         payload = {

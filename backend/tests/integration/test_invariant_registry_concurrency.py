@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, date, datetime
 from uuid import uuid4
+from itertools import product
+from string import ascii_uppercase
 
 import pytest
 from sqlalchemy import func, select
@@ -36,7 +38,7 @@ from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 pytestmark = pytest.mark.integration
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
-
+_COUNTRY_CODES = iter("".join(pair) for pair in product(ascii_uppercase, repeat=2))
 
 class AlwaysBanal:
     def score(self, occurrence_count: int | None) -> Banality:
@@ -46,7 +48,7 @@ class AlwaysBanal:
 async def _make_investigation(session_factory, suffix: str) -> AnalystInvestigation:
     edition = Edition(
         country=f"P09 {suffix}",
-        country_code=f"{suffix[0].upper()}{suffix[1].upper()}",
+        country_code=next(_COUNTRY_CODES),
         period_start=date(2026, 8, 1),
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
@@ -75,7 +77,7 @@ async def _make_investigation(session_factory, suffix: str) -> AnalystInvestigat
         budget=LoopBudget(),
     )
     async with SqlAlchemyUnitOfWork(session_factory) as uow:
-        await uow.editions.add(edition)
+        assert await uow.editions.add_if_absent(edition)
         await uow.subjects.add(subject)
         await uow.subject_production_runs.add(run)
         await uow.production_artifacts.append(artifact)

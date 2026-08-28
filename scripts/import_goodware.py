@@ -205,9 +205,16 @@ def _aggregate(
             source_occurrences = 0
             rows: list[tuple[str, str, int]] = []
             for original_value, original_count in raw.items():
-                normalized = normalize_value(kind, original_value)
                 count = _validated_count(kind, original_value, original_count)
                 source_occurrences += count
+
+                # Official yarGen goodware shards may use the empty string as
+                # a sentinel for unavailable imphashes or empty string entries.
+                # Preserve source statistics, but never persist it as a feature.
+                if kind in {"imphash", "string"} and original_value == "":
+                    continue
+
+                normalized = normalize_value(kind, original_value)
                 rows.append((kind, normalized, count))
             with connection:
                 connection.executemany(
@@ -361,8 +368,23 @@ def verify_stage(output_dir: Path) -> dict[str, Any]:
             count = record["occurrence_count"]
             if not isinstance(kind, str) or not isinstance(value, str):
                 raise GoodwareImportError("records.jsonl feature fields must be strings")
-            if normalize_value(kind, value) != value:
-                raise GoodwareImportError("records.jsonl contains a non-normalized feature")
+            # Source normalization for yarGen strings is intentionally lossy:
+            # doubled backslashes and escaped quotes are unescaped during build.
+            # Re-applying that source transformation here would therefore not
+            # be idempotent for some legitimate already-normalized strings.
+            #
+            # Stage validation checks the canonical target representation
+            # instead: strings must be non-empty NFC text. Other feature kinds
+            # have idempotent normalization and can still use normalize_value().
+            if kind == "string":
+                if not value or unicodedata.normalize("NFC", value) != value:
+                    raise GoodwareImportError(
+                        "records.jsonl contains a non-normalized feature"
+                    )
+            elif normalize_value(kind, value) != value:
+                raise GoodwareImportError(
+                    "records.jsonl contains a non-normalized feature"
+                )
             _validated_count(kind, value, count)
             canonical = (_canonical_json(record) + "\n").encode("utf-8")
             if raw_line != canonical:
