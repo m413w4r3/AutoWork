@@ -222,6 +222,28 @@ async def test_initial_failure_does_not_block_remaining_subjects_before_recovery
 
 
 @pytest.mark.asyncio
+async def test_recovery_subject_schedule_is_persisted_before_dispatch() -> None:
+    uow, runs = _batch_uow(["bridge_timeout"])
+    policy = ProductionPacingPolicy(
+        subject_jitter_min_seconds=7,
+        subject_jitter_max_seconds=7,
+        model_jitter_min_seconds=0,
+        model_jitter_max_seconds=0,
+    )
+    service = EditionProductionService(lambda: uow, policy)
+
+    recovered = await service.on_subject_terminal(
+        uow.edition_production_batches.item.id, runs[0].id
+    )
+
+    assert recovered is runs[0]
+    assert uow.edition_production_batches.item.phase is ProductionBatchPhase.RECOVERY
+    dispatch_at = uow.edition_production_batches.item.next_dispatch_at
+    assert dispatch_at is not None
+    assert 0 < policy.delay_until(dispatch_at, now=datetime.now(UTC)) <= 7000
+
+
+@pytest.mark.asyncio
 async def test_unknown_error_is_manual_only_and_count_never_exceeds_one() -> None:
     uow, runs = _batch_uow(["unknown_code"])
     service = EditionProductionService(lambda: uow)

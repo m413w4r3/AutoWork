@@ -33,13 +33,14 @@ from cti_app.application.jobs import (
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_jobs import ProductionStageChain
+from cti_app.application.production_jobs import ProductionStageChain, stage_job_kind
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalRoutingPolicy
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
 from cti_app.domain.jobs import JobStatus
+from cti_app.domain.production import ProductionProfile, production_stages
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
@@ -63,7 +64,12 @@ EXECUTE_JOB_TIME_LIMIT_MS = int(get_settings().job_actor_time_limit_seconds * 10
 
 # Kinds dont l'attente survit à la perte du worker. Le processus de recovery
 # les déclare explicitement pour ne pas construire tous les services métier.
-DURABLE_RESUME_JOB_KINDS = frozenset({DISCOVERY_JOB_KIND})
+DURABLE_RESUME_JOB_KINDS = frozenset(
+    {
+        DISCOVERY_JOB_KIND,
+        *(stage_job_kind(stage) for stage in production_stages(ProductionProfile.BRIEF_AUTO)),
+    }
+)
 
 
 @dramatiq.actor(max_retries=0)

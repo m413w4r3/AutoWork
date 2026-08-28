@@ -19,6 +19,7 @@ from cti_app.application.production_jobs import (
     register_production_jobs,
     stage_job_kind,
 )
+from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
@@ -240,6 +241,31 @@ async def test_successful_stage_queues_the_next_one(
     )
 
 
+async def test_recovered_old_stage_job_resubmits_the_current_stage_without_failing_run(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, jobs, orchestrator = _build(
+        uow, monkeypatch, {"stage": "sources", "status": "success"}
+    )
+    run = _run(uow, SubjectProductionStage.REFERENCES)
+
+    handler = registry.handler(stage_job_kind(SubjectProductionStage.SOURCES))
+    await handler(
+        ProductionStageParameters(
+            run_id=run.id,
+            expected_stage=SubjectProductionStage.SOURCES.value,
+            pipeline_generation=run.pipeline_generation,
+        ),
+        _Context(),  # type: ignore[arg-type]
+    )
+
+    assert orchestrator.calls == []
+    assert [job.kind for job in jobs.submitted] == [
+        stage_job_kind(SubjectProductionStage.REFERENCES)
+    ]
+    assert uow.subject_production_runs.items[run.id].status is SubjectProductionStatus.RUNNING
+
+
 async def test_next_stage_job_is_idempotent_per_run_and_stage(
     uow: _Uow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -401,6 +427,91 @@ async def test_transient_error_stays_retryable_and_keeps_the_run_alive(
     # The run must not be terminated: the job will be retried.
     assert uow.subject_production_runs.items[run.id].status is SubjectProductionStatus.RUNNING
     assert jobs.submitted == []
+
+
+@pytest.mark.parametrize(
+    ("recovery_stage", "expected_delay"),
+    (
+        (SubjectProductionStage.SOURCES, 7000),
+        (SubjectProductionStage.EXTRACTION, 7000),
+        (SubjectProductionStage.REFERENCES, 18000),
+        (SubjectProductionStage.SYNTHESIS, 18000),
+    ),
+)
+async def test_recovery_dispatch_combines_subject_and_model_pacing(
+    uow: _Uow,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_stage: SubjectProductionStage,
+    expected_delay: int,
+) -> None:
+    first = _run(uow, SubjectProductionStage.SOURCES)
+    next_run = _run(uow, recovery_stage)
+    next_run.status = SubjectProductionStatus.RUNNING
+    batch = EditionProductionBatch(
+        edition_id=first.edition_id,
+        profile=ProductionProfile.BRIEF_AUTO,
+        status="running",
+    )
+    uow.edition_production_batches.items[batch.id] = batch
+    uow.edition_production_batch_items.items.append(
+        EditionProductionBatchItem(
+            batch_id=batch.id,
+            subject_id=first.subject_id,
+            production_run_id=first.id,
+            position=1,
+        )
+    )
+
+    class RecoveryBatchService:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def clear_next_dispatch(self, run_id: UUID) -> None:
+            del run_id
+
+        async def on_subject_terminal(
+            self, batch_id: UUID, run_id: UUID, *, correlation_id: str
+        ) -> SubjectProductionRun:
+            del batch_id, run_id, correlation_id
+            return next_run
+
+        async def next_dispatch_delay_ms(self, batch_id: UUID) -> int:
+            del batch_id
+            return 7000
+
+    monkeypatch.setattr(
+        "cti_app.application.production_jobs.EditionProductionService", RecoveryBatchService
+    )
+    monkeypatch.setattr(
+        "cti_app.application.production_jobs.ProductionWorkflowOrchestrator",
+        lambda *args, **kwargs: _Orchestrator(
+            {"stage": "sources", "status": "error", "error": "failed"}
+        ),
+    )
+    registry = JobRegistry()
+    dispatcher = _Dispatcher()
+    chain = ProductionStageChain(
+        ProductionPacingPolicy(
+            subject_jitter_min_seconds=7,
+            subject_jitter_max_seconds=7,
+            model_jitter_min_seconds=11,
+            model_jitter_max_seconds=11,
+        )
+    )
+    jobs = _Jobs()
+    chain.bind(jobs, dispatcher)  # type: ignore[arg-type]
+    register_production_jobs(registry, lambda: uow, chain=chain)  # type: ignore[arg-type]
+
+    handler = registry.handler(stage_job_kind(SubjectProductionStage.SOURCES))
+    with pytest.raises(JobHandlerError):
+        await handler(
+            ProductionStageParameters(
+                run_id=first.id, expected_stage=SubjectProductionStage.SOURCES.value
+            ),
+            _Context(),  # type: ignore[arg-type]
+        )
+
+    assert dispatcher.delays == [expected_delay]
 
 
 def test_stage_parameters_survive_the_json_round_trip() -> None:

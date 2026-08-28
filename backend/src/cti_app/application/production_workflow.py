@@ -373,10 +373,26 @@ class ProductionWorkflowOrchestrator:
                     run.subject_id, supplemental
                 )
                 new_sources = len(added)
-                if added and context is not None:
-                    await self._collection_service.collect_subject(
-                        run.subject_id, context.job_id, context, snapshot=snapshot
-                    )
+                if context is not None:
+                    report_urls = {source.canonical_url for source in report.sources}
+                    for collection in await self._collection_service.list_sources(run.subject_id):
+                        if (
+                            collection.canonical_url not in report_urls
+                            or collection.state.value in _ARCHIVED_STATES
+                        ):
+                            continue
+                        try:
+                            await self._collection_service.collect_subject(
+                                run.subject_id,
+                                context.job_id,
+                                context,
+                                collection_id=collection.id,
+                                snapshot=snapshot,
+                            )
+                        except Exception as exc:
+                            warnings.append(
+                                f"supplemental_collection_failed:{collection.canonical_url}:{exc}"
+                            )
             except Exception as exc:
                 warnings.append(f"supplemental_collection_failed:{exc}")
 
@@ -548,6 +564,9 @@ class ProductionWorkflowOrchestrator:
                 snapshot=snapshot,
             )
             sources = await self._collection_service.list_sources(run.subject_id)
+            if snapshot is not None:
+                snapshot_urls = {source.canonical_url for source in snapshot.core_sources}
+                sources = [source for source in sources if source.canonical_url in snapshot_urls]
         except Exception as e:
             return {
                 "stage": "sources",
@@ -588,7 +607,11 @@ class ProductionWorkflowOrchestrator:
         async with self._uow_factory() as uow:
             research_date = run.research_date or datetime.now(UTC).date()
             ctx = await build_subject_production_context(
-                uow, run.subject_id, research_date, snapshot=snapshot
+                uow,
+                run.subject_id,
+                research_date,
+                snapshot=snapshot,
+                relevant_source_urls=None,
             )
             subject_title = ctx.subject_title
 
@@ -755,7 +778,11 @@ class ProductionWorkflowOrchestrator:
                 }
             research_date = run.research_date or datetime.now(UTC).date()
             policy = await build_subject_production_context(
-                uow, run.subject_id, research_date, snapshot=snapshot
+                uow,
+                run.subject_id,
+                research_date,
+                snapshot=snapshot,
+                relevant_source_urls={source.canonical_url for source in report.sources},
             )
             if not policy.external_llm_allowed:
                 return {
@@ -1047,19 +1074,6 @@ class ProductionWorkflowOrchestrator:
                     "error": "References artifact not found",
                 }
 
-            synthesis_research_date = run.research_date or datetime.now(UTC).date()
-            synthesis_ctx = await build_subject_production_context(
-                uow, run.subject_id, synthesis_research_date, snapshot=snapshot
-            )
-            synthesis_policy_allows = synthesis_ctx.external_llm_allowed
-            if not synthesis_policy_allows:
-                return {
-                    "stage": "synthesis",
-                    "status": "needs_review",
-                    "error_code": "external_llm_blocked",
-                    "error": "Diffusion policy forbids sending this subject to an external model",
-                }
-
             report = await self._load_reference_report(references)
             if (
                 report is None
@@ -1072,17 +1086,42 @@ class ProductionWorkflowOrchestrator:
                     "error_code": "synthesis_inputs_missing",
                     "error": "Reference or extraction payload is not readable",
                 }
+            synthesis_research_date = run.research_date or datetime.now(UTC).date()
+            synthesis_ctx = await build_subject_production_context(
+                uow,
+                run.subject_id,
+                synthesis_research_date,
+                snapshot=snapshot,
+                relevant_source_urls={source.canonical_url for source in report.sources},
+            )
+            synthesis_policy_allows = synthesis_ctx.external_llm_allowed
+            if not synthesis_policy_allows:
+                return {
+                    "stage": "synthesis",
+                    "status": "needs_review",
+                    "error_code": "external_llm_blocked",
+                    "error": "Diffusion policy forbids sending this subject to an external model",
+                }
             extraction_payload = technical_extraction_from_json(
                 await self._artifact_store.read_json(extraction.canonical_blob_id)
             )
             subject_title, _ = await self._subject_context(uow, run.subject_id, snapshot)
             collections = await uow.source_collections.list_for_subject(run.subject_id)
             source_tiers_by_url: dict[str, str] = {}
-            for collection in collections:
-                if collection.origin_kind in {SourceOriginKind.DISCOVERY, SourceOriginKind.MANUAL}:
-                    source_tiers_by_url[collection.canonical_url] = "core"
-                elif collection.origin_kind is SourceOriginKind.REFERENCE_RESEARCH:
-                    source_tiers_by_url[collection.canonical_url] = "supporting"
+            if snapshot is not None:
+                core_urls = {source.canonical_url for source in snapshot.core_sources}
+                relevant_urls = {source.canonical_url for source in report.sources}
+                source_tiers_by_url.update({url: "core" for url in core_urls})
+                source_tiers_by_url.update({url: "supporting" for url in relevant_urls - core_urls})
+            else:
+                for collection in collections:
+                    if collection.origin_kind in {
+                        SourceOriginKind.DISCOVERY,
+                        SourceOriginKind.MANUAL,
+                    }:
+                        source_tiers_by_url[collection.canonical_url] = "core"
+                    elif collection.origin_kind is SourceOriginKind.REFERENCE_RESEARCH:
+                        source_tiers_by_url[collection.canonical_url] = "supporting"
             synthesis_pack = self._build_synthesis_evidence_pack(
                 report, extraction_payload, source_tiers_by_url
             )

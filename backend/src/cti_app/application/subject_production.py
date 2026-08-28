@@ -531,11 +531,25 @@ class EditionProductionService:
             if started is not None:
                 await uow.commit()
                 return started
+            if batch.status == "cancelled":
+                await uow.commit()
+                return None
 
             items = await uow.edition_production_batch_items.list_for_batch(batch_id)
             all_runs = [
                 await uow.subject_production_runs.get(item.production_run_id) for item in items
             ]
+            active = next(
+                (
+                    run
+                    for run in all_runs
+                    if run is not None and run.status is SubjectProductionStatus.RUNNING
+                ),
+                None,
+            )
+            if active is not None:
+                await uow.commit()
+                return active
             all_terminal = all(
                 run is not None and run.status in _TERMINAL_STATUSES for run in all_runs
             )
@@ -586,6 +600,9 @@ class EditionProductionService:
                 await save_item(item)
             if batch.phase is ProductionBatchPhase.INITIAL:
                 batch.enter_recovery()
+            batch.schedule_next_dispatch(
+                datetime.now(UTC) + timedelta(milliseconds=self._pacing.subject_delay_ms())
+            )
             await uow.edition_production_batches.save(batch)
             return retried
         return None

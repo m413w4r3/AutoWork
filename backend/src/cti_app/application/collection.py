@@ -55,6 +55,11 @@ _COLLECTED_STATES = {
 }
 
 
+def _snapshot_source_urls(snapshot: ProductionInputSnapshot) -> frozenset[str]:
+    """Return the frozen source URL set in deterministic order-independent form."""
+    return frozenset(source.canonical_url for source in snapshot.core_sources)
+
+
 @dataclass(frozen=True, slots=True)
 class SupplementalSource:
     """A publication proposed by reference research, not by discovery."""
@@ -202,7 +207,7 @@ class SubjectCollectionService:
         if snapshot.subject_id != subject_id:
             raise CollectionNotAllowedError("Production snapshot does not belong to the subject")
 
-        snapshot_urls = {source.canonical_url for source in snapshot.core_sources}
+        snapshot_urls = _snapshot_source_urls(snapshot)
         async with self._uow_factory() as uow:
             current = list(await uow.source_collections.list_for_subject(subject_id))
             seen_urls = {item.canonical_url for item in current}
@@ -216,15 +221,7 @@ class SubjectCollectionService:
             await uow.commit()
             current = list(await uow.source_collections.list_for_subject(subject_id))
 
-        # Q1 may add reference-research sources after SOURCES. They remain
-        # eligible, while a newly discovered current candidate does not.
-        return [
-            item
-            for item in current
-            if item.canonical_url in snapshot_urls
-            or item.origin_kind
-            in {SourceOriginKind.REFERENCE_RESEARCH, SourceOriginKind.MANUAL}
-        ]
+        return [item for item in current if item.canonical_url in snapshot_urls]
 
     async def add_supplemental_sources(
         self,
@@ -284,8 +281,7 @@ class SubjectCollectionService:
             all_collections = list(await uow.source_collections.list_for_subject(subject_id))
             by_id = {item.id: item for item in all_collections}
             existing_children = sum(
-                item.origin_kind is SourceOriginKind.REFERENCED_EVIDENCE
-                for item in all_collections
+                item.origin_kind is SourceOriginKind.REFERENCED_EVIDENCE for item in all_collections
             )
             per_parent: dict[UUID, int] = {}
             for item in all_collections:
@@ -420,15 +416,20 @@ class SubjectCollectionService:
         collection_id: UUID | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> str:
-        sources = (
-            await self.initialize_from_snapshot(subject_id, snapshot)
-            if snapshot is not None
-            else await self.initialize(subject_id)
-        )
         if collection_id is not None:
-            sources = [item for item in sources if item.id == collection_id]
-            if not sources:
+            if snapshot is not None and snapshot.subject_id != subject_id:
+                raise CollectionNotAllowedError(
+                    "Production snapshot does not belong to the subject"
+                )
+            async with self._uow_factory() as uow:
+                source = await uow.source_collections.get(collection_id)
+            if source is None or source.subject_id != subject_id:
                 raise CollectionItemNotFoundError(str(collection_id))
+            sources = [source]
+        elif snapshot is not None:
+            sources = await self.initialize_from_snapshot(subject_id, snapshot)
+        else:
+            sources = await self.initialize(subject_id)
         summary = CollectionSummary(total=len(sources))
         await context.report_progress(0, len(sources), "Préparation de la collecte")
         for index, source in enumerate(sources, start=1):

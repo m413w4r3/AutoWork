@@ -10,6 +10,7 @@ from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentSe
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.jobs import (
+    DuplicateJobError,
     JobDispatcher,
     JobExecutionContext,
     JobHandlerError,
@@ -167,15 +168,24 @@ def register_production_jobs(
         )
         if started is None:
             return
-        subject_delay_ms: int | None = None
-        if started.current_stage is SubjectProductionStage.SOURCES:
-            subject_delay_ms = await batches.next_dispatch_delay_ms(batch_id)
-        await stage_chain.submit(
-            run=started,
-            stage=started.current_stage,
-            correlation_id=correlation_id,
-            delay_ms=subject_delay_ms,
-        )
+        subject_delay_ms = await batches.next_dispatch_delay_ms(batch_id)
+        if started.current_stage in {
+            SubjectProductionStage.REFERENCES,
+            SubjectProductionStage.SYNTHESIS,
+        }:
+            subject_delay_ms += production_pacing.model_delay_ms(started.current_stage)
+        try:
+            await stage_chain.submit(
+                run=started,
+                stage=started.current_stage,
+                correlation_id=correlation_id,
+                delay_ms=subject_delay_ms,
+            )
+        except DuplicateJobError:
+            # A recovered worker may reach this hand-off after the original
+            # dispatch already committed. The idempotency key is the proof
+            # that the existing job is the exact same stage attempt.
+            return
 
     async def handle_stage(
         parameters: JobParameters,
@@ -188,6 +198,20 @@ def register_production_jobs(
         async with uow_factory() as uow:
             current = await uow.subject_production_runs.get(parameters.run_id)
         if current is None or current.pipeline_generation != parameters.pipeline_generation:
+            return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
+        if current.current_stage is not stage:
+            if (
+                current.status is SubjectProductionStatus.RUNNING
+                and current.current_stage is not SubjectProductionStage.ANALYST_RESEARCH
+            ):
+                try:
+                    await stage_chain.submit(
+                        run=current,
+                        stage=current.current_stage,
+                        correlation_id=await context.correlation_id(),
+                    )
+                except DuplicateJobError:
+                    pass
             return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
         await EditionProductionService(uow_factory).clear_next_dispatch(parameters.run_id)
         orchestrator = ProductionWorkflowOrchestrator(

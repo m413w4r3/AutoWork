@@ -20,7 +20,9 @@ from cti_app.application.jobs import (
     SynchronousJobDispatcher,
     create_job_registry,
 )
+from cti_app.application.production_jobs import stage_job_kind
 from cti_app.domain.jobs import Job, JobStatus
+from cti_app.domain.production import SubjectProductionStage
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 
 
@@ -60,9 +62,7 @@ async def test_synchronous_dispatcher_retries_transient_bridge_timeout() -> None
         nonlocal calls
         calls += 1
         if calls < 3:
-            raise JobHandlerError(
-                "bridge_timeout", "Le bridge a expiré.", transient=True
-            )
+            raise JobHandlerError("bridge_timeout", "Le bridge a expiré.", transient=True)
         return "memory://result"
 
     registry.register("test.flaky", DemoJobParameters, flaky_handler)
@@ -150,9 +150,7 @@ async def test_a_crashed_job_leaves_its_traceback_in_the_diagnostics_trail(
     registry.register("test.unsafe", DemoJobParameters, unsafe_handler)
     service = JobService(factory, registry)
     diagnostics = DiagnosticsLog.from_env(tmp_path)
-    dispatcher = SynchronousJobDispatcher(
-        JobExecutor(factory, registry, diagnostics=diagnostics)
-    )
+    dispatcher = SynchronousJobDispatcher(JobExecutor(factory, registry, diagnostics=diagnostics))
     job = await service.submit(
         kind="test.unsafe",
         aggregate_type="subject",
@@ -191,9 +189,7 @@ async def test_a_controlled_job_failure_is_recorded_with_its_code(tmp_path: Path
     registry.register("test.refusing", DemoJobParameters, refusing_handler)
     service = JobService(factory, registry)
     diagnostics = DiagnosticsLog.from_env(tmp_path)
-    dispatcher = SynchronousJobDispatcher(
-        JobExecutor(factory, registry, diagnostics=diagnostics)
-    )
+    dispatcher = SynchronousJobDispatcher(JobExecutor(factory, registry, diagnostics=diagnostics))
     job = await service.submit(
         kind="test.refusing",
         aggregate_type="subject",
@@ -302,6 +298,37 @@ async def test_durable_kind_recovery_resumes_same_attempt_without_registry_looku
     assert requeued.next_retry_at is not None
     assert requeued.attempt == 0
     assert requeued.error_code == "worker_interrupted"
+
+
+async def test_production_recovery_resumes_the_same_business_attempt() -> None:
+    factory = InMemoryJobUnitOfWorkFactory()
+    service = JobService(factory, create_job_registry())
+    kind = stage_job_kind(SubjectProductionStage.SOURCES)
+    job = Job(
+        kind=kind,
+        aggregate_type="subject",
+        aggregate_id=uuid4(),
+        idempotency_key=f"production-{uuid4()}",
+        correlation_id="test",
+        input_parameters={
+            "run_id": str(uuid4()),
+            "expected_stage": SubjectProductionStage.SOURCES.value,
+            "pipeline_generation": 0,
+        },
+        max_attempts=3,
+    )
+    job.start(datetime.now(UTC) - timedelta(minutes=10))
+    factory.state[job.id] = job
+
+    await service.recover_abandoned(
+        timedelta(seconds=120),
+        resume_current_attempt_kinds=frozenset({kind}),
+    )
+
+    recovered = await service.get(job.id)
+    assert recovered.status is JobStatus.QUEUED
+    assert recovered.attempt == 0
+    assert recovered.error_code == "worker_interrupted"
 
 
 async def test_durable_kind_recovery_cancels_a_job_whose_worker_died() -> None:

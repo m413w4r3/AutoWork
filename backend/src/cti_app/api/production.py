@@ -15,6 +15,7 @@ from cti_app.application.production_jobs import (
     PRODUCTION_STAGE_MAX_ATTEMPTS,
     ProductionStageParameters,
     production_stage_idempotency_key,
+    stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_stage_status import (
@@ -340,6 +341,101 @@ async def _create_and_start_run(
     return run, job.id
 
 
+async def _retry_production_run(
+    request: Request,
+    run_id: UUID,
+    payload: RetryProductionStageRequest,
+    user: str,
+) -> dict[str, Any]:
+    """Retry exactly one persisted production run and enqueue its stage."""
+    uow_factory, jobs, dispatcher = _runtime(request)
+
+    async with uow_factory() as uow:
+        current = await uow.subject_production_runs.get(run_id)
+        if not current:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No production run found for run {run_id}",
+            )
+        if current.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "retry_not_allowed_while_running"},
+            )
+
+    service = SubjectProductionService(uow_factory)
+    try:
+        old_generation = current.pipeline_generation
+        run, staled = await service.retry_from_stage(run_id, payload.stage)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": str(e)},
+        ) from e
+
+    parameters = ProductionStageParameters(
+        run_id=run.id,
+        expected_stage=payload.stage.value,
+        pipeline_generation=run.pipeline_generation,
+    )
+    job = await jobs.submit(
+        kind=stage_job_kind(payload.stage),
+        aggregate_type="subject",
+        aggregate_id=run.subject_id,
+        idempotency_key=production_stage_idempotency_key(run, payload.stage),
+        correlation_id=get_correlation_id(),
+        input_parameters=parameters.model_dump(mode="json"),
+        max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
+        actor_id=user,
+    )
+    await dispatcher.dispatch(
+        job.id,
+        delay_ms=_production_pacing(request).model_delay_ms(payload.stage),
+    )
+    diagnostics = getattr(request.app.state, "production_diagnostics", None)
+    if diagnostics is not None:
+        diagnostics.record(
+            event="production.stage_retry_requested",
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage=payload.stage.value,
+            correlation_id=get_correlation_id(),
+            requested_stage=payload.stage.value,
+            previous_status=current.status.value,
+            previous_stage=current.current_stage.value,
+            old_generation=old_generation,
+            new_generation=run.pipeline_generation,
+            staled_artifacts=staled,
+            job_id=str(job.id),
+        )
+
+    view = _run_view(run, run.edition_id, job_id=job.id)
+    view["action"] = "stage_retry_requested"
+    view["requested_stage"] = payload.stage.value
+    view["old_generation"] = old_generation
+    view["pipeline_generation"] = run.pipeline_generation
+    view["staled_artifacts"] = staled
+    return view
+
+
+async def _cancel_non_terminal_run_jobs(
+    jobs: JobService,
+    runs: Sequence[tuple[UUID, UUID]],
+) -> None:
+    """Request cancellation only for jobs carrying an exact production run ID."""
+    list_jobs = getattr(jobs, "list_for_aggregate", None)
+    cancel_job = getattr(jobs, "cancel", None)
+    if list_jobs is None or cancel_job is None:
+        return
+    for run_id, subject_id in runs:
+        for job in await list_jobs("subject", subject_id):
+            if str(job.input_parameters.get("run_id")) == str(run_id) and not job.is_terminal:
+                try:
+                    await cancel_job(job.id, actor_id="system")
+                except (LookupError, ValueError):
+                    pass
+
+
 # Subject Production Endpoints
 
 
@@ -555,8 +651,7 @@ async def retry_production_stage(
     user: str = "system",
 ) -> dict[str, Any]:
     """Deliberately recompute a stage in the current run and chain onward."""
-    uow_factory, jobs, dispatcher = _runtime(request)
-
+    uow_factory, _, _ = _runtime(request)
     async with uow_factory() as uow:
         current = await uow.subject_production_runs.get_current_for_subject(subject_id)
         if not current:
@@ -564,71 +659,19 @@ async def retry_production_stage(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No production run found for subject {subject_id}",
             )
-        if current.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "retry_not_allowed_while_running"},
-            )
-        edition_id = current.edition_id
+        current_run_id = current.id
 
-    service = SubjectProductionService(uow_factory)
-    try:
-        old_generation = current.pipeline_generation
-        run, staled = await service.retry_from_stage(current.id, payload.stage)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": str(e)},
-        ) from e
+    return await _retry_production_run(request, current_run_id, payload, user)
 
-    parameters = ProductionStageParameters(
-        run_id=run.id,
-        expected_stage=payload.stage.value,
-        pipeline_generation=run.pipeline_generation,
-    )
-    kind = (
-        "production.subject.assemble"
-        if payload.stage is SubjectProductionStage.ASSEMBLY
-        else f"production.subject.{payload.stage.value}"
-    )
-    job = await jobs.submit(
-        kind=kind,
-        aggregate_type="subject",
-        aggregate_id=run.subject_id,
-        idempotency_key=production_stage_idempotency_key(run, payload.stage),
-        correlation_id=get_correlation_id(),
-        input_parameters=parameters.model_dump(mode="json"),
-        max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
-        actor_id=user,
-    )
-    await dispatcher.dispatch(
-        job.id,
-        delay_ms=_production_pacing(request).model_delay_ms(payload.stage),
-    )
-    diagnostics = getattr(request.app.state, "production_diagnostics", None)
-    if diagnostics is not None:
-        diagnostics.record(
-            event="production.stage_retry_requested",
-            run_id=run.id,
-            subject_id=run.subject_id,
-            stage=payload.stage.value,
-            correlation_id=get_correlation_id(),
-            requested_stage=payload.stage.value,
-            previous_status=current.status.value,
-            previous_stage=current.current_stage.value,
-            old_generation=old_generation,
-            new_generation=run.pipeline_generation,
-            staled_artifacts=staled,
-            job_id=str(job.id),
-        )
 
-    view = _run_view(run, edition_id, job_id=job.id)
-    view["action"] = "stage_retry_requested"
-    view["requested_stage"] = payload.stage.value
-    view["old_generation"] = old_generation
-    view["pipeline_generation"] = run.pipeline_generation
-    view["staled_artifacts"] = staled
-    return view
+@router.post("/production/runs/{run_id}/retry")
+async def retry_production_run(
+    run_id: UUID,
+    payload: RetryProductionStageRequest,
+    request: Request,
+    user: str = "system",
+) -> dict[str, Any]:
+    return await _retry_production_run(request, run_id, payload, user)
 
 
 @router.post("/subjects/{subject_id}/production/cancel")
@@ -636,7 +679,7 @@ async def cancel_production(
     subject_id: UUID,
     request: Request,
 ) -> dict[str, Any]:
-    uow_factory, _, _ = _runtime(request)
+    uow_factory, jobs, _ = _runtime(request)
     service = SubjectProductionService(uow_factory)
 
     async with uow_factory() as uow:
@@ -647,7 +690,8 @@ async def cancel_production(
                 detail=f"No production run found for subject {subject_id}",
             )
 
-    await service.cancel_run(run.id)
+    cancelled = await service.cancel_run(run.id)
+    await _cancel_non_terminal_run_jobs(jobs, [(cancelled.id, cancelled.subject_id)])
 
     return {
         "action": "cancel",
@@ -668,7 +712,22 @@ async def _artifact_view(
         if not run:
             raise HTTPException(status_code=404, detail="No production run found")
 
-        artifact = await uow.production_artifacts.get_current(run.id, stage)
+    return await _artifact_view_for_run(request, run.id, stage)
+
+
+async def _artifact_view_for_run(
+    request: Request,
+    run_id: UUID,
+    stage: str,
+) -> dict[str, Any]:
+    uow_factory, _, _ = _runtime(request)
+
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="No production run found")
+
+        artifact = await uow.production_artifacts.get_current(run_id, stage)
         if not artifact:
             raise HTTPException(status_code=404, detail=f"{stage} artifact not found")
 
@@ -710,6 +769,11 @@ async def get_synthesis_artifact(subject_id: UUID, request: Request) -> dict[str
 @router.get("/subjects/{subject_id}/production/artifacts/brief")
 async def get_brief_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
     return await _artifact_view(request, subject_id, "brief")
+
+
+@router.get("/production/runs/{run_id}/artifacts/brief")
+async def get_run_brief_artifact(run_id: UUID, request: Request) -> dict[str, Any]:
+    return await _artifact_view_for_run(request, run_id, "brief")
 
 
 class SaveBriefDraftRequest(BaseModel):
@@ -907,8 +971,7 @@ async def cancel_edition_batch(
     request: Request,
 ) -> dict[str, Any]:
     uow_factory, jobs, _ = _runtime(request)
-    current_run_id: UUID | None = None
-    current_subject_id: UUID | None = None
+    runs_to_cancel: list[tuple[UUID, UUID]] = []
 
     async with uow_factory() as uow:
         batch = await uow.edition_production_batches.get_for_update(batch_id)
@@ -931,28 +994,16 @@ async def cancel_edition_batch(
             run = await uow.subject_production_runs.get_for_update(item.production_run_id)
             if run is None:
                 continue
+            runs_to_cancel.append((run.id, run.subject_id))
             if run.status is SubjectProductionStatus.QUEUED:
                 run.mark_cancelled(now=datetime.now(UTC))
                 await uow.subject_production_runs.save(run)
-            elif run.status is SubjectProductionStatus.RUNNING and current_run_id is None:
-                current_run_id = run.id
-                current_subject_id = run.subject_id
+            elif run.status is SubjectProductionStatus.RUNNING:
+                run.mark_cancelled(now=datetime.now(UTC))
+                await uow.subject_production_runs.save(run)
         await uow.commit()
 
-    if current_run_id is not None:
-        list_jobs = getattr(jobs, "list_for_aggregate", None)
-        cancel_job = getattr(jobs, "cancel", None)
-        if list_jobs is not None and cancel_job is not None:
-            for job in await list_jobs("subject", current_subject_id):
-                if (
-                    str(job.input_parameters.get("run_id")) == str(current_run_id)
-                    and not job.is_terminal
-                ):
-                    try:
-                        await cancel_job(job.id, actor_id="system")
-                    except (LookupError, ValueError):
-                        pass
-                    break
+    await _cancel_non_terminal_run_jobs(jobs, runs_to_cancel)
 
     return {
         "action": "cancel",

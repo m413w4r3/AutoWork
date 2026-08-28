@@ -300,6 +300,47 @@ class _Jobs:
         return _Job()
 
 
+class _TrackedJob:
+    def __init__(self, *, subject_id: UUID, run_id: UUID) -> None:
+        self.id = uuid4()
+        self.subject_id = subject_id
+        self.input_parameters = {"run_id": str(run_id)}
+        self.status = "running"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status == "cancelled"
+
+
+class _CancelableJobs:
+    def __init__(self) -> None:
+        self.submitted: list[dict[str, Any]] = []
+        self.jobs: list[_TrackedJob] = []
+        self.cancelled: list[UUID] = []
+
+    async def submit(self, **kwargs: Any) -> _TrackedJob:
+        job = _TrackedJob(
+            subject_id=kwargs["aggregate_id"],
+            run_id=UUID(kwargs["input_parameters"]["run_id"]),
+        )
+        self.submitted.append(kwargs)
+        self.jobs.append(job)
+        return job
+
+    async def list_for_aggregate(
+        self, aggregate_type: str, aggregate_id: UUID
+    ) -> list[_TrackedJob]:
+        assert aggregate_type == "subject"
+        return [job for job in self.jobs if job.subject_id == aggregate_id]
+
+    async def cancel(self, job_id: UUID, *, actor_id: str = "system") -> _TrackedJob:
+        del actor_id
+        job = next(job for job in self.jobs if job.id == job_id)
+        job.status = "cancelled"
+        self.cancelled.append(job.id)
+        return job
+
+
 class _Dispatcher:
     def __init__(self) -> None:
         self.dispatched: list[UUID] = []
@@ -1173,3 +1214,109 @@ async def test_retry_stage_rejects_queued_or_running_run(
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "retry_not_allowed_while_running"
+
+
+async def test_brief_artifact_by_run_does_not_follow_subject_current_run(
+    api: AsyncClient,
+    uow: _Uow,
+) -> None:
+    subject_id = uuid4()
+    first = _terminal_run(uuid4(), subject_id, status=SubjectProductionStatus.FAILED)
+    second = _terminal_run(first.edition_id, subject_id, status=SubjectProductionStatus.FAILED)
+    await uow.subject_production_runs.add(first)
+    await uow.subject_production_runs.add(second)
+    first_artifact = _artifact(first, ProductionArtifactStage.BRIEF)
+    second_artifact = _artifact(second, ProductionArtifactStage.BRIEF)
+    await uow.production_artifacts.append(first_artifact)
+    await uow.production_artifacts.append(second_artifact)
+
+    by_run = await api.get(f"/api/production/runs/{first.id}/artifacts/brief")
+    by_subject = await api.get(f"/api/subjects/{subject_id}/production/artifacts/brief")
+
+    assert by_run.status_code == 200, by_run.text
+    assert by_subject.status_code == 200, by_subject.text
+    assert by_run.json()["artifact_id"] == str(first_artifact.id)
+    assert by_subject.json()["artifact_id"] == str(second_artifact.id)
+
+
+async def test_retry_by_run_changes_only_the_requested_run(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    subject_id = uuid4()
+    first = _terminal_run(uuid4(), subject_id, status=SubjectProductionStatus.FAILED)
+    second = _terminal_run(first.edition_id, subject_id, status=SubjectProductionStatus.FAILED)
+    await uow.subject_production_runs.add(first)
+    await uow.subject_production_runs.add(second)
+    await uow.production_artifacts.append(_artifact(first, ProductionArtifactStage.REFERENCES))
+
+    response = await api.post(
+        f"/api/production/runs/{first.id}/retry", json={"stage": "references"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["run_id"] == str(first.id)
+    assert uow.subject_production_runs.items[first.id].pipeline_generation == 1
+    assert uow.subject_production_runs.items[second.id].pipeline_generation == 0
+    assert production_app.state.job_service.submitted[-1]["input_parameters"]["run_id"] == str(
+        first.id
+    )
+
+
+async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subjects = [uuid4(), uuid4()]
+    for name, subject_id in zip(("A", "B"), subjects, strict=True):
+        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+    jobs = _CancelableJobs()
+    production_app.state.job_service = jobs
+
+    started = await api.post(f"/api/editions/{edition_id}/production/briefs", json={})
+    assert started.status_code == 200, started.text
+    batch = next(iter(uow.edition_production_batches.items.values()))
+    first_run = uow.subject_production_runs.items[
+        uow.edition_production_batch_items.items[0].production_run_id
+    ]
+    unrelated = _TrackedJob(subject_id=subjects[0], run_id=uuid4())
+    jobs.jobs.append(unrelated)
+
+    response = await api.post(f"/api/editions/{edition_id}/production/briefs/{batch.id}/cancel")
+    repeated = await api.post(f"/api/editions/{edition_id}/production/briefs/{batch.id}/cancel")
+
+    assert response.status_code == 200, response.text
+    assert repeated.status_code == 200, repeated.text
+    assert batch.status == "cancelled"
+    assert all(
+        run.status is SubjectProductionStatus.CANCELLED
+        for run in uow.subject_production_runs.items.values()
+    )
+    exact_job = jobs.jobs[0]
+    assert str(first_run.id) == exact_job.input_parameters["run_id"]
+    assert exact_job.id in jobs.cancelled
+    assert unrelated.id not in jobs.cancelled
+
+
+async def test_subject_cancel_marks_run_and_cancels_its_exact_job(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    jobs = _CancelableJobs()
+    production_app.state.job_service = jobs
+
+    started = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    assert started.status_code == 200, started.text
+    run_id = UUID(started.json()["run_id"])
+    response = await api.post(f"/api/subjects/{subject_id}/production/cancel")
+
+    assert response.status_code == 200, response.text
+    assert uow.subject_production_runs.items[run_id].status is SubjectProductionStatus.CANCELLED
+    assert jobs.cancelled == [jobs.jobs[0].id]

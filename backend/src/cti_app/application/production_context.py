@@ -7,6 +7,7 @@ asked to research a bare title with no anchor and no time window.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date
 from uuid import UUID
@@ -59,6 +60,7 @@ async def build_subject_production_context(
     subject_id: UUID,
     research_date: date | ProductionInputSnapshot | None = None,
     snapshot: ProductionInputSnapshot | None = None,
+    relevant_source_urls: Collection[str] | None = None,
 ) -> SubjectProductionContext:
     """Assemble the prompt context from what the editorial phase established."""
     if isinstance(research_date, ProductionInputSnapshot):
@@ -68,6 +70,7 @@ async def build_subject_production_context(
         research_date = snapshot.research_date
     if research_date is None:
         raise ValueError("research_date or production input snapshot is required")
+    relevant_urls = frozenset(relevant_source_urls or ())
 
     group = await uow.editorial_groups.get_by_subject(subject_id)
     title = snapshot.subject_title if snapshot else (group.title if group else str(subject_id))
@@ -85,17 +88,11 @@ async def build_subject_production_context(
 
     collections = list(await uow.source_collections.list_for_subject(subject_id))
     if snapshot is not None:
-        core_sources = [
-            _describe(source)
-            for source in snapshot.core_sources
-        ]
-        core_sources.extend(
-            _describe(item)
-            for item in collections
-            if item.origin_kind is SourceOriginKind.MANUAL
-        )
-        core_sources_text = "\n".join(dict.fromkeys(core_sources))
+        core_source_urls = frozenset(source.canonical_url for source in snapshot.core_sources)
+        allowed_urls = core_source_urls | relevant_urls
+        core_sources_text = "\n".join(_describe(source) for source in snapshot.core_sources)
     else:
+        allowed_urls = None
         core_sources_text = "\n".join(
             _describe(item)
             for item in collections
@@ -105,6 +102,7 @@ async def build_subject_production_context(
         _describe(item)
         for item in collections
         if item.origin_kind is SourceOriginKind.REFERENCE_RESEARCH
+        and (allowed_urls is None or item.canonical_url in relevant_urls)
     )
 
     # The diffusion policy decides whether this subject may reach an external
@@ -112,10 +110,29 @@ async def build_subject_production_context(
     blocking = tuple(
         item.canonical_url
         for item in collections
-        if item.do_not_submit or not item.external_llm_allowed
+        if (allowed_urls is None or item.canonical_url in allowed_urls)
+        and (item.do_not_submit or not item.external_llm_allowed)
     )
+    if snapshot is not None:
+        blocking = tuple(
+            dict.fromkeys(
+                (
+                    *blocking,
+                    *(
+                        source.canonical_url
+                        for source in snapshot.core_sources
+                        if not source.external_llm_allowed
+                    ),
+                )
+            )
+        )
 
-    archived = [item for item in collections if item.state in _ARCHIVED_STATES]
+    archived = [
+        item
+        for item in collections
+        if item.state in _ARCHIVED_STATES
+        and (allowed_urls is None or item.canonical_url in allowed_urls)
+    ]
     technical_summary = (
         f"{len(archived)} publication(s) déjà archivée(s) pour ce sujet."
         if archived

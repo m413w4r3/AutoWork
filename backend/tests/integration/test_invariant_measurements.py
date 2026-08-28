@@ -25,6 +25,7 @@ async def test_measure_features_bulk_matches_single_measurements_and_chunks(
     subject_id, sample_id, blob_id = uuid4(), uuid4(), uuid4()
     async with uow_factory() as uow:
         session = uow._require_session()
+
         session.add_all(
             [
                 SubjectRow(
@@ -43,21 +44,31 @@ async def test_measure_features_bulk_matches_single_measurements_and_chunks(
                     object_key=f"bulk/{blob_id}",
                     created_at=now,
                 ),
-                SampleRow(
-                    id=sample_id,
-                    subject_id=subject_id,
-                    blob_id=blob_id,
-                    original_name="bulk.bin",
-                    origin="integration-test",
-                    acquired_at=now,
-                    license_restriction=None,
-                    tlp="CLEAR",
-                    do_not_submit=True,
-                    external_llm_allowed=False,
-                    imphash="hash-known",
-                    imphash_source="local",
-                    created_at=now,
-                ),
+            ]
+        )
+        await session.flush()
+
+        session.add(
+            SampleRow(
+                id=sample_id,
+                subject_id=subject_id,
+                blob_id=blob_id,
+                original_name="bulk.bin",
+                origin="integration-test",
+                acquired_at=now,
+                license_restriction=None,
+                tlp="CLEAR",
+                do_not_submit=True,
+                external_llm_allowed=False,
+                imphash="hash-known",
+                imphash_source="local",
+                created_at=now,
+            ),
+        )
+        await session.flush()
+
+        session.add_all(
+            [
                 ReferenceMemberRow(
                     id=uuid4(),
                     sample_id=sample_id,
