@@ -24,6 +24,7 @@ from cti_app.application.persistence import (
     EditionAuditRepository,
     EditionProductionBatchItemRepository,
     EditionProductionBatchRepository,
+    EditionReleaseRepository,
     EditionRepository,
     EditorialGroupRepository,
     GoodwareBaselineRepository,
@@ -40,6 +41,9 @@ from cti_app.application.persistence import (
     ProductionArtifactRepository,
     ProductionInputSnapshotRepository,
     ProvenanceRepository,
+    PublicationManifestEntryRepository,
+    PublicationManifestExclusionRepository,
+    PublicationManifestRepository,
     PublicationReviewDecisionRepository,
     ReferenceMemberRepository,
     RejectedModelProposalRepository,
@@ -94,6 +98,12 @@ from cti_app.infrastructure.database.repositories.discovery_cumulative import (
     SqlAlchemyDiscoverySubjectIdentityRepository,
     SqlAlchemySubjectContributionRepository,
     SqlAlchemySubjectMergeEventRepository,
+)
+from cti_app.infrastructure.database.repositories.edition_publication import (
+    SqlAlchemyEditionReleaseRepository,
+    SqlAlchemyPublicationManifestEntryRepository,
+    SqlAlchemyPublicationManifestExclusionRepository,
+    SqlAlchemyPublicationManifestRepository,
 )
 from cti_app.infrastructure.database.repositories.editions import (
     SqlAlchemyEditionAuditRepository,
@@ -189,6 +199,10 @@ class SqlAlchemyUnitOfWork:
     batch_status_read_model: BatchStatusReadRepository
     edition_review_read_model: EditionReviewReadRepository
     publication_review_decisions: PublicationReviewDecisionRepository
+    publication_manifests: PublicationManifestRepository
+    publication_manifest_entries: PublicationManifestEntryRepository
+    publication_manifest_exclusions: PublicationManifestExclusionRepository
+    edition_releases: EditionReleaseRepository
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -261,6 +275,14 @@ class SqlAlchemyUnitOfWork:
         self.publication_review_decisions = SqlAlchemyPublicationReviewDecisionRepository(
             self._session
         )
+        self.publication_manifests = SqlAlchemyPublicationManifestRepository(self._session)
+        self.publication_manifest_entries = SqlAlchemyPublicationManifestEntryRepository(
+            self._session
+        )
+        self.publication_manifest_exclusions = SqlAlchemyPublicationManifestExclusionRepository(
+            self._session
+        )
+        self.edition_releases = SqlAlchemyEditionReleaseRepository(self._session)
         self._committed = False
         return self
 

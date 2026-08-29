@@ -7,6 +7,7 @@ from typing import Final
 
 from cti_app.application.french_typography import format_french_date
 from cti_app.application.production_normalization import display_indicator_value
+from cti_app.domain.edition_publication import EditionDocumentV1
 from cti_app.domain.publication import ArtifactType, BriefDocumentV1, RichSpanKind, RichText
 
 PANDOC_RENDERER_VERSION = "1"
@@ -113,9 +114,7 @@ def render_brief_pandoc(document: BriefDocumentV1) -> str:
             blocks.append(_styled_block("paragraph", f"{label}\u00a0:"))
             values = "\n\n".join(
                 _safe_text(
-                    display_indicator_value(
-                        item.normalized_value, artifact_type, defanged=False
-                    )
+                    display_indicator_value(item.normalized_value, artifact_type, defanged=False)
                 )
                 for item in by_type[artifact_type].values
             )
@@ -125,3 +124,13 @@ def render_brief_pandoc(document: BriefDocumentV1) -> str:
     if "`" in rendered:
         raise ValueError("Pandoc publication Markdown must not contain backticks")
     return rendered
+
+
+def render_edition_pandoc(document: EditionDocumentV1) -> str:
+    """Render an ordered edition from its already frozen publication documents."""
+    if not document.publications:
+        raise ValueError("An edition document must contain at least one publication")
+    rendered = "\n\n".join(
+        render_brief_pandoc(publication.document).rstrip() for publication in document.publications
+    )
+    return rendered.rstrip() + "\n"

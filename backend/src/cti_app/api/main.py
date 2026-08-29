@@ -29,8 +29,15 @@ from cti_app.application.discovery.cumulative.jobs import RECONCILE_DISCOVERY_JO
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
 from cti_app.application.discovery.service import DiscoveryService
+from cti_app.application.edition_publication import (
+    EditionAssemblyService,
+    EditionPublicationService,
+)
 from cti_app.application.edition_review import EditionReviewService
-from cti_app.application.edition_workspace import EditionProductionCheckpointService
+from cti_app.application.edition_workspace import (
+    EditionProductionCheckpointService,
+    EditionWorkspaceMaterializer,
+)
 from cti_app.application.editions import EditionService
 from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.http_collection import (
@@ -224,6 +231,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.edition_workspace_root,
         diagnostics=production_diagnostics,
     )
+    publication_assembly = EditionAssemblyService(
+        uow_factory,
+        production_artifact_store,
+        workspace_materializer=EditionWorkspaceMaterializer(settings.edition_workspace_root),
+    )
     subject_content_service = SubjectContentService(uow_factory, production_artifact_store)
     production_chain = ProductionStageChain(production_pacing)
     registry = create_job_registry(
@@ -238,6 +250,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         production_diagnostics=production_diagnostics,
         cumulative_discovery_service=cumulative_discovery_service,
         production_checkpoint=production_checkpoint,
+        publication_assembly=publication_assembly,
     )
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory
@@ -265,6 +278,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.subject_production_service = subject_production_service
     app.state.edition_production_service = edition_production_service
     app.state.edition_review_service = EditionReviewService(uow_factory)
+    app.state.edition_publication_service = EditionPublicationService(
+        uow_factory,
+        production_artifact_store,
+        job_service=job_service,
+        job_dispatcher=job_dispatcher,
+    )
     yield
     await readiness.close()
     await job_engine.dispose()

@@ -57,6 +57,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     collection,
     core,
     discovery,
+    edition_publication,
     editions,
     editorial,
     jobs,
@@ -96,6 +97,19 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "publication_review_decisions",
         "trg_publication_review_decisions_append_only",
     ): "reject_evidence_mutation",
+    (
+        "publication_manifests",
+        "trg_publication_manifests_append_only",
+    ): "reject_evidence_mutation",
+    (
+        "publication_manifest_entries",
+        "trg_publication_manifest_entries_append_only",
+    ): "reject_evidence_mutation",
+    (
+        "publication_manifest_exclusions",
+        "trg_publication_manifest_exclusions_append_only",
+    ): "reject_evidence_mutation",
+    ("edition_releases", "trg_edition_releases_append_only"): "reject_evidence_mutation",
     (
         "production_input_snapshots",
         "trg_production_input_snapshots_append_only",

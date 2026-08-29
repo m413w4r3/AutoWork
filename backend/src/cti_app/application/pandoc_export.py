@@ -28,7 +28,24 @@ def export_brief_docx(
     executable: str = "pandoc",
     timeout: float = 30.0,
 ) -> Path:
-    """Render and export one DOCX, failing with actionable boundary errors."""
+    return export_markdown_docx(
+        render_brief_pandoc(document),
+        output_path,
+        reference_doc=reference_doc,
+        executable=executable,
+        timeout=timeout,
+    )
+
+
+def export_markdown_docx(
+    markdown_content: str,
+    output_path: Path,
+    *,
+    reference_doc: Path = DEFAULT_REFERENCE_DOC,
+    executable: str = "pandoc",
+    timeout: float = 30.0,
+) -> Path:
+    """Export renderer-independent Markdown to DOCX with Pandoc."""
     binary = shutil.which(executable)
     if binary is None:
         raise PandocExportError(f"Pandoc executable not found: {executable}")
@@ -40,7 +57,7 @@ def export_brief_docx(
     LOGGER.info("Pandoc version: %s", version.stdout.splitlines()[0])
     with tempfile.TemporaryDirectory(prefix="autowork-pandoc-") as directory:
         markdown = Path(directory) / "brief.md"
-        markdown.write_text(render_brief_pandoc(document), encoding="utf-8")
+        markdown.write_text(markdown_content, encoding="utf-8")
         try:
             completed = subprocess.run(
                 [

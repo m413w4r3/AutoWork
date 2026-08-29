@@ -108,6 +108,11 @@ class EditionReviewService:
             edition = await uow.editions.get(edition_id)
             self._require_review(edition, edition_id)
             rows = await uow.edition_review_read_model.list_for_edition(edition_id)
+        return self.from_rows(edition_id, rows)
+
+    @staticmethod
+    def from_rows(edition_id: UUID, rows: Sequence[EditionReviewReadItem]) -> EditionReview:
+        """Evaluate the same review rules inside an already open transaction."""
         items = tuple(_build_item(row) for row in rows)
         return EditionReview(
             edition_id=edition_id,
@@ -185,9 +190,7 @@ class EditionReviewService:
                         )
                     )
                 ):
-                    raise ReviewItemStaleError(
-                        "review item does not refer to the current document"
-                    )
+                    raise ReviewItemStaleError("review item does not refer to the current document")
             elif (
                 artifact.id != document_artifact_id
                 or artifact.version != document_artifact_version

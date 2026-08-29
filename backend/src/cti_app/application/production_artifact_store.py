@@ -34,10 +34,13 @@ class ProductionArtifactStore:
         self._catalog = catalog
 
     async def put_text(self, text: str, *, bucket: str) -> UUID:
+        return await self.put_bytes(
+            text.encode("utf-8"), bucket=bucket, mime_type="text/plain; charset=utf-8"
+        )
+
+    async def put_bytes(self, content: bytes, *, bucket: str, mime_type: str) -> UUID:
         record = await self._catalog.ingest(
-            BytesIO(text.encode("utf-8")),
-            logical_bucket=bucket,
-            mime_type="text/plain; charset=utf-8",
+            BytesIO(content), logical_bucket=bucket, mime_type=mime_type
         )
         return record.id
 
@@ -69,8 +72,10 @@ class ProductionArtifactStore:
         return record.id, hashlib.sha256(encoded).hexdigest()
 
     async def read_text(self, blob_id: UUID) -> str:
-        raw = await self._catalog.read(blob_id, max_bytes=MAX_ARTIFACT_BYTES)
-        return raw.decode("utf-8")
+        return (await self.read_bytes(blob_id)).decode("utf-8")
+
+    async def read_bytes(self, blob_id: UUID, *, max_bytes: int = MAX_ARTIFACT_BYTES) -> bytes:
+        return await self._catalog.read(blob_id, max_bytes=max_bytes)
 
     async def read_json(self, blob_id: UUID) -> dict[str, Any]:
         payload = json.loads(await self.read_text(blob_id))

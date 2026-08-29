@@ -18,6 +18,12 @@ from cti_app.infrastructure.database.models.collection import (
 )
 from cti_app.infrastructure.database.models.core import ProvenanceEventRow
 from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
+from cti_app.infrastructure.database.models.edition_publication import (
+    EditionReleaseRow,
+    PublicationManifestEntryRow,
+    PublicationManifestExclusionRow,
+    PublicationManifestRow,
+)
 from cti_app.infrastructure.database.models.editions import EditionAuditEventRow, EditionRow
 from cti_app.infrastructure.database.models.editorial import EditorialGroupRow, HumanDecisionRow
 from cti_app.infrastructure.database.models.jobs import JobEventRow, JobRow
@@ -33,6 +39,7 @@ from cti_app.infrastructure.database.models.production import (
     ProductionArtifactRow,
     SubjectProductionRunRow,
 )
+from cti_app.infrastructure.database.models.publication_review import PublicationReviewDecisionRow
 
 
 class SqlAlchemyEditionRepository:
@@ -100,6 +107,7 @@ class SqlAlchemyEditionRepository:
 
     async def delete(self, edition_id: UUID, expected_version: int) -> bool:
         # Single transaction, strict FK dependency order.
+        await self._session.execute(text("SET LOCAL cti.allow_destructive_edition_delete = 'on'"))
         batch_rows = list(
             (
                 await self._session.execute(
@@ -165,6 +173,35 @@ class SqlAlchemyEditionRepository:
                 select(EditionProductionBatchRow.id).where(
                     EditionProductionBatchRow.edition_id == edition_id
                 )
+            )
+        )
+        manifest_ids = list(
+            await self._session.scalars(
+                select(PublicationManifestRow.id).where(
+                    PublicationManifestRow.edition_id == edition_id
+                )
+            )
+        )
+        if manifest_ids:
+            await self._session.execute(
+                delete(EditionReleaseRow).where(EditionReleaseRow.manifest_id.in_(manifest_ids))
+            )
+            await self._session.execute(
+                delete(PublicationManifestExclusionRow).where(
+                    PublicationManifestExclusionRow.manifest_id.in_(manifest_ids)
+                )
+            )
+            await self._session.execute(
+                delete(PublicationManifestEntryRow).where(
+                    PublicationManifestEntryRow.manifest_id.in_(manifest_ids)
+                )
+            )
+            await self._session.execute(
+                delete(PublicationManifestRow).where(PublicationManifestRow.id.in_(manifest_ids))
+            )
+        await self._session.execute(
+            delete(PublicationReviewDecisionRow).where(
+                PublicationReviewDecisionRow.edition_id == edition_id
             )
         )
         if batch_ids:

@@ -22,6 +22,7 @@ EXPECTED_CHAIN = (
     "0013_production_batch",
     "0014_publication_review",
     "0015_nullable_review_document",
+    "0016_edition_publication",
 )
 
 
@@ -55,4 +56,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0013_production_batch": "0012_goodware_index_artifacts",
         "0014_publication_review": "0013_production_batch",
         "0015_nullable_review_document": "0014_publication_review",
+        "0016_edition_publication": "0015_nullable_review_document",
     }

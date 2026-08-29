@@ -30,6 +30,12 @@ from cti_app.domain.discovery_cumulative import (
     SubjectContribution,
     SubjectMergeEvent,
 )
+from cti_app.domain.edition_publication import (
+    EditionRelease,
+    PublicationManifestEntryV1,
+    PublicationManifestExclusionV1,
+    PublicationManifestV1,
+)
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import AnalystDecision, EditorialGroup, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
@@ -654,6 +660,10 @@ class UnitOfWork(Protocol):
     batch_status_read_model: BatchStatusReadRepository
     edition_review_read_model: EditionReviewReadRepository
     publication_review_decisions: PublicationReviewDecisionRepository
+    publication_manifests: PublicationManifestRepository
+    publication_manifest_entries: PublicationManifestEntryRepository
+    publication_manifest_exclusions: PublicationManifestExclusionRepository
+    edition_releases: EditionReleaseRepository
 
     async def __aenter__(self) -> Self: ...
 
@@ -834,6 +844,10 @@ class ProductionUnitOfWork(Protocol):
     edition_production_batch_items: EditionProductionBatchItemRepository
     edition_review_read_model: EditionReviewReadRepository
     publication_review_decisions: PublicationReviewDecisionRepository
+    publication_manifests: PublicationManifestRepository
+    publication_manifest_entries: PublicationManifestEntryRepository
+    publication_manifest_exclusions: PublicationManifestExclusionRepository
+    edition_releases: EditionReleaseRepository
 
     async def __aenter__(self) -> Self: ...
 
@@ -859,3 +873,45 @@ class PublicationReviewDecisionRepository(Protocol):
     async def append(self, decision: PublicationReviewDecision) -> None: ...
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[PublicationReviewDecision]: ...
+
+
+class PublicationManifestRepository(Protocol):
+    async def add(self, manifest: PublicationManifestV1, manifest_blob_id: UUID) -> None: ...
+
+    async def get(self, manifest_id: UUID) -> PublicationManifestV1 | None: ...
+
+    async def get_blob_id(self, manifest_id: UUID) -> UUID | None: ...
+
+    async def get_for_edition_version(
+        self, edition_id: UUID, edition_version: int
+    ) -> PublicationManifestV1 | None: ...
+
+    async def get_latest_for_edition(self, edition_id: UUID) -> PublicationManifestV1 | None: ...
+
+
+class PublicationManifestEntryRepository(Protocol):
+    async def append_many(
+        self, manifest_id: UUID, entries: Sequence[PublicationManifestEntryV1]
+    ) -> None: ...
+
+    async def list_for_manifest(
+        self, manifest_id: UUID
+    ) -> Sequence[PublicationManifestEntryV1]: ...
+
+
+class PublicationManifestExclusionRepository(Protocol):
+    async def append_many(
+        self, manifest_id: UUID, exclusions: Sequence[PublicationManifestExclusionV1]
+    ) -> None: ...
+
+    async def list_for_manifest(
+        self, manifest_id: UUID
+    ) -> Sequence[PublicationManifestExclusionV1]: ...
+
+
+class EditionReleaseRepository(Protocol):
+    async def add_if_absent(self, release: EditionRelease) -> bool: ...
+
+    async def get_by_manifest(self, manifest_id: UUID) -> EditionRelease | None: ...
+
+    async def get_for_edition(self, edition_id: UUID) -> EditionRelease | None: ...

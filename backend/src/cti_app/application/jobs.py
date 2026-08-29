@@ -620,6 +620,7 @@ def create_job_registry(
     cumulative_discovery_service: object | None = None,
     seed_enrichment: object | None = None,
     production_checkpoint: object | None = None,
+    publication_assembly: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
@@ -705,6 +706,17 @@ def create_job_registry(
             seed_enrichment=cast(Any, seed_enrichment),
             checkpoint=production_checkpoint,
         )
+    if publication_assembly is not None:
+        from cti_app.application.edition_publication import (
+            EditionAssemblyService,
+            register_publication_jobs,
+        )
+
+        if not isinstance(publication_assembly, EditionAssemblyService):
+            raise TypeError("publication_assembly must be an EditionAssemblyService")
+        if uow_factory is None or not callable(uow_factory):
+            raise TypeError("uow_factory must be callable for publication assembly")
+        register_publication_jobs(registry, cast(Any, uow_factory), publication_assembly)
     return registry
 
 

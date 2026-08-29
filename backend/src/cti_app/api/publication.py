@@ -5,9 +5,15 @@ from __future__ import annotations
 from typing import Annotated, NoReturn
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from cti_app.application.edition_publication import (
+    EditionPublicationService,
+    EditionReleaseStatus,
+    PublicationAcceptanceError,
+    PublicationManifestNotFoundError,
+)
 from cti_app.application.edition_review import (
     EditionReview,
     EditionReviewItemNotFoundError,
@@ -21,6 +27,7 @@ from cti_app.application.edition_review import (
 from cti_app.application.identity import IdentityProvider
 from cti_app.domain.production import SubjectProductionStage, SubjectProductionStatus
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
+from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api", tags=["publication"])
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -102,9 +109,44 @@ class ReviewDecisionView(BaseModel):
     occurred_at: str
 
 
+class PublicationAcceptView(BaseModel):
+    edition_id: UUID
+    edition_status: str
+    manifest_id: UUID
+    manifest_sha256: str
+    edition_version: int
+    batch_id: UUID
+    job_id: UUID | None
+    job_dispatched: bool
+
+
+class EditionReleaseView(BaseModel):
+    edition_id: UUID
+    edition_status: str
+    manifest_id: UUID | None
+    manifest_sha256: str | None
+    release_id: UUID | None
+    json_available: bool
+    markdown_available: bool
+    docx_available: bool
+    published_at: str | None
+
+
 def _service(request: Request) -> EditionReviewService:
     configured = getattr(request.app.state, "edition_review_service", None)
     return configured or EditionReviewService(request.app.state.uow_factory)
+
+
+def _publication_service(request: Request) -> EditionPublicationService:
+    configured = getattr(request.app.state, "edition_publication_service", None)
+    if configured is None:
+        configured = EditionPublicationService(
+            request.app.state.uow_factory,
+            request.app.state.production_artifact_store,
+            job_service=getattr(request.app.state, "job_service", None),
+            job_dispatcher=getattr(request.app.state, "job_dispatcher", None),
+        )
+    return configured
 
 
 async def _actor_id(request: Request) -> str:
@@ -155,6 +197,54 @@ async def exclude_review_item(
         payload,
         request,
         PublicationDecision.EXCLUDE,
+    )
+
+
+@router.post(
+    "/editions/{edition_id}/publication/accept",
+    response_model=PublicationAcceptView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def accept_edition_publication(edition_id: UUID, request: Request) -> PublicationAcceptView:
+    try:
+        result = await _publication_service(request).accept(
+            edition_id,
+            actor_id=await _actor_id(request),
+            correlation_id=get_correlation_id(),
+        )
+        return PublicationAcceptView(
+            edition_id=result.manifest.edition_id,
+            edition_status=result.edition_status.value,
+            manifest_id=result.manifest.id,
+            manifest_sha256=result.manifest.content_sha256,
+            edition_version=result.manifest.edition_version,
+            batch_id=result.manifest.batch_id,
+            job_id=result.job_id,
+            job_dispatched=result.job_dispatched,
+        )
+    except Exception as exc:
+        _raise_publication_error(exc)
+
+
+@router.get("/editions/{edition_id}/release", response_model=EditionReleaseView)
+async def get_edition_release(edition_id: UUID, request: Request) -> EditionReleaseView:
+    try:
+        release = await _publication_service(request).release_status(edition_id)
+        return _release_view(release)
+    except Exception as exc:
+        _raise_publication_error(exc)
+
+
+@router.get("/editions/{edition_id}/release/docx")
+async def download_edition_docx(edition_id: UUID, request: Request) -> Response:
+    try:
+        _, content = await _publication_service(request).read_docx(edition_id)
+    except Exception as exc:
+        _raise_publication_error(exc)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="bulletin-{edition_id}.docx"'},
     )
 
 
@@ -230,6 +320,20 @@ def _decision_view(decision: PublicationReviewDecision) -> ReviewDecisionView:
     )
 
 
+def _release_view(release: EditionReleaseStatus) -> EditionReleaseView:
+    return EditionReleaseView(
+        edition_id=release.edition_id,
+        edition_status=release.edition_status.value,
+        manifest_id=release.manifest_id,
+        manifest_sha256=release.manifest_sha256,
+        release_id=release.release.id if release.release is not None else None,
+        json_available=release.json_available,
+        markdown_available=release.markdown_available,
+        docx_available=release.docx_available,
+        published_at=release.published_at.isoformat() if release.published_at else None,
+    )
+
+
 def _raise_review_error(exc: Exception) -> NoReturn:
     if isinstance(exc, EditionReviewNotFoundError):
         raise HTTPException(
@@ -259,4 +363,19 @@ def _raise_review_error(exc: Exception) -> NoReturn:
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"code": "invalid_review_document"},
         ) from exc
+    raise exc
+
+
+def _raise_publication_error(exc: Exception) -> NoReturn:
+    if isinstance(exc, PublicationManifestNotFoundError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Edition release not available"
+        ) from exc
+    if isinstance(exc, PublicationAcceptanceError):
+        code = str(exc)
+        if code == "edition_not_found":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Edition not found"
+            ) from exc
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": code}) from exc
     raise exc

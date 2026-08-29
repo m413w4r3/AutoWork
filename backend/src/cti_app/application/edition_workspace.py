@@ -121,6 +121,28 @@ class EditionWorkspaceMaterializer:
             files=tuple(files),
         )
 
+    async def materialize_release(
+        self,
+        *,
+        period: date,
+        country_code: str,
+        edition_id: UUID,
+        manifest: Mapping[str, Any],
+        edition: Mapping[str, Any],
+        markdown: str,
+        docx: bytes,
+    ) -> Path:
+        """Write the release projection after canonical persistence succeeds."""
+        edition_path = self._prepare_edition_path(
+            self._workspace_root, edition_id, period, country_code
+        )
+        release_path = edition_path / "release"
+        self._write_json(release_path / "publication-manifest.json", manifest)
+        self._write_json(release_path / "edition.json", edition)
+        self._write_text(release_path / "edition.md", markdown)
+        self._write_bytes(release_path / "bulletin.docx", docx)
+        return release_path
+
     @staticmethod
     def _prepare_edition_path(
         workspace_root: Path, edition_id: UUID, period: date, country_code: str
@@ -200,6 +222,19 @@ class EditionWorkspaceMaterializer:
         temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         try:
             temporary.write_bytes(encoded)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def _write_bytes(cls, path: Path, content: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cls._safe_destination(path)
+        if path.is_file() and path.read_bytes() == content:
+            return
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_bytes(content)
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)

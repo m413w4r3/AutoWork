@@ -69,6 +69,10 @@ from cti_app.infrastructure.database.models.core import (
     VirusTotalFileViewRow,
     VirusTotalObservationRow,
 )
+from cti_app.infrastructure.database.models.edition_publication import (
+    EditionReleaseRow,
+    PublicationManifestRow,
+)
 from cti_app.infrastructure.database.models.model_execution import (
     ModelConversationTurnRow,
     ModelRunRow,
@@ -216,6 +220,26 @@ class SqlAlchemyBlobRepository:
             .select_from(CodeFeatureSetRow)
             .where(CodeFeatureSetRow.feature_blob_id == blob_id)
         )
+        manifest_count = await self._session.scalar(
+            select(func.count())
+            .select_from(PublicationManifestRow)
+            .where(PublicationManifestRow.manifest_blob_id == blob_id)
+        )
+        release_json_count = await self._session.scalar(
+            select(func.count())
+            .select_from(EditionReleaseRow)
+            .where(EditionReleaseRow.edition_document_blob_id == blob_id)
+        )
+        release_markdown_count = await self._session.scalar(
+            select(func.count())
+            .select_from(EditionReleaseRow)
+            .where(EditionReleaseRow.markdown_blob_id == blob_id)
+        )
+        release_docx_count = await self._session.scalar(
+            select(func.count())
+            .select_from(EditionReleaseRow)
+            .where(EditionReleaseRow.docx_blob_id == blob_id)
+        )
         return (
             int(document_count or 0)
             + int(decoded_document_count or 0)
@@ -235,6 +259,10 @@ class SqlAlchemyBlobRepository:
             + int(capability_set_count or 0)
             + int(code_feature_set_count or 0)
             + int(code_feature_payload_count or 0)
+            + int(manifest_count or 0)
+            + int(release_json_count or 0)
+            + int(release_markdown_count or 0)
+            + int(release_docx_count or 0)
         )
 
     async def delete(self, blob_id: UUID) -> None:

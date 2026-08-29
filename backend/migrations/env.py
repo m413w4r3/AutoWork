@@ -11,6 +11,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     collection,
     core,
     discovery,
+    edition_publication,
     editions,
     editorial,
     jobs,

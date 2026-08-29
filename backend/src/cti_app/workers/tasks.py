@@ -17,6 +17,10 @@ from cti_app.application.discovery.cumulative.jobs import RECONCILE_DISCOVERY_JO
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.service import DiscoveryService
+from cti_app.application.edition_publication import (
+    EDITION_ASSEMBLE_JOB_KIND,
+    EditionAssemblyService,
+)
 from cti_app.application.edition_workspace import EditionProductionCheckpointService
 from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.http_collection import (
@@ -67,6 +71,7 @@ EXECUTE_JOB_TIME_LIMIT_MS = int(get_settings().job_actor_time_limit_seconds * 10
 # les déclare explicitement pour ne pas construire tous les services métier.
 DURABLE_RESUME_JOB_KINDS = frozenset(
     {
+        EDITION_ASSEMBLE_JOB_KIND,
         DISCOVERY_JOB_KIND,
         *(stage_job_kind(stage) for stage in production_stages(ProductionProfile.BRIEF_AUTO)),
     }
@@ -271,6 +276,11 @@ async def _execute_job(job_id: UUID) -> int | None:
             settings.edition_workspace_root,
             diagnostics=production_diagnostics,
         )
+        publication_assembly = EditionAssemblyService(
+            uow_factory,
+            production_artifact_store,
+            workspace_materializer=None,
+        )
         production_pacing = ProductionPacingPolicy.from_settings(settings)
         production_chain = ProductionStageChain(production_pacing)
         registry = create_job_registry(
@@ -286,6 +296,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             cumulative_discovery_service=cumulative_discovery_service,
             seed_enrichment=seed_enrichment,
             production_checkpoint=production_checkpoint,
+            publication_assembly=publication_assembly,
         )
         job_service = JobService(uow_factory, registry)
         production_chain.bind(job_service, job_dispatcher)
