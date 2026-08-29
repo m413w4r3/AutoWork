@@ -82,6 +82,9 @@ describe("EditionDetailPage archivage", () => {
     expect(
       screen.queryByRole("button", { name: "Archiver l’édition" }),
     ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Supprimer définitivement/ }),
+    ).not.toBeInTheDocument();
   });
 
   it("conserve l’archivage pour une édition PUBLISHED", async () => {

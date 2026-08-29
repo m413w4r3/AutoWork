@@ -243,3 +243,28 @@ async def test_repeated_snapshot_synchronization_is_idempotent() -> None:
 
     assert len(first) == len(second) == 1
     assert first[0].id == second[0].id
+
+
+@pytest.mark.asyncio
+async def test_selection_survives_workspace_projection_failure() -> None:
+    class FailingWorkspace:
+        async def materialize(self, *args: object) -> None:
+            del args
+            raise OSError("workspace unavailable")
+
+    uow = InMemoryEditorialUnitOfWorkFactory()
+    edition = _edition()
+    uow.editions[edition.id] = edition
+    candidate = _candidate("Workspace failure", "https://example.test/failure")
+    candidate.iocs = ("203.0.113.10",)
+    uow.snapshots[edition.id] = _snapshot(
+        edition.id,
+        [(uuid4(), candidate, (DiscoveryMemberReference(uuid4(), candidate.id),))],
+    )
+
+    service = EditorialGroupingService(uow, materializer=FailingWorkspace())
+    groups = await service.synchronize(edition.id)
+
+    assert groups[0].status is EditorialGroupStatus.SELECTED
+    assert groups[0].subject_id in uow.subjects
+    assert len(uow.decisions) == 1

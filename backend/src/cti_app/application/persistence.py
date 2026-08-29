@@ -73,6 +73,11 @@ from cti_app.domain.publication_review import PublicationReviewDecision
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
 from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 
+
+class ActiveSubjectProductionRunConflictError(RuntimeError):
+    """The database rejected a second active run for one subject."""
+
+
 if TYPE_CHECKING:
     from cti_app.application.edition_review import EditionReviewReadRepository
 
@@ -349,8 +354,6 @@ class EditionRepository(Protocol):
 
     async def update(self, edition: Edition, expected_version: int) -> bool: ...
 
-    async def delete(self, edition_id: UUID, expected_version: int) -> bool: ...
-
     async def list(
         self,
         *,
@@ -367,8 +370,6 @@ class EditionAuditRepository(Protocol):
     async def append(self, event: EditionAuditEvent) -> None: ...
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[EditionAuditEvent]: ...
-
-    async def delete_for_edition(self, edition_id: UUID) -> None: ...
 
 
 class ModelRunRepository(Protocol):
@@ -731,6 +732,8 @@ class SubjectProductionRunRepository(Protocol):
     async def save(self, run: SubjectProductionRun) -> None: ...
 
     async def get_current_for_subject(self, subject_id: UUID) -> SubjectProductionRun | None: ...
+
+    async def lock_creation_for_subject(self, subject_id: UUID) -> None: ...
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectProductionRun]: ...
 

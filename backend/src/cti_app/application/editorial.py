@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -29,6 +30,9 @@ from cti_app.domain.editorial import (
     HumanDecisionType,
 )
 from cti_app.domain.entities import Sample, SourceDocument, Subject
+from cti_app.logging import get_correlation_id
+
+logger = logging.getLogger(__name__)
 
 
 class EditorialGroupNotFoundError(LookupError):
@@ -97,7 +101,27 @@ class EditorialGroupingService:
         self._workspace_root = workspace_root
         self._auto_selection_policy = auto_selection_policy or EditorialAutoSelectionPolicyV1()
 
+    async def _materialize_subject(
+        self, edition_id: UUID, group_id: UUID, subject: Subject
+    ) -> None:
+        if self._materializer is None:
+            return
+        try:
+            await self._materializer.materialize(subject, (), (), {}, self._workspace_root)
+        except Exception:
+            logger.exception(
+                "subject_workspace_materialize_failed",
+                extra={
+                    "operation": "subject_workspace_materialize",
+                    "edition_id": str(edition_id),
+                    "group_id": str(group_id),
+                    "subject_id": str(subject.id),
+                    "correlation_id": get_correlation_id(),
+                },
+            )
+
     async def synchronize(self, edition_id: UUID) -> list[EditorialGroup]:
+        selected_subjects: list[tuple[UUID, Subject]] = []
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
             if edition is None:
@@ -177,7 +201,7 @@ class EditorialGroupingService:
                 if snapshot_candidate is not None:
                     group_candidates = (*group_candidates, snapshot_candidate)
                 if self._auto_selection_policy.should_select_article(group_candidates):
-                    await self._select_locked(
+                    selected_subject = await self._select_locked(
                         uow,
                         edition,
                         group,
@@ -187,8 +211,11 @@ class EditorialGroupingService:
                         rule=self._auto_selection_policy.rule,
                         policy_version=self._auto_selection_policy.version,
                     )
+                    selected_subjects.append((group.id, selected_subject))
             await uow.commit()
-            return existing
+        for group_id, selected_subject in selected_subjects:
+            await self._materialize_subject(edition_id, group_id, selected_subject)
+        return existing
 
     async def board(self, edition_id: UUID) -> EditorialBoard:
         async with self._uow_factory() as uow:
@@ -229,6 +256,7 @@ class EditorialGroupingService:
             raise EditorialActionError("A group can only be decided once per confirmation")
 
         ordered = sorted(commands, key=lambda command: command.group_id.hex)
+        selected_subjects: list[tuple[UUID, Subject]] = []
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
             if edition is None:
@@ -269,7 +297,7 @@ class EditorialGroupingService:
                     )
                     continue
 
-                await self._select_locked(
+                subject = await self._select_locked(
                     uow,
                     edition,
                     group,
@@ -277,7 +305,10 @@ class EditorialGroupingService:
                     correlation_id=correlation_id,
                     batch_confirmation=True,
                 )
+                selected_subjects.append((group.id, subject))
             await uow.commit()
+        for group_id, subject in selected_subjects:
+            await self._materialize_subject(edition_id, group_id, subject)
 
     async def merge(
         self,
@@ -415,7 +446,7 @@ class EditorialGroupingService:
             edition = await uow.editions.get(edition_id)
             if group is None or group.edition_id != edition_id or edition is None:
                 raise EditorialGroupNotFoundError(str(group_id))
-            await self._select_locked(
+            subject = await self._select_locked(
                 uow,
                 edition,
                 group,
@@ -423,7 +454,8 @@ class EditorialGroupingService:
                 correlation_id=correlation_id,
             )
             await uow.commit()
-            return group
+        await self._materialize_subject(edition_id, group.id, subject)
+        return group
 
     async def _select_locked(
         self,
@@ -437,7 +469,7 @@ class EditorialGroupingService:
         rule: str | None = None,
         policy_version: int | None = None,
         batch_confirmation: bool = False,
-    ) -> EditorialGroup:
+    ) -> Subject:
         # All selection modes share this transaction and mutation sequence.
         subject = Subject(
             external_id=f"edition:{group.edition_id}:group:{group.id}",
@@ -445,8 +477,6 @@ class EditorialGroupingService:
             tlp=edition.tlp,
         )
         await uow.subjects.add(subject)
-        if self._materializer is not None:
-            await self._materializer.materialize(subject, (), (), {}, self._workspace_root)
         group.select(subject.id)
         await uow.editorial_groups.save(group)
         payload: dict[str, object] = {
@@ -470,7 +500,7 @@ class EditorialGroupingService:
                 payload=payload,
             )
         )
-        return group
+        return subject
 
     async def decisions(self, edition_id: UUID) -> list[HumanDecision]:
         async with self._uow_factory() as uow:

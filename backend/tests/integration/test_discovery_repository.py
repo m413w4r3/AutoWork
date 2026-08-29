@@ -180,14 +180,6 @@ async def test_discovery_batch_round_trip_and_source_status(
         )
         assert reread.citations[0]["label"] == "Original report"
 
-        async with SqlAlchemyUnitOfWork(session_factory) as uow:
-            assert await uow.editions.delete(edition.id, edition.version)
-            await uow.commit()
-
-        async with SqlAlchemyUnitOfWork(session_factory) as uow:
-            assert await uow.editions.get(edition.id) is None
-            assert await uow.discovery_batches.get(batch.id) is None
-            assert await uow.model_runs.get(research_run.id) is None
     finally:
         await engine.dispose()
 
@@ -200,10 +192,10 @@ async def test_discovery_batch_contributions_metadata_preserved(
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
     edition = Edition(
-        country="Iran",
-        country_code="IR",
-        period_start=date(2026, 8, 1),
-        period_end=date(2026, 8, 31),
+        country="Iraq",
+        country_code="IQ",
+        period_start=date(2026, 9, 1),
+        period_end=date(2026, 9, 30),
         tlp=TLP.AMBER,
         languages=("fr", "en", "fa"),
         target_articles=8,

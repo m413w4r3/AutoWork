@@ -4,12 +4,14 @@ import asyncio
 from datetime import date
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from types import TracebackType
+from typing import Any, cast
+from uuid import uuid4
 
 import pytest
 
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.persistence import ProductionUnitOfWorkFactory, UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_parsers import (
     reference_report_from_json,
@@ -17,6 +19,7 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.production_state import ProductionStateService
+from cti_app.application.subject_production import SubjectProductionService
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
@@ -32,6 +35,8 @@ from cti_app.domain.production import (
     SubjectProductionStatus,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
+from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 
 pytestmark = pytest.mark.integration
 
@@ -429,15 +434,83 @@ async def test_run_number_allocation_is_serialized_in_postgres(
 
     async def create_run() -> int:
         async with uow_factory() as uow:
+            await uow.subject_production_runs.lock_creation_for_subject(subject.id)
             number = await uow.subject_production_runs.allocate_next_run_number(subject.id)
             await uow.subject_production_runs.add(
                 SubjectProductionRun(
                     subject_id=subject.id,
                     edition_id=edition.id,
                     run_number=number,
+                    status=SubjectProductionStatus.CANCELLED,
                 )
             )
             await uow.commit()
             return number
 
     assert sorted(await asyncio.gather(create_run(), create_run())) == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_subject_run_creation_converges_on_one_postgres_run(
+    migrated_postgres_url: str,
+) -> None:
+    """The creation lock and partial index make duplicate starts idempotent."""
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    edition = Edition(
+        country="Germany",
+        country_code="DE",
+        period_start=date(2027, 1, 1),
+        period_end=date(2027, 1, 31),
+        tlp=TLP.AMBER,
+        languages=("fr",),
+        target_articles=2,
+        source_profile="test",
+    )
+    subject = Subject(
+        external_id=f"SUBJ-CONCURRENT-{uuid4().hex}",
+        slug=f"concurrent-{uuid4().hex}",
+        tlp=TLP.AMBER,
+    )
+
+    async with SqlAlchemyUnitOfWork(session_factory) as uow:
+        assert await uow.editions.add_if_absent(edition)
+        await uow.subjects.add(subject)
+        await uow.commit()
+
+    class RunCreationUnitOfWork:
+        production_input_snapshots = None
+
+        def __init__(self) -> None:
+            self._delegate = SqlAlchemyUnitOfWork(session_factory)
+
+        async def __aenter__(self) -> Any:
+            await self._delegate.__aenter__()
+            return self
+
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            await self._delegate.__aexit__(exc_type, exc_value, traceback)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._delegate, name)
+
+    def factory() -> Any:
+        return RunCreationUnitOfWork()
+
+    service = SubjectProductionService(cast(ProductionUnitOfWorkFactory, factory))
+    try:
+        results = await asyncio.gather(
+            service.create_run(subject.id, edition.id),
+            service.create_run(subject.id, edition.id),
+        )
+    finally:
+        await engine.dispose()
+
+    assert len({run.id for run, _ in results}) == 1
+    assert sorted(created for _, created in results) == [False, True]
+    assert {run.run_number for run, _ in results} == {1}

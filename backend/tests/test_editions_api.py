@@ -1,4 +1,5 @@
 from datetime import date
+from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -247,12 +248,13 @@ async def test_create_read_update_transition_and_filter_scenario() -> None:
         listed = await client.get("/api/editions?country_code=IR&period=2026-07")
         audit = await client.get(f"/api/editions/{edition_id}/audit")
         stale = await client.put(f"/api/editions/{edition_id}", json=update_payload)
-        stale_delete = await client.delete(f"/api/editions/{edition_id}?version=1")
-        deleted = await client.delete(
-            f"/api/editions/{edition_id}?version={transitioned.json()['version']}"
+        archived = await client.post(
+            f"/api/editions/{edition_id}/transitions",
+            json={
+                "target_status": "archived",
+                "version": transitioned.json()["version"],
+            },
         )
-        missing = await client.get(f"/api/editions/{edition_id}")
-        listed_after_delete = await client.get("/api/editions?country_code=IR&period=2026-07")
 
     assert created.status_code == 201
     assert fetched.json()["country"] == "Iran"
@@ -260,6 +262,8 @@ async def test_create_read_update_transition_and_filter_scenario() -> None:
     assert transitioned.json()["status"] == "discovery"
     assert transitioned.json()["allowed_transitions"] == ["selection", "archived"]
     assert listed.json()["total"] == 1
+    assert archived.status_code == 200
+    assert archived.json()["status"] == "archived"
     assert [event["actor_id"] for event in audit.json()] == [
         "dev-analyst",
         "dev-analyst",
@@ -267,7 +271,19 @@ async def test_create_read_update_transition_and_filter_scenario() -> None:
     ]
     assert stale.status_code == 409
     assert stale.json()["detail"]["code"] == "stale_edition_version"
-    assert stale_delete.status_code == 409
-    assert deleted.status_code == 204
-    assert missing.status_code == 404
-    assert listed_after_delete.json()["total"] == 0
+    assert listed.json()["total"] == 1
+
+
+async def test_edition_delete_endpoint_is_not_public() -> None:
+    factory = InMemoryEditionUnitOfWorkFactory()
+    application = FastAPI()
+    application.include_router(router)
+    application.state.edition_service = EditionService(factory)
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.delete(f"/api/editions/{uuid4()}?version=1")
+
+    assert response.status_code == 405

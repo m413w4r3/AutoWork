@@ -508,7 +508,7 @@ class SubjectCollectionService:
         message = _summary_message(summary)
         await context.report_progress(len(sources), len(sources), message)
         if summary.success_count:
-            await self._materialize_workspace(subject_id)
+            await self._materialize_workspace(subject_id, job_id=job_id)
         output_reference = await self._record_summary(subject_id, job_id, summary)
         logger.info(
             "source_collection_completed",
@@ -722,7 +722,7 @@ class SubjectCollectionService:
             await uow.commit()
         return f"provenance://events/{event.id}"
 
-    async def _materialize_workspace(self, subject_id: UUID) -> None:
+    async def _materialize_workspace(self, subject_id: UUID, *, job_id: UUID | None = None) -> None:
         if self._workspace_materializer is None or self._workspace_root is None:
             return
         async with self._uow_factory() as uow:
@@ -730,7 +730,12 @@ class SubjectCollectionService:
             if subject is None:
                 raise CollectionItemNotFoundError(str(subject_id))
             documents = list(await uow.source_documents.list_for_subject(subject_id))
-            samples = list(await uow.samples.list_for_subject(subject_id))
+            samples_repository = getattr(uow, "samples", None)
+            samples = (
+                list(await samples_repository.list_for_subject(subject_id))
+                if samples_repository is not None
+                else []
+            )
             blob_ids = {
                 blob_id
                 for document in documents
@@ -743,13 +748,24 @@ class SubjectCollectionService:
                 if blob is None:
                     raise CollectionItemNotFoundError(str(blob_id))
                 blobs[blob_id] = blob
-        await self._workspace_materializer.materialize(
-            subject,
-            documents,
-            samples,
-            blobs,
-            self._workspace_root,
-        )
+        try:
+            await self._workspace_materializer.materialize(
+                subject,
+                documents,
+                samples,
+                blobs,
+                self._workspace_root,
+            )
+        except Exception:
+            logger.exception(
+                "subject_workspace_materialize_failed",
+                extra={
+                    "operation": "subject_workspace_materialize",
+                    "subject_id": str(subject_id),
+                    "job_id": str(job_id) if job_id is not None else None,
+                    "correlation_id": get_correlation_id(),
+                },
+            )
 
     @staticmethod
     def _log_source_result(

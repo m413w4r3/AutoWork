@@ -45,16 +45,6 @@ class InMemoryEditionRepository:
         self._state[edition.id] = deepcopy(edition)
         return True
 
-    async def delete(self, edition_id: UUID, expected_version: int) -> bool:
-        current = self._state.get(edition_id)
-        if current is None or current.version != expected_version:
-            return False
-        del self._state[edition_id]
-        for edition in self._state.values():
-            if edition.previous_edition_id == edition_id:
-                edition.previous_edition_id = None
-        return True
-
     async def list(
         self,
         *,
@@ -86,10 +76,6 @@ class InMemoryEditionAuditRepository:
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[EditionAuditEvent]:
         return [deepcopy(event) for event in self._events if event.edition_id == edition_id]
-
-    async def delete_for_edition(self, edition_id: UUID) -> None:
-        self._events[:] = [event for event in self._events if event.edition_id != edition_id]
-
 
 class InMemoryEditionUnitOfWork:
     editions: EditionRepository

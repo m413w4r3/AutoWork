@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID
 
 from cti_app.application.persistence import (
+    ActiveSubjectProductionRunConflictError,
     ProductionUnitOfWork,
     ProductionUnitOfWorkFactory,
 )
@@ -169,42 +170,60 @@ class SubjectProductionService:
         knows whether to start it and submit a job — two concurrent POSTs must
         yield one logical run and one logical job.
         """
-        async with self._uow_factory() as uow:
-            existing = await uow.subject_production_runs.get_current_for_subject(subject_id)
-            if existing and existing.status in (
-                SubjectProductionStatus.QUEUED,
-                SubjectProductionStatus.RUNNING,
-            ):
-                return existing, False
+        try:
+            async with self._uow_factory() as uow:
+                lock_creation = getattr(
+                    uow.subject_production_runs, "lock_creation_for_subject", None
+                )
+                if lock_creation is not None:
+                    await lock_creation(subject_id)
 
-            allocator = getattr(uow.subject_production_runs, "allocate_next_run_number", None)
-            if allocator is not None:
-                next_run_number = await allocator(subject_id)
-            else:
-                # Lightweight test repositories predating the SQL helper.
-                all_runs = await uow.subject_production_runs.list_for_edition(edition_id)
-                next_run_number = 1 + sum(1 for r in all_runs if r.subject_id == subject_id)
+                existing = await uow.subject_production_runs.get_current_for_subject(subject_id)
+                if existing and existing.status in (
+                    SubjectProductionStatus.QUEUED,
+                    SubjectProductionStatus.RUNNING,
+                ):
+                    return existing, False
 
-            run = SubjectProductionRun(
-                subject_id=subject_id,
-                edition_id=edition_id,
-                run_number=next_run_number,
-            )
-            await uow.subject_production_runs.add(run)
-            snapshot_repository = getattr(uow, "production_input_snapshots", None)
-            if snapshot_repository is not None:
-                assert run.research_date is not None
-                snapshot = await capture_production_input_snapshot(
-                    uow,
-                    production_run_id=run.id,
+                allocator = getattr(uow.subject_production_runs, "allocate_next_run_number", None)
+                if allocator is not None:
+                    next_run_number = await allocator(subject_id)
+                else:
+                    # Lightweight test repositories predating the SQL helper.
+                    all_runs = await uow.subject_production_runs.list_for_edition(edition_id)
+                    next_run_number = 1 + sum(1 for r in all_runs if r.subject_id == subject_id)
+
+                run = SubjectProductionRun(
                     subject_id=subject_id,
                     edition_id=edition_id,
-                    research_date=run.research_date,
-                    captured_at=run.created_at,
+                    run_number=next_run_number,
                 )
-                await snapshot_repository.add(snapshot)
-            await uow.commit()
-            return run, True
+                await uow.subject_production_runs.add(run)
+                snapshot_repository = getattr(uow, "production_input_snapshots", None)
+                if snapshot_repository is not None:
+                    assert run.research_date is not None
+                    snapshot = await capture_production_input_snapshot(
+                        uow,
+                        production_run_id=run.id,
+                        subject_id=subject_id,
+                        edition_id=edition_id,
+                        research_date=run.research_date,
+                        captured_at=run.created_at,
+                    )
+                    await snapshot_repository.add(snapshot)
+                await uow.commit()
+                return run, True
+        except ActiveSubjectProductionRunConflictError:
+            # The partial unique index is a final race-safety net.  Reload the
+            # committed winner so an extremely narrow race remains idempotent.
+            async with self._uow_factory() as uow:
+                winner = await uow.subject_production_runs.get_current_for_subject(subject_id)
+                if winner and winner.status in (
+                    SubjectProductionStatus.QUEUED,
+                    SubjectProductionStatus.RUNNING,
+                ):
+                    return winner, False
+            raise
 
     async def start_run(self, run_id: UUID) -> SubjectProductionRun:
         async with self._uow_factory() as uow:
@@ -212,8 +231,9 @@ class SubjectProductionService:
             if not run:
                 raise ValueError(f"Production run {run_id} not found")
 
-            run.start_running(now=datetime.now(UTC))
-            await uow.subject_production_runs.save(run)
+            if run.status is not SubjectProductionStatus.RUNNING:
+                run.start_running(now=datetime.now(UTC))
+                await uow.subject_production_runs.save(run)
             await uow.commit()
             return run
 
@@ -476,6 +496,20 @@ class EditionProductionService:
 
             items = []
             for position, subject_id in enumerate(subject_ids, start=1):
+                lock_creation = getattr(
+                    uow.subject_production_runs, "lock_creation_for_subject", None
+                )
+                if lock_creation is not None:
+                    await lock_creation(subject_id)
+                get_current = getattr(
+                    uow.subject_production_runs, "get_current_for_subject", None
+                )
+                current_run = await get_current(subject_id) if get_current is not None else None
+                if current_run and current_run.status in (
+                    SubjectProductionStatus.QUEUED,
+                    SubjectProductionStatus.RUNNING,
+                ):
+                    raise ValueError("subject_production_run_active")
                 run = SubjectProductionRun(
                     subject_id=subject_id,
                     edition_id=edition_id,

@@ -647,6 +647,29 @@ async def test_blob_store_failure_remains_systemic(tmp_path: Path) -> None:
         await app.archive_one(source.id, uuid4())
 
 
+async def test_workspace_failure_does_not_fail_collection_job(tmp_path: Path) -> None:
+    class FailingWorkspace:
+        async def materialize(self, *args: object) -> None:
+            del args
+            raise OSError("workspace unavailable")
+
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(Transport([response()]), Resolver()),
+        FilesystemBlobStore(tmp_path / "blobs"),
+        workspace_materializer=FailingWorkspace(),  # type: ignore[arg-type]
+        workspace_root=tmp_path / "workspaces",
+    )
+    context = cast(JobExecutionContext, NoopContext(uuid4()))
+
+    output_reference = await app.collect_subject(subject.id, context.job_id, context)
+
+    assert output_reference.startswith("provenance://events/")
+    assert any(event.event_type == "source.collection_completed" for event in factory.provenance)
+
+
 async def test_postgresql_commit_failure_remains_systemic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

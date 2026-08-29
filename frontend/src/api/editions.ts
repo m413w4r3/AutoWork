@@ -90,13 +90,6 @@ export function transitionEdition(
   );
 }
 
-export function deleteEdition(edition: Edition): Promise<void> {
-  return request<void>(
-    `/api/editions/${encodeURIComponent(edition.id)}?version=${edition.version}`,
-    { method: "DELETE" },
-  );
-}
-
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (response.ok) {

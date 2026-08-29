@@ -8,7 +8,8 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict
 
-from cti_app.application.jobs import JobDispatcher, JobService
+from cti_app.application.identity import IdentityProvider
+from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobService
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_jobs import (
@@ -149,6 +150,11 @@ async def _selected_article_group(request: Request, subject_id: UUID) -> Editori
         return group
 
 
+async def _actor_id(request: Request) -> str:
+    provider: IdentityProvider = request.app.state.identity_provider
+    return (await provider.current()).actor_id
+
+
 def _production_state_error(exc: ProductionStateError) -> HTTPException:
     code_to_status = {
         "production_state_not_found": status.HTTP_404_NOT_FOUND,
@@ -276,7 +282,7 @@ async def _create_and_start_run(
     *,
     subject_id: UUID,
     edition_id: UUID,
-    user: str,
+    actor_id: str,
 ) -> tuple[SubjectProductionRun, UUID | None]:
     """Creates (or reuses an in-flight) run and submits its SOURCES job.
 
@@ -305,16 +311,19 @@ async def _create_and_start_run(
         expected_stage=SubjectProductionStage.SOURCES.value,
         pipeline_generation=run.pipeline_generation,
     )
-    job = await jobs.submit(
-        kind="production.subject.sources",
-        aggregate_type="subject",
-        aggregate_id=run.subject_id,
-        idempotency_key=production_stage_idempotency_key(run, SubjectProductionStage.SOURCES),
-        correlation_id=get_correlation_id(),
-        input_parameters=parameters.model_dump(mode="json"),
-        max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
-        actor_id=user,
-    )
+    try:
+        job = await jobs.submit(
+            kind="production.subject.sources",
+            aggregate_type="subject",
+            aggregate_id=run.subject_id,
+            idempotency_key=production_stage_idempotency_key(run, SubjectProductionStage.SOURCES),
+            correlation_id=get_correlation_id(),
+            input_parameters=parameters.model_dump(mode="json"),
+            max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
+            actor_id=actor_id,
+        )
+    except DuplicateJobError as exc:
+        return run, exc.existing_job_id
     await dispatcher.dispatch(job.id)
     return run, job.id
 
@@ -323,7 +332,7 @@ async def _retry_production_run(
     request: Request,
     run_id: UUID,
     payload: RetryProductionStageRequest,
-    user: str,
+    actor_id: str,
 ) -> dict[str, Any]:
     """Retry exactly one persisted production run and enqueue its stage."""
     uow_factory, jobs, dispatcher = _runtime(request)
@@ -358,7 +367,7 @@ async def _retry_production_run(
         correlation_id=get_correlation_id(),
         input_parameters=parameters.model_dump(mode="json"),
         max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
-        actor_id=user,
+        actor_id=actor_id,
     )
     await dispatcher.dispatch(
         job.id,
@@ -379,6 +388,7 @@ async def _retry_production_run(
             new_generation=run.pipeline_generation,
             staled_artifacts=staled,
             job_id=str(job.id),
+            actor_id=actor_id,
         )
 
     view = _run_view(run, run.edition_id, job_id=job.id)
@@ -393,6 +403,8 @@ async def _retry_production_run(
 async def _cancel_non_terminal_run_jobs(
     jobs: JobService,
     runs: Sequence[tuple[UUID, UUID]],
+    *,
+    actor_id: str,
 ) -> None:
     """Request cancellation only for jobs carrying an exact production run ID."""
     list_jobs = getattr(jobs, "list_for_aggregate", None)
@@ -403,7 +415,7 @@ async def _cancel_non_terminal_run_jobs(
         for job in await list_jobs("subject", subject_id):
             if str(job.input_parameters.get("run_id")) == str(run_id) and not job.is_terminal:
                 try:
-                    await cancel_job(job.id, actor_id="system")
+                    await cancel_job(job.id, actor_id=actor_id)
                 except (LookupError, ValueError):
                     pass
 
@@ -416,7 +428,6 @@ async def start_subject_production(
     subject_id: UUID,
     request: Request,
     body: StartSubjectProductionRequest | None = None,
-    user: str = "system",
 ) -> dict[str, Any]:
     uow_factory, jobs, dispatcher = _runtime(request)
 
@@ -441,7 +452,7 @@ async def start_subject_production(
             dispatcher,
             subject_id=subject_id,
             edition_id=edition_id,
-            user=user,
+            actor_id=await _actor_id(request),
         )
     except ValueError as e:
         raise HTTPException(
@@ -585,7 +596,6 @@ async def retry_production_stage(
     subject_id: UUID,
     payload: RetryProductionStageRequest,
     request: Request,
-    user: str = "system",
 ) -> dict[str, Any]:
     """Deliberately recompute a stage in the current run and chain onward."""
     uow_factory, _, _ = _runtime(request)
@@ -598,7 +608,7 @@ async def retry_production_stage(
             )
         current_run_id = current.id
 
-    return await _retry_production_run(request, current_run_id, payload, user)
+    return await _retry_production_run(request, current_run_id, payload, await _actor_id(request))
 
 
 @router.post("/production/runs/{run_id}/retry")
@@ -606,9 +616,8 @@ async def retry_production_run(
     run_id: UUID,
     payload: RetryProductionStageRequest,
     request: Request,
-    user: str = "system",
 ) -> dict[str, Any]:
-    return await _retry_production_run(request, run_id, payload, user)
+    return await _retry_production_run(request, run_id, payload, await _actor_id(request))
 
 
 @router.post("/subjects/{subject_id}/production/cancel")
@@ -628,7 +637,11 @@ async def cancel_production(
             )
 
     cancelled = await service.cancel_run(run.id)
-    await _cancel_non_terminal_run_jobs(jobs, [(cancelled.id, cancelled.subject_id)])
+    await _cancel_non_terminal_run_jobs(
+        jobs,
+        [(cancelled.id, cancelled.subject_id)],
+        actor_id=await _actor_id(request),
+    )
 
     return {
         "action": "cancel",
@@ -722,7 +735,6 @@ async def start_edition_production(
     edition_id: UUID,
     request: Request,
     body: StartEditionProductionRequest | None = None,
-    user: str = "system",
 ) -> BatchStatus:
     # Idempotent: returns the existing active batch if one exists.
     payload = body or StartEditionProductionRequest()
@@ -756,10 +768,11 @@ async def start_edition_production(
         subject_ids = list(eligible_order)
 
     try:
+        actor_id = await _actor_id(request)
         batch = await service.create_batch(
             edition_id=edition_id,
             subject_ids=subject_ids,
-            actor_id=user,
+            actor_id=actor_id,
             correlation_id=get_correlation_id(),
         )
 
@@ -782,7 +795,7 @@ async def start_edition_production(
                 correlation_id=get_correlation_id(),
                 input_parameters=parameters.model_dump(mode="json"),
                 max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
-                actor_id=user,
+                actor_id=actor_id,
             )
             await dispatcher.dispatch(job.id)
     except ValueError as e:
@@ -855,7 +868,11 @@ async def cancel_edition_batch(
                 await uow.subject_production_runs.save(run)
         await uow.commit()
 
-    await _cancel_non_terminal_run_jobs(jobs, runs_to_cancel)
+    await _cancel_non_terminal_run_jobs(
+        jobs,
+        runs_to_cancel,
+        actor_id=await _actor_id(request),
+    )
 
     return {
         "action": "cancel",

@@ -24,6 +24,7 @@ EXPECTED_CHAIN = (
     "0015_nullable_review_document",
     "0016_edition_publication",
     "0017_unified_article_production",
+    "0018_subject_active_run",
 )
 
 
@@ -59,4 +60,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0015_nullable_review_document": "0014_publication_review",
         "0016_edition_publication": "0015_nullable_review_document",
         "0017_unified_article_production": "0016_edition_publication",
+        "0018_subject_active_run": "0017_unified_article_production",
     }

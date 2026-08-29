@@ -4,7 +4,7 @@ from datetime import date, datetime
 from typing import Annotated, NoReturn, TypedDict
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.editions import (
@@ -146,20 +146,6 @@ async def update_edition(edition_id: UUID, payload: EditionUpdate, request: Requ
             correlation_id=get_correlation_id(),
         )
         return _edition_view(edition)
-    except Exception as exc:
-        _raise_api_error(exc)
-
-
-@router.delete("/{edition_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_edition(
-    edition_id: UUID,
-    request: Request,
-    version: Annotated[int, Query(ge=1)],
-) -> Response:
-    service, _ = await _runtime(request)
-    try:
-        await service.delete(edition_id, expected_version=version)
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
     except Exception as exc:
         _raise_api_error(exc)
 

@@ -58,6 +58,12 @@ class SubjectProductionRunRow(Base):
         CheckConstraint(f"current_stage IN ({PRODUCTION_STAGE_VALUES_SQL})", name="ck_run_stage"),
         Index("ix_subject_production_runs_subject_id_created_at", "subject_id", "created_at"),
         Index("ix_subject_production_runs_edition_id_status", "edition_id", "status"),
+        Index(
+            "uq_subject_production_one_active_run",
+            "subject_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)

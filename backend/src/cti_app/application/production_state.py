@@ -396,6 +396,11 @@ class ProductionStateService:
         now = datetime.now(UTC)
 
         async with self._uow_factory() as uow:
+            lock_creation = getattr(
+                uow.subject_production_runs, "lock_creation_for_subject", None
+            )
+            if lock_creation is not None:
+                await lock_creation(subject_id)
             current = await uow.subject_production_runs.get_current_for_subject(subject_id)
             if current and current.status in (
                 SubjectProductionStatus.QUEUED,

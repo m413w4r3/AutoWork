@@ -3,8 +3,10 @@ from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cti_app.application.persistence import ActiveSubjectProductionRunConflictError
 from cti_app.application.production_read_model import BatchStatusItem
 from cti_app.domain.editorial import AnalystDecision, AnalystDecisionTargetType, AnalystDecisionType
 from cti_app.domain.production import (
@@ -206,7 +208,14 @@ class SqlAlchemySubjectProductionRunRepository:
         self._session.add(row)
         # Repository rows do not have ORM relationships, so SQLAlchemy cannot
         # infer this FK ordering when artifacts are added in the same UoW.
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as exc:
+            constraint_name = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+            constraint_name = constraint_name or getattr(exc.orig, "constraint_name", None)
+            if constraint_name == "uq_subject_production_one_active_run":
+                raise ActiveSubjectProductionRunConflictError from exc
+            raise
 
     async def get(self, run_id: UUID) -> SubjectProductionRun | None:
         row = await self._session.get(SubjectProductionRunRow, run_id)
@@ -248,7 +257,7 @@ class SqlAlchemySubjectProductionRunRepository:
         query = (
             select(SubjectProductionRunRow)
             .where(SubjectProductionRunRow.subject_id == subject_id)
-            .order_by(SubjectProductionRunRow.created_at.desc())
+            .order_by(SubjectProductionRunRow.created_at.desc(), SubjectProductionRunRow.id.desc())
             .limit(1)
         )
         result = await self._session.execute(query)
@@ -264,15 +273,14 @@ class SqlAlchemySubjectProductionRunRepository:
         result = await self._session.execute(query)
         return [_subject_production_run_from_row(row) for row in result.scalars()]
 
-    async def allocate_next_run_number(self, subject_id: UUID) -> int:
-        """Allocate a subject-local number while holding a transaction lock.
-
-        The advisory lock is released by the surrounding UoW commit/rollback,
-        so concurrent run creation cannot observe the same maximum number.
-        """
+    async def lock_creation_for_subject(self, subject_id: UUID) -> None:
+        """Serialize run creation for one subject until this transaction ends."""
         await self._session.execute(
             select(func.pg_advisory_xact_lock(func.hashtext(str(subject_id))))
         )
+
+    async def allocate_next_run_number(self, subject_id: UUID) -> int:
+        """Return the next subject-local number after the creation lock is held."""
         maximum = await self._session.scalar(
             select(func.max(SubjectProductionRunRow.run_number)).where(
                 SubjectProductionRunRow.subject_id == subject_id

@@ -34,7 +34,7 @@ from cti_app.domain.model_runs import (
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.models.core import ProvenanceEventRow, SubjectRow
 from cti_app.infrastructure.database.models.editions import EditionAuditEventRow, EditionRow
-from cti_app.infrastructure.database.models.jobs import JobEventRow, JobRow
+from cti_app.infrastructure.database.models.jobs import JobEventRow
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 
@@ -185,69 +185,6 @@ async def test_edition_audit_and_job_transitions_are_append_only(
         with pytest.raises(DBAPIError):
             async with engine.begin() as connection:
                 await connection.execute(delete(JobEventRow).where(JobEventRow.job_id == job.id))
-    finally:
-        await engine.dispose()
-
-
-@pytest.mark.asyncio
-async def test_edition_can_be_purged_with_its_audit_and_jobs(
-    migrated_postgres_url: str,
-) -> None:
-    engine = create_postgres_engine(migrated_postgres_url)
-    session_factory = create_session_factory(engine)
-
-    def edition_uow_factory() -> EditionUnitOfWork:
-        return SqlAlchemyUnitOfWork(session_factory)
-
-    def job_uow_factory() -> JobUnitOfWork:
-        return SqlAlchemyUnitOfWork(session_factory)
-
-    edition_service = EditionService(edition_uow_factory)
-    job_service = JobService(job_uow_factory, create_job_registry())
-    try:
-        edition = await edition_service.create(
-            country="Deletion Test",
-            country_code="DT",
-            period_start=date(2026, 8, 1),
-            period_end=date(2026, 8, 31),
-            tlp=TLP.AMBER,
-            languages=("fr",),
-            target_articles=2,
-            previous_edition_id=None,
-            source_profile="test",
-            actor_id="dev-analyst",
-            correlation_id="edition-delete-integration",
-        )
-        job = await job_service.submit(
-            kind="demo.deterministic",
-            aggregate_type="edition",
-            aggregate_id=edition.id,
-            idempotency_key=f"edition-delete-{uuid4()}",
-            correlation_id="edition-delete-job",
-            input_parameters={"steps": 1},
-            actor_id="dev-analyst",
-        )
-
-        await edition_service.delete(edition.id, expected_version=edition.version)
-
-        async with engine.connect() as connection:
-            assert (
-                await connection.scalar(select(EditionRow.id).where(EditionRow.id == edition.id))
-                is None
-            )
-            assert (
-                await connection.scalar(
-                    select(EditionAuditEventRow.id).where(
-                        EditionAuditEventRow.edition_id == edition.id
-                    )
-                )
-                is None
-            )
-            assert await connection.scalar(select(JobRow.id).where(JobRow.id == job.id)) is None
-            assert (
-                await connection.scalar(select(JobEventRow.id).where(JobEventRow.job_id == job.id))
-                is None
-            )
     finally:
         await engine.dispose()
 

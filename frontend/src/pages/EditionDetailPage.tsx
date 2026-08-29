@@ -1,12 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
 
-import {
-  deleteEdition,
-  type Edition,
-  getEdition,
-  transitionEdition,
-} from "../api/editions";
+import { type Edition, getEdition, transitionEdition } from "../api/editions";
 import { ErrorMessage } from "../components/ErrorMessage";
 import {
   StatusBadge,
@@ -14,12 +8,10 @@ import {
   formatPeriod,
 } from "../features/editions/editionPresentation";
 import { EditionWorkflow } from "../features/edition-workflow/EditionWorkflow";
-import { Link, navigate } from "../routing";
+import { Link } from "../routing";
 
 export function EditionDetailPage({ editionId }: { editionId: string }) {
   const queryClient = useQueryClient();
-  const [showDeletion, setShowDeletion] = useState(false);
-  const [deletionConfirmation, setDeletionConfirmation] = useState("");
   const edition = useQuery({
     queryKey: ["edition", editionId],
     queryFn: () => getEdition(editionId),
@@ -31,15 +23,6 @@ export function EditionDetailPage({ editionId }: { editionId: string }) {
       void queryClient.invalidateQueries({ queryKey: ["editions"] });
     },
   });
-  const deletion = useMutation({
-    mutationFn: deleteEdition,
-    onSuccess: () => {
-      queryClient.removeQueries({ queryKey: ["edition", editionId] });
-      void queryClient.invalidateQueries({ queryKey: ["editions"] });
-      navigate("/editions");
-    },
-  });
-
   if (edition.isPending) return <p role="status">Chargement de l’édition…</p>;
   if (edition.isError)
     return (
@@ -112,65 +95,6 @@ export function EditionDetailPage({ editionId }: { editionId: string }) {
             {transition.isPending ? "Archivage…" : "Archiver l’édition"}
           </button>
         ) : null}
-      </section>
-      <section className="danger-zone" aria-labelledby="edition-deletion">
-        <h2 id="edition-deletion">Zone dangereuse</h2>
-        <p>
-          Cette action efface définitivement l’édition et toutes ses données de
-          découverte, de sélection et de production. Elle est irréversible.
-        </p>
-        {!showDeletion ? (
-          <button
-            type="button"
-            className="button button--danger"
-            onClick={() => setShowDeletion(true)}
-          >
-            Supprimer définitivement l’édition
-          </button>
-        ) : (
-          <div className="deletion-confirmation">
-            <label htmlFor="edition-deletion-confirmation">
-              Pour confirmer, saisissez le nom du pays : {current.country}
-            </label>
-            <input
-              id="edition-deletion-confirmation"
-              autoComplete="off"
-              value={deletionConfirmation}
-              onChange={(event) => setDeletionConfirmation(event.target.value)}
-            />
-            {deletion.error ? (
-              <ErrorMessage
-                error={deletion.error}
-                fallback="Suppression impossible."
-              />
-            ) : null}
-            <div className="action-list">
-              <button
-                type="button"
-                className="button button--secondary"
-                disabled={deletion.isPending}
-                onClick={() => {
-                  setShowDeletion(false);
-                  setDeletionConfirmation("");
-                }}
-              >
-                Annuler
-              </button>
-              <button
-                type="button"
-                className="button button--danger"
-                disabled={
-                  deletion.isPending || deletionConfirmation !== current.country
-                }
-                onClick={() => deletion.mutate(current)}
-              >
-                {deletion.isPending
-                  ? "Suppression…"
-                  : "Effacer toutes les données"}
-              </button>
-            </div>
-          </div>
-        )}
       </section>
     </section>
   );

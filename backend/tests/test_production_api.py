@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.production import router
+from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.production_parsers import technical_extraction_from_json
 from cti_app.application.production_read_model import BatchStatusItem
 from cti_app.application.production_state import (
@@ -457,6 +458,7 @@ def production_app(uow: _Uow) -> FastAPI:
     application.state.uow_factory = lambda: uow
     application.state.job_service = _Jobs()
     application.state.job_dispatcher = _Dispatcher()
+    application.state.identity_provider = LocalIdentityProvider()
     application.state.production_artifact_store = _ArtifactStore()
     application.state.model_service = _FailingModel()
     application.state.model_gateway = _FailingModel()
@@ -496,6 +498,23 @@ async def test_start_subject_production_needs_no_edition_id(api: AsyncClient, uo
 
     assert response.status_code == 200, response.text
     assert response.json()["edition_id"] == str(edition_id)
+
+
+async def test_start_subject_production_ignores_spoofed_user_query_parameter(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Identity", subject_id))
+    production_app.state.identity_provider = LocalIdentityProvider("real-user")
+
+    response = await api.post(
+        f"/api/subjects/{subject_id}/production?user=administrator",
+        json={},
+    )
+
+    assert response.status_code == 200, response.text
+    assert production_app.state.job_service.submitted[-1]["actor_id"] == "real-user"
 
 
 async def test_start_subject_production_returns_the_run_actually_started(
