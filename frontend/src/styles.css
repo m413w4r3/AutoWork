@@ -1503,6 +1503,160 @@ h1 {
   background: #f8fbf9;
 }
 
+/* Publication review ----------------------------------------------------- */
+
+.review-console {
+  display: grid;
+  gap: 1rem;
+  padding: 1.5rem;
+  border: 1px solid #d4ded7;
+  border-radius: 1rem;
+  background: #fff;
+}
+
+.review-console__heading h2 {
+  margin: 0;
+}
+
+.review-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem 1.5rem;
+  padding: 1rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.7rem;
+  background: #f8fbf9;
+}
+
+.review-item-list {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.review-item-card {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.75rem;
+}
+
+.review-item-card__heading,
+.review-item-card__title,
+.review-item-card__actions,
+.review-item-card__exclude-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.review-item-card__heading {
+  justify-content: space-between;
+}
+
+.review-item-card__position {
+  color: #55665c;
+  font-variant-numeric: tabular-nums;
+}
+
+.review-item-card__status {
+  font-weight: 700;
+}
+
+.review-item-card__status.is-ready {
+  color: #1f6042;
+}
+
+.review-item-card__status.is-needs_review,
+.review-item-card__status.is-failed,
+.review-item-card__status.is-cancelled {
+  color: #92443b;
+}
+
+.review-item-card__message,
+.review-item-card__progress {
+  margin: 0;
+}
+
+.review-item-card__message {
+  color: #92443b;
+}
+
+.review-item-card__actions a {
+  display: inline-flex;
+  min-height: 2.8rem;
+  align-items: center;
+  padding: 0.7rem 1.1rem;
+  border: 1px solid #1f6042;
+  border-radius: 0.65rem;
+  color: #294137;
+  background: #fff;
+  font-weight: 700;
+}
+
+.review-item-card__exclude {
+  display: grid;
+  gap: 0.6rem;
+  padding: 1rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.65rem;
+  background: #f8fbf9;
+}
+
+.review-item-card__exclude textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.review-item-card__diagnostics {
+  padding-top: 0.5rem;
+  border-top: 1px solid #d4ded7;
+  color: #55665c;
+  font-size: 0.85rem;
+}
+
+.review-item-card__diagnostics summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.review-item-card__diagnostics dl {
+  display: grid;
+  grid-template-columns: minmax(8rem, max-content) 1fr;
+  gap: 0.25rem 1rem;
+  margin-bottom: 0;
+}
+
+.review-item-card__diagnostics dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace;
+}
+
+.review-acceptance {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid #d4ded7;
+}
+
+.review-acceptance h3,
+.review-acceptance p {
+  margin: 0;
+}
+
+.review-acceptance p {
+  margin-top: 0.35rem;
+  color: #55665c;
+}
+
 /* Revue de fusion : la consolidation s'arrête ici quand elle hésite. */
 .merge-review {
   margin: 2rem 0;

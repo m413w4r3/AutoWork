@@ -91,6 +91,32 @@ const batch = {
   finished_at: null,
 };
 
+const review = {
+  edition_id: edition.id,
+  items: [
+    {
+      position: 1,
+      subject_id: "subject-1",
+      title: "Sujet prêt",
+      run_id: "run-1",
+      pipeline_generation: 1,
+      run_status: "ready" as const,
+      document_artifact_id: "artifact-1",
+      document_artifact_version: 1,
+      document_input_hash: "a".repeat(64),
+      effective_decision_id: null,
+      effective_decision: "include" as const,
+      included: true,
+      blocking: false,
+      can_retry: false,
+      retry_stage: null,
+      error_code: null,
+      error_message: null,
+    },
+  ],
+  can_accept: true,
+};
+
 const emptyDiscovery = {
   batches: [],
   candidates: [],
@@ -295,12 +321,16 @@ describe("rendu strict des états Edition", () => {
     expect(screen.queryByText("Campagne A")).not.toBeInTheDocument();
   });
 
-  it("REVIEW affiche le résumé de fin sans découverte ni sélection", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(batch)));
+  it("REVIEW affiche la console de revue sans découverte ni sélection", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(review)));
     renderWorkflow(editionWith("review"));
     expect(
-      await screen.findByRole("heading", { name: "Production terminée" }),
+      await screen.findByRole("heading", { name: "Revue de publication" }),
     ).toBeInTheDocument();
+    expect(screen.getByText("1 inclus")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Accepter la production" }),
+    ).toBeDisabled();
     expect(screen.queryByText("Sujets candidats")).not.toBeInTheDocument();
     expect(screen.queryByText("Campagne A")).not.toBeInTheDocument();
   });

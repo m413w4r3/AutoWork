@@ -4,6 +4,7 @@ import { ArticleTab } from "../features/subject/ArticleTab";
 import { AssetsTab } from "../features/subject/AssetsTab";
 import { IndicatorsTab } from "../features/subject/IndicatorsTab";
 import { PipelineTab } from "../features/subject/PipelineTab";
+import { Link } from "../routing";
 
 type SubjectTab = "article" | "indicators" | "assets" | "pipeline";
 
@@ -19,7 +20,7 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
 
   return (
     <section className="subject-workbench">
-      <a href="/editions">← Retour aux éditions</a>
+      <Link to="/editions">← Retour aux éditions</Link>
       <div className="detail-heading">
         <div>
           <p className="eyebrow">Sujet</p>

@@ -2,10 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { fetchEditorialBoard, type EditorialGroup } from "../../api/editorial";
-import {
-  getEditionProduction,
-  startEditionProduction,
-} from "../../api/production";
+import { startEditionProduction } from "../../api/production";
 import {
   transitionEdition,
   type Edition,
@@ -15,6 +12,7 @@ import { EditorialBoard } from "../../components/EditorialBoard";
 import { DiscoveryPanel } from "../discovery/DiscoveryPanel";
 import { discoveryJobStorageKey } from "../discovery/discoveryStorage";
 import { ProductionConsole } from "./ProductionConsole";
+import { ReviewConsole } from "./ReviewConsole";
 
 const WORKFLOW_STEPS = [
   ["discovery", "Découverte"],
@@ -192,42 +190,6 @@ function SelectionPhase({ edition }: { edition: Edition }) {
   );
 }
 
-function ProductionSummary({
-  batch,
-}: {
-  batch: {
-    completed: number;
-    needs_review: number;
-    failed: number;
-    cancelled: number;
-  } | null;
-}) {
-  if (!batch) return null;
-  return (
-    <div className="production-summary" aria-label="Résumé de production">
-      <strong>{batch.completed} prêts</strong>
-      <strong>{batch.needs_review} à vérifier</strong>
-      <strong>{batch.failed} échecs</strong>
-      {batch.cancelled > 0 ? <strong>{batch.cancelled} annulés</strong> : null}
-    </div>
-  );
-}
-
-function ReviewPhase({ editionId }: { editionId: string }) {
-  const batch = useQuery({
-    queryKey: ["batch", editionId],
-    queryFn: () => getEditionProduction(editionId),
-  });
-  return (
-    <section className="workflow-placeholder" aria-labelledby="review-heading">
-      <p className="eyebrow">Revue</p>
-      <h2 id="review-heading">Production terminée</h2>
-      <ProductionSummary batch={batch.data ?? null} />
-      <p>La revue détaillée sera disponible à l’étape suivante.</p>
-    </section>
-  );
-}
-
 function PlaceholderPhase({
   status,
 }: {
@@ -265,7 +227,7 @@ export function EditionWorkflow({ edition }: { edition: Edition }) {
         <ProductionConsole editionId={edition.id} />
       ) : null}
       {edition.status === "review" ? (
-        <ReviewPhase editionId={edition.id} />
+        <ReviewConsole editionId={edition.id} />
       ) : null}
       {edition.status === "assembling" ||
       edition.status === "published" ||
