@@ -30,9 +30,9 @@ class PublicationReviewDecision:
     subject_id: UUID
     production_run_id: UUID
     pipeline_generation: int
-    document_artifact_id: UUID
-    document_artifact_version: int
-    document_input_hash: str
+    document_artifact_id: UUID | None
+    document_artifact_version: int | None
+    document_input_hash: str | None
     decision: PublicationDecision
     actor_id: str
     reason: str | None = None
@@ -42,9 +42,20 @@ class PublicationReviewDecision:
     def __post_init__(self) -> None:
         if self.pipeline_generation < 0:
             raise ValueError("pipeline_generation must be >= 0")
-        if self.document_artifact_version < 1:
+        document_identity = (
+            self.document_artifact_id,
+            self.document_artifact_version,
+            self.document_input_hash,
+        )
+        if any(value is None for value in document_identity) and any(
+            value is not None for value in document_identity
+        ):
+            raise ValueError("document identity must be complete or empty")
+        if self.document_artifact_version is not None and self.document_artifact_version < 1:
             raise ValueError("document_artifact_version must be >= 1")
-        if not _SHA256_RE.fullmatch(self.document_input_hash):
+        if self.document_input_hash is not None and not _SHA256_RE.fullmatch(
+            self.document_input_hash
+        ):
             raise ValueError("document_input_hash must be lowercase SHA-256")
         if not self.actor_id.strip():
             raise ValueError("actor_id must not be empty")
@@ -55,5 +66,9 @@ class PublicationReviewDecision:
             object.__setattr__(self, "reason", normalized_reason or None)
         if self.decision is PublicationDecision.EXCLUDE and not self.reason:
             raise ValueError("exclude decisions require a reason")
+        if self.decision is PublicationDecision.INCLUDE and any(
+            value is None for value in document_identity
+        ):
+            raise ValueError("include decisions require document identity")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")

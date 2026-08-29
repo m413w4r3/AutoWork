@@ -24,6 +24,7 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionProfile,
     SubjectProductionRun,
+    SubjectProductionStage,
     SubjectProductionStatus,
 )
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
@@ -84,8 +85,10 @@ def _row(
     *,
     artifact_status: ProductionArtifactStatus | None = ProductionArtifactStatus.VERIFIED,
     decision: PublicationDecision | None = None,
+    effective_decision_id: UUID | None = None,
     generation: int = 2,
     position: int = 1,
+    retry_stage: SubjectProductionStage | None = None,
 ) -> EditionReviewReadItem:
     return EditionReviewReadItem(
         position=position,
@@ -101,6 +104,8 @@ def _row(
         error_code="failed" if status is SubjectProductionStatus.FAILED else None,
         error_message="Échec public" if status is SubjectProductionStatus.FAILED else None,
         effective_decision=decision,
+        effective_decision_id=effective_decision_id,
+        retry_stage=retry_stage,
     )
 
 
@@ -134,8 +139,9 @@ class _Runs:
 
 
 class _Artifacts:
-    def __init__(self, artifact_status: ProductionArtifactStatus) -> None:
-        self.artifact = ProductionArtifact(
+    def __init__(self, artifact_status: ProductionArtifactStatus | None) -> None:
+        self.artifact = (
+            ProductionArtifact(
             id=ARTIFACT_ID,
             production_run_id=RUN_ID,
             subject_id=SUBJECT_ID,
@@ -143,6 +149,9 @@ class _Artifacts:
             version=1,
             input_hash=INPUT_HASH,
             status=artifact_status,
+            )
+            if artifact_status is not None
+            else None
         )
 
     async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
@@ -161,9 +170,7 @@ class _Uow:
     def __init__(self, edition: Edition, row: EditionReviewReadItem) -> None:
         self.editions = _Editions(edition)
         self.subject_production_runs = _Runs(_run(row.run_status, row.pipeline_generation))
-        self.production_artifacts = _Artifacts(
-            row.document_artifact_status or ProductionArtifactStatus.NEEDS_REVIEW
-        )
+        self.production_artifacts = _Artifacts(row.document_artifact_status)
         self.edition_review_read_model = _ReadModel([row])
         self.publication_review_decisions = _Decisions()
         self.commits = 0
@@ -351,3 +358,142 @@ async def test_api_exclude_requires_a_non_blank_reason_and_review_is_public() ->
     assert blank.status_code == 422
     assert accepted.status_code == 200
     assert accepted.json()["reason"] == "hors périmètre"
+
+
+@pytest.mark.asyncio
+async def test_api_exclude_without_document_is_allowed_when_run_has_no_document() -> None:
+    uow = _Uow(_edition(), _row(SubjectProductionStatus.FAILED, artifact_status=None))
+    async with AsyncClient(
+        transport=ASGITransport(app=_api(uow)), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/api/editions/{EDITION_ID}/review/items/{SUBJECT_ID}/exclude",
+            json={
+                "production_run_id": str(RUN_ID),
+                "pipeline_generation": 2,
+                "reason": "No brief was produced",
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["document_artifact_id"] is None
+    assert response.json()["document_artifact_version"] is None
+    assert response.json()["document_input_hash"] is None
+    assert len(uow.publication_review_decisions.items) == 1
+
+
+@pytest.mark.asyncio
+async def test_api_separates_include_and_exclude_document_contracts() -> None:
+    uow = _Uow(_edition(), _row(SubjectProductionStatus.FAILED, artifact_status=None))
+    async with AsyncClient(
+        transport=ASGITransport(app=_api(uow)), base_url="http://test"
+    ) as client:
+        missing_include = await client.post(
+            f"/api/editions/{EDITION_ID}/review/items/{SUBJECT_ID}/include",
+            json={
+                "production_run_id": str(RUN_ID),
+                "pipeline_generation": 2,
+            },
+        )
+        partial_exclude = await client.post(
+            f"/api/editions/{EDITION_ID}/review/items/{SUBJECT_ID}/exclude",
+            json={
+                "production_run_id": str(RUN_ID),
+                "pipeline_generation": 2,
+                "document_artifact_version": 1,
+                "reason": "Incomplete identity",
+            },
+        )
+    assert missing_include.status_code == 422
+    assert partial_exclude.status_code == 422
+    assert uow.publication_review_decisions.items == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [SubjectProductionStatus.FAILED, SubjectProductionStatus.NEEDS_REVIEW],
+)
+async def test_exclude_without_document_is_allowed_for_terminal_failed_runs(
+    status: SubjectProductionStatus,
+) -> None:
+    row = _row(status, artifact_status=None)
+    uow = _Uow(_edition(), row)
+    event = await EditionReviewService(cast(Any, _Factory(uow))).decide(
+        EDITION_ID,
+        SUBJECT_ID,
+        decision=PublicationDecision.EXCLUDE,
+        production_run_id=RUN_ID,
+        pipeline_generation=2,
+        document_artifact_id=None,
+        document_artifact_version=None,
+        document_input_hash=None,
+        actor_id="analyst-1",
+        reason="No usable document was produced",
+    )
+    assert (event.document_artifact_id, event.document_artifact_version) == (None, None)
+    assert event.document_input_hash is None
+    assert len(uow.publication_review_decisions.items) == 1
+
+
+@pytest.mark.asyncio
+async def test_documentless_exclusion_is_stale_when_a_document_exists() -> None:
+    uow = _Uow(_edition(), _row(SubjectProductionStatus.READY))
+    with pytest.raises(ReviewItemStaleError):
+        await EditionReviewService(cast(Any, _Factory(uow))).decide(
+            EDITION_ID,
+            SUBJECT_ID,
+            decision=PublicationDecision.EXCLUDE,
+            production_run_id=RUN_ID,
+            pipeline_generation=2,
+            document_artifact_id=None,
+            document_artifact_version=None,
+            document_input_hash=None,
+            actor_id="analyst-1",
+            reason="No document identity supplied",
+        )
+    assert uow.publication_review_decisions.items == []
+
+
+@pytest.mark.asyncio
+async def test_review_acceptance_requires_an_included_item() -> None:
+    empty_uow = _Uow(_edition(), _row(SubjectProductionStatus.READY))
+    empty_uow.edition_review_read_model = _ReadModel([])
+    empty_review = await EditionReviewService(cast(Any, _Factory(empty_uow))).get(EDITION_ID)
+    assert not empty_review.can_accept
+
+    all_excluded_uow = _Uow(
+        _edition(), _row(SubjectProductionStatus.READY, decision=PublicationDecision.EXCLUDE)
+    )
+    assert not (
+        await EditionReviewService(cast(Any, _Factory(all_excluded_uow))).get(EDITION_ID)
+    ).can_accept
+
+    included = _row(SubjectProductionStatus.READY)
+    failed_excluded = _row(
+        SubjectProductionStatus.FAILED,
+        artifact_status=None,
+        decision=PublicationDecision.EXCLUDE,
+        position=2,
+    )
+    mixed_uow = _Uow(_edition(), included)
+    mixed_uow.edition_review_read_model = _ReadModel([included, failed_excluded])
+    assert (await EditionReviewService(cast(Any, _Factory(mixed_uow))).get(EDITION_ID)).can_accept
+
+
+@pytest.mark.asyncio
+async def test_review_exposes_effective_decision_id_and_backend_retry_stage() -> None:
+    explicit_id = UUID("55555555-5555-4555-8555-555555555555")
+    item, _ = await _review(
+        SubjectProductionStatus.FAILED,
+        artifact_status=None,
+        decision=PublicationDecision.EXCLUDE,
+        effective_decision_id=explicit_id,
+        retry_stage=SubjectProductionStage.SYNTHESIS,
+    )
+    assert item.effective_decision_id == explicit_id
+    assert item.retry_stage is SubjectProductionStage.SYNTHESIS
+
+    ready_item, _ = await _review(
+        SubjectProductionStatus.READY, retry_stage=SubjectProductionStage.SYNTHESIS
+    )
+    assert ready_item.retry_stage is None

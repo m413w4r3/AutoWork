@@ -4,11 +4,15 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import String, and_, cast, func, select
+from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.application.edition_review import EditionReviewReadItem
-from cti_app.domain.production import ProductionArtifactStatus, SubjectProductionStatus
+from cti_app.domain.production import (
+    ProductionArtifactStatus,
+    SubjectProductionStage,
+    SubjectProductionStatus,
+)
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
 from cti_app.infrastructure.database.models.editorial import EditorialGroupRow
 from cti_app.infrastructure.database.models.production import (
@@ -122,12 +126,14 @@ class SqlAlchemyEditionReviewReadRepository:
                 SubjectProductionRunRow.id.label("run_id"),
                 SubjectProductionRunRow.pipeline_generation.label("pipeline_generation"),
                 SubjectProductionRunRow.status.label("run_status"),
+                SubjectProductionRunRow.current_stage.label("current_stage"),
                 current_artifacts.c.artifact_id,
                 current_artifacts.c.artifact_version,
                 current_artifacts.c.artifact_hash,
                 current_artifacts.c.artifact_status,
                 SubjectProductionRunRow.error_code.label("error_code"),
                 SubjectProductionRunRow.error_message.label("error_message"),
+                PublicationReviewDecisionRow.id.label("decision_id"),
                 PublicationReviewDecisionRow.decision.label("decision"),
                 func.row_number()
                 .over(
@@ -168,12 +174,22 @@ class SqlAlchemyEditionReviewReadRepository:
                     == SubjectProductionRunRow.id,
                     PublicationReviewDecisionRow.pipeline_generation
                     == SubjectProductionRunRow.pipeline_generation,
-                    PublicationReviewDecisionRow.document_artifact_id
-                    == current_artifacts.c.artifact_id,
-                    PublicationReviewDecisionRow.document_artifact_version
-                    == current_artifacts.c.artifact_version,
-                    PublicationReviewDecisionRow.document_input_hash
-                    == current_artifacts.c.artifact_hash,
+                    or_(
+                        and_(
+                            current_artifacts.c.artifact_id.is_(None),
+                            PublicationReviewDecisionRow.document_artifact_id.is_(None),
+                            PublicationReviewDecisionRow.document_artifact_version.is_(None),
+                            PublicationReviewDecisionRow.document_input_hash.is_(None),
+                        ),
+                        and_(
+                            PublicationReviewDecisionRow.document_artifact_id
+                            == current_artifacts.c.artifact_id,
+                            PublicationReviewDecisionRow.document_artifact_version
+                            == current_artifacts.c.artifact_version,
+                            PublicationReviewDecisionRow.document_input_hash
+                            == current_artifacts.c.artifact_hash,
+                        ),
+                    ),
                 ),
             )
             .where(EditionProductionBatchItemRow.batch_id == latest_batch_id)
@@ -206,24 +222,34 @@ def _decision_from_row(row: PublicationReviewDecisionRow) -> PublicationReviewDe
 
 
 def _read_item_from_row(row: Any) -> EditionReviewReadItem:
+    run_status = SubjectProductionStatus(row["run_status"])
+    artifact_status = (
+        ProductionArtifactStatus(row["artifact_status"])
+        if row["artifact_status"] is not None
+        else None
+    )
+    artifact_verified = artifact_status is ProductionArtifactStatus.VERIFIED
+    can_retry = run_status in {
+        SubjectProductionStatus.FAILED,
+        SubjectProductionStatus.NEEDS_REVIEW,
+        SubjectProductionStatus.CANCELLED,
+    } or (run_status is SubjectProductionStatus.READY and not artifact_verified)
     return EditionReviewReadItem(
         position=row["position"],
         subject_id=row["subject_id"],
         title=row["title"],
         run_id=row["run_id"],
         pipeline_generation=row["pipeline_generation"],
-        run_status=SubjectProductionStatus(row["run_status"]),
+        run_status=run_status,
         document_artifact_id=row["artifact_id"],
         document_artifact_version=row["artifact_version"],
         document_input_hash=row["artifact_hash"],
-        document_artifact_status=(
-            ProductionArtifactStatus(row["artifact_status"])
-            if row["artifact_status"] is not None
-            else None
-        ),
+        document_artifact_status=artifact_status,
         error_code=row["error_code"],
         error_message=row["error_message"],
+        effective_decision_id=row["decision_id"],
         effective_decision=(
             PublicationDecision(row["decision"]) if row["decision"] is not None else None
         ),
+        retry_stage=SubjectProductionStage(row["current_stage"]) if can_retry else None,
     )

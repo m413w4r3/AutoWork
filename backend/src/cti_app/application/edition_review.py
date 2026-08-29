@@ -9,7 +9,11 @@ from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.domain.editions import EditionStatus
-from cti_app.domain.production import ProductionArtifactStatus, SubjectProductionStatus
+from cti_app.domain.production import (
+    ProductionArtifactStatus,
+    SubjectProductionStage,
+    SubjectProductionStatus,
+)
 from cti_app.domain.publication_review import (
     PublicationDecision,
     PublicationReviewDecision,
@@ -33,6 +37,8 @@ class EditionReviewReadItem:
     error_code: str | None
     error_message: str | None
     effective_decision: PublicationDecision | None
+    effective_decision_id: UUID | None = None
+    retry_stage: SubjectProductionStage | None = None
 
 
 class EditionReviewReadRepository(Protocol):
@@ -56,6 +62,8 @@ class EditionReviewItem:
     included: bool
     blocking: bool
     can_retry: bool
+    effective_decision_id: UUID | None = None
+    retry_stage: SubjectProductionStage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +93,10 @@ class InvalidReviewReasonError(ValueError):
     pass
 
 
+class InvalidReviewDocumentError(ValueError):
+    pass
+
+
 class EditionReviewService:
     """Read and append review decisions without mutating production state."""
 
@@ -100,7 +112,9 @@ class EditionReviewService:
         return EditionReview(
             edition_id=edition_id,
             items=items,
-            can_accept=all(not item.blocking for item in items),
+            can_accept=bool(items)
+            and any(item.included for item in items)
+            and all(not item.blocking for item in items),
         )
 
     async def decide(
@@ -111,15 +125,18 @@ class EditionReviewService:
         decision: PublicationDecision,
         production_run_id: UUID,
         pipeline_generation: int,
-        document_artifact_id: UUID,
-        document_artifact_version: int,
-        document_input_hash: str,
+        document_artifact_id: UUID | None,
+        document_artifact_version: int | None,
+        document_input_hash: str | None,
         actor_id: str,
         reason: str | None = None,
     ) -> PublicationReviewDecision:
         normalized_reason = reason.strip() if reason is not None else None
         if decision is PublicationDecision.EXCLUDE and not normalized_reason:
             raise InvalidReviewReasonError("exclude decisions require a non-empty reason")
+        _validate_document_identity(
+            document_artifact_id, document_artifact_version, document_input_hash
+        )
 
         async with self._uow_factory() as uow:
             edition = await _get_edition_for_update(uow, edition_id)
@@ -144,10 +161,35 @@ class EditionReviewService:
             artifact = await uow.production_artifacts.get_current(row.run_id, "brief")
             if (
                 run is None
-                or artifact is None
                 or row.run_id != production_run_id
+                or run.edition_id != edition_id
+                or run.subject_id != subject_id
                 or run.pipeline_generation != pipeline_generation
-                or artifact.id != document_artifact_id
+            ):
+                raise ReviewItemStaleError("review item does not refer to the current document")
+            if artifact is None:
+                if (
+                    decision is not PublicationDecision.EXCLUDE
+                    or run.status
+                    not in {
+                        SubjectProductionStatus.FAILED,
+                        SubjectProductionStatus.NEEDS_REVIEW,
+                        SubjectProductionStatus.CANCELLED,
+                    }
+                    or any(
+                        value is not None
+                        for value in (
+                            document_artifact_id,
+                            document_artifact_version,
+                            document_input_hash,
+                        )
+                    )
+                ):
+                    raise ReviewItemStaleError(
+                        "review item does not refer to the current document"
+                    )
+            elif (
+                artifact.id != document_artifact_id
                 or artifact.version != document_artifact_version
                 or artifact.input_hash != document_input_hash
             ):
@@ -212,6 +254,7 @@ def _build_item(row: EditionReviewReadItem) -> EditionReviewItem:
         SubjectProductionStatus.NEEDS_REVIEW,
         SubjectProductionStatus.CANCELLED,
     } or (row.run_status is SubjectProductionStatus.READY and not artifact_verified)
+    retry_stage = row.retry_stage if can_retry else None
     return EditionReviewItem(
         position=row.position,
         subject_id=row.subject_id,
@@ -228,7 +271,19 @@ def _build_item(row: EditionReviewReadItem) -> EditionReviewItem:
         included=included,
         blocking=blocking,
         can_retry=can_retry,
+        effective_decision_id=row.effective_decision_id,
+        retry_stage=retry_stage,
     )
+
+
+def _validate_document_identity(
+    artifact_id: UUID | None,
+    artifact_version: int | None,
+    input_hash: str | None,
+) -> None:
+    values = (artifact_id, artifact_version, input_hash)
+    if any(value is None for value in values) and any(value is not None for value in values):
+        raise InvalidReviewDocumentError("document identity must be complete or empty")
 
 
 __all__ = [
@@ -240,6 +295,7 @@ __all__ = [
     "EditionReviewReadRepository",
     "EditionReviewService",
     "EditionReviewStatusError",
+    "InvalidReviewDocumentError",
     "InvalidReviewReasonError",
     "ReviewItemStaleError",
 ]

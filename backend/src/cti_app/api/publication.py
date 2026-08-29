@@ -6,7 +6,7 @@ from typing import Annotated, NoReturn
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cti_app.application.edition_review import (
     EditionReview,
@@ -14,21 +14,26 @@ from cti_app.application.edition_review import (
     EditionReviewNotFoundError,
     EditionReviewService,
     EditionReviewStatusError,
+    InvalidReviewDocumentError,
     InvalidReviewReasonError,
     ReviewItemStaleError,
 )
 from cti_app.application.identity import IdentityProvider
+from cti_app.domain.production import SubjectProductionStage, SubjectProductionStatus
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
 
 router = APIRouter(prefix="/api", tags=["publication"])
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 
 
-class ReviewDocumentRequest(BaseModel):
+class ReviewRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     production_run_id: UUID
     pipeline_generation: Annotated[int, Field(ge=0)]
+
+
+class ReviewDocumentRequest(ReviewRunRequest):
     document_artifact_id: UUID
     document_artifact_version: Annotated[int, Field(ge=1)]
     document_input_hash: Annotated[str, Field(pattern=_SHA256_PATTERN)]
@@ -38,8 +43,22 @@ class IncludeReviewRequest(ReviewDocumentRequest):
     reason: str | None = Field(default=None, max_length=500)
 
 
-class ExcludeReviewRequest(ReviewDocumentRequest):
+class ExcludeReviewRequest(ReviewRunRequest):
+    document_artifact_id: UUID | None = None
+    document_artifact_version: Annotated[int | None, Field(ge=1)] = None
+    document_input_hash: Annotated[str | None, Field(pattern=_SHA256_PATTERN)] = None
     reason: Annotated[str, Field(min_length=1, max_length=500)]
+
+    @model_validator(mode="after")
+    def document_identity_is_atomic(self) -> ExcludeReviewRequest:
+        values = (
+            self.document_artifact_id,
+            self.document_artifact_version,
+            self.document_input_hash,
+        )
+        if any(value is None for value in values) and any(value is not None for value in values):
+            raise ValueError("document identity must be complete or empty")
+        return self
 
 
 class ReviewItemView(BaseModel):
@@ -48,16 +67,18 @@ class ReviewItemView(BaseModel):
     title: str
     run_id: UUID
     pipeline_generation: int
-    run_status: str
+    run_status: SubjectProductionStatus
     document_artifact_id: UUID | None
     document_artifact_version: int | None
     document_input_hash: str | None
     error_code: str | None
     error_message: str | None
     effective_decision: PublicationDecision | None
+    effective_decision_id: UUID | None
     included: bool
     blocking: bool
     can_retry: bool
+    retry_stage: SubjectProductionStage | None
 
 
 class EditionReviewView(BaseModel):
@@ -72,9 +93,9 @@ class ReviewDecisionView(BaseModel):
     subject_id: UUID
     production_run_id: UUID
     pipeline_generation: int
-    document_artifact_id: UUID
-    document_artifact_version: int
-    document_input_hash: str
+    document_artifact_id: UUID | None
+    document_artifact_version: int | None
+    document_input_hash: str | None
     decision: PublicationDecision
     actor_id: str
     reason: str | None
@@ -140,7 +161,7 @@ async def exclude_review_item(
 async def _decide(
     edition_id: UUID,
     subject_id: UUID,
-    payload: ReviewDocumentRequest,
+    payload: IncludeReviewRequest | ExcludeReviewRequest,
     request: Request,
     decision: PublicationDecision,
 ) -> ReviewDecisionView:
@@ -180,9 +201,11 @@ def _review_view(review: EditionReview) -> EditionReviewView:
                 error_code=item.error_code,
                 error_message=item.error_message,
                 effective_decision=item.effective_decision,
+                effective_decision_id=item.effective_decision_id,
                 included=item.included,
                 blocking=item.blocking,
                 can_retry=item.can_retry,
+                retry_stage=item.retry_stage,
             )
             for item in review.items
         ],
@@ -230,5 +253,10 @@ def _raise_review_error(exc: Exception) -> NoReturn:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"code": "invalid_review_reason"},
+        ) from exc
+    if isinstance(exc, InvalidReviewDocumentError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": "invalid_review_document"},
         ) from exc
     raise exc

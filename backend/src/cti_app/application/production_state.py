@@ -267,8 +267,22 @@ class ProductionStateService:
     async def export_state(
         self, *, subject_id: UUID, subject_title: str
     ) -> ProductionStateSnapshotV1:
+        """Export the latest run for a subject for backwards compatibility."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+            if run is None:
+                raise ProductionStateError(
+                    code="production_state_not_found", message="No production run found"
+                )
+
+        return await self.export_run_state(run.id, subject_title=subject_title)
+
+    async def export_run_state(
+        self, run_id: UUID, subject_title: str
+    ) -> ProductionStateSnapshotV1:
+        """Export exactly ``run_id`` without resolving another current run."""
+        async with self._uow_factory() as uow:
+            run = await uow.subject_production_runs.get(run_id)
             if run is None:
                 raise ProductionStateError(
                     code="production_state_not_found", message="No production run found"

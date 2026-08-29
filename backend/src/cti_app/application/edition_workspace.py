@@ -16,7 +16,11 @@ from uuid import UUID, uuid4
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_state import ProductionStateService, ProductionStateSnapshotV1
+from cti_app.application.production_state import (
+    ProductionStateError,
+    ProductionStateService,
+    ProductionStateSnapshotV1,
+)
 from cti_app.domain.production import ProductionArtifactStage
 
 _COUNTRY_CODE = re.compile(r"^[A-Z]{2}$")
@@ -228,10 +232,20 @@ class EditionProductionCheckpointService:
             context = await self._resolve_context(run_id)
             if context is None:
                 return None
-            state = await self._state.export_state(
-                subject_id=context.subject_id,
-                subject_title=context.subject_title,
-            )
+            try:
+                state = await self._state.export_run_state(
+                    context.run_id,
+                    subject_title=context.subject_title,
+                )
+            except ProductionStateError as exc:
+                if exc.code in {
+                    "production_state_not_found",
+                    "production_state_active_run",
+                    "production_state_incomplete",
+                    "production_state_unverified",
+                }:
+                    return None
+                raise
             publication, rendered = await self._optional_publication(run_id)
             sources, assets = await self._optional_asset_manifests(context.subject_id)
             return await self._materializer.materialize(
@@ -291,15 +305,9 @@ class EditionProductionCheckpointService:
         publication: dict[str, Any] | None = None
         rendered: str | None = None
         if artifact.canonical_blob_id is not None:
-            try:
-                publication = await self._artifact_store.read_json(artifact.canonical_blob_id)
-            except Exception:
-                publication = None
+            publication = await self._artifact_store.read_json(artifact.canonical_blob_id)
         if artifact.rendered_blob_id is not None:
-            try:
-                rendered = await self._artifact_store.read_text(artifact.rendered_blob_id)
-            except Exception:
-                rendered = None
+            rendered = await self._artifact_store.read_text(artifact.rendered_blob_id)
         return publication, rendered
 
     async def _optional_asset_manifests(

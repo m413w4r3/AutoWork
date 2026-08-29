@@ -41,6 +41,18 @@ class PublicationReviewDecisionRow(Base):
             "decision <> 'exclude' OR char_length(btrim(reason)) > 0",
             name="ck_publication_review_exclude_reason",
         ),
+        CheckConstraint(
+            "(document_artifact_id IS NULL AND document_artifact_version IS NULL "
+            "AND document_input_hash IS NULL) OR "
+            "(document_artifact_id IS NOT NULL AND document_artifact_version IS NOT NULL "
+            "AND document_input_hash IS NOT NULL)",
+            name="ck_publication_review_document_identity",
+        ),
+        CheckConstraint(
+            "decision <> 'include' OR (document_artifact_id IS NOT NULL "
+            "AND document_artifact_version IS NOT NULL AND document_input_hash IS NOT NULL)",
+            name="ck_publication_review_include_document_identity",
+        ),
         Index(
             "ix_publication_review_edition_occurred",
             "edition_id",
@@ -79,10 +91,10 @@ class PublicationReviewDecisionRow(Base):
     document_artifact_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("production_artifacts.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
     )
-    document_artifact_version: Mapped[int] = mapped_column(nullable=False)
-    document_input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    document_artifact_version: Mapped[int | None] = mapped_column(nullable=True)
+    document_input_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     decision: Mapped[str] = mapped_column(String(16), nullable=False)
     actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
