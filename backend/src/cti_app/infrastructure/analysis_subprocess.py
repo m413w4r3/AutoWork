@@ -72,9 +72,22 @@ async def run_analysis_subprocess(
                     return bytes(buffer), True
                 buffer.extend(chunk)
 
-        async def kill_and_wait() -> None:
+        async def drain_stream(stream: asyncio.StreamReader) -> None:
+            while await stream.read(64 * 1024):
+                pass
+
+        async def kill_and_wait(
+            reader_tasks: tuple[asyncio.Task[tuple[bytes, bool]], ...],
+        ) -> None:
             if process.returncode is None:
                 process.kill()
+            await asyncio.gather(*reader_tasks, return_exceptions=True)
+            assert process.stdout is not None
+            assert process.stderr is not None
+            await asyncio.gather(
+                drain_stream(process.stdout),
+                drain_stream(process.stderr),
+            )
             await process.wait()
 
         def close_transport() -> None:
@@ -92,10 +105,7 @@ async def run_analysis_subprocess(
                 while tasks:
                     done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                     if any(task.result()[1] for task in done):
-                        if process.returncode is None:
-                            process.kill()
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                        await kill_and_wait()
+                        await kill_and_wait((stdout_task, stderr_task))
                         output = [task.result()[0] for task in (stdout_task, stderr_task)]
                         return output[0], output[1], process.returncode, True
                 exit_code = await process.wait()
@@ -103,10 +113,7 @@ async def run_analysis_subprocess(
                 stderr, _ = stderr_task.result()
                 return stdout, stderr, exit_code, False
             except asyncio.CancelledError:
-                if process.returncode is None:
-                    process.kill()
-                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-                await kill_and_wait()
+                await kill_and_wait((stdout_task, stderr_task))
                 raise
 
         try:
