@@ -62,8 +62,7 @@ _CITATION = re.compile(r"\[(S\d{1,3})\]", re.IGNORECASE)
 def _term_pattern(term: str) -> re.Pattern[str]:
     pieces = re.split(r"([\s_-]+)", term.strip())
     pattern = "".join(
-        r"[\s_-]+" if re.fullmatch(r"[\s_-]+", piece) else re.escape(piece)
-        for piece in pieces
+        r"[\s_-]+" if re.fullmatch(r"[\s_-]+", piece) else re.escape(piece) for piece in pieces
     )
     return re.compile(rf"(?<!\w){pattern}(?!\w)", re.IGNORECASE)
 
@@ -179,8 +178,7 @@ class SemanticAnnotator:
             candidates, key=lambda item: (-item.priority, -(item.end - item.start), item.start)
         ):
             if any(
-                candidate.start < other.end and candidate.end > other.start
-                for other in selected
+                candidate.start < other.end and candidate.end > other.start for other in selected
             ):
                 continue
             selected.append(candidate)

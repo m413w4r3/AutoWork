@@ -77,6 +77,7 @@ class InMemoryEditionAuditRepository:
     async def list_for_edition(self, edition_id: UUID) -> Sequence[EditionAuditEvent]:
         return [deepcopy(event) for event in self._events if event.edition_id == edition_id]
 
+
 class InMemoryEditionUnitOfWork:
     editions: EditionRepository
     edition_audit: EditionAuditRepository

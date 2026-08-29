@@ -48,9 +48,7 @@ def build_packing_signals(payload: bytes, recovered_function_count: int) -> Pack
 
     executable_bytes = sum(len(data) for data in executable_sections)
     entropy = (
-        max(_shannon_entropy(data) for data in executable_sections)
-        if executable_sections
-        else None
+        max(_shannon_entropy(data) for data in executable_sections) if executable_sections else None
     )
     registry = load_non_discriminant_patterns()
     marker_hits: list[str] = []

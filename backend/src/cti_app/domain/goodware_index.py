@@ -66,11 +66,7 @@ def goodware_lookup_key(feature_kind: str, normalized_value: str) -> bytes:
     except UnicodeEncodeError as exc:
         raise GoodwareMeasurementError("feature kind must be ASCII") from exc
     return hashlib.sha256(
-        KEY_VERSION.encode("ascii")
-        + b"\0"
-        + kind_bytes
-        + b"\0"
-        + normalized_value.encode("utf-8")
+        KEY_VERSION.encode("ascii") + b"\0" + kind_bytes + b"\0" + normalized_value.encode("utf-8")
     ).digest()
 
 

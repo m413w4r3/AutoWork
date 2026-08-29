@@ -628,9 +628,7 @@ def _create_model_runs() -> None:
             nullable=False,
             server_default=sa.text("'[]'::jsonb"),
         ),
-        sa.Column(
-            "citation_count", sa.BigInteger(), nullable=False, server_default=sa.text("'0'")
-        ),
+        sa.Column("citation_count", sa.BigInteger(), nullable=False, server_default=sa.text("'0'")),
         sa.Column(
             "extracted_url_count", sa.BigInteger(), nullable=False, server_default=sa.text("'0'")
         ),
@@ -1321,9 +1319,7 @@ def _create_claims() -> None:
             "'infection_chain', 'ttp', 'victimology')",
             name="ck_claims_kind",
         ),
-        sa.CheckConstraint(
-            "span_start >= 0 AND span_end > span_start", name="ck_claims_span"
-        ),
+        sa.CheckConstraint("span_start >= 0 AND span_end > span_start", name="ck_claims_span"),
         sa.CheckConstraint(
             "(local_span_start IS NULL AND local_span_end IS NULL) OR "
             "(local_span_start >= 0 AND local_span_end > local_span_start)",
@@ -1369,9 +1365,7 @@ def _create_indicators() -> None:
             "kind IN ('hash', 'domain', 'ip', 'url', 'cve', 'attack_id', 'email')",
             name="ck_indicators_kind",
         ),
-        sa.CheckConstraint(
-            "span_start >= 0 AND span_end > span_start", name="ck_indicators_span"
-        ),
+        sa.CheckConstraint("span_start >= 0 AND span_end > span_start", name="ck_indicators_span"),
         sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["group_id"], ["editorial_groups.id"], ondelete="RESTRICT"),

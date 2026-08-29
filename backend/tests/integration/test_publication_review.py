@@ -238,8 +238,7 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
             with pytest.raises(DBAPIError, match="append-only"):
                 await session.execute(
                     text(
-                        "UPDATE publication_review_decisions "
-                        "SET reason = 'changed' WHERE id = :id"
+                        "UPDATE publication_review_decisions SET reason = 'changed' WHERE id = :id"
                     ),
                     {"id": decision_id},
                 )

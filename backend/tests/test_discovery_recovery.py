@@ -393,9 +393,7 @@ async def test_completion_recovery_requires_conversation_id_and_expected_turn_id
             InMemoryDiscoveryUnitOfWorkFactory(), gateway, archive=gateway
         ).start_completion_recovery(params_a, missing_conversation.id)
 
-    missing_turn_id = _needs_review_parent(
-        params_b, conversation={"id": _CONVERSATION["id"]}
-    )
+    missing_turn_id = _needs_review_parent(params_b, conversation={"id": _CONVERSATION["id"]})
     model_uow.state[missing_turn_id.id] = missing_turn_id
     with pytest.raises(ModelGatewayError, match="conversation is unavailable"):
         await DiscoveryService(
@@ -490,9 +488,7 @@ async def test_completion_recovery_returns_existing_continuation_source_without_
 # --- 7. Standalone import ----------------------------------------------------
 
 
-async def test_standalone_import_ids_are_deterministic_and_reimport_creates_no_second_run() -> (
-    None
-):
+async def test_standalone_import_ids_are_deterministic_and_reimport_creates_no_second_run() -> None:
     adapter = TransientResearchAdapter()
     gateway, model_uow, _ = gateway_for_adapter(adapter)
     discovery = DiscoveryService(

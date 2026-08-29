@@ -63,9 +63,7 @@ async def test_import_accepts_v1_checksum_and_rejects_unknown_fields() -> None:
 
     payload["unexpected"] = True
     with pytest.raises(ProductionStateError) as exc_info:
-        await ProductionStateService(
-            _FailingFactory(), cast(Any, object())
-        ).import_state(
+        await ProductionStateService(_FailingFactory(), cast(Any, object())).import_state(
             subject_id=uuid4(), edition_id=uuid4(), payload=payload
         )
     assert exc_info.value.code == "production_state_invalid"
@@ -85,9 +83,7 @@ async def test_import_rejects_format_and_version_before_uow(
     payload = _payload()
     payload[field] = value
     with pytest.raises(ProductionStateError) as exc_info:
-        await ProductionStateService(
-            _FailingFactory(), cast(Any, object())
-        ).import_state(
+        await ProductionStateService(_FailingFactory(), cast(Any, object())).import_state(
             subject_id=uuid4(), edition_id=uuid4(), payload=payload
         )
     assert exc_info.value.code == code
@@ -98,9 +94,7 @@ async def test_import_rejects_bad_checksum_without_side_effects() -> None:
     payload = _payload()
     payload["content_sha256"] = "d" * 64
     with pytest.raises(ProductionStateError) as exc_info:
-        await ProductionStateService(
-            _FailingFactory(), cast(Any, object())
-        ).import_state(
+        await ProductionStateService(_FailingFactory(), cast(Any, object())).import_state(
             subject_id=uuid4(), edition_id=uuid4(), payload=payload
         )
     assert exc_info.value.code == "production_state_checksum_mismatch"

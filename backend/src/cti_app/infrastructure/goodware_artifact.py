@@ -169,11 +169,7 @@ def _verify_sources(source_dir: Path, manifest: Mapping[str, object]) -> None:
     if not source_dir.is_dir():
         raise GoodwareImportError(f"source directory does not exist: {source_dir}")
     paths = sorted(
-        (
-            path
-            for path in source_dir.iterdir()
-            if path.is_file() and path.suffix.lower() == ".db"
-        ),
+        (path for path in source_dir.iterdir() if path.is_file() and path.suffix.lower() == ".db"),
         key=lambda path: path.name,
     )
     actual: list[dict[str, object]] = []

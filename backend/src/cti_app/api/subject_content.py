@@ -93,9 +93,7 @@ async def get_subject_content(subject_id: UUID, request: Request) -> ContentResp
 
 
 @router.get("/subjects/{subject_id}/indicators", response_model=list[IndicatorResponse])
-async def get_subject_indicators(
-    subject_id: UUID, request: Request
-) -> list[IndicatorResponse]:
+async def get_subject_indicators(subject_id: UUID, request: Request) -> list[IndicatorResponse]:
     values: list[SubjectIndicatorView] = await _service(request).indicators(subject_id)
     return [IndicatorResponse.model_validate(value, from_attributes=True) for value in values]
 
@@ -107,11 +105,9 @@ async def get_subject_assets(subject_id: UUID, request: Request) -> AssetsRespon
         raise _not_found()
     return AssetsResponse(
         sources=[
-            AssetResponse.model_validate(item, from_attributes=True)
-            for item in value.sources
+            AssetResponse.model_validate(item, from_attributes=True) for item in value.sources
         ],
         samples=[
-            AssetResponse.model_validate(item, from_attributes=True)
-            for item in value.samples
+            AssetResponse.model_validate(item, from_attributes=True) for item in value.samples
         ],
     )

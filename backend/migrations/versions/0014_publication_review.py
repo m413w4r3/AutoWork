@@ -38,8 +38,7 @@ def upgrade() -> None:
             name="ck_publication_review_artifact_version",
         ),
         sa.CheckConstraint(
-            "char_length(document_input_hash) = 64 "
-            "AND document_input_hash ~ '^[0-9a-f]{64}$'",
+            "char_length(document_input_hash) = 64 AND document_input_hash ~ '^[0-9a-f]{64}$'",
             name="ck_publication_review_input_hash",
         ),
         sa.CheckConstraint(
@@ -110,8 +109,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute(
-        "DROP TRIGGER trg_publication_review_decisions_append_only "
-        "ON publication_review_decisions"
+        "DROP TRIGGER trg_publication_review_decisions_append_only ON publication_review_decisions"
     )
     op.drop_index(
         "ix_publication_review_current_artifact",

@@ -114,6 +114,7 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
             await uow.commit()
             return artifact
 
+
 class ExtractionService(_ArtifactPayloadMixin):
     def __init__(
         self,

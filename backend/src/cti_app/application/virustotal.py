@@ -172,9 +172,7 @@ class VirusTotalRoutingPolicy:
     performing any request.
     """
 
-    routes: Mapping[VirusTotalCapability, VirusTotalOperationRoute] = field(
-        default_factory=dict
-    )
+    routes: Mapping[VirusTotalCapability, VirusTotalOperationRoute] = field(default_factory=dict)
 
     def route_for(self, capability: VirusTotalCapability) -> VirusTotalOperationRoute | None:
         return self.routes.get(capability)

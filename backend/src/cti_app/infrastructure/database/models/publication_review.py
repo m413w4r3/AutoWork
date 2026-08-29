@@ -25,8 +25,7 @@ class PublicationReviewDecisionRow(Base):
             name="ck_publication_review_artifact_version",
         ),
         CheckConstraint(
-            "char_length(document_input_hash) = 64 "
-            "AND document_input_hash ~ '^[0-9a-f]{64}$'",
+            "char_length(document_input_hash) = 64 AND document_input_hash ~ '^[0-9a-f]{64}$'",
             name="ck_publication_review_input_hash",
         ),
         CheckConstraint(

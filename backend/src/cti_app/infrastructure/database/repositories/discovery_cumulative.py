@@ -109,8 +109,7 @@ class SqlAlchemyDiscoveryMergeRunRepository:
             update(DiscoveryMergeRunRow)
             .where(
                 DiscoveryMergeRunRow.id == run_id,
-                DiscoveryMergeRunRow.validation_status
-                == MergeValidationStatus.NEEDS_REVIEW.value,
+                DiscoveryMergeRunRow.validation_status == MergeValidationStatus.NEEDS_REVIEW.value,
             )
             .values(validation_status=MergeValidationStatus.RESOLVED.value)
         )

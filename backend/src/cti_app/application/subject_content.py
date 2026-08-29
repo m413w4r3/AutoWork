@@ -137,9 +137,7 @@ class SubjectContentService:
                 normalized = item.normalized_value or normalize_indicator_value(
                     item.value, item.artifact_type
                 )
-                display = display_indicator_value(
-                    item.value, item.artifact_type, defanged=True
-                )
+                display = display_indicator_value(item.value, item.artifact_type, defanged=True)
             except ValueError:
                 continue
             indicators.append(
@@ -181,11 +179,7 @@ class SubjectContentService:
             original_name=source.original_name,
             mime_type=source.detected_mime_type or source.declared_mime_type,
             sha256=source.decoded_sha256 or source.encoded_sha256,
-            size=(
-                source.decoded_size
-                if source.decoded_size is not None
-                else source.encoded_size
-            ),
+            size=(source.decoded_size if source.decoded_size is not None else source.encoded_size),
             origin=source.origin,
             provenance=provenance or None,
             tlp=source.tlp,

@@ -52,9 +52,7 @@ class InMemoryJobRepository:
     ) -> Sequence[Job]:
         return [
             deepcopy(job)
-            for job in sorted(
-                self._jobs.values(), key=lambda item: item.created_at, reverse=True
-            )
+            for job in sorted(self._jobs.values(), key=lambda item: item.created_at, reverse=True)
             if job.aggregate_type == aggregate_type
             and job.aggregate_id == aggregate_id
             and (kind is None or job.kind == kind)

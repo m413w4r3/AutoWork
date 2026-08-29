@@ -1,4 +1,5 @@
 """real AutoWork reference corpus"""
+
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
@@ -10,23 +11,42 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_table("reference_members",
+    op.create_table(
+        "reference_members",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("sample_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("samples.id", ondelete="RESTRICT"), nullable=False),
+        sa.Column(
+            "sample_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("samples.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
         sa.Column("sample_sha256", sa.String(64), nullable=False),
         sa.Column("family_label", sa.Text(), nullable=False),
-        sa.Column("origin_investigation_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("analyst_investigations.id", ondelete="RESTRICT")),
+        sa.Column(
+            "origin_investigation_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("analyst_investigations.id", ondelete="RESTRICT"),
+        ),
         sa.Column("promoted_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("actor_id", sa.String(255), nullable=False),
         sa.Column("label_source", sa.String(32), nullable=False),
         sa.UniqueConstraint("sample_id", "family_label", name="uq_reference_members_sample_label"),
-        sa.CheckConstraint("label_source IN ('ANALYST','OPERATOR_IMPORT')", name="ck_reference_members_source"),
+        sa.CheckConstraint(
+            "label_source IN ('ANALYST','OPERATOR_IMPORT')", name="ck_reference_members_source"
+        ),
     )
     op.create_index("ix_reference_members_sample_id", "reference_members", ["sample_id"])
-    op.create_table("reference_member_disputes",
-        sa.Column("member_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("reference_members.id", ondelete="RESTRICT"), primary_key=True),
+    op.create_table(
+        "reference_member_disputes",
+        sa.Column(
+            "member_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("reference_members.id", ondelete="RESTRICT"),
+            primary_key=True,
+        ),
         sa.Column("created_at", sa.DateTime(timezone=True), primary_key=True),
-        sa.Column("reason", sa.Text(), nullable=False), sa.Column("actor_id", sa.String(255), nullable=False),
+        sa.Column("reason", sa.Text(), nullable=False),
+        sa.Column("actor_id", sa.String(255), nullable=False),
     )
     op.execute(
         """

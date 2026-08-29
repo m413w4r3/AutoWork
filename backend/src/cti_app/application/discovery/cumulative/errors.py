@@ -17,9 +17,7 @@ class DiscoverySnapshotStaleError(RuntimeError):
     the contribution has to be planned again from the current state.
     """
 
-    def __init__(
-        self, reason: str, *, replan: ReconcileDiscoveryParameters | None = None
-    ) -> None:
+    def __init__(self, reason: str, *, replan: ReconcileDiscoveryParameters | None = None) -> None:
         super().__init__(reason)
         self.replan = replan
 

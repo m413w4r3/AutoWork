@@ -67,11 +67,15 @@ def test_same_publication_requires_corroborator_not_title_alone() -> None:
     # Same title, but different publisher AND different date: two genuinely
     # distinct articles (e.g. recurring "Weekly roundup" pieces) must not merge.
     a = make_source(
-        "https://a.example/one", title="Weekly threat roundup", publisher="Vendor A",
+        "https://a.example/one",
+        title="Weekly threat roundup",
+        publisher="Vendor A",
         published_at=date(2026, 5, 1),
     )
     b = make_source(
-        "https://b.example/two", title="Weekly threat roundup", publisher="Vendor B",
+        "https://b.example/two",
+        title="Weekly threat roundup",
+        publisher="Vendor B",
         published_at=date(2026, 5, 8),
     )
     assert same_publication(a, b) is False

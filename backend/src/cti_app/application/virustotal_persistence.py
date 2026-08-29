@@ -38,8 +38,12 @@ class VirusTotalObservationService:
         self._uow_factory = uow_factory
 
     async def store_file_report(
-        self, report: VirusTotalFileReport, *, subject_id: UUID | None = None,
-        observed_at: datetime, checkpoint_id: str | None = None
+        self,
+        report: VirusTotalFileReport,
+        *,
+        subject_id: UUID | None = None,
+        observed_at: datetime,
+        checkpoint_id: str | None = None,
     ) -> VirusTotalObservation:
         if checkpoint_id is not None:
             async with self._uow_factory() as uow:

@@ -142,17 +142,13 @@ class CodeFeatureSet:
             "status": self.status.value,
             "ngrams": [
                 {
-                    **{
-                        name: getattr(ngram, name)
-                        for name in CODE_NGRAM_STRUCTURAL_FIELDS
-                    },
+                    **{name: getattr(ngram, name) for name in CODE_NGRAM_STRUCTURAL_FIELDS},
                     "mnemonics": list(ngram.mnemonics),
                 }
                 for ngram in self.ngrams
             ],
             "packing": {
-                name: getattr(self.packing, name)
-                for name in self.packing.__dataclass_fields__
+                name: getattr(self.packing, name) for name in self.packing.__dataclass_fields__
             },
             "errors": list(self.errors),
         }
@@ -236,9 +232,7 @@ def build_code_ngrams(
                     if len(selected) != size:
                         continue
                     tokens = tuple(
-                        token
-                        for instruction in selected
-                        for token in instruction.escaped_bytes
+                        token for instruction in selected for token in instruction.escaped_bytes
                     )
                     pattern = escaped_pattern(tokens)
                     fixed = sum(not _escaped_is_masked(token) for token in tokens)

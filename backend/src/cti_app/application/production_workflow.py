@@ -442,9 +442,7 @@ class ProductionWorkflowOrchestrator:
             if synthesis.rendered_blob_id is not None:
                 loaded["synthesis_text"] = await store.read_text(synthesis.rendered_blob_id)
             if publication.rendered_blob_id is not None:
-                loaded["publication_markdown"] = await store.read_text(
-                    publication.rendered_blob_id
-                )
+                loaded["publication_markdown"] = await store.read_text(publication.rendered_blob_id)
         except Exception:
             return loaded
         return loaded

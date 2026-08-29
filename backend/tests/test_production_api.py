@@ -555,9 +555,7 @@ async def test_start_subject_production_rejects_non_selected_subject(
     assert response.status_code == 409
 
 
-async def test_start_edition_produces_every_selected_article(
-    api: AsyncClient, uow: _Uow
-) -> None:
+async def test_start_edition_produces_every_selected_article(api: AsyncClient, uow: _Uow) -> None:
     edition_id = uuid4()
     subjects = [uuid4() for _ in range(3)]
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):

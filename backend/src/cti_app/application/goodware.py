@@ -134,9 +134,7 @@ class GoodwareService:
         manifest = _validate_artifact(artifact_dir, source_dir)
         fingerprint = cast(str, manifest["baseline_fingerprint_sha256"])
         async with self._uow_factory() as uow:
-            existing = await uow.goodware_baselines.get_by_baseline_fingerprint_sha256(
-                fingerprint
-            )
+            existing = await uow.goodware_baselines.get_by_baseline_fingerprint_sha256(fingerprint)
             if existing is not None:
                 return existing
 
@@ -279,9 +277,7 @@ class GoodwareMeasurementService:
         return {
             value: count
             for (kind, value), count in (
-                await prepared.lookup_batch(
-                    [(feature_kind, value) for value in values]
-                )
+                await prepared.lookup_batch([(feature_kind, value) for value in values])
             ).items()
             if kind == feature_kind
         }

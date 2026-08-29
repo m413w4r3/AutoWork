@@ -501,9 +501,7 @@ class EditionProductionService:
                 )
                 if lock_creation is not None:
                     await lock_creation(subject_id)
-                get_current = getattr(
-                    uow.subject_production_runs, "get_current_for_subject", None
-                )
+                get_current = getattr(uow.subject_production_runs, "get_current_for_subject", None)
                 current_run = await get_current(subject_id) if get_current is not None else None
                 if current_run and current_run.status in (
                     SubjectProductionStatus.QUEUED,

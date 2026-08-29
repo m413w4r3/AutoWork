@@ -73,9 +73,7 @@ class CodeFeatureService:
             if existing is not None:
                 return existing
 
-        payload = await self._blobs.read(
-            sample.blob_id, max_bytes=analysis_max_sample_bytes
-        )
+        payload = await self._blobs.read(sample.blob_id, max_bytes=analysis_max_sample_bytes)
         result = await self._smda.extract(
             payload,
             timeout_seconds=smda_timeout_seconds,

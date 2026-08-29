@@ -505,9 +505,9 @@ async def test_fresh_zero_p09_uses_persisted_m2_provenance() -> None:
     }
     provenance = result.snapshot.context["provenances"][0]
     assert provenance["kind"] == "sample_feature"
-    assert provenance["sample_sha256"] == result.snapshot.context["origin_samples"][0][
-        "sample_sha256"
-    ]
+    assert (
+        provenance["sample_sha256"] == result.snapshot.context["origin_samples"][0]["sample_sha256"]
+    )
     assert provenance["feature_id"] == str(feature["id"])
     assert provenance["offsets"] == [16]
 
@@ -596,9 +596,7 @@ async def test_banal_and_multi_family_are_filtered_but_small_corpus_survives() -
     banal["payload"]["strings"][0]["banality"] = "BANAL"  # type: ignore[index]
     multi["payload"]["strings"][0]["corpus_verdict"] = "MULTI_FAMILY"  # type: ignore[index]
     small["payload"]["strings"][0]["corpus_verdict"] = "CORPUS_TOO_SMALL"  # type: ignore[index]
-    state = _State(
-        samples=[sample], static_features=[banal, multi, small], invariants=[]
-    )
+    state = _State(samples=[sample], static_features=[banal, multi, small], invariants=[])
     service, _, _, _ = _service(state)
 
     context = (await service.propose(investigation_id=INVESTIGATION_ID)).snapshot.context
@@ -632,19 +630,14 @@ async def test_excluded_feature_does_not_change_feature_snapshot_sha() -> None:
     retained = _static_feature(sample.id, value="retained")
     excluded = _static_feature(sample.id, value="excluded")
     excluded["payload"]["strings"][0]["banality"] = "BANAL"  # type: ignore[index]
-    first, *_ = _service(
-        _State(samples=[sample], static_features=[retained], invariants=[])
-    )
+    first, *_ = _service(_State(samples=[sample], static_features=[retained], invariants=[]))
     second, *_ = _service(
         _State(samples=[sample], static_features=[retained, excluded], invariants=[])
     )
 
     first_result = await first.propose(investigation_id=INVESTIGATION_ID)
     second_result = await second.propose(investigation_id=INVESTIGATION_ID)
-    assert (
-        first_result.snapshot.feature_pack_sha256
-        == second_result.snapshot.feature_pack_sha256
-    )
+    assert first_result.snapshot.feature_pack_sha256 == second_result.snapshot.feature_pack_sha256
 
 
 @pytest.mark.asyncio
@@ -655,9 +648,7 @@ async def test_snapshot_sha_is_deterministic_under_row_ordering() -> None:
         {"id": uuid4(), "sample_id": sample.id, "sample_sha256": "c" * 64, "family_label": "luna"},
     ]
     features = [_static_feature(sample.id)]
-    first, *_ = _service(
-        _State(samples=[sample], members=members, static_features=features)
-    )
+    first, *_ = _service(_State(samples=[sample], members=members, static_features=features))
     second, *_ = _service(
         _State(samples=[sample], members=list(reversed(members)), static_features=features)
     )
@@ -715,9 +706,7 @@ async def test_replay_reuses_persisted_input_after_p09_mutation() -> None:
     conversation = _ConversationService(output=json.dumps(output))
     state = _State(samples=[sample], static_features=[feature], invariants=[])
     registry = _Registry()
-    registry.mutation = lambda: state.invariants.invariants.append(
-        SimpleNamespace(provenances=())
-    )
+    registry.mutation = lambda: state.invariants.invariants.append(SimpleNamespace(provenances=()))
     service, _, _, _ = _service(state, conversation=conversation, registry=registry)
 
     first = await service.propose(investigation_id=INVESTIGATION_ID, cycle_number=1)
@@ -891,9 +880,7 @@ async def test_frequency_estimate_is_ignored_from_canonical_response() -> None:
     assert "frequency_estimate" in raw
     assert "frequency_estimate" not in str(normalized["content"])
     assert normalized["reference"] != turn.output_blob_reference
-    assert normalized["sha256"] == hashlib.sha256(
-        str(normalized["content"]).encode()
-    ).hexdigest()
+    assert normalized["sha256"] == hashlib.sha256(str(normalized["content"]).encode()).hexdigest()
     assert normalized["parser_stage"] == "p10_strict_proposal"
     assert normalized["transformations"] == ("ignored estimate fields: frequency_estimate",)
 

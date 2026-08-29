@@ -313,9 +313,7 @@ class InvariantRegistryService:
                 ),
                 None,
             )
-            if invariant_type is InvariantType.CODE_NGRAM and (
-                ngram is None or packing is None
-            ):
+            if invariant_type is InvariantType.CODE_NGRAM and (ngram is None or packing is None):
                 return await self._reject(
                     uow=uow,
                     investigation_id=investigation_id,
@@ -344,9 +342,7 @@ class InvariantRegistryService:
             if ngram is not None:
                 opcode_lookup = opcode_fragment16_lookup_value(ngram)
                 goodware_descriptor = (
-                    ("opcode_fragment16", opcode_lookup)
-                    if opcode_lookup is not None
-                    else None
+                    ("opcode_fragment16", opcode_lookup) if opcode_lookup is not None else None
                 )
             baseline_id, occurrence_count = await self._goodware_measurement(
                 baseline_id=baseline_id,
@@ -356,9 +352,7 @@ class InvariantRegistryService:
             measured_occurrence_count = (
                 occurrence_count if occurrence_count is not None and occurrence_count > 0 else None
             )
-            banality = self._banality_scorer.score(
-                measured_occurrence_count
-            )
+            banality = self._banality_scorer.score(measured_occurrence_count)
             if banality is Banality.BANAL:
                 return await self._reject(
                     uow=uow,

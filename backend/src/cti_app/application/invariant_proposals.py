@@ -188,12 +188,15 @@ class ProposalConversationService:
                 conversation.id, existing_turn, investigation.subject_id
             )
             persisted_snapshot = _snapshot_from_prompt(content.input_text)
-            if make_proposal_turn_idempotency_key(
-                investigation_id=investigation_id,
-                cycle_number=effective_cycle,
-                snapshot=persisted_snapshot,
-                prompt_version=self._prompt_version,
-            ) != idempotency_key:
+            if (
+                make_proposal_turn_idempotency_key(
+                    investigation_id=investigation_id,
+                    cycle_number=effective_cycle,
+                    snapshot=persisted_snapshot,
+                    prompt_version=self._prompt_version,
+                )
+                != idempotency_key
+            ):
                 raise ProposalConversationError(
                     "The persisted proposal turn does not match its idempotency key"
                 )
@@ -328,13 +331,9 @@ class ProposalConversationService:
             all_sample_ids = tuple(sample.id for sample in samples)
             all_sample_context = await self._sample_context(uow, samples)
             sample_by_id = {sample.id: sample for sample in samples}
-            sample_context_by_id = {
-                UUID(item["sample_id"]): item for item in all_sample_context
-            }
+            sample_context_by_id = {UUID(item["sample_id"]): item for item in all_sample_context}
 
-            members = await _optional_call(
-                getattr(uow, "reference_members", None), "list"
-            )
+            members = await _optional_call(getattr(uow, "reference_members", None), "list")
             corpus_state = await self._corpus_context(uow, members)
             static_features = await _feature_records(
                 getattr(uow, "sample_feature_sets", None),
@@ -352,19 +351,13 @@ class ProposalConversationService:
                 "list_for_samples",
             )
             static_features = tuple(
-                item
-                for item in static_features
-                if _record_belongs_to_samples(item, all_sample_ids)
+                item for item in static_features if _record_belongs_to_samples(item, all_sample_ids)
             )
             code_features = tuple(
-                item
-                for item in code_features
-                if _record_belongs_to_samples(item, all_sample_ids)
+                item for item in code_features if _record_belongs_to_samples(item, all_sample_ids)
             )
             capabilities = tuple(
-                item
-                for item in capabilities
-                if _record_belongs_to_samples(item, all_sample_ids)
+                item for item in capabilities if _record_belongs_to_samples(item, all_sample_ids)
             )
             invariants = await _optional_call(
                 getattr(uow, "invariants", None),
@@ -381,9 +374,7 @@ class ProposalConversationService:
                 "list_for_subject",
                 investigation.subject_id,
             )
-            static_features = tuple(
-                sorted(static_features, key=lambda item: _canonical_json(item))
-            )
+            static_features = tuple(sorted(static_features, key=lambda item: _canonical_json(item)))
             code_features = tuple(sorted(code_features, key=lambda item: _canonical_json(item)))
             capabilities = tuple(sorted(capabilities, key=lambda item: _canonical_json(item)))
             invariants = tuple(
@@ -398,17 +389,11 @@ class ProposalConversationService:
 
             candidate_records: list[dict[str, Any]] = []
             for item in static_features:
-                candidate_records.extend(
-                    _static_candidate_records(item, sample_context_by_id)
-                )
+                candidate_records.extend(_static_candidate_records(item, sample_context_by_id))
             for item in code_features:
-                candidate_records.extend(
-                    _code_candidate_records(item, sample_context_by_id)
-                )
+                candidate_records.extend(_code_candidate_records(item, sample_context_by_id))
             for item in capabilities:
-                candidate_records.extend(
-                    _capability_candidate_records(item, sample_context_by_id)
-                )
+                candidate_records.extend(_capability_candidate_records(item, sample_context_by_id))
             candidate_records.sort(key=_candidate_sort_key)
 
             descriptors = tuple(
@@ -435,12 +420,10 @@ class ProposalConversationService:
                                 InvariantType(candidate["invariant_type"]),
                                 candidate["pattern"],
                             )
-                        ) is not None
-                        if (
-                            goodware_descriptor := _goodware_descriptor(
-                                candidate, descriptor
-                            )
-                        ) is not None
+                        )
+                        is not None
+                        if (goodware_descriptor := _goodware_descriptor(candidate, descriptor))
+                        is not None
                     }
                 )
             )
@@ -545,13 +528,9 @@ class ProposalConversationService:
                 if candidate["source_kind"] == "capabilities"
             ]
             corpus_hash = _sha256_json(corpus_state)
-            feature_hash = _sha256_json(
-                _candidate_persisted_references(static_candidates)
-            )
+            feature_hash = _sha256_json(_candidate_persisted_references(static_candidates))
             code_hash = _sha256_json(_candidate_persisted_references(code_candidates))
-            capability_hash = _sha256_json(
-                _candidate_persisted_references(capability_candidates)
-            )
+            capability_hash = _sha256_json(_candidate_persisted_references(capability_candidates))
             context = {
                 "snapshot_references": {
                     "input_pack_sha256": investigation.input_sha256,
@@ -569,14 +548,10 @@ class ProposalConversationService:
                 "reference_corpus": corpus_state,
                 "static_features": [_candidate_context(item) for item in static_candidates],
                 "code_features": [_candidate_context(item) for item in code_candidates],
-                "capabilities": [
-                    _candidate_context(item) for item in capability_candidates
-                ],
+                "capabilities": [_candidate_context(item) for item in capability_candidates],
                 "existing_invariants": [_invariant_context(item) for item in invariants],
                 "prior_rejections": [_rejection_context(item) for item in rejections],
-                "report_claims": [
-                    _bounded_json(item, drop_timestamps=True) for item in claims
-                ],
+                "report_claims": [_bounded_json(item, drop_timestamps=True) for item in claims],
                 "provenances": [
                     {"provenance_ref": ref, **canonical_provenance(value)}
                     for ref, value in sorted(provenance_by_ref.items())
@@ -617,9 +592,7 @@ class ProposalConversationService:
             result["corpus_family_sample_counts"] = [
                 list(item) for item in sorted(assessment.family_sample_counts.items())
             ]
-            result["corpus_benign_sample_occurrences"] = (
-                assessment.benign_sample_occurrences
-            )
+            result["corpus_benign_sample_occurrences"] = assessment.benign_sample_occurrences
 
         goodware_descriptor = (
             _goodware_descriptor(result, descriptor) if descriptor is not None else None
@@ -635,9 +608,7 @@ class ProposalConversationService:
             else None
         )
         if descriptor is not None and descriptor[0] == "code_ngram":
-            result["goodware_verdict"] = (
-                "PRESENT" if measured_occurrence is not None else "UNKNOWN"
-            )
+            result["goodware_verdict"] = "PRESENT" if measured_occurrence is not None else "UNKNOWN"
             result["goodware_occurrence_count"] = measured_occurrence
         result["goodware_baseline_id"] = str(baseline_id)
         result["banality_occurrence_count"] = occurrence
@@ -818,9 +789,7 @@ class ProposalConversationService:
             await uow.analyst_investigations.save(investigation)
             await uow.commit()
 
-    async def _has_verified_head(
-        self, conversation: ModelConversation, subject_id: UUID
-    ) -> bool:
+    async def _has_verified_head(self, conversation: ModelConversation, subject_id: UUID) -> bool:
         if not conversation.head_turn_id or not conversation.external_locator:
             return False
         try:
@@ -849,9 +818,7 @@ class ProposalConversationService:
         direct_output = getattr(turn, "output_text", None)
         if isinstance(direct_output, str):
             return direct_output
-        turns = await self._model_conversations.turns(
-            conversation_id, context_subject_id=None
-        )
+        turns = await self._model_conversations.turns(conversation_id, context_subject_id=None)
         content = next((item for item in turns if item.turn.id == turn.id), None)
         if content is None or content.output_text is None:
             raise ProposalOutputValidationError("The proposal turn has no persisted output")
@@ -1009,9 +976,7 @@ def _parse_proposal_response_details(
         candidates.append(candidate.model_copy(update={"proposal_id": proposal_id}))
     response = response.model_copy(update={"candidate_invariants": candidates})
     transformations = (
-        (f"ignored estimate fields: {', '.join(sorted(ignored_fields))}",)
-        if ignored_fields
-        else ()
+        (f"ignored estimate fields: {', '.join(sorted(ignored_fields))}",) if ignored_fields else ()
     )
     return response, transformations
 
@@ -1040,9 +1005,7 @@ def _validate_yara_references(
     proposal_ids = {candidate.proposal_id for candidate in candidates}
     provenance_ids = set(provenance_by_ref)
     references = (
-        set(draft.proposal_refs)
-        | set(draft.provenance_refs)
-        | set(draft.condition.references)
+        set(draft.proposal_refs) | set(draft.provenance_refs) | set(draft.condition.references)
     )
     if not references.issubset(proposal_ids | provenance_ids):
         raise ProposalOutputValidationError("YARA draft contains an unknown proposal reference")
@@ -1180,9 +1143,7 @@ def _bounded_pattern(value: Any) -> str | None:
     return text
 
 
-def _candidate_category(
-    feature: Any, record: Any, default: str
-) -> str:
+def _candidate_category(feature: Any, record: Any, default: str) -> str:
     value = _value(feature, "category", _value(record, "category", default))
     value = _enum_value(value)
     try:
@@ -1645,14 +1606,10 @@ def _select_candidate_records(
                 if item["source_kind"] == "static_features"
             ],
             "code_features": [
-                _candidate_context(item)
-                for item in trial
-                if item["source_kind"] == "code_features"
+                _candidate_context(item) for item in trial if item["source_kind"] == "code_features"
             ],
             "capabilities": [
-                _candidate_context(item)
-                for item in trial
-                if item["source_kind"] == "capabilities"
+                _candidate_context(item) for item in trial if item["source_kind"] == "capabilities"
             ],
         }
         if len(_canonical_json(groups)) > _MAX_CONTEXT_CHARS // 2:
@@ -1954,9 +1911,7 @@ def _bounded_json(value: Any, *, drop_timestamps: bool = False, depth: int = 0) 
                     key_text,
                     _bounded_json(
                         item,
-                        drop_timestamps=(
-                            drop_timestamps and key_text.lower() != "occurred_at"
-                        ),
+                        drop_timestamps=(drop_timestamps and key_text.lower() != "occurred_at"),
                         depth=depth + 1,
                     ),
                 )

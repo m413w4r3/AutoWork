@@ -31,9 +31,7 @@ async def test_smda_adapter_materializes_canonical_bytes(tmp_path: Path) -> None
             AnalysisSubprocessStatus,
         )
 
-        return AnalysisSubprocessResult(
-            AnalysisSubprocessStatus.NON_ZERO_EXIT, 1, b"", b""
-        )
+        return AnalysisSubprocessResult(AnalysisSubprocessStatus.NON_ZERO_EXIT, 1, b"", b"")
 
     payload = build_pe64()
     source = tmp_path / "canonical.bin"
@@ -103,10 +101,6 @@ async def test_real_smda_45_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert all(
         len(instruction.escaped_bytes) == len(instruction.bytes) for instruction in instructions
     )
-    ngrams = build_code_ngrams(
-        result.extraction.functions, (2,), max_per_sample=100
-    )
+    ngrams = build_code_ngrams(result.extraction.functions, (2,), max_per_sample=100)
     assert ngrams
-    assert re.fullmatch(
-        r"(?:[0-9a-f]{2}|\?\?)(?: (?:[0-9a-f]{2}|\?\?))+", ngrams[0].pattern
-    )
+    assert re.fullmatch(r"(?:[0-9a-f]{2}|\?\?)(?: (?:[0-9a-f]{2}|\?\?))+", ngrams[0].pattern)

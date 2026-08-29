@@ -96,6 +96,7 @@ def test_pinned_smda_public_api_is_importable() -> None:
     from smda.common import SmdaFunction
     from smda.Disassembler import Disassembler, SmdaReport
     from smda.SmdaConfig import SmdaConfig
+
     assert Disassembler is not None
     assert SmdaConfig.ESCAPER_DOWNWARD_COMPATIBILITY
     assert SmdaFunction.INTEL_PIC_HASH_ESCAPE_VERSION

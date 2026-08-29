@@ -9,6 +9,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
   let jobPolls = 0;
   let merged = false;
   let selected = false;
+  let selectionOpened = false;
   const edition = {
     id: editionId,
     country: "Iran",
@@ -20,13 +21,20 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     target_articles: 3,
     previous_edition_id: null,
     source_profile: "iran-default",
-    status: "selection",
+    status: "discovery",
     version: 2,
     progress_percent: 25,
-    allowed_transitions: ["production", "archived"],
+    allowed_transitions: ["selection", "archived"],
     created_at: "2026-06-01T00:00:00Z",
     updated_at: "2026-06-01T00:00:00Z",
   };
+  const currentEdition = () => ({
+    ...edition,
+    status: selectionOpened ? "selection" : "discovery",
+    allowed_transitions: selectionOpened
+      ? ["production", "archived"]
+      : ["selection", "archived"],
+  });
   const source = (
     id: string,
     title: string,
@@ -173,7 +181,14 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (path === `/api/editions/${editionId}`)
-      return route.fulfill({ json: edition });
+      return route.fulfill({ json: currentEdition() });
+    if (
+      path === `/api/editions/${editionId}/transitions` &&
+      request.method() === "POST"
+    ) {
+      selectionOpened = true;
+      return route.fulfill({ json: currentEdition() });
+    }
     if (path.endsWith("/discovery/candidates"))
       return route.fulfill({
         json: {
@@ -203,6 +218,13 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
               : [],
           candidates: searched && jobCompleted ? [cyfirma, ncc] : [],
           total: searched && jobCompleted ? 2 : 0,
+          merge_stats: {
+            raw_batch_count: searched && jobCompleted ? 1 : 0,
+            raw_candidate_count: searched && jobCompleted ? 2 : 0,
+            consolidated_candidate_count: searched && jobCompleted ? 2 : 0,
+            unique_publication_count: searched && jobCompleted ? 2 : 0,
+            duplicate_publication_occurrence_count: 0,
+          },
           warning: "provisoire",
         },
       });
@@ -299,6 +321,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
   ).not.toBeVisible();
 
   await page.clock.fastForward(2_100);
+  await page.getByText("Détails techniques de la découverte").click();
   await expect(
     page.getByRole("heading", { name: cyfirma.title }).first(),
   ).toBeVisible();
@@ -306,6 +329,10 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     page.getByRole("heading", { name: ncc.title }).first(),
   ).toBeVisible();
 
+  await page.getByRole("button", { name: "Ouvrir la sélection" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Sélection des sujets" }),
+  ).toBeVisible();
   await page.getByText("Organiser les publications").click();
   const firstGroup = page
     .locator(".advanced-group-card")

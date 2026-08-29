@@ -153,8 +153,7 @@ class SqlAlchemyEditionReviewReadRepository:
             .select_from(EditionProductionBatchItemRow)
             .join(
                 SubjectProductionRunRow,
-                SubjectProductionRunRow.id
-                == EditionProductionBatchItemRow.production_run_id,
+                SubjectProductionRunRow.id == EditionProductionBatchItemRow.production_run_id,
             )
             .outerjoin(
                 ProductionInputSnapshotRow,
@@ -164,8 +163,7 @@ class SqlAlchemyEditionReviewReadRepository:
             .outerjoin(
                 current_artifacts,
                 and_(
-                    current_artifacts.c.run_id
-                    == EditionProductionBatchItemRow.production_run_id,
+                    current_artifacts.c.run_id == EditionProductionBatchItemRow.production_run_id,
                     current_artifacts.c.artifact_rank == 1,
                 ),
             )
@@ -175,8 +173,7 @@ class SqlAlchemyEditionReviewReadRepository:
                     PublicationReviewDecisionRow.edition_id == edition_id,
                     PublicationReviewDecisionRow.subject_id
                     == EditionProductionBatchItemRow.subject_id,
-                    PublicationReviewDecisionRow.production_run_id
-                    == SubjectProductionRunRow.id,
+                    PublicationReviewDecisionRow.production_run_id == SubjectProductionRunRow.id,
                     PublicationReviewDecisionRow.pipeline_generation
                     == SubjectProductionRunRow.pipeline_generation,
                     or_(
@@ -200,11 +197,7 @@ class SqlAlchemyEditionReviewReadRepository:
             .where(EditionProductionBatchItemRow.batch_id == latest_batch_id)
             .subquery("ranked_review_items")
         )
-        query = (
-            select(ranked)
-            .where(ranked.c.decision_rank == 1)
-            .order_by(ranked.c.position)
-        )
+        query = select(ranked).where(ranked.c.decision_rank == 1).order_by(ranked.c.position)
         rows = (await self._session.execute(query)).mappings()
         return [_read_item_from_row(row) for row in rows]
 

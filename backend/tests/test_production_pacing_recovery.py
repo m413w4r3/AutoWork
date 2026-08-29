@@ -198,9 +198,7 @@ async def test_batch_terminal_handoff_moves_production_edition_to_review() -> No
     uow, runs = _batch_uow(["unknown_code"])
     service = EditionProductionService(lambda: uow)
 
-    result = await service.on_subject_terminal(
-        uow.edition_production_batches.item.id, runs[0].id
-    )
+    result = await service.on_subject_terminal(uow.edition_production_batches.item.id, runs[0].id)
 
     assert result is None
     assert uow.editions.edition.status is EditionStatus.REVIEW
@@ -319,9 +317,7 @@ async def test_stage_dispatch_uses_model_jitter_and_subject_override() -> None:
         )
     )
     chain.bind(Jobs(), dispatcher)  # type: ignore[arg-type]
-    run = SubjectProductionRun(
-        subject_id=uuid4(), edition_id=uuid4()
-    )
+    run = SubjectProductionRun(subject_id=uuid4(), edition_id=uuid4())
 
     await chain.submit(
         run=run,

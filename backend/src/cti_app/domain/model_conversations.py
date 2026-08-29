@@ -218,5 +218,3 @@ class ModelConversationTurn:
         self.error_message = " ".join(message.replace("\x00", "").split())[:500]
         self.error_details = details
         self.finished_at = now or datetime.now(UTC)
-
-

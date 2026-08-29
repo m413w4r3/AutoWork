@@ -173,16 +173,12 @@ class SqlAlchemyInvariantRepository:
                 lookup_value = normalized_value.lower()
             else:
                 continue
-            grouped.setdefault(feature_kind, {}).setdefault(lookup_value, []).append(
-                descriptor
-            )
+            grouped.setdefault(feature_kind, {}).setdefault(lookup_value, []).append(descriptor)
 
         for feature_kind, values_by_key in grouped.items():
             values = tuple(values_by_key)
             if feature_kind in _HASH_FEATURE_KINDS:
-                measured = await self._measure_sample_hash_bulk(
-                    feature_kind, values, sample_ids
-                )
+                measured = await self._measure_sample_hash_bulk(feature_kind, values, sample_ids)
             else:
                 measured = await self._measure_indexed_feature_bulk(
                     feature_kind, values, sample_ids
@@ -235,23 +231,15 @@ class SqlAlchemyInvariantRepository:
         row = await self._session.get(CandidateInvariantRow, invariant_id)
         return await self._candidate_from_row(row) if row is not None else None
 
-    async def get_invariant_by_proposal_key(
-        self, proposal_key: str
-    ) -> CandidateInvariant | None:
+    async def get_invariant_by_proposal_key(self, proposal_key: str) -> CandidateInvariant | None:
         row = await self._session.scalar(
-            select(CandidateInvariantRow).where(
-                CandidateInvariantRow.proposal_key == proposal_key
-            )
+            select(CandidateInvariantRow).where(CandidateInvariantRow.proposal_key == proposal_key)
         )
         return await self._candidate_from_row(row) if row is not None else None
 
-    async def get_rejection_by_proposal_key(
-        self, proposal_key: str
-    ) -> InvariantRejection | None:
+    async def get_rejection_by_proposal_key(self, proposal_key: str) -> InvariantRejection | None:
         row = await self._session.scalar(
-            select(InvariantRejectionRow).where(
-                InvariantRejectionRow.proposal_key == proposal_key
-            )
+            select(InvariantRejectionRow).where(InvariantRejectionRow.proposal_key == proposal_key)
         )
         return _rejection_from_row(row) if row is not None else None
 
@@ -611,9 +599,7 @@ class SqlAlchemyInvariantRepository:
         normalized_values: Sequence[str],
         sample_ids: Sequence[UUID],
     ) -> Mapping[str, tuple[tuple[tuple[UUID, str], ...], int, int]]:
-        members: dict[str, list[tuple[UUID, str]]] = {
-            value: [] for value in normalized_values
-        }
+        members: dict[str, list[tuple[UUID, str]]] = {value: [] for value in normalized_values}
         benign: dict[str, int] = {value: 0 for value in normalized_values}
         support: dict[str, int] = {value: 0 for value in normalized_values}
         dispute = select(ReferenceMemberDisputeRow.member_id).where(
@@ -664,9 +650,7 @@ class SqlAlchemyInvariantRepository:
                 benign[str(value).lower()] = int(count)
 
             for sample_start in range(0, len(sample_ids), _MEASUREMENT_IN_CHUNK_SIZE):
-                snapshot_ids = sample_ids[
-                    sample_start : sample_start + _MEASUREMENT_IN_CHUNK_SIZE
-                ]
+                snapshot_ids = sample_ids[sample_start : sample_start + _MEASUREMENT_IN_CHUNK_SIZE]
                 support_result = await self._session.execute(
                     select(
                         SampleFeatureIndexRow.normalized_value,
@@ -697,9 +681,7 @@ class SqlAlchemyInvariantRepository:
         sample_ids: Sequence[UUID],
     ) -> Mapping[str, tuple[tuple[tuple[UUID, str], ...], int, int]]:
         column = getattr(SampleRow, feature_kind)
-        members: dict[str, list[tuple[UUID, str]]] = {
-            value: [] for value in normalized_values
-        }
+        members: dict[str, list[tuple[UUID, str]]] = {value: [] for value in normalized_values}
         benign: dict[str, int] = {value: 0 for value in normalized_values}
         support: dict[str, int] = {value: 0 for value in normalized_values}
         dispute = select(ReferenceMemberDisputeRow.member_id).where(
@@ -735,9 +717,7 @@ class SqlAlchemyInvariantRepository:
                 benign[value] = int(count)
 
             for sample_start in range(0, len(sample_ids), _MEASUREMENT_IN_CHUNK_SIZE):
-                snapshot_ids = sample_ids[
-                    sample_start : sample_start + _MEASUREMENT_IN_CHUNK_SIZE
-                ]
+                snapshot_ids = sample_ids[sample_start : sample_start + _MEASUREMENT_IN_CHUNK_SIZE]
                 support_result = await self._session.execute(
                     select(column, func.count(func.distinct(SampleRow.id)))
                     .select_from(SampleRow)
@@ -796,13 +776,17 @@ class SqlAlchemyInvariantRepository:
                 .exists(),
             )
         )
-        support = await self._session.scalar(
-            select(func.count(func.distinct(SampleFeatureIndexRow.sample_id))).where(
-                SampleFeatureIndexRow.feature_kind == feature_kind,
-                SampleFeatureIndexRow.normalized_value == normalized_value.lower(),
-                SampleFeatureIndexRow.sample_id.in_(tuple(sample_ids)),
+        support = (
+            await self._session.scalar(
+                select(func.count(func.distinct(SampleFeatureIndexRow.sample_id))).where(
+                    SampleFeatureIndexRow.feature_kind == feature_kind,
+                    SampleFeatureIndexRow.normalized_value == normalized_value.lower(),
+                    SampleFeatureIndexRow.sample_id.in_(tuple(sample_ids)),
+                )
             )
-        ) if sample_ids else 0
+            if sample_ids
+            else 0
+        )
         return members, int(benign or 0), int(support or 0)
 
     async def _measure_sample_hash(
@@ -839,16 +823,18 @@ class SqlAlchemyInvariantRepository:
                 .exists(),
             )
         )
-        support = await self._session.scalar(
-            select(func.count(func.distinct(SampleRow.id))).where(
-                column == normalized_value, SampleRow.id.in_(tuple(sample_ids))
+        support = (
+            await self._session.scalar(
+                select(func.count(func.distinct(SampleRow.id))).where(
+                    column == normalized_value, SampleRow.id.in_(tuple(sample_ids))
+                )
             )
-        ) if sample_ids else 0
+            if sample_ids
+            else 0
+        )
         return members, int(benign or 0), int(support or 0)
 
-    async def _candidate_from_row(
-        self, row: CandidateInvariantRow
-    ) -> CandidateInvariant:
+    async def _candidate_from_row(self, row: CandidateInvariantRow) -> CandidateInvariant:
         provenance_rows = await self._session.scalars(
             select(CandidateInvariantProvenanceRow)
             .where(CandidateInvariantProvenanceRow.invariant_id == row.id)

@@ -226,37 +226,63 @@ def _manual(pattern: str = "CreateMutexW", moment: datetime = NOW) -> AnalystMan
 
 def test_closed_taxonomies_are_exact() -> None:
     assert {item.value for item in InvariantType} == {
-        "literal_string", "hex_pattern", "code_ngram", "opcode_sequence",
-        "import_name", "export_name", "section_name", "capability",
-        "similarity_hash", "structural_metadata", "relation",
+        "literal_string",
+        "hex_pattern",
+        "code_ngram",
+        "opcode_sequence",
+        "import_name",
+        "export_name",
+        "section_name",
+        "capability",
+        "similarity_hash",
+        "structural_metadata",
+        "relation",
     }
     assert {item.value for item in InvariantCategory} == {
-        "c2_indicator", "mutex_or_event", "pdb_or_build_path", "config_marker",
-        "crypto_constant", "custom_protocol", "ransom_or_ui_text", "code_sequence",
-        "capability_pattern", "similarity_key", "library_noise", "packer_artifact",
-        "compiler_artifact", "generic_winapi", "unknown",
+        "c2_indicator",
+        "mutex_or_event",
+        "pdb_or_build_path",
+        "config_marker",
+        "crypto_constant",
+        "custom_protocol",
+        "ransom_or_ui_text",
+        "code_sequence",
+        "capability_pattern",
+        "similarity_key",
+        "library_noise",
+        "packer_artifact",
+        "compiler_artifact",
+        "generic_winapi",
+        "unknown",
     }
 
 
 def test_provenances_require_their_own_fields() -> None:
-    assert SampleFeatureProvenance(
-        sample_sha256="a" * 64, feature_id="f", offsets=(1,)
-    ).kind == "sample_feature"
-    assert CodeFeatureProvenance(
-        sample_sha256="a" * 64,
-        function_address=0x1000,
-        offset=2,
-        disassembler_version="smda",
-    ).kind == "code_feature"
-    assert ToolOutputProvenance(
-        sample_sha256="a" * 64, tool="capa", version="1", internal_id="row"
-    ).kind == "tool_output"
-    assert CapabilityProvenance(
-        sample_sha256="a" * 64, capability_id="rule", addresses=("0x1",)
-    ).kind == "capability"
     assert (
-        ReportClaimProvenance(claim_id="claim", source_document="document").kind
-        == "report_claim"
+        SampleFeatureProvenance(sample_sha256="a" * 64, feature_id="f", offsets=(1,)).kind
+        == "sample_feature"
+    )
+    assert (
+        CodeFeatureProvenance(
+            sample_sha256="a" * 64,
+            function_address=0x1000,
+            offset=2,
+            disassembler_version="smda",
+        ).kind
+        == "code_feature"
+    )
+    assert (
+        ToolOutputProvenance(
+            sample_sha256="a" * 64, tool="capa", version="1", internal_id="row"
+        ).kind
+        == "tool_output"
+    )
+    assert (
+        CapabilityProvenance(sample_sha256="a" * 64, capability_id="rule", addresses=("0x1",)).kind
+        == "capability"
+    )
+    assert (
+        ReportClaimProvenance(claim_id="claim", source_document="document").kind == "report_claim"
     )
     assert _manual().kind == "analyst_manual"
     with pytest.raises(ValueError):
@@ -397,8 +423,12 @@ async def test_banal_and_multi_family_are_rejected_but_small_corpus_survives() -
         source_id="manual", sample_sha256=None, feature_kind="string", normalized_value="banal"
     )
     banal = await service.propose(
-        investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
-        category=InvariantCategory.UNKNOWN, pattern="banal", provenance=_manual("banal", NOW),
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.LITERAL_STRING,
+        category=InvariantCategory.UNKNOWN,
+        pattern="banal",
+        provenance=_manual("banal", NOW),
     )
     assert banal.rejection and banal.rejection.cause is InvariantRejectionCause.BANAL
 
@@ -407,7 +437,9 @@ async def test_banal_and_multi_family_are_rejected_but_small_corpus_survives() -
         source_id="manual", sample_sha256=None, feature_kind="string", normalized_value="multi"
     )
     multi = await service.propose(
-        investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.LITERAL_STRING,
         category=InvariantCategory.UNKNOWN,
         pattern="multi",
         provenance=_manual("multi", NOW.replace(microsecond=1)),
@@ -421,7 +453,9 @@ async def test_banal_and_multi_family_are_rejected_but_small_corpus_survives() -
         source_id="manual", sample_sha256=None, feature_kind="string", normalized_value="small"
     )
     small = await service.propose(
-        investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.LITERAL_STRING,
         category=InvariantCategory.UNKNOWN,
         pattern="small",
         provenance=_manual("small", NOW.replace(microsecond=2)),
@@ -445,9 +479,7 @@ async def test_banal_and_multi_family_are_rejected_but_small_corpus_survives() -
         ),
     ],
 )
-async def test_structural_types_require_technical_provenance(
-    invariant_type, provenances
-) -> None:
+async def test_structural_types_require_technical_provenance(invariant_type, provenances) -> None:
     service, uow = _service()
     uow.invariants.resolved = ResolvedFeature(
         source_id="manual", sample_sha256=None, feature_kind=None, normalized_value=None
@@ -510,27 +542,39 @@ def _packing() -> PackingSignals:
 async def test_code_ngram_thresholds_are_strict_at_the_boundary(ngram, cause) -> None:
     service, uow = _service()
     uow.invariants.resolved = ResolvedFeature(
-        source_id="code", sample_sha256="a" * 64, feature_kind="code_ngram",
-        normalized_value=ngram.pattern.strip().lower(), code_ngram=ngram, packing=_packing(),
+        source_id="code",
+        sample_sha256="a" * 64,
+        feature_kind="code_ngram",
+        normalized_value=ngram.pattern.strip().lower(),
+        code_ngram=ngram,
+        packing=_packing(),
     )
     uow.invariants.measurements = FeatureMeasurements(benign_prevalence=0)
     result = await service.propose(
-        investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.CODE_NGRAM,
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.CODE_NGRAM,
         category=InvariantCategory.CODE_SEQUENCE,
         pattern=ngram.pattern,
-            provenance=_code_provenance(),
+        provenance=_code_provenance(),
     )
     assert result.rejection and result.rejection.cause is cause
 
     if cause is InvariantRejectionCause.CODE_NGRAM_MASK_RATIO:
         uow.invariants.resolved = ResolvedFeature(
-            source_id="code", sample_sha256="a" * 64, feature_kind="code_ngram",
-            normalized_value=ngram.pattern.strip().lower(), code_ngram=_ngram(masked=2, longest=8),
+            source_id="code",
+            sample_sha256="a" * 64,
+            feature_kind="code_ngram",
+            normalized_value=ngram.pattern.strip().lower(),
+            code_ngram=_ngram(masked=2, longest=8),
             packing=_packing(),
         )
         result = await service.propose(
-            investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.CODE_NGRAM,
-            category=InvariantCategory.CODE_SEQUENCE, pattern=ngram.pattern,
+            investigation_id=INVESTIGATION_ID,
+            sample_ids=(),
+            type=InvariantType.CODE_NGRAM,
+            category=InvariantCategory.CODE_SEQUENCE,
+            pattern=ngram.pattern,
             provenance=_code_provenance(NOW.replace(microsecond=3)),
         )
         assert result.accepted
@@ -543,46 +587,61 @@ def test_likely_packed_uses_all_human_signals() -> None:
         "executable_bytes_per_function_gte": 1200,
         "known_packer_marker_hit": True,
     }
-    assert likely_packed(
-        PackingSignals(
-            max_executable_section_entropy=7.2,
-            executable_bytes=1200,
-            recovered_function_count=1,
-            executable_bytes_per_function=1200,
-            known_packer_marker_hits=("upx",),
-        ), **thresholds
-    ) is True
-    assert likely_packed(
-        PackingSignals(
-            max_executable_section_entropy=7.2,
-            executable_bytes=1200,
-            recovered_function_count=1,
-            executable_bytes_per_function=1200,
-            known_packer_marker_hits=(),
-        ), **thresholds
-    ) is False
-    assert likely_packed(
-        PackingSignals(
-            max_executable_section_entropy=None,
-            executable_bytes=0,
-            recovered_function_count=0,
-            executable_bytes_per_function=None,
-            known_packer_marker_hits=(),
-        ), **thresholds
-    ) is None
-    assert likely_packed(
-        PackingSignals(
-            max_executable_section_entropy=1.0,
-            executable_bytes=1,
-            recovered_function_count=1,
-            executable_bytes_per_function=1,
-            known_packer_marker_hits=("upx",),
-        ),
-        operator="ANY",
-        max_executable_section_entropy_gte=7.2,
-        executable_bytes_per_function_gte=1200,
-        known_packer_marker_hit=True,
-    ) is True
+    assert (
+        likely_packed(
+            PackingSignals(
+                max_executable_section_entropy=7.2,
+                executable_bytes=1200,
+                recovered_function_count=1,
+                executable_bytes_per_function=1200,
+                known_packer_marker_hits=("upx",),
+            ),
+            **thresholds,
+        )
+        is True
+    )
+    assert (
+        likely_packed(
+            PackingSignals(
+                max_executable_section_entropy=7.2,
+                executable_bytes=1200,
+                recovered_function_count=1,
+                executable_bytes_per_function=1200,
+                known_packer_marker_hits=(),
+            ),
+            **thresholds,
+        )
+        is False
+    )
+    assert (
+        likely_packed(
+            PackingSignals(
+                max_executable_section_entropy=None,
+                executable_bytes=0,
+                recovered_function_count=0,
+                executable_bytes_per_function=None,
+                known_packer_marker_hits=(),
+            ),
+            **thresholds,
+        )
+        is None
+    )
+    assert (
+        likely_packed(
+            PackingSignals(
+                max_executable_section_entropy=1.0,
+                executable_bytes=1,
+                recovered_function_count=1,
+                executable_bytes_per_function=1,
+                known_packer_marker_hits=("upx",),
+            ),
+            operator="ANY",
+            max_executable_section_entropy_gte=7.2,
+            executable_bytes_per_function_gte=1200,
+            known_packer_marker_hit=True,
+        )
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -593,8 +652,11 @@ async def test_report_claim_confirmation_requires_positive_support() -> None:
     )
     uow.invariants.measurements = FeatureMeasurements(benign_prevalence=0, positive_support=0)
     unconfirmed = await service.propose(
-        investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
-        category=InvariantCategory.C2_INDICATOR, pattern="x",
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.LITERAL_STRING,
+        category=InvariantCategory.C2_INDICATOR,
+        pattern="x",
         provenance=ReportClaimProvenance(claim_id="claim-1", source_document="doc-1"),
         positive_sample_confirmed=True,
     )
@@ -602,8 +664,11 @@ async def test_report_claim_confirmation_requires_positive_support() -> None:
 
     uow.invariants.measurements = FeatureMeasurements(benign_prevalence=0, positive_support=2)
     confirmed = await service.propose(
-        investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
-        category=InvariantCategory.C2_INDICATOR, pattern="x",
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.LITERAL_STRING,
+        category=InvariantCategory.C2_INDICATOR,
+        pattern="x",
         provenance=ReportClaimProvenance(claim_id="claim-2", source_document="doc-1"),
         positive_sample_confirmed=True,
     )
@@ -619,14 +684,22 @@ async def test_manual_and_regular_paths_share_scorer_and_transition_audit() -> N
     uow.invariants.measurements = FeatureMeasurements(benign_prevalence=0)
     uow.goodware_baselines.occurrence = 3
     result = await service.propose_manual(
-        investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
-        category=InvariantCategory.UNKNOWN, motif="x", actor_id="analyst", occurred_at=NOW,
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.LITERAL_STRING,
+        category=InvariantCategory.UNKNOWN,
+        motif="x",
+        actor_id="analyst",
+        occurred_at=NOW,
         pattern="x",
     )
     assert result.invariant and result.invariant.banality is Banality.SUSPICIOUS_COMMON
     transitioned = await service.transition(
-        invariant_id=result.invariant.id, to_status=InvariantStatus.APPROVED_FOR_PIVOT,
-        actor_id="analyst", occurred_at=NOW, reason="human review",
+        invariant_id=result.invariant.id,
+        to_status=InvariantStatus.APPROVED_FOR_PIVOT,
+        actor_id="analyst",
+        occurred_at=NOW,
+        reason="human review",
     )
     assert transitioned.status is InvariantStatus.APPROVED_FOR_PIVOT
     assert uow.invariants.transitions[0][1]["reason"] == "human review"
@@ -640,13 +713,23 @@ async def test_replay_and_rejection_statistics_are_idempotent() -> None:
     )
     uow.invariants.measurements = FeatureMeasurements(benign_prevalence=0)
     first = await service.propose_manual(
-        investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
-        category=InvariantCategory.UNKNOWN, motif="x", actor_id="analyst", occurred_at=NOW,
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.LITERAL_STRING,
+        category=InvariantCategory.UNKNOWN,
+        motif="x",
+        actor_id="analyst",
+        occurred_at=NOW,
         pattern="x",
     )
     second = await service.propose_manual(
-        investigation_id=INVESTIGATION_ID, sample_ids=(), type=InvariantType.LITERAL_STRING,
-        category=InvariantCategory.UNKNOWN, motif="x", actor_id="analyst", occurred_at=NOW,
+        investigation_id=INVESTIGATION_ID,
+        sample_ids=(),
+        type=InvariantType.LITERAL_STRING,
+        category=InvariantCategory.UNKNOWN,
+        motif="x",
+        actor_id="analyst",
+        occurred_at=NOW,
         pattern="x",
     )
     assert first.invariant == second.invariant
@@ -659,12 +742,16 @@ async def test_replay_and_rejection_statistics_are_idempotent() -> None:
 def test_replay_key_is_canonical_and_stable() -> None:
     provenance = _manual("x")
     first = make_proposal_key(
-        investigation_id=INVESTIGATION_ID, invariant_type=InvariantType.LITERAL_STRING,
-        pattern=" x ", provenance=provenance,
+        investigation_id=INVESTIGATION_ID,
+        invariant_type=InvariantType.LITERAL_STRING,
+        pattern=" x ",
+        provenance=provenance,
     )
     second = make_proposal_key(
-        investigation_id=INVESTIGATION_ID, invariant_type=InvariantType.LITERAL_STRING,
-        pattern="x", provenance=provenance,
+        investigation_id=INVESTIGATION_ID,
+        invariant_type=InvariantType.LITERAL_STRING,
+        pattern="x",
+        provenance=provenance,
     )
     assert first == second
 

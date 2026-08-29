@@ -3,6 +3,7 @@
 Revision ID: 0005_sample_acquisition
 Revises: 0004_sample_lifecycle
 """
+
 from collections.abc import Sequence
 
 import sqlalchemy as sa
@@ -29,9 +30,7 @@ def upgrade() -> None:
         sa.Column("error_code", sa.String(length=64), nullable=True),
         sa.Column("occurred_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("reason IN ('seed', 'hit_review')", name="ck_sample_acquisition_reason"),
-        sa.CheckConstraint(
-            "outcome IN ('success', 'error')", name="ck_sample_acquisition_outcome"
-        ),
+        sa.CheckConstraint("outcome IN ('success', 'error')", name="ck_sample_acquisition_outcome"),
         sa.CheckConstraint(
             "hash_family IN ('md5', 'sha1', 'sha256')",
             name="ck_sample_acquisition_hash_family",
@@ -70,9 +69,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "uq_sample_acquisition_success_replay", table_name="sample_acquisition_attempts"
-    )
+    op.drop_index("uq_sample_acquisition_success_replay", table_name="sample_acquisition_attempts")
     op.drop_index(
         "ix_sample_acquisition_attempts_investigation", table_name="sample_acquisition_attempts"
     )

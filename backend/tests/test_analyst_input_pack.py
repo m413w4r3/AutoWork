@@ -43,11 +43,7 @@ class _Packs:
 
     async def get_for_investigation(self, investigation_id: UUID) -> AnalystInputPack | None:
         return next(
-            (
-                item
-                for item in self.items.values()
-                if item.investigation_id == investigation_id
-            ),
+            (item for item in self.items.values() if item.investigation_id == investigation_id),
             None,
         )
 
@@ -88,9 +84,7 @@ class _Store:
 
 
 def test_pack_is_canonical_and_uses_only_accepted_structured_file_indicators() -> None:
-    run = SubjectProductionRun(
-        subject_id=uuid4(), edition_id=uuid4()
-    )
+    run = SubjectProductionRun(subject_id=uuid4(), edition_id=uuid4())
     synthesis = ProductionArtifact(
         production_run_id=run.id,
         subject_id=run.subject_id,

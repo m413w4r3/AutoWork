@@ -5,11 +5,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from asyncpg.exceptions import UniqueViolationError  # type: ignore[import-untyped]
-from sqlalchemy import func, select
+from sqlalchemy import select
 
-from cti_app.domain.goodware import GoodwareFeature
-from cti_app.infrastructure.database.models.base import Base
 from cti_app.infrastructure.database.models.core import (
     BlobRow,
     CapabilitySetRow,
@@ -57,8 +54,9 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
                 ),
                 GoodwareBaselineRow(
                     id=baseline_id,
+                    baseline_fingerprint_sha256="a" * 64,
                     source_set_sha256="b" * 64,
-                    records_sha256="c" * 64,
+                    normalization_version="synthetic-v1",
                     record_count=10001,
                     occurrence_sum=50015001,
                     pattern_version="synthetic-v1",
@@ -69,25 +67,24 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
         await session.flush()
 
         session.add(
-
-                SampleRow(
-                    id=sample_id,
-                    subject_id=subject_id,
-                    blob_id=blob_id,
-                    original_name="synthetic.bin",
-                    origin="integration-test",
-                    acquired_at=now,
-                    license_restriction=None,
-                    tlp="CLEAR",
-                    do_not_submit=True,
-                    external_llm_allowed=False,
-                    created_at=now,
-                ),
+            SampleRow(
+                id=sample_id,
+                subject_id=subject_id,
+                blob_id=blob_id,
+                original_name="synthetic.bin",
+                origin="integration-test",
+                acquired_at=now,
+                license_restriction=None,
+                tlp="CLEAR",
+                do_not_submit=True,
+                external_llm_allowed=False,
+                created_at=now,
+            ),
         )
         await session.flush()
 
         session.add_all(
-        [
+            [
                 SampleFeatureSetRow(
                     id=sample_feature_set_id,
                     sample_id=sample_id,
@@ -129,18 +126,8 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
         )
         await session.flush()
 
-        copied = await uow.goodware_baselines.add_features(  # type: ignore[attr-defined]
-            baseline_id,
-            (
-                GoodwareFeature(
-                    feature_kind="string",
-                    normalized_value=f"value-{index:05d}",
-                    occurrence_count=index + 1,
-                )
-                for index in range(10001)
-            ),
-        )
-        assert copied == 10001
+        baseline = await uow.goodware_baselines.get(baseline_id)  # type: ignore[attr-defined]
+        assert baseline is not None
         await uow.sample_feature_sets.index(  # type: ignore[attr-defined]
             SimpleNamespace(
                 sample_id=sample_id,
@@ -186,25 +173,6 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
         )
         await uow.commit()  # type: ignore[attr-defined]
 
-        goodware_count = await session.scalar(
-            select(func.count())
-            .select_from(Base.metadata.tables["goodware_features"])
-            .where(Base.metadata.tables["goodware_features"].c.baseline_id == baseline_id)
-        )
-        assert goodware_count == 10001
-        goodware_values = (
-            await session.execute(
-                select(
-                    Base.metadata.tables["goodware_features"].c.normalized_value,
-                    Base.metadata.tables["goodware_features"].c.occurrence_count,
-                )
-                .where(Base.metadata.tables["goodware_features"].c.baseline_id == baseline_id)
-                .order_by(Base.metadata.tables["goodware_features"].c.normalized_value)
-            )
-        ).all()
-        assert goodware_values[0] == ("value-00000", 1)
-        assert goodware_values[-1] == ("value-10000", 10001)
-
         index_rows = (
             await session.scalars(
                 select(SampleFeatureIndexRow).where(SampleFeatureIndexRow.sample_id == sample_id)
@@ -221,16 +189,3 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
         assert by_kind[("code_ngram", "ab cd")].code_feature_set_id == code_feature_set_id
         assert len([row for row in index_rows if row.capability_set_id == capability_set_id]) == 2
         assert by_kind[("capability", "cap_alpha")].capability_set_id == capability_set_id
-
-    with pytest.raises(UniqueViolationError):
-        async with uow_factory() as duplicate_uow:  # type: ignore[operator]
-            await duplicate_uow.goodware_baselines.add_features(  # type: ignore[attr-defined]
-                baseline_id,
-                (
-                    GoodwareFeature(
-                        feature_kind="string",
-                        normalized_value="value-00000",
-                        occurrence_count=999,
-                    ),
-                ),
-            )

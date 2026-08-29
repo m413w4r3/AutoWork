@@ -55,10 +55,7 @@ async def test_index_paths_deduplicate_and_do_one_owner_lookup() -> None:
         strings=[
             {"value": "Alpha", "occurrence_count": 7},
             {"value": "alpha", "occurrence_count": 3},
-            *[
-                {"value": f"value-{index}", "occurrence_count": 1}
-                for index in range(1000)
-            ],
+            *[{"value": f"value-{index}", "occurrence_count": 1} for index in range(1000)],
         ],
         imports=(),
         exports=(),

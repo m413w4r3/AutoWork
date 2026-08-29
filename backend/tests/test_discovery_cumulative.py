@@ -235,11 +235,7 @@ async def test_cross_batch_repeated_incomplete_citation_does_not_balloon() -> No
     for index in range(3):
         batch = _batch(
             edition_id,
-            [
-                _candidate_with_incomplete(
-                    "Canonical title", f"https://example.test/anchor-{index}"
-                )
-            ],
+            [_candidate_with_incomplete("Canonical title", f"https://example.test/anchor-{index}")],
         )
         intake = _intake(batch)
         delta = build_discovery_delta(intake, batch)

@@ -68,9 +68,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute(
-        sa.text("DELETE FROM sample_feature_index WHERE code_feature_set_id IS NOT NULL")
-    )
+    op.execute(sa.text("DELETE FROM sample_feature_index WHERE code_feature_set_id IS NOT NULL"))
     op.drop_constraint(
         "fk_sample_feature_index_code_feature_set", "sample_feature_index", type_="foreignkey"
     )

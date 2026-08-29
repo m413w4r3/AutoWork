@@ -130,5 +130,3 @@ ioc-note: <une phrase courte ou none>
 # LIMITES
 
 <limites principales de la recherche et de l’accès aux sources>"""
-
-

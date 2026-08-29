@@ -77,8 +77,10 @@ def _require_text(value: str, field_name: str) -> str:
 
 
 def _require_sha256(value: str, field_name: str = "sample_sha256") -> None:
-    if not isinstance(value, str) or len(value) != 64 or any(
-        char not in "0123456789abcdef" for char in value
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
     ):
         raise ValueError(f"{field_name} must be a lowercase SHA-256")
 
@@ -351,9 +353,9 @@ def make_proposal_key(
         "pattern": canonical_pattern(pattern),
         "provenances": canonical_set,
     }
-    encoded = json.dumps(
-        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -431,16 +433,20 @@ class CandidateInvariant:
             char not in "0123456789abcdef" for char in self.proposal_key
         ):
             raise ValueError("proposal_key must be lowercase SHA-256")
-        if any(value < 0 for value in (
-            self.banality_occurrence_count,
-            self.corpus_malware_sample_count,
-            self.benign_prevalence,
-            self.positive_support,
-            self.byte_count,
-            self.fixed_byte_count,
-            self.masked_byte_count,
-            self.longest_fixed_run,
-        ) if value is not None):
+        if any(
+            value < 0
+            for value in (
+                self.banality_occurrence_count,
+                self.corpus_malware_sample_count,
+                self.benign_prevalence,
+                self.positive_support,
+                self.byte_count,
+                self.fixed_byte_count,
+                self.masked_byte_count,
+                self.longest_fixed_run,
+            )
+            if value is not None
+        ):
             raise ValueError("invariant measurements cannot be negative")
         if not self.provenances:
             raise ValueError("at least one provenance is required")

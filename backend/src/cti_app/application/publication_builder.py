@@ -76,9 +76,7 @@ def _merge_citations(spans: RichText) -> RichText:
         if output and output[-1].kind is RichSpanKind.TEXT:
             previous = output[-1]
             output[-1] = RichSpan(previous.kind, previous.text.rstrip(), previous.source_ids)
-        output.append(
-            RichSpan(RichSpanKind.CITATION, "", tuple(dict.fromkeys(source_ids)))
-        )
+        output.append(RichSpan(RichSpanKind.CITATION, "", tuple(dict.fromkeys(source_ids))))
         index = cursor
     return tuple(output)
 
@@ -96,9 +94,7 @@ def build_publication_document(
     known_sources = report.source_ids()
 
     def annotate(text: str) -> RichText:
-        spans = _merge_citations(
-            annotator.annotate(apply_french_spacing(text), extraction)
-        )
+        spans = _merge_citations(annotator.annotate(apply_french_spacing(text), extraction))
         unknown = {
             source_id
             for span in spans
@@ -165,8 +161,7 @@ def build_publication_document(
             for artifact_type, values in grouped.items()
         ),
         sources=tuple(
-            PublicationSource(source.local_id, source.canonical_url)
-            for source in report.sources
+            PublicationSource(source.local_id, source.canonical_url) for source in report.sources
         ),
         uncertainties=tuple(report.uncertainties) + tuple(extraction.uncertainties),
     )

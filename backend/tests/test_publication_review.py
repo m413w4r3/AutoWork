@@ -139,13 +139,13 @@ class _Artifacts:
     def __init__(self, artifact_status: ProductionArtifactStatus | None) -> None:
         self.artifact = (
             ProductionArtifact(
-            id=ARTIFACT_ID,
-            production_run_id=RUN_ID,
-            subject_id=SUBJECT_ID,
-            stage=ProductionArtifactStage.PUBLICATION,
-            version=1,
-            input_hash=INPUT_HASH,
-            status=artifact_status,
+                id=ARTIFACT_ID,
+                production_run_id=RUN_ID,
+                subject_id=SUBJECT_ID,
+                stage=ProductionArtifactStage.PUBLICATION,
+                version=1,
+                input_hash=INPUT_HASH,
+                status=artifact_status,
             )
             if artifact_status is not None
             else None
@@ -195,9 +195,7 @@ class _Factory:
         return self.uow
 
 
-async def _review(
-    status: SubjectProductionStatus, **kwargs: Any
-) -> tuple[Any, _Uow]:
+async def _review(status: SubjectProductionStatus, **kwargs: Any) -> tuple[Any, _Uow]:
     row = _row(status, **kwargs)
     uow = _Uow(_edition(), row)
     result = await EditionReviewService(cast(Any, _Factory(uow))).get(EDITION_ID)
@@ -235,10 +233,7 @@ async def test_review_rules_and_exact_acceptance() -> None:
 
 @pytest.mark.asyncio
 async def test_read_model_preserves_batch_order_and_has_one_call_for_twenty_items() -> None:
-    rows = [
-        _row(SubjectProductionStatus.READY, position=position)
-        for position in range(20, 0, -1)
-    ]
+    rows = [_row(SubjectProductionStatus.READY, position=position) for position in range(20, 0, -1)]
     uow = _Uow(_edition(), rows[0])
     uow.edition_review_read_model = _ReadModel(rows)
     result = await EditionReviewService(cast(Any, _Factory(uow))).get(EDITION_ID)

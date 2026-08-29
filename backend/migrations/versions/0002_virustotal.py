@@ -3,6 +3,7 @@
 Revision ID: 0002_virustotal
 Revises: 0001_baseline
 """
+
 from collections.abc import Sequence
 
 import sqlalchemy as sa
@@ -50,18 +51,14 @@ def upgrade() -> None:
             ")",
             name="ck_vt_observation_capability",
         ),
-        sa.CheckConstraint(
-            "raw_sha256 ~ '^[0-9a-f]{64}$'", name="ck_vt_observation_raw_sha256"
-        ),
+        sa.CheckConstraint("raw_sha256 ~ '^[0-9a-f]{64}$'", name="ck_vt_observation_raw_sha256"),
         sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["blob_id"], ["blobs.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_vt_observations_blob_id", "virustotal_observations", ["blob_id"])
     op.create_index("ix_vt_observations_subject_id", "virustotal_observations", ["subject_id"])
-    op.create_index(
-        "ix_vt_observations_execution_id", "virustotal_observations", ["execution_id"]
-    )
+    op.create_index("ix_vt_observations_execution_id", "virustotal_observations", ["execution_id"])
     op.create_table(
         "virustotal_file_views",
         sa.Column("id", sa.Uuid(), nullable=False),

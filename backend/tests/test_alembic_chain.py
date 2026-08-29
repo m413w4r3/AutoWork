@@ -39,10 +39,7 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     assert all(len(revision_id) <= 32 for revision_id in revision_ids)
     assert len(revision_ids) == len(set(revision_ids)), "duplicate Alembic revision IDs"
     assert set(revision_ids) == set(EXPECTED_CHAIN)
-    assert {
-        script.revision: script.down_revision
-        for script in revisions
-    } == {
+    assert {script.revision: script.down_revision for script in revisions} == {
         "0001_baseline": None,
         "0002_virustotal": "0001_baseline",
         "0003_analyst_workflow": "0002_virustotal",

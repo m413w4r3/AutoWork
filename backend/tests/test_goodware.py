@@ -97,9 +97,7 @@ def test_thresholds_are_ordered() -> None:
 
 
 class _LookupRepository:
-    def __init__(
-        self, baseline: GoodwareBaseline, artifact: GoodwareIndexArtifact
-    ) -> None:
+    def __init__(self, baseline: GoodwareBaseline, artifact: GoodwareIndexArtifact) -> None:
         self.baseline = baseline
         self.artifact = artifact
         self.calls = 0
@@ -110,11 +108,7 @@ class _LookupRepository:
 
     async def get_by_baseline_fingerprint_sha256(self, fingerprint: str) -> GoodwareBaseline | None:
         self.calls += 1
-        return (
-            self.baseline
-            if fingerprint == self.baseline.baseline_fingerprint_sha256
-            else None
-        )
+        return self.baseline if fingerprint == self.baseline.baseline_fingerprint_sha256 else None
 
     async def get_index_artifact(
         self, baseline_id: object, **kwargs: object
@@ -173,7 +167,9 @@ class _LookupStore:
         return "copy"
 
 
-def _lookup_fixture(tmp_path: Path) -> tuple[
+def _lookup_fixture(
+    tmp_path: Path,
+) -> tuple[
     GoodwareBaseline,
     GoodwareIndexArtifact,
     dict[UUID, SimpleNamespace],
@@ -228,9 +224,7 @@ def _lookup_fixture(tmp_path: Path) -> tuple[
     index_bytes = index_path.read_bytes()
     manifest["index_sha256"] = hashlib.sha256(index_bytes).hexdigest()
     manifest["index_size"] = len(index_bytes)
-    manifest_bytes = (
-        goodware_application._canonical_json(manifest) + "\n"
-    ).encode("utf-8")
+    manifest_bytes = (goodware_application._canonical_json(manifest) + "\n").encode("utf-8")
     baseline = GoodwareBaseline(
         id=baseline_id,
         baseline_fingerprint_sha256=fingerprint,
@@ -303,9 +297,12 @@ async def test_measurement_prepares_once_and_reuses_uuid_and_fingerprint(
     prepared = await service.prepare(baseline.id)
     assert await prepared.lookup("string", "hello") == 7
     counts = (uow_factory.calls, store.reads, store.materializations, dict(verifications))
-    assert await (await service.prepare(baseline.baseline_fingerprint_sha256)).lookup(
-        "string", "hello"
-    ) == 7
+    assert (
+        await (await service.prepare(baseline.baseline_fingerprint_sha256)).lookup(
+            "string", "hello"
+        )
+        == 7
+    )
     assert (uow_factory.calls, store.reads, store.materializations, verifications) == counts
 
 
@@ -391,9 +388,7 @@ async def test_import_descriptor_mismatch_precedes_baseline_persistence(
         "normalization_version": goodware_application.NORMALIZATION_VERSION,
         "key_version": goodware_application.KEY_VERSION,
         "index_format_version": goodware_application.INDEX_FORMAT_VERSION,
-        "baseline_fingerprint_sha256": goodware_application.baseline_fingerprint_sha256(
-            source_set
-        ),
+        "baseline_fingerprint_sha256": goodware_application.baseline_fingerprint_sha256(source_set),
         "record_count": 0,
         "occurrence_sum": 0,
         "index_sha256": hashlib.sha256(index_bytes).hexdigest(),

@@ -263,9 +263,7 @@ class ModelRun:
         self.finished_at = timestamp
         self.updated_at = timestamp
 
-    def restart_after_certain_pre_submission_failure(
-        self, *, now: datetime | None = None
-    ) -> None:
+    def restart_after_certain_pre_submission_failure(self, *, now: datetime | None = None) -> None:
         """Allow explicit retry only when caller proved provider saw no request."""
         if self.status is not ModelRunStatus.FAILED:
             raise ValueError("Only failed ModelRuns can restart")

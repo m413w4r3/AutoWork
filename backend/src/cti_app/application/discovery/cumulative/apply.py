@@ -306,9 +306,7 @@ def _merge_sources(
     remap: dict[UUID, UUID] = {}
     for candidate in candidates:
         for incoming in candidate.sources:
-            existing = next(
-                (item for item in merged if same_publication(item, incoming)), None
-            )
+            existing = next((item for item in merged if same_publication(item, incoming)), None)
             if existing is None:
                 merged.append(deepcopy(incoming))
                 continue
@@ -358,9 +356,7 @@ def _merge_incomplete_sources(
     merged: list[IncompleteSourceCandidate] = []
     for candidate in candidates:
         for incoming in candidate.incomplete_sources:
-            existing = next(
-                (item for item in merged if same_publication(item, incoming)), None
-            )
+            existing = next((item for item in merged if same_publication(item, incoming)), None)
             if existing is None:
                 merged.append(deepcopy(incoming))
                 continue
@@ -413,9 +409,7 @@ def _snapshot_hash(subjects: Sequence[DiscoverySubject]) -> str:
 def _assert_non_loss(
     parent: DiscoverySnapshot | None, delta: DiscoveryDelta, result: DiscoverySnapshot
 ) -> None:
-    final_sources = [
-        source for subject in result.subjects for source in subject.candidate.sources
-    ]
+    final_sources = [source for subject in result.subjects for source in subject.candidate.sources]
     expected_sources = [
         source for candidate in delta.candidates for source in candidate.candidate.sources
     ]

@@ -70,9 +70,13 @@ def main(path: Path) -> None:
 
 
 def _canonical_version(value: Any) -> str:
-    if isinstance(value, (list, tuple)) and value and all(
-        isinstance(component, int) and not isinstance(component, bool) and component >= 0
-        for component in value
+    if (
+        isinstance(value, (list, tuple))
+        and value
+        and all(
+            isinstance(component, int) and not isinstance(component, bool) and component >= 0
+            for component in value
+        )
     ):
         return ".".join(str(component) for component in value)
     if isinstance(value, str) and value.strip():

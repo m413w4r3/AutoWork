@@ -313,9 +313,7 @@ class ProductionStateService:
 
         return await self.export_run_state(run.id, subject_title=subject_title)
 
-    async def export_run_state(
-        self, run_id: UUID, subject_title: str
-    ) -> ProductionStateSnapshotV2:
+    async def export_run_state(self, run_id: UUID, subject_title: str) -> ProductionStateSnapshotV2:
         """Export exactly ``run_id`` without resolving another current run."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get(run_id)
@@ -396,9 +394,7 @@ class ProductionStateService:
         now = datetime.now(UTC)
 
         async with self._uow_factory() as uow:
-            lock_creation = getattr(
-                uow.subject_production_runs, "lock_creation_for_subject", None
-            )
+            lock_creation = getattr(uow.subject_production_runs, "lock_creation_for_subject", None)
             if lock_creation is not None:
                 await lock_creation(subject_id)
             current = await uow.subject_production_runs.get_current_for_subject(subject_id)

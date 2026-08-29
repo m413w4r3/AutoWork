@@ -221,9 +221,7 @@ def _investigation(
         production_run_id=uuid4(),
         subject_id=uuid4(),
         synthesis_artifact_id=uuid4(),
-        budget=LoopBudget(
-            max_vt_read_units=max_vt_read_units, max_hits_acquired=max_hits_acquired
-        ),
+        budget=LoopBudget(max_vt_read_units=max_vt_read_units, max_hits_acquired=max_hits_acquired),
     )
 
 
@@ -519,9 +517,7 @@ async def test_capability_disabled_is_checked_before_hash_validation(tmp_path: P
     investigation = _investigation()
     db.investigations[investigation.id] = investigation
     port = _FakePort(content=b"unreachable")
-    service = _service(
-        tmp_path, db, port, capabilities=VirusTotalCapabilities(file_download=False)
-    )
+    service = _service(tmp_path, db, port, capabilities=VirusTotalCapabilities(file_download=False))
 
     with pytest.raises(SampleAcquisitionCapabilityDisabledError):
         await service.acquire(

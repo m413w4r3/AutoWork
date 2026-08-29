@@ -49,9 +49,7 @@ class CandidateInvariantRow(Base):
     __tablename__ = "candidate_invariants"
     __table_args__ = (
         UniqueConstraint("proposal_key", name="uq_candidate_invariants_proposal_key"),
-        CheckConstraint(
-            f"type IN ({INVARIANT_TYPES_SQL})", name="ck_candidate_invariants_type"
-        ),
+        CheckConstraint(f"type IN ({INVARIANT_TYPES_SQL})", name="ck_candidate_invariants_type"),
         CheckConstraint(
             f"category IN ({INVARIANT_CATEGORIES_SQL})", name="ck_candidate_invariants_category"
         ),

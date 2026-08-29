@@ -228,7 +228,9 @@ async def test_pre_submission_crash_does_not_leave_the_model_run_running(
         BlobCatalogService(blob_store, conversation_uow)  # type: ignore[arg-type]
     )
     gateway = _CrashesBeforeGatewayClaimsTheRun(
-        router, conversation_uow, output_store  # type: ignore[arg-type]
+        router,
+        conversation_uow,
+        output_store,  # type: ignore[arg-type]
     )
     service = ModelConversationService(
         conversation_uow,  # type: ignore[arg-type]

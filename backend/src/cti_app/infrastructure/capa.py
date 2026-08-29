@@ -106,9 +106,7 @@ def parse_capa_output(payload: bytes) -> tuple[tuple[dict[str, Any], ...], tuple
             },
             key=lambda value: int(value, 16),
         )
-        attack = sorted(
-            {spec.id.strip() for spec in rule.meta.attack if spec.id.strip()}
-        )
+        attack = sorted({spec.id.strip() for spec in rule.meta.attack if spec.id.strip()})
         mbc = sorted({spec.id.strip() for spec in rule.meta.mbc if spec.id.strip()})
         capabilities.append(
             {
@@ -144,7 +142,8 @@ class CapaRunner:
         try:
             result = await self._runner(
                 ["capa", "-r", str(rules_path), "--json", sample_path],
-                timeout_seconds=timeout_seconds, output_limit=output_limit,
+                timeout_seconds=timeout_seconds,
+                output_limit=output_limit,
                 memory_limit_bytes=memory_limit_bytes,
                 environment={"PATH": os.environ.get("PATH", ""), "LANG": "C", "LC_ALL": "C"},
             )

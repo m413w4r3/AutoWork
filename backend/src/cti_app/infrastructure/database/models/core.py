@@ -48,9 +48,7 @@ class BlobRow(Base):
 class GoodwareBaselineRow(Base):
     __tablename__ = "goodware_baselines"
     __table_args__ = (
-        UniqueConstraint(
-            "baseline_fingerprint_sha256", name="uq_goodware_baselines_fingerprint"
-        ),
+        UniqueConstraint("baseline_fingerprint_sha256", name="uq_goodware_baselines_fingerprint"),
     )
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     baseline_fingerprint_sha256: Mapped[str] = mapped_column(String(64), nullable=False)

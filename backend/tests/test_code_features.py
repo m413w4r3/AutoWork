@@ -70,9 +70,7 @@ def test_ngrams_contain_structural_fields_only() -> None:
         (
             CodeFunction(
                 offset=0,
-                instructions=tuple(
-                    replace_instruction_at(raw, index, index) for index in range(8)
-                ),
+                instructions=tuple(replace_instruction_at(raw, index, index) for index in range(8)),
             ),
         ),
         (8,),
@@ -234,54 +232,99 @@ async def test_extract_idempotence_uses_persisted_smda_versions_before_adapter()
 
 def test_new_code_feature_json_has_structural_ngram_fields_only() -> None:
     feature = _code_feature_set_from_row(
-        cast(CodeFeatureSetRow, SimpleNamespace(
-            id=uuid4(), sample_id=uuid4(), blob_id=uuid4(), feature_blob_id=uuid4(),
-            tool_version="smda", escaper_compatibility_version="escape",
-            intel_pic_hash_escape_version="pic", parameters_sha256="parameters",
-            architecture="x64", status="SUCCEEDED",
-            payload={
-                "ngrams": [{
-                    "pattern": "90 90", "instruction_count": 2, "byte_count": 2,
-                    "fixed_byte_count": 2, "masked_byte_count": 0,
-                    "longest_fixed_run": 2, "function_offset": 0,
-                    "start_offset": 0, "mnemonics": ["nop", "nop"],
-                    "occurrence_count": 1,
-                }],
-                "packing": {
-                    "max_executable_section_entropy": None, "executable_bytes": 0,
-                    "recovered_function_count": 0, "executable_bytes_per_function": None,
-                    "known_packer_marker_hits": [],
+        cast(
+            CodeFeatureSetRow,
+            SimpleNamespace(
+                id=uuid4(),
+                sample_id=uuid4(),
+                blob_id=uuid4(),
+                feature_blob_id=uuid4(),
+                tool_version="smda",
+                escaper_compatibility_version="escape",
+                intel_pic_hash_escape_version="pic",
+                parameters_sha256="parameters",
+                architecture="x64",
+                status="SUCCEEDED",
+                payload={
+                    "ngrams": [
+                        {
+                            "pattern": "90 90",
+                            "instruction_count": 2,
+                            "byte_count": 2,
+                            "fixed_byte_count": 2,
+                            "masked_byte_count": 0,
+                            "longest_fixed_run": 2,
+                            "function_offset": 0,
+                            "start_offset": 0,
+                            "mnemonics": ["nop", "nop"],
+                            "occurrence_count": 1,
+                        }
+                    ],
+                    "packing": {
+                        "max_executable_section_entropy": None,
+                        "executable_bytes": 0,
+                        "recovered_function_count": 0,
+                        "executable_bytes_per_function": None,
+                        "known_packer_marker_hits": [],
+                    },
                 },
-            }, errors=[],
-        ))
+                errors=[],
+            ),
+        )
     )
     assert set(feature.as_json()["ngrams"][0]) == {
-        "pattern", "instruction_count", "byte_count", "fixed_byte_count",
-        "masked_byte_count", "longest_fixed_run", "function_offset", "start_offset",
-        "mnemonics", "occurrence_count",
+        "pattern",
+        "instruction_count",
+        "byte_count",
+        "fixed_byte_count",
+        "masked_byte_count",
+        "longest_fixed_run",
+        "function_offset",
+        "start_offset",
+        "mnemonics",
+        "occurrence_count",
     }
 
 
 def test_legacy_code_feature_payload_ignores_assessment_fields() -> None:
     row = SimpleNamespace(
-        id=uuid4(), sample_id=uuid4(), blob_id=uuid4(), feature_blob_id=uuid4(),
-        tool_version="smda", escaper_compatibility_version="escape",
-        intel_pic_hash_escape_version="pic", parameters_sha256="parameters",
-        architecture="x64", status="SUCCEEDED",
+        id=uuid4(),
+        sample_id=uuid4(),
+        blob_id=uuid4(),
+        feature_blob_id=uuid4(),
+        tool_version="smda",
+        escaper_compatibility_version="escape",
+        intel_pic_hash_escape_version="pic",
+        parameters_sha256="parameters",
+        architecture="x64",
+        status="SUCCEEDED",
         payload={
-            "ngrams": [{
-                "pattern": "90 90", "instruction_count": 2, "byte_count": 2,
-                "fixed_byte_count": 2, "masked_byte_count": 0, "longest_fixed_run": 2,
-                "function_offset": 0, "start_offset": 0, "mnemonics": ["nop", "nop"],
-                "occurrence_count": 1, "goodware_verdict": "PRESENT",
-                "corpus_verdict": "FAMILY_SPECIFIC", "goodware_occurrence_count": 4,
-            }],
+            "ngrams": [
+                {
+                    "pattern": "90 90",
+                    "instruction_count": 2,
+                    "byte_count": 2,
+                    "fixed_byte_count": 2,
+                    "masked_byte_count": 0,
+                    "longest_fixed_run": 2,
+                    "function_offset": 0,
+                    "start_offset": 0,
+                    "mnemonics": ["nop", "nop"],
+                    "occurrence_count": 1,
+                    "goodware_verdict": "PRESENT",
+                    "corpus_verdict": "FAMILY_SPECIFIC",
+                    "goodware_occurrence_count": 4,
+                }
+            ],
             "packing": {
-                "max_executable_section_entropy": None, "executable_bytes": 0,
-                "recovered_function_count": 0, "executable_bytes_per_function": None,
+                "max_executable_section_entropy": None,
+                "executable_bytes": 0,
+                "recovered_function_count": 0,
+                "executable_bytes_per_function": None,
                 "known_packer_marker_hits": [],
             },
-        }, errors=[],
+        },
+        errors=[],
     )
     feature = _code_feature_set_from_row(cast(CodeFeatureSetRow, row))
     assert feature.ngrams[0].pattern == "90 90"

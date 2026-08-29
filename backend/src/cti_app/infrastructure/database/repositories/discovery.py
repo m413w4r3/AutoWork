@@ -254,9 +254,7 @@ def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
                 candidate=candidate,
                 status=ContributionStatus(meta["status"]),
                 created_at=datetime.fromisoformat(meta["created_at"]),
-                accepted_at=(
-                    datetime.fromisoformat(accepted_at_raw) if accepted_at_raw else None
-                ),
+                accepted_at=(datetime.fromisoformat(accepted_at_raw) if accepted_at_raw else None),
                 human_note=meta["human_note"],
             )
         )
@@ -280,14 +278,10 @@ def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
         unattached_visible_citations=tuple(payload["unattached_visible_citations"]),
         parsing_revision=int(payload["parsing_revision"]),
         supersedes_batch_id=(
-            UUID(str(payload["supersedes_batch_id"]))
-            if payload["supersedes_batch_id"]
-            else None
+            UUID(str(payload["supersedes_batch_id"])) if payload["supersedes_batch_id"] else None
         ),
         replaced_by_batch_id=(
-            UUID(str(payload["replaced_by_batch_id"]))
-            if payload["replaced_by_batch_id"]
-            else None
+            UUID(str(payload["replaced_by_batch_id"])) if payload["replaced_by_batch_id"] else None
         ),
         source_mode=DiscoverySourceMode(str(payload["source_mode"])),
         bridge_capabilities=cast(dict[str, object], payload["bridge_capabilities"]),

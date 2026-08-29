@@ -205,9 +205,7 @@ class CumulativeDiscoveryService:
             )
             handles = build_merge_handles(parent, delta, included_subjects=included)
             planner: DiscoveryMergePlanner = (
-                HeuristicMergePlanner()
-                if parent is None
-                else (planner_override or self._planner)
+                HeuristicMergePlanner() if parent is None else (planner_override or self._planner)
             )
             excluded_subject_count = len(parent.subjects) - len(handles.existing) if parent else 0
             cache_key_run = make_merge_run(
@@ -479,9 +477,7 @@ class CumulativeDiscoveryService:
         written to the diagnostics trail before it is re-raised.
         """
         try:
-            return await self._resolve_merge_run(
-                edition_id, run_id, decisions, actor_id=actor_id
-            )
+            return await self._resolve_merge_run(edition_id, run_id, decisions, actor_id=actor_id)
         except DiscoverySnapshotStaleError as exc:
             # Queued outside the unit of work above: it holds a row lock on the
             # active snapshot that the reconciliation would wait on.
@@ -591,9 +587,7 @@ class CumulativeDiscoveryService:
                     edition_id=str(edition_id),
                     intake_id=str(original.intake_id),
                     planned_against_snapshot_id=(
-                        str(original.parent_snapshot_id)
-                        if original.parent_snapshot_id
-                        else None
+                        str(original.parent_snapshot_id) if original.parent_snapshot_id else None
                     ),
                     active_snapshot_id=str(parent_id) if parent_id else None,
                     decisions=decision_trail,
@@ -814,5 +808,3 @@ def _default_human_merge_targets(
         )
         resolved.append(replace(decision, target_subject_handle=target))
     return tuple(resolved)
-
-

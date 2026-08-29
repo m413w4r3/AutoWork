@@ -194,9 +194,7 @@ def test_semantic_annotation_prioritizes_entities_and_citations() -> None:
     assert kinds["Cavern Manticore"] is RichSpanKind.ACTOR
     assert kinds["WinDirStat"] is RichSpanKind.TOOL
     assert kinds["DLL side-loading"] is RichSpanKind.TECHNICAL
-    assert next(span for span in spans if span.kind is RichSpanKind.CITATION).source_ids == (
-        "S1",
-    )
+    assert next(span for span in spans if span.kind is RichSpanKind.CITATION).source_ids == ("S1",)
 
 
 def test_synthesis_validator_blocks_inventory_only_ioc_but_accepts_both() -> None:

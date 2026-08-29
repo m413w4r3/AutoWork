@@ -35,18 +35,53 @@ MAX_REFERENCED_EVIDENCE_PER_SUBJECT: Final = 20
 _TECHNICAL_EXTENSIONS: Final = frozenset({".pdf", ".txt", ".csv", ".json", ".xml", ".yaml", ".yml"})
 _FORBIDDEN_RESOURCE_EXTENSIONS: Final = frozenset(
     {
-        ".avif", ".bmp", ".css", ".gif", ".ico", ".jpeg", ".jpg", ".js",
-        ".mjs", ".png", ".svg", ".webp",
+        ".avif",
+        ".bmp",
+        ".css",
+        ".gif",
+        ".ico",
+        ".jpeg",
+        ".jpg",
+        ".js",
+        ".mjs",
+        ".png",
+        ".svg",
+        ".webp",
     }
 )
 _TECHNICAL_SIGNALS: Final = (
-    "ioc", "iocs", "indicator", "indicators", "indicators of compromise", "md5", "sha1",
-    "sha256", "sha512", "yara", "sigma", "suricata", "stix", "misp",
-    "threat indicators", "appendix", "annex",
+    "ioc",
+    "iocs",
+    "indicator",
+    "indicators",
+    "indicators of compromise",
+    "md5",
+    "sha1",
+    "sha256",
+    "sha512",
+    "yara",
+    "sigma",
+    "suricata",
+    "stix",
+    "misp",
+    "threat indicators",
+    "appendix",
+    "annex",
 )
 _NON_TECHNICAL_SIGNALS: Final = (
-    "login", "sign in", "privacy", "terms", "cookie", "facebook", "linkedin", "twitter",
-    "x.com", "instagram", "youtube", "navigation", "menu",
+    "login",
+    "sign in",
+    "privacy",
+    "terms",
+    "cookie",
+    "facebook",
+    "linkedin",
+    "twitter",
+    "x.com",
+    "instagram",
+    "youtube",
+    "navigation",
+    "menu",
 )
 
 

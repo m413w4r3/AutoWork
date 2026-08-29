@@ -23,9 +23,7 @@ INVARIANT_CATEGORIES_SQL = (
 INVARIANT_STATUSES_SQL = (
     "'proposed', 'approved_for_pivot', 'validated', 'rejected', 'unselective', 'shared_component'"
 )
-INVARIANT_PROVENANCE_KINDS_SQL = (
-    "'sample_feature', 'code_feature', 'tool_output', 'capability', 'report_claim', 'analyst_manual'"
-)
+INVARIANT_PROVENANCE_KINDS_SQL = "'sample_feature', 'code_feature', 'tool_output', 'capability', 'report_claim', 'analyst_manual'"
 INVARIANT_REJECTION_CAUSES_SQL = (
     "'provenance_invalid', 'invalid_category', 'library_noise', 'packer_artifact', "
     "'compiler_artifact', 'generic_winapi', 'banal', 'multi_family', 'empty_pattern', "
@@ -198,7 +196,9 @@ def upgrade() -> None:
             name="ck_invariant_rejections_proposal_key",
         ),
         sa.CheckConstraint("char_length(reason) <= 500", name="ck_invariant_rejections_reason"),
-        sa.CheckConstraint("cycle_number IS NULL OR cycle_number >= 1", name="ck_invariant_rejections_cycle"),
+        sa.CheckConstraint(
+            "cycle_number IS NULL OR cycle_number >= 1", name="ck_invariant_rejections_cycle"
+        ),
     )
     op.create_index(
         "ix_invariant_rejections_investigation",

@@ -39,6 +39,7 @@ pytestmark = pytest.mark.integration
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
 _COUNTRY_CODES = iter("".join(pair) for pair in product(ascii_uppercase, repeat=2))
 
+
 class AlwaysBanal:
     def score(self, occurrence_count: int | None) -> Banality:
         return Banality.BANAL
@@ -101,14 +102,14 @@ async def _counts(engine, investigation_id):
     async with engine.connect() as connection:
         return (
             await connection.scalar(
-                select(func.count()).select_from(CandidateInvariantRow).where(
-                    CandidateInvariantRow.investigation_id == investigation_id
-                )
+                select(func.count())
+                .select_from(CandidateInvariantRow)
+                .where(CandidateInvariantRow.investigation_id == investigation_id)
             ),
             await connection.scalar(
-                select(func.count()).select_from(InvariantRejectionRow).where(
-                    InvariantRejectionRow.investigation_id == investigation_id
-                )
+                select(func.count())
+                .select_from(InvariantRejectionRow)
+                .where(InvariantRejectionRow.investigation_id == investigation_id)
             ),
         )
 

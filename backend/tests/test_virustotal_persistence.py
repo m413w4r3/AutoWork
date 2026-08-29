@@ -467,7 +467,7 @@ async def test_descriptors_only_true_is_recorded_for_intelligence_search(
         api_generation=VirusTotalEndpointVariant.V3,
     )
     observations = await service.store_intelligence_search(
-        search, query='type:peexe', observed_at=datetime.now(UTC)
+        search, query="type:peexe", observed_at=datetime.now(UTC)
     )
     assert observations[0].safe_parameters["descriptors_only"] is True
     assert observations[0].safe_parameters["query"] == "type:peexe"

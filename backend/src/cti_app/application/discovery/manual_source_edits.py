@@ -228,9 +228,7 @@ MANUAL_SOURCE_EDIT_VERSION = "manual-url-attach-v1"
 def _manual_edit_content(
     edition_id: UUID, subject_id: UUID, incomplete_source_id: UUID, url: str
 ) -> bytes:
-    return (
-        f"manual-url-attach:v1:{edition_id}:{subject_id}:{incomplete_source_id}:{url}"
-    ).encode()
+    return (f"manual-url-attach:v1:{edition_id}:{subject_id}:{incomplete_source_id}:{url}").encode()
 
 
 def _build_manual_edit_batch(

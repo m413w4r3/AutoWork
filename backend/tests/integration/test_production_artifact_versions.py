@@ -69,9 +69,7 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
         source_profile="test",
     )
     subject = Subject(external_id="SUBJ-ARTIFACT-VERSIONS", slug="artifact-versions", tlp=TLP.AMBER)
-    run = SubjectProductionRun(
-        subject_id=subject.id, edition_id=edition.id
-    )
+    run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
 
     async with uow_factory() as uow:
         assert await uow.editions.add_if_absent(edition)
@@ -131,9 +129,7 @@ async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
         source_profile="test",
     )
     subject = Subject(external_id="SUBJ-ANALYST-FK", slug="analyst-fk", tlp=TLP.AMBER)
-    run = SubjectProductionRun(
-        subject_id=subject.id, edition_id=edition.id
-    )
+    run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
     run.start_running()
     synthesis = ProductionArtifact(
         production_run_id=run.id,
@@ -217,9 +213,7 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
     }
     extraction: dict[str, Any] = {"items": [], "uncertainties": []}
     synthesis = "Fait [S1]"
-    run = SubjectProductionRun(
-        subject_id=source.id, edition_id=edition.id
-    )
+    run = SubjectProductionRun(subject_id=source.id, edition_id=edition.id)
     run.start_running()
     run.current_stage = SubjectProductionStage.ASSEMBLY
     run.mark_needs_review(code="seed", message="seed")
@@ -260,15 +254,13 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
     async with uow_factory() as uow:
         imported = await uow.subject_production_runs.get(result.run_id)
         assert imported is not None
-        assert imported.profile is None
         assert imported.status is SubjectProductionStatus.NEEDS_REVIEW
         assert imported.current_stage is SubjectProductionStage.ASSEMBLY
         assert imported.started_at is not None
         assert imported.finished_at is not None
         assert imported.error_code == "imported_production_state"
         assert imported.error_message == (
-            "État importé : références, extraction et synthèse restaurées ; "
-            "assemblage non rejoué."
+            "État importé : références, extraction et synthèse restaurées ; assemblage non rejoué."
         )
         assert imported.error_details is None
         imported_artifacts = [
@@ -403,7 +395,6 @@ async def test_unified_import_does_not_create_analyst_handoff_on_real_postgres(
         assert imported_run is not None
         imported_artifacts = await uow.production_artifacts.list_for_run(imported_run.id)
         imported_investigation = await uow.analyst_investigations.get_for_run(imported_run.id)
-    assert imported_run.profile is None
     assert imported_run.status is SubjectProductionStatus.NEEDS_REVIEW
     assert imported_run.current_stage is SubjectProductionStage.ASSEMBLY
     assert imported_run.started_at is not None

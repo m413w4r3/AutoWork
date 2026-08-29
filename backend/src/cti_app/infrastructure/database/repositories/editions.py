@@ -134,6 +134,7 @@ class SqlAlchemyEditionAuditRepository:
         )
         return [_edition_audit_from_row(row) for row in rows]
 
+
 def _edition_values(edition: Edition) -> dict[str, object]:
     return {
         "id": edition.id,

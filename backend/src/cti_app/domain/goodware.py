@@ -111,9 +111,7 @@ NON_DISCRIMINANT_CATEGORIES = (
 @dataclass(frozen=True, slots=True)
 class NonDiscriminantPatternRegistry:
     entries: tuple[DeclaredNonDiscriminant, ...]
-    _lookup: Mapping[tuple[str, str], DeclaredNonDiscriminant] = field(
-        init=False, repr=False
-    )
+    _lookup: Mapping[tuple[str, str], DeclaredNonDiscriminant] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(

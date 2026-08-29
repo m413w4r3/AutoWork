@@ -26,8 +26,7 @@ MODEL_RUN_STATUS_VALUES_SQL = (
 )
 CONVERSATION_TRANSPORT_VALUES_SQL = "'chatgpt_bridge', 'openai_responses', 'application_managed'"
 CONVERSATION_PURPOSE_VALUES_SQL = (
-    "'discovery', 'analyst_assistance', 'pivot_research', "
-    "'drafting', 'critic', 'subject_research'"
+    "'discovery', 'analyst_assistance', 'pivot_research', 'drafting', 'critic', 'subject_research'"
 )
 CONVERSATION_STATUS_VALUES_SQL = (
     "'pending', 'ready', 'busy', 'needs_review', 'unavailable', 'archived'"
@@ -114,9 +113,7 @@ class ModelRunRow(Base):
 class ModelOutputRejectionRow(Base):
     __tablename__ = "model_output_rejections"
     __table_args__ = (
-        CheckConstraint(
-            "value_sha256 ~ '^[0-9a-f]{64}$'", name="ck_model_output_rejections_hash"
-        ),
+        CheckConstraint("value_sha256 ~ '^[0-9a-f]{64}$'", name="ck_model_output_rejections_hash"),
         Index("ix_model_output_rejections_run", "model_run_id", "created_at"),
     )
 
@@ -236,5 +233,3 @@ class ModelConversationTurnRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-

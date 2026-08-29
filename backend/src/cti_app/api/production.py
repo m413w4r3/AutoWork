@@ -196,8 +196,7 @@ def _eligible_article_subject_ids(groups: Iterable[EditorialGroup]) -> list[UUID
     return [
         group.subject_id
         for group in groups
-        if group.subject_id is not None
-        and group.status == EditorialGroupStatus.SELECTED
+        if group.subject_id is not None and group.status == EditorialGroupStatus.SELECTED
     ]
 
 

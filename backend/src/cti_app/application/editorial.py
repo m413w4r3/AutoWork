@@ -66,6 +66,7 @@ class EditorialAutoSelectionPolicyV1:
     def should_select_article(self, candidates: Sequence[CandidateTopic]) -> bool:
         return any(_candidate_has_ioc_signal(candidate) for candidate in candidates)
 
+
 class WorkspaceMaterializer(Protocol):
     async def materialize(
         self,
@@ -86,6 +87,7 @@ class EditorialBoard:
     ignored: int
     undecided: int
     target_articles: int
+
 
 class EditorialGroupingService:
     def __init__(

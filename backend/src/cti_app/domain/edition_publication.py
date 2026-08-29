@@ -360,8 +360,7 @@ class EditionDocumentV2:
             document = publication_document_from_json(item["document"])
             if not isinstance(document, PublicationDocumentV2):
                 raise ValueError(
-                    "EditionDocumentV2 publications must contain "
-                    "PublicationDocumentV2 documents"
+                    "EditionDocumentV2 publications must contain PublicationDocumentV2 documents"
                 )
             publications.append(
                 EditionPublicationV2(

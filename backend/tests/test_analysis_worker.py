@@ -48,15 +48,14 @@ async def test_analysis_registry_contains_and_invokes_capa_job() -> None:
         errors=(),
     )
     capa = _FakeCapabilitiesService(result)
-    registry = create_analysis_job_registry(
-        object.__new__(StaticAnalysisService), capa
-    )
+    registry = create_analysis_job_registry(object.__new__(StaticAnalysisService), capa)
 
     assert registry.validate(STATIC_ANALYSIS_JOB_KIND, {"sample_id": sample_id})
     parameters = registry.validate(CAPA_ANALYSIS_JOB_KIND, {"sample_id": sample_id})
     context = _ProgressContext()
     value = await registry.handler(CAPA_ANALYSIS_JOB_KIND)(
-        parameters, context  # type: ignore[arg-type]
+        parameters,
+        context,  # type: ignore[arg-type]
     )
 
     assert capa.calls == [sample_id]

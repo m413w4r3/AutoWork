@@ -17,12 +17,8 @@ depends_on = None
 
 def upgrade() -> None:
     bind = op.get_bind()
-    if bind.execute(
-        sa.text("SELECT EXISTS (SELECT 1 FROM goodware_baselines)")
-    ).scalar():
-        raise RuntimeError(
-            "refusing Goodware v2 migration while legacy baselines exist"
-        )
+    if bind.execute(sa.text("SELECT EXISTS (SELECT 1 FROM goodware_baselines)")).scalar():
+        raise RuntimeError("refusing Goodware v2 migration while legacy baselines exist")
 
     op.drop_index("ix_goodware_features_lookup", table_name="goodware_features")
     op.drop_table("goodware_features")
@@ -91,9 +87,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
-    if bind.execute(
-        sa.text("SELECT EXISTS (SELECT 1 FROM goodware_baselines)")
-    ).scalar():
+    if bind.execute(sa.text("SELECT EXISTS (SELECT 1 FROM goodware_baselines)")).scalar():
         raise RuntimeError(
             "refusing Goodware v2 downgrade while baselines exist; v2 metadata cannot be reconstructed"
         )

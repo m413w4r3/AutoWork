@@ -64,9 +64,7 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "editorial_group_version >= 1", name="ck_production_input_group_version"
         ),
-        sa.CheckConstraint(
-            "period_start <= period_end", name="ck_production_input_period_order"
-        ),
+        sa.CheckConstraint("period_start <= period_end", name="ck_production_input_period_order"),
         sa.CheckConstraint(
             "jsonb_typeof(core_sources) = 'array'", name="ck_production_input_sources_array"
         ),
@@ -83,9 +81,7 @@ def upgrade() -> None:
             ["editorial_group_id"], ["editorial_groups.id"], ondelete="RESTRICT"
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "production_run_id", name="uq_production_input_snapshots_run"
-        ),
+        sa.UniqueConstraint("production_run_id", name="uq_production_input_snapshots_run"),
     )
     op.create_index(
         "ix_production_input_snapshots_subject",
@@ -100,10 +96,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute("DROP TRIGGER trg_production_input_snapshots_append_only ON production_input_snapshots")
-    op.drop_index(
-        "ix_production_input_snapshots_subject", table_name="production_input_snapshots"
+    op.execute(
+        "DROP TRIGGER trg_production_input_snapshots_append_only ON production_input_snapshots"
     )
+    op.drop_index("ix_production_input_snapshots_subject", table_name="production_input_snapshots")
     op.drop_table("production_input_snapshots")
 
     op.drop_constraint(

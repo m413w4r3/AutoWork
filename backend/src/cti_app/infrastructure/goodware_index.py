@@ -79,9 +79,7 @@ def _check_table_schema(
         raise GoodwareImportError(f"unexpected SQLite index on {table}")
 
 
-def expected_metadata(
-    manifest: Mapping[str, object], *, pattern_version: str
-) -> dict[str, str]:
+def expected_metadata(manifest: Mapping[str, object], *, pattern_version: str) -> dict[str, str]:
     return {
         "baseline_fingerprint_sha256": cast(str, manifest["baseline_fingerprint_sha256"]),
         "index_format_version": INDEX_FORMAT_VERSION,
@@ -141,8 +139,7 @@ def verify_sqlite_index(
         metadata_rows = list(connection.execute("SELECT key, value FROM metadata"))
         expected = expected_metadata(manifest, pattern_version=pattern_version)
         if len(metadata_rows) != len(_METADATA_KEYS) or any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in metadata_rows
+            not isinstance(key, str) or not isinstance(value, str) for key, value in metadata_rows
         ):
             raise GoodwareImportError("SQLite metadata is malformed")
         if dict(metadata_rows) != expected:
@@ -174,9 +171,7 @@ class GoodwareSQLiteReader:
             connection.close()
         return None if row is None else int(row[0])
 
-    def lookup_batch(
-        self, features: Sequence[tuple[str, str]]
-    ) -> dict[tuple[str, str], int]:
+    def lookup_batch(self, features: Sequence[tuple[str, str]]) -> dict[tuple[str, str], int]:
         keys: dict[bytes, tuple[str, str]] = {}
         for feature_kind, normalized_value in features:
             keys[goodware_lookup_key(feature_kind, normalized_value)] = (
@@ -217,9 +212,7 @@ class GoodwareSQLiteReader:
 
     def _connect(self) -> sqlite3.Connection:
         try:
-            connection = sqlite3.connect(
-                f"{self._index_path.resolve().as_uri()}?mode=ro", uri=True
-            )
+            connection = sqlite3.connect(f"{self._index_path.resolve().as_uri()}?mode=ro", uri=True)
             connection.execute("PRAGMA query_only = ON")
             if connection.execute("PRAGMA query_only").fetchone()[0] != 1:
                 connection.close()

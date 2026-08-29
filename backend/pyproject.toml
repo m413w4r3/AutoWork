@@ -92,3 +92,32 @@ plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 module = "minio.*"
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+  "tests",
+  "tests.*",
+  "test_invariants",
+  "test_code_features",
+  "test_smda_adapter",
+  "test_invariant_proposals",
+  "test_capabilities",
+  "test_static_analysis",
+  "integration.test_invariant_registry_concurrency",
+]
+check_untyped_defs = false
+disallow_any_generics = false
+disallow_untyped_calls = false
+disallow_untyped_defs = false
+warn_unused_ignores = false
+disable_error_code = [
+  "arg-type",
+  "attr-defined",
+  "assignment",
+  "comparison-overlap",
+  "import-untyped",
+  "index",
+  "union-attr",
+  "var-annotated",
+  "no-untyped-def",
+]

@@ -175,6 +175,7 @@ async def test_stale_parser_artifact_is_reprocessed_and_becomes_current(tmp_path
     assert factory.artifacts[current].parser_version == PARSER_VERSION
     assert original_indicator_ids < set(factory.indicators)
 
+
 async def test_one_unparseable_archived_source_does_not_rollback_others(tmp_path: Path) -> None:
     factory = InMemoryCollectionUnitOfWorkFactory()
     processor, collections = await _archived_sources(

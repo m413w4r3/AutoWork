@@ -59,8 +59,8 @@ class DiagnosticsLog:
                     "- `events.jsonl` : un événement par ligne (index)\n"
                     "- `runs/<run_id>/` : payloads bruts, dans l'ordre des étapes\n\n"
                     "Lecture : `make diagnostics`, par exemple\n"
-                    "`make diagnostics ARGS=\"--failures -v\"` ou\n"
-                    "`make diagnostics ARGS=\"merge. -n 100\"`.\n\n"
+                    '`make diagnostics ARGS="--failures -v"` ou\n'
+                    '`make diagnostics ARGS="merge. -n 100"`.\n\n'
                     "Familles d'événements :\n\n"
                     "- `model.*`, `parse.*`, `stage.*` : ce que le modèle a répondu\n"
                     "  et ce que le parser en a fait\n"
@@ -237,9 +237,7 @@ class DiagnosticsLog:
         if error is not None:
             fields.setdefault("error_type", type(error).__name__)
             fields.setdefault("error", str(error))
-            payload = "".join(
-                traceback.format_exception(type(error), error, error.__traceback__)
-            )
+            payload = "".join(traceback.format_exception(type(error), error, error.__traceback__))
         if error_code is not None:
             fields["error_code"] = error_code
         self.record(

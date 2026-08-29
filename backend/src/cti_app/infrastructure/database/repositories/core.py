@@ -399,8 +399,7 @@ class SqlAlchemyGoodwareBaselineRepository:
     ) -> GoodwareBaseline | None:
         row = await self._session.scalar(
             select(GoodwareBaselineRow).where(
-                GoodwareBaselineRow.baseline_fingerprint_sha256
-                == baseline_fingerprint_sha256
+                GoodwareBaselineRow.baseline_fingerprint_sha256 == baseline_fingerprint_sha256
             )
         )
         return await self._from_row(row)
@@ -866,9 +865,7 @@ class SqlAlchemyCodeFeatureSetRepository:
                     "blob_id": str(row.blob_id),
                     "feature_blob_id": str(row.feature_blob_id),
                     "blob_sha256": await _blob_sha256(self._session, row.blob_id),
-                    "feature_blob_sha256": await _blob_sha256(
-                        self._session, row.feature_blob_id
-                    ),
+                    "feature_blob_sha256": await _blob_sha256(self._session, row.feature_blob_id),
                     "tool_version": row.tool_version,
                     "escaper_compatibility_version": row.escaper_compatibility_version,
                     "intel_pic_hash_escape_version": row.intel_pic_hash_escape_version,
@@ -887,10 +884,7 @@ def _code_feature_set_from_row(row: CodeFeatureSetRow) -> CodeFeatureSet:
     ngrams = tuple(
         CodeNgram(
             **{
-                **{
-                    name: item[name]
-                    for name in CODE_NGRAM_STRUCTURAL_FIELDS
-                },
+                **{name: item[name] for name in CODE_NGRAM_STRUCTURAL_FIELDS},
                 "mnemonics": tuple(item["mnemonics"]),
             }
         )
@@ -1010,9 +1004,7 @@ class SqlAlchemySampleFeatureSetRepository:
                     "blob_id": str(row.blob_id),
                     "feature_blob_id": str(row.feature_blob_id),
                     "blob_sha256": await _blob_sha256(self._session, row.blob_id),
-                    "feature_blob_sha256": await _blob_sha256(
-                        self._session, row.feature_blob_id
-                    ),
+                    "feature_blob_sha256": await _blob_sha256(self._session, row.feature_blob_id),
                     "extractor_version": row.extractor_version,
                     "parameters_sha256": row.parameters_sha256,
                     "payload": row.payload,
