@@ -9,6 +9,7 @@ from pydantic import ConfigDict, Field
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.edition_workspace import EditionProductionCheckpointService
 from cti_app.application.jobs import (
     DuplicateJobError,
     JobDispatcher,
@@ -141,6 +142,7 @@ def register_production_jobs(
     diagnostics: DiagnosticsLog | None = None,
     seed_enrichment: VirusTotalSeedEnrichmentService | None = None,
     pacing: ProductionPacingPolicy | None = None,
+    checkpoint: EditionProductionCheckpointService | None = None,
 ) -> None:
     """Register the five production stage jobs."""
     stage_chain = chain or ProductionStageChain()
@@ -153,6 +155,15 @@ def register_production_jobs(
         so this runs on every terminal outcome, not only on success.
         """
         batches = EditionProductionService(uow_factory, production_pacing)
+        if checkpoint is not None:
+            # The projection is deliberately outside the batch transaction and
+            # is never allowed to change the terminal production outcome.
+            try:
+                await checkpoint.checkpoint(run_id, correlation_id=correlation_id)
+            except Exception:
+                # The concrete service is best-effort too; this guard keeps
+                # alternate/test implementations from changing batch semantics.
+                pass
         async with uow_factory() as uow:
             item = await uow.edition_production_batch_items.get_by_run(run_id)
             if item is None:

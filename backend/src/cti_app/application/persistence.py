@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from types import TracebackType
-from typing import Protocol, Self
+from typing import TYPE_CHECKING, Protocol, Self
 from uuid import UUID
 
 from cti_app.application.production_read_model import BatchStatusReadRepository
@@ -64,8 +64,12 @@ from cti_app.domain.production import (
     SampleAcquisitionAttempt,
     SubjectProductionRun,
 )
+from cti_app.domain.publication_review import PublicationReviewDecision
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
 from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
+
+if TYPE_CHECKING:
+    from cti_app.application.edition_review import EditionReviewReadRepository
 
 
 class BlobRepository(Protocol):
@@ -648,6 +652,8 @@ class UnitOfWork(Protocol):
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
     batch_status_read_model: BatchStatusReadRepository
+    edition_review_read_model: EditionReviewReadRepository
+    publication_review_decisions: PublicationReviewDecisionRepository
 
     async def __aenter__(self) -> Self: ...
 
@@ -826,6 +832,8 @@ class ProductionUnitOfWork(Protocol):
     source_collections: SourceCollectionRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
+    edition_review_read_model: EditionReviewReadRepository
+    publication_review_decisions: PublicationReviewDecisionRepository
 
     async def __aenter__(self) -> Self: ...
 
@@ -843,3 +851,11 @@ class ProductionUnitOfWork(Protocol):
 
 class ProductionUnitOfWorkFactory(Protocol):
     def __call__(self) -> ProductionUnitOfWork: ...
+
+
+class PublicationReviewDecisionRepository(Protocol):
+    """Append-only persistence port for publication review events."""
+
+    async def append(self, decision: PublicationReviewDecision) -> None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[PublicationReviewDecision]: ...

@@ -619,6 +619,7 @@ def create_job_registry(
     production_diagnostics: object | None = None,
     cumulative_discovery_service: object | None = None,
     seed_enrichment: object | None = None,
+    production_checkpoint: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
@@ -664,6 +665,7 @@ def create_job_registry(
         register_brief_jobs(registry, brief_service)
     if uow_factory is not None:
         from cti_app.application.diagnostics import DiagnosticsLog
+        from cti_app.application.edition_workspace import EditionProductionCheckpointService
         from cti_app.application.model_conversations import ModelConversationService
         from cti_app.application.production_artifact_store import ProductionArtifactStore
         from cti_app.application.production_jobs import (
@@ -687,6 +689,10 @@ def create_job_registry(
             production_diagnostics, DiagnosticsLog
         ):
             raise TypeError("production_diagnostics must be a DiagnosticsLog")
+        if production_checkpoint is not None and not isinstance(
+            production_checkpoint, EditionProductionCheckpointService
+        ):
+            raise TypeError("production_checkpoint must be an EditionProductionCheckpointService")
         register_production_jobs(
             registry,
             uow_factory,
@@ -697,6 +703,7 @@ def create_job_registry(
             artifact_store=production_artifact_store,
             diagnostics=production_diagnostics,
             seed_enrichment=cast(Any, seed_enrichment),
+            checkpoint=production_checkpoint,
         )
     return registry
 

@@ -263,7 +263,11 @@ function ExtractionPreview({ document }: { document: ExtractionDocumentV2 }) {
   );
 }
 
-function BriefPreview({ document }: { document: BriefDocumentV1 }) {
+export function PublicationDocumentView({
+  document,
+}: {
+  document: BriefDocumentV1;
+}) {
   const visibleGroups = document.indicators.filter(
     (group) => IOC_LABELS[group.artifact_type] && group.values.length > 0,
   );
@@ -388,7 +392,7 @@ export function ProductionArtifactView({
         )}
 
       {stage === "brief" && isBriefDocument(artifact.canonical_content) && (
-        <BriefPreview document={artifact.canonical_content} />
+        <PublicationDocumentView document={artifact.canonical_content} />
       )}
 
       {stage === "extraction" &&

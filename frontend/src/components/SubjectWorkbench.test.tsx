@@ -86,6 +86,12 @@ function renderWorkbench() {
   );
 }
 
+function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.toString();
+  return input.url;
+}
+
 afterEach(() => vi.unstubAllGlobals());
 
 describe("SubjectWorkbench", () => {
@@ -142,5 +148,108 @@ describe("SubjectWorkbench", () => {
     expect(screen.getByText(/Original : evil\[\.\]example/)).toHaveTextContent(
       "normalisé : evil.example",
     );
+  });
+
+  it("ouvre Article par défaut et charge uniquement le contenu", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      expect(requestUrl(input)).toBe(`/api/subjects/${subjectId}/content`);
+      return Promise.resolve(
+        Response.json({
+          subject_id: subjectId,
+          run_id: "run-1",
+          pipeline_generation: 1,
+          artifact_id: "artifact-1",
+          artifact_version: 1,
+          artifact_input_hash: "a".repeat(64),
+          status: "verified",
+          schema_version: "1",
+          canonical_content: {
+            schema_version: "1",
+            title: "Article canonique",
+            timeline: [],
+            synthesis: [],
+            indicators: [],
+            sources: [],
+            uncertainties: [],
+          },
+          rendered_content: null,
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderWorkbench();
+
+    expect(
+      await screen.findByRole("heading", { name: "Article canonique" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Article" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("charge IOC et sources/fichiers seulement à l’ouverture de leur onglet", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = requestUrl(input);
+      if (url.endsWith("/content")) {
+        return Promise.resolve(
+          Response.json({
+            subject_id: subjectId,
+            run_id: "run-1",
+            pipeline_generation: 1,
+            artifact_id: "artifact-1",
+            artifact_version: 1,
+            artifact_input_hash: "a".repeat(64),
+            status: "verified",
+            schema_version: "1",
+            canonical_content: {
+              schema_version: "1",
+              title: "Article",
+              timeline: [],
+              synthesis: [],
+              indicators: [],
+              sources: [],
+              uncertainties: [],
+            },
+            rendered_content: null,
+          }),
+        );
+      }
+      if (url.endsWith("/indicators")) {
+        return Promise.resolve(Response.json([]));
+      }
+      if (url.endsWith("/assets")) {
+        return Promise.resolve(Response.json({ sources: [], samples: [] }));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderWorkbench();
+    await screen.findByRole("heading", { name: "Article" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "IOC" }));
+    expect(
+      await screen.findByText("Aucun IOC vérifié pour cet article."),
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/subjects/${subjectId}/indicators`,
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/blob"),
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Sources et fichiers" }),
+    );
+    expect(await screen.findByText("Sources")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(`/api/subjects/${subjectId}/assets`);
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        requestUrl(url).includes("download"),
+      ),
+    ).toBe(false);
   });
 });

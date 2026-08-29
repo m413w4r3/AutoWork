@@ -1013,6 +1013,47 @@ h1 {
   color: white;
 }
 
+.subject-data-table {
+  display: grid;
+  overflow-x: auto;
+  border: 1px solid #cfdbd3;
+  border-radius: 0.65rem;
+}
+
+.subject-data-table__row {
+  display: grid;
+  grid-template-columns:
+    minmax(7rem, 0.7fr) minmax(14rem, 2fr) minmax(8rem, 1fr)
+    minmax(8rem, 1fr);
+  gap: 1rem;
+  align-items: center;
+  min-width: 42rem;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid #e2e8e4;
+}
+
+.subject-data-table__row:first-child {
+  border-top: 0;
+}
+
+.subject-data-table__row--header {
+  background: #f7faf7;
+}
+
+.subject-asset-list {
+  display: grid;
+  gap: 0.75rem;
+  padding: 0;
+  list-style: none;
+}
+
+.subject-asset-list > li {
+  padding: 1rem;
+  border: 1px solid #cfdbd3;
+  border-radius: 0.65rem;
+  background: #fff;
+}
+
 .workbench-list {
   display: grid;
   gap: 1rem;

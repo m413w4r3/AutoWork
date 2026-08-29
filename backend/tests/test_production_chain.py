@@ -7,12 +7,14 @@ subject — including when it failed, so one bad subject cannot block the queue.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.edition_workspace import EditionProductionCheckpointService
 from cti_app.application.jobs import JobHandlerError, JobRegistry
+from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_jobs import (
     ProductionStageChain,
     ProductionStageParameters,
@@ -184,6 +186,14 @@ class _Orchestrator:
         return self.result
 
 
+class _Checkpoint:
+    def __init__(self) -> None:
+        self.calls: list[UUID] = []
+
+    async def checkpoint(self, run_id: UUID, *, correlation_id: str) -> None:
+        self.calls.append(run_id)
+
+
 @pytest.fixture
 def uow() -> _Uow:
     return _Uow()
@@ -193,6 +203,7 @@ def _build(
     uow: _Uow,
     monkeypatch: pytest.MonkeyPatch,
     result: dict[str, Any],
+    checkpoint: object | None = None,
 ) -> tuple[JobRegistry, _Jobs, _Orchestrator]:
     orchestrator = _Orchestrator(result)
     monkeypatch.setattr(
@@ -203,7 +214,12 @@ def _build(
     jobs = _Jobs()
     chain = ProductionStageChain()
     chain.bind(jobs, _Dispatcher())  # type: ignore[arg-type]
-    register_production_jobs(registry, lambda: uow, chain=chain)  # type: ignore[arg-type]
+    register_production_jobs(
+        registry,
+        cast(UnitOfWorkFactory, lambda: uow),
+        chain=chain,
+        checkpoint=cast(EditionProductionCheckpointService | None, checkpoint),
+    )
     return registry, jobs, orchestrator
 
 
@@ -372,6 +388,31 @@ async def test_failed_subject_does_not_block_the_batch(
     assert uow.subject_production_runs.items[first.id].status is SubjectProductionStatus.FAILED
     assert [job.kind for job in jobs.submitted] == [stage_job_kind(SubjectProductionStage.SOURCES)]
     assert uow.subject_production_runs.items[second.id].status is (SubjectProductionStatus.RUNNING)
+
+
+async def test_terminalization_calls_the_checkpoint_once(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _Checkpoint()
+    registry, _, _ = _build(
+        uow,
+        monkeypatch,
+        {"stage": "references", "status": "error", "error": "boom"},
+        checkpoint=checkpoint,
+    )
+    first = _run(uow, SubjectProductionStage.REFERENCES)
+    _batch_of(uow, first)
+
+    handler = registry.handler(stage_job_kind(SubjectProductionStage.REFERENCES))
+    with pytest.raises(JobHandlerError):
+        await handler(
+            ProductionStageParameters(
+                run_id=first.id, expected_stage=SubjectProductionStage.REFERENCES.value
+            ),
+            _Context(),  # type: ignore[arg-type]
+        )
+
+    assert checkpoint.calls == [first.id]
 
 
 async def test_needs_review_is_a_business_outcome_not_a_crash(

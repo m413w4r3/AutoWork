@@ -231,6 +231,7 @@ services:
       QWEN_CHUNK_MAX_CHARS: ${QWEN_CHUNK_MAX_CHARS:-12000}
       QWEN_CHUNK_OVERLAP_CHARS: ${QWEN_CHUNK_OVERLAP_CHARS:-500}
       SUBJECT_WORKSPACE_ROOT: /work/subjects
+      EDITION_WORKSPACE_ROOT: /work/editions
       GOODWARE_CACHE_ROOT: ${GOODWARE_CACHE_ROOT:-/var/cache/autowork/goodware}
       DIAGNOSTICS_LOG_ROOT: ${DIAGNOSTICS_LOG_ROOT:-/var/diagnostics}
       VIRUSTOTAL_FILE_REPORT_ENABLED: ${VIRUSTOTAL_FILE_REPORT_ENABLED:-false}
@@ -251,6 +252,7 @@ services:
       VIRUSTOTAL_MAX_RESULTS: ${VIRUSTOTAL_MAX_RESULTS:-1000}
     volumes:
       - subject_workspaces:/work/subjects
+      - edition_workspaces:/work/editions
       - goodware_cache:/var/cache/autowork/goodware
       - ./var/diagnostics:/var/diagnostics
     ports:
@@ -308,6 +310,7 @@ services:
     environment: *backend-environment
     volumes:
       - subject_workspaces:/work/subjects
+      - edition_workspaces:/work/editions
       - goodware_cache:/var/cache/autowork/goodware
       - ./var/diagnostics:/var/diagnostics
     extra_hosts:
@@ -425,6 +428,7 @@ volumes:
   minio_data:
   bridge_data:
   subject_workspaces:
+  edition_workspaces:
   goodware_cache:
 
 networks:

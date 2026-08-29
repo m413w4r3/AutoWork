@@ -62,6 +62,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     jobs,
     model_execution,
     production,
+    publication_review,
 )
 from cti_app.infrastructure.database.models.base import Base
 from tests.integration.conftest import _alembic_config
@@ -91,6 +92,10 @@ IndexShape = tuple[str, tuple[str, ...], bool, bool]
 # migration chain at HEAD. This is the complete, canonical baseline installed
 # by the current migration chain.
 EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
+    (
+        "publication_review_decisions",
+        "trg_publication_review_decisions_append_only",
+    ): "reject_evidence_mutation",
     (
         "production_input_snapshots",
         "trg_production_input_snapshots_append_only",

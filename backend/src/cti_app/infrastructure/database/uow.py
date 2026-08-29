@@ -2,6 +2,7 @@ from types import TracebackType
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cti_app.application.edition_review import EditionReviewReadRepository
 from cti_app.application.persistence import (
     AnalystDecisionRepository,
     AnalystInputPackRepository,
@@ -39,6 +40,7 @@ from cti_app.application.persistence import (
     ProductionArtifactRepository,
     ProductionInputSnapshotRepository,
     ProvenanceRepository,
+    PublicationReviewDecisionRepository,
     ReferenceMemberRepository,
     RejectedModelProposalRepository,
     SampleAcquisitionAttemptRepository,
@@ -128,6 +130,10 @@ from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemySampleAcquisitionAttemptRepository,
     SqlAlchemySubjectProductionRunRepository,
 )
+from cti_app.infrastructure.database.repositories.publication_review import (
+    SqlAlchemyEditionReviewReadRepository,
+    SqlAlchemyPublicationReviewDecisionRepository,
+)
 
 
 class SqlAlchemyUnitOfWork:
@@ -181,6 +187,8 @@ class SqlAlchemyUnitOfWork:
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
     batch_status_read_model: BatchStatusReadRepository
+    edition_review_read_model: EditionReviewReadRepository
+    publication_review_decisions: PublicationReviewDecisionRepository
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -249,6 +257,10 @@ class SqlAlchemyUnitOfWork:
             self._session
         )
         self.batch_status_read_model = SqlAlchemyBatchStatusReadRepository(self._session)
+        self.edition_review_read_model = SqlAlchemyEditionReviewReadRepository(self._session)
+        self.publication_review_decisions = SqlAlchemyPublicationReviewDecisionRepository(
+            self._session
+        )
         self._committed = False
         return self
 

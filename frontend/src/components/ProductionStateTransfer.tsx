@@ -182,7 +182,7 @@ export function ProductionStateTransfer({
   return (
     <section className="production-state-transfer">
       <h3>État de production</h3>
-      <p>Exportez ou restaurez les artefacts de production de cette brève.</p>
+      <p>Exportez ou restaurez les artefacts de production de cet article.</p>
       <div className="production-state-transfer__actions">
         <button
           className="button button--secondary"

@@ -16,6 +16,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     jobs,
     model_execution,
     production,
+    publication_review,
 )
 from cti_app.infrastructure.database.models.base import Base
 

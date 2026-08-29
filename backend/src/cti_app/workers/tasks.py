@@ -17,6 +17,7 @@ from cti_app.application.discovery.cumulative.jobs import RECONCILE_DISCOVERY_JO
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.service import DiscoveryService
+from cti_app.application.edition_workspace import EditionProductionCheckpointService
 from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.http_collection import (
     CollectionPolicy,
@@ -264,6 +265,12 @@ async def _execute_job(job_id: UUID) -> int | None:
         production_artifact_store = ProductionArtifactStore(
             BlobCatalogService(blob_store, uow_factory)
         )
+        production_checkpoint = EditionProductionCheckpointService(
+            uow_factory,
+            production_artifact_store,
+            settings.edition_workspace_root,
+            diagnostics=production_diagnostics,
+        )
         production_pacing = ProductionPacingPolicy.from_settings(settings)
         production_chain = ProductionStageChain(production_pacing)
         registry = create_job_registry(
@@ -278,6 +285,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             production_diagnostics=production_diagnostics,
             cumulative_discovery_service=cumulative_discovery_service,
             seed_enrichment=seed_enrichment,
+            production_checkpoint=production_checkpoint,
         )
         job_service = JobService(uow_factory, registry)
         production_chain.bind(job_service, job_dispatcher)

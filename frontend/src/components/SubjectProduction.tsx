@@ -8,7 +8,6 @@ import {
 } from "../api/production";
 import type { StageStatus } from "../api/production";
 import { ProductionStageCard } from "./ProductionStageCard";
-import { BriefDraftEditor } from "./BriefDraftEditor";
 import { ProductionStateTransfer } from "./ProductionStateTransfer";
 
 interface SubjectProductionProps {
@@ -154,7 +153,7 @@ export function SubjectProduction({
   if (restartable) {
     return (
       <section className="production-panel">
-        <h2>Production de la brève</h2>
+        <h2>Production de l’article</h2>
         {status ? (
           <p className="production-counters">
             La production précédente s’est terminée en{" "}
@@ -180,7 +179,7 @@ export function SubjectProduction({
             ? "Démarrage…"
             : status
               ? "Relancer la production"
-              : "Produire cette brève"}
+              : "Produire cet article"}
         </button>
         <ProductionStateTransfer
           subjectId={subjectId}
@@ -222,7 +221,7 @@ export function SubjectProduction({
     <section className="production-panel">
       <div className="production-panel__heading">
         <div>
-          <p className="eyebrow">{status.editorial_type}</p>
+          <p className="eyebrow">Pipeline de production</p>
           <h2>{status.title}</h2>
         </div>
         <span className={`badge production-status is-${status.status}`}>
@@ -337,14 +336,6 @@ export function SubjectProduction({
           La relance n’a pas pu démarrer : {String(retryStageMutation.error)}
         </p>
       ) : null}
-
-      {status.status === "ready" && (
-        <BriefDraftEditor
-          subjectId={subjectId}
-          isAvailable={true}
-          onClose={undefined}
-        />
-      )}
 
       <div className="production-actions">
         {status.status === "ready" && (

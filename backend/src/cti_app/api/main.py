@@ -16,6 +16,7 @@ from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
 from cti_app.api.production import router as production_router
+from cti_app.api.publication import router as publication_router
 from cti_app.api.subject_content import router as subject_content_router
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.briefs import BriefService
@@ -28,6 +29,8 @@ from cti_app.application.discovery.cumulative.jobs import RECONCILE_DISCOVERY_JO
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
 from cti_app.application.discovery.service import DiscoveryService
+from cti_app.application.edition_review import EditionReviewService
+from cti_app.application.edition_workspace import EditionProductionCheckpointService
 from cti_app.application.editions import EditionService
 from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.http_collection import (
@@ -215,6 +218,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     subject_production_service = SubjectProductionService(uow_factory)
     edition_production_service = EditionProductionService(uow_factory, production_pacing)
     production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+    production_checkpoint = EditionProductionCheckpointService(
+        uow_factory,
+        production_artifact_store,
+        settings.edition_workspace_root,
+        diagnostics=production_diagnostics,
+    )
     subject_content_service = SubjectContentService(uow_factory, production_artifact_store)
     production_chain = ProductionStageChain(production_pacing)
     registry = create_job_registry(
@@ -228,6 +237,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         production_artifact_store=production_artifact_store,
         production_diagnostics=production_diagnostics,
         cumulative_discovery_service=cumulative_discovery_service,
+        production_checkpoint=production_checkpoint,
     )
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory
@@ -254,6 +264,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.brief_service = brief_service
     app.state.subject_production_service = subject_production_service
     app.state.edition_production_service = edition_production_service
+    app.state.edition_review_service = EditionReviewService(uow_factory)
     yield
     await readiness.close()
     await job_engine.dispose()
@@ -290,6 +301,7 @@ def create_app() -> FastAPI:
     application.include_router(briefs_router)
     application.include_router(model_conversations_router)
     application.include_router(production_router)
+    application.include_router(publication_router)
     application.include_router(subject_content_router)
     return application
 

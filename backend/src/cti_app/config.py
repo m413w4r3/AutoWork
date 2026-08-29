@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     s3_bucket: str = "cti-local"
     s3_secure: bool = False
     subject_workspace_root: Path = Path("work/subjects")
+    edition_workspace_root: Path = Path("/work/editions")
     goodware_cache_root: Path = Path("/var/cache/autowork/goodware")
     # Local development trail of model answers and parser decisions.
     # Empty disables it; never enable outside a local environment.
