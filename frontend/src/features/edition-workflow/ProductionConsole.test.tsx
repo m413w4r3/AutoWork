@@ -3,7 +3,10 @@ import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { BatchStatus } from "../../api/production";
-import { ProductionConsole } from "./ProductionConsole";
+import {
+  ProductionConsole,
+  productionBatchPollingInterval,
+} from "./ProductionConsole";
 
 const EDITION_ID = "edition-1";
 
@@ -115,7 +118,7 @@ describe("ProductionConsole", () => {
       "1 annulés",
     );
     expect(screen.getByText("1 récupération automatique")).toBeInTheDocument();
-    expect(screen.getAllByText("Génération 8")).toHaveLength(2);
+    expect(screen.queryByText(/Génération/)).not.toBeInTheDocument();
     expect(
       screen.getByText("Validation manuelle requise."),
     ).toBeInTheDocument();
@@ -167,5 +170,15 @@ describe("ProductionConsole", () => {
       ),
     ).toHaveLength(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["queued", 2_000],
+    ["running", 2_000],
+    ["completed", false],
+    ["completed_with_issues", false],
+    ["cancelled", false],
+  ] as const)("polling %s => %s", (status, expected) => {
+    expect(productionBatchPollingInterval(status)).toBe(expected);
   });
 });

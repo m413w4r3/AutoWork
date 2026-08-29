@@ -16,6 +16,7 @@ from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
 from cti_app.api.production import router as production_router
+from cti_app.api.subject_content import router as subject_content_router
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
@@ -42,6 +43,7 @@ from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subject_production import (
     EditionProductionService,
     SubjectProductionService,
@@ -213,6 +215,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     subject_production_service = SubjectProductionService(uow_factory)
     edition_production_service = EditionProductionService(uow_factory, production_pacing)
     production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
+    subject_content_service = SubjectContentService(uow_factory, production_artifact_store)
     production_chain = ProductionStageChain(production_pacing)
     registry = create_job_registry(
         model_gateway,
@@ -229,6 +232,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory
     app.state.production_artifact_store = production_artifact_store
+    app.state.subject_content_service = subject_content_service
     app.state.production_diagnostics = production_diagnostics
     app.state.production_pacing = production_pacing
     job_service = JobService(uow_factory, registry)
@@ -286,6 +290,7 @@ def create_app() -> FastAPI:
     application.include_router(briefs_router)
     application.include_router(model_conversations_router)
     application.include_router(production_router)
+    application.include_router(subject_content_router)
     return application
 
 

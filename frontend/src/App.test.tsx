@@ -27,6 +27,12 @@ const iranEdition: Edition = {
   updated_at: "2026-08-08T00:00:00Z",
 };
 
+const discoveryEdition: Edition = {
+  ...iranEdition,
+  status: "discovery",
+  allowed_transitions: ["selection", "archived"],
+};
+
 const emptyEditorialBoard = {
   groups: [],
   selected_briefs: 0,
@@ -83,7 +89,7 @@ function discoveryFetchMock() {
       }
       if (url.includes("/editorial-groups"))
         return Response.json(emptyEditorialBoard);
-      if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+      if (url.endsWith(iranEdition.id)) return Response.json(discoveryEdition);
       void init;
       return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
     }),
@@ -296,7 +302,8 @@ describe("App éditions", () => {
           });
         if (url.includes("/editorial-groups"))
           return Response.json(emptyEditorialBoard);
-        if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+        if (url.endsWith(iranEdition.id))
+          return Response.json(discoveryEdition);
         return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
       }),
     );
@@ -493,7 +500,8 @@ describe("App éditions", () => {
               updated_at: "2026-08-10T10:01:00Z",
             });
           }
-          if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+          if (url.endsWith(iranEdition.id))
+            return Response.json(discoveryEdition);
           return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
         },
       ),
@@ -764,7 +772,8 @@ describe("App éditions", () => {
         }
         if (url.includes("/editorial-groups"))
           return Response.json(emptyEditorialBoard);
-        if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
+        if (url.endsWith(iranEdition.id))
+          return Response.json(discoveryEdition);
         return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
       }),
     );

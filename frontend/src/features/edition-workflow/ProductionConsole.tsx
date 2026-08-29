@@ -42,6 +42,12 @@ const TERMINAL_BATCH_STATUSES = new Set([
   "cancelled",
 ]);
 
+export function productionBatchPollingInterval(
+  status: BatchStatus["status"] | undefined,
+): number | false {
+  return status === "queued" || status === "running" ? 2_000 : false;
+}
+
 function formatCountdown(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = seconds % 60;
@@ -135,7 +141,6 @@ function ProductionItem({
             {item.auto_recovery_count > 1 ? "s" : ""}
           </span>
         ) : null}
-        <span>Génération {item.pipeline_generation}</span>
       </div>
       <ItemError item={item} />
     </li>
@@ -150,7 +155,7 @@ export function ProductionConsole({ editionId }: { editionId: string }) {
     queryFn: () => getEditionProduction(editionId),
     refetchInterval: (query) => {
       const status = query.state.data?.status;
-      return status === "queued" || status === "running" ? 2_000 : false;
+      return productionBatchPollingInterval(status);
     },
   });
 

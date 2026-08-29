@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback } from "react";
+import { useState } from "react";
 
 import { fetchEditorialBoard, type EditorialGroup } from "../../api/editorial";
 import {
@@ -13,6 +13,7 @@ import {
 } from "../../api/editions";
 import { EditorialBoard } from "../../components/EditorialBoard";
 import { DiscoveryPanel } from "../discovery/DiscoveryPanel";
+import { discoveryJobStorageKey } from "../discovery/discoveryStorage";
 import { ProductionConsole } from "./ProductionConsole";
 
 const WORKFLOW_STEPS = [
@@ -47,10 +48,12 @@ function WorkflowStepper({ status }: { status: EditionStatus }) {
 function StatusAction({
   edition,
   target,
+  disabled = false,
   children,
 }: {
   edition: Edition;
   target: EditionStatus;
+  disabled?: boolean;
   children: React.ReactNode;
 }) {
   const queryClient = useQueryClient();
@@ -72,7 +75,7 @@ function StatusAction({
       ) : null}
       <button
         className="button"
-        disabled={transition.isPending}
+        disabled={transition.isPending || disabled}
         onClick={() => transition.mutate()}
       >
         {transition.isPending ? "Mise à jour…" : children}
@@ -82,20 +85,48 @@ function StatusAction({
 }
 
 function DiscoveryPhase({ edition }: { edition: Edition }) {
-  const onRunningChange = useCallback(() => undefined, []);
+  const [discoveryRunning, setDiscoveryRunning] = useState(() =>
+    Boolean(window.localStorage.getItem(discoveryJobStorageKey(edition.id))),
+  );
+
+  if (edition.status === "draft") {
+    return (
+      <>
+        <section
+          className="workflow-placeholder"
+          aria-labelledby="discovery-intro-heading"
+        >
+          <p className="eyebrow">Découverte</p>
+          <h2 id="discovery-intro-heading">Préparer la découverte</h2>
+          <p>
+            Lancez la phase de découverte pour rechercher et examiner les sujets
+            candidats de cette édition.
+          </p>
+        </section>
+        <StatusAction edition={edition} target="discovery">
+          Démarrer la découverte
+        </StatusAction>
+      </>
+    );
+  }
+
   return (
     <>
       <DiscoveryPanel
         editionId={edition.id}
-        onRunningChange={onRunningChange}
+        onRunningChange={setDiscoveryRunning}
       />
-      <StatusAction edition={edition} target="discovery">
-        Démarrer la découverte
+      <StatusAction
+        edition={edition}
+        target="selection"
+        disabled={discoveryRunning}
+      >
+        Ouvrir la sélection
       </StatusAction>
-      {edition.status === "discovery" ? (
-        <StatusAction edition={edition} target="selection">
-          Ouvrir la sélection
-        </StatusAction>
+      {discoveryRunning ? (
+        <p className="workflow-note" role="status">
+          La recherche en cours doit se terminer avant la sélection.
+        </p>
       ) : null}
     </>
   );

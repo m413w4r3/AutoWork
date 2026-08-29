@@ -1358,6 +1358,11 @@ h1 {
   gap: 0.75rem;
 }
 
+.workflow-note {
+  margin: 0;
+  color: #55665c;
+}
+
 .production-start-panel,
 .workflow-placeholder {
   display: grid;
