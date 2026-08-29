@@ -1657,6 +1657,30 @@ h1 {
   color: #55665c;
 }
 
+.publication-console {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.publication-console p {
+  margin: 0;
+}
+
+.publication-console__download {
+  justify-self: start;
+  text-decoration: none;
+}
+
+.publication-console__diagnostics {
+  color: #55665c;
+  font-size: 0.85rem;
+}
+
+.publication-console__diagnostics summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
 /* Revue de fusion : la consolidation s'arrête ici quand elle hésite. */
 .merge-review {
   margin: 2rem 0;

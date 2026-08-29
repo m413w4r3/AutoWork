@@ -12,6 +12,7 @@ import { EditorialBoard } from "../../components/EditorialBoard";
 import { DiscoveryPanel } from "../discovery/DiscoveryPanel";
 import { discoveryJobStorageKey } from "../discovery/discoveryStorage";
 import { ProductionConsole } from "./ProductionConsole";
+import { PublicationConsole } from "./PublicationConsole";
 import { ReviewConsole } from "./ReviewConsole";
 
 const WORKFLOW_STEPS = [
@@ -190,29 +191,6 @@ function SelectionPhase({ edition }: { edition: Edition }) {
   );
 }
 
-function PlaceholderPhase({
-  status,
-}: {
-  status: "assembling" | "published" | "archived";
-}) {
-  const copy = {
-    assembling: ["Publication en cours", "L’assemblage final est en cours."],
-    published: ["Publication", "L’édition est publiée."],
-    archived: [
-      "Édition archivée",
-      "Cette édition est disponible en lecture seule.",
-    ],
-  } as const;
-  const [title, description] = copy[status];
-  return (
-    <section className="workflow-placeholder" aria-live="polite">
-      <p className="eyebrow">Publication</p>
-      <h2>{title}</h2>
-      <p>{description}</p>
-    </section>
-  );
-}
-
 export function EditionWorkflow({ edition }: { edition: Edition }) {
   return (
     <section className="edition-workflow" aria-label="Workflow de l’édition">
@@ -232,7 +210,10 @@ export function EditionWorkflow({ edition }: { edition: Edition }) {
       {edition.status === "assembling" ||
       edition.status === "published" ||
       edition.status === "archived" ? (
-        <PlaceholderPhase status={edition.status} />
+        <PublicationConsole
+          editionId={edition.id}
+          editionStatus={edition.status}
+        />
       ) : null}
     </section>
   );

@@ -35,7 +35,7 @@ from cti_app.domain.edition_publication import (
     PublicationManifestV1,
 )
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
-from cti_app.domain.jobs import Job
+from cti_app.domain.jobs import InvalidJobTransitionError, Job, JobStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,11 @@ class EditionReleaseStatus:
     manifest_id: UUID | None
     manifest_sha256: str | None
     release: EditionRelease | None
+    assembly_job_id: UUID | None
+    assembly_status: JobStatus | None
+    assembly_error_code: str | None
+    assembly_error_message: str | None
+    can_retry_assembly: bool
 
     @property
     def json_available(self) -> bool:
@@ -99,6 +104,23 @@ class EditionReleaseStatus:
     @property
     def published_at(self) -> datetime | None:
         return self.release.created_at if self.release is not None else None
+
+
+def _edition_metadata_projection(edition: Edition) -> dict[str, Any]:
+    """Return the stable editorial metadata embedded in a release document."""
+    return {
+        "id": str(edition.id),
+        "country": edition.country,
+        "country_code": edition.country_code,
+        "period_start": edition.period_start.isoformat(),
+        "period_end": edition.period_end.isoformat(),
+        "tlp": edition.tlp.value,
+        "languages": list(edition.languages),
+        "previous_edition_id": (
+            str(edition.previous_edition_id) if edition.previous_edition_id else None
+        ),
+        "source_profile": edition.source_profile,
+    }
 
 
 class _WorkspaceReleaseMaterializer(Protocol):
@@ -270,26 +292,61 @@ class EditionPublicationService:
     ) -> tuple[UUID | None, bool]:
         if self._job_service is None or self._job_dispatcher is None:
             return None, False
-        job: Job
         try:
-            try:
-                job = await self._job_service.submit(
-                    kind=EDITION_ASSEMBLE_JOB_KIND,
-                    aggregate_type="edition",
-                    aggregate_id=manifest.edition_id,
+            jobs = await self._job_service.list_for_aggregate(
+                "edition", manifest.edition_id, kind=EDITION_ASSEMBLE_JOB_KIND
+            )
+            job = _latest_assembly_job(jobs, manifest.id)
+            if job is None:
+                job = await self._submit_assembly_job(
+                    manifest,
                     idempotency_key=f"publication-assemble-{manifest.id}",
                     correlation_id=correlation_id,
-                    input_parameters={"manifest_id": str(manifest.id)},
-                    max_attempts=3,
                     actor_id=actor_id,
+                    max_attempts=3,
                 )
-            except DuplicateJobError as exc:
-                job = await self._job_service.get(exc.existing_job_id)
+
+            # The policy is deliberately publication-specific.  A terminal
+            # failed job can be reused while it still has manual attempts;
+            # once exhausted (or cancelled), the successor gets a distinct
+            # deterministic idempotency key.
+            for _ in range(3):
+                if job.status is JobStatus.QUEUED:
+                    break
+                if job.status in {
+                    JobStatus.RUNNING,
+                    JobStatus.SUCCEEDED,
+                    JobStatus.WAITING_HUMAN,
+                }:
+                    return job.id, False
+                if job.status is JobStatus.FAILED and job.attempt < job.max_attempts:
+                    try:
+                        job = await self._job_service.retry(job.id, actor_id=actor_id)
+                    except InvalidJobTransitionError:
+                        # A concurrent accept may have repaired the same job.
+                        # Reload it and apply the state policy to the winner.
+                        job = await self._job_service.get(job.id)
+                    continue
+                if job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+                    previous_job_id = job.id
+                    job = await self._submit_assembly_job(
+                        manifest,
+                        idempotency_key=(
+                            f"publication-assemble-{manifest.id}-after-{previous_job_id}"
+                        ),
+                        correlation_id=correlation_id,
+                        actor_id=actor_id,
+                        max_attempts=job.max_attempts,
+                    )
+                    continue
+            else:
+                raise RuntimeError("publication assembly job state did not stabilize")
         except Exception:
             logger.exception(
-                "Unable to create publication assembly job for manifest %s", manifest.id
+                "Unable to assure publication assembly job for manifest %s", manifest.id
             )
             return None, False
+
         try:
             await self._job_dispatcher.dispatch(job.id)
         except Exception:
@@ -298,6 +355,29 @@ class EditionPublicationService:
             logger.exception("Unable to dispatch publication assembly job %s", job.id)
             return job.id, False
         return job.id, True
+
+    async def _submit_assembly_job(
+        self,
+        manifest: PublicationManifestV1,
+        *,
+        idempotency_key: str,
+        correlation_id: str,
+        actor_id: str,
+        max_attempts: int,
+    ) -> Job:
+        try:
+            return await self._job_service.submit(  # type: ignore[union-attr]
+                kind=EDITION_ASSEMBLE_JOB_KIND,
+                aggregate_type="edition",
+                aggregate_id=manifest.edition_id,
+                idempotency_key=idempotency_key,
+                correlation_id=correlation_id,
+                input_parameters={"manifest_id": str(manifest.id)},
+                max_attempts=max_attempts,
+                actor_id=actor_id,
+            )
+        except DuplicateJobError as exc:
+            return await self._job_service.get(exc.existing_job_id)  # type: ignore[union-attr]
 
     async def release_status(self, edition_id: UUID) -> EditionReleaseStatus:
         async with self._uow_factory() as uow:
@@ -310,12 +390,30 @@ class EditionPublicationService:
                 if manifest is not None
                 else None
             )
+            assembly_job = None
+            jobs = getattr(uow, "jobs", None)
+            if jobs is not None and manifest is not None:
+                assembly_jobs = await jobs.list_for_aggregate(
+                    "edition", edition_id, kind=EDITION_ASSEMBLE_JOB_KIND
+                )
+                assembly_job = _latest_assembly_job(assembly_jobs, manifest.id)
+            can_retry_assembly = edition.status is EditionStatus.ASSEMBLING and (
+                assembly_job is None
+                or assembly_job.status in {JobStatus.FAILED, JobStatus.CANCELLED}
+            )
             return EditionReleaseStatus(
                 edition_id=edition_id,
                 edition_status=edition.status,
                 manifest_id=manifest.id if manifest is not None else None,
                 manifest_sha256=manifest.content_sha256 if manifest is not None else None,
                 release=release,
+                assembly_job_id=assembly_job.id if assembly_job is not None else None,
+                assembly_status=assembly_job.status if assembly_job is not None else None,
+                assembly_error_code=assembly_job.error_code if assembly_job is not None else None,
+                assembly_error_message=(
+                    assembly_job.error_message if assembly_job is not None else None
+                ),
+                can_retry_assembly=can_retry_assembly,
             )
 
     async def read_docx(self, edition_id: UUID) -> tuple[EditionReleaseStatus, bytes]:
@@ -344,110 +442,130 @@ class EditionAssemblyService:
     async def assemble(
         self, manifest_id: UUID, *, context: JobExecutionContext | None = None
     ) -> EditionRelease:
+        # Phase 1: every potentially slow read/render/blob operation runs
+        # outside an Edition FOR UPDATE lock. Only immutable IDs from the
+        # manifest are followed; no current artifact is resolved here.
         async with self._uow_factory() as uow:
             manifest = await uow.publication_manifests.get(manifest_id)
             if manifest is None:
                 raise PublicationManifestNotFoundError(str(manifest_id))
             existing = await uow.edition_releases.get_by_manifest(manifest_id)
-            if existing is not None:
-                return await self._finish_existing(uow, existing, manifest)
             edition = await uow.editions.get(manifest.edition_id)
             if edition is None:
                 raise PublicationAssemblyError("edition_not_found")
-            manifest_blob_id = await uow.publication_manifests.get_blob_id(manifest_id)
-            if manifest_blob_id is None:
-                raise PublicationAssemblyError("manifest_blob_missing")
+            expected_version = manifest.edition_version + 1
+            if existing is None:
+                if edition.status is not EditionStatus.ASSEMBLING:
+                    raise PublicationAssemblyError("edition_must_be_assembling")
+                if edition.version != expected_version:
+                    raise PublicationAssemblyError("edition_changed_after_publication_freeze")
+            manifest_blob_id = None
+            if existing is None:
+                manifest_blob_id = await uow.publication_manifests.get_blob_id(manifest_id)
+                if manifest_blob_id is None:
+                    raise PublicationAssemblyError("manifest_blob_missing")
 
-        blob_payload = await self._artifact_store.read_json(manifest_blob_id)
-        blob_manifest = PublicationManifestV1.from_json(blob_payload)
-        if blob_manifest != manifest:
-            raise PublicationAssemblyError("manifest_blob_mismatch")
+        if existing is None:
+            assert manifest_blob_id is not None
+            blob_payload = await self._artifact_store.read_json(manifest_blob_id)
+            blob_manifest = PublicationManifestV1.from_json(blob_payload)
+            if blob_manifest != manifest:
+                raise PublicationAssemblyError("manifest_blob_mismatch")
 
-        publications: list[EditionPublicationV1] = []
-        for entry in manifest.entries:
+            publications: list[EditionPublicationV1] = []
             async with self._uow_factory() as uow:
-                run = await uow.subject_production_runs.get(entry.production_run_id)
-                artifact = await uow.production_artifacts.get(entry.document_artifact_id)
-            if (
-                run is None
-                or artifact is None
-                or run.edition_id != manifest.edition_id
-                or run.subject_id != entry.subject_id
-                or run.pipeline_generation != entry.pipeline_generation
-                or artifact.production_run_id != entry.production_run_id
-                or artifact.subject_id != entry.subject_id
-                or artifact.id != entry.document_artifact_id
-                or artifact.version != entry.document_artifact_version
-                or artifact.input_hash != entry.document_input_hash
-                or artifact.stage is not ProductionArtifactStage.BRIEF
-                or artifact.status is not ProductionArtifactStatus.VERIFIED
-                or artifact.canonical_blob_id is None
-            ):
-                raise PublicationAssemblyError("manifest_artifact_mismatch")
-            payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
-            try:
-                from cti_app.domain.publication import BriefDocumentV1
+                for entry in manifest.entries:
+                    run = await uow.subject_production_runs.get(entry.production_run_id)
+                    artifact = await uow.production_artifacts.get(entry.document_artifact_id)
+                    if (
+                        run is None
+                        or artifact is None
+                        or run.edition_id != manifest.edition_id
+                        or run.subject_id != entry.subject_id
+                        or run.pipeline_generation != entry.pipeline_generation
+                        or artifact.production_run_id != entry.production_run_id
+                        or artifact.subject_id != entry.subject_id
+                        or artifact.id != entry.document_artifact_id
+                        or artifact.version != entry.document_artifact_version
+                        or artifact.input_hash != entry.document_input_hash
+                        or artifact.stage is not ProductionArtifactStage.BRIEF
+                        or artifact.status is not ProductionArtifactStatus.VERIFIED
+                        or artifact.canonical_blob_id is None
+                    ):
+                        raise PublicationAssemblyError("manifest_artifact_mismatch")
+                    payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
+                    try:
+                        from cti_app.domain.publication import BriefDocumentV1
 
-                publication = BriefDocumentV1.from_json(payload)
-            except (KeyError, TypeError, ValueError) as exc:
-                raise PublicationAssemblyError("publication_document_invalid") from exc
-            publications.append(
-                EditionPublicationV1(
-                    position=entry.position, subject_id=entry.subject_id, document=publication
-                )
+                        publication = BriefDocumentV1.from_json(payload)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise PublicationAssemblyError("publication_document_invalid") from exc
+                    publications.append(
+                        EditionPublicationV1(
+                            position=entry.position,
+                            subject_id=entry.subject_id,
+                            document=publication,
+                        )
+                    )
+
+            # Keep the stable projection and routing metadata detached from
+            # the UoW; they are rendering/workspace inputs only.
+            edition_document = EditionDocumentV1(
+                edition=_edition_metadata_projection(edition),
+                publications=tuple(publications),
             )
+            markdown = render_edition_pandoc(edition_document)
+            edition_json = edition_document.to_json()
+            edition_blob_id, edition_hash = await self._artifact_store.put_canonical_json(
+                edition_json, bucket=EDITION_DOCUMENT_BLOB_BUCKET
+            )
+            markdown_bytes = markdown.encode("utf-8")
+            markdown_hash = hashlib.sha256(markdown_bytes).hexdigest()
+            markdown_blob_id = await self._artifact_store.put_text(
+                markdown, bucket=EDITION_MARKDOWN_BLOB_BUCKET
+            )
+            with tempfile.TemporaryDirectory(prefix="autowork-edition-docx-") as directory:
+                docx_path = Path(directory) / "bulletin.docx"
+                export_markdown_docx(markdown, docx_path)
+                docx = docx_path.read_bytes()
+            docx_hash = hashlib.sha256(docx).hexdigest()
+            docx_blob_id = await self._artifact_store.put_bytes(
+                docx,
+                bucket=EDITION_DOCX_BLOB_BUCKET,
+                mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            candidate_release = EditionRelease(
+                edition_id=manifest.edition_id,
+                manifest_id=manifest.id,
+                edition_document_blob_id=edition_blob_id,
+                markdown_blob_id=markdown_blob_id,
+                docx_blob_id=docx_blob_id,
+                edition_document_sha256=edition_hash,
+                markdown_sha256=markdown_hash,
+                docx_sha256=docx_hash,
+            )
+            workspace_payload = (edition_json, markdown, docx)
+            edition_period = edition.period_start
+            edition_country_code = edition.country_code
+        else:
+            candidate_release = None
+            workspace_payload = None
+            edition_period = edition.period_start
+            edition_country_code = edition.country_code
 
+        correlation_id = await context.correlation_id() if context else "-"
+
+        # Phase 2: only short database work occurs while Edition is locked.
         async with self._uow_factory() as uow:
             edition = await uow.editions.get_for_update(manifest.edition_id)
             if edition is None:
                 raise PublicationAssemblyError("edition_not_found")
-            if edition.status not in {EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED}:
-                raise PublicationAssemblyError("edition_must_be_assembling")
             existing = await uow.edition_releases.get_by_manifest(manifest_id)
             if existing is not None:
-                release = await self._finish_existing(uow, existing, manifest)
-                workspace_payload = None
-            else:
-                edition_document = EditionDocumentV1(
-                    edition=edition.snapshot(), publications=tuple(publications)
-                )
-                markdown = render_edition_pandoc(edition_document)
-                edition_json = edition_document.to_json()
-                edition_blob_id, edition_hash = await self._artifact_store.put_canonical_json(
-                    edition_json, bucket=EDITION_DOCUMENT_BLOB_BUCKET
-                )
-                markdown_bytes = markdown.encode("utf-8")
-                markdown_hash = hashlib.sha256(markdown_bytes).hexdigest()
-                markdown_blob_id = await self._artifact_store.put_text(
-                    markdown, bucket=EDITION_MARKDOWN_BLOB_BUCKET
-                )
-                with tempfile.TemporaryDirectory(prefix="autowork-edition-docx-") as directory:
-                    docx_path = Path(directory) / "bulletin.docx"
-                    export_markdown_docx(markdown, docx_path)
-                    docx = docx_path.read_bytes()
-                docx_hash = hashlib.sha256(docx).hexdigest()
-                docx_blob_id = await self._artifact_store.put_bytes(
-                    docx,
-                    bucket=EDITION_DOCX_BLOB_BUCKET,
-                    mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
-                release = EditionRelease(
-                    edition_id=edition.id,
-                    manifest_id=manifest.id,
-                    edition_document_blob_id=edition_blob_id,
-                    markdown_blob_id=markdown_blob_id,
-                    docx_blob_id=docx_blob_id,
-                    edition_document_sha256=edition_hash,
-                    markdown_sha256=markdown_hash,
-                    docx_sha256=docx_hash,
-                )
-                if not await uow.edition_releases.add_if_absent(release):
-                    persisted = await uow.edition_releases.get_by_manifest(manifest.id)
-                    if persisted is None:
-                        raise PublicationAssemblyError("release_idempotency_conflict")
-                    release = persisted
-                workspace_payload = (edition_document.to_json(), markdown, docx)
+                release = existing
                 if edition.status is EditionStatus.ASSEMBLING:
+                    if edition.version != expected_version:
+                        raise PublicationAssemblyError("edition_changed_after_publication_freeze")
                     before = edition.snapshot()
                     edition.transition(EditionStatus.PUBLISHED)
                     if not await uow.editions.update(edition, before["version"]):
@@ -459,18 +577,47 @@ class EditionAssemblyService:
                             action="edition.published",
                             before=before,
                             after=edition.snapshot(),
-                            correlation_id=await context.correlation_id() if context else "-",
+                            correlation_id=correlation_id,
                         )
                     )
+                elif edition.status is not EditionStatus.PUBLISHED:
+                    raise PublicationAssemblyError("edition_must_be_assembling")
+            else:
+                if edition.status is not EditionStatus.ASSEMBLING:
+                    raise PublicationAssemblyError("edition_must_be_assembling")
+                if edition.version != expected_version:
+                    raise PublicationAssemblyError("edition_changed_after_publication_freeze")
+                if candidate_release is None:
+                    raise PublicationAssemblyError("release_candidate_missing")
+                release = candidate_release
+                if not await uow.edition_releases.add_if_absent(release):
+                    persisted = await uow.edition_releases.get_by_manifest(manifest.id)
+                    if persisted is None:
+                        raise PublicationAssemblyError("release_idempotency_conflict")
+                    release = persisted
+                before = edition.snapshot()
+                edition.transition(EditionStatus.PUBLISHED)
+                if not await uow.editions.update(edition, before["version"]):
+                    raise PublicationAssemblyError("edition_changed_during_assembly")
+                await uow.edition_audit.append(
+                    EditionAuditEvent(
+                        edition_id=edition.id,
+                        actor_id="system:publication",
+                        action="edition.published",
+                        before=before,
+                        after=edition.snapshot(),
+                        correlation_id=correlation_id,
+                    )
+                )
             await uow.commit()
 
         if self._workspace_materializer is not None and workspace_payload is not None:
             try:
                 edition_payload, markdown, docx = workspace_payload
                 await self._workspace_materializer.materialize_release(
-                    period=edition.period_start,
-                    country_code=edition.country_code,
-                    edition_id=edition.id,
+                    period=edition_period,
+                    country_code=edition_country_code,
+                    edition_id=manifest.edition_id,
                     manifest=manifest.to_json(),
                     edition=edition_payload,
                     markdown=markdown,
@@ -485,28 +632,6 @@ class EditionAssemblyService:
                 # Publication is already durable; a progress bookkeeping
                 # failure must not turn a successful release into a retry loop.
                 logger.exception("Unable to report publication assembly progress")
-        return release
-
-    async def _finish_existing(
-        self, uow: Any, release: EditionRelease, manifest: PublicationManifestV1
-    ) -> EditionRelease:
-        edition = await uow.editions.get_for_update(manifest.edition_id)
-        if edition is not None and edition.status is EditionStatus.ASSEMBLING:
-            before = edition.snapshot()
-            edition.transition(EditionStatus.PUBLISHED)
-            if not await uow.editions.update(edition, before["version"]):
-                raise PublicationAssemblyError("edition_changed_during_assembly")
-            await uow.edition_audit.append(
-                EditionAuditEvent(
-                    edition_id=edition.id,
-                    actor_id="system:publication",
-                    action="edition.published",
-                    before=before,
-                    after=edition.snapshot(),
-                    correlation_id="-",
-                )
-            )
-            await uow.commit()
         return release
 
 
@@ -547,6 +672,16 @@ async def _get_run_for_update(uow: Any, run_id: UUID) -> Any:
     repository = uow.subject_production_runs
     getter = getattr(repository, "get_for_update", None)
     return await getter(run_id) if getter is not None else await repository.get(run_id)
+
+
+def _latest_assembly_job(jobs: Any, manifest_id: UUID) -> Job | None:
+    matching = [
+        job
+        for job in jobs
+        if job.kind == EDITION_ASSEMBLE_JOB_KIND
+        and str(job.input_parameters.get("manifest_id")) == str(manifest_id)
+    ]
+    return max(matching, key=lambda job: (job.created_at, str(job.id)), default=None)
 
 
 __all__ = [

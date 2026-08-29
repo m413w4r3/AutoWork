@@ -1,4 +1,4 @@
-import { ApiError } from "./editions";
+import { ApiError, type EditionStatus } from "./editions";
 
 export type PublicationDecision = "include" | "exclude";
 
@@ -13,6 +13,37 @@ export type ReviewRetryStage =
   | "analyst_research"
   | "analyst_note"
   | "assembly";
+
+export type AssemblyJobStatus =
+  "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+export interface PublicationAcceptResponse {
+  edition_id: string;
+  edition_status: EditionStatus;
+  manifest_id: string;
+  manifest_sha256: string;
+  edition_version: number;
+  batch_id: string;
+  job_id: string | null;
+  job_dispatched: boolean;
+}
+
+export interface EditionReleaseResponse {
+  edition_id: string;
+  edition_status: EditionStatus;
+  manifest_id: string | null;
+  manifest_sha256: string | null;
+  release_id: string | null;
+  json_available: boolean;
+  markdown_available: boolean;
+  docx_available: boolean;
+  published_at: string | null;
+  assembly_job_id: string | null;
+  assembly_status: AssemblyJobStatus | null;
+  assembly_error_code: string | null;
+  assembly_error_message: string | null;
+  can_retry_assembly: boolean;
+}
 
 export interface ReviewItem {
   position: number;
@@ -89,6 +120,27 @@ export async function getEditionReview(
   editionId: string,
 ): Promise<EditionReview> {
   return request(`/api/editions/${editionId}/review`);
+}
+
+export function acceptEditionPublication(
+  editionId: string,
+): Promise<PublicationAcceptResponse> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/publication/accept`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function getEditionRelease(
+  editionId: string,
+): Promise<EditionReleaseResponse> {
+  return request(`/api/editions/${encodeURIComponent(editionId)}/release`);
+}
+
+export function editionDocxUrl(editionId: string): string {
+  return `/api/editions/${encodeURIComponent(editionId)}/release/docx`;
 }
 
 export async function includeReviewItem(

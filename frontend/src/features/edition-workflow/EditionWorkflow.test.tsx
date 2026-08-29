@@ -117,6 +117,23 @@ const review = {
   can_accept: true,
 };
 
+const release = {
+  edition_id: edition.id,
+  edition_status: "assembling" as const,
+  manifest_id: "manifest-1",
+  manifest_sha256: "a".repeat(64),
+  release_id: null,
+  json_available: false,
+  markdown_available: false,
+  docx_available: false,
+  published_at: null,
+  assembly_job_id: "job-assembly",
+  assembly_status: "queued" as const,
+  assembly_error_code: null,
+  assembly_error_message: null,
+  can_retry_assembly: false,
+};
+
 const emptyDiscovery = {
   batches: [],
   candidates: [],
@@ -330,31 +347,45 @@ describe("rendu strict des états Edition", () => {
     expect(screen.getByText("1 inclus")).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Accepter la production" }),
-    ).toBeDisabled();
+    ).toBeEnabled();
     expect(screen.queryByText("Sujets candidats")).not.toBeInTheDocument();
     expect(screen.queryByText("Campagne A")).not.toBeInTheDocument();
   });
 
-  it("ASSEMBLING affiche son placeholder sans action métier", () => {
+  it("ASSEMBLING charge le release et affiche l’état d’assemblage", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(release)));
     renderWorkflow(editionWith("assembling"));
     expect(
-      screen.getByRole("heading", { name: "Publication en cours" }),
+      await screen.findByRole("heading", { name: "Manifest figé" }),
     ).toBeInTheDocument();
+    expect(screen.getByText("Assemblage du bulletin")).toBeInTheDocument();
+    expect(screen.getByText("En attente")).toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
-  it("PUBLISHED affiche son placeholder sans action métier", () => {
+  it("PUBLISHED affiche son état sans action si le DOCX n’est pas disponible", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...release,
+          edition_status: "published",
+          assembly_status: "succeeded",
+        }),
+      ),
+    );
     renderWorkflow(editionWith("published"));
     expect(
-      screen.getByRole("heading", { name: "Publication" }),
+      await screen.findByRole("heading", { name: "Bulletin publié" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
-  it("ARCHIVED affiche son placeholder sans action métier", () => {
+  it("ARCHIVED affiche son état en lecture seule", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(release)));
     renderWorkflow(editionWith("archived"));
     expect(
-      screen.getByRole("heading", { name: "Édition archivée" }),
+      await screen.findByRole("heading", { name: "Édition archivée" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });

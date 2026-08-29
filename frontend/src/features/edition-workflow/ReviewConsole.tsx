@@ -1,14 +1,40 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { getEditionReview } from "../../api/publication";
+import {
+  acceptEditionPublication,
+  getEditionReview,
+} from "../../api/publication";
+import { ApiError } from "../../api/editions";
 import { ReviewItemCard } from "./ReviewItemCard";
 import { reviewPollingInterval } from "./reviewPolling";
 
 export function ReviewConsole({ editionId }: { editionId: string }) {
+  const queryClient = useQueryClient();
   const review = useQuery({
     queryKey: ["edition-review", editionId],
     queryFn: () => getEditionReview(editionId),
     refetchInterval: (query) => reviewPollingInterval(query.state.data),
+  });
+  const accept = useMutation({
+    mutationFn: () => acceptEditionPublication(editionId),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: ["edition-release", editionId],
+      });
+      void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
+      void queryClient.invalidateQueries({ queryKey: ["editions"] });
+    },
+    onError: (error) => {
+      if (
+        error instanceof ApiError &&
+        error.code === "review_cannot_be_accepted"
+      ) {
+        void queryClient.invalidateQueries({
+          queryKey: ["edition-review", editionId],
+        });
+      }
+    },
   });
 
   if (review.isPending) return <p role="status">Chargement de la revue…</p>;
@@ -73,8 +99,23 @@ export function ReviewConsole({ editionId }: { editionId: string }) {
               : "Résolvez ou excluez les articles bloquants."}
           </p>
         </div>
-        <button className="button" type="button" disabled>
-          Accepter la production
+        {accept.error ? (
+          <p className="error-message" role="alert">
+            {accept.error instanceof ApiError &&
+            accept.error.code === "review_cannot_be_accepted"
+              ? "La revue ne peut plus être acceptée. Rechargez la revue."
+              : accept.error instanceof Error
+                ? accept.error.message
+                : "La publication n’a pas pu être acceptée."}
+          </p>
+        ) : null}
+        <button
+          className="button"
+          type="button"
+          disabled={!currentReview.can_accept || accept.isPending}
+          onClick={() => accept.mutate()}
+        >
+          {accept.isPending ? "Acceptation…" : "Accepter la production"}
         </button>
       </section>
     </section>

@@ -31,6 +31,7 @@ from cti_app.application.production_state import (
 )
 from cti_app.application.subject_production import (
     EditionProductionService,
+    ProductionRunNotFoundError,
     SubjectProductionService,
 )
 from cti_app.config import get_settings
@@ -341,28 +342,22 @@ async def _retry_production_run(
     """Retry exactly one persisted production run and enqueue its stage."""
     uow_factory, jobs, dispatcher = _runtime(request)
 
-    async with uow_factory() as uow:
-        current = await uow.subject_production_runs.get(run_id)
-        if not current:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No production run found for run {run_id}",
-            )
-        if current.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "retry_not_allowed_while_running"},
-            )
-
     service = SubjectProductionService(uow_factory)
     try:
-        old_generation = current.pipeline_generation
-        run, staled = await service.retry_from_stage(run_id, payload.stage)
+        retry = await service.retry_from_stage(run_id, payload.stage)
+    except ProductionRunNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No production run found for run {run_id}",
+        ) from e
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": str(e)},
         ) from e
+    run = retry.run
+    old_generation = retry.old_generation
+    staled = retry.staled_artifacts
 
     parameters = ProductionStageParameters(
         run_id=run.id,
@@ -392,8 +387,8 @@ async def _retry_production_run(
             stage=payload.stage.value,
             correlation_id=get_correlation_id(),
             requested_stage=payload.stage.value,
-            previous_status=current.status.value,
-            previous_stage=current.current_stage.value,
+            previous_status=retry.previous_status.value,
+            previous_stage=retry.previous_stage.value,
             old_generation=old_generation,
             new_generation=run.pipeline_generation,
             staled_artifacts=staled,

@@ -96,6 +96,57 @@ async def test_generic_transition_allows_normal_transition() -> None:
     assert [event.action for event in factory.events] == ["edition.transitioned"]
 
 
+@pytest.mark.parametrize(
+    "status",
+    (EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED, EditionStatus.ARCHIVED),
+)
+async def test_metadata_update_is_rejected_after_publication_freeze(
+    status: EditionStatus,
+) -> None:
+    factory = InMemoryEditionUnitOfWorkFactory()
+    edition = Edition(
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        tlp=TLP.GREEN,
+        languages=("fr",),
+        target_major_articles=0,
+        target_briefs=1,
+        source_profile="default",
+        status=status,
+    )
+    factory.state[edition.id] = edition
+    application = FastAPI()
+    application.include_router(router)
+    application.state.edition_service = EditionService(factory)
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.put(
+            f"/api/editions/{edition.id}",
+            json={
+                "country": "France",
+                "country_code": "FR",
+                "period_start": "2026-07-01",
+                "period_end": "2026-07-31",
+                "tlp": "GREEN",
+                "languages": ["fr"],
+                "target_major_articles": 0,
+                "target_briefs": 2,
+                "previous_edition_id": None,
+                "source_profile": "default",
+                "version": 1,
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "invalid_edition_action"
+    assert factory.state[edition.id].target_briefs == 1
+
+
 async def test_create_read_update_transition_and_filter_scenario() -> None:
     factory = InMemoryEditionUnitOfWorkFactory()
     application = FastAPI()

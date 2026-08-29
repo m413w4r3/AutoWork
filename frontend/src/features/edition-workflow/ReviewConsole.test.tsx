@@ -399,6 +399,56 @@ describe("ReviewConsole", () => {
     ).toBeDisabled();
   });
 
+  it("active Accept sans body métier et invalide la publication et l’édition", async () => {
+    const { client, fetchMock } = renderReview(makeReview());
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Accepter la production" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([, init]) => init?.method === "POST"),
+      ).toBe(true),
+    );
+    const [url, init] = postCall(fetchMock);
+    expect(url).toBe("/api/editions/edition-1/publication/accept");
+    expect(init.body).toBeUndefined();
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["edition-release", EDITION_ID],
+    });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["edition", EDITION_ID],
+    });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["editions"] });
+  });
+
+  it("recharge la revue quand le backend refuse l’acceptation", async () => {
+    const { client } = renderReview(makeReview(), () =>
+      Response.json(
+        { detail: { code: "review_cannot_be_accepted" } },
+        { status: 409 },
+      ),
+    );
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Accepter la production" }),
+    );
+
+    expect(
+      await screen.findByText(
+        "La revue ne peut plus être acceptée. Rechargez la revue.",
+      ),
+    ).toBeInTheDocument();
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["edition-review", EDITION_ID],
+    });
+  });
+
   it("ne demande aucun artifact lourd depuis la revue", async () => {
     const { fetchMock } = renderReview(makeReview());
     await screen.findByText("Article de test");

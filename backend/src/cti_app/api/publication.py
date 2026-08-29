@@ -25,6 +25,7 @@ from cti_app.application.edition_review import (
     ReviewItemStaleError,
 )
 from cti_app.application.identity import IdentityProvider
+from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import SubjectProductionStage, SubjectProductionStatus
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
 from cti_app.logging import get_correlation_id
@@ -130,6 +131,11 @@ class EditionReleaseView(BaseModel):
     markdown_available: bool
     docx_available: bool
     published_at: str | None
+    assembly_job_id: UUID | None
+    assembly_status: JobStatus | None
+    assembly_error_code: str | None
+    assembly_error_message: str | None
+    can_retry_assembly: bool
 
 
 def _service(request: Request) -> EditionReviewService:
@@ -331,6 +337,11 @@ def _release_view(release: EditionReleaseStatus) -> EditionReleaseView:
         markdown_available=release.markdown_available,
         docx_available=release.docx_available,
         published_at=release.published_at.isoformat() if release.published_at else None,
+        assembly_job_id=release.assembly_job_id,
+        assembly_status=release.assembly_status,
+        assembly_error_code=release.assembly_error_code,
+        assembly_error_message=release.assembly_error_message,
+        can_retry_assembly=release.can_retry_assembly,
     )
 
 

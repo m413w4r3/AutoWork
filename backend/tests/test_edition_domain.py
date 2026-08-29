@@ -3,7 +3,12 @@ from datetime import date
 import pytest
 
 from cti_app.domain.classification import TLP
-from cti_app.domain.editions import Edition, EditionStatus, InvalidEditionTransitionError
+from cti_app.domain.editions import (
+    Edition,
+    EditionImmutableError,
+    EditionStatus,
+    InvalidEditionTransitionError,
+)
 
 
 def make_edition() -> Edition:
@@ -45,3 +50,46 @@ def test_state_machine_exposes_only_valid_actions() -> None:
     assert edition.progress_percent == 15
     with pytest.raises(InvalidEditionTransitionError):
         edition.transition(EditionStatus.PUBLISHED)
+
+
+@pytest.mark.parametrize(
+    "status",
+    (EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED, EditionStatus.ARCHIVED),
+)
+def test_frozen_editions_reject_metadata_updates(status: EditionStatus) -> None:
+    edition = make_edition()
+    edition.status = status
+
+    with pytest.raises(EditionImmutableError):
+        edition.update_metadata(
+            country="Iran",
+            country_code="IR",
+            period_start=date(2026, 7, 1),
+            period_end=date(2026, 7, 31),
+            tlp=TLP.AMBER,
+            languages=("fr", "en", "fa"),
+            target_major_articles=3,
+            target_briefs=7,
+            previous_edition_id=None,
+            source_profile="iran-default",
+        )
+
+
+def test_review_editions_allow_metadata_updates() -> None:
+    edition = make_edition()
+    edition.status = EditionStatus.REVIEW
+
+    edition.update_metadata(
+        country="Iran",
+        country_code="IR",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        tlp=TLP.AMBER,
+        languages=("fr", "en", "fa"),
+        target_major_articles=3,
+        target_briefs=7,
+        previous_edition_id=None,
+        source_profile="iran-default",
+    )
+
+    assert edition.target_briefs == 7

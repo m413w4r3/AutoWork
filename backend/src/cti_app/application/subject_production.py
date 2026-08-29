@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -35,6 +36,24 @@ _SOURCE_ROLE_ORDER = {
     "social": 4,
     "unknown": 9,
 }
+
+
+class ProductionRunNotFoundError(LookupError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectProductionRetryResult:
+    run: SubjectProductionRun
+    staled_artifacts: list[str]
+    previous_status: SubjectProductionStatus
+    previous_stage: SubjectProductionStage
+    old_generation: int
+
+    def __iter__(self) -> Iterator[SubjectProductionRun | list[str]]:
+        """Keep the former ``run, staled`` unpacking contract for callers."""
+        yield self.run
+        yield self.staled_artifacts
 
 
 async def capture_production_input_snapshot(
@@ -272,22 +291,67 @@ class SubjectProductionService:
 
     async def retry_from_stage(
         self, run_id: UUID, stage: SubjectProductionStage
-    ) -> tuple[SubjectProductionRun, list[str]]:
+    ) -> SubjectProductionRetryResult:
         async with self._uow_factory() as uow:
-            run, staled = await self._retry_from_stage_in_uow(uow, run_id, stage)
+            # A user retry must acquire locks in the same order as publication
+            # freeze: Edition first, then SubjectProductionRun.  The initial
+            # read only discovers the edition that owns the run.
+            initial_run = await uow.subject_production_runs.get(run_id)
+            if not initial_run:
+                raise ProductionRunNotFoundError(str(run_id))
+
+            editions = getattr(uow, "editions", None)
+            if editions is not None:
+                get_edition_for_update = getattr(editions, "get_for_update", None)
+                edition = (
+                    await get_edition_for_update(initial_run.edition_id)
+                    if get_edition_for_update is not None
+                    else await editions.get(initial_run.edition_id)
+                )
+                if edition is None:
+                    raise ValueError("edition_not_found")
+                if edition.status not in {EditionStatus.PRODUCTION, EditionStatus.REVIEW}:
+                    raise ValueError("edition_frozen_for_publication")
+
+                # A manifest is immutable evidence of a freeze.  Keep this
+                # check under the Edition lock so a retry cannot race with the
+                # transaction that creates the manifest.
+                manifests = getattr(uow, "publication_manifests", None)
+                if (
+                    manifests is not None
+                    and await manifests.get_latest_for_edition(initial_run.edition_id) is not None
+                ):
+                    raise ValueError("edition_frozen_for_publication")
+
+                result = await self._retry_from_stage_in_uow(
+                    uow,
+                    run_id,
+                    stage,
+                    expected_edition_id=initial_run.edition_id,
+                )
+            else:
+                # Lightweight non-database callers predating the Edition port
+                # still use the shared transaction core.  The real production
+                # UoW always exposes ``editions`` and therefore takes the
+                # protected path above.
+                result = await self._retry_from_stage_in_uow(uow, run_id, stage)
             await uow.commit()
-            return run, staled
+            return result
 
     async def _retry_from_stage_in_uow(
         self,
         uow: ProductionUnitOfWork,
         run_id: UUID,
         stage: SubjectProductionStage,
-    ) -> tuple[SubjectProductionRun, list[str]]:
+        *,
+        expected_edition_id: UUID | None = None,
+    ) -> SubjectProductionRetryResult:
         """Shared transaction core for manual and automatic business retries."""
         run = await uow.subject_production_runs.get_for_update(run_id)
         if not run:
-            raise ValueError(f"Production run {run_id} not found")
+            raise ProductionRunNotFoundError(str(run_id))
+        if expected_edition_id is not None and run.edition_id != expected_edition_id:
+            raise ValueError("production_run_edition_changed")
 
         if run.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
             raise ValueError("retry_not_allowed_while_running")
@@ -313,6 +377,9 @@ class SubjectProductionService:
             if artifact is None:
                 raise ValueError("retry_prerequisite_missing")
 
+        previous_status = run.status
+        previous_stage = run.current_stage
+        old_generation = run.pipeline_generation
         run.retry_from_stage(stage, now=datetime.now(UTC))
         artifacts = getattr(uow, "production_artifacts", None)
         staled = (
@@ -322,7 +389,13 @@ class SubjectProductionService:
         )
 
         await uow.subject_production_runs.save(run)
-        return run, staled
+        return SubjectProductionRetryResult(
+            run=run,
+            staled_artifacts=staled,
+            previous_status=previous_status,
+            previous_stage=previous_stage,
+            old_generation=old_generation,
+        )
 
 
 _TERMINAL_STATUSES = {
@@ -584,7 +657,7 @@ class EditionProductionService:
             if run is None or not ProductionRecoveryPolicyV1.eligible(item, run):
                 continue
             try:
-                retried, _ = await SubjectProductionService(
+                retried = await SubjectProductionService(
                     self._uow_factory
                 )._retry_from_stage_in_uow(uow, run.id, run.current_stage)
             except ValueError as exc:
@@ -604,7 +677,7 @@ class EditionProductionService:
                 datetime.now(UTC) + timedelta(milliseconds=self._pacing.subject_delay_ms())
             )
             await uow.edition_production_batches.save(batch)
-            return retried
+            return retried.run
         return None
 
     async def _finish_batch_in_uow(

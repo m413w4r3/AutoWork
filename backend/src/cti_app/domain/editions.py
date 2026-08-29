@@ -113,8 +113,14 @@ class Edition:
         source_profile: str,
         now: datetime | None = None,
     ) -> None:
-        if self.status in {EditionStatus.PUBLISHED, EditionStatus.ARCHIVED}:
-            raise EditionImmutableError("Published or archived editions cannot be modified")
+        if self.status in {
+            EditionStatus.ASSEMBLING,
+            EditionStatus.PUBLISHED,
+            EditionStatus.ARCHIVED,
+        }:
+            raise EditionImmutableError(
+                "Assembling, published or archived editions cannot be modified"
+            )
         ensure_tlp_not_downgraded(self.tlp, tlp)
         self.country = country.strip()
         self.country_code = country_code.strip().upper()

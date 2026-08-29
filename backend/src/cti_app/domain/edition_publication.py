@@ -129,8 +129,10 @@ class PublicationManifestV1:
         object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
 
         entries = tuple(sorted(self.entries, key=lambda item: item.position))
-        if tuple(item.position for item in entries) != tuple(range(1, len(entries) + 1)):
-            raise ValueError("manifest entry positions must be unique and contiguous")
+        if any(item.position < 1 for item in entries):
+            raise ValueError("manifest entry positions must be positive")
+        if len({item.position for item in entries}) != len(entries):
+            raise ValueError("manifest entry positions must be unique")
         if len({item.subject_id for item in entries}) != len(entries):
             raise ValueError("manifest entries must contain unique subjects")
         exclusions = tuple(sorted(self.exclusions, key=lambda item: str(item.subject_id)))
@@ -255,8 +257,10 @@ class EditionDocumentV1:
         if self.schema_version != EDITION_DOCUMENT_SCHEMA_VERSION:
             raise ValueError(f"unsupported edition document schema: {self.schema_version}")
         publications = tuple(sorted(self.publications, key=lambda item: item.position))
-        if tuple(item.position for item in publications) != tuple(range(1, len(publications) + 1)):
-            raise ValueError("edition publication positions must be unique and contiguous")
+        if any(item.position < 1 for item in publications):
+            raise ValueError("edition publication positions must be positive")
+        if len({item.position for item in publications}) != len(publications):
+            raise ValueError("edition publication positions must be unique")
         object.__setattr__(self, "publications", publications)
 
     @property
