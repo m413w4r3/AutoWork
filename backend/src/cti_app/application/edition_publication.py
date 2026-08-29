@@ -27,9 +27,7 @@ from cti_app.application.pandoc_rendering import render_edition_pandoc
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.edition_publication import (
-    EditionDocumentV1,
     EditionDocumentV2,
-    EditionPublicationV1,
     EditionPublicationV2,
     EditionRelease,
     PublicationManifestEntryV1,
@@ -40,7 +38,6 @@ from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.jobs import InvalidJobTransitionError, Job, JobStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 from cti_app.domain.publication import (
-    BriefDocumentV1,
     PublicationDocumentV2,
     publication_document_from_json,
 )
@@ -479,7 +476,6 @@ class EditionAssemblyService:
             if blob_manifest != manifest:
                 raise PublicationAssemblyError("manifest_blob_mismatch")
 
-            legacy_publications: list[EditionPublicationV1] = []
             current_publications: list[EditionPublicationV2] = []
             async with self._uow_factory() as uow:
                 for entry in manifest.entries:
@@ -496,11 +492,7 @@ class EditionAssemblyService:
                         or artifact.id != entry.document_artifact_id
                         or artifact.version != entry.document_artifact_version
                         or artifact.input_hash != entry.document_input_hash
-                        or artifact.stage
-                        not in {
-                            ProductionArtifactStage.PUBLICATION,
-                            ProductionArtifactStage.BRIEF,
-                        }
+                        or artifact.stage is not ProductionArtifactStage.PUBLICATION
                         or artifact.status is not ProductionArtifactStatus.VERIFIED
                         or artifact.canonical_blob_id is None
                     ):
@@ -510,41 +502,22 @@ class EditionAssemblyService:
                         publication = publication_document_from_json(payload)
                     except (KeyError, TypeError, ValueError) as exc:
                         raise PublicationAssemblyError("publication_document_invalid") from exc
-                    if artifact.stage is ProductionArtifactStage.PUBLICATION:
-                        if not isinstance(publication, PublicationDocumentV2):
-                            raise PublicationAssemblyError("publication_document_schema_mismatch")
-                        current_publications.append(
-                            EditionPublicationV2(
-                                position=entry.position,
-                                subject_id=entry.subject_id,
-                                document=publication,
-                            )
+                    if not isinstance(publication, PublicationDocumentV2):
+                        raise PublicationAssemblyError("publication_document_schema_mismatch")
+                    current_publications.append(
+                        EditionPublicationV2(
+                            position=entry.position,
+                            subject_id=entry.subject_id,
+                            document=publication,
                         )
-                    else:
-                        if not isinstance(publication, BriefDocumentV1):
-                            raise PublicationAssemblyError("publication_document_schema_mismatch")
-                        legacy_publications.append(
-                            EditionPublicationV1(
-                                position=entry.position,
-                                subject_id=entry.subject_id,
-                                document=publication,
-                            )
-                        )
+                    )
 
             # Keep the stable projection and routing metadata detached from
             # the UoW; they are rendering/workspace inputs only.
-            if current_publications and legacy_publications:
-                raise PublicationAssemblyError("manifest_contains_mixed_document_schemas")
-            if current_publications:
-                edition_document: EditionDocumentV1 | EditionDocumentV2 = EditionDocumentV2(
-                    edition=_edition_metadata_projection(edition),
-                    publications=tuple(current_publications),
-                )
-            else:
-                edition_document = EditionDocumentV1(
-                    edition=_edition_metadata_projection(edition),
-                    publications=tuple(legacy_publications),
-                )
+            edition_document = EditionDocumentV2(
+                edition=_edition_metadata_projection(edition),
+                publications=tuple(current_publications),
+            )
             markdown = render_edition_pandoc(edition_document)
             edition_json = edition_document.to_json()
             edition_blob_id, edition_hash = await self._artifact_store.put_canonical_json(

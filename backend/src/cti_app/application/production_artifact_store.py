@@ -18,7 +18,7 @@ from uuid import UUID
 
 from cti_app.application.blobs import BlobCatalogService
 
-# Production payloads are text; a brief or a reference report never approaches
+# Production payloads are text; a publication or a reference report never approaches
 # this, so it is a guard against reading a corrupted blob into memory.
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 

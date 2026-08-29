@@ -42,7 +42,7 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
-from cti_app.domain.publication import BriefDocumentV1, PublicationDocumentV2
+from cti_app.domain.publication import PublicationDocumentV2
 from cti_app.domain.publication_review import PublicationDecision
 
 EDITION_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -90,14 +90,12 @@ def _artifact(
     run_id: UUID,
     subject_id: UUID,
     blob_id: UUID,
-    *,
-    legacy: bool = False,
 ) -> ProductionArtifact:
     return ProductionArtifact(
         id=artifact_id,
         production_run_id=run_id,
         subject_id=subject_id,
-        stage=ProductionArtifactStage.BRIEF if legacy else ProductionArtifactStage.PUBLICATION,
+        stage=ProductionArtifactStage.PUBLICATION,
         version=1,
         input_hash="a" * 64,
         status=ProductionArtifactStatus.VERIFIED,
@@ -105,10 +103,9 @@ def _artifact(
     )
 
 
-def _document(title: str, *, legacy: bool = False) -> BriefDocumentV1 | PublicationDocumentV2:
-    document_type = BriefDocumentV1 if legacy else PublicationDocumentV2
-    return document_type(
-        schema_version="1" if legacy else "2",
+def _document(title: str) -> PublicationDocumentV2:
+    return PublicationDocumentV2(
+        schema_version="2",
         title=title,
         timeline=(),
         synthesis=(),
@@ -269,15 +266,13 @@ class _Uow:
         edition: Edition,
         rows: list[EditionReviewReadItem],
         blobs: _BlobStore,
-        *,
-        legacy: bool = False,
     ) -> None:
         blob_a = uuid4()
         blob_b = uuid4()
         blob_c = uuid4()
-        blobs.blobs[blob_a] = json.dumps(_document("Alpha", legacy=legacy).to_json()).encode()
-        blobs.blobs[blob_b] = json.dumps(_document("Bravo", legacy=legacy).to_json()).encode()
-        blobs.blobs[blob_c] = json.dumps(_document("Charlie", legacy=legacy).to_json()).encode()
+        blobs.blobs[blob_a] = json.dumps(_document("Alpha").to_json()).encode()
+        blobs.blobs[blob_b] = json.dumps(_document("Bravo").to_json()).encode()
+        blobs.blobs[blob_c] = json.dumps(_document("Charlie").to_json()).encode()
         self.editions = _Editions(edition)
         self.edition_production_batches = type(
             "Batches", (), {"get_latest_for_edition": self._get_batch}
@@ -296,9 +291,9 @@ class _Uow:
         )
         self.production_artifacts = _Artifacts(
             {
-                ARTIFACT_A: _artifact(ARTIFACT_A, RUN_A, SUBJECT_A, blob_a, legacy=legacy),
-                ARTIFACT_B: _artifact(ARTIFACT_B, RUN_B, SUBJECT_B, blob_b, legacy=legacy),
-                ARTIFACT_C: _artifact(ARTIFACT_C, RUN_C, SUBJECT_C, blob_c, legacy=legacy),
+                ARTIFACT_A: _artifact(ARTIFACT_A, RUN_A, SUBJECT_A, blob_a),
+                ARTIFACT_B: _artifact(ARTIFACT_B, RUN_B, SUBJECT_B, blob_b),
+                ARTIFACT_C: _artifact(ARTIFACT_C, RUN_C, SUBJECT_C, blob_c),
             }
         )
         self.edition_review_read_model = _ReadModel(rows)
@@ -592,23 +587,6 @@ def test_manifest_and_edition_document_allow_multiple_editorial_gaps() -> None:
         ),
     )
     assert [publication.position for publication in document.ordered_publications] == [2, 4, 7]
-
-
-@pytest.mark.asyncio
-async def test_historical_brief_manifest_still_assembles_as_v1() -> None:
-    blobs = _BlobStore()
-    uow = _Uow(_edition(), [], blobs, legacy=True)
-    manifest = _job_manifest()
-    manifest_blob_id, _ = await blobs.put_canonical_json(manifest.to_json(), bucket="manifests")
-    await uow.publication_manifests.add(manifest, manifest_blob_id)
-    uow.editions.edition.transition(EditionStatus.ASSEMBLING)
-
-    assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
-    release = await assembly.assemble(manifest.id)
-
-    edition_document = await blobs.read_json(release.edition_document_blob_id)
-    assert edition_document["schema_version"] == "1"
-    assert edition_document["publications"][0]["document"]["schema_version"] == "1"
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
-from hashlib import sha256
 from typing import Any, cast
 from uuid import UUID
 
@@ -37,9 +36,8 @@ from cti_app.application.subject_production import (
 )
 from cti_app.domain.editorial import EditorialGroup, EditorialGroupStatus
 from cti_app.domain.production import (
-    ProductionArtifact,
     ProductionArtifactStage,
-    ProductionArtifactStatus,
+    ProductionBatchStatus,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -113,7 +111,7 @@ class BatchItemDetail(BaseModel):
 class BatchStatus(BaseModel):
     batch_id: str
     edition_id: str
-    status: str
+    status: ProductionBatchStatus
     items: int
     completed: int
     needs_review: int
@@ -207,16 +205,6 @@ def _collect_warnings(artifacts: Sequence[Any]) -> list[str]:
     return out
 
 
-def _public_production_stage(stage: SubjectProductionStage) -> SubjectProductionStage:
-    """Hide historical analyst checkpoints from the current read model."""
-    if stage in {
-        SubjectProductionStage.ANALYST_RESEARCH,
-        SubjectProductionStage.ANALYST_NOTE,
-    }:
-        return SubjectProductionStage.ASSEMBLY
-    return stage
-
-
 def _run_view(
     run: SubjectProductionRun, edition_id: UUID, *, job_id: UUID | None
 ) -> dict[str, Any]:
@@ -225,7 +213,7 @@ def _run_view(
         "subject_id": str(run.subject_id),
         "edition_id": str(edition_id),
         "status": run.status.value,
-        "stage": _public_production_stage(run.current_stage).value,
+        "stage": run.current_stage.value,
         "job_id": str(job_id) if job_id else None,
         "created_at": run.created_at.isoformat(),
         "error_code": run.error_code,
@@ -256,7 +244,7 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
                 title=item.title,
                 run_id=str(item.run_id),
                 status=item.status,
-                current_stage=_public_production_stage(item.current_stage),
+                current_stage=item.current_stage,
                 pipeline_generation=item.pipeline_generation,
                 auto_recovery_count=item.auto_recovery_count,
                 error_code=item.error_code,
@@ -534,7 +522,7 @@ async def get_subject_production(
                 else str(run.subject_id)
             ),
             status=run.status.value,
-            current_stage=_public_production_stage(run.current_stage).value,
+            current_stage=run.current_stage.value,
             progress_current=completed_stages,
             progress_total=len(stages),
             references_conversation_id=(
@@ -729,94 +717,6 @@ async def get_run_publication_artifact(run_id: UUID, request: Request) -> dict[s
     return await _artifact_view_for_run(request, run_id, ProductionArtifactStage.PUBLICATION.value)
 
 
-class SaveBriefDraftRequest(BaseModel):
-    content: str
-
-
-@router.post("/subjects/{subject_id}/production/brief/draft")
-async def save_brief_draft(
-    subject_id: UUID,
-    request: Request,
-    body: SaveBriefDraftRequest,
-) -> dict[str, Any]:
-    uow_factory, _, _ = _runtime(request)
-
-    async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
-        if not run:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No production run found for subject {subject_id}",
-            )
-
-        # Artifacts are append-only: each saved draft creates a new version.
-        # Not get_current: a synthesis retry stales every prior brief
-        # artifact, and get_current excludes STALE rows — numbering off it
-        # would restart at 1 and collide with (production_run_id, stage,
-        # version) uniqueness against the original brief.
-        current = await uow.production_artifacts.get_current(run.id, "brief")
-        all_briefs = [
-            artifact
-            for artifact in await uow.production_artifacts.list_for_run(run.id)
-            if artifact.stage is ProductionArtifactStage.BRIEF
-        ]
-        latest = max(all_briefs, key=lambda artifact: artifact.version, default=None)
-        saved_at = datetime.now(UTC).isoformat()
-        draft_version = int(current.metadata.get("draft_version", 0)) + 1 if current else 1
-        artifact = ProductionArtifact(
-            production_run_id=run.id,
-            subject_id=subject_id,
-            stage=ProductionArtifactStage.BRIEF,
-            version=latest.version + 1 if latest else 1,
-            input_hash=sha256(body.content.encode("utf-8")).hexdigest(),
-            status=ProductionArtifactStatus.NEEDS_REVIEW,
-            metadata={
-                "draft_content": body.content,
-                "saved_at": saved_at,
-                "draft_version": draft_version,
-            },
-        )
-        await uow.production_artifacts.append(artifact)
-
-        await uow.commit()
-
-        return {
-            "action": "save_brief_draft",
-            "artifact_id": str(artifact.id),
-            "run_id": str(run.id),
-            "saved_at": artifact.metadata.get("saved_at"),
-            "draft_version": artifact.metadata.get("draft_version", 1),
-        }
-
-
-@router.get("/subjects/{subject_id}/production/brief/draft")
-async def get_brief_draft(subject_id: UUID, request: Request) -> dict[str, Any]:
-    uow_factory, _, _ = _runtime(request)
-
-    async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
-        if not run:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No production run found for subject {subject_id}",
-            )
-
-        artifact = await uow.production_artifacts.get_current(run.id, "brief")
-        if not artifact or "draft_content" not in artifact.metadata:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No brief draft found",
-            )
-
-        return {
-            "artifact_id": str(artifact.id),
-            "run_id": str(run.id),
-            "content": artifact.metadata.get("draft_content"),
-            "saved_at": artifact.metadata.get("saved_at"),
-            "draft_version": artifact.metadata.get("draft_version", 1),
-        }
-
-
 @router.post("/editions/{edition_id}/production")
 async def start_edition_production(
     edition_id: UUID,
@@ -960,5 +860,5 @@ async def cancel_edition_batch(
     return {
         "action": "cancel",
         "batch_id": str(batch.id),
-        "status": batch.status,
+        "status": batch.status.value,
     }

@@ -7,7 +7,6 @@ from uuid import UUID
 
 from cti_app.application.persistence import UnitOfWork
 from cti_app.domain.blobs import BlobRecord
-from cti_app.domain.briefs import BriefDraft, BriefEvidencePack
 from cti_app.domain.collection import (
     Claim,
     CollectionAttempt,
@@ -214,59 +213,6 @@ class InMemoryRejectedProposalRepository:
         self._proposals.extend(deepcopy(list(proposals)))
 
 
-class InMemoryBriefPackRepository:
-    def __init__(self, packs: dict[UUID, BriefEvidencePack]) -> None:
-        self._packs = packs
-
-    async def append(self, pack: BriefEvidencePack) -> None:
-        self._packs[pack.id] = deepcopy(pack)
-
-    async def get(self, pack_id: UUID) -> BriefEvidencePack | None:
-        return deepcopy(self._packs.get(pack_id))
-
-    async def get_current(self, subject_id: UUID) -> BriefEvidencePack | None:
-        values = [item for item in self._packs.values() if item.subject_id == subject_id]
-        return deepcopy(max(values, key=lambda item: item.version)) if values else None
-
-    async def get_by_hash(self, subject_id: UUID, content_hash: str) -> BriefEvidencePack | None:
-        value = next(
-            (
-                item
-                for item in self._packs.values()
-                if item.subject_id == subject_id and item.content_hash == content_hash
-            ),
-            None,
-        )
-        return deepcopy(value)
-
-    async def list_for_subject(self, subject_id: UUID) -> list[BriefEvidencePack]:
-        return sorted(
-            [deepcopy(item) for item in self._packs.values() if item.subject_id == subject_id],
-            key=lambda item: item.version,
-        )
-
-
-class InMemoryBriefDraftRepository:
-    def __init__(self, drafts: dict[UUID, BriefDraft]) -> None:
-        self._drafts = drafts
-
-    async def append(self, draft: BriefDraft) -> None:
-        self._drafts[draft.id] = deepcopy(draft)
-
-    async def get(self, draft_id: UUID) -> BriefDraft | None:
-        return deepcopy(self._drafts.get(draft_id))
-
-    async def get_current(self, subject_id: UUID) -> BriefDraft | None:
-        values = [item for item in self._drafts.values() if item.subject_id == subject_id]
-        return deepcopy(max(values, key=lambda item: item.version)) if values else None
-
-    async def list_for_subject(self, subject_id: UUID) -> list[BriefDraft]:
-        return sorted(
-            [deepcopy(item) for item in self._drafts.values() if item.subject_id == subject_id],
-            key=lambda item: item.version,
-        )
-
-
 class InMemoryProvenanceRepository:
     def __init__(self, events: list[ProvenanceEvent]) -> None:
         self._events = events
@@ -302,8 +248,6 @@ class InMemoryCollectionUnitOfWork:
         self.rejected_model_proposals = InMemoryRejectedProposalRepository(
             factory.rejected_proposals
         )
-        self.brief_evidence_packs = InMemoryBriefPackRepository(factory.brief_packs)
-        self.brief_drafts = InMemoryBriefDraftRepository(factory.brief_drafts)
 
     async def __aenter__(self) -> InMemoryCollectionUnitOfWork:
         return self
@@ -340,8 +284,6 @@ class InMemoryCollectionUnitOfWorkFactory:
         self.claims: dict[UUID, Claim] = {}
         self.indicators: dict[UUID, Indicator] = {}
         self.rejected_proposals: list[RejectedModelProposal] = []
-        self.brief_packs: dict[UUID, BriefEvidencePack] = {}
-        self.brief_drafts: dict[UUID, BriefDraft] = {}
 
     def __call__(self) -> UnitOfWork:
         return cast(UnitOfWork, InMemoryCollectionUnitOfWork(self))

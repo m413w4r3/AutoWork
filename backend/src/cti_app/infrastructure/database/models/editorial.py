@@ -27,8 +27,7 @@ GROUPING_CONFIDENCE_VALUES_SQL = "'low', 'medium', 'high'"
 HUMAN_DECISION_VALUES_SQL = (
     "'merge', 'split', 'reject', 'select', 'claim_validate', 'claim_correct', "
     "'claim_reject', 'indicator_validate', 'indicator_correct', 'indicator_reject', "
-    "'source_relationship_validate', 'source_relationship_correct', "
-    "'brief_changes_requested', 'brief_approve', 'brief_promote'"
+    "'source_relationship_validate', 'source_relationship_correct'"
 )
 
 

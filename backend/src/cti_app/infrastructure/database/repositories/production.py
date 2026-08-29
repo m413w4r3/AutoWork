@@ -15,6 +15,7 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionBatchStatus,
     ProductionInputSnapshot,
     ProductionInputSource,
     SampleAcquisitionAttempt,
@@ -435,7 +436,7 @@ class SqlAlchemyEditionProductionBatchRepository:
         row = EditionProductionBatchRow(
             id=batch.id,
             edition_id=batch.edition_id,
-            status=batch.status,
+            status=batch.status.value,
             phase=batch.phase.value,
             next_dispatch_at=batch.next_dispatch_at,
             created_at=batch.created_at,
@@ -475,7 +476,7 @@ class SqlAlchemyEditionProductionBatchRepository:
             update(EditionProductionBatchRow)
             .where(EditionProductionBatchRow.id == batch.id)
             .values(
-                status=batch.status,
+                status=batch.status.value,
                 phase=batch.phase.value,
                 next_dispatch_at=batch.next_dispatch_at,
                 started_at=batch.started_at,
@@ -490,7 +491,11 @@ class SqlAlchemyEditionProductionBatchRepository:
             select(EditionProductionBatchRow)
             .where(
                 (EditionProductionBatchRow.edition_id == edition_id)
-                & (EditionProductionBatchRow.status.in_(["queued", "running"]))
+                & (
+                    EditionProductionBatchRow.status.in_(
+                        (ProductionBatchStatus.QUEUED.value, ProductionBatchStatus.RUNNING.value)
+                    )
+                )
             )
             .order_by(EditionProductionBatchRow.created_at.desc())
             .limit(1)
@@ -753,12 +758,16 @@ def _production_artifact_from_row(row: ProductionArtifactRow) -> ProductionArtif
 
 
 def _edition_production_batch_from_row(row: EditionProductionBatchRow) -> EditionProductionBatch:
-    from cti_app.domain.production import EditionProductionBatch, ProductionBatchPhase
+    from cti_app.domain.production import (
+        EditionProductionBatch,
+        ProductionBatchPhase,
+        ProductionBatchStatus,
+    )
 
     return EditionProductionBatch(
         id=row.id,
         edition_id=row.edition_id,
-        status=row.status,
+        status=ProductionBatchStatus(row.status),
         phase=ProductionBatchPhase(row.phase),
         next_dispatch_at=row.next_dispatch_at,
         created_at=row.created_at,

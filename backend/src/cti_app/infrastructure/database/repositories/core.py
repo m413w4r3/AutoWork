@@ -45,7 +45,6 @@ from cti_app.domain.virustotal import (
     VirusTotalObservation,
     VirusTotalOperation,
 )
-from cti_app.infrastructure.database.models.briefs import BriefEvidencePackRow
 from cti_app.infrastructure.database.models.collection import (
     DerivedArtifactRow,
     SourceCollectionRow,
@@ -160,11 +159,6 @@ class SqlAlchemyBlobRepository:
             .select_from(SourceCollectionRow)
             .where(SourceCollectionRow.decoded_blob_id == blob_id)
         )
-        brief_pack_count = await self._session.scalar(
-            select(func.count())
-            .select_from(BriefEvidencePackRow)
-            .where(BriefEvidencePackRow.blob_id == blob_id)
-        )
         conversation_input_count = await self._session.scalar(
             select(func.count())
             .select_from(ModelConversationTurnRow)
@@ -247,7 +241,6 @@ class SqlAlchemyBlobRepository:
             + int(model_output_count or 0)
             + int(artifact_count or 0)
             + int(decoded_source_count or 0)
-            + int(brief_pack_count or 0)
             + int(conversation_input_count or 0)
             + int(conversation_output_count or 0)
             + int(virustotal_observation_count or 0)

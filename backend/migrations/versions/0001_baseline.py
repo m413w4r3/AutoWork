@@ -202,13 +202,6 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
         "append_only",
     ),
     (
-        "brief_evidence_packs",
-        "trg_brief_evidence_packs_append_only",
-        "reject_evidence_mutation",
-        "append_only",
-    ),
-    ("brief_drafts", "trg_brief_drafts_append_only", "reject_evidence_mutation", "append_only"),
-    (
         "discovery_intakes",
         "trg_discovery_intakes_append_only",
         "reject_discovery_intakes_mutation",
@@ -257,8 +250,6 @@ _TABLES_IN_CREATION_ORDER: tuple[str, ...] = (
     "claims",
     "indicators",
     "rejected_model_proposals",
-    "brief_evidence_packs",
-    "brief_drafts",
     "model_conversations",
     "model_conversation_turns",
     "model_output_rejections",
@@ -315,8 +306,6 @@ def upgrade() -> None:
     _create_claims()
     _create_indicators()
     _create_rejected_model_proposals()
-    _create_brief_evidence_packs()
-    _create_brief_drafts()
     _create_model_conversations()
     _create_model_conversation_turns()
     op.create_foreign_key(
@@ -517,8 +506,7 @@ def _create_editions() -> None:
         sa.Column("period_end", sa.Date(), nullable=False),
         sa.Column("tlp", sa.String(length=16), nullable=False),
         sa.Column("languages", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("target_major_articles", sa.BigInteger(), nullable=False),
-        sa.Column("target_briefs", sa.BigInteger(), nullable=False),
+        sa.Column("target_articles", sa.BigInteger(), nullable=False),
         sa.Column("previous_edition_id", sa.Uuid(), nullable=True),
         sa.Column("source_profile", sa.String(length=128), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False),
@@ -532,8 +520,7 @@ def _create_editions() -> None:
             name="ck_editions_status",
         ),
         sa.CheckConstraint("version >= 1", name="ck_editions_version"),
-        sa.CheckConstraint("target_major_articles BETWEEN 0 AND 20", name="ck_editions_major"),
-        sa.CheckConstraint("target_briefs BETWEEN 0 AND 100", name="ck_editions_briefs"),
+        sa.CheckConstraint("target_articles BETWEEN 0 AND 120", name="ck_editions_articles"),
         sa.CheckConstraint("period_start <= period_end", name="ck_editions_period_order"),
         sa.CheckConstraint(
             "period_start = date_trunc('month', period_start)::date "
@@ -891,7 +878,6 @@ def _create_editorial_groups() -> None:
         sa.Column("needs_source_expansion", sa.Boolean(), nullable=False),
         sa.Column("grouping_confidence", sa.String(length=32), nullable=False),
         sa.Column("grouping_justification", sa.Text(), nullable=False),
-        sa.Column("editorial_type", sa.String(length=32), nullable=True),
         sa.Column("subject_id", sa.Uuid(), nullable=True),
         sa.Column("payload", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
         sa.Column("version", sa.Integer(), nullable=False),
@@ -906,10 +892,6 @@ def _create_editorial_groups() -> None:
             "outcome IN ('new_subject', 'duplicate_same_publication', "
             "'update_previous_subject', 'non_independent_reprint', 'ambiguous_review')",
             name="ck_editorial_groups_outcome",
-        ),
-        sa.CheckConstraint(
-            "editorial_type IS NULL OR editorial_type IN ('brief', 'major')",
-            name="ck_editorial_groups_type",
         ),
         sa.CheckConstraint(
             "source_relationship_status IN ('provisional', 'verified')",
@@ -954,8 +936,7 @@ def _create_human_decisions() -> None:
             "decision_type IN ('merge', 'split', 'reject', 'select', 'claim_validate', "
             "'claim_correct', 'claim_reject', 'indicator_validate', 'indicator_correct', "
             "'indicator_reject', 'source_relationship_validate', "
-            "'source_relationship_correct', 'brief_changes_requested', 'brief_approve', "
-            "'brief_promote')",
+            "'source_relationship_correct')",
             name="ck_human_decisions_type",
         ),
         sa.CheckConstraint(
@@ -1439,88 +1420,6 @@ def _create_rejected_model_proposals() -> None:
     )
 
 
-def _create_brief_evidence_packs() -> None:
-    op.create_table(
-        "brief_evidence_packs",
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("subject_id", sa.Uuid(), nullable=False),
-        sa.Column("edition_id", sa.Uuid(), nullable=False),
-        sa.Column("group_id", sa.Uuid(), nullable=False),
-        sa.Column("version", sa.Integer(), nullable=False),
-        sa.Column("content_hash", sa.String(64), nullable=False),
-        sa.Column("object_hashes", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("sources", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("claims", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("indicators", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("normalized_entities", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("uncertainties", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("human_decisions", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("blob_id", sa.Uuid(), nullable=False),
-        sa.Column("created_by", sa.String(255), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.CheckConstraint("version > 0", name="ck_brief_evidence_packs_version"),
-        sa.CheckConstraint(
-            "char_length(content_hash) = 64 AND content_hash ~ '^[0-9a-f]{64}$'",
-            name="ck_brief_evidence_packs_hash",
-        ),
-        sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["group_id"], ["editorial_groups.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["blob_id"], ["blobs.id"], ondelete="RESTRICT"),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("subject_id", "version", name="uq_brief_evidence_packs_version"),
-        sa.UniqueConstraint(
-            "subject_id", "content_hash", name="uq_brief_evidence_packs_content_hash"
-        ),
-    )
-    op.create_index(
-        "ix_brief_evidence_packs_subject",
-        "brief_evidence_packs",
-        ["subject_id", "version"],
-    )
-
-
-def _create_brief_drafts() -> None:
-    op.create_table(
-        "brief_drafts",
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("subject_id", sa.Uuid(), nullable=False),
-        sa.Column("edition_id", sa.Uuid(), nullable=False),
-        sa.Column("group_id", sa.Uuid(), nullable=False),
-        sa.Column("pack_id", sa.Uuid(), nullable=False),
-        sa.Column("pack_hash", sa.String(64), nullable=False),
-        sa.Column("version", sa.Integer(), nullable=False),
-        sa.Column("title", sa.String(500), nullable=False),
-        sa.Column("blocks", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("limits", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("source_ids", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-        sa.Column("model_run_id", sa.Uuid(), nullable=False),
-        sa.Column("provider", sa.String(32), nullable=False),
-        sa.Column("status", sa.String(32), nullable=False),
-        sa.Column("parent_draft_id", sa.Uuid(), nullable=True),
-        sa.Column("regenerated_block_id", sa.Uuid(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.CheckConstraint("version > 0", name="ck_brief_drafts_version"),
-        sa.CheckConstraint(
-            "status IN ('draft', 'changes_requested', 'approved', 'promoted')",
-            name="ck_brief_drafts_status",
-        ),
-        sa.CheckConstraint(
-            "char_length(pack_hash) = 64 AND pack_hash ~ '^[0-9a-f]{64}$'",
-            name="ck_brief_drafts_pack_hash",
-        ),
-        sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["group_id"], ["editorial_groups.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["pack_id"], ["brief_evidence_packs.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["model_run_id"], ["model_runs.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["parent_draft_id"], ["brief_drafts.id"], ondelete="RESTRICT"),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("subject_id", "version", name="uq_brief_drafts_version"),
-    )
-    op.create_index("ix_brief_drafts_subject", "brief_drafts", ["subject_id", "version"])
-
-
 def _create_model_conversations() -> None:
     op.create_table(
         "model_conversations",
@@ -1662,7 +1561,6 @@ def _create_subject_production_runs() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("subject_id", sa.Uuid(), nullable=False),
         sa.Column("edition_id", sa.Uuid(), nullable=False),
-        sa.Column("profile", sa.String(32), nullable=False),
         sa.Column("status", sa.String(32), nullable=False),
         sa.Column("current_stage", sa.String(32), nullable=False),
         sa.Column("references_conversation_id", sa.Uuid(), nullable=True),
@@ -1699,7 +1597,6 @@ def _create_subject_production_runs() -> None:
             "current_stage IN ('sources','references','extraction','synthesis','assembly')",
             name="ck_run_stage",
         ),
-        sa.CheckConstraint("profile IN ('brief_auto','major_assisted')", name="ck_run_profile"),
         sa.ForeignKeyConstraint(["subject_id"], ["subjects.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
@@ -1749,7 +1646,8 @@ def _create_production_artifacts() -> None:
         ),
         sa.CheckConstraint("version >= 1", name="ck_artifact_version"),
         sa.CheckConstraint(
-            "stage IN ('references','extraction','synthesis','brief')", name="ck_artifact_stage"
+            "stage IN ('references','extraction','synthesis','publication')",
+            name="ck_artifact_stage",
         ),
         sa.CheckConstraint(
             "status IN ('verified','stale','needs_review')", name="ck_artifact_status"
@@ -1781,7 +1679,6 @@ def _create_edition_production_batches() -> None:
         "edition_production_batches",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("edition_id", sa.Uuid(), nullable=False),
-        sa.Column("profile", sa.String(32), nullable=False),
         sa.Column("status", sa.String(32), nullable=False),
         sa.Column(
             "created_at",
@@ -1796,7 +1693,6 @@ def _create_edition_production_batches() -> None:
             "status IN ('queued','running','completed','completed_with_issues','cancelled')",
             name="ck_batch_status",
         ),
-        sa.CheckConstraint("profile IN ('brief_auto','major_assisted')", name="ck_batch_profile"),
         sa.ForeignKeyConstraint(["edition_id"], ["editions.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
     )
@@ -1833,5 +1729,3 @@ def _create_edition_production_batch_items() -> None:
         sa.UniqueConstraint("batch_id", "position", name="uq_batch_position"),
         sa.UniqueConstraint("batch_id", "subject_id", name="uq_batch_subject"),
     )
-
-

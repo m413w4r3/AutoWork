@@ -158,7 +158,7 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
                     document_input_hash=None,
                     decision="exclude",
                     actor_id="analyst",
-                    reason="No brief was produced",
+                    reason="No publication was produced",
                     occurred_at=now,
                 )
             )

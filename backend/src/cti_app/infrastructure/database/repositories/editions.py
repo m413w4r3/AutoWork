@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
-from cti_app.infrastructure.database.models.briefs import BriefDraftRow, BriefEvidencePackRow
 from cti_app.infrastructure.database.models.collection import (
     ClaimRow,
     CollectionAttemptRow,
@@ -148,15 +147,9 @@ class SqlAlchemyEditionRepository:
                 )
             )
         )
-        draft_model_run_ids = list(
-            await self._session.scalars(
-                select(BriefDraftRow.model_run_id).where(BriefDraftRow.edition_id == edition_id)
-            )
-        )
         model_run_ids = {
             *turn_model_run_ids,
             *claim_model_run_ids,
-            *draft_model_run_ids,
             *(row.discovery_model_run_id for row in batch_rows),
         }
 
@@ -249,12 +242,6 @@ class SqlAlchemyEditionRepository:
                 )
             )
 
-        await self._session.execute(
-            delete(BriefDraftRow).where(BriefDraftRow.edition_id == edition_id)
-        )
-        await self._session.execute(
-            delete(BriefEvidencePackRow).where(BriefEvidencePackRow.edition_id == edition_id)
-        )
         await self._session.execute(delete(ClaimRow).where(ClaimRow.edition_id == edition_id))
         await self._session.execute(
             delete(IndicatorRow).where(IndicatorRow.edition_id == edition_id)
@@ -311,7 +298,7 @@ class SqlAlchemyEditionRepository:
                     )
                 )
             )
-            for model in (ClaimRow, RejectedModelProposalRow, BriefDraftRow):
+            for model in (ClaimRow, RejectedModelProposalRow):
                 referenced_run_ids.update(
                     await self._session.scalars(
                         select(model.model_run_id).where(model.model_run_id.in_(model_run_ids))

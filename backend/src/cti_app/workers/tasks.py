@@ -8,7 +8,6 @@ from minio import Minio
 
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
@@ -257,7 +256,6 @@ async def _execute_job(job_id: UUID) -> int | None:
             workspace_materializer=SubjectWorkspaceMaterializer(blob_store),
             workspace_root=settings.subject_workspace_root,
         )
-        brief_service = BriefService(uow_factory, blob_store, model_gateway)
         model_conversation_service = ModelConversationService(
             uow_factory,
             model_gateway,
@@ -287,7 +285,6 @@ async def _execute_job(job_id: UUID) -> int | None:
             model_gateway,
             discovery_service,
             collection_service,
-            brief_service,
             uow_factory,
             model_conversation_service=model_conversation_service,
             production_chain=production_chain,

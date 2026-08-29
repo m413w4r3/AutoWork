@@ -262,7 +262,7 @@ def test_cavern_document_round_trip_and_pandoc_golden() -> None:
     assert "CVE-2026-1234" not in markdown
 
 
-def test_brief_document_title_uses_editorial_title_exactly() -> None:
+def test_publication_document_title_uses_editorial_title_exactly() -> None:
     """Q1's editorial_title must reach the published title verbatim."""
     document = build_publication_document(
         subject_title="Cavern",

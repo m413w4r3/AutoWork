@@ -3,17 +3,8 @@ import { ApiError } from "./editions";
 export type SubjectProductionStatus =
   "queued" | "running" | "ready" | "needs_review" | "failed" | "cancelled";
 
-/** @deprecated historical analyst stages remain readable only. */
-export type HistoricalSubjectProductionStage =
-  "analyst_research" | "analyst_note";
 export type SubjectProductionStage =
-  | "sources"
-  | "references"
-  | "extraction"
-  | "synthesis"
-  | "analyst_research"
-  | "analyst_note"
-  | "assembly";
+  "sources" | "references" | "extraction" | "synthesis" | "assembly";
 
 export type ProductionBatchPhase = "initial" | "recovery" | "review";
 
@@ -101,7 +92,7 @@ export interface ArtifactResponse {
   version: number;
   status: "verified" | "stale" | "needs_review";
   metadata: Record<string, unknown>;
-  /** Publication Markdown is downloadable, not the BRIEF preview source. */
+  /** Publication Markdown is downloadable alongside the canonical document. */
   rendered_content: string | null;
   canonical_content:
     PublicationDocument | ExtractionDocumentV2 | Record<string, unknown> | null;
@@ -330,25 +321,6 @@ export async function getPublicationArtifact(
   subjectId: string,
 ): Promise<ArtifactResponse> {
   return request(`/api/subjects/${subjectId}/production/artifacts/publication`);
-}
-
-export async function saveBriefDraft(
-  subjectId: string,
-  content: string,
-): Promise<{ artifact_id: string; saved_at: string; draft_version: number }> {
-  return request(`/api/subjects/${subjectId}/production/brief/draft`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
-}
-
-export async function getBriefDraft(subjectId: string): Promise<{
-  content: string;
-  saved_at: string;
-  draft_version: number;
-} | null> {
-  return requestOrNull(`/api/subjects/${subjectId}/production/brief/draft`);
 }
 
 // Edition production API

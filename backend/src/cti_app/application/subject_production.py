@@ -19,6 +19,7 @@ from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
     ProductionBatchPhase,
+    ProductionBatchStatus,
     ProductionInputSnapshot,
     ProductionInputSource,
     SubjectProductionRun,
@@ -454,7 +455,7 @@ class EditionProductionService:
 
             batch = EditionProductionBatch(
                 edition_id=edition_id,
-                status="queued",
+                status=ProductionBatchStatus.QUEUED,
                 phase=ProductionBatchPhase.INITIAL,
                 created_at=created_at,
             )
@@ -538,7 +539,7 @@ class EditionProductionService:
         whole decision; the caller commits and dispatches afterwards.
         """
         items = await uow.edition_production_batch_items.list_for_batch(batch.id)
-        if batch.status == "cancelled":
+        if batch.status is ProductionBatchStatus.CANCELLED:
             for item in items:
                 run = await uow.subject_production_runs.get_for_update(item.production_run_id)
                 if run is not None and run.status is SubjectProductionStatus.QUEUED:
@@ -556,13 +557,13 @@ class EditionProductionService:
                 started_at = datetime.now(UTC)
                 run.start_running(now=started_at)
                 await uow.subject_production_runs.save(run)
-                if batch.status == "queued":
+                if batch.status is ProductionBatchStatus.QUEUED:
                     batch.start(now=started_at)
                 if pace_subject:
                     batch.schedule_next_dispatch(
                         started_at + timedelta(milliseconds=self._pacing.subject_delay_ms())
                     )
-                if batch.status == "running":
+                if batch.status is ProductionBatchStatus.RUNNING:
                     await uow.edition_production_batches.save(batch)
                 return run
         return None
@@ -598,7 +599,7 @@ class EditionProductionService:
             if started is not None:
                 await uow.commit()
                 return started
-            if batch.status == "cancelled":
+            if batch.status is ProductionBatchStatus.CANCELLED:
                 await uow.commit()
                 return None
 
@@ -620,7 +621,10 @@ class EditionProductionService:
             all_terminal = all(
                 run is not None and run.status in _TERMINAL_STATUSES for run in all_runs
             )
-            if all_terminal and batch.status in {"queued", "running"}:
+            if all_terminal and batch.status in {
+                ProductionBatchStatus.QUEUED,
+                ProductionBatchStatus.RUNNING,
+            }:
                 recovery = (
                     await self._retry_next_recovery_in_uow(uow, batch, items)
                     if batch.phase is not ProductionBatchPhase.REVIEW

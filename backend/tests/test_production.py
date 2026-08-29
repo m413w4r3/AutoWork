@@ -11,7 +11,6 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -26,7 +25,6 @@ class TestSubjectProductionRun:
         run = SubjectProductionRun(
             subject_id=subject_id,
             edition_id=edition_id,
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         assert run.status == SubjectProductionStatus.QUEUED
@@ -41,7 +39,6 @@ class TestSubjectProductionRun:
         run = SubjectProductionRun(
             subject_id=subject_id,
             edition_id=edition_id,
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         run.start_running()
@@ -66,7 +63,6 @@ class TestSubjectProductionRun:
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         run.start_running()
@@ -77,7 +73,6 @@ class TestSubjectProductionRun:
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         run.start_running()
@@ -95,7 +90,6 @@ class TestSubjectProductionRun:
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         run.start_running()
@@ -163,7 +157,6 @@ class TestEditionProductionBatch:
 
         batch = EditionProductionBatch(
             edition_id=edition_id,
-            profile=ProductionProfile.BRIEF_AUTO,
             status="queued",
         )
 
@@ -174,7 +167,6 @@ class TestEditionProductionBatch:
     def test_batch_lifecycle(self) -> None:
         batch = EditionProductionBatch(
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
             status="queued",
         )
 
@@ -189,7 +181,6 @@ class TestEditionProductionBatch:
     def test_batch_finish_with_issues(self) -> None:
         batch = EditionProductionBatch(
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
             status="queued",
         )
 
@@ -257,14 +248,13 @@ class TestInputHashComputation:
 
 
 class TestProductionWorkflow:
-    def test_brief_auto_workflow_sequence(self) -> None:
+    def test_article_workflow_sequence(self) -> None:
         subject_id = uuid4()
         edition_id = uuid4()
 
         run = SubjectProductionRun(
             subject_id=subject_id,
             edition_id=edition_id,
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         assert run.current_stage is SubjectProductionStage.SOURCES
@@ -290,7 +280,6 @@ class TestProductionWorkflow:
 
         batch = EditionProductionBatch(
             edition_id=edition_id,
-            profile=ProductionProfile.BRIEF_AUTO,
             status="queued",
         )
 

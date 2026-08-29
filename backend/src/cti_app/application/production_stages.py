@@ -339,11 +339,6 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
             await uow.commit()
             return artifact
 
-    async def assemble_brief(self, *args: Any, **kwargs: Any) -> ProductionArtifact:
-        """Deprecated compatibility name; writes the current publication stage."""
-
-        return await self.assemble_publication(*args, **kwargs)
-
     async def _load_inputs(
         self,
         references_artifact: ProductionArtifact,
@@ -390,16 +385,9 @@ class ProductionQAService:
         extraction: TechnicalExtraction | None = None,
         synthesis_text: str = "",
         publication_markdown: str = "",
-        brief_artifact: ProductionArtifact | None = None,
-        brief_markdown: str = "",
         archived_urls: set[str] | None = None,
         research_date: date | None = None,
     ) -> dict[str, Any]:
-        # Historical ``brief_*`` aliases are read-only compatibility for old
-        # imported callers; new workflow calls use publication names.
-        publication_artifact = publication_artifact or brief_artifact
-        if not publication_markdown:
-            publication_markdown = brief_markdown
         checks: dict[str, bool] = {}
         errors: list[str] = []
         warnings: list[str] = []

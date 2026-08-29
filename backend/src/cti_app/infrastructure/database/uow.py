@@ -8,8 +8,6 @@ from cti_app.application.persistence import (
     AnalystInputPackRepository,
     AnalystInvestigationRepository,
     BlobRepository,
-    BriefDraftRepository,
-    BriefEvidencePackRepository,
     CapabilitySetRepository,
     ClaimRepository,
     CodeFeatureSetRepository,
@@ -60,10 +58,6 @@ from cti_app.application.persistence import (
     VirusTotalObservationRepository,
 )
 from cti_app.application.production_read_model import BatchStatusReadRepository
-from cti_app.infrastructure.database.repositories.briefs import (
-    SqlAlchemyBriefDraftRepository,
-    SqlAlchemyBriefEvidencePackRepository,
-)
 from cti_app.infrastructure.database.repositories.collection import (
     SqlAlchemyClaimRepository,
     SqlAlchemyCollectionAttemptRepository,
@@ -186,8 +180,6 @@ class SqlAlchemyUnitOfWork:
     claims: ClaimRepository
     indicators: IndicatorRepository
     rejected_model_proposals: RejectedModelProposalRepository
-    brief_evidence_packs: BriefEvidencePackRepository
-    brief_drafts: BriefDraftRepository
     subject_production_runs: SubjectProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
@@ -258,8 +250,6 @@ class SqlAlchemyUnitOfWork:
         self.claims = SqlAlchemyClaimRepository(self._session)
         self.indicators = SqlAlchemyIndicatorRepository(self._session)
         self.rejected_model_proposals = SqlAlchemyRejectedModelProposalRepository(self._session)
-        self.brief_evidence_packs = SqlAlchemyBriefEvidencePackRepository(self._session)
-        self.brief_drafts = SqlAlchemyBriefDraftRepository(self._session)
         self.subject_production_runs = SqlAlchemySubjectProductionRunRepository(self._session)
         self.production_input_snapshots = SqlAlchemyProductionInputSnapshotRepository(self._session)
         self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)

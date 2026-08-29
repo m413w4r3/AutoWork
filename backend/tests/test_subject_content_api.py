@@ -17,7 +17,6 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    ProductionProfile,
     SubjectProductionRun,
 )
 
@@ -139,7 +138,6 @@ def _run(*, created_at: datetime | None = None, generation: int = 1) -> SubjectP
         id=uuid4(),
         subject_id=SUBJECT_ID,
         edition_id=uuid4(),
-        profile=ProductionProfile.BRIEF_AUTO,
         pipeline_generation=generation,
         created_at=created_at or datetime.now(UTC),
     )
@@ -223,7 +221,7 @@ async def test_content_returns_current_artifact_without_raw_blob(subject: Subjec
     rendered_id = uuid4()
     artifact = _artifact(
         run,
-        ProductionArtifactStage.BRIEF,
+        ProductionArtifactStage.PUBLICATION,
         canonical_id,
         rendered_blob_id=rendered_id,
     )
@@ -250,8 +248,8 @@ async def test_content_uses_new_current_generation(subject: Subject) -> None:
     second = _run(created_at=datetime.now(UTC) + timedelta(seconds=1), generation=2)
     first_blob, second_blob = uuid4(), uuid4()
     artifacts = [
-        _artifact(first, ProductionArtifactStage.BRIEF, first_blob),
-        _artifact(second, ProductionArtifactStage.BRIEF, second_blob, version=2),
+        _artifact(first, ProductionArtifactStage.PUBLICATION, first_blob),
+        _artifact(second, ProductionArtifactStage.PUBLICATION, second_blob, version=2),
     ]
     payloads = _Payloads({first_blob: _document("Old"), second_blob: _document("New")})
     app = _app(_Uow(subject, [first, second], artifacts), payloads)

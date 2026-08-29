@@ -1,4 +1,4 @@
-"""Current publication artifact resolution with historical fallback."""
+"""Current publication artifact resolution."""
 
 from __future__ import annotations
 
@@ -15,9 +15,6 @@ class _ArtifactRepository(Protocol):
 async def current_publication_artifact(
     repository: _ArtifactRepository, run_id: UUID
 ) -> ProductionArtifact | None:
-    """Resolve PUBLICATION first and BRIEF only for historical runs."""
+    """Resolve the current PUBLICATION artifact only."""
 
-    current = await repository.get_current(run_id, ProductionArtifactStage.PUBLICATION.value)
-    if current is not None:
-        return current
-    return await repository.get_current(run_id, ProductionArtifactStage.BRIEF.value)
+    return await repository.get_current(run_id, ProductionArtifactStage.PUBLICATION.value)

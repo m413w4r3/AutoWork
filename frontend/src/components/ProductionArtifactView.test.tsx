@@ -6,13 +6,13 @@ import { ProductionArtifactView } from "./ProductionArtifactView";
 
 afterEach(() => vi.unstubAllGlobals());
 
-it("construit la preview de brève depuis le JSON canonique", async () => {
+it("construit la preview de publication depuis le JSON canonique", async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn().mockResolvedValue(
       Response.json({
-        artifact_id: "brief-1",
-        stage: "brief",
+        artifact_id: "publication-1",
+        stage: "publication",
         version: 1,
         status: "verified",
         metadata: {},
@@ -52,7 +52,7 @@ it("construit la preview de brève depuis le JSON canonique", async () => {
   });
   render(
     <QueryClientProvider client={client}>
-      <ProductionArtifactView subjectId="subject-1" stage="brief" />
+      <ProductionArtifactView subjectId="subject-1" stage="publication" />
     </QueryClientProvider>,
   );
 
@@ -65,6 +65,6 @@ it("construit la preview de brève depuis le JSON canonique", async () => {
   expect(screen.getByText("example.com")).toBeInTheDocument();
   expect(
     screen.getByRole("link", { name: "Télécharger le Markdown Pandoc" }),
-  ).toHaveAttribute("download", "breve-pandoc.md");
+  ).toHaveAttribute("download", "publication-pandoc.md");
   expect(screen.queryByText(/custom-style/)).not.toBeInTheDocument();
 });

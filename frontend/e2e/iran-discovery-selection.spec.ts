@@ -156,7 +156,6 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
       title: ncc.title,
       outcome: "new_subject",
       status: merged ? "superseded" : "proposed",
-      editorial_type: null,
       subject_id: null,
       candidates: [ncc],
       score,

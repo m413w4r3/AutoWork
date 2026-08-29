@@ -15,13 +15,6 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceCandidate, SourceRole
 
 
-class ProductionProfile(StrEnum):
-    """Historical profile values accepted only by compatibility readers."""
-
-    BRIEF_AUTO = "brief_auto"
-    MAJOR_ASSISTED = "major_assisted"
-
-
 class SubjectProductionStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -36,8 +29,6 @@ class SubjectProductionStage(StrEnum):
     REFERENCES = "references"
     EXTRACTION = "extraction"
     SYNTHESIS = "synthesis"
-    ANALYST_RESEARCH = "analyst_research"
-    ANALYST_NOTE = "analyst_note"
     ASSEMBLY = "assembly"
 
 
@@ -192,14 +183,8 @@ class ProductionInputSnapshot:
         return hashlib.sha256(encoded).hexdigest()
 
 
-def production_stages(
-    legacy_profile: ProductionProfile | None = None,
-) -> tuple[SubjectProductionStage, ...]:
-    """Return the one executable publication pipeline.
-
-    The argument is a historical compatibility shim and is ignored.
-    """
-    del legacy_profile
+def production_stages() -> tuple[SubjectProductionStage, ...]:
+    """Return the one executable publication pipeline."""
     return (
         SubjectProductionStage.SOURCES,
         SubjectProductionStage.REFERENCES,
@@ -209,27 +194,11 @@ def production_stages(
     )
 
 
-def next_stage(
-    stage_or_legacy_profile: SubjectProductionStage | ProductionProfile,
-    legacy_stage: SubjectProductionStage | None = None,
-) -> SubjectProductionStage | None:
+def next_stage(stage: SubjectProductionStage) -> SubjectProductionStage | None:
     """Return the successor in the unified pipeline."""
-    stage = legacy_stage or stage_or_legacy_profile
     if not isinstance(stage, SubjectProductionStage):
         raise TypeError("next_stage requires a SubjectProductionStage")
-    stages = (
-        (
-            SubjectProductionStage.SOURCES,
-            SubjectProductionStage.REFERENCES,
-            SubjectProductionStage.EXTRACTION,
-            SubjectProductionStage.SYNTHESIS,
-            SubjectProductionStage.ANALYST_RESEARCH,
-            SubjectProductionStage.ANALYST_NOTE,
-            SubjectProductionStage.ASSEMBLY,
-        )
-        if legacy_stage is not None and stage_or_legacy_profile is ProductionProfile.MAJOR_ASSISTED
-        else production_stages()
-    )
+    stages = production_stages()
     try:
         index = stages.index(stage)
     except ValueError as exc:
@@ -242,7 +211,6 @@ class ProductionArtifactStage(StrEnum):
     EXTRACTION = "extraction"
     SYNTHESIS = "synthesis"
     PUBLICATION = "publication"
-    BRIEF = "brief"
 
 
 class ProductionArtifactStatus(StrEnum):
@@ -328,8 +296,6 @@ class LoopBudget:
 class SubjectProductionRun:
     subject_id: UUID
     edition_id: UUID
-    # Historical rows/fixtures only; new persistence has no profile column.
-    profile: ProductionProfile | None = None
     status: SubjectProductionStatus = SubjectProductionStatus.QUEUED
     current_stage: SubjectProductionStage = SubjectProductionStage.SOURCES
     references_conversation_id: UUID | None = None
@@ -371,31 +337,8 @@ class SubjectProductionRun:
         self.updated_at = self.started_at
         self.version += 1
 
-    def resume_verified_import_at_analyst_research(self, *, now: datetime | None = None) -> None:
-        """Historical compatibility transition; current imports stop at assembly."""
-        if self.profile is not ProductionProfile.MAJOR_ASSISTED:
-            raise ValueError("Only major_assisted runs have an analyst checkpoint")
-        if self.status is not SubjectProductionStatus.QUEUED:
-            raise ValueError("Imported run must start from QUEUED status")
-        if self.current_stage is not SubjectProductionStage.SOURCES:
-            raise ValueError("Imported run must start from SOURCES stage")
-        moment = now or datetime.now(UTC)
-        self.status = SubjectProductionStatus.RUNNING
-        self.current_stage = SubjectProductionStage.ANALYST_RESEARCH
-        self.started_at = moment
-        self.finished_at = None
-        self.error_code = None
-        self.error_message = None
-        self.error_details = None
-        self.updated_at = moment
-        self.version += 1
-
     def advance_stage(self, *, now: datetime | None = None) -> None:
-        successor = (
-            next_stage(self.profile, self.current_stage)
-            if self.profile is ProductionProfile.MAJOR_ASSISTED
-            else next_stage(self.current_stage)
-        )
+        successor = next_stage(self.current_stage)
         if successor is not None:
             self.current_stage = successor
         self.updated_at = now or datetime.now(UTC)
@@ -700,12 +643,18 @@ class SampleAcquisitionAttempt:
             raise ValueError("occurred_at must be timezone-aware")
 
 
+class ProductionBatchStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    COMPLETED_WITH_ISSUES = "completed_with_issues"
+    CANCELLED = "cancelled"
+
+
 @dataclass(slots=True, kw_only=True)
 class EditionProductionBatch:
     edition_id: UUID
-    # Historical compatibility only; new batches have no profile.
-    profile: ProductionProfile | None = None
-    status: str  # queued, running, completed, completed_with_issues, cancelled
+    status: ProductionBatchStatus
     phase: ProductionBatchPhase = ProductionBatchPhase.INITIAL
     next_dispatch_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -715,34 +664,31 @@ class EditionProductionBatch:
     version: int = 1
 
     def __post_init__(self) -> None:
-        valid_statuses = {
-            "queued",
-            "running",
-            "completed",
-            "completed_with_issues",
-            "cancelled",
-        }
-        if self.status not in valid_statuses:
-            raise ValueError(f"Invalid status: {self.status}")
+        if not isinstance(self.status, ProductionBatchStatus):
+            self.status = ProductionBatchStatus(str(self.status))
         if not isinstance(self.phase, ProductionBatchPhase):
             self.phase = ProductionBatchPhase(str(self.phase))
 
     def start(self, *, now: datetime | None = None) -> None:
-        if self.status != "queued":
+        if self.status is not ProductionBatchStatus.QUEUED:
             raise ValueError("Can only start from queued status")
-        self.status = "running"
+        self.status = ProductionBatchStatus.RUNNING
         self.started_at = now or datetime.now(UTC)
         self.version += 1
 
     def finish(self, *, completed_with_issues: bool = False, now: datetime | None = None) -> None:
-        if self.status != "running":
+        if self.status is not ProductionBatchStatus.RUNNING:
             raise ValueError("Can only finish from running status")
-        self.status = "completed_with_issues" if completed_with_issues else "completed"
+        self.status = (
+            ProductionBatchStatus.COMPLETED_WITH_ISSUES
+            if completed_with_issues
+            else ProductionBatchStatus.COMPLETED
+        )
         self.finished_at = now or datetime.now(UTC)
         self.version += 1
 
     def cancel(self, *, now: datetime | None = None) -> None:
-        self.status = "cancelled"
+        self.status = ProductionBatchStatus.CANCELLED
         self.next_dispatch_at = None
         self.finished_at = now or datetime.now(UTC)
         self.version += 1
@@ -759,7 +705,7 @@ class EditionProductionBatch:
             self.version += 1
 
     def enter_recovery(self) -> None:
-        if self.status != "running":
+        if self.status is not ProductionBatchStatus.RUNNING:
             raise ValueError("Can only enter recovery from a running batch")
         self.phase = ProductionBatchPhase.RECOVERY
         self.version += 1

@@ -11,7 +11,7 @@ from cti_app.domain.editions import (
 )
 
 
-def make_edition() -> Edition:
+def make_edition(target_articles: int = 8) -> Edition:
     return Edition(
         country="Iran",
         country_code="IR",
@@ -19,8 +19,7 @@ def make_edition() -> Edition:
         period_end=date(2026, 7, 31),
         tlp=TLP.AMBER,
         languages=("fr", "en", "fa"),
-        target_major_articles=2,
-        target_briefs=6,
+        target_articles=target_articles,
         source_profile="iran-default",
     )
 
@@ -34,10 +33,19 @@ def test_month_period_and_language_validation() -> None:
             period_end=date(2026, 7, 31),
             tlp=TLP.AMBER,
             languages=("fr",),
-            target_major_articles=2,
-            target_briefs=6,
+            target_articles=8,
             source_profile="iran-default",
         )
+
+
+@pytest.mark.parametrize("target_articles", (0, 100, 101, 120))
+def test_target_articles_accepts_the_complete_allowed_range(target_articles: int) -> None:
+    assert make_edition(target_articles).target_articles == target_articles
+
+
+def test_target_articles_above_the_bound_is_rejected() -> None:
+    with pytest.raises(ValueError, match="between 0 and 120"):
+        make_edition(121)
 
 
 def test_state_machine_exposes_only_valid_actions() -> None:
@@ -85,8 +93,7 @@ def test_frozen_editions_reject_metadata_updates(status: EditionStatus) -> None:
             period_end=date(2026, 7, 31),
             tlp=TLP.AMBER,
             languages=("fr", "en", "fa"),
-            target_major_articles=3,
-            target_briefs=7,
+            target_articles=10,
             previous_edition_id=None,
             source_profile="iran-default",
         )
@@ -103,10 +110,9 @@ def test_review_editions_allow_metadata_updates() -> None:
         period_end=date(2026, 7, 31),
         tlp=TLP.AMBER,
         languages=("fr", "en", "fa"),
-        target_major_articles=3,
-        target_briefs=7,
+        target_articles=10,
         previous_edition_id=None,
         source_profile="iran-default",
     )
 
-    assert edition.target_briefs == 7
+    assert edition.target_articles == 10

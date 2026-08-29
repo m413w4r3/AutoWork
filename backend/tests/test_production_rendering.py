@@ -1,4 +1,4 @@
-"""Deterministic brief rendering and the QA gate that guards READY."""
+"""Deterministic publication rendering and the QA gate that guards READY."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from cti_app.application.production_parsers import (
 from cti_app.application.production_rendering import (
     build_reference_numbering,
     collect_indicators,
-    render_brief,
+    render_publication_markdown,
 )
 from cti_app.application.production_stages import ProductionQAService
 from cti_app.application.production_verification import (
@@ -130,10 +130,10 @@ def test_indicators_are_deduplicated_by_kind_and_value() -> None:
     ]
 
 
-def test_brief_contains_the_real_content_and_no_placeholder() -> None:
+def test_publication_contains_the_real_content_and_no_placeholder() -> None:
     numbering = build_reference_numbering(_report(), SYNTHESIS)
 
-    brief = render_brief(
+    publication = render_publication_markdown(
         subject_title="TAG-182 et MarkiRAT",
         report=_report(),
         extraction=_extraction(),
@@ -141,19 +141,19 @@ def test_brief_contains_the_real_content_and_no_placeholder() -> None:
         numbering=numbering,
     )
 
-    assert "# TAG-182 et MarkiRAT" in brief
-    assert "Première observation." in brief
-    assert "Le groupe agit depuis 2020 [1]." in brief
-    assert "malicious.example.com" in brief
-    assert "https://a.example/one" in brief
-    assert "mots)" not in brief
-    assert "identifiées" not in brief
-    assert "[S1]" not in brief and "[S2]" not in brief
+    assert "# TAG-182 et MarkiRAT" in publication
+    assert "Première observation." in publication
+    assert "Le groupe agit depuis 2020 [1]." in publication
+    assert "malicious.example.com" in publication
+    assert "https://a.example/one" in publication
+    assert "mots)" not in publication
+    assert "identifiées" not in publication
+    assert "[S1]" not in publication and "[S2]" not in publication
 
 
 def test_every_footnote_used_is_declared() -> None:
     numbering = build_reference_numbering(_report(), SYNTHESIS)
-    brief = render_brief(
+    publication = render_publication_markdown(
         subject_title="T",
         report=_report(),
         extraction=_extraction(),
@@ -161,7 +161,7 @@ def test_every_footnote_used_is_declared() -> None:
         numbering=numbering,
     )
 
-    declared = {line.split("]")[0][1:] for line in brief.splitlines() if line.startswith("[")}
+    declared = {line.split("]")[0][1:] for line in publication.splitlines() if line.startswith("[")}
 
     assert declared == {"1", "2"}
 
@@ -186,11 +186,11 @@ async def _qa(**overrides: Any) -> dict[str, Any]:
         "references_artifact": _artifact(ProductionArtifactStage.REFERENCES),
         "extraction_artifact": _artifact(ProductionArtifactStage.EXTRACTION),
         "synthesis_artifact": _artifact(ProductionArtifactStage.SYNTHESIS),
-        "brief_artifact": _artifact(ProductionArtifactStage.BRIEF),
+        "publication_artifact": _artifact(ProductionArtifactStage.PUBLICATION),
         "report": _report(),
         "extraction": _extraction(),
         "synthesis_text": SYNTHESIS,
-        "brief_markdown": render_brief(
+        "publication_markdown": render_publication_markdown(
             subject_title="T",
             report=_report(),
             extraction=_extraction(),
@@ -204,7 +204,7 @@ async def _qa(**overrides: Any) -> dict[str, Any]:
     return await ProductionQAService(lambda: None).run_qa(**payload)  # type: ignore[arg-type]
 
 
-async def test_a_complete_brief_passes_qa() -> None:
+async def test_a_complete_publication_passes_qa() -> None:
     result = await _qa()
 
     assert result["passed"] is True, result["errors"]
@@ -280,7 +280,7 @@ async def test_qa_fails_on_a_stale_artifact() -> None:
 
 
 async def test_qa_fails_on_an_orphan_footnote() -> None:
-    result = await _qa(brief_markdown="# T\n\nTexte avec [7] sans déclaration.\n")
+    result = await _qa(publication_markdown="# T\n\nTexte avec [7] sans déclaration.\n")
 
     assert result["checks"]["no_orphan_footnote"] is False
 

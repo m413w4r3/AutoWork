@@ -19,7 +19,6 @@ from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
     ProductionInputSnapshot,
     ProductionInputSource,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
 )
@@ -245,7 +244,6 @@ async def test_sources_stage_counts_only_snapshot_sources() -> None:
     run = SubjectProductionRun(
         subject_id=subject_id,
         edition_id=uuid4(),
-        profile=ProductionProfile.BRIEF_AUTO,
         current_stage=SubjectProductionStage.SOURCES,
     )
 
@@ -270,7 +268,6 @@ async def test_archived_source_outside_snapshot_cannot_make_sources_succeed() ->
     run = SubjectProductionRun(
         subject_id=subject_id,
         edition_id=uuid4(),
-        profile=ProductionProfile.BRIEF_AUTO,
     )
 
     result = await orchestrator._execute_sources_stage(run, cast(Any, _Context()), snapshot)
@@ -338,7 +335,6 @@ async def test_q1_collects_only_report_urls_by_exact_collection_id() -> None:
     run = SubjectProductionRun(
         subject_id=subject_id,
         edition_id=uuid4(),
-        profile=ProductionProfile.BRIEF_AUTO,
     )
 
     result = await orchestrator._integrate_reference_sources(run, report, cast(Any, _Context()))

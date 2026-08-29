@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.application.edition_review import EditionReviewReadItem
 from cti_app.domain.production import (
+    ProductionArtifactStage,
     ProductionArtifactStatus,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -101,7 +102,7 @@ class SqlAlchemyEditionReviewReadRepository:
                 .label("artifact_rank"),
             )
             .where(
-                ProductionArtifactRow.stage.in_(("publication", "brief")),
+                ProductionArtifactRow.stage == ProductionArtifactStage.PUBLICATION.value,
                 ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value,
             )
             .subquery("current_review_artifacts")

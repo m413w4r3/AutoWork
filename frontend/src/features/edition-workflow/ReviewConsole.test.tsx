@@ -297,7 +297,7 @@ describe("ReviewConsole", () => {
       included: false,
       blocking: true,
       can_retry: true,
-      retry_stage: "analyst_note",
+      retry_stage: "synthesis",
       document_artifact_id: null,
       document_artifact_version: null,
       document_input_hash: null,
@@ -313,7 +313,7 @@ describe("ReviewConsole", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
     const [url, init] = postCall(fetchMock);
     expect(url).toBe("/api/production/runs/run-retry/retry");
-    expect(JSON.parse(bodyOf(init))).toEqual({ stage: "analyst_note" });
+    expect(JSON.parse(bodyOf(init))).toEqual({ stage: "synthesis" });
     expect(invalidate).toHaveBeenCalledWith({
       queryKey: ["edition-review", EDITION_ID],
     });

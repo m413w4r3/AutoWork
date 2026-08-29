@@ -479,7 +479,7 @@ async def test_get_subject_production_without_run_returns_404(api: AsyncClient) 
     assert response.status_code != 422
 
 
-async def test_get_edition_briefs_without_batch_returns_404(api: AsyncClient) -> None:
+async def test_get_edition_production_without_batch_returns_404(api: AsyncClient) -> None:
     response = await api.get(f"/api/editions/{uuid4()}/production")
 
     assert response.status_code == 404
@@ -767,30 +767,6 @@ async def test_start_production_after_failure_creates_a_new_run(
 
     dispatcher = production_app.state.job_dispatcher
     assert len(dispatcher.dispatched) == 1
-
-
-async def test_save_brief_draft_appends_artifact_versions(api: AsyncClient, uow: _Uow) -> None:
-    edition_id = uuid4()
-    subject_id = uuid4()
-    run = SubjectProductionRun(
-        subject_id=subject_id,
-        edition_id=edition_id,
-    )
-    await uow.subject_production_runs.add(run)
-
-    first = await api.post(
-        f"/api/subjects/{subject_id}/production/brief/draft",
-        json={"content": "première version"},
-    )
-    second = await api.post(
-        f"/api/subjects/{subject_id}/production/brief/draft",
-        json={"content": "seconde version"},
-    )
-
-    assert first.status_code == 200, first.text
-    assert second.status_code == 200, second.text
-    assert [artifact.version for artifact in uow.production_artifacts.items] == [1, 2]
-    assert second.json()["draft_version"] == 2
 
 
 def _ready_run(edition_id: UUID, subject_id: UUID, *, run_number: int = 1) -> SubjectProductionRun:

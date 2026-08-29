@@ -39,8 +39,7 @@ async def test_cumulative_snapshot_identity_and_contribution_round_trip(
         period_end=date(2026, 7, 31),
         tlp=TLP.AMBER,
         languages=("fr", "en"),
-        target_major_articles=2,
-        target_briefs=6,
+        target_articles=8,
         source_profile="iran-default",
     )
     run = ModelRun(

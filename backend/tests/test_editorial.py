@@ -139,10 +139,10 @@ async def test_active_snapshot_creates_one_group_per_durable_subject() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ioc_signal_auto_selects_brief_even_above_target_and_audits_once() -> None:
+async def test_ioc_signal_auto_selects_article_even_above_target_and_audits_once() -> None:
     uow = InMemoryEditorialUnitOfWorkFactory()
     edition = _edition()
-    edition.target_briefs = 0
+    edition.target_articles = 0
     uow.editions[edition.id] = edition
     candidate = _candidate("IOC campaign", "https://example.test/ioc")
     candidate.iocs = ("203.0.113.10",)
@@ -156,7 +156,6 @@ async def test_ioc_signal_auto_selects_brief_even_above_target_and_audits_once()
     second = await service.synchronize(edition.id)
 
     assert first[0].status is EditorialGroupStatus.SELECTED
-    assert first[0].editorial_type is None
     assert second[0].id == first[0].id
     assert second[0].subject_id == first[0].subject_id
     assert len(uow.subjects) == 1
@@ -169,7 +168,7 @@ async def test_ioc_signal_auto_selects_brief_even_above_target_and_audits_once()
 
 
 @pytest.mark.asyncio
-async def test_source_ioc_signal_auto_selects_brief() -> None:
+async def test_source_ioc_signal_auto_selects_article() -> None:
     uow = InMemoryEditorialUnitOfWorkFactory()
     edition = _edition()
     uow.editions[edition.id] = edition
@@ -184,7 +183,6 @@ async def test_source_ioc_signal_auto_selects_brief() -> None:
     groups = await EditorialGroupingService(uow).synchronize(edition.id)
 
     assert groups[0].status is EditorialGroupStatus.SELECTED
-    assert groups[0].editorial_type is None
 
 
 @pytest.mark.asyncio

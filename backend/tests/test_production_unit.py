@@ -20,11 +20,9 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
-    next_stage,
 )
 
 
@@ -55,7 +53,6 @@ class TestSubjectProductionRunStates:
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         assert run.current_stage is SubjectProductionStage.SOURCES
@@ -76,7 +73,6 @@ class TestSubjectProductionRunStates:
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         run.start_running(now=datetime.now(UTC))
@@ -89,7 +85,6 @@ class TestSubjectProductionRunStates:
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         run.start_running(now=datetime.now(UTC))
@@ -109,7 +104,6 @@ class TestSubjectProductionRunStates:
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         run.start_running(now=datetime.now(UTC))
@@ -127,7 +121,6 @@ class TestSubjectProductionRunStates:
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         run.start_running(now=datetime.now(UTC))
@@ -140,7 +133,6 @@ class TestSubjectProductionRunStates:
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         run.start_running(now=datetime.now(UTC))
@@ -157,13 +149,11 @@ class TestEditionProductionBatch:
         batch = EditionProductionBatch(
             id=uuid4(),
             edition_id=edition_id,
-            profile=ProductionProfile.BRIEF_AUTO,
             status="queued",
         )
 
         assert batch.edition_id == edition_id
         assert batch.status == "queued"
-        assert batch.profile == ProductionProfile.BRIEF_AUTO
         assert batch.started_at is None
 
     def test_batch_start_transitions_to_running(self) -> None:
@@ -172,7 +162,6 @@ class TestEditionProductionBatch:
         batch = EditionProductionBatch(
             id=uuid4(),
             edition_id=edition_id,
-            profile=ProductionProfile.BRIEF_AUTO,
             status="queued",
         )
 
@@ -185,7 +174,6 @@ class TestEditionProductionBatch:
         batch = EditionProductionBatch(
             id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
             status="running",
             started_at=datetime.now(UTC),
         )
@@ -199,7 +187,6 @@ class TestEditionProductionBatch:
         batch = EditionProductionBatch(
             id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
             status="running",
             started_at=datetime.now(UTC),
         )
@@ -208,60 +195,6 @@ class TestEditionProductionBatch:
 
         assert batch.status == "completed_with_issues"
         assert batch.finished_at is not None
-
-
-class TestProductionProfileVariants:
-    def test_brief_auto_profile(self) -> None:
-        run = SubjectProductionRun(
-            subject_id=uuid4(),
-            edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
-        )
-
-        assert run.profile == ProductionProfile.BRIEF_AUTO
-
-    def test_major_assisted_profile(self) -> None:
-        run = SubjectProductionRun(
-            subject_id=uuid4(),
-            edition_id=uuid4(),
-            profile=ProductionProfile.MAJOR_ASSISTED,
-        )
-
-        assert run.profile == ProductionProfile.MAJOR_ASSISTED
-
-    def test_major_import_resume_clears_terminal_fields(self) -> None:
-        moment = datetime.now(UTC)
-        run = SubjectProductionRun(
-            subject_id=uuid4(),
-            edition_id=uuid4(),
-            profile=ProductionProfile.MAJOR_ASSISTED,
-            research_date=moment.date(),
-            started_at=moment,
-            finished_at=moment,
-            error_code="imported_production_state",
-            error_message="stale import message",
-            error_details={"stale": True},
-        )
-
-        run.resume_verified_import_at_analyst_research(now=moment)
-
-        assert run.status == SubjectProductionStatus.RUNNING
-        assert run.current_stage == SubjectProductionStage.ANALYST_RESEARCH
-        assert run.started_at == moment
-        assert run.finished_at is None
-        assert run.error_code is None
-        assert run.error_message is None
-        assert run.error_details is None
-
-    def test_profile_progression_is_explicit(self) -> None:
-        assert (
-            next_stage(ProductionProfile.BRIEF_AUTO, SubjectProductionStage.SYNTHESIS)
-            is SubjectProductionStage.ASSEMBLY
-        )
-        assert (
-            next_stage(ProductionProfile.MAJOR_ASSISTED, SubjectProductionStage.SYNTHESIS)
-            is SubjectProductionStage.ANALYST_RESEARCH
-        )
 
 
 class TestAnalystInvestigation:

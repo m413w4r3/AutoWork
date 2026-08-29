@@ -25,7 +25,6 @@ from cti_app.domain.production import (
     LoopBudget,
     ProductionArtifact,
     ProductionArtifactStage,
-    ProductionProfile,
     SubjectProductionRun,
 )
 from cti_app.infrastructure.database.models.invariants import (
@@ -53,15 +52,13 @@ async def _make_investigation(session_factory, suffix: str) -> AnalystInvestigat
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
         languages=("en",),
-        target_major_articles=1,
-        target_briefs=1,
+        target_articles=2,
         source_profile="p09-test",
     )
     subject = Subject(external_id=f"P09-{suffix}", slug=f"p09-{suffix}", tlp=TLP.AMBER)
     run = SubjectProductionRun(
         subject_id=subject.id,
         edition_id=edition.id,
-        profile=ProductionProfile.BRIEF_AUTO,
     )
     artifact = ProductionArtifact(
         production_run_id=run.id,

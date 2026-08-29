@@ -139,7 +139,7 @@ describe("JobStatusCard", () => {
     vi.stubGlobal("EventSource", undefined);
     const failed = {
       id: "4de4af61-811e-4c1c-ad4a-9b39a5c06c94",
-      kind: "brief.generate",
+      kind: "production.subject.synthesis",
       aggregate_type: "subject",
       aggregate_id: "b131b279-d486-4af2-a1b8-c3579583b97e",
       status: "failed",

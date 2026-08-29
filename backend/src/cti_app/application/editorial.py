@@ -23,7 +23,6 @@ from cti_app.domain.editorial import (
     EditorialGroup,
     EditorialGroupStatus,
     EditorialScore,
-    EditorialType,
     GroupingConfidence,
     GroupingOutcome,
     HumanDecision,
@@ -43,9 +42,6 @@ class EditorialActionError(ValueError):
 class EditorialDecisionValue(StrEnum):
     ARTICLE = "article"
     IGNORE = "ignore"
-    # Historical integrations are read-only compatibility paths.
-    BRIEF = "brief"
-    MAJOR = "major"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,10 +61,6 @@ class EditorialAutoSelectionPolicyV1:
 
     def should_select_article(self, candidates: Sequence[CandidateTopic]) -> bool:
         return any(_candidate_has_ioc_signal(candidate) for candidate in candidates)
-
-    def should_select_brief(self, candidates: Sequence[CandidateTopic]) -> bool:
-        """Historical policy name."""
-        return self.should_select_article(candidates)
 
 class WorkspaceMaterializer(Protocol):
     async def materialize(
@@ -90,22 +82,6 @@ class EditorialBoard:
     ignored: int
     undecided: int
     target_articles: int
-
-    @property
-    def selected_briefs(self) -> int:
-        return self.selected_articles
-
-    @property
-    def selected_major(self) -> int:
-        return 0
-
-    @property
-    def target_briefs(self) -> int:
-        return self.target_articles
-
-    @property
-    def target_major(self) -> int:
-        return 0
 
 class EditorialGroupingService:
     def __init__(
@@ -236,7 +212,7 @@ class EditorialGroupingService:
                 selected_articles=len(selected),
                 ignored=len(ignored),
                 undecided=len(undecided),
-                target_articles=edition.target_articles or 0,
+                target_articles=edition.target_articles,
             )
 
     async def decide_many(
@@ -297,12 +273,6 @@ class EditorialGroupingService:
                     uow,
                     edition,
                     group,
-                    legacy_editorial_type=(
-                        EditorialType(command.decision.value)
-                        if command.decision
-                        in {EditorialDecisionValue.BRIEF, EditorialDecisionValue.MAJOR}
-                        else None
-                    ),
                     actor_id=actor_id,
                     correlation_id=correlation_id,
                     batch_confirmation=True,
@@ -408,7 +378,6 @@ class EditorialGroupingService:
         self,
         edition_id: UUID,
         group_id: UUID,
-        legacy_editorial_type: EditorialType | None = None,
         *,
         reason: str,
         actor_id: str,
@@ -437,7 +406,6 @@ class EditorialGroupingService:
         self,
         edition_id: UUID,
         group_id: UUID,
-        legacy_editorial_type: EditorialType | None = None,
         *,
         actor_id: str,
         correlation_id: str,
@@ -451,7 +419,6 @@ class EditorialGroupingService:
                 uow,
                 edition,
                 group,
-                legacy_editorial_type=legacy_editorial_type,
                 actor_id=actor_id,
                 correlation_id=correlation_id,
             )
@@ -463,7 +430,6 @@ class EditorialGroupingService:
         uow: UnitOfWork,
         edition: Edition,
         group: EditorialGroup,
-        legacy_editorial_type: EditorialType | None = None,
         *,
         actor_id: str,
         correlation_id: str,
@@ -482,8 +448,6 @@ class EditorialGroupingService:
         if self._materializer is not None:
             await self._materializer.materialize(subject, (), (), {}, self._workspace_root)
         group.select(subject.id)
-        if legacy_editorial_type is not None:
-            group.editorial_type = legacy_editorial_type
         await uow.editorial_groups.save(group)
         payload: dict[str, object] = {
             "subject_id": str(subject.id),

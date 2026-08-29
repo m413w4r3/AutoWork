@@ -28,10 +28,9 @@ def _artifact(stage: ProductionArtifactStage) -> ProductionArtifact:
 
 
 class _Repository:
-    def __init__(self, publication: ProductionArtifact | None, brief: ProductionArtifact | None):
+    def __init__(self, publication: ProductionArtifact | None):
         self.artifacts = {
             ProductionArtifactStage.PUBLICATION.value: publication,
-            ProductionArtifactStage.BRIEF.value: brief,
         }
         self.calls: list[str] = []
 
@@ -44,19 +43,18 @@ class _Repository:
 @pytest.mark.asyncio
 async def test_publication_resolver_prefers_current_publication() -> None:
     publication = _artifact(ProductionArtifactStage.PUBLICATION)
-    repository = _Repository(publication, _artifact(ProductionArtifactStage.BRIEF))
+    repository = _Repository(publication)
 
     assert await current_publication_artifact(repository, RUN_ID) is publication
     assert repository.calls == ["publication"]
 
 
 @pytest.mark.asyncio
-async def test_publication_resolver_falls_back_to_historical_brief() -> None:
-    brief = _artifact(ProductionArtifactStage.BRIEF)
-    repository = _Repository(None, brief)
+async def test_publication_resolver_does_not_fall_back_to_other_stages() -> None:
+    repository = _Repository(None)
 
-    assert await current_publication_artifact(repository, RUN_ID) is brief
-    assert repository.calls == ["publication", "brief"]
+    assert await current_publication_artifact(repository, RUN_ID) is None
+    assert repository.calls == ["publication"]
 
 
 def test_current_pipeline_contains_only_the_five_article_stages() -> None:

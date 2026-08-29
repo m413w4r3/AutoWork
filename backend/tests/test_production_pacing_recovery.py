@@ -16,7 +16,6 @@ from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
     ProductionBatchPhase,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -115,7 +114,6 @@ def _failed_run(edition_id: UUID, subject_id: UUID, code: str) -> SubjectProduct
     run = SubjectProductionRun(
         subject_id=subject_id,
         edition_id=edition_id,
-        profile=ProductionProfile.BRIEF_AUTO,
         current_stage=SubjectProductionStage.SOURCES,
     )
     run.start_running()
@@ -128,7 +126,6 @@ def _batch_uow(codes: list[str]) -> tuple[_Uow, list[SubjectProductionRun]]:
     runs = [_failed_run(edition_id, uuid4(), code) for code in codes]
     batch = EditionProductionBatch(
         edition_id=edition_id,
-        profile=ProductionProfile.BRIEF_AUTO,
         status="running",
     )
     items = [
@@ -148,8 +145,7 @@ def _batch_uow(codes: list[str]) -> tuple[_Uow, list[SubjectProductionRun]]:
         period_end=date(2026, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_major_articles=0,
-        target_briefs=len(runs),
+        target_articles=len(runs),
         source_profile="default",
         status=EditionStatus.PRODUCTION,
     )
@@ -324,7 +320,7 @@ async def test_stage_dispatch_uses_model_jitter_and_subject_override() -> None:
     )
     chain.bind(Jobs(), dispatcher)  # type: ignore[arg-type]
     run = SubjectProductionRun(
-        subject_id=uuid4(), edition_id=uuid4(), profile=ProductionProfile.BRIEF_AUTO
+        subject_id=uuid4(), edition_id=uuid4()
     )
 
     await chain.submit(
@@ -359,7 +355,6 @@ def test_business_retry_uses_fresh_conversations_per_stage(
     run = SubjectProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        profile=ProductionProfile.BRIEF_AUTO,
         references_conversation_id=references_id,
         synthesis_conversation_id=synthesis_id,
     )

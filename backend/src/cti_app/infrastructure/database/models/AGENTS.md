@@ -15,7 +15,6 @@ Database ORM model organization by bounded context.
 | **editorial.py** | Editorial decisions | EditorialGroups, HumanDecisions |
 | **collection.py** | Collections & evidence | Collection, Artifacts, Claims, Indicators |
 | **model_execution.py** | Model lifecycle | ModelRuns, Conversations, Execution lifecycle |
-| **briefs.py** | Evidence packs | EvidencePacks, Drafts |
 | **production.py** | Production runs | ProductionRuns, Artifacts, Batches |
 | **jobs.py** | Background jobs | Jobs, Events |
 

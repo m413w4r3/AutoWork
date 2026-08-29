@@ -36,8 +36,7 @@ async def test_editorial_group_round_trip_and_human_decision_is_append_only(
         period_end=date(2026, 9, 30),
         tlp=TLP.AMBER,
         languages=("fr", "en"),
-        target_major_articles=2,
-        target_briefs=6,
+        target_articles=8,
         source_profile="iran-default",
     )
     group = EditorialGroup(

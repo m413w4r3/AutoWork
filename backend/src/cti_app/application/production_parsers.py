@@ -608,7 +608,7 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
 def _editorial_title(body: str) -> str | None:
     for line in body.splitlines():
         match = _FIELD.match(line)
-        if match and _normalize_key(match.group("key")) in {"editorial-title", "brief-title"}:
+        if match and _normalize_key(match.group("key")) == "editorial-title":
             return match.group("value").strip() or None
     return None
 

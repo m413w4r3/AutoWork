@@ -1,9 +1,9 @@
-"""Deterministic rendering of the final brief.
+"""Deterministic rendering helpers for the final publication.
 
 AutoWork owns the reference numbering, not the model: `[S1]` is an id local to
 one conversation, `[1]` is what the reader sees. Numbers are assigned by first
 use in the synthesis so the text reads in order, and a source keeps its number
-for the whole brief.
+for the whole publication.
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ def collect_indicators(extraction: TechnicalExtraction) -> list[ExtractionItem]:
     return out
 
 
-def render_brief(
+def render_publication_markdown(
     *,
     subject_title: str,
     report: ReferenceReport,
@@ -107,7 +107,7 @@ def render_brief(
     synthesis_text: str,
     numbering: dict[str, int],
 ) -> str:
-    """Render the brief: title, chronology, synthesis, indicators."""
+    """Render the publication: title, chronology, synthesis, indicators."""
     lines: list[str] = [f"# {subject_title}", ""]
 
     lines.append("## Références")

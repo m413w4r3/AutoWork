@@ -20,7 +20,6 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    ProductionProfile,
     SubjectProductionRun,
 )
 
@@ -90,7 +89,7 @@ class _Store:
 
 def test_pack_is_canonical_and_uses_only_accepted_structured_file_indicators() -> None:
     run = SubjectProductionRun(
-        subject_id=uuid4(), edition_id=uuid4(), profile=ProductionProfile.MAJOR_ASSISTED
+        subject_id=uuid4(), edition_id=uuid4()
     )
     synthesis = ProductionArtifact(
         production_run_id=run.id,
@@ -181,7 +180,6 @@ async def test_handoff_is_idempotent_and_only_uses_q2_structured_indicators() ->
     run = SubjectProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        profile=ProductionProfile.MAJOR_ASSISTED,
         research_date=date(2026, 8, 26),
     )
     synthesis = ProductionArtifact(
@@ -247,7 +245,6 @@ async def test_handoff_rejects_an_inconsistent_existing_pack() -> None:
     run = SubjectProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        profile=ProductionProfile.MAJOR_ASSISTED,
         research_date=date(2026, 8, 26),
     )
     synthesis = ProductionArtifact(

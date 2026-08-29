@@ -22,7 +22,6 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -59,8 +58,7 @@ def _edition(status: EditionStatus = EditionStatus.REVIEW) -> Edition:
         period_end=date(2026, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_major_articles=0,
-        target_briefs=1,
+        target_articles=1,
         source_profile="test",
         status=status,
     )
@@ -73,7 +71,6 @@ def _run(status: SubjectProductionStatus, generation: int = 2) -> SubjectProduct
         id=RUN_ID,
         subject_id=SUBJECT_ID,
         edition_id=EDITION_ID,
-        profile=ProductionProfile.BRIEF_AUTO,
         status=status,
         current_stage=SubjectProductionStage.ASSEMBLY,
         pipeline_generation=generation,
@@ -145,7 +142,7 @@ class _Artifacts:
             id=ARTIFACT_ID,
             production_run_id=RUN_ID,
             subject_id=SUBJECT_ID,
-            stage=ProductionArtifactStage.BRIEF,
+            stage=ProductionArtifactStage.PUBLICATION,
             version=1,
             input_hash=INPUT_HASH,
             status=artifact_status,
@@ -155,7 +152,7 @@ class _Artifacts:
         )
 
     async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
-        return self.artifact if run_id == RUN_ID and stage == "brief" else None
+        return self.artifact if run_id == RUN_ID and stage == "publication" else None
 
 
 class _Decisions:
@@ -371,7 +368,7 @@ async def test_api_exclude_without_document_is_allowed_when_run_has_no_document(
             json={
                 "production_run_id": str(RUN_ID),
                 "pipeline_generation": 2,
-                "reason": "No brief was produced",
+                "reason": "No publication was produced",
             },
         )
     assert response.status_code == 200

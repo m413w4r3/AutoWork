@@ -1,6 +1,6 @@
 """Stage status exposed to the UI.
 
-SOURCES produces no artifact and ASSEMBLY produces the `brief` artifact, so a
+SOURCES produces no artifact and ASSEMBLY produces the `publication` artifact, so a
 naive artifact-driven mapping reports SOURCES as pending forever.
 """
 
@@ -13,7 +13,6 @@ from cti_app.application.production_stage_status import (
     completed_stage_count,
 )
 from cti_app.domain.production import (
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
 )
@@ -23,7 +22,6 @@ def _run(stage: SubjectProductionStage) -> SubjectProductionRun:
     run = SubjectProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        profile=ProductionProfile.BRIEF_AUTO,
     )
     run.start_running()
     run.current_stage = stage

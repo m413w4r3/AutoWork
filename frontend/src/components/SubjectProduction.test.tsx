@@ -26,7 +26,6 @@ function status(
   return {
     subject_id: SUBJECT_ID,
     title: "TAG-182 et MarkiRAT",
-    editorial_type: "brief",
     status: runStatus,
     current_stage: currentStage,
     progress_current: 2,

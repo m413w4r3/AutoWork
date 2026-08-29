@@ -5,7 +5,6 @@ from uuid import NAMESPACE_URL, uuid5
 from fastapi import FastAPI, Request
 from minio import Minio
 
-from cti_app.api.briefs import router as briefs_router
 from cti_app.api.collection import router as collection_router
 from cti_app.api.discovery import router as discovery_router
 from cti_app.api.discovery_merge import merge_runs_router
@@ -19,7 +18,6 @@ from cti_app.api.production import router as production_router
 from cti_app.api.publication import router as publication_router
 from cti_app.api.subject_content import router as subject_content_router
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.briefs import BriefService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.diagnostics import DiagnosticsLog
@@ -213,7 +211,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory,
         blob_store,
     )
-    brief_service = BriefService(uow_factory, blob_store, model_gateway)
     model_conversation_service = ModelConversationService(
         uow_factory,
         model_gateway,
@@ -242,7 +239,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model_gateway,
         discovery_service,
         collection_service,
-        brief_service,
         uow_factory,
         model_conversation_service=model_conversation_service,
         production_chain=production_chain,
@@ -274,7 +270,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.editorial_service = editorial_service
     app.state.collection_service = collection_service
     app.state.collection_review_service = collection_review_service
-    app.state.brief_service = brief_service
     app.state.subject_production_service = subject_production_service
     app.state.edition_production_service = edition_production_service
     app.state.edition_review_service = EditionReviewService(uow_factory)
@@ -317,7 +312,6 @@ def create_app() -> FastAPI:
     application.include_router(editorial_router)
     application.include_router(jobs_router)
     application.include_router(collection_router)
-    application.include_router(briefs_router)
     application.include_router(model_conversations_router)
     application.include_router(production_router)
     application.include_router(publication_router)

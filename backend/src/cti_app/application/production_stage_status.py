@@ -19,8 +19,6 @@ _STAGE_ARTIFACT: dict[SubjectProductionStage, ProductionArtifactStage | None] = 
     SubjectProductionStage.REFERENCES: ProductionArtifactStage.REFERENCES,
     SubjectProductionStage.EXTRACTION: ProductionArtifactStage.EXTRACTION,
     SubjectProductionStage.SYNTHESIS: ProductionArtifactStage.SYNTHESIS,
-    SubjectProductionStage.ANALYST_RESEARCH: None,
-    SubjectProductionStage.ANALYST_NOTE: None,
     SubjectProductionStage.ASSEMBLY: ProductionArtifactStage.PUBLICATION,
 }
 
@@ -37,14 +35,7 @@ def build_stage_statuses(
     a terminal run reports its outcome on the stage it stopped at.
     """
     stages_for_pipeline = production_stages()
-    # A terminal legacy run may still point at an analyst checkpoint. Keep it
-    # readable through the generic production model without exposing or
-    # scheduling that historical stage.
-    current_stage = (
-        run.current_stage
-        if run.current_stage in stages_for_pipeline
-        else SubjectProductionStage.ASSEMBLY
-    )
+    current_stage = run.current_stage
     current_index = stages_for_pipeline.index(current_stage)
     statuses: dict[str, dict[str, Any]] = {}
 

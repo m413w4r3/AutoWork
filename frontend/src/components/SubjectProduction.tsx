@@ -205,18 +205,14 @@ export function SubjectProduction({
   const completedStages = stageList.filter(
     (stage) => stages[stage]?.status === "succeeded",
   ).length;
-  const issueStageIndex = RETRY_STAGES.indexOf(
-    status.current_stage as RetryStage,
-  );
+  const issueStageIndex = RETRY_STAGES.indexOf(status.current_stage);
   const retryStages: readonly RetryStage[] =
     status.status === "ready"
       ? RETRY_STAGES
       : showIssue && issueStageIndex >= 0
         ? RETRY_STAGES.slice(0, issueStageIndex + 1)
         : [];
-  const issueRetryStage = showIssue
-    ? (status.current_stage as RetryStage)
-    : null;
+  const issueRetryStage = showIssue ? status.current_stage : null;
 
   return (
     <section className="production-panel">

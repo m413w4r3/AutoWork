@@ -6,13 +6,7 @@ export type ReviewRunStatus =
   "queued" | "running" | "ready" | "needs_review" | "failed" | "cancelled";
 
 export type ReviewRetryStage =
-  | "sources"
-  | "references"
-  | "extraction"
-  | "synthesis"
-  | "analyst_research"
-  | "analyst_note"
-  | "assembly";
+  "sources" | "references" | "extraction" | "synthesis" | "assembly";
 
 export type AssemblyJobStatus =
   "queued" | "running" | "waiting_human" | "succeeded" | "failed" | "cancelled";

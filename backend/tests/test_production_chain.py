@@ -25,7 +25,6 @@ from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -227,7 +226,6 @@ def _run(uow: _Uow, stage: SubjectProductionStage) -> SubjectProductionRun:
     run = SubjectProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        profile=ProductionProfile.BRIEF_AUTO,
     )
     run.start_running()
     run.current_stage = stage
@@ -322,7 +320,6 @@ def _batch_of(uow: _Uow, first: SubjectProductionRun) -> SubjectProductionRun:
     """A two-subject batch whose second subject is still queued."""
     batch = EditionProductionBatch(
         edition_id=first.edition_id,
-        profile=ProductionProfile.BRIEF_AUTO,
         status="running",
     )
     uow.edition_production_batches.items[batch.id] = batch
@@ -330,7 +327,6 @@ def _batch_of(uow: _Uow, first: SubjectProductionRun) -> SubjectProductionRun:
     second = SubjectProductionRun(
         subject_id=uuid4(),
         edition_id=first.edition_id,
-        profile=ProductionProfile.BRIEF_AUTO,
     )
     uow.subject_production_runs.items[second.id] = second
 
@@ -490,7 +486,6 @@ async def test_recovery_dispatch_combines_subject_and_model_pacing(
     next_run.status = SubjectProductionStatus.RUNNING
     batch = EditionProductionBatch(
         edition_id=first.edition_id,
-        profile=ProductionProfile.BRIEF_AUTO,
         status="running",
     )
     uow.edition_production_batches.items[batch.id] = batch

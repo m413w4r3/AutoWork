@@ -56,7 +56,7 @@ def export_markdown_docx(
     )
     LOGGER.info("Pandoc version: %s", version.stdout.splitlines()[0])
     with tempfile.TemporaryDirectory(prefix="autowork-pandoc-") as directory:
-        markdown = Path(directory) / "brief.md"
+        markdown = Path(directory) / "publication.md"
         markdown.write_text(markdown_content, encoding="utf-8")
         try:
             completed = subprocess.run(

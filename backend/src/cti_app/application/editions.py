@@ -57,18 +57,6 @@ class EditionPage:
     page_size: int
 
 
-def _target_articles(
-    target_articles: int | None,
-    target_major_articles: int | None,
-    target_briefs: int | None,
-) -> int:
-    if target_articles is not None:
-        return target_articles
-    if target_major_articles is None or target_briefs is None:
-        raise ValueError("target_articles is required")
-    return target_major_articles + target_briefs
-
-
 class EditionService:
     def __init__(self, uow_factory: EditionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
@@ -82,15 +70,12 @@ class EditionService:
         period_end: date,
         tlp: TLP,
         languages: tuple[str, ...],
-        target_articles: int | None = None,
-        target_major_articles: int | None = None,
-        target_briefs: int | None = None,
+        target_articles: int,
         previous_edition_id: UUID | None,
         source_profile: str,
         actor_id: str,
         correlation_id: str,
     ) -> Edition:
-        target_articles = _target_articles(target_articles, target_major_articles, target_briefs)
         edition = Edition(
             country=country,
             country_code=country_code,
@@ -161,9 +146,7 @@ class EditionService:
         period_end: date,
         tlp: TLP,
         languages: tuple[str, ...],
-        target_articles: int | None = None,
-        target_major_articles: int | None = None,
-        target_briefs: int | None = None,
+        target_articles: int,
         previous_edition_id: UUID | None,
         source_profile: str,
         actor_id: str,
@@ -177,9 +160,6 @@ class EditionService:
                 raise EditionConcurrencyError("Edition was modified by another request")
             await self._validate_previous(uow, previous_edition_id, edition.id)
             before = edition.snapshot()
-            target_articles = _target_articles(
-                target_articles, target_major_articles, target_briefs
-            )
             edition.update_metadata(
                 country=country,
                 country_code=country_code,

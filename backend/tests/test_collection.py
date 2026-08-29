@@ -33,7 +33,6 @@ from cti_app.domain.editorial import (
     CandidateReference,
     EditorialGroup,
     EditorialScore,
-    EditorialType,
     GroupingConfidence,
     GroupingOutcome,
 )
@@ -124,8 +123,7 @@ def selected_subject(
         period_end=date(2026, 7, calendar.monthrange(2026, 7)[1]),
         tlp=TLP.AMBER,
         languages=("fr", "en"),
-        target_major_articles=1,
-        target_briefs=1,
+        target_articles=2,
         previous_edition_id=None,
         source_profile="default",
     )
@@ -189,7 +187,7 @@ def selected_subject(
         grouping_confidence=GroupingConfidence.HIGH,
         grouping_justification="test",
     )
-    group.select(EditorialType.MAJOR, subject.id)
+    group.select(subject.id)
     factory.editions[edition.id] = edition
     factory.subjects[subject.id] = subject
     factory.batches[batch.id] = batch

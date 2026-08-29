@@ -528,6 +528,6 @@ class ProductionStateService:
             status="needs_review",
             current_stage="assembly",
             imported_stages=("references", "extraction", "synthesis"),
-            schema_version=PRODUCTION_STATE_SCHEMA_VERSION,
+            schema_version=snapshot.schema_version,
             content_sha256=snapshot.content_sha256,
         )

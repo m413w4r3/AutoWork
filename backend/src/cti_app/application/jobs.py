@@ -611,7 +611,6 @@ def create_job_registry(
     model_gateway: object | None = None,
     discovery_service: object | None = None,
     collection_service: object | None = None,
-    brief_service: object | None = None,
     uow_factory: object | None = None,
     model_conversation_service: object | None = None,
     production_chain: object | None = None,
@@ -658,12 +657,6 @@ def create_job_registry(
         if not isinstance(collection_service, SubjectCollectionService):
             raise TypeError("collection_service must be a SubjectCollectionService")
         register_collection_jobs(registry, collection_service)
-    if brief_service is not None:
-        from cti_app.application.briefs import BriefService, register_brief_jobs
-
-        if not isinstance(brief_service, BriefService):
-            raise TypeError("brief_service must be a BriefService")
-        register_brief_jobs(registry, brief_service)
     if uow_factory is not None:
         from cti_app.application.diagnostics import DiagnosticsLog
         from cti_app.application.edition_workspace import EditionProductionCheckpointService
