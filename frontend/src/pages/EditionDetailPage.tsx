@@ -4,26 +4,19 @@ import { useState } from "react";
 import {
   deleteEdition,
   type Edition,
-  type EditionStatus,
   getEdition,
   transitionEdition,
 } from "../api/editions";
-import { EditorialBoard } from "../components/EditorialBoard";
 import { ErrorMessage } from "../components/ErrorMessage";
-import { DiscoveryPanel } from "../features/discovery/DiscoveryPanel";
-import { discoveryJobStorageKey } from "../features/discovery/discoveryStorage";
 import {
   StatusBadge,
   TlpBadge,
   formatPeriod,
-  statusLabels,
 } from "../features/editions/editionPresentation";
+import { EditionWorkflow } from "../features/edition-workflow/EditionWorkflow";
 import { Link, navigate } from "../routing";
 
 export function EditionDetailPage({ editionId }: { editionId: string }) {
-  const [discoveryRunning, setDiscoveryRunning] = useState(() =>
-    Boolean(window.localStorage.getItem(discoveryJobStorageKey(editionId))),
-  );
   const queryClient = useQueryClient();
   const [showDeletion, setShowDeletion] = useState(false);
   const [deletionConfirmation, setDeletionConfirmation] = useState("");
@@ -32,13 +25,7 @@ export function EditionDetailPage({ editionId }: { editionId: string }) {
     queryFn: () => getEdition(editionId),
   });
   const transition = useMutation({
-    mutationFn: ({
-      current,
-      target,
-    }: {
-      current: Edition;
-      target: EditionStatus;
-    }) => transitionEdition(current, target),
+    mutationFn: (current: Edition) => transitionEdition(current, "archived"),
     onSuccess: (updated) => {
       queryClient.setQueryData(["edition", editionId], updated);
       void queryClient.invalidateQueries({ queryKey: ["editions"] });
@@ -90,7 +77,7 @@ export function EditionDetailPage({ editionId }: { editionId: string }) {
           <dd>{current.target_major_articles}</dd>
         </div>
         <div>
-          <dt>Objectif indicatif de brèves</dt>
+          <dt>Objectif indicatif d’articles courts</dt>
           <dd>{current.target_briefs}</dd>
         </div>
         <div>
@@ -110,37 +97,24 @@ export function EditionDetailPage({ editionId }: { editionId: string }) {
           </dd>
         </div>
       </dl>
-      <DiscoveryPanel
-        editionId={current.id}
-        onRunningChange={setDiscoveryRunning}
-      />
-      {!discoveryRunning ? <EditorialBoard editionId={current.id} /> : null}
-      <section className="actions-panel" aria-labelledby="edition-actions">
-        <h2 id="edition-actions">Actions disponibles</h2>
+      <EditionWorkflow edition={current} />
+      <section className="danger-zone" aria-labelledby="edition-archive">
+        <h2 id="edition-archive">Actions secondaires</h2>
         {transition.error ? (
           <ErrorMessage
             error={transition.error}
-            fallback="Transition impossible."
+            fallback="Archivage impossible."
           />
         ) : null}
-        {current.allowed_transitions.length === 0 ? (
-          <p>Aucune transition disponible.</p>
-        ) : (
-          <div className="action-list">
-            {current.allowed_transitions.map((target) => (
-              <button
-                key={target}
-                className={
-                  target === "archived" ? "button button--danger" : "button"
-                }
-                disabled={transition.isPending}
-                onClick={() => transition.mutate({ current, target })}
-              >
-                Passer à « {statusLabels[target]} »
-              </button>
-            ))}
-          </div>
-        )}
+        {current.allowed_transitions.includes("archived") ? (
+          <button
+            className="button button--secondary"
+            disabled={transition.isPending}
+            onClick={() => transition.mutate(current)}
+          >
+            {transition.isPending ? "Archivage…" : "Archiver l’édition"}
+          </button>
+        ) : null}
       </section>
       <section className="danger-zone" aria-labelledby="edition-deletion">
         <h2 id="edition-deletion">Zone dangereuse</h2>

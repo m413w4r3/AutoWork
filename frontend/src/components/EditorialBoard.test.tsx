@@ -167,11 +167,10 @@ it("désactive le polling malgré la valeur globale de production", async () => 
     expect(
       screen.getByText("Aucun groupe en attente de décision."),
     ).toBeInTheDocument();
-    // One for the board, one for the production batch status.
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
   await act(() => vi.advanceTimersByTimeAsync(60_000));
-  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(fetchMock).toHaveBeenCalledTimes(1);
 });
 
 it("propose quatre choix exclusifs et confirme les décisions dans un seul lot", async () => {
@@ -223,7 +222,7 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
     .closest("article")!;
   expect(within(first).getByRole("radio", { name: "À décider" })).toBeChecked();
   expect(
-    within(first).getByRole("radio", { name: "Brève" }),
+    within(first).getByRole("radio", { name: "Article" }),
   ).toBeInTheDocument();
   expect(
     within(first).getByRole("radio", {
@@ -241,7 +240,7 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
   expect(
     screen.getByRole("button", { name: "Confirmer la sélection (0)" }),
   ).toBeDisabled();
-  await user.click(within(first).getByRole("radio", { name: "Brève" }));
+  await user.click(within(first).getByRole("radio", { name: "Article" }));
   const second = screen
     .getAllByRole("heading", { name: "Campagne B" })[0]!
     .closest("article")!;
@@ -272,7 +271,7 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
   ]);
 });
 
-it("ajoute immédiatement un autre sujet aux brèves", async () => {
+it("ajoute immédiatement un autre sujet aux articles", async () => {
   const autoSelected = {
     ...groups[0],
     status: "selected" as const,
@@ -322,7 +321,7 @@ it("ajoute immédiatement un autre sujet aux brèves", async () => {
     .getAllByRole("heading", { name: "Campagne B" })[0]!
     .closest("article")!;
   await user.click(
-    within(other).getByRole("button", { name: "Ajouter aux brèves" }),
+    within(other).getByRole("button", { name: "Ajouter aux articles" }),
   );
 
   expect(postedBodies).toEqual([

@@ -1,5 +1,22 @@
 import { ApiError } from "./editions";
 
+export type SubjectProductionStatus =
+  "queued" | "running" | "ready" | "needs_review" | "failed" | "cancelled";
+
+export type SubjectProductionStage =
+  | "sources"
+  | "references"
+  | "extraction"
+  | "synthesis"
+  | "analyst_research"
+  | "analyst_note"
+  | "assembly";
+
+export type ProductionBatchPhase = "initial" | "recovery" | "review";
+
+type ProductionBatchStatus =
+  "queued" | "running" | "completed" | "completed_with_issues" | "cancelled";
+
 export interface StageStatus {
   status:
     | "pending"
@@ -21,9 +38,8 @@ export interface ProductionStatus {
   subject_id: string;
   title: string;
   editorial_type: string;
-  status:
-    "queued" | "running" | "ready" | "needs_review" | "failed" | "cancelled";
-  current_stage: string;
+  status: SubjectProductionStatus;
+  current_stage: SubjectProductionStage;
   progress_current: number;
   progress_total: number;
   references_conversation_id: string | null;
@@ -33,6 +49,9 @@ export interface ProductionStatus {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  error_details: Record<string, unknown> | null;
   /** Parser recoveries worth showing, never blocking. */
   warnings: string[];
   stages: Record<string, StageStatus>;
@@ -49,16 +68,21 @@ export interface BatchItemDetail {
   subject_id: string;
   title: string;
   run_id: string;
-  status: string;
-  current_stage: string;
+  status: SubjectProductionStatus;
+  current_stage: SubjectProductionStage;
+  pipeline_generation: number;
+  auto_recovery_count: number;
+  error_code: string | null;
+  error_message: string | null;
 }
 
 export interface BatchStatus {
   batch_id: string;
   edition_id: string;
   profile: string;
-  status:
-    "queued" | "running" | "completed" | "completed_with_issues" | "cancelled";
+  status: ProductionBatchStatus;
+  phase: ProductionBatchPhase;
+  next_dispatch_at: string | null;
   items: number;
   completed: number;
   needs_review: number;
@@ -295,22 +319,20 @@ export async function getBriefDraft(subjectId: string): Promise<{
   return requestOrNull(`/api/subjects/${subjectId}/production/brief/draft`);
 }
 
-// Edition Production API
+// Edition production API
 
 /**
  * Start batch production for an edition.
  *
- * Without `subjectIds` every selected brief of the edition is produced;
- * with it, only that subset.
+ * Without a subject list, every eligible subject of the edition is produced.
  */
-export async function startEditionBriefProduction(
+export async function startEditionProduction(
   editionId: string,
-  subjectIds?: string[],
 ): Promise<BatchStatus> {
   return request(`/api/editions/${editionId}/production/briefs`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ subject_ids: subjectIds ?? null }),
+    body: JSON.stringify({ subject_ids: null }),
   });
 }
 
@@ -319,7 +341,7 @@ export async function startEditionBriefProduction(
  *
  * Returns null when no batch has been started yet.
  */
-export async function getEditionBriefProduction(
+export async function getEditionProduction(
   editionId: string,
 ): Promise<BatchStatus | null> {
   return requestOrNull(`/api/editions/${editionId}/production/briefs`);

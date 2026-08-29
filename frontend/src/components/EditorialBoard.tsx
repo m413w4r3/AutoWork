@@ -10,7 +10,7 @@ import {
   type EditorialDecision,
   type EditorialGroup,
 } from "../api/editorial";
-import { ProductionQueue } from "./ProductionQueue";
+import { Link } from "../routing";
 
 const scoreLabels: Record<string, string> = {
   impact: "Impact",
@@ -39,8 +39,6 @@ type DecisionChoice = EditorialDecision | "undecided";
 export function EditorialBoard({ editionId }: { editionId: string }) {
   const queryClient = useQueryClient();
   const [checkedGroups, setCheckedGroups] = useState<string[]>([]);
-  // Subjects picked for production; the queue below acts on this list.
-  const [selectedSubjects, setSelectedSubjects] = useState<string[]>([]);
   const [drafts, setDrafts] = useState<Record<string, EditorialDecision>>({});
   const board = useQuery({
     queryKey: ["editorial-board", editionId],
@@ -57,13 +55,6 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
   });
 
   const draftEntries = useMemo(() => Object.entries(drafts), [drafts]);
-  const toggleSubject = (subjectId: string) =>
-    setSelectedSubjects((current) =>
-      current.includes(subjectId)
-        ? current.filter((id) => id !== subjectId)
-        : [...current, subjectId],
-    );
-
   if (board.isPending) return <p role="status">Regroupement des candidats…</p>;
   if (board.isError)
     return (
@@ -79,33 +70,17 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
   const ready = board.data.groups.filter(
     (group) => group.status === "selected",
   );
-  const automaticBriefs = ready.filter(
+  const automaticArticles = ready.filter(
     (group) => group.editorial_type === "brief" && hasIocSignal(group),
   );
-  const otherReady = ready.filter((group) => !automaticBriefs.includes(group));
-
-  // Selected briefs are what the batch production can act on.
-  const eligibleBriefs = ready.flatMap((group) =>
-    group.editorial_type === "brief" && group.subject_id
-      ? [{ subjectId: group.subject_id, title: group.title }]
-      : [],
-  );
-
-  const productionQueue = (
-    <div className="production-queue-section">
-      <ProductionQueue
-        editionId={editionId}
-        briefs={eligibleBriefs}
-        selectedSubjects={selectedSubjects}
-        onProduced={() => setSelectedSubjects([])}
-      />
-    </div>
+  const otherReady = ready.filter(
+    (group) => !automaticArticles.includes(group),
   );
   const proposedIds = new Set(proposed.map((group) => group.id));
   const activeDraftEntries = draftEntries.filter(([groupId]) =>
     proposedIds.has(groupId),
   );
-  const draftBriefs = activeDraftEntries.filter(
+  const draftArticles = activeDraftEntries.filter(
     ([, value]) => value === "brief",
   ).length;
   const draftMajor = activeDraftEntries.filter(
@@ -114,7 +89,7 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
   const draftIgnored = activeDraftEntries.filter(
     ([, value]) => value === "ignore",
   ).length;
-  const currentBriefs = board.data.selected_briefs + draftBriefs;
+  const currentArticles = board.data.selected_briefs + draftArticles;
   const currentMajor = board.data.selected_major + draftMajor;
   const currentIgnored =
     (board.data.ignored ??
@@ -125,7 +100,6 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
 
   return (
     <>
-      {productionQueue}
       <section
         className="editorial-board"
         aria-labelledby="editorial-board-heading"
@@ -136,7 +110,7 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
             <h2 id="editorial-board-heading">Sélection des sujets</h2>
           </div>
           <div className="selection-counter" aria-label="Décisions courantes">
-            <strong>{currentBriefs}</strong> brèves ·{" "}
+            <strong>{currentArticles}</strong> articles courts ·{" "}
             <strong>{currentMajor}</strong> articles approfondis ·{" "}
             <strong>{currentIgnored}</strong> ignorés ·{" "}
             <strong>{currentUndecided}</strong> encore à décider
@@ -164,7 +138,7 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
                   group={group}
                   decision={drafts[group.id] ?? "undecided"}
                   pending={action.isPending}
-                  onAddToBrief={() =>
+                  onAddToArticle={() =>
                     action.mutate(() =>
                       confirmEditorialDecisions(editionId, [
                         {
@@ -212,7 +186,7 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
         </section>
 
         <section className="ready-subjects" aria-labelledby="ready-heading">
-          {automaticBriefs.length > 0 ? (
+          {automaticArticles.length > 0 ? (
             <div
               className="automatic-ioc-subjects"
               aria-labelledby="automatic-ioc-heading"
@@ -221,20 +195,16 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
                 Ajoutées automatiquement — IOC détectés
               </h3>
               <p className="ready-indicator">
-                {automaticBriefs.length} brève
-                {automaticBriefs.length > 1 ? "s" : ""} ajoutée
-                {automaticBriefs.length > 1 ? "s" : ""} automatiquement.
+                {automaticArticles.length} article
+                {automaticArticles.length > 1 ? "s" : ""} ajouté
+                {automaticArticles.length > 1 ? "s" : ""} automatiquement.
               </p>
-              <SubjectList
-                groups={automaticBriefs}
-                selectedSubjects={selectedSubjects}
-                onToggle={toggleSubject}
-              />
+              <SubjectList groups={automaticArticles} />
             </div>
           ) : null}
           <h3 id="ready-heading">Prêts à traiter</h3>
           <p className="ready-indicator">
-            {ready.length} sujets prêts · {board.data.selected_briefs} brève
+            {ready.length} sujets prêts · {board.data.selected_briefs} article
             {board.data.selected_briefs > 1 ? "s" : ""} ·{" "}
             {board.data.selected_major} article
             {board.data.selected_major > 1 ? "s" : ""} principal
@@ -247,11 +217,7 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
               Les sujets sélectionnés automatiquement sont listés ci-dessus.
             </p>
           ) : (
-            <SubjectList
-              groups={otherReady}
-              selectedSubjects={selectedSubjects}
-              onToggle={toggleSubject}
-            />
+            <SubjectList groups={otherReady} />
           )}
         </section>
 
@@ -301,13 +267,13 @@ function EditorialDecisionCard({
   group,
   decision,
   pending,
-  onAddToBrief,
+  onAddToArticle,
   onDecision,
 }: {
   group: EditorialGroup;
   decision: DecisionChoice;
   pending: boolean;
-  onAddToBrief: () => void;
+  onAddToArticle: () => void;
   onDecision: (decision: DecisionChoice) => void;
 }) {
   const presentation = group.presentation ?? group.candidates[0]?.summary;
@@ -432,18 +398,18 @@ function EditorialDecisionCard({
         </div>
       ) : null}
       <button
-        className="button add-to-brief"
+        className="button add-to-article"
         disabled={pending}
-        onClick={onAddToBrief}
+        onClick={onAddToArticle}
       >
-        Ajouter aux brèves
+        Ajouter aux articles
       </button>
       <fieldset className="decision-options">
         <legend>Décision éditoriale</legend>
         {(
           [
             ["undecided", "À décider"],
-            ["brief", "Brève"],
+            ["brief", "Article"],
             ["major", "Article approfondi + pivots"],
             ["ignore", "Ignorer"],
           ] as const
@@ -465,39 +431,22 @@ function EditorialDecisionCard({
   );
 }
 
-function SubjectList({
-  groups,
-  selectedSubjects,
-  onToggle,
-}: {
-  groups: EditorialGroup[];
-  selectedSubjects: string[];
-  onToggle: (subjectId: string) => void;
-}) {
+function SubjectList({ groups }: { groups: EditorialGroup[] }) {
   return (
     <ul className="ready-subject-list">
       {groups.map((group) => {
-        const producible = group.editorial_type === "brief" && group.subject_id;
         return (
           <li key={group.id}>
-            {producible ? (
-              <input
-                type="checkbox"
-                aria-label={group.title}
-                checked={selectedSubjects.includes(group.subject_id!)}
-                onChange={() => onToggle(group.subject_id!)}
-              />
-            ) : null}
             <div>
               <strong>{group.title}</strong>
               <small>
                 {group.editorial_type === "brief"
-                  ? "Brève"
+                  ? "Article"
                   : "Article principal + pivots"}
               </small>
             </div>
             {group.subject_id ? (
-              <a href={`/subjects/${group.subject_id}`}>Ouvrir le sujet</a>
+              <Link to={`/subjects/${group.subject_id}`}>Ouvrir le sujet</Link>
             ) : null}
           </li>
         );

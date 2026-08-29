@@ -910,7 +910,7 @@ h1 {
 
 .workflow-steps {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0.5rem;
   margin: 1.25rem 0;
   padding: 0;
@@ -1346,10 +1346,115 @@ h1 {
   margin: 0.2rem 0;
 }
 
-.ready-subject-list li input[type="checkbox"] {
-  width: 1.15rem;
-  height: 1.15rem;
-  margin-right: 0.2rem;
+.edition-workflow {
+  display: grid;
+  gap: 1.25rem;
+  margin-bottom: 2rem;
+}
+
+.workflow-action {
+  display: grid;
+  justify-items: start;
+  gap: 0.75rem;
+}
+
+.production-start-panel,
+.workflow-placeholder {
+  display: grid;
+  gap: 0.8rem;
+  padding: 1.5rem;
+  border: 1px solid #d4ded7;
+  border-radius: 1rem;
+  background: #fff;
+}
+
+.production-start-panel h2,
+.workflow-placeholder h2 {
+  margin: 0;
+}
+
+.production-start-panel p,
+.workflow-placeholder p {
+  margin-bottom: 0;
+}
+
+.production-phase {
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid #b9cfc0;
+  border-radius: 0.65rem;
+  color: #294137;
+}
+
+.production-phase span {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.production-phase[data-phase="recovery"] {
+  background: #f7faf7;
+}
+
+.production-recovery-note {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border-left: 4px solid #527062;
+  background: #f7faf7;
+}
+
+.production-next-dispatch {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.production-console .production-counters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem 1.25rem;
+}
+
+.production-console .production-item-list li {
+  display: block;
+}
+
+.production-item__main {
+  display: grid;
+  grid-template-columns: 4rem minmax(0, 1fr) max-content;
+  align-items: center;
+  gap: 0.8rem;
+}
+
+.production-item__details,
+.production-item__error {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  margin: 0.45rem 0 0 4.8rem;
+  color: #55665c;
+  font-size: 0.85rem;
+}
+
+.production-item__error {
+  display: grid;
+  margin-top: 0.7rem;
+  color: #92443b;
+}
+
+.production-item__error small {
+  color: #6b4a45;
+}
+
+.production-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem 1.5rem;
+  padding: 1rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.7rem;
+  background: #f8fbf9;
 }
 
 /* Revue de fusion : la consolidation s'arrête ici quand elle hésite. */

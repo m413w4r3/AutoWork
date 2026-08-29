@@ -1,0 +1,246 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback } from "react";
+
+import { fetchEditorialBoard, type EditorialGroup } from "../../api/editorial";
+import {
+  getEditionProduction,
+  startEditionProduction,
+} from "../../api/production";
+import {
+  transitionEdition,
+  type Edition,
+  type EditionStatus,
+} from "../../api/editions";
+import { EditorialBoard } from "../../components/EditorialBoard";
+import { DiscoveryPanel } from "../discovery/DiscoveryPanel";
+import { ProductionConsole } from "./ProductionConsole";
+
+const WORKFLOW_STEPS = [
+  ["discovery", "Découverte"],
+  ["selection", "Sélection"],
+  ["production", "Production"],
+  ["review", "Revue"],
+  ["publication", "Publication"],
+] as const;
+
+function stepForStatus(status: EditionStatus): string {
+  if (status === "draft" || status === "discovery") return "discovery";
+  if (status === "selection") return "selection";
+  if (status === "production") return "production";
+  if (status === "review") return "review";
+  return "publication";
+}
+
+function WorkflowStepper({ status }: { status: EditionStatus }) {
+  const currentStep = stepForStatus(status);
+  return (
+    <ol className="workflow-steps" aria-label="Workflow de l’édition">
+      {WORKFLOW_STEPS.map(([step, label]) => (
+        <li key={step} aria-current={step === currentStep ? "step" : undefined}>
+          {label}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function StatusAction({
+  edition,
+  target,
+  children,
+}: {
+  edition: Edition;
+  target: EditionStatus;
+  children: React.ReactNode;
+}) {
+  const queryClient = useQueryClient();
+  const transition = useMutation({
+    mutationFn: () => transitionEdition(edition, target),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(["edition", edition.id], updated);
+      void queryClient.invalidateQueries({ queryKey: ["editions"] });
+    },
+  });
+
+  if (!edition.allowed_transitions.includes(target)) return null;
+  return (
+    <div className="workflow-action">
+      {transition.error ? (
+        <p className="error-message" role="alert">
+          {transition.error.message}
+        </p>
+      ) : null}
+      <button
+        className="button"
+        disabled={transition.isPending}
+        onClick={() => transition.mutate()}
+      >
+        {transition.isPending ? "Mise à jour…" : children}
+      </button>
+    </div>
+  );
+}
+
+function DiscoveryPhase({ edition }: { edition: Edition }) {
+  const onRunningChange = useCallback(() => undefined, []);
+  return (
+    <>
+      <DiscoveryPanel
+        editionId={edition.id}
+        onRunningChange={onRunningChange}
+      />
+      <StatusAction edition={edition} target="discovery">
+        Démarrer la découverte
+      </StatusAction>
+      {edition.status === "discovery" ? (
+        <StatusAction edition={edition} target="selection">
+          Ouvrir la sélection
+        </StatusAction>
+      ) : null}
+    </>
+  );
+}
+
+function isEligibleSubject(group: EditorialGroup): boolean {
+  return (
+    group.status === "selected" &&
+    group.editorial_type === "brief" &&
+    group.subject_id !== null
+  );
+}
+
+function SelectionPhase({ edition }: { edition: Edition }) {
+  const queryClient = useQueryClient();
+  const board = useQuery({
+    queryKey: ["editorial-board", edition.id],
+    queryFn: () => fetchEditorialBoard(edition.id),
+  });
+  const start = useMutation({
+    mutationFn: () => startEditionProduction(edition.id),
+    onSuccess: (batch) => {
+      queryClient.setQueryData(["batch", edition.id], batch);
+      void queryClient.invalidateQueries({ queryKey: ["batch", edition.id] });
+      void queryClient.invalidateQueries({ queryKey: ["edition", edition.id] });
+    },
+  });
+  const eligibleCount =
+    board.data?.groups.filter(isEligibleSubject).length ?? 0;
+
+  return (
+    <>
+      <EditorialBoard editionId={edition.id} />
+      <section
+        className="production-start-panel"
+        aria-labelledby="production-start-heading"
+      >
+        <p className="eyebrow">Production</p>
+        <h2 id="production-start-heading">
+          {eligibleCount} article{eligibleCount > 1 ? "s" : ""} éligible
+          {eligibleCount > 1 ? "s" : ""}
+        </h2>
+        <p>
+          La sélection éditoriale détermine les sujets qui seront envoyés au lot
+          de production.
+        </p>
+        {start.error ? (
+          <p className="error-message" role="alert">
+            Le lancement de la production a échoué : {String(start.error)}
+          </p>
+        ) : null}
+        <button
+          className="button"
+          disabled={start.isPending || eligibleCount === 0}
+          onClick={() => start.mutate()}
+        >
+          {start.isPending
+            ? "Lancement…"
+            : `Lancer la production de ${eligibleCount} article${eligibleCount > 1 ? "s" : ""}`}
+        </button>
+      </section>
+    </>
+  );
+}
+
+function ProductionSummary({
+  batch,
+}: {
+  batch: {
+    completed: number;
+    needs_review: number;
+    failed: number;
+    cancelled: number;
+  } | null;
+}) {
+  if (!batch) return null;
+  return (
+    <div className="production-summary" aria-label="Résumé de production">
+      <strong>{batch.completed} prêts</strong>
+      <strong>{batch.needs_review} à vérifier</strong>
+      <strong>{batch.failed} échecs</strong>
+      {batch.cancelled > 0 ? <strong>{batch.cancelled} annulés</strong> : null}
+    </div>
+  );
+}
+
+function ReviewPhase({ editionId }: { editionId: string }) {
+  const batch = useQuery({
+    queryKey: ["batch", editionId],
+    queryFn: () => getEditionProduction(editionId),
+  });
+  return (
+    <section className="workflow-placeholder" aria-labelledby="review-heading">
+      <p className="eyebrow">Revue</p>
+      <h2 id="review-heading">Production terminée</h2>
+      <ProductionSummary batch={batch.data ?? null} />
+      <p>La revue détaillée sera disponible à l’étape suivante.</p>
+    </section>
+  );
+}
+
+function PlaceholderPhase({
+  status,
+}: {
+  status: "assembling" | "published" | "archived";
+}) {
+  const copy = {
+    assembling: ["Publication en cours", "L’assemblage final est en cours."],
+    published: ["Publication", "L’édition est publiée."],
+    archived: [
+      "Édition archivée",
+      "Cette édition est disponible en lecture seule.",
+    ],
+  } as const;
+  const [title, description] = copy[status];
+  return (
+    <section className="workflow-placeholder" aria-live="polite">
+      <p className="eyebrow">Publication</p>
+      <h2>{title}</h2>
+      <p>{description}</p>
+    </section>
+  );
+}
+
+export function EditionWorkflow({ edition }: { edition: Edition }) {
+  return (
+    <section className="edition-workflow" aria-label="Workflow de l’édition">
+      <WorkflowStepper status={edition.status} />
+      {edition.status === "draft" || edition.status === "discovery" ? (
+        <DiscoveryPhase edition={edition} />
+      ) : null}
+      {edition.status === "selection" ? (
+        <SelectionPhase edition={edition} />
+      ) : null}
+      {edition.status === "production" ? (
+        <ProductionConsole editionId={edition.id} />
+      ) : null}
+      {edition.status === "review" ? (
+        <ReviewPhase editionId={edition.id} />
+      ) : null}
+      {edition.status === "assembling" ||
+      edition.status === "published" ||
+      edition.status === "archived" ? (
+        <PlaceholderPhase status={edition.status} />
+      ) : null}
+    </section>
+  );
+}

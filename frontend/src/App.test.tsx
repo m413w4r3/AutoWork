@@ -150,7 +150,7 @@ describe("App éditions", () => {
     ).toBeInTheDocument();
   });
 
-  it("crée une édition Iran et n’affiche que les transitions autorisées", async () => {
+  it("crée une édition Iran et affiche les actions de workflow autorisées", async () => {
     const fetchMock = vi.fn(
       withProductionNotStarted(
         (input: RequestInfo | URL, init?: RequestInit) => {
@@ -203,10 +203,10 @@ describe("App éditions", () => {
       await screen.findByRole("heading", { name: "Iran" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Passer à « Découverte »" }),
+      screen.getByRole("button", { name: "Démarrer la découverte" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Passer à « Archivée »" }),
+      screen.getByRole("button", { name: "Archiver l’édition" }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /Publiée/ }),
@@ -307,7 +307,7 @@ describe("App éditions", () => {
 
     expect(await screen.findByText("Terminée")).toBeInTheDocument();
     expect(
-      await screen.findByRole("heading", { name: "Sélection des sujets" }),
+      await screen.findByRole("heading", { name: "Sujets candidats" }),
     ).toBeInTheDocument();
     expect(
       window.localStorage.getItem(`cti-discovery-job:${iranEdition.id}`),
@@ -792,7 +792,7 @@ describe("App éditions", () => {
     // Et la sélection des sujets ne se met à jour qu'une fois ce job
     // terminal, en montrant le sujet consolidé.
     expect(
-      await screen.findByRole("heading", { name: "Sélection des sujets" }),
+      await screen.findByRole("heading", { name: "Sujets candidats" }),
     ).toBeInTheDocument();
     expect(candidatesCallCount).toBeGreaterThan(1);
     expect(

@@ -56,6 +56,9 @@ function productionStatus(
     created_at: "2026-08-20T12:00:00Z",
     started_at: "2026-08-20T12:00:00Z",
     finished_at: "2026-08-20T12:30:00Z",
+    error_code: null,
+    error_message: null,
+    error_details: null,
     warnings: [],
     stages: {},
   };
