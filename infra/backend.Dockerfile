@@ -15,7 +15,7 @@ COPY backend/pyproject.toml backend/uv.lock backend/README.md backend/alembic.in
 COPY backend/migrations ./migrations
 COPY backend/src ./src
 COPY backend/assets ./assets
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --no-group analysis
 
 ENV PATH="/app/.venv/bin:$PATH"
 CMD ["uvicorn", "cti_app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

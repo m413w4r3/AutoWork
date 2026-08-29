@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
   ProductionStatus,
+  ProductionStateSnapshotV2,
   ProductionStateSnapshotV1,
 } from "../api/production";
 import { ProductionStateTransfer } from "./ProductionStateTransfer";
@@ -35,6 +36,15 @@ const snapshot: ProductionStateSnapshotV1 = {
     synthesis: { input_hash: "c", rendered_content: "Synthèse" },
   },
   content_sha256: "d",
+};
+
+const snapshotV2: ProductionStateSnapshotV2 = {
+  ...snapshot,
+  schema_version: 2,
+  origin: {
+    subject_title: "Campagne d’Iran",
+    research_date: null,
+  },
 };
 
 function productionStatus(
@@ -84,14 +94,14 @@ function responseFor(input: RequestInfo | URL, init?: RequestInit): Response {
       : input instanceof URL
         ? input.href
         : input.url;
-  if (url.endsWith("/state/export")) return Response.json(snapshot);
+  if (url.endsWith("/state/export")) return Response.json(snapshotV2);
   if (url.endsWith("/state/import") && init?.method === "POST") {
     return Response.json({
       run_id: "run-imported",
       status: "needs_review",
       current_stage: "assembly",
       imported_stages: ["references", "extraction", "synthesis"],
-      schema_version: 1,
+      schema_version: 2,
       content_sha256: "d",
     });
   }
@@ -149,6 +159,65 @@ describe("ProductionStateTransfer", () => {
     expect(screen.getByText(/Exporté le :/)).toBeInTheDocument();
     expect(screen.getAllByText(/✓/)).toHaveLength(3);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("recharge immédiatement le V2 produit par l’export et l’importe", async () => {
+    const fetchMock = vi.fn(responseFor);
+    vi.stubGlobal("fetch", fetchMock);
+    let exportedBlob: Blob | undefined;
+    const createObjectURL = vi.fn((blob: Blob) => {
+      exportedBlob = blob;
+      return "blob:round-trip";
+    });
+    Object.defineProperty(URL, "createObjectURL", {
+      value: createObjectURL,
+      configurable: true,
+    });
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "revokeObjectURL", {
+      value: revokeObjectURL,
+      configurable: true,
+    });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(
+      () => undefined,
+    );
+    renderTransfer(productionStatus("ready"));
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Exporter l’état" }),
+    );
+    await waitFor(() => expect(exportedBlob).toBeDefined());
+    const blob = exportedBlob;
+    if (!blob) throw new Error("Export did not create a Blob");
+    const exportedJson = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === "string") resolve(reader.result);
+        else reject(new Error("Exported Blob was not text"));
+      };
+      reader.onerror = () =>
+        reject(reader.error ?? new Error("Unable to read Blob"));
+      reader.readAsText(blob);
+    });
+    const file = new File([exportedJson], "round-trip.json", {
+      type: "application/json",
+    });
+    await userEvent.upload(screen.getByLabelText("Importer un état"), file);
+
+    expect(
+      await screen.findByText("Format : AutoWork production-state v2"),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Importer" }),
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    const body = fetchMock.mock.calls[1]?.[1]?.body;
+    if (typeof body !== "string")
+      throw new Error("Import request has no JSON body");
+    expect(JSON.parse(body)).toMatchObject({
+      schema_version: 2,
+      origin: { subject_title: "Campagne d’Iran", research_date: null },
+    });
   });
 
   it("signale un autre sujet et permet d’annuler sans importer", async () => {
@@ -230,7 +299,7 @@ describe("ProductionStateTransfer", () => {
     );
     await waitFor(() => expect(click).toHaveBeenCalled());
     expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
-    expect(downloadedName).toContain("production-state-v1");
+    expect(downloadedName).toContain("production-state-v2");
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:test");
   });
 

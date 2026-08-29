@@ -6,6 +6,7 @@ import json
 import zipfile
 from datetime import date
 from io import BytesIO
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 from uuid import UUID, uuid4
@@ -22,6 +23,7 @@ from cti_app.application.edition_publication import (
     PublicationAssemblyError,
 )
 from cti_app.application.edition_review import EditionReviewReadItem
+from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
 from cti_app.application.jobs import DuplicateJobError
 from cti_app.domain.classification import TLP
 from cti_app.domain.edition_publication import (
@@ -432,6 +434,12 @@ class _Dispatcher:
             raise RuntimeError("redis unavailable")
 
 
+class _BrokenReleaseMaterializer:
+    async def materialize_release(self, **kwargs: Any) -> None:
+        del kwargs
+        raise OSError("workspace unavailable")
+
+
 @pytest.mark.asyncio
 async def test_accept_freezes_order_exclusion_and_same_manifest_on_retry() -> None:
     rows = [
@@ -707,7 +715,9 @@ async def test_empty_review_is_rejected_without_freeze() -> None:
 
 
 @pytest.mark.asyncio
-async def test_assembly_reads_manifest_artifact_id_and_publishes_real_docx() -> None:
+async def test_assembly_reads_manifest_artifact_id_and_publishes_real_docx(
+    tmp_path: Path,
+) -> None:
     row = EditionReviewReadItem(
         position=1,
         subject_id=SUBJECT_A,
@@ -727,7 +737,11 @@ async def test_assembly_reads_manifest_artifact_id_and_publishes_real_docx() -> 
     uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
     accepted = await publication.accept(EDITION_ID, actor_id="analyst")
-    assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
+    assembly = EditionAssemblyService(
+        lambda: uow,
+        blobs,
+        workspace_materializer=EditionWorkspaceMaterializer(tmp_path / "editions"),
+    )  # type: ignore[arg-type]
 
     release = await assembly.assemble(accepted.manifest_id)
     content = await blobs.read_bytes(release.docx_blob_id, max_bytes=32 * 1024 * 1024)
@@ -740,8 +754,50 @@ async def test_assembly_reads_manifest_artifact_id_and_publishes_real_docx() -> 
     with zipfile.ZipFile(BytesIO(content)) as archive:
         document_xml = archive.read("word/document.xml")
         assert b"Alpha" in document_xml
+    release_path = tmp_path / "editions/2026-08_FR/release"
+    assert sorted(path.name for path in release_path.iterdir()) == [
+        "bulletin.docx",
+        "edition.json",
+        "edition.md",
+        "publication-manifest.json",
+    ]
+    assert (release_path / "bulletin.docx").read_bytes() == content
     await assembly.assemble(accepted.manifest_id)
     assert uow.edition_releases.add_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_assembly_filesystem_failure_keeps_canonical_release_published() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=SubjectProductionStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(), [row], blobs)
+    publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
+    accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+    assembly = EditionAssemblyService(
+        lambda: uow,
+        blobs,
+        workspace_materializer=_BrokenReleaseMaterializer(),  # type: ignore[arg-type]
+    )
+
+    release = await assembly.assemble(accepted.manifest_id)
+
+    assert release.edition_id == EDITION_ID
+    assert uow.editions.edition.status is EditionStatus.PUBLISHED
+    assert uow.edition_releases.release is release
 
 
 @pytest.mark.asyncio

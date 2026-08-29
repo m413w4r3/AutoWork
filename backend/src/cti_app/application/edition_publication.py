@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -134,8 +135,8 @@ class _WorkspaceReleaseMaterializer(Protocol):
         period: Any,
         country_code: str,
         edition_id: UUID,
-        manifest: dict[str, Any],
-        edition: dict[str, Any],
+        manifest: Mapping[str, Any],
+        edition: Mapping[str, Any],
         markdown: str,
         docx: bytes,
     ) -> Any: ...

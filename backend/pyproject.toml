@@ -39,6 +39,9 @@ dev = [
   "ruff>=0.12,<1",
 ]
 
+[tool.uv]
+default-groups = ["dev", "analysis"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/cti_app"]
 

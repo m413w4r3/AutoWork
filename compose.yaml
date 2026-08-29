@@ -250,8 +250,8 @@ services:
       VIRUSTOTAL_MAX_PAGES: ${VIRUSTOTAL_MAX_PAGES:-10}
       VIRUSTOTAL_MAX_RESULTS: ${VIRUSTOTAL_MAX_RESULTS:-1000}
     volumes:
-      - subject_workspaces:/work/subjects
-      - edition_workspaces:/work/editions
+      - ./var/workspaces/subjects:/work/subjects
+      - ./var/workspaces/editions:/work/editions
       - goodware_cache:/var/cache/autowork/goodware
       - ./var/diagnostics:/var/diagnostics
     ports:
@@ -308,8 +308,8 @@ services:
       ]
     environment: *backend-environment
     volumes:
-      - subject_workspaces:/work/subjects
-      - edition_workspaces:/work/editions
+      - ./var/workspaces/subjects:/work/subjects
+      - ./var/workspaces/editions:/work/editions
       - goodware_cache:/var/cache/autowork/goodware
       - ./var/diagnostics:/var/diagnostics
     extra_hosts:
@@ -426,8 +426,6 @@ volumes:
   redis_data:
   minio_data:
   bridge_data:
-  subject_workspaces:
-  edition_workspaces:
   goodware_cache:
 
 networks:

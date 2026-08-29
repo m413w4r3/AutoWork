@@ -39,6 +39,8 @@ frontend/playwright-report/
 docs/references/
 data/
 work/
+/var/workspaces/subjects/
+/var/workspaces/editions/
 output/
 outputs/
 artifacts/

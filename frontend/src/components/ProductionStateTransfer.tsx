@@ -6,7 +6,7 @@ import {
   importProductionState,
 } from "../api/production";
 import type {
-  ProductionStateSnapshotV1,
+  ProductionStateSnapshot,
   ProductionStatus,
 } from "../api/production";
 
@@ -19,20 +19,82 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isSnapshot(value: unknown): value is ProductionStateSnapshotV1 {
-  if (!isRecord(value)) return false;
-  const origin = value.origin;
-  const artifacts = value.artifacts;
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]) {
   return (
-    value.format === "autowork.production-state" &&
-    value.schema_version === 1 &&
-    typeof value.content_sha256 === "string" &&
-    isRecord(origin) &&
+    Object.keys(value).length === keys.length &&
+    keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+  );
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isArtifacts(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const references = value.references;
+  const extraction = value.extraction;
+  const synthesis = value.synthesis;
+  return (
+    hasExactKeys(value, ["references", "extraction", "synthesis"]) &&
+    isRecord(references) &&
+    hasExactKeys(references, ["input_hash", "canonical_content"]) &&
+    typeof references.input_hash === "string" &&
+    isRecord(references.canonical_content) &&
+    isRecord(extraction) &&
+    hasExactKeys(extraction, ["input_hash", "canonical_content"]) &&
+    typeof extraction.input_hash === "string" &&
+    isRecord(extraction.canonical_content) &&
+    isRecord(synthesis) &&
+    hasExactKeys(synthesis, ["input_hash", "rendered_content"]) &&
+    typeof synthesis.input_hash === "string" &&
+    typeof synthesis.rendered_content === "string"
+  );
+}
+
+function isProductionStateSnapshot(
+  value: unknown,
+): value is ProductionStateSnapshot {
+  if (!isRecord(value)) return false;
+  if (
+    !hasExactKeys(value, [
+      "format",
+      "schema_version",
+      "exported_at",
+      "origin",
+      "artifacts",
+      "content_sha256",
+    ]) ||
+    value.format !== "autowork.production-state" ||
+    (value.schema_version !== 1 && value.schema_version !== 2) ||
+    typeof value.exported_at !== "string" ||
+    typeof value.content_sha256 !== "string" ||
+    !isArtifacts(value.artifacts) ||
+    !isRecord(value.origin)
+  ) {
+    return false;
+  }
+
+  const origin = value.origin;
+  if (value.schema_version === 1) {
+    return (
+      hasExactKeys(origin, [
+        "subject_title",
+        "editorial_type",
+        "profile",
+        "research_date",
+      ]) &&
+      typeof origin.subject_title === "string" &&
+      origin.editorial_type === "brief" &&
+      origin.profile === "brief_auto" &&
+      isNullableString(origin.research_date)
+    );
+  }
+
+  return (
+    hasExactKeys(origin, ["subject_title", "research_date"]) &&
     typeof origin.subject_title === "string" &&
-    isRecord(artifacts) &&
-    "references" in artifacts &&
-    "extraction" in artifacts &&
-    "synthesis" in artifacts
+    isNullableString(origin.research_date)
   );
 }
 
@@ -109,7 +171,7 @@ export function ProductionStateTransfer({
   const queryClient = useQueryClient();
   const inputRef = useRef<HTMLInputElement>(null);
   const [selectedSnapshot, setSelectedSnapshot] =
-    useState<ProductionStateSnapshotV1 | null>(null);
+    useState<ProductionStateSnapshot | null>(null);
   const [parseError, setParseError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
@@ -121,7 +183,7 @@ export function ProductionStateTransfer({
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `autowork-${slugify(snapshot.origin.subject_title)}-production-state-v1-${filesystemTimestamp(snapshot.exported_at)}.json`;
+      link.download = `autowork-${slugify(snapshot.origin.subject_title)}-production-state-v2-${filesystemTimestamp(snapshot.exported_at)}.json`;
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -130,7 +192,7 @@ export function ProductionStateTransfer({
   });
 
   const importMutation = useMutation({
-    mutationFn: (snapshot: ProductionStateSnapshotV1) =>
+    mutationFn: (snapshot: ProductionStateSnapshot) =>
       importProductionState(subjectId, snapshot),
     onSuccess: () => {
       setSuccess(
@@ -170,7 +232,7 @@ export function ProductionStateTransfer({
     try {
       const text = await readFileText(file);
       const value: unknown = JSON.parse(text);
-      if (!isSnapshot(value)) throw new Error("invalid");
+      if (!isProductionStateSnapshot(value)) throw new Error("invalid");
       setSelectedSnapshot(value);
     } catch {
       setParseError(
@@ -237,7 +299,10 @@ export function ProductionStateTransfer({
             Exporté le :{" "}
             {new Date(selectedSnapshot.exported_at).toLocaleString("fr-FR")}
           </p>
-          <p>Format : AutoWork production-state v1</p>
+          <p>
+            Format : AutoWork production-state v
+            {selectedSnapshot.schema_version}
+          </p>
           <p>Contenu :</p>
           <ul className="production-state-transfer__stage-list">
             <li>✓ Références</li>

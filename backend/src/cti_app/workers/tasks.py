@@ -20,7 +20,10 @@ from cti_app.application.edition_publication import (
     EDITION_ASSEMBLE_JOB_KIND,
     EditionAssemblyService,
 )
-from cti_app.application.edition_workspace import EditionProductionCheckpointService
+from cti_app.application.edition_workspace import (
+    EditionProductionCheckpointService,
+    EditionWorkspaceMaterializer,
+)
 from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.http_collection import (
     CollectionPolicy,
@@ -268,16 +271,20 @@ async def _execute_job(job_id: UUID) -> int | None:
         production_artifact_store = ProductionArtifactStore(
             BlobCatalogService(blob_store, uow_factory)
         )
+        edition_workspace_materializer = EditionWorkspaceMaterializer(
+            settings.edition_workspace_root
+        )
         production_checkpoint = EditionProductionCheckpointService(
             uow_factory,
             production_artifact_store,
             settings.edition_workspace_root,
+            materializer=edition_workspace_materializer,
             diagnostics=production_diagnostics,
         )
         publication_assembly = EditionAssemblyService(
             uow_factory,
             production_artifact_store,
-            workspace_materializer=None,
+            workspace_materializer=edition_workspace_materializer,
         )
         production_pacing = ProductionPacingPolicy.from_settings(settings)
         production_chain = ProductionStageChain(production_pacing)

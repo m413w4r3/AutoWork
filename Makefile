@@ -5,6 +5,7 @@
 UV ?= uv
 PNPM ?= pnpm
 COMPOSE ?= docker compose
+BRIDGE_CI_PROJECT ?= cti-bulletin-bridge-ci
 
 up:
 	$(COMPOSE) up -d --build --wait
@@ -20,12 +21,16 @@ down:
 # bridge back in by hand, which no data reset should ever require.
 # Kept in step with the `name:` at the top of compose.yaml.
 COMPOSE_PROJECT ?= cti-bulletin
-CLEAN_VOLUMES = postgres_data redis_data minio_data subject_workspaces
+CLEAN_VOLUMES = postgres_data redis_data minio_data
+CLEAN_PATHS = var/workspaces/subjects var/workspaces/editions
 
 clean:
 	$(COMPOSE) down
 	@for volume in $(CLEAN_VOLUMES); do \
 		docker volume rm -f "$(COMPOSE_PROJECT)_$$volume" >/dev/null 2>&1 || true; \
+	done
+	@for path in $(CLEAN_PATHS); do \
+		rm -rf -- "$$path"; \
 	done
 	@echo "Données applicatives effacées. Session du bridge ChatGPT conservée."
 
@@ -56,8 +61,8 @@ diagnostics:
 	@python3 scripts/diagnostics.py $(ARGS)
 
 bridge-soak:
-	$(COMPOSE) --profile bridge-test run --rm --build bridge-soak
-	$(COMPOSE) --profile bridge-test down -v
+	$(COMPOSE) -p $(BRIDGE_CI_PROJECT) --profile bridge-test run --rm --build bridge-soak
+	$(COMPOSE) -p $(BRIDGE_CI_PROJECT) --profile bridge-test down -v
 
 restart-bridge:
 	$(COMPOSE) up -d --build --wait --force-recreate --no-deps chatgpt-bridge

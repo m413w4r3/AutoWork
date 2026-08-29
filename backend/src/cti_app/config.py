@@ -26,8 +26,8 @@ class Settings(BaseSettings):
     s3_secret_key: str = "local-minio-password"
     s3_bucket: str = "cti-local"
     s3_secure: bool = False
-    subject_workspace_root: Path = Path("work/subjects")
-    edition_workspace_root: Path = Path("/work/editions")
+    subject_workspace_root: Path = Path("var/workspaces/subjects")
+    edition_workspace_root: Path = Path("var/workspaces/editions")
     goodware_cache_root: Path = Path("/var/cache/autowork/goodware")
     # Local development trail of model answers and parser decisions.
     # Empty disables it; never enable outside a local environment.

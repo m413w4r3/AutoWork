@@ -4,6 +4,13 @@ from pydantic import ValidationError
 from cti_app.config import Settings
 
 
+def test_workspace_defaults_are_host_explorable() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.subject_workspace_root.as_posix() == "var/workspaces/subjects"
+    assert settings.edition_workspace_root.as_posix() == "var/workspaces/editions"
+
+
 def test_settings_are_loaded_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("S3_BUCKET", "test-bucket")
     monkeypatch.setenv("READINESS_TIMEOUT_SECONDS", "1.5")

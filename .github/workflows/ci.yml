@@ -79,6 +79,6 @@ jobs:
       - run: docker compose config --quiet
       # `--build` est obligatoire : sans lui, `run` réutilise une image existante
       # et le soak validerait du code qui n'est pas celui du commit.
-      - run: docker compose --profile bridge-test run --rm --build bridge-soak
+      - run: docker compose -p cti-bulletin-bridge-ci --profile bridge-test run --rm --build bridge-soak
       - if: always()
-        run: docker compose --profile bridge-test down -v
+        run: docker compose -p cti-bulletin-bridge-ci --profile bridge-test down -v
