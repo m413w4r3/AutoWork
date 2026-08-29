@@ -106,7 +106,8 @@ export function EditionDetailPage({ editionId }: { editionId: string }) {
             fallback="Archivage impossible."
           />
         ) : null}
-        {current.allowed_transitions.includes("archived") ? (
+        {current.status !== "assembling" &&
+        current.allowed_transitions.includes("archived") ? (
           <button
             className="button button--secondary"
             disabled={transition.isPending}

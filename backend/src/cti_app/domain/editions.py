@@ -39,7 +39,6 @@ EDITION_TRANSITIONS: dict[EditionStatus, tuple[EditionStatus, ...]] = {
     EditionStatus.ASSEMBLING: (
         EditionStatus.REVIEW,
         EditionStatus.PUBLISHED,
-        EditionStatus.ARCHIVED,
     ),
     EditionStatus.PUBLISHED: (EditionStatus.ARCHIVED,),
     EditionStatus.ARCHIVED: (),

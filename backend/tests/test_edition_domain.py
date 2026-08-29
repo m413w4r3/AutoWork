@@ -52,6 +52,23 @@ def test_state_machine_exposes_only_valid_actions() -> None:
         edition.transition(EditionStatus.PUBLISHED)
 
 
+def test_assembling_cannot_be_archived_but_published_can() -> None:
+    edition = make_edition()
+    edition.status = EditionStatus.ASSEMBLING
+    assert edition.allowed_transitions == (
+        EditionStatus.REVIEW,
+        EditionStatus.PUBLISHED,
+    )
+
+    with pytest.raises(InvalidEditionTransitionError):
+        edition.transition(EditionStatus.ARCHIVED)
+
+    edition.status = EditionStatus.PUBLISHED
+    edition.transition(EditionStatus.ARCHIVED)
+
+    assert edition.status is EditionStatus.ARCHIVED
+
+
 @pytest.mark.parametrize(
     "status",
     (EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED, EditionStatus.ARCHIVED),

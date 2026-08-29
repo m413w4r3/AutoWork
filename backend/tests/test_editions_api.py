@@ -62,6 +62,74 @@ async def test_generic_transition_requires_workflow_use_case(
     assert [event.action for event in factory.events] == []
 
 
+async def test_generic_transition_cannot_archive_assembling_edition() -> None:
+    factory = InMemoryEditionUnitOfWorkFactory()
+    edition = Edition(
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        tlp=TLP.GREEN,
+        languages=("fr",),
+        target_major_articles=0,
+        target_briefs=1,
+        source_profile="default",
+        status=EditionStatus.ASSEMBLING,
+    )
+    factory.state[edition.id] = edition
+    application = FastAPI()
+    application.include_router(router)
+    application.state.edition_service = EditionService(factory)
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/api/editions/{edition.id}/transitions",
+            json={"target_status": "archived", "version": edition.version},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "invalid_edition_action"
+    assert factory.state[edition.id].status is EditionStatus.ASSEMBLING
+    assert factory.state[edition.id].version == 1
+    assert [event.action for event in factory.events] == []
+
+
+async def test_generic_transition_can_archive_published_edition() -> None:
+    factory = InMemoryEditionUnitOfWorkFactory()
+    edition = Edition(
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        tlp=TLP.GREEN,
+        languages=("fr",),
+        target_major_articles=0,
+        target_briefs=1,
+        source_profile="default",
+        status=EditionStatus.PUBLISHED,
+    )
+    factory.state[edition.id] = edition
+    application = FastAPI()
+    application.include_router(router)
+    application.state.edition_service = EditionService(factory)
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/api/editions/{edition.id}/transitions",
+            json={"target_status": "archived", "version": edition.version},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "archived"
+    assert factory.state[edition.id].status is EditionStatus.ARCHIVED
+
+
 async def test_generic_transition_allows_normal_transition() -> None:
     factory = InMemoryEditionUnitOfWorkFactory()
     edition = Edition(

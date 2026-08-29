@@ -14,12 +14,7 @@ export function publicationPollingInterval(
 ): number | false {
   if (editionStatus !== "assembling") return false;
   if (release?.edition_status === "published") return false;
-  if (
-    release &&
-    release.assembly_status !== null &&
-    !isActiveAssembly(release.assembly_status)
-  ) {
-    return false;
-  }
-  return 2_000;
+  if (!release) return 2_000;
+  if (release.can_retry_assembly) return false;
+  return isActiveAssembly(release.assembly_status) ? 2_000 : false;
 }

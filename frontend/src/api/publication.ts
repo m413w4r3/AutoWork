@@ -15,7 +15,7 @@ export type ReviewRetryStage =
   | "assembly";
 
 export type AssemblyJobStatus =
-  "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  "queued" | "running" | "waiting_human" | "succeeded" | "failed" | "cancelled";
 
 export interface PublicationAcceptResponse {
   edition_id: string;

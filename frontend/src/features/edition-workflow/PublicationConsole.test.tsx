@@ -85,10 +85,25 @@ describe("PublicationConsole", () => {
     },
   );
 
+  it.each([
+    ["queued", "En attente"],
+    ["running", "Assemblage en cours"],
+    ["succeeded", "Assemblage terminé"],
+  ] as const)("%s n’affiche pas de retry", async (assembly_status, label) => {
+    renderConsole("assembling", {
+      ...baseRelease,
+      assembly_status,
+    });
+
+    expect(await screen.findByText(label)).toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
   it("cesse le polling pour les états terminaux", () => {
     for (const assembly_status of [
       "failed",
       "cancelled",
+      "waiting_human",
       "succeeded",
     ] as const) {
       expect(
@@ -105,6 +120,87 @@ describe("PublicationConsole", () => {
         assembly_status: "succeeded",
       }),
     ).toBe(false);
+  });
+
+  it("cesse le polling quand aucun job ne peut être relancé", () => {
+    expect(
+      publicationPollingInterval("assembling", {
+        ...baseRelease,
+        assembly_status: null,
+        assembly_job_id: null,
+        can_retry_assembly: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("suit can_retry_assembly même si le statut du job est actif", () => {
+    expect(
+      publicationPollingInterval("assembling", {
+        ...baseRelease,
+        assembly_status: "running",
+        can_retry_assembly: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("affiche le retry quand aucun job d’assemblage n’existe", async () => {
+    const { fetchMock } = renderConsole("assembling", {
+      ...baseRelease,
+      assembly_job_id: null,
+      assembly_status: null,
+      can_retry_assembly: true,
+    });
+    const user = userEvent.setup();
+
+    expect(
+      await screen.findByText("L'assemblage n'a pas pu être démarré."),
+    ).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: "Relancer l'assemblage" }),
+    );
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([input, init]) =>
+            init?.method === "POST" &&
+            urlOf(input) === "/api/editions/edition-1/publication/accept",
+        ),
+      ).toBe(true),
+    );
+    expect(
+      fetchMock.mock.calls.find(([, init]) => init?.method === "POST")?.[1]
+        ?.body,
+    ).toBeUndefined();
+  });
+
+  it("affiche le retry pour un assemblage annulé", async () => {
+    renderConsole("assembling", {
+      ...baseRelease,
+      assembly_status: "cancelled",
+      can_retry_assembly: true,
+    });
+
+    expect(
+      await screen.findByText("L'assemblage a été annulé."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Relancer l'assemblage" }),
+    ).toBeInTheDocument();
+  });
+
+  it("affiche l’intervention requise sans retry par défaut", async () => {
+    renderConsole("assembling", {
+      ...baseRelease,
+      assembly_status: "waiting_human",
+      can_retry_assembly: false,
+    });
+
+    expect(
+      await screen.findByText(
+        "Intervention requise pour poursuivre l'assemblage.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
   it("affiche une erreur publique, les diagnostics et le retry avec le POST Accept", async () => {

@@ -142,11 +142,19 @@ export function PublicationConsole({
 
   const failed = current.assembly_status === "failed";
   const statusLabel =
-    current.assembly_status === "running"
-      ? "Assemblage en cours"
-      : current.assembly_status === "queued"
-        ? "En attente"
-        : "Assemblage du bulletin";
+    current.assembly_status === null
+      ? "L'assemblage n'a pas pu être démarré."
+      : current.assembly_status === "running"
+        ? "Assemblage en cours"
+        : current.assembly_status === "queued"
+          ? "En attente"
+          : current.assembly_status === "waiting_human"
+            ? "Intervention requise pour poursuivre l'assemblage."
+            : current.assembly_status === "cancelled"
+              ? "L'assemblage a été annulé."
+              : current.assembly_status === "succeeded"
+                ? "Assemblage terminé"
+                : "L'assemblage a échoué.";
 
   return (
     <section
@@ -160,7 +168,7 @@ export function PublicationConsole({
       {failed && current.assembly_error_message ? (
         <p className="error-message">{current.assembly_error_message}</p>
       ) : null}
-      {failed && current.can_retry_assembly ? (
+      {current.can_retry_assembly ? (
         <button
           className="button"
           type="button"
