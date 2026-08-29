@@ -31,6 +31,8 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v4
+      - name: Install Pandoc for DOCX publication tests
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pandoc
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
