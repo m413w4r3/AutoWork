@@ -35,8 +35,7 @@ async def test_generic_transition_requires_workflow_use_case(
         period_end=date(2026, 7, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_major_articles=0,
-        target_briefs=1,
+        target_articles=1,
         source_profile="default",
         status=source,
     )
@@ -71,8 +70,7 @@ async def test_generic_transition_cannot_archive_assembling_edition() -> None:
         period_end=date(2026, 7, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_major_articles=0,
-        target_briefs=1,
+        target_articles=1,
         source_profile="default",
         status=EditionStatus.ASSEMBLING,
     )
@@ -106,8 +104,7 @@ async def test_generic_transition_can_archive_published_edition() -> None:
         period_end=date(2026, 7, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_major_articles=0,
-        target_briefs=1,
+        target_articles=1,
         source_profile="default",
         status=EditionStatus.PUBLISHED,
     )
@@ -139,8 +136,7 @@ async def test_generic_transition_allows_normal_transition() -> None:
         period_end=date(2026, 7, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_major_articles=0,
-        target_briefs=1,
+        target_articles=1,
         source_profile="default",
         status=EditionStatus.DRAFT,
     )
@@ -179,8 +175,7 @@ async def test_metadata_update_is_rejected_after_publication_freeze(
         period_end=date(2026, 7, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_major_articles=0,
-        target_briefs=1,
+        target_articles=1,
         source_profile="default",
         status=status,
     )
@@ -202,8 +197,7 @@ async def test_metadata_update_is_rejected_after_publication_freeze(
                 "period_end": "2026-07-31",
                 "tlp": "GREEN",
                 "languages": ["fr"],
-                "target_major_articles": 0,
-                "target_briefs": 2,
+                "target_articles": 2,
                 "previous_edition_id": None,
                 "source_profile": "default",
                 "version": 1,
@@ -212,7 +206,7 @@ async def test_metadata_update_is_rejected_after_publication_freeze(
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "invalid_edition_action"
-    assert factory.state[edition.id].target_briefs == 1
+    assert factory.state[edition.id].target_articles == 1
 
 
 async def test_create_read_update_transition_and_filter_scenario() -> None:
@@ -229,8 +223,7 @@ async def test_create_read_update_transition_and_filter_scenario() -> None:
         "period_end": "2026-07-31",
         "tlp": "AMBER",
         "languages": ["fr", "en", "fa"],
-        "target_major_articles": 2,
-        "target_briefs": 6,
+        "target_articles": 8,
         "previous_edition_id": None,
         "source_profile": "iran-default",
     }
@@ -245,7 +238,7 @@ async def test_create_read_update_transition_and_filter_scenario() -> None:
         )
         edition_id = created.json()["id"]
         fetched = await client.get(f"/api/editions/{edition_id}")
-        update_payload = {**payload, "target_briefs": 8, "version": 1}
+        update_payload = {**payload, "target_articles": 10, "version": 1}
         updated = await client.put(f"/api/editions/{edition_id}", json=update_payload)
         transitioned = await client.post(
             f"/api/editions/{edition_id}/transitions",
@@ -263,7 +256,7 @@ async def test_create_read_update_transition_and_filter_scenario() -> None:
 
     assert created.status_code == 201
     assert fetched.json()["country"] == "Iran"
-    assert updated.json()["target_briefs"] == 8
+    assert updated.json()["target_articles"] == 10
     assert transitioned.json()["status"] == "discovery"
     assert transitioned.json()["allowed_transitions"] == ["selection", "archived"]
     assert listed.json()["total"] == 1

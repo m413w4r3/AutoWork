@@ -18,6 +18,8 @@ class GroupingOutcome(StrEnum):
 
 
 class EditorialType(StrEnum):
+    """Historical classification retained for compatibility readers only."""
+
     BRIEF = "brief"
     MAJOR = "major"
 
@@ -131,6 +133,8 @@ class EditorialGroup:
     grouping_justification: str
     id: UUID = field(default_factory=uuid4)
     status: EditorialGroupStatus = EditorialGroupStatus.PROPOSED
+    # Historical in-memory fixtures can still be rehydrated; current APIs do
+    # not expose or persist this field after the unification migration.
     editorial_type: EditorialType | None = None
     subject_id: UUID | None = None
     discovery_subject_id: UUID | None = None
@@ -184,15 +188,30 @@ class EditorialGroup:
         self.status = EditorialGroupStatus.REJECTED
         self._bump()
 
-    def select(self, editorial_type: EditorialType, subject_id: UUID) -> None:
+    def select(
+        self,
+        subject_or_legacy_type: UUID | EditorialType,
+        legacy_subject_id: UUID | None = None,
+    ) -> None:
         if self.status is not EditorialGroupStatus.PROPOSED:
             raise ValueError("Only proposed groups can be selected")
         self.status = EditorialGroupStatus.SELECTED
-        self.editorial_type = editorial_type
-        self.subject_id = subject_id
+        if legacy_subject_id is not None:
+            self.editorial_type = (
+                subject_or_legacy_type
+                if isinstance(subject_or_legacy_type, EditorialType)
+                else None
+            )
+            self.subject_id = legacy_subject_id
+        elif isinstance(subject_or_legacy_type, UUID):
+            self.editorial_type = None
+            self.subject_id = subject_or_legacy_type
+        else:
+            raise TypeError("Selection requires a subject_id")
         self._bump()
 
     def promote_to_major(self) -> None:
+        """Historical transition retained for old in-memory fixtures."""
         if self.status is not EditorialGroupStatus.SELECTED:
             raise ValueError("Only a selected group can be promoted")
         if self.editorial_type is not EditorialType.BRIEF:

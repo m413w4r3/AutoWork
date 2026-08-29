@@ -13,7 +13,6 @@ const groups = [
     title: "Campagne A",
     outcome: "new_subject",
     status: "proposed",
-    editorial_type: null,
     subject_id: null,
     presentation: "Présentation éditoriale A",
     actor_or_campaign: "MuddyWater",
@@ -78,7 +77,6 @@ const groups = [
     historical_comparison: {
       group_id: "99999999-9999-4999-8999-999999999999",
       title: "Campagne du mois précédent",
-      editorial_type: "major",
       subject_id: "88888888-8888-4888-8888-888888888888",
     },
     version: 1,
@@ -89,7 +87,6 @@ const groups = [
     title: "Campagne B",
     outcome: "ambiguous_review",
     status: "proposed",
-    editorial_type: null,
     subject_id: null,
     candidates: [
       {
@@ -137,12 +134,10 @@ it("désactive le polling malgré la valeur globale de production", async () => 
   vi.useFakeTimers();
   const board = {
     groups: [],
-    selected_briefs: 0,
-    selected_major: 0,
+    selected_articles: 0,
     ignored: 0,
     undecided: 0,
-    target_briefs: 4,
-    target_major: 2,
+    target_articles: 6,
     automatic_selection: false,
   };
   const fetchMock = vi.fn(withProductionNotStarted(() => Response.json(board)));
@@ -176,12 +171,10 @@ it("désactive le polling malgré la valeur globale de production", async () => 
 it("propose quatre choix exclusifs et confirme les décisions dans un seul lot", async () => {
   const board = {
     groups,
-    selected_briefs: 0,
-    selected_major: 0,
+    selected_articles: 0,
     ignored: 0,
     undecided: 2,
-    target_briefs: 4,
-    target_major: 2,
+    target_articles: 6,
     automatic_selection: false,
   };
   const postedBodies: unknown[] = [];
@@ -224,11 +217,7 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
   expect(
     within(first).getByRole("radio", { name: "Article" }),
   ).toBeInTheDocument();
-  expect(
-    within(first).getByRole("radio", {
-      name: "Article approfondi + pivots",
-    }),
-  ).toBeInTheDocument();
+  expect(within(first).getAllByRole("radio")).toHaveLength(3);
   expect(
     within(first).getByRole("radio", { name: "Ignorer" }),
   ).toBeInTheDocument();
@@ -244,11 +233,7 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
   const second = screen
     .getAllByRole("heading", { name: "Campagne B" })[0]!
     .closest("article")!;
-  await user.click(
-    within(second).getByRole("radio", {
-      name: "Article approfondi + pivots",
-    }),
-  );
+  await user.click(within(second).getByRole("radio", { name: "Article" }));
   await user.click(
     screen.getByRole("button", { name: "Confirmer la sélection (2)" }),
   );
@@ -259,12 +244,12 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
         {
           group_id: "11111111-1111-4111-8111-111111111111",
           version: 1,
-          decision: "brief",
+          decision: "article",
         },
         {
           group_id: "22222222-2222-4222-8222-222222222222",
           version: 1,
-          decision: "major",
+          decision: "article",
         },
       ],
     },
@@ -275,17 +260,14 @@ it("ajoute immédiatement un autre sujet aux articles", async () => {
   const autoSelected = {
     ...groups[0],
     status: "selected" as const,
-    editorial_type: "brief" as const,
     subject_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
   };
   const board = {
     groups: [autoSelected, groups[1]],
-    selected_briefs: 1,
-    selected_major: 0,
+    selected_articles: 1,
     ignored: 0,
     undecided: 1,
-    target_briefs: 0,
-    target_major: 2,
+    target_articles: 2,
     automatic_selection: false,
   };
   const postedBodies: unknown[] = [];
@@ -313,9 +295,7 @@ it("ajoute immédiatement un autre sujet aux articles", async () => {
   );
 
   expect(
-    await screen.findByRole("heading", {
-      name: "Ajoutées automatiquement — IOC détectés",
-    }),
+    await screen.findByRole("heading", { name: "Sélection des sujets" }),
   ).toBeInTheDocument();
   const other = screen
     .getAllByRole("heading", { name: "Campagne B" })[0]!
@@ -330,7 +310,7 @@ it("ajoute immédiatement un autre sujet aux articles", async () => {
         {
           group_id: "22222222-2222-4222-8222-222222222222",
           version: 1,
-          decision: "brief",
+          decision: "article",
         },
       ],
     },

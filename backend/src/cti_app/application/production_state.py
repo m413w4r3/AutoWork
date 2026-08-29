@@ -1,4 +1,4 @@
-"""Portable export and import of verified brief production state.
+"""Portable export and import of verified publication production state.
 
 Blob ingestion necessarily precedes the SQL transaction that references the
 three new immutable payloads. If that transaction fails, the content-addressed
@@ -17,11 +17,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from cti_app.application.analyst_handoff import (
-    AnalystPostSynthesisService,
-    analyst_handoff_policy_from_sources,
-    loop_budget_from_settings,
-)
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
     MAX_ARTIFACT_BYTES,
@@ -36,20 +31,19 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.subject_production import capture_production_input_snapshot
-from cti_app.config import get_settings
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
 )
 
 PRODUCTION_STATE_FORMAT = "autowork.production-state"
-PRODUCTION_STATE_SCHEMA_VERSION = 1
+PRODUCTION_STATE_V1_SCHEMA_VERSION = 1
+PRODUCTION_STATE_SCHEMA_VERSION = 2
 MAX_PRODUCTION_STATE_BYTES = 16 * 1024 * 1024
 IMPORTED_RUN_ERROR_CODE = "imported_production_state"
 
@@ -63,7 +57,6 @@ _ERROR_CODES = {
     "production_state_invalid",
     "production_state_checksum_mismatch",
     "production_state_too_large",
-    "production_state_research_date_required",
 }
 _HASH = r"^[0-9a-f]{64}$"
 
@@ -77,13 +70,24 @@ class ProductionStateError(ValueError):
         super().__init__(message)
 
 
-class ProductionStateOrigin(BaseModel):
+class ProductionStateOriginV1(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     subject_title: str
     editorial_type: Literal["brief"]
     profile: Literal["brief_auto"]
     research_date: date | None
+
+
+class ProductionStateOriginV2(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject_title: str
+    research_date: date | None
+
+
+# Historical import name.
+ProductionStateOrigin = ProductionStateOriginV1
 
 
 class ProductionStateReferences(BaseModel):
@@ -121,7 +125,25 @@ class ProductionStateSnapshotV1(BaseModel):
     format: Literal["autowork.production-state"]
     schema_version: Literal[1]
     exported_at: datetime
-    origin: ProductionStateOrigin
+    origin: ProductionStateOriginV1
+    artifacts: ProductionStateArtifacts
+    content_sha256: str = Field(pattern=_HASH)
+
+    @field_validator("exported_at")
+    @classmethod
+    def exported_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("exported_at must be timezone-aware")
+        return value
+
+
+class ProductionStateSnapshotV2(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    format: Literal["autowork.production-state"]
+    schema_version: Literal[2]
+    exported_at: datetime
+    origin: ProductionStateOriginV2
     artifacts: ProductionStateArtifacts
     content_sha256: str = Field(pattern=_HASH)
 
@@ -138,9 +160,9 @@ class ProductionStateImportResult(BaseModel):
 
     run_id: UUID
     status: Literal["needs_review", "running"]
-    current_stage: Literal["assembly", "analyst_research"]
+    current_stage: Literal["assembly"]
     imported_stages: tuple[Literal["references"], Literal["extraction"], Literal["synthesis"]]
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     content_sha256: str = Field(pattern=_HASH)
 
 
@@ -154,7 +176,9 @@ def _canonical_json(payload: Mapping[str, Any]) -> bytes:
 
 
 def compute_production_state_checksum(
-    snapshot_without_checksum: ProductionStateSnapshotV1 | Mapping[str, Any],
+    snapshot_without_checksum: (
+        ProductionStateSnapshotV1 | ProductionStateSnapshotV2 | Mapping[str, Any]
+    ),
 ) -> str:
     if isinstance(snapshot_without_checksum, BaseModel):
         payload = snapshot_without_checksum.model_dump(mode="json", exclude={"content_sha256"})
@@ -176,7 +200,7 @@ def _json_size(payload: dict[str, Any]) -> int:
 
 
 def _validate_parsers(
-    snapshot: ProductionStateSnapshotV1,
+    snapshot: ProductionStateSnapshotV1 | ProductionStateSnapshotV2,
 ) -> tuple[ReferenceReport, TechnicalExtraction]:
     try:
         report = reference_report_from_json(snapshot.artifacts.references.canonical_content)
@@ -191,18 +215,31 @@ def _validate_parsers(
     return report, extraction
 
 
-def _validate_snapshot(payload: dict[str, Any]) -> ProductionStateSnapshotV1:
+def _validate_snapshot(
+    payload: dict[str, Any],
+) -> ProductionStateSnapshotV1 | ProductionStateSnapshotV2:
     if payload.get("format") != PRODUCTION_STATE_FORMAT:
         raise ProductionStateError(
             code="production_state_invalid_format", message="Unsupported production state format"
         )
-    if payload.get("schema_version") != PRODUCTION_STATE_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if schema_version not in {PRODUCTION_STATE_V1_SCHEMA_VERSION, PRODUCTION_STATE_SCHEMA_VERSION}:
         raise ProductionStateError(
             code="production_state_version_unsupported",
             message="Unsupported production state schema version",
         )
+    if schema_version == PRODUCTION_STATE_SCHEMA_VERSION and (
+        "editorial_type" in payload.get("origin", {}) or "profile" in payload.get("origin", {})
+    ):
+        raise ProductionStateError(
+            code="production_state_version_unsupported",
+            message="Legacy production state origin cannot be labeled as schema version 2",
+        )
     try:
-        snapshot = ProductionStateSnapshotV1.model_validate(payload)
+        snapshot_type = (
+            ProductionStateSnapshotV1 if schema_version == 1 else ProductionStateSnapshotV2
+        )
+        snapshot = snapshot_type.model_validate(payload)
     except ValidationError as exc:
         raise _invalid("Invalid production state") from exc
 
@@ -226,11 +263,13 @@ def _validate_snapshot(payload: dict[str, Any]) -> ProductionStateSnapshotV1:
     return snapshot
 
 
-def _snapshot_metadata(snapshot: ProductionStateSnapshotV1, now: datetime) -> dict[str, Any]:
+def _snapshot_metadata(
+    snapshot: ProductionStateSnapshotV1 | ProductionStateSnapshotV2, now: datetime
+) -> dict[str, Any]:
     return {
         "snapshot_import": {
             "format": PRODUCTION_STATE_FORMAT,
-            "schema_version": PRODUCTION_STATE_SCHEMA_VERSION,
+            "schema_version": snapshot.schema_version,
             "exported_at": snapshot.exported_at.isoformat(),
             "content_sha256": snapshot.content_sha256,
         },
@@ -260,14 +299,11 @@ class ProductionStateService:
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
-        self._analyst_handoff = AnalystPostSynthesisService(
-            uow_factory, artifact_store, lambda: loop_budget_from_settings(get_settings())
-        )
 
     async def export_state(
         self, *, subject_id: UUID, subject_title: str
-    ) -> ProductionStateSnapshotV1:
-        """Export the latest run for a subject for backwards compatibility."""
+    ) -> ProductionStateSnapshotV2:
+        """Export the latest run for a subject in the current V2 format."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_current_for_subject(subject_id)
             if run is None:
@@ -279,7 +315,7 @@ class ProductionStateService:
 
     async def export_run_state(
         self, run_id: UUID, subject_title: str
-    ) -> ProductionStateSnapshotV1:
+    ) -> ProductionStateSnapshotV2:
         """Export exactly ``run_id`` without resolving another current run."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get(run_id)
@@ -323,13 +359,11 @@ class ProductionStateService:
         except (EntityNotFoundError, KeyError, TypeError, ValueError, UnicodeError) as exc:
             raise _invalid("Production artifact content is invalid") from exc
 
-        origin = ProductionStateOrigin(
+        origin = ProductionStateOriginV2(
             subject_title=subject_title,
-            editorial_type="brief",
-            profile="brief_auto",
             research_date=run.research_date,
         )
-        snapshot = ProductionStateSnapshotV1(
+        snapshot = ProductionStateSnapshotV2(
             format=PRODUCTION_STATE_FORMAT,
             schema_version=PRODUCTION_STATE_SCHEMA_VERSION,
             exported_at=datetime.now(UTC),
@@ -357,14 +391,8 @@ class ProductionStateService:
         subject_id: UUID,
         edition_id: UUID,
         payload: dict[str, Any],
-        profile: ProductionProfile = ProductionProfile.BRIEF_AUTO,
     ) -> ProductionStateImportResult:
         snapshot = _validate_snapshot(payload)
-        if profile is ProductionProfile.MAJOR_ASSISTED and snapshot.origin.research_date is None:
-            raise ProductionStateError(
-                code="production_state_research_date_required",
-                message="major_assisted import requires a frozen research_date",
-            )
         now = datetime.now(UTC)
 
         async with self._uow_factory() as uow:
@@ -429,38 +457,24 @@ class ProductionStateService:
             else:
                 runs = await uow.subject_production_runs.list_for_edition(edition_id)
                 next_run_number = 1 + sum(1 for item in runs if item.subject_id == subject_id)
-            is_brief_auto = profile is ProductionProfile.BRIEF_AUTO
             run = SubjectProductionRun(
                 subject_id=subject_id,
                 edition_id=edition_id,
-                profile=profile,
-                status=(
-                    SubjectProductionStatus.NEEDS_REVIEW
-                    if is_brief_auto
-                    else SubjectProductionStatus.QUEUED
-                ),
-                current_stage=(
-                    SubjectProductionStage.ASSEMBLY
-                    if is_brief_auto
-                    else SubjectProductionStage.SOURCES
-                ),
+                status=SubjectProductionStatus.NEEDS_REVIEW,
+                current_stage=SubjectProductionStage.ASSEMBLY,
                 run_number=next_run_number,
                 research_date=snapshot.origin.research_date,
-                error_code=IMPORTED_RUN_ERROR_CODE if is_brief_auto else None,
+                error_code=IMPORTED_RUN_ERROR_CODE,
                 error_message=(
                     "État importé : références, extraction et synthèse restaurées ; "
                     "assemblage non rejoué."
-                    if is_brief_auto
-                    else None
                 ),
-                started_at=now if is_brief_auto else None,
-                finished_at=now if is_brief_auto else None,
+                started_at=now,
+                finished_at=now,
                 created_at=now,
                 updated_at=now,
                 version=1,
             )
-            if profile is ProductionProfile.MAJOR_ASSISTED:
-                run.resume_verified_import_at_analyst_research(now=now)
             await uow.subject_production_runs.add(run)
             snapshot_repository = getattr(uow, "production_input_snapshots", None)
             editorial_group = await uow.editorial_groups.get_by_subject(subject_id)
@@ -508,28 +522,12 @@ class ProductionStateService:
                 metadata=synthesis_meta,
             )
             await uow.production_artifacts.append(synthesis)
-            if profile is ProductionProfile.MAJOR_ASSISTED:
-                # Seed VT enrichment is intentionally outside this deterministic
-                # import; the consuming workflow must ensure it idempotently.
-                policy = analyst_handoff_policy_from_sources(
-                    await uow.source_collections.list_for_subject(subject_id)
-                )
-                await self._analyst_handoff.ensure_for_verified_synthesis(
-                    run=run,
-                    synthesis=synthesis,
-                    extraction_artifacts=(extraction,),
-                    extraction_items=extraction_content.get("items", []),
-                    policy=policy,
-                    uow=uow,
-                )
             await uow.commit()
         return ProductionStateImportResult(
             run_id=run.id,
-            status=("needs_review" if profile is ProductionProfile.BRIEF_AUTO else "running"),
-            current_stage=(
-                "assembly" if profile is ProductionProfile.BRIEF_AUTO else "analyst_research"
-            ),
+            status="needs_review",
+            current_stage="assembly",
             imported_stages=("references", "extraction", "synthesis"),
-            schema_version=1,
+            schema_version=PRODUCTION_STATE_SCHEMA_VERSION,
             content_sha256=snapshot.content_sha256,
         )

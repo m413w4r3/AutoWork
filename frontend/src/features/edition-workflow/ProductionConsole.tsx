@@ -25,6 +25,7 @@ const STAGE_LABELS: Record<SubjectProductionStage, string> = {
   references: "Références",
   extraction: "Extraction",
   synthesis: "Synthèse",
+  /** Historical stages may appear on old runs only. */
   analyst_research: "Recherche analyste",
   analyst_note: "Note analyste",
   assembly: "Assemblage",

@@ -15,8 +15,7 @@ const iranEdition: Edition = {
   period_end: "2026-07-31",
   tlp: "AMBER",
   languages: ["fr", "en", "fa"],
-  target_major_articles: 2,
-  target_briefs: 6,
+  target_articles: 8,
   previous_edition_id: null,
   source_profile: "iran-default",
   status: "draft",
@@ -35,10 +34,10 @@ const discoveryEdition: Edition = {
 
 const emptyEditorialBoard = {
   groups: [],
-  selected_briefs: 0,
-  selected_major: 0,
-  target_briefs: 6,
-  target_major: 2,
+  selected_articles: 0,
+  ignored: 0,
+  undecided: 0,
+  target_articles: 8,
   automatic_selection: false,
 };
 
@@ -193,12 +192,7 @@ describe("App éditions", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByLabelText(
-        "Objectif indicatif d’articles principaux — sans limite de sélection",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByLabelText(
-        "Objectif indicatif de brèves — sans limite de sélection",
+        "Objectif indicatif d’articles — sans limite de sélection",
       ),
     ).toBeInTheDocument();
     await user.clear(screen.getByLabelText("Profil de sources"));

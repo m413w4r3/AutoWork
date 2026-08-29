@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une brève", async ({
+test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un article", async ({
   page,
 }) => {
   const editionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -17,8 +17,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
     period_end: "2026-05-31",
     tlp: "AMBER",
     languages: ["fr", "en", "fa"],
-    target_major_articles: 1,
-    target_briefs: 2,
+    target_articles: 3,
     previous_edition_id: null,
     source_profile: "iran-default",
     status: "selection",
@@ -138,7 +137,6 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
       title: cyfirma.title,
       outcome: "new_subject",
       status: selected ? "selected" : "proposed",
-      editorial_type: selected ? "brief" : null,
       subject_id: selected ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" : null,
       candidates: merged ? [cyfirma, ncc] : [cyfirma],
       score,
@@ -274,12 +272,10 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
       return route.fulfill({
         json: {
           groups: groups(),
-          selected_briefs: selected ? 1 : 0,
-          selected_major: 0,
+          selected_articles: selected ? 1 : 0,
           ignored: 0,
           undecided: selected ? 0 : merged ? 1 : 2,
-          target_briefs: 2,
-          target_major: 1,
+          target_articles: 3,
           automatic_selection: false,
         },
       });
@@ -326,12 +322,10 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'une 
   await expect(page.locator(".editorial-group-card")).toHaveCount(1);
   await page
     .locator(".editorial-group-card")
-    .getByRole("radio", { name: "Brève" })
+    .getByRole("radio", { name: "Article" })
     .check();
   await page
     .getByRole("button", { name: "Confirmer la sélection (1)" })
     .click();
-  await expect(
-    page.getByText("1 sujets prêts · 1 brève · 0 article principal"),
-  ).toBeVisible();
+  await expect(page.getByText("1 article prêt")).toBeVisible();
 });

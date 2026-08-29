@@ -36,8 +36,7 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
           period_end: "2026-08-31",
           tlp: "AMBER",
           languages: ["fr", "en", "fa"],
-          target_major_articles: 2,
-          target_briefs: 6,
+          target_articles: 8,
           previous_edition_id: null,
           source_profile: "iran-default",
           status: "discovery",
@@ -58,12 +57,10 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
       return route.fulfill({
         json: {
           groups: [],
-          selected_briefs: 0,
-          selected_major: 0,
+          selected_articles: 0,
           ignored: 0,
           undecided: 0,
-          target_briefs: 6,
-          target_major: 2,
+          target_articles: 8,
           automatic_selection: false,
         },
       });

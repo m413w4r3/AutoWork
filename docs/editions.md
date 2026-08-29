@@ -13,7 +13,7 @@ transition.
 | `period_start`, `period_end` | premier et dernier jour du même mois |
 | `tlp` | `CLEAR` à `RED`, sans déclassement |
 | `languages` | liste non vide de codes BCP47 simples et uniques |
-| `target_major_articles`, `target_briefs` | objectifs bornés, respectivement 0–20 et 0–100 |
+| `target_articles` | objectif du nombre total d’articles, borné de 0 à 120 |
 | `previous_edition_id` | référence optionnelle à une édition existante |
 | `source_profile` | identifiant de configuration, pas un contenu de source |
 | `status`, `version` | état de workflow et verrou de concurrence optimiste |
@@ -55,4 +55,3 @@ Work que la modification.
 
 Le repository d'audit est append-only et un trigger PostgreSQL rejette `UPDATE` et `DELETE`.
 Un trigger distinct empêche également un déclassement TLP par SQL direct.
-

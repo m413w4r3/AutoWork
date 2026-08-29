@@ -18,7 +18,6 @@ class Settings(BaseSettings):
     )
 
     app_env: str = "development"
-    production_major_assisted_enabled: bool = False
     log_level: str = "INFO"
     postgres_dsn: str = "postgresql+asyncpg://cti_app:local-postgres-only@postgres:5432/cti_app"
     redis_url: str = "redis://redis:6379/0"

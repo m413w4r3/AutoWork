@@ -18,8 +18,7 @@ Chaque lot M2 crée exactement la migration nommée dans son prompt et les lots
 suivants ne la réécrivent pas.
 
 Préserve les invariants validés de P04 :
-- brief_auto reste inchangé ;
-- major_assisted reste derrière son feature flag ;
+- la production courante est unifiée en articles ;
 - la synthèse et l'input pack restent immuables ;
 - aucun modèle n'est appelé dans le handoff analyste ;
 - aucune opération VT n'est placée dans la transaction canonique du handoff.

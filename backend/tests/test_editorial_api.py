@@ -42,7 +42,7 @@ async def test_editorial_api_group_select_and_decision_audit() -> None:
         group_id = board.json()["groups"][0]["id"]
         selected = await client.post(
             f"/api/editions/{edition.id}/editorial-groups/{group_id}/select",
-            json={"editorial_type": "brief"},
+            json={},
             headers={"X-Correlation-ID": "editorial-api-test"},
         )
         decisions = await client.get(f"/api/editions/{edition.id}/editorial-groups/decisions")
@@ -51,7 +51,6 @@ async def test_editorial_api_group_select_and_decision_audit() -> None:
     assert board.json()["automatic_selection"] is False
     selected_group = next(item for item in selected.json()["groups"] if item["id"] == group_id)
     assert selected_group["status"] == "selected"
-    assert selected_group["editorial_type"] == "brief"
     assert selected_group["subject_id"] is not None
     assert decisions.json()[0]["decision_type"] == "select"
     assert decisions.json()[0]["actor_id"] == "dev-analyst"
@@ -91,7 +90,7 @@ async def test_editorial_api_applies_versioned_decisions_in_one_request() -> Non
                     {
                         "group_id": board["groups"][0]["id"],
                         "version": board["groups"][0]["version"],
-                        "decision": "brief",
+                        "decision": "article",
                     },
                     {
                         "group_id": board["groups"][1]["id"],
@@ -103,6 +102,6 @@ async def test_editorial_api_applies_versioned_decisions_in_one_request() -> Non
         )
 
     assert response.status_code == 200
-    assert response.json()["selected_briefs"] == 1
+    assert response.json()["selected_articles"] == 1
     assert response.json()["ignored"] == 1
     assert response.json()["undecided"] == 0

@@ -26,7 +26,6 @@ from cti_app.domain.discovery import (
 from cti_app.domain.editorial import (
     EditorialGroup,
     EditorialGroupStatus,
-    EditorialType,
     GroupingConfidence,
     GroupingOutcome,
     HumanDecision,
@@ -63,7 +62,6 @@ class CandidateSummaryView(BaseModel):
 class HistoricalComparisonView(BaseModel):
     group_id: UUID
     title: str
-    editorial_type: EditorialType | None
     subject_id: UUID | None
 
 
@@ -89,7 +87,6 @@ class EditorialGroupView(BaseModel):
     title: str
     outcome: GroupingOutcome
     status: EditorialGroupStatus
-    editorial_type: EditorialType | None
     subject_id: UUID | None
     presentation: str | None
     actor_or_campaign: str | None
@@ -117,12 +114,10 @@ class EditorialGroupView(BaseModel):
 
 class EditorialBoardView(BaseModel):
     groups: list[EditorialGroupView]
-    selected_briefs: int
-    selected_major: int
+    selected_articles: int
     ignored: int
     undecided: int
-    target_briefs: int
-    target_major: int
+    target_articles: int
     automatic_selection: bool = False
 
 
@@ -147,15 +142,13 @@ class RejectRequest(BaseModel):
 class SelectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    editorial_type: EditorialType
-
 
 class EditorialDecisionItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     group_id: UUID
     version: int = Field(ge=1)
-    decision: Literal["brief", "major", "ignore"]
+    decision: Literal["article", "ignore"]
 
 
 class EditorialDecisionsRequest(BaseModel):
@@ -253,7 +246,6 @@ async def select_group(
         await service.select(
             edition_id,
             group_id,
-            payload.editorial_type,
             actor_id=actor_id,
             correlation_id=get_correlation_id(),
         )
@@ -304,12 +296,10 @@ async def _runtime(request: Request) -> tuple[EditorialGroupingService, str]:
 def _board_view(board: EditorialBoard) -> EditorialBoardView:
     return EditorialBoardView(
         groups=[_group_view(group, board) for group in board.groups],
-        selected_briefs=board.selected_briefs,
-        selected_major=board.selected_major,
+        selected_articles=board.selected_articles,
         ignored=board.ignored,
         undecided=board.undecided,
-        target_briefs=board.target_briefs,
-        target_major=board.target_major,
+        target_articles=board.target_articles,
     )
 
 
@@ -384,7 +374,6 @@ def _group_view(group: EditorialGroup, board: EditorialBoard) -> EditorialGroupV
         title=group.title,
         outcome=group.outcome,
         status=group.status,
-        editorial_type=group.editorial_type,
         subject_id=group.subject_id,
         presentation=presentation,
         actor_or_campaign=actor_or_campaign,

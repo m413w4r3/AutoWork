@@ -15,7 +15,7 @@ from cti_app.domain.discovery_cumulative import (
     DiscoverySubject,
 )
 from cti_app.domain.editions import Edition
-from cti_app.domain.editorial import EditorialGroupStatus, EditorialType
+from cti_app.domain.editorial import EditorialGroupStatus
 from tests.editorial_support import InMemoryEditorialUnitOfWorkFactory
 
 
@@ -27,8 +27,7 @@ def _edition() -> Edition:
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
         languages=("fr", "en"),
-        target_major_articles=2,
-        target_briefs=4,
+        target_articles=6,
         previous_edition_id=None,
         source_profile="iran-default",
     )
@@ -157,7 +156,7 @@ async def test_ioc_signal_auto_selects_brief_even_above_target_and_audits_once()
     second = await service.synchronize(edition.id)
 
     assert first[0].status is EditorialGroupStatus.SELECTED
-    assert first[0].editorial_type is EditorialType.BRIEF
+    assert first[0].editorial_type is None
     assert second[0].id == first[0].id
     assert second[0].subject_id == first[0].subject_id
     assert len(uow.subjects) == 1
@@ -185,7 +184,7 @@ async def test_source_ioc_signal_auto_selects_brief() -> None:
     groups = await EditorialGroupingService(uow).synchronize(edition.id)
 
     assert groups[0].status is EditorialGroupStatus.SELECTED
-    assert groups[0].editorial_type is EditorialType.BRIEF
+    assert groups[0].editorial_type is None
 
 
 @pytest.mark.asyncio
@@ -202,7 +201,6 @@ async def test_snapshot_enrichment_keeps_selected_editorial_group_and_subject() 
     selected = await service.select(
         edition.id,
         group.id,
-        EditorialType.BRIEF,
         actor_id="analyst",
         correlation_id="test",
     )

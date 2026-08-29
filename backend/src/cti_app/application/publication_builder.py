@@ -1,4 +1,4 @@
-"""Build the canonical brief document from verified production artifacts."""
+"""Build the canonical publication document from verified production artifacts."""
 
 from __future__ import annotations
 
@@ -17,9 +17,9 @@ from cti_app.application.semantic_annotation import SemanticAnnotator
 from cti_app.domain.publication import (
     PUBLICATION_SCHEMA_VERSION,
     ArtifactType,
-    BriefDocumentV1,
     Indicator,
     IndicatorGroup,
+    PublicationDocumentV2,
     PublicationSource,
     RichSpan,
     RichSpanKind,
@@ -41,7 +41,7 @@ def _normalize_title(title: str, extraction: TechnicalExtraction) -> str:
             for item in extraction.items
             if item.supported and item.semantic_type is SemanticType.ACTOR
         ),
-        "Brève",
+        "Publication",
     )
     return f"[{actor}] {cleaned}"
 
@@ -83,15 +83,15 @@ def _merge_citations(spans: RichText) -> RichText:
     return tuple(output)
 
 
-def build_brief_document(
+def build_publication_document(
     *,
     subject_title: str,
     report: ReferenceReport,
     extraction: TechnicalExtraction,
     synthesis_text: str,
     annotator: SemanticAnnotator | None = None,
-) -> BriefDocumentV1:
-    """Build a deterministic, fully serializable publication document."""
+) -> PublicationDocumentV2:
+    """Build a deterministic, fully serializable V2 publication document."""
     annotator = annotator or SemanticAnnotator()
     known_sources = report.source_ids()
 
@@ -155,7 +155,7 @@ def build_brief_document(
         )
 
     title = report.editorial_title or subject_title
-    return BriefDocumentV1(
+    return PublicationDocumentV2(
         schema_version=PUBLICATION_SCHEMA_VERSION,
         title=_normalize_title(title, extraction),
         timeline=timeline,

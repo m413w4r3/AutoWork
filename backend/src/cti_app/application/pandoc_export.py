@@ -1,4 +1,4 @@
-"""Subprocess boundary for exporting a canonical brief to DOCX with Pandoc."""
+"""Subprocess boundary for exporting a canonical publication to DOCX."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from cti_app.application.pandoc_rendering import render_brief_pandoc
-from cti_app.domain.publication import BriefDocumentV1
+from cti_app.application.pandoc_rendering import render_publication_pandoc
+from cti_app.domain.publication import BriefDocumentV1, PublicationDocumentV2
 
 LOGGER = logging.getLogger(__name__)
 PANDOC_EXTENSIONS = "markdown+fenced_divs+bracketed_spans+superscript"
@@ -20,8 +20,8 @@ class PandocExportError(RuntimeError):
     pass
 
 
-def export_brief_docx(
-    document: BriefDocumentV1,
+def export_publication_docx(
+    document: BriefDocumentV1 | PublicationDocumentV2,
     output_path: Path,
     *,
     reference_doc: Path = DEFAULT_REFERENCE_DOC,
@@ -29,7 +29,7 @@ def export_brief_docx(
     timeout: float = 30.0,
 ) -> Path:
     return export_markdown_docx(
-        render_brief_pandoc(document),
+        render_publication_pandoc(document),
         output_path,
         reference_doc=reference_doc,
         executable=executable,

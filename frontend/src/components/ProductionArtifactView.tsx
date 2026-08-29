@@ -3,9 +3,9 @@ import {
   getReferencesArtifact,
   getExtractionArtifact,
   getSynthesisArtifact,
-  getBriefArtifact,
+  getPublicationArtifact,
   type ArtifactResponse,
-  type BriefDocumentV1,
+  type PublicationDocument,
   type ExtractionDocumentV2,
   type ExtractionItemV2,
   type RichSpan,
@@ -13,7 +13,7 @@ import {
 
 interface ProductionArtifactViewProps {
   subjectId: string;
-  stage: "references" | "extraction" | "synthesis" | "brief";
+  stage: "references" | "extraction" | "synthesis" | "publication" | "brief";
   onClose?: () => void;
 }
 
@@ -21,7 +21,8 @@ const STAGE_LABELS: Record<string, string> = {
   references: "Références",
   extraction: "Extraction CTI",
   synthesis: "Synthèse",
-  brief: "Aperçu de la brève",
+  publication: "Aperçu de la publication",
+  brief: "Aperçu de la brève historique",
 };
 
 const STATUS_LABELS: Record<string, string> = {
@@ -40,19 +41,20 @@ function getArtifactFetcher(
       return getExtractionArtifact;
     case "synthesis":
       return getSynthesisArtifact;
+    case "publication":
     case "brief":
-      return getBriefArtifact;
+      return getPublicationArtifact;
     default:
       throw new Error(`Unknown stage: ${stage}`);
   }
 }
 
-function isBriefDocument(value: unknown): value is BriefDocumentV1 {
+function isPublicationDocument(value: unknown): value is PublicationDocument {
   return (
     typeof value === "object" &&
     value !== null &&
     "schema_version" in value &&
-    value.schema_version === "1" &&
+    (value.schema_version === "1" || value.schema_version === "2") &&
     "timeline" in value &&
     Array.isArray(value.timeline)
   );
@@ -266,7 +268,7 @@ function ExtractionPreview({ document }: { document: ExtractionDocumentV2 }) {
 export function PublicationDocumentView({
   document,
 }: {
-  document: BriefDocumentV1;
+  document: PublicationDocument;
 }) {
   const visibleGroups = document.indicators.filter(
     (group) => IOC_LABELS[group.artifact_type] && group.values.length > 0,
@@ -391,28 +393,33 @@ export function ProductionArtifactView({
           </div>
         )}
 
-      {stage === "brief" && isBriefDocument(artifact.canonical_content) && (
-        <PublicationDocumentView document={artifact.canonical_content} />
-      )}
+      {(stage === "publication" || stage === "brief") &&
+        isPublicationDocument(artifact.canonical_content) && (
+          <PublicationDocumentView document={artifact.canonical_content} />
+        )}
 
       {stage === "extraction" &&
         isExtractionDocument(artifact.canonical_content) && (
           <ExtractionPreview document={artifact.canonical_content} />
         )}
 
-      {stage === "brief" && artifact.rendered_content && (
-        <p>
-          <a
-            className="button button--secondary"
-            download="breve-pandoc.md"
-            href={`data:text/markdown;charset=utf-8,${encodeURIComponent(artifact.rendered_content)}`}
-          >
-            Télécharger le Markdown Pandoc
-          </a>
-        </p>
-      )}
+      {(stage === "publication" || stage === "brief") &&
+        artifact.rendered_content && (
+          <p>
+            <a
+              className="button button--secondary"
+              download={
+                stage === "brief" ? "breve-pandoc.md" : "publication-pandoc.md"
+              }
+              href={`data:text/markdown;charset=utf-8,${encodeURIComponent(artifact.rendered_content)}`}
+            >
+              Télécharger le Markdown Pandoc
+            </a>
+          </p>
+        )}
 
-      {stage !== "brief" &&
+      {stage !== "publication" &&
+        stage !== "brief" &&
         stage !== "extraction" &&
         artifact.rendered_content && (
           <div className="artifact-content">
@@ -422,7 +429,8 @@ export function ProductionArtifactView({
           </div>
         )}
 
-      {stage !== "brief" &&
+      {stage !== "publication" &&
+        stage !== "brief" &&
         stage !== "extraction" &&
         artifact.canonical_content && (
           <div className="artifact-canonical">

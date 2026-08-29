@@ -27,7 +27,6 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -61,13 +60,12 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_major_articles=1,
-        target_briefs=1,
+        target_articles=2,
         source_profile="test",
     )
     subject = Subject(external_id="SUBJ-ARTIFACT-VERSIONS", slug="artifact-versions", tlp=TLP.AMBER)
     run = SubjectProductionRun(
-        subject_id=subject.id, edition_id=edition.id, profile=ProductionProfile.BRIEF_AUTO
+        subject_id=subject.id, edition_id=edition.id
     )
 
     async with uow_factory() as uow:
@@ -83,7 +81,7 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
             "references",
             "extraction",
             "synthesis",
-            "brief",
+            "publication",
         ]
         for stage in (ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION):
             await uow.production_artifacts.append(_artifact(run, stage, 2))
@@ -94,7 +92,7 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
             "references",
             "extraction",
             "synthesis",
-            "brief",
+            "publication",
         ]
         for stage in (ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION):
             await uow.production_artifacts.append(_artifact(run, stage, 3))
@@ -124,13 +122,12 @@ async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
         period_end=date(2026, 12, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_major_articles=1,
-        target_briefs=1,
+        target_articles=2,
         source_profile="test",
     )
     subject = Subject(external_id="SUBJ-ANALYST-FK", slug="analyst-fk", tlp=TLP.AMBER)
     run = SubjectProductionRun(
-        subject_id=subject.id, edition_id=edition.id, profile=ProductionProfile.MAJOR_ASSISTED
+        subject_id=subject.id, edition_id=edition.id
     )
     run.start_running()
     synthesis = ProductionArtifact(
@@ -194,8 +191,7 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
         period_end=date(2026, 9, 30),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_major_articles=1,
-        target_briefs=1,
+        target_articles=2,
         source_profile="test",
     )
     source = Subject(external_id="SUBJ-STATE-A", slug="state-a", tlp=TLP.AMBER)
@@ -217,7 +213,7 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
     extraction: dict[str, Any] = {"items": [], "uncertainties": []}
     synthesis = "Fait [S1]"
     run = SubjectProductionRun(
-        subject_id=source.id, edition_id=edition.id, profile=ProductionProfile.BRIEF_AUTO
+        subject_id=source.id, edition_id=edition.id
     )
     run.start_running()
     run.current_stage = SubjectProductionStage.ASSEMBLY
@@ -259,7 +255,7 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
     async with uow_factory() as uow:
         imported = await uow.subject_production_runs.get(result.run_id)
         assert imported is not None
-        assert imported.profile is ProductionProfile.BRIEF_AUTO
+        assert imported.profile is None
         assert imported.status is SubjectProductionStatus.NEEDS_REVIEW
         assert imported.current_stage is SubjectProductionStage.ASSEMBLY
         assert imported.started_at is not None
@@ -300,10 +296,10 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
 
 
 @pytest.mark.asyncio
-async def test_major_assisted_import_creates_handoff_without_llm_on_real_postgres(
+async def test_unified_import_does_not_create_analyst_handoff_on_real_postgres(
     uow_factory: UnitOfWorkFactory, tmp_path: Path
 ) -> None:
-    """Import a valid checkpoint and persist the analyst handoff in one UoW."""
+    """Import a valid checkpoint without entering the independent analyst subsystem."""
     edition = Edition(
         country="France",
         country_code="FR",
@@ -311,8 +307,7 @@ async def test_major_assisted_import_creates_handoff_without_llm_on_real_postgre
         period_end=date(2026, 11, 30),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_major_articles=1,
-        target_briefs=1,
+        target_articles=2,
         source_profile="test",
     )
     source = Subject(
@@ -339,7 +334,6 @@ async def test_major_assisted_import_creates_handoff_without_llm_on_real_postgre
     run = SubjectProductionRun(
         subject_id=source.id,
         edition_id=edition.id,
-        profile=ProductionProfile.BRIEF_AUTO,
         research_date=date(2026, 11, 12),
     )
     run.start_running()
@@ -395,45 +389,22 @@ async def test_major_assisted_import_creates_handoff_without_llm_on_real_postgre
         subject_id=target.id,
         edition_id=edition.id,
         payload=snapshot.model_dump(mode="json"),
-        profile=ProductionProfile.MAJOR_ASSISTED,
     )
 
-    assert result.status == "running"
-    assert result.current_stage == "analyst_research"
+    assert result.status == "needs_review"
+    assert result.current_stage == "assembly"
     async with uow_factory() as uow:
         imported_run = await uow.subject_production_runs.get(result.run_id)
         assert imported_run is not None
         imported_artifacts = await uow.production_artifacts.list_for_run(imported_run.id)
         imported_investigation = await uow.analyst_investigations.get_for_run(imported_run.id)
-        assert imported_investigation is not None
-        imported_pack = await uow.analyst_input_packs.get_for_investigation(
-            imported_investigation.id
-        )
-    synthesis_artifacts = [
-        artifact
-        for artifact in imported_artifacts
-        if artifact.stage is ProductionArtifactStage.SYNTHESIS
-    ]
-    assert imported_run.profile is ProductionProfile.MAJOR_ASSISTED
-    assert imported_run.status == SubjectProductionStatus.RUNNING
-    assert imported_run.current_stage == SubjectProductionStage.ANALYST_RESEARCH
-    assert imported_run.research_date is not None
+    assert imported_run.profile is None
+    assert imported_run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert imported_run.current_stage is SubjectProductionStage.ASSEMBLY
     assert imported_run.started_at is not None
-    assert imported_run.finished_at is None
-    assert imported_run.error_code is None
-    assert imported_run.error_message is None
-    assert imported_run.error_details is None
-    assert [(artifact.version, artifact.status.value) for artifact in synthesis_artifacts] == [
-        (1, "verified")
-    ]
-    assert imported_pack is not None
-    assert imported_investigation.synthesis_artifact_id == synthesis_artifacts[0].id
-    assert imported_investigation.input_pack_blob_id == imported_pack.blob_id
-    assert imported_investigation.input_sha256 == imported_pack.sha256
-    assert all(artifact.model_run_id is None for artifact in imported_artifacts)
-    assert imported_run.references_conversation_id is None
-    assert imported_run.synthesis_conversation_id is None
-    assert imported_investigation.pivot_conversation_id is None
+    assert imported_run.finished_at is not None
+    assert len(imported_artifacts) == 3
+    assert imported_investigation is None
 
 
 @pytest.mark.asyncio
@@ -447,8 +418,7 @@ async def test_run_number_allocation_is_serialized_in_postgres(
         period_end=date(2026, 10, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_major_articles=1,
-        target_briefs=1,
+        target_articles=2,
         source_profile="test",
     )
     subject = Subject(external_id="SUBJ-RUN-LOCK", slug="run-lock", tlp=TLP.AMBER)
@@ -464,7 +434,6 @@ async def test_run_number_allocation_is_serialized_in_postgres(
                 SubjectProductionRun(
                     subject_id=subject.id,
                     edition_id=edition.id,
-                    profile=ProductionProfile.BRIEF_AUTO,
                     run_number=number,
                 )
             )

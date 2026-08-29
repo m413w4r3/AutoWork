@@ -36,7 +36,6 @@ from cti_app.domain.briefs import (
 from cti_app.domain.collection import ClaimKind, CollectionState
 from cti_app.domain.editorial import (
     EditorialGroupStatus,
-    EditorialType,
     HumanDecision,
     HumanDecisionType,
 )
@@ -455,9 +454,8 @@ class BriefService:
             if (
                 group is None
                 or group.status is not EditorialGroupStatus.SELECTED
-                or group.editorial_type is not EditorialType.BRIEF
             ):
-                raise BriefError("Only a selected brief can freeze an evidence pack")
+                raise BriefError("Only a selected article can freeze an evidence pack")
             collections = list(await uow.source_collections.list_for_subject(subject_id))
             documents = {
                 item.id: item for item in await uow.source_documents.list_for_subject(subject_id)

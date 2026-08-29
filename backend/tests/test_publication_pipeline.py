@@ -10,8 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from cti_app.application.pandoc_export import export_brief_docx
-from cti_app.application.pandoc_rendering import WORD_STYLE_MAP, render_brief_pandoc
+from cti_app.application.pandoc_export import export_publication_docx
+from cti_app.application.pandoc_rendering import (
+    WORD_STYLE_MAP,
+    render_publication_pandoc,
+)
 from cti_app.application.production_normalization import (
     canonical_indicator_key,
     display_indicator_value,
@@ -31,10 +34,17 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.production_rendering import collect_indicators
-from cti_app.application.publication_builder import build_brief_document
+from cti_app.application.publication_builder import (
+    build_publication_document,
+)
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.domain.discovery import SourceRole
-from cti_app.domain.publication import ArtifactType, BriefDocumentV1, RichSpanKind
+from cti_app.domain.publication import (
+    ArtifactType,
+    PublicationDocumentV2,
+    RichSpanKind,
+    publication_document_from_json,
+)
 
 ROOT = Path(__file__).parents[2]
 HASH = "37e123bd" + "a" * 52 + "4066"
@@ -215,8 +225,22 @@ def test_synthesis_validator_blocks_inventory_only_ioc_but_accepts_both() -> Non
     assert ioc.text == "cloudlanecdn[.]com"
 
 
+def test_current_builder_writes_only_v2_and_uses_the_central_reader() -> None:
+    document = build_publication_document(
+        subject_title="Cavern",
+        report=_report(),
+        extraction=_extraction(),
+        synthesis_text="Cavern Manticore utilise WinDirStat [S1].",
+    )
+
+    assert isinstance(document, PublicationDocumentV2)
+    assert document.to_json()["schema_version"] == "2"
+    assert publication_document_from_json(document.to_json()) == document
+    assert render_publication_pandoc(document)
+
+
 def test_cavern_document_round_trip_and_pandoc_golden() -> None:
-    document = build_brief_document(
+    document = build_publication_document(
         subject_title="Cavern",
         report=_report(),
         extraction=_extraction(),
@@ -225,8 +249,7 @@ def test_cavern_document_round_trip_and_pandoc_golden() -> None:
             "WinDirStat, un binaire légitime [S1]."
         ),
     )
-    assert BriefDocumentV1.from_json(document.to_json()) == document
-    markdown = render_brief_pandoc(document)
+    markdown = render_publication_pandoc(document)
     assert "# " not in markdown and "[S1]" not in markdown and "`" not in markdown
     assert "**Cavern Manticore**" in markdown
     assert "**HOLLOWGRAPH**" in markdown
@@ -241,7 +264,7 @@ def test_cavern_document_round_trip_and_pandoc_golden() -> None:
 
 def test_brief_document_title_uses_editorial_title_exactly() -> None:
     """Q1's editorial_title must reach the published title verbatim."""
-    document = build_brief_document(
+    document = build_publication_document(
         subject_title="Cavern",
         report=_report(),
         extraction=_extraction(),
@@ -265,13 +288,13 @@ def test_reference_doc_contains_every_mapped_style() -> None:
 
 @pytest.mark.skipif(shutil.which("pandoc") is None, reason="Pandoc is not installed")
 def test_real_pandoc_export_produces_an_openable_docx(tmp_path: Path) -> None:
-    document = build_brief_document(
+    document = build_publication_document(
         subject_title="Cavern",
         report=_report(),
         extraction=_extraction(),
         synthesis_text="Cavern Manticore utilise WinDirStat [S1].",
     )
-    output = export_brief_docx(document, tmp_path / "brief.docx")
+    output = export_publication_docx(document, tmp_path / "publication.docx")
     with zipfile.ZipFile(output) as archive:
         assert archive.testzip() is None
         styles = archive.read("word/styles.xml")

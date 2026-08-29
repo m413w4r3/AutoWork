@@ -23,7 +23,6 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchPhase,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -38,13 +37,12 @@ async def test_freeze_blocks_concurrent_retry_after_edition_lock_is_released(
 ) -> None:
     edition = Edition(
         country="Freeze Test",
-        country_code=f"F{uuid4().hex[0].upper()}",
+        country_code="FT",
         period_start=date(2099, 8, 1),
         period_end=date(2099, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_major_articles=0,
-        target_briefs=1,
+        target_articles=1,
         source_profile="test",
         status=EditionStatus.REVIEW,
     )
@@ -56,7 +54,6 @@ async def test_freeze_blocks_concurrent_retry_after_edition_lock_is_released(
     run = SubjectProductionRun(
         subject_id=subject.id,
         edition_id=edition.id,
-        profile=ProductionProfile.BRIEF_AUTO,
         status=SubjectProductionStatus.FAILED,
         current_stage=SubjectProductionStage.SOURCES,
         error_code="production_failed",
@@ -81,7 +78,7 @@ async def test_freeze_blocks_concurrent_retry_after_edition_lock_is_released(
     artifact = ProductionArtifact(
         production_run_id=run.id,
         subject_id=subject.id,
-        stage=ProductionArtifactStage.BRIEF,
+        stage=ProductionArtifactStage.PUBLICATION,
         version=1,
         input_hash="c" * 64,
         status=ProductionArtifactStatus.VERIFIED,
@@ -89,7 +86,6 @@ async def test_freeze_blocks_concurrent_retry_after_edition_lock_is_released(
     )
     batch = EditionProductionBatch(
         edition_id=edition.id,
-        profile=ProductionProfile.BRIEF_AUTO,
         status="running",
         phase=ProductionBatchPhase.REVIEW,
     )

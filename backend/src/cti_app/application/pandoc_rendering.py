@@ -7,8 +7,14 @@ from typing import Final
 
 from cti_app.application.french_typography import format_french_date
 from cti_app.application.production_normalization import display_indicator_value
-from cti_app.domain.edition_publication import EditionDocumentV1
-from cti_app.domain.publication import ArtifactType, BriefDocumentV1, RichSpanKind, RichText
+from cti_app.domain.edition_publication import EditionDocumentV1, EditionDocumentV2
+from cti_app.domain.publication import (
+    ArtifactType,
+    BriefDocumentV1,
+    PublicationDocumentV2,
+    RichSpanKind,
+    RichText,
+)
 
 PANDOC_RENDERER_VERSION = "1"
 
@@ -88,7 +94,7 @@ def _render_rich(text: RichText, sources: dict[str, str]) -> str:
     return "".join(output)
 
 
-def render_brief_pandoc(document: BriefDocumentV1) -> str:
+def render_publication_pandoc(document: BriefDocumentV1 | PublicationDocumentV2) -> str:
     """Render publication Markdown without invoking Pandoc or reading the network."""
     sources = {source.source_id: source.canonical_url for source in document.sources}
     blocks = [_styled_block("title", _safe_text(document.title))]
@@ -126,11 +132,12 @@ def render_brief_pandoc(document: BriefDocumentV1) -> str:
     return rendered
 
 
-def render_edition_pandoc(document: EditionDocumentV1) -> str:
+def render_edition_pandoc(document: EditionDocumentV1 | EditionDocumentV2) -> str:
     """Render an ordered edition from its already frozen publication documents."""
     if not document.publications:
         raise ValueError("An edition document must contain at least one publication")
     rendered = "\n\n".join(
-        render_brief_pandoc(publication.document).rstrip() for publication in document.publications
+        render_publication_pandoc(publication.document).rstrip()
+        for publication in document.publications
     )
     return rendered.rstrip() + "\n"

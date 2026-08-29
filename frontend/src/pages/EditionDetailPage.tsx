@@ -73,12 +73,8 @@ export function EditionDetailPage({ editionId }: { editionId: string }) {
           <dd>{current.languages.join(", ")}</dd>
         </div>
         <div>
-          <dt>Objectif indicatif d’articles principaux</dt>
-          <dd>{current.target_major_articles}</dd>
-        </div>
-        <div>
-          <dt>Objectif indicatif d’articles courts</dt>
-          <dd>{current.target_briefs}</dd>
+          <dt>Objectif indicatif d’articles</dt>
+          <dd>{current.target_articles}</dd>
         </div>
         <div>
           <dt>Profil de sources</dt>

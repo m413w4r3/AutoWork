@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("parcourt candidat Iran, brève fondée sur preuves, puis validation", async ({
+test("parcourt candidat Iran, article fondé sur preuves, puis validation", async ({
   page,
 }) => {
   const editionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -16,8 +16,7 @@ test("parcourt candidat Iran, brève fondée sur preuves, puis validation", asyn
     period_end: "2026-07-31",
     tlp: "AMBER",
     languages: ["fr", "fa"],
-    target_major_articles: 1,
-    target_briefs: 1,
+    target_articles: 2,
     previous_edition_id: null,
     source_profile: "iran-default",
     status: "selection",
@@ -33,7 +32,6 @@ test("parcourt candidat Iran, brève fondée sur preuves, puis validation", asyn
     title: "Campagne ciblant des administrations iraniennes",
     outcome: "new_subject",
     status: selected ? "selected" : "proposed",
-    editorial_type: selected ? "brief" : null,
     subject_id: selected ? subjectId : null,
     candidates: [
       {
@@ -157,12 +155,10 @@ test("parcourt candidat Iran, brève fondée sur preuves, puis validation", asyn
       return route.fulfill({
         json: {
           groups: [group()],
-          selected_briefs: selected ? 1 : 0,
-          selected_major: 0,
+          selected_articles: selected ? 1 : 0,
           ignored: 0,
           undecided: selected ? 0 : 1,
-          target_briefs: 1,
-          target_major: 1,
+          target_articles: 2,
           automatic_selection: false,
         },
       });
@@ -226,7 +222,7 @@ test("parcourt candidat Iran, brève fondée sur preuves, puis validation", asyn
   });
 
   await page.goto(`/editions/${editionId}`);
-  await page.getByRole("radio", { name: "Brève" }).check();
+  await page.getByRole("radio", { name: "Article" }).check();
   await page
     .getByRole("button", { name: "Confirmer la sélection (1)" })
     .click();

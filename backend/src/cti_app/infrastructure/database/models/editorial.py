@@ -23,7 +23,6 @@ GROUPING_OUTCOME_VALUES_SQL = (
     "'new_subject', 'duplicate_same_publication', 'update_previous_subject', "
     "'non_independent_reprint', 'ambiguous_review'"
 )
-EDITORIAL_TYPE_VALUES_SQL = "'brief', 'major'"
 GROUPING_CONFIDENCE_VALUES_SQL = "'low', 'medium', 'high'"
 HUMAN_DECISION_VALUES_SQL = (
     "'merge', 'split', 'reject', 'select', 'claim_validate', 'claim_correct', "
@@ -43,10 +42,6 @@ class EditorialGroupRow(Base):
         CheckConstraint(
             f"outcome IN ({GROUPING_OUTCOME_VALUES_SQL})",
             name="ck_editorial_groups_outcome",
-        ),
-        CheckConstraint(
-            f"editorial_type IS NULL OR editorial_type IN ({EDITORIAL_TYPE_VALUES_SQL})",
-            name="ck_editorial_groups_type",
         ),
         CheckConstraint(
             f"source_relationship_status IN ({RELATIONSHIP_STATUS_VALUES_SQL})",
@@ -74,7 +69,6 @@ class EditorialGroupRow(Base):
     needs_source_expansion: Mapped[bool] = mapped_column(Boolean, nullable=False)
     grouping_confidence: Mapped[str] = mapped_column(String(32), nullable=False)
     grouping_justification: Mapped[str] = mapped_column(Text, nullable=False)
-    editorial_type: Mapped[str | None] = mapped_column(String(32))
     subject_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT")
     )

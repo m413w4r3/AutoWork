@@ -1,11 +1,4 @@
-"""Per-stage status shown to the UI.
-
-Profile-specific workflow stages do not map one-to-one onto artifacts:
-SOURCES, ANALYST_RESEARCH, and ANALYST_NOTE never produce one, while ASSEMBLY
-produces the artifact named `brief`. Deriving the stage list from artifacts
-alone therefore reports some stages as pending forever and ASSEMBLY as never
-done.
-"""
+"""Per-stage status shown to the UI."""
 
 from __future__ import annotations
 
@@ -28,7 +21,7 @@ _STAGE_ARTIFACT: dict[SubjectProductionStage, ProductionArtifactStage | None] = 
     SubjectProductionStage.SYNTHESIS: ProductionArtifactStage.SYNTHESIS,
     SubjectProductionStage.ANALYST_RESEARCH: None,
     SubjectProductionStage.ANALYST_NOTE: None,
-    SubjectProductionStage.ASSEMBLY: ProductionArtifactStage.BRIEF,
+    SubjectProductionStage.ASSEMBLY: ProductionArtifactStage.PUBLICATION,
 }
 
 
@@ -43,11 +36,19 @@ def build_stage_statuses(
     Stages before the current one are complete, the current one is running, and
     a terminal run reports its outcome on the stage it stopped at.
     """
-    stages_for_profile = production_stages(run.profile)
-    current_index = stages_for_profile.index(run.current_stage)
+    stages_for_pipeline = production_stages()
+    # A terminal legacy run may still point at an analyst checkpoint. Keep it
+    # readable through the generic production model without exposing or
+    # scheduling that historical stage.
+    current_stage = (
+        run.current_stage
+        if run.current_stage in stages_for_pipeline
+        else SubjectProductionStage.ASSEMBLY
+    )
+    current_index = stages_for_pipeline.index(current_stage)
     statuses: dict[str, dict[str, Any]] = {}
 
-    for index, stage in enumerate(stages_for_profile):
+    for index, stage in enumerate(stages_for_pipeline):
         artifact_stage = _STAGE_ARTIFACT[stage]
         artifact = artifacts.get(artifact_stage.value) if artifact_stage else None
 

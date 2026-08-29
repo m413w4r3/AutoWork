@@ -77,7 +77,8 @@ function stageDetail(
 }
 
 function stageArtifactHref(subjectId: string, stage: string): string {
-  return `/subjects/${subjectId}/production/artifacts/${stage}`;
+  const artifactStage = stage === "assembly" ? "publication" : stage;
+  return `/subjects/${subjectId}/production/artifacts/${artifactStage}`;
 }
 
 function issueCopy(status: string, errorCode: string | null): string {
@@ -268,7 +269,7 @@ export function SubjectProduction({
           <a href={`/subjects/${subjectId}#conversations`}>Voir la synthèse</a>
         ) : null}
         {status.status === "ready" ? (
-          <a href={`/subjects/${subjectId}/production/artifacts/brief`}>
+          <a href={`/subjects/${subjectId}/production/artifacts/publication`}>
             Aperçu
           </a>
         ) : null}

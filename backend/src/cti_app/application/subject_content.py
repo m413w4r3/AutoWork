@@ -7,6 +7,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_normalization import (
     display_indicator_value,
     normalize_indicator_value,
@@ -19,8 +20,7 @@ from cti_app.application.production_parsers import (
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import Sample, SourceDocument
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
-from cti_app.domain.publication import ArtifactType
-from cti_app.domain.publication import BriefDocumentV1 as CurrentPublicationDocument
+from cti_app.domain.publication import ArtifactType, publication_document_from_json
 
 
 class ArtifactPayloadReader(Protocol):
@@ -87,14 +87,12 @@ class SubjectContentService:
             run = await uow.subject_production_runs.get_current_for_subject(subject_id)
             if run is None:
                 return None
-            artifact = await uow.production_artifacts.get_current(
-                run.id, ProductionArtifactStage.BRIEF.value
-            )
+            artifact = await current_publication_artifact(uow.production_artifacts, run.id)
             if artifact is None or artifact.canonical_blob_id is None:
                 return None
 
             canonical = await self._artifact_store.read_json(artifact.canonical_blob_id)
-            document = CurrentPublicationDocument.from_json(canonical)
+            document = publication_document_from_json(canonical)
             rendered = (
                 await self._artifact_store.read_text(artifact.rendered_blob_id)
                 if artifact.rendered_blob_id is not None

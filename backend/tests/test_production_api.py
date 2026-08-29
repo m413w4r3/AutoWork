@@ -34,7 +34,6 @@ from cti_app.domain.editorial import (
     EditorialGroup,
     EditorialGroupStatus,
     EditorialScore,
-    EditorialType,
     GroupingConfidence,
     GroupingOutcome,
 )
@@ -47,7 +46,6 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchPhase,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -79,7 +77,7 @@ def _group(edition_id: UUID, title: str, subject_id: UUID) -> EditorialGroup:
         grouping_confidence=GroupingConfidence.HIGH,
         grouping_justification="test",
     )
-    group.select(EditorialType.BRIEF, subject_id)
+    group.select(subject_id)
     return group
 
 
@@ -235,7 +233,7 @@ class _Artifacts:
         return max(matches, key=lambda artifact: artifact.version) if matches else None
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
-        stages = ["references", "extraction", "synthesis", "brief"]
+        stages = ["references", "extraction", "synthesis", "publication"]
         if stage not in stages:
             return
         downstream = set(stages[stages.index(stage) + 1 :])
@@ -250,7 +248,7 @@ class _Artifacts:
             "references": "references",
             "extraction": "extraction",
             "synthesis": "synthesis",
-            "assembly": "brief",
+            "assembly": "publication",
         }
         if stage not in pipeline:
             return []
@@ -482,7 +480,7 @@ async def test_get_subject_production_without_run_returns_404(api: AsyncClient) 
 
 
 async def test_get_edition_briefs_without_batch_returns_404(api: AsyncClient) -> None:
-    response = await api.get(f"/api/editions/{uuid4()}/production/briefs")
+    response = await api.get(f"/api/editions/{uuid4()}/production")
 
     assert response.status_code == 404
     assert response.status_code != 422
@@ -538,7 +536,7 @@ async def test_start_subject_production_rejects_non_selected_subject(
     assert response.status_code == 409
 
 
-async def test_start_edition_briefs_produces_every_selected_brief(
+async def test_start_edition_produces_every_selected_article(
     api: AsyncClient, uow: _Uow
 ) -> None:
     edition_id = uuid4()
@@ -546,20 +544,20 @@ async def test_start_edition_briefs_produces_every_selected_brief(
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
         uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
 
-    response = await api.post(f"/api/editions/{edition_id}/production/briefs", json={})
+    response = await api.post(f"/api/editions/{edition_id}/production", json={})
 
     assert response.status_code == 200, response.text
     assert response.json()["items"] == 3
 
 
-async def test_start_edition_briefs_honours_subject_selection(api: AsyncClient, uow: _Uow) -> None:
+async def test_start_edition_honours_subject_selection(api: AsyncClient, uow: _Uow) -> None:
     edition_id = uuid4()
     subjects = [uuid4() for _ in range(3)]
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
         uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
 
     response = await api.post(
-        f"/api/editions/{edition_id}/production/briefs",
+        f"/api/editions/{edition_id}/production",
         json={"subject_ids": [str(subjects[0]), str(subjects[2])]},
     )
 
@@ -570,14 +568,14 @@ async def test_start_edition_briefs_honours_subject_selection(api: AsyncClient, 
     assert produced == {subjects[0], subjects[2]}
 
 
-async def test_start_edition_briefs_submits_sources_job_with_standard_retry_policy(
+async def test_start_edition_submits_sources_job_with_standard_retry_policy(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
     uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
 
-    response = await api.post(f"/api/editions/{edition_id}/production/briefs", json={})
+    response = await api.post(f"/api/editions/{edition_id}/production", json={})
 
     assert response.status_code == 200, response.text
     jobs = production_app.state.job_service
@@ -592,7 +590,7 @@ async def test_batch_status_exposes_phase_schedule_and_item_error_details(
     edition_id = uuid4()
     subject_id = uuid4()
     uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
-    started = await api.post(f"/api/editions/{edition_id}/production/briefs", json={})
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
     assert started.status_code == 200, started.text
 
     batch = next(iter(uow.edition_production_batches.items.values()))
@@ -604,7 +602,7 @@ async def test_batch_status_exposes_phase_schedule_and_item_error_details(
     run.pipeline_generation = 2
     run.mark_failed(code="bridge_timeout", message="bridge stopped")
 
-    response = await api.get(f"/api/editions/{edition_id}/production/briefs")
+    response = await api.get(f"/api/editions/{edition_id}/production")
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["phase"] == "recovery"
@@ -624,7 +622,7 @@ async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_title
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
         uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
 
-    started = await api.post(f"/api/editions/{edition_id}/production/briefs", json={})
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
     assert started.status_code == 200, started.text
     uow.batch_status_read_model.calls = 0
     batch_items = uow.edition_production_batch_items.items
@@ -634,7 +632,7 @@ async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_title
         subject_title="Snapshot title"
     )
 
-    response = await api.get(f"/api/editions/{edition_id}/production/briefs")
+    response = await api.get(f"/api/editions/{edition_id}/production")
 
     assert response.status_code == 200, response.text
     details = response.json()["item_details"]
@@ -644,13 +642,13 @@ async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_title
     assert uow.batch_status_read_model.calls == 1
 
 
-async def test_start_edition_briefs_rejects_unselected_subject(api: AsyncClient, uow: _Uow) -> None:
+async def test_start_edition_rejects_unselected_subject(api: AsyncClient, uow: _Uow) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
     uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
 
     response = await api.post(
-        f"/api/editions/{edition_id}/production/briefs",
+        f"/api/editions/{edition_id}/production",
         json={"subject_ids": [str(uuid4())]},
     )
 
@@ -664,7 +662,7 @@ async def test_batch_creates_exactly_one_run_per_subject(api: AsyncClient, uow: 
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
         uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
 
-    response = await api.post(f"/api/editions/{edition_id}/production/briefs", json={})
+    response = await api.post(f"/api/editions/{edition_id}/production", json={})
 
     assert response.status_code == 200, response.text
     assert len(uow.subject_production_runs.items) == 3
@@ -714,7 +712,6 @@ def _terminal_run(
     run = SubjectProductionRun(
         subject_id=subject_id,
         edition_id=edition_id,
-        profile=ProductionProfile.BRIEF_AUTO,
         run_number=run_number,
     )
     run.start_running()
@@ -778,7 +775,6 @@ async def test_save_brief_draft_appends_artifact_versions(api: AsyncClient, uow:
     run = SubjectProductionRun(
         subject_id=subject_id,
         edition_id=edition_id,
-        profile=ProductionProfile.BRIEF_AUTO,
     )
     await uow.subject_production_runs.add(run)
 
@@ -801,7 +797,6 @@ def _ready_run(edition_id: UUID, subject_id: UUID, *, run_number: int = 1) -> Su
     run = SubjectProductionRun(
         subject_id=subject_id,
         edition_id=edition_id,
-        profile=ProductionProfile.BRIEF_AUTO,
         run_number=run_number,
     )
     run.start_running()
@@ -931,7 +926,7 @@ async def test_production_state_export_import_is_transparent(
     assert exported.status_code == 200, exported.text
     snapshot = exported.json()
     assert snapshot["format"] == "autowork.production-state"
-    assert snapshot["schema_version"] == 1
+    assert snapshot["schema_version"] == 2
     assert snapshot["content_sha256"]
     assert snapshot["artifacts"]["references"]["canonical_content"]["sources"][0]["id"] == "S1"
     assert (
@@ -1009,75 +1004,6 @@ async def test_production_state_import_has_no_generation_side_effects(
     assert response.status_code == 200
     assert len(jobs.submitted) == before_jobs
     assert len(uow.subject_production_runs.items) == before_runs + 1
-
-
-async def test_production_state_import_major_creates_handoff_without_model_or_synthesis_rerun(
-    api: AsyncClient, uow: _Uow, production_app: FastAPI, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import cti_app.api.production as production_api
-
-    monkeypatch.setattr(
-        production_api,
-        "get_settings",
-        lambda: SimpleNamespace(production_major_assisted_enabled=True),
-    )
-    edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Major", subject_id))
-    snapshot = _state_payload()
-    item = snapshot["artifacts"]["extraction"]["canonical_content"]["items"][0]
-    item.update(
-        {
-            "id": "I-hash",
-            "value": "a" * 64,
-            "normalized_value": "a" * 64,
-            "artifact_type": "hash",
-            "indicator_status": "confirmed_ioc",
-            "supported": True,
-        }
-    )
-    snapshot_model = ProductionStateSnapshotV1.model_validate(snapshot)
-    snapshot["content_sha256"] = compute_production_state_checksum(snapshot_model)
-
-    response = await api.post(
-        f"/api/subjects/{subject_id}/production/state/import?profile=major_assisted",
-        json=snapshot,
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "running"
-    assert response.json()["current_stage"] == "analyst_research"
-
-    run = await uow.subject_production_runs.get_current_for_subject(subject_id)
-    assert run is not None
-    assert run.profile is ProductionProfile.MAJOR_ASSISTED
-    assert run.current_stage is SubjectProductionStage.ANALYST_RESEARCH
-    assert len(await uow.production_artifacts.list_for_run(run.id)) == 3
-    investigation = await uow.analyst_investigations.get_for_run(run.id)
-    assert investigation is not None and investigation.input_sha256 is not None
-    pack = await uow.analyst_input_packs.get_for_investigation(investigation.id)
-    assert pack is not None and pack.sha256 == investigation.input_sha256
-    visible = await api.get(f"/api/subjects/{subject_id}/investigation")
-    assert visible.status_code == 200
-    assert [item["value"] for item in visible.json()["file_indicators"]] == ["a" * 64]
-
-
-async def test_production_state_import_major_obeys_feature_flag(
-    api: AsyncClient, uow: _Uow, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import cti_app.api.production as production_api
-
-    monkeypatch.setattr(
-        production_api,
-        "get_settings",
-        lambda: SimpleNamespace(production_major_assisted_enabled=False),
-    )
-    edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Major", subject_id))
-    response = await api.post(
-        f"/api/subjects/{subject_id}/production/state/import?profile=major_assisted",
-        json=_state_payload(),
-    )
-    assert response.status_code == 501
-    assert not uow.subject_production_runs.items
 
 
 async def test_production_state_export_import_export_preserves_business_content(
@@ -1191,29 +1117,33 @@ async def test_production_state_import_maps_validation_errors(
         (
             SubjectProductionStatus.READY,
             SubjectProductionStage.SOURCES,
-            ["references", "extraction", "synthesis", "brief"],
+            ["references", "extraction", "synthesis", "publication"],
         ),
         (
             SubjectProductionStatus.READY,
             SubjectProductionStage.REFERENCES,
-            ["references", "extraction", "synthesis", "brief"],
+            ["references", "extraction", "synthesis", "publication"],
         ),
         (
             SubjectProductionStatus.READY,
             SubjectProductionStage.EXTRACTION,
-            ["extraction", "synthesis", "brief"],
+            ["extraction", "synthesis", "publication"],
         ),
-        (SubjectProductionStatus.READY, SubjectProductionStage.SYNTHESIS, ["synthesis", "brief"]),
-        (SubjectProductionStatus.READY, SubjectProductionStage.ASSEMBLY, ["brief"]),
+        (
+            SubjectProductionStatus.READY,
+            SubjectProductionStage.SYNTHESIS,
+            ["synthesis", "publication"],
+        ),
+        (SubjectProductionStatus.READY, SubjectProductionStage.ASSEMBLY, ["publication"]),
         (
             SubjectProductionStatus.FAILED,
             SubjectProductionStage.EXTRACTION,
-            ["extraction", "synthesis", "brief"],
+            ["extraction", "synthesis", "publication"],
         ),
         (
             SubjectProductionStatus.NEEDS_REVIEW,
             SubjectProductionStage.EXTRACTION,
-            ["extraction", "synthesis", "brief"],
+            ["extraction", "synthesis", "publication"],
         ),
     ),
 )
@@ -1226,9 +1156,7 @@ async def test_retry_stage_reuses_run_and_stales_selected_stage_and_downstream(
     expected_stale: list[str],
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    run = SubjectProductionRun(
-        subject_id=subject_id, edition_id=edition_id, profile=ProductionProfile.BRIEF_AUTO
-    )
+    run = SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
     run.start_running()
     run.current_stage = SubjectProductionStage.ASSEMBLY
     if initial_status is SubjectProductionStatus.READY:
@@ -1281,9 +1209,7 @@ async def test_retry_stage_reuses_run_and_stales_selected_stage_and_downstream(
 async def test_retry_stage_rejects_queued_or_running_run(
     api: AsyncClient, uow: _Uow, status: SubjectProductionStatus
 ) -> None:
-    run = SubjectProductionRun(
-        subject_id=uuid4(), edition_id=uuid4(), profile=ProductionProfile.BRIEF_AUTO
-    )
+    run = SubjectProductionRun(subject_id=uuid4(), edition_id=uuid4())
     if status is SubjectProductionStatus.RUNNING:
         run.start_running()
     await uow.subject_production_runs.add(run)
@@ -1296,7 +1222,7 @@ async def test_retry_stage_rejects_queued_or_running_run(
     assert response.json()["detail"]["code"] == "retry_not_allowed_while_running"
 
 
-async def test_brief_artifact_by_run_does_not_follow_subject_current_run(
+async def test_publication_artifact_by_run_does_not_follow_subject_current_run(
     api: AsyncClient,
     uow: _Uow,
 ) -> None:
@@ -1305,13 +1231,13 @@ async def test_brief_artifact_by_run_does_not_follow_subject_current_run(
     second = _terminal_run(first.edition_id, subject_id, status=SubjectProductionStatus.FAILED)
     await uow.subject_production_runs.add(first)
     await uow.subject_production_runs.add(second)
-    first_artifact = _artifact(first, ProductionArtifactStage.BRIEF)
-    second_artifact = _artifact(second, ProductionArtifactStage.BRIEF)
+    first_artifact = _artifact(first, ProductionArtifactStage.PUBLICATION)
+    second_artifact = _artifact(second, ProductionArtifactStage.PUBLICATION)
     await uow.production_artifacts.append(first_artifact)
     await uow.production_artifacts.append(second_artifact)
 
-    by_run = await api.get(f"/api/production/runs/{first.id}/artifacts/brief")
-    by_subject = await api.get(f"/api/subjects/{subject_id}/production/artifacts/brief")
+    by_run = await api.get(f"/api/production/runs/{first.id}/artifacts/publication")
+    by_subject = await api.get(f"/api/subjects/{subject_id}/production/artifacts/publication")
 
     assert by_run.status_code == 200, by_run.text
     assert by_subject.status_code == 200, by_subject.text
@@ -1356,7 +1282,7 @@ async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
     jobs = _CancelableJobs()
     production_app.state.job_service = jobs
 
-    started = await api.post(f"/api/editions/{edition_id}/production/briefs", json={})
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
     assert started.status_code == 200, started.text
     batch = next(iter(uow.edition_production_batches.items.values()))
     first_run = uow.subject_production_runs.items[
@@ -1365,8 +1291,8 @@ async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
     unrelated = _TrackedJob(subject_id=subjects[0], run_id=uuid4())
     jobs.jobs.append(unrelated)
 
-    response = await api.post(f"/api/editions/{edition_id}/production/briefs/{batch.id}/cancel")
-    repeated = await api.post(f"/api/editions/{edition_id}/production/briefs/{batch.id}/cancel")
+    response = await api.post(f"/api/editions/{edition_id}/production/{batch.id}/cancel")
+    repeated = await api.post(f"/api/editions/{edition_id}/production/{batch.id}/cancel")
 
     assert response.status_code == 200, response.text
     assert repeated.status_code == 200, repeated.text

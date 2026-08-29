@@ -72,9 +72,11 @@ class Edition:
     period_end: date
     tlp: TLP
     languages: tuple[str, ...]
-    target_major_articles: int
-    target_briefs: int
     source_profile: str
+    target_articles: int | None = None
+    # Read-only compatibility fields for historical fixtures before migration.
+    target_major_articles: int | None = None
+    target_briefs: int | None = None
     previous_edition_id: UUID | None = None
     id: UUID = field(default_factory=uuid4)
     status: EditionStatus = EditionStatus.DRAFT
@@ -87,6 +89,13 @@ class Edition:
         self.country_code = self.country_code.strip().upper()
         self.languages = tuple(dict.fromkeys(self.languages))
         self.source_profile = self.source_profile.strip()
+        if self.target_articles is None:
+            if self.target_major_articles is None or self.target_briefs is None:
+                raise ValueError("target_articles is required")
+            self.target_articles = self.target_major_articles + self.target_briefs
+        if self.target_major_articles is None and self.target_briefs is None:
+            self.target_major_articles = 0
+            self.target_briefs = self.target_articles
         self._validate()
 
     @property
@@ -106,8 +115,9 @@ class Edition:
         period_end: date,
         tlp: TLP,
         languages: tuple[str, ...],
-        target_major_articles: int,
-        target_briefs: int,
+        target_articles: int | None = None,
+        target_major_articles: int | None = None,
+        target_briefs: int | None = None,
         previous_edition_id: UUID | None,
         source_profile: str,
         now: datetime | None = None,
@@ -127,8 +137,15 @@ class Edition:
         self.period_end = period_end
         self.tlp = tlp
         self.languages = tuple(dict.fromkeys(languages))
-        self.target_major_articles = target_major_articles
-        self.target_briefs = target_briefs
+        if target_articles is None:
+            if target_major_articles is None or target_briefs is None:
+                raise ValueError("target_articles is required")
+            target_articles = target_major_articles + target_briefs
+        self.target_articles = target_articles
+        self.target_major_articles = (
+            target_major_articles if target_major_articles is not None else 0
+        )
+        self.target_briefs = target_briefs if target_briefs is not None else target_articles
         self.previous_edition_id = previous_edition_id
         self.source_profile = source_profile.strip()
         self._validate()
@@ -151,8 +168,7 @@ class Edition:
             "period_end": self.period_end.isoformat(),
             "tlp": self.tlp.value,
             "languages": list(self.languages),
-            "target_major_articles": self.target_major_articles,
-            "target_briefs": self.target_briefs,
+            "target_articles": self.target_articles,
             "previous_edition_id": (
                 str(self.previous_edition_id) if self.previous_edition_id else None
             ),
@@ -177,10 +193,12 @@ class Edition:
             not LANGUAGE_PATTERN.fullmatch(language) for language in self.languages
         ):
             raise ValueError("Languages must be unique BCP47-like codes")
-        if not 0 <= self.target_major_articles <= 20:
-            raise ValueError("Target major articles must be between 0 and 20")
-        if not 0 <= self.target_briefs <= 100:
-            raise ValueError("Target briefs must be between 0 and 100")
+        if self.target_articles is None or not 0 <= self.target_articles <= 120:
+            raise ValueError("Target articles must be between 0 and 120")
+        if self.target_major_articles is not None and not 0 <= self.target_major_articles <= 20:
+            raise ValueError("Historical target major articles must be between 0 and 20")
+        if self.target_briefs is not None and not 0 <= self.target_briefs <= 100:
+            raise ValueError("Historical target briefs must be between 0 and 100")
         if not SOURCE_PROFILE_PATTERN.fullmatch(self.source_profile):
             raise ValueError("Invalid source profile")
         if self.version < 1:

@@ -41,8 +41,7 @@ class EditionFields(BaseModel):
     period_end: date
     tlp: TLP
     languages: list[str] = Field(min_length=1, max_length=10)
-    target_major_articles: int = Field(ge=0, le=20)
-    target_briefs: int = Field(ge=0, le=100)
+    target_articles: int = Field(ge=0, le=120)
     previous_edition_id: UUID | None = None
     source_profile: str = Field(min_length=1, max_length=128)
 
@@ -205,8 +204,7 @@ class EditionFieldArguments(TypedDict):
     period_end: date
     tlp: TLP
     languages: tuple[str, ...]
-    target_major_articles: int
-    target_briefs: int
+    target_articles: int
     previous_edition_id: UUID | None
     source_profile: str
 
@@ -219,8 +217,7 @@ def _field_arguments(payload: EditionFields) -> EditionFieldArguments:
         "period_end": payload.period_end,
         "tlp": payload.tlp,
         "languages": tuple(payload.languages),
-        "target_major_articles": payload.target_major_articles,
-        "target_briefs": payload.target_briefs,
+        "target_articles": payload.target_articles,
         "previous_edition_id": payload.previous_edition_id,
         "source_profile": payload.source_profile,
     }
@@ -235,8 +232,7 @@ def _edition_view(edition: Edition) -> EditionView:
         period_end=edition.period_end,
         tlp=edition.tlp,
         languages=list(edition.languages),
-        target_major_articles=edition.target_major_articles,
-        target_briefs=edition.target_briefs,
+        target_articles=edition.target_articles,
         previous_edition_id=edition.previous_edition_id,
         source_profile=edition.source_profile,
         status=edition.status,

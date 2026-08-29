@@ -36,8 +36,7 @@ class EditionRow(Base):
         CheckConstraint(f"tlp IN ({TLP_VALUES_SQL})", name="ck_editions_tlp"),
         CheckConstraint(f"status IN ({EDITION_STATUS_VALUES_SQL})", name="ck_editions_status"),
         CheckConstraint("version >= 1", name="ck_editions_version"),
-        CheckConstraint("target_major_articles BETWEEN 0 AND 20", name="ck_editions_major"),
-        CheckConstraint("target_briefs BETWEEN 0 AND 100", name="ck_editions_briefs"),
+        CheckConstraint("target_articles BETWEEN 0 AND 120", name="ck_editions_articles"),
         CheckConstraint("period_start <= period_end", name="ck_editions_period_order"),
         CheckConstraint(
             "period_start = date_trunc('month', period_start)::date "
@@ -57,8 +56,7 @@ class EditionRow(Base):
     period_end: Mapped[date] = mapped_column(nullable=False)
     tlp: Mapped[str] = mapped_column(String(16), nullable=False)
     languages: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
-    target_major_articles: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    target_briefs: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_articles: Mapped[int] = mapped_column(BigInteger, nullable=False)
     previous_edition_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="SET NULL")
     )

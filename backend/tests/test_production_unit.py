@@ -33,7 +33,6 @@ class TestSubjectProductionRunStates:
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         assert run.status == SubjectProductionStatus.QUEUED
@@ -45,7 +44,6 @@ class TestSubjectProductionRunStates:
         run = SubjectProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            profile=ProductionProfile.BRIEF_AUTO,
         )
 
         run.start_running(now=datetime.now(UTC))

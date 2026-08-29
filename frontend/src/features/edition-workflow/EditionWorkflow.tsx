@@ -132,11 +132,7 @@ function DiscoveryPhase({ edition }: { edition: Edition }) {
 }
 
 function isEligibleSubject(group: EditorialGroup): boolean {
-  return (
-    group.status === "selected" &&
-    group.editorial_type === "brief" &&
-    group.subject_id !== null
-  );
+  return group.status === "selected" && group.subject_id !== null;
 }
 
 function SelectionPhase({ edition }: { edition: Edition }) {

@@ -27,7 +27,6 @@ from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import EditionProductionService
 from cti_app.domain.production import (
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -213,7 +212,7 @@ def register_production_jobs(
         if current.current_stage is not stage:
             if (
                 current.status is SubjectProductionStatus.RUNNING
-                and current.current_stage is not SubjectProductionStage.ANALYST_RESEARCH
+                and current.current_stage in production_stages()
             ):
                 try:
                     await stage_chain.submit(
@@ -244,7 +243,7 @@ def register_production_jobs(
             correlation_id=correlation_id,
         )
 
-        stages = list(production_stages(current.profile))
+        stages = list(production_stages())
         stage_index = stages.index(stage)
         await context.report_progress(
             stage_index + 1,
@@ -332,10 +331,6 @@ def register_production_jobs(
             await uow.commit()
             next_stage = advancing.current_stage
 
-        # ANALYST_RESEARCH is a deliberate manual checkpoint in P04.
-        if next_stage is SubjectProductionStage.ANALYST_RESEARCH:
-            return f"production-stage://{parameters.run_id}/{stage.value}#awaiting_analyst"
-
         job_id = await stage_chain.submit(
             run=advancing,
             stage=next_stage,
@@ -349,7 +344,7 @@ def register_production_jobs(
             )
         return f"production-stage://{parameters.run_id}/{stage.value}"
 
-    for stage in SubjectProductionStage:
+    for stage in production_stages():
         registry.register(
             stage_job_kind(stage),
             ProductionStageParameters,
@@ -359,7 +354,6 @@ def register_production_jobs(
 
 
 __all__ = [
-    "ProductionProfile",
     "ProductionStageChain",
     "ProductionStageParameters",
     "production_stage_idempotency_key",

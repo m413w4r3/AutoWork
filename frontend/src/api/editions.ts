@@ -17,8 +17,7 @@ export interface EditionFields {
   period_end: string;
   tlp: Tlp;
   languages: string[];
-  target_major_articles: number;
-  target_briefs: number;
+  target_articles: number;
   previous_edition_id: string | null;
   source_profile: string;
 }

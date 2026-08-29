@@ -41,9 +41,11 @@ class EditorialActionError(ValueError):
 
 
 class EditorialDecisionValue(StrEnum):
+    ARTICLE = "article"
+    IGNORE = "ignore"
+    # Historical integrations are read-only compatibility paths.
     BRIEF = "brief"
     MAJOR = "major"
-    IGNORE = "ignore"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,15 +57,18 @@ class EditorialDecisionCommand:
 
 @dataclass(frozen=True, slots=True)
 class EditorialAutoSelectionPolicyV1:
-    """Select briefs from editorial IOC signals, independently of quotas."""
+    """Select articles from editorial signals, independently of quotas."""
 
     version: int = 1
     rule: str = "ioc_signal_v1"
     actor_id: str = "system:editorial-auto-selection"
 
-    def should_select_brief(self, candidates: Sequence[CandidateTopic]) -> bool:
+    def should_select_article(self, candidates: Sequence[CandidateTopic]) -> bool:
         return any(_candidate_has_ioc_signal(candidate) for candidate in candidates)
 
+    def should_select_brief(self, candidates: Sequence[CandidateTopic]) -> bool:
+        """Historical policy name."""
+        return self.should_select_article(candidates)
 
 class WorkspaceMaterializer(Protocol):
     async def materialize(
@@ -81,13 +86,26 @@ class EditorialBoard:
     groups: list[EditorialGroup]
     candidates: dict[CandidateReference, CandidateTopic]
     historical_groups: dict[UUID, EditorialGroup]
-    selected_briefs: int
-    selected_major: int
+    selected_articles: int
     ignored: int
     undecided: int
-    target_briefs: int
-    target_major: int
+    target_articles: int
 
+    @property
+    def selected_briefs(self) -> int:
+        return self.selected_articles
+
+    @property
+    def selected_major(self) -> int:
+        return 0
+
+    @property
+    def target_briefs(self) -> int:
+        return self.target_articles
+
+    @property
+    def target_major(self) -> int:
+        return 0
 
 class EditorialGroupingService:
     def __init__(
@@ -182,12 +200,11 @@ class EditorialGroupingService:
                 )
                 if snapshot_candidate is not None:
                     group_candidates = (*group_candidates, snapshot_candidate)
-                if self._auto_selection_policy.should_select_brief(group_candidates):
+                if self._auto_selection_policy.should_select_article(group_candidates):
                     await self._select_locked(
                         uow,
                         edition,
                         group,
-                        EditorialType.BRIEF,
                         actor_id=self._auto_selection_policy.actor_id,
                         correlation_id=f"editorial-auto-selection-v1:{group.id}",
                         automatic=True,
@@ -216,16 +233,10 @@ class EditorialGroupingService:
                 groups=groups,
                 candidates=_candidate_map(batches),
                 historical_groups={group.id: group for group in [*historical, *selected]},
-                selected_briefs=sum(
-                    group.editorial_type is EditorialType.BRIEF for group in selected
-                ),
-                selected_major=sum(
-                    group.editorial_type is EditorialType.MAJOR for group in selected
-                ),
+                selected_articles=len(selected),
                 ignored=len(ignored),
                 undecided=len(undecided),
-                target_briefs=edition.target_briefs,
-                target_major=edition.target_major_articles,
+                target_articles=edition.target_articles or 0,
             )
 
     async def decide_many(
@@ -282,12 +293,16 @@ class EditorialGroupingService:
                     )
                     continue
 
-                editorial_type = EditorialType(command.decision.value)
                 await self._select_locked(
                     uow,
                     edition,
                     group,
-                    editorial_type,
+                    legacy_editorial_type=(
+                        EditorialType(command.decision.value)
+                        if command.decision
+                        in {EditorialDecisionValue.BRIEF, EditorialDecisionValue.MAJOR}
+                        else None
+                    ),
                     actor_id=actor_id,
                     correlation_id=correlation_id,
                     batch_confirmation=True,
@@ -393,6 +408,7 @@ class EditorialGroupingService:
         self,
         edition_id: UUID,
         group_id: UUID,
+        legacy_editorial_type: EditorialType | None = None,
         *,
         reason: str,
         actor_id: str,
@@ -421,7 +437,7 @@ class EditorialGroupingService:
         self,
         edition_id: UUID,
         group_id: UUID,
-        editorial_type: EditorialType,
+        legacy_editorial_type: EditorialType | None = None,
         *,
         actor_id: str,
         correlation_id: str,
@@ -435,7 +451,7 @@ class EditorialGroupingService:
                 uow,
                 edition,
                 group,
-                editorial_type,
+                legacy_editorial_type=legacy_editorial_type,
                 actor_id=actor_id,
                 correlation_id=correlation_id,
             )
@@ -447,7 +463,7 @@ class EditorialGroupingService:
         uow: UnitOfWork,
         edition: Edition,
         group: EditorialGroup,
-        editorial_type: EditorialType,
+        legacy_editorial_type: EditorialType | None = None,
         *,
         actor_id: str,
         correlation_id: str,
@@ -465,10 +481,11 @@ class EditorialGroupingService:
         await uow.subjects.add(subject)
         if self._materializer is not None:
             await self._materializer.materialize(subject, (), (), {}, self._workspace_root)
-        group.select(editorial_type, subject.id)
+        group.select(subject.id)
+        if legacy_editorial_type is not None:
+            group.editorial_type = legacy_editorial_type
         await uow.editorial_groups.save(group)
         payload: dict[str, object] = {
-            "editorial_type": editorial_type.value,
             "subject_id": str(subject.id),
             "score_total": group.score.total,
             "automatic": automatic,

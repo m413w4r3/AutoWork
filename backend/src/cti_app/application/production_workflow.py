@@ -12,11 +12,6 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from cti_app.application.analyst_handoff import (
-    AnalystHandoffPolicy,
-    AnalystPostSynthesisService,
-    loop_budget_from_settings,
-)
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
@@ -59,14 +54,13 @@ from cti_app.application.production_prompts import (
     ProductionPromptTemplates,
 )
 from cti_app.application.production_stages import (
-    BriefAssemblyService,
     ExtractionService,
     ProductionQAService,
+    PublicationAssemblyService,
     ReferenceResearchService,
     SynthesisService,
     compute_input_hash,
 )
-from cti_app.config import get_settings
 from cti_app.domain.collection import SourceOriginKind
 from cti_app.domain.model_conversations import (
     ConversationMode,
@@ -78,7 +72,6 @@ from cti_app.domain.model_conversations import (
 from cti_app.domain.model_runs import ModelProvider, ModelRole
 from cti_app.domain.production import (
     ProductionInputSnapshot,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -142,7 +135,7 @@ def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
 
 
 class ProductionWorkflowOrchestrator:
-    """Orchestrates the complete production workflow for supported profiles."""
+    """Orchestrates the single article publication workflow."""
 
     def __init__(
         self,
@@ -165,19 +158,10 @@ class ProductionWorkflowOrchestrator:
         self._references = ReferenceResearchService(uow_factory, artifact_store)
         self._extraction = ExtractionService(uow_factory, artifact_store)
         self._synthesis = SynthesisService(uow_factory, artifact_store)
-        self._assembly = BriefAssemblyService(uow_factory, artifact_store)
+        self._assembly = PublicationAssemblyService(uow_factory, artifact_store)
         self._qa = ProductionQAService(uow_factory)
         self._seed_enrichment = seed_enrichment
         self._pacing = pacing or ProductionPacingPolicy.zero()
-        self._analyst_handoff = (
-            AnalystPostSynthesisService(
-                uow_factory,
-                artifact_store,
-                lambda: loop_budget_from_settings(get_settings()),
-            )
-            if artifact_store is not None
-            else None
-        )
 
     async def execute_stage(
         self,
@@ -439,9 +423,9 @@ class ProductionWorkflowOrchestrator:
         references: Any,
         extraction: Any,
         synthesis: Any,
-        brief: Any,
+        publication: Any,
     ) -> dict[str, Any]:
-        """Read back what QA needs to judge the brief."""
+        """Read back what QA needs to judge the publication."""
         if self._artifact_store is None:
             return {}
         store = self._artifact_store
@@ -457,8 +441,10 @@ class ProductionWorkflowOrchestrator:
                 )
             if synthesis.rendered_blob_id is not None:
                 loaded["synthesis_text"] = await store.read_text(synthesis.rendered_blob_id)
-            if brief.rendered_blob_id is not None:
-                loaded["brief_markdown"] = await store.read_text(brief.rendered_blob_id)
+            if publication.rendered_blob_id is not None:
+                loaded["publication_markdown"] = await store.read_text(
+                    publication.rendered_blob_id
+                )
         except Exception:
             return loaded
         return loaded
@@ -1243,14 +1229,6 @@ class ProductionWorkflowOrchestrator:
                     },
                 )
 
-                analyst_handoff = await self._ensure_analyst_handoff(
-                    run=run,
-                    synthesis=artifact,
-                    extraction=extraction,
-                    extraction_payload=extraction_payload,
-                    policy=synthesis_ctx,
-                )
-
                 result = {
                     "stage": "synthesis",
                     "status": "success",
@@ -1258,54 +1236,9 @@ class ProductionWorkflowOrchestrator:
                     "word_count": len(output_text.split()),
                     "repair_actions": parsed.repair_actions,
                 }
-                if analyst_handoff is not None:
-                    result["analyst_investigation_id"] = str(analyst_handoff.investigation_id)
-                    await self._enrich_analyst_handoff(run, synthesis_ctx, analyst_handoff)
                 return result
             except Exception as e:
                 return self._handle_stage_exception(run, "synthesis", e)
-
-    async def _ensure_analyst_handoff(
-        self,
-        *,
-        run: SubjectProductionRun,
-        synthesis: Any,
-        extraction: Any,
-        extraction_payload: Any,
-        policy: Any,
-    ) -> Any | None:
-        """Persist the major handoff; seed enrichment is deliberately separate."""
-        if run.profile is not ProductionProfile.MAJOR_ASSISTED:
-            return None
-        if self._analyst_handoff is None:
-            raise ValueError("Analyst input pack requires the production artifact store")
-        return await self._analyst_handoff.ensure_for_verified_synthesis(
-            run=run,
-            synthesis=synthesis,
-            extraction_artifacts=(extraction,),
-            extraction_items=extraction_payload.items,
-            policy=AnalystHandoffPolicy(
-                tlp=getattr(policy, "tlp", None),
-                do_not_submit=bool(getattr(policy, "do_not_submit", False)),
-                external_llm_allowed=bool(getattr(policy, "external_llm_allowed", False)),
-            ),
-        )
-
-    async def _enrich_analyst_handoff(
-        self, run: SubjectProductionRun, policy: Any, handoff: Any
-    ) -> None:
-        if self._seed_enrichment is None:
-            return
-        for value in handoff.file_indicators:
-            await self._seed_enrichment.enrich(
-                value,
-                subject_id=run.subject_id,
-                external_lookup_allowed=bool(getattr(policy, "external_llm_allowed", False)),
-                has_bytes=False,
-                checkpoint_id=(
-                    f"analyst-input-pack:{handoff.investigation_id}:{handoff.input_sha256}:{value}"
-                ),
-            )
 
     async def _execute_assembly_stage(
         self, run: SubjectProductionRun, snapshot: ProductionInputSnapshot | None = None
@@ -1329,7 +1262,7 @@ class ProductionWorkflowOrchestrator:
                 for item in await uow.source_collections.list_for_subject(run.subject_id)
                 if item.state.value in _ARCHIVED_STATES
             }
-            brief = await self._assembly.assemble_brief(
+            publication = await self._assembly.assemble_publication(
                 run_id=run.id,
                 subject_id=run.subject_id,
                 subject_title=subject_title,
@@ -1339,13 +1272,13 @@ class ProductionWorkflowOrchestrator:
             )
 
             # QA reads the real payloads, not the counters.
-            qa_inputs = await self._load_qa_inputs(references, extraction, synthesis, brief)
+            qa_inputs = await self._load_qa_inputs(references, extraction, synthesis, publication)
             qa_result = await self._qa.run_qa(
                 run_id=run.id,
                 references_artifact=references,
                 extraction_artifact=extraction,
                 synthesis_artifact=synthesis,
-                brief_artifact=brief,
+                publication_artifact=publication,
                 archived_urls=archived_urls,
                 research_date=run.research_date,
                 **qa_inputs,

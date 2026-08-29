@@ -11,8 +11,7 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
     period_end: "2026-07-31",
     tlp: "AMBER",
     languages: ["fr", "en", "fa"],
-    target_major_articles: 2,
-    target_briefs: 6,
+    target_articles: 8,
     previous_edition_id: null,
     source_profile: "iran-default",
     status: "draft",
@@ -61,10 +60,8 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
           contentType: "application/json",
           body: JSON.stringify({
             groups: [],
-            selected_briefs: 0,
-            selected_major: 0,
-            target_briefs: 6,
-            target_major: 2,
+            selected_articles: 0,
+            target_articles: 8,
             automatic_selection: false,
           }),
         });

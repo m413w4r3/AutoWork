@@ -10,7 +10,7 @@ from typing import Any
 from uuid import UUID
 
 from cti_app.application.discovery_report_parser import extract_http_urls
-from cti_app.application.pandoc_rendering import PANDOC_RENDERER_VERSION, render_brief_pandoc
+from cti_app.application.pandoc_rendering import PANDOC_RENDERER_VERSION, render_publication_pandoc
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_parsers import (
@@ -20,7 +20,7 @@ from cti_app.application.production_parsers import (
     technical_extraction_from_json,
 )
 from cti_app.application.production_rendering import collect_indicators
-from cti_app.application.publication_builder import build_brief_document
+from cti_app.application.publication_builder import build_publication_document
 from cti_app.application.semantic_annotation import SEMANTIC_ANNOTATOR_VERSION
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -113,7 +113,6 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
 
             await uow.commit()
             return artifact
-
 
 class ExtractionService(_ArtifactPayloadMixin):
     def __init__(
@@ -249,8 +248,8 @@ class SynthesisService(_ArtifactPayloadMixin):
             return artifact
 
 
-class BriefAssemblyService(_ArtifactPayloadMixin):
-    """Manages brief assembly stage (deterministic)."""
+class PublicationAssemblyService(_ArtifactPayloadMixin):
+    """Manages publication assembly stage (deterministic)."""
 
     def __init__(
         self,
@@ -260,7 +259,7 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
 
-    async def assemble_brief(
+    async def assemble_publication(
         self,
         run_id: UUID,
         subject_id: UUID,
@@ -269,7 +268,7 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
         extraction_artifact: ProductionArtifact,
         synthesis_artifact: ProductionArtifact,
     ) -> ProductionArtifact:
-        """Render the final brief from the stored artifacts.
+        """Render the final publication from the stored artifacts.
 
         Deterministic: no model call. Reads the real payloads rather than the
         counters kept in `metadata`.
@@ -292,7 +291,7 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
             }
             input_hash = compute_input_hash(input_data)
 
-            # Not get_current: a synthesis retry stales the previous brief
+            # Not get_current: a synthesis retry stales the previous publication
             # first, and get_current excludes STALE rows — using it here
             # would restart numbering at 1 and collide with the
             # (production_run_id, stage, version) uniqueness of the original.
@@ -300,26 +299,26 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
             prior_versions = [
                 artifact.version
                 for artifact in existing
-                if artifact.stage is ProductionArtifactStage.BRIEF
+                if artifact.stage is ProductionArtifactStage.PUBLICATION
             ]
             version = max(prior_versions) + 1 if prior_versions else 1
 
-            document = build_brief_document(
+            document = build_publication_document(
                 subject_title=subject_title,
                 report=report,
                 extraction=extraction,
                 synthesis_text=synthesis_text,
             )
-            brief_markdown = render_brief_pandoc(document)
+            publication_markdown = render_publication_pandoc(document)
 
             raw_id, canonical_id, rendered_id = await self._store_payloads(
                 canonical=document.to_json(),
-                rendered=brief_markdown,
+                rendered=publication_markdown,
             )
             artifact = ProductionArtifact(
                 production_run_id=run_id,
                 subject_id=subject_id,
-                stage=ProductionArtifactStage.BRIEF,
+                stage=ProductionArtifactStage.PUBLICATION,
                 version=version,
                 input_hash=input_hash,
                 status=ProductionArtifactStatus.VERIFIED,
@@ -327,7 +326,7 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
                 canonical_blob_id=canonical_id,
                 rendered_blob_id=rendered_id,
                 metadata={
-                    "word_count": len(brief_markdown.split()),
+                    "word_count": len(publication_markdown.split()),
                     "reference_count": len(document.sources),
                     "indicator_count": len(collect_indicators(extraction)),
                     "publication_schema_version": PUBLICATION_SCHEMA_VERSION,
@@ -340,6 +339,11 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
             await uow.commit()
             return artifact
 
+    async def assemble_brief(self, *args: Any, **kwargs: Any) -> ProductionArtifact:
+        """Deprecated compatibility name; writes the current publication stage."""
+
+        return await self.assemble_publication(*args, **kwargs)
+
     async def _load_inputs(
         self,
         references_artifact: ProductionArtifact,
@@ -347,7 +351,7 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
         synthesis_artifact: ProductionArtifact,
     ) -> tuple[ReferenceReport, TechnicalExtraction, str]:
         if self._artifact_store is None:
-            raise ValueError("Brief assembly requires an artifact store")
+            raise ValueError("Publication assembly requires an artifact store")
         if references_artifact.canonical_blob_id is None:
             raise ValueError("References artifact has no canonical payload")
         if extraction_artifact.canonical_blob_id is None:
@@ -367,7 +371,7 @@ class BriefAssemblyService(_ArtifactPayloadMixin):
 class ProductionQAService:
     """Automated QA gate between assembly and READY.
 
-    Every check answers one question: can a reader trust what this brief
+    Every check answers one question: can a reader trust what this publication
     asserts, given only the sources we actually hold?
     """
 
@@ -380,15 +384,22 @@ class ProductionQAService:
         references_artifact: ProductionArtifact | None,
         extraction_artifact: ProductionArtifact | None,
         synthesis_artifact: ProductionArtifact | None,
-        brief_artifact: ProductionArtifact | None,
+        publication_artifact: ProductionArtifact | None = None,
         *,
         report: ReferenceReport | None = None,
         extraction: TechnicalExtraction | None = None,
         synthesis_text: str = "",
+        publication_markdown: str = "",
+        brief_artifact: ProductionArtifact | None = None,
         brief_markdown: str = "",
         archived_urls: set[str] | None = None,
         research_date: date | None = None,
     ) -> dict[str, Any]:
+        # Historical ``brief_*`` aliases are read-only compatibility for old
+        # imported callers; new workflow calls use publication names.
+        publication_artifact = publication_artifact or brief_artifact
+        if not publication_markdown:
+            publication_markdown = brief_markdown
         checks: dict[str, bool] = {}
         errors: list[str] = []
         warnings: list[str] = []
@@ -402,13 +413,13 @@ class ProductionQAService:
         require("references_present", references_artifact is not None, "Références manquantes")
         require("extraction_present", extraction_artifact is not None, "Extraction manquante")
         require("synthesis_present", synthesis_artifact is not None, "Synthèse manquante")
-        require("brief_present", brief_artifact is not None, "Brève manquante")
+        require("publication_present", publication_artifact is not None, "Publication manquante")
 
         for label, artifact in (
             ("references", references_artifact),
             ("extraction", extraction_artifact),
             ("synthesis", synthesis_artifact),
-            ("brief", brief_artifact),
+            ("publication", publication_artifact),
         ):
             if artifact is not None:
                 require(
@@ -483,13 +494,19 @@ class ProductionQAService:
                 "La synthèse cite une URL hors corpus",
             )
 
-        if brief_markdown:
-            used = {int(match.group(1)) for match in _BRIEF_FOOTNOTE.finditer(brief_markdown)}
-            declared = {int(match.group(1)) for match in _BRIEF_DECLARED.finditer(brief_markdown)}
+        if publication_markdown:
+            used = {
+                int(match.group(1))
+                for match in _PUBLICATION_FOOTNOTE.finditer(publication_markdown)
+            }
+            declared = {
+                int(match.group(1))
+                for match in _PUBLICATION_DECLARED.finditer(publication_markdown)
+            }
             require(
                 "no_orphan_footnote",
                 used <= declared,
-                "La brève contient une note de bas de page orpheline",
+                "La publication contient une note de bas de page orpheline",
             )
 
         passed = all(checks.values()) and not errors
@@ -502,5 +519,5 @@ class ProductionQAService:
 
 
 _SYNTHESIS_MARKER = re.compile(r"\[(S\d{1,3})\]", re.IGNORECASE)
-_BRIEF_FOOTNOTE = re.compile(r"(?<!^)\[(\d{1,3})\]", re.MULTILINE)
-_BRIEF_DECLARED = re.compile(r"^\[(\d{1,3})\]\s", re.MULTILINE)
+_PUBLICATION_FOOTNOTE = re.compile(r"(?<!^)\[(\d{1,3})\]", re.MULTILINE)
+_PUBLICATION_DECLARED = re.compile(r"^\[(\d{1,3})\]\s", re.MULTILINE)

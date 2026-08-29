@@ -45,7 +45,7 @@ from cti_app.application.virustotal_persistence import VirusTotalObservationServ
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
 from cti_app.domain.jobs import JobStatus
-from cti_app.domain.production import ProductionProfile, production_stages
+from cti_app.domain.production import production_stages
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
@@ -73,7 +73,7 @@ DURABLE_RESUME_JOB_KINDS = frozenset(
     {
         EDITION_ASSEMBLE_JOB_KIND,
         DISCOVERY_JOB_KIND,
-        *(stage_job_kind(stage) for stage in production_stages(ProductionProfile.BRIEF_AUTO)),
+        *(stage_job_kind(stage) for stage in production_stages()),
     }
 )
 

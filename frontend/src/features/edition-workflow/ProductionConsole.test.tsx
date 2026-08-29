@@ -35,7 +35,6 @@ describe("ProductionConsole", () => {
     const batch: BatchStatus = {
       batch_id: "batch-1",
       edition_id: EDITION_ID,
-      profile: "brief_auto",
       status: "running",
       phase: "recovery",
       next_dispatch_at: new Date(Date.now() + 42_000).toISOString(),
@@ -63,7 +62,7 @@ describe("ProductionConsole", () => {
           title: "Sujet à vérifier",
           run_id: "run-2",
           status: "needs_review",
-          current_stage: "analyst_note",
+          current_stage: "synthesis",
           pipeline_generation: 8,
           auto_recovery_count: 1,
           error_code: "review_required",
@@ -139,7 +138,6 @@ describe("ProductionConsole", () => {
     const batch: BatchStatus = {
       batch_id: "batch-2",
       edition_id: EDITION_ID,
-      profile: "brief_auto",
       status: "completed_with_issues",
       phase: "review",
       next_dispatch_at: null,

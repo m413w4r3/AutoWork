@@ -3,6 +3,9 @@ import { ApiError } from "./editions";
 export type SubjectProductionStatus =
   "queued" | "running" | "ready" | "needs_review" | "failed" | "cancelled";
 
+/** @deprecated historical analyst stages remain readable only. */
+export type HistoricalSubjectProductionStage =
+  "analyst_research" | "analyst_note";
 export type SubjectProductionStage =
   | "sources"
   | "references"
@@ -37,7 +40,6 @@ export interface StageStatus {
 export interface ProductionStatus {
   subject_id: string;
   title: string;
-  editorial_type: string;
   status: SubjectProductionStatus;
   current_stage: SubjectProductionStage;
   progress_current: number;
@@ -79,7 +81,6 @@ export interface BatchItemDetail {
 export interface BatchStatus {
   batch_id: string;
   edition_id: string;
-  profile: string;
   status: ProductionBatchStatus;
   phase: ProductionBatchPhase;
   next_dispatch_at: string | null;
@@ -103,7 +104,7 @@ export interface ArtifactResponse {
   /** Publication Markdown is downloadable, not the BRIEF preview source. */
   rendered_content: string | null;
   canonical_content:
-    BriefDocumentV1 | ExtractionDocumentV2 | Record<string, unknown> | null;
+    PublicationDocument | ExtractionDocumentV2 | Record<string, unknown> | null;
 }
 
 export interface ExtractionItemV2 {
@@ -156,12 +157,27 @@ export interface ProductionStateSnapshotV1 {
   content_sha256: string;
 }
 
+export interface ProductionStateSnapshotV2 {
+  format: "autowork.production-state";
+  schema_version: 2;
+  exported_at: string;
+  origin: {
+    subject_title: string;
+    research_date: string | null;
+  };
+  artifacts: ProductionStateSnapshotV1["artifacts"];
+  content_sha256: string;
+}
+
+export type ProductionStateSnapshot =
+  ProductionStateSnapshotV1 | ProductionStateSnapshotV2;
+
 export interface ProductionStateImportResult {
   run_id: string;
   status: "needs_review";
   current_stage: "assembly";
   imported_stages: ["references", "extraction", "synthesis"];
-  schema_version: 1;
+  schema_version: 1 | 2;
   content_sha256: string;
 }
 
@@ -203,7 +219,26 @@ export interface BriefDocumentV1 {
   }>;
   sources: Array<{ source_id: string; canonical_url: string }>;
   uncertainties: string[];
+  analyst_note?: RichSpan[] | null;
+  original_indicators?: Array<{
+    artifact_type: string;
+    values: Array<{
+      value: string;
+      normalized_value: string;
+      artifact_type: string;
+      source_ids: string[];
+    }>;
+  }>;
 }
+
+export interface PublicationDocumentV2 extends Omit<
+  BriefDocumentV1,
+  "schema_version"
+> {
+  schema_version: "2";
+}
+
+export type PublicationDocument = BriefDocumentV1 | PublicationDocumentV2;
 
 /**
  * Start production of a subject.
@@ -213,12 +248,9 @@ export interface BriefDocumentV1 {
  */
 export async function startSubjectProduction(
   subjectId: string,
-  profile: "brief_auto" | "major_assisted" = "brief_auto",
 ): Promise<{ run_id: string; status: string }> {
   return request(`/api/subjects/${subjectId}/production`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ profile }),
   });
 }
 
@@ -236,13 +268,13 @@ export async function getSubjectProduction(
 
 export async function exportProductionState(
   subjectId: string,
-): Promise<ProductionStateSnapshotV1> {
+): Promise<ProductionStateSnapshotV2> {
   return request(`/api/subjects/${subjectId}/production/state/export`);
 }
 
 export async function importProductionState(
   subjectId: string,
-  snapshot: ProductionStateSnapshotV1,
+  snapshot: ProductionStateSnapshot,
 ): Promise<ProductionStateImportResult> {
   return request(`/api/subjects/${subjectId}/production/state/import`, {
     method: "POST",
@@ -294,10 +326,10 @@ export async function getSynthesisArtifact(
   return request(`/api/subjects/${subjectId}/production/artifacts/synthesis`);
 }
 
-export async function getBriefArtifact(
+export async function getPublicationArtifact(
   subjectId: string,
 ): Promise<ArtifactResponse> {
-  return request(`/api/subjects/${subjectId}/production/artifacts/brief`);
+  return request(`/api/subjects/${subjectId}/production/artifacts/publication`);
 }
 
 export async function saveBriefDraft(
@@ -329,7 +361,7 @@ export async function getBriefDraft(subjectId: string): Promise<{
 export async function startEditionProduction(
   editionId: string,
 ): Promise<BatchStatus> {
-  return request(`/api/editions/${editionId}/production/briefs`, {
+  return request(`/api/editions/${editionId}/production`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ subject_ids: null }),
@@ -344,7 +376,7 @@ export async function startEditionProduction(
 export async function getEditionProduction(
   editionId: string,
 ): Promise<BatchStatus | null> {
-  return requestOrNull(`/api/editions/${editionId}/production/briefs`);
+  return requestOrNull(`/api/editions/${editionId}/production`);
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {

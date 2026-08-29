@@ -15,9 +15,9 @@ from cti_app.domain.collection import (
     ReviewStatus,
 )
 
-# What `brief_auto` is allowed to put in front of a reader without a human
-# having looked at it.
-ACCEPTED_FOR_BRIEF_AUTO = frozenset(
+# What the unified publication pipeline may put in front of a reader without a
+# human having looked at it.
+ACCEPTED_FOR_PUBLICATION = frozenset(
     {
         ReviewStatus.MACHINE_VERIFIED,
         ReviewStatus.VALIDATED,
@@ -64,6 +64,6 @@ def project_review_status(
     return ReviewStatus.MACHINE_VERIFIED if machine_verified else ReviewStatus.EXTRACTED
 
 
-def accepted_for_brief_auto(status: ReviewStatus) -> bool:
-    """Whether an item may feed an automatic brief."""
-    return status in ACCEPTED_FOR_BRIEF_AUTO
+def accepted_for_publication(status: ReviewStatus) -> bool:
+    """Whether an item may feed the unified publication."""
+    return status in ACCEPTED_FOR_PUBLICATION

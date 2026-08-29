@@ -44,7 +44,6 @@ function productionStatus(
   return {
     subject_id: SUBJECT_ID,
     title,
-    editorial_type: "brief",
     status,
     current_stage: "assembly",
     progress_current: 5,

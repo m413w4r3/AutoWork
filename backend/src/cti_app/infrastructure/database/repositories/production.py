@@ -17,7 +17,6 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionInputSnapshot,
     ProductionInputSource,
-    ProductionProfile,
     SampleAcquisitionAttempt,
     SampleAcquisitionOutcome,
     SampleAcquisitionReason,
@@ -187,7 +186,6 @@ class SqlAlchemySubjectProductionRunRepository:
             id=run.id,
             subject_id=run.subject_id,
             edition_id=run.edition_id,
-            profile=run.profile.value,
             status=run.status.value,
             current_stage=run.current_stage.value,
             references_conversation_id=run.references_conversation_id,
@@ -380,7 +378,7 @@ class SqlAlchemyProductionArtifactRepository:
             ProductionArtifactStage.REFERENCES.value,
             ProductionArtifactStage.EXTRACTION.value,
             ProductionArtifactStage.SYNTHESIS.value,
-            ProductionArtifactStage.BRIEF.value,
+            ProductionArtifactStage.PUBLICATION.value,
         ]
         if stage not in stages:
             return
@@ -408,7 +406,7 @@ class SqlAlchemyProductionArtifactRepository:
             "references": "references",
             "extraction": "extraction",
             "synthesis": "synthesis",
-            "assembly": "brief",
+            "assembly": "publication",
         }
         affected = [
             artifact_stages[item]
@@ -437,7 +435,6 @@ class SqlAlchemyEditionProductionBatchRepository:
         row = EditionProductionBatchRow(
             id=batch.id,
             edition_id=batch.edition_id,
-            profile=batch.profile.value,
             status=batch.status,
             phase=batch.phase.value,
             next_dispatch_at=batch.next_dispatch_at,
@@ -614,7 +611,6 @@ def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectPro
         id=row.id,
         subject_id=row.subject_id,
         edition_id=row.edition_id,
-        profile=ProductionProfile(row.profile),
         status=SubjectProductionStatus(row.status),
         current_stage=SubjectProductionStage(row.current_stage),
         references_conversation_id=row.references_conversation_id,
@@ -757,16 +753,11 @@ def _production_artifact_from_row(row: ProductionArtifactRow) -> ProductionArtif
 
 
 def _edition_production_batch_from_row(row: EditionProductionBatchRow) -> EditionProductionBatch:
-    from cti_app.domain.production import (
-        EditionProductionBatch,
-        ProductionBatchPhase,
-        ProductionProfile,
-    )
+    from cti_app.domain.production import EditionProductionBatch, ProductionBatchPhase
 
     return EditionProductionBatch(
         id=row.id,
         edition_id=row.edition_id,
-        profile=ProductionProfile(row.profile),
         status=row.status,
         phase=ProductionBatchPhase(row.phase),
         next_dispatch_at=row.next_dispatch_at,

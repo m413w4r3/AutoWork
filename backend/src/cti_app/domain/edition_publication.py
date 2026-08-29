@@ -10,10 +10,15 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from cti_app.domain.publication import BriefDocumentV1
+from cti_app.domain.publication import (
+    BriefDocumentV1,
+    PublicationDocumentV2,
+    publication_document_from_json,
+)
 
 PUBLICATION_MANIFEST_SCHEMA_VERSION = "1"
-EDITION_DOCUMENT_SCHEMA_VERSION = "1"
+EDITION_DOCUMENT_SCHEMA_VERSION = "1"  # historical EditionDocumentV1
+EDITION_DOCUMENT_V2_SCHEMA_VERSION = "2"
 
 
 def _canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -287,10 +292,88 @@ class EditionDocumentV1:
                 EditionPublicationV1(
                     position=int(item["position"]),
                     subject_id=UUID(str(item["subject_id"])),
-                    document=BriefDocumentV1.from_json(item["document"]),
+                    document=_legacy_publication_from_json(item["document"]),
                 )
                 for item in payload.get("publications", [])
             ),
+        )
+
+
+def _legacy_publication_from_json(payload: Mapping[str, Any]) -> BriefDocumentV1:
+    document = publication_document_from_json(payload)
+    if not isinstance(document, BriefDocumentV1):
+        raise ValueError("EditionDocumentV1 publications must contain BriefDocumentV1 documents")
+    return document
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EditionPublicationV2:
+    position: int
+    subject_id: UUID
+    document: PublicationDocumentV2
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "position": self.position,
+            "subject_id": str(self.subject_id),
+            "document": self.document.to_json(),
+        }
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class EditionDocumentV2:
+    """Renderer-independent edition document for new publication releases."""
+
+    edition: dict[str, Any]
+    publications: tuple[EditionPublicationV2, ...]
+    schema_version: str = EDITION_DOCUMENT_V2_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != EDITION_DOCUMENT_V2_SCHEMA_VERSION:
+            raise ValueError(f"unsupported edition document schema: {self.schema_version}")
+        publications = tuple(sorted(self.publications, key=lambda item: item.position))
+        if any(item.position < 1 for item in publications):
+            raise ValueError("edition publication positions must be positive")
+        if len({item.position for item in publications}) != len(publications):
+            raise ValueError("edition publication positions must be unique")
+        object.__setattr__(self, "publications", publications)
+
+    @property
+    def edition_metadata(self) -> dict[str, Any]:
+        return self.edition
+
+    @property
+    def ordered_publications(self) -> tuple[EditionPublicationV2, ...]:
+        return self.publications
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "edition": self.edition,
+            "publications": [publication.to_json() for publication in self.publications],
+        }
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, Any]) -> EditionDocumentV2:
+        publications: list[EditionPublicationV2] = []
+        for item in payload.get("publications", []):
+            document = publication_document_from_json(item["document"])
+            if not isinstance(document, PublicationDocumentV2):
+                raise ValueError(
+                    "EditionDocumentV2 publications must contain "
+                    "PublicationDocumentV2 documents"
+                )
+            publications.append(
+                EditionPublicationV2(
+                    position=int(item["position"]),
+                    subject_id=UUID(str(item["subject_id"])),
+                    document=document,
+                )
+            )
+        return cls(
+            schema_version=str(payload["schema_version"]),
+            edition=dict(payload["edition"]),
+            publications=tuple(publications),
         )
 
 
@@ -318,9 +401,12 @@ class EditionRelease:
 
 __all__ = [
     "EDITION_DOCUMENT_SCHEMA_VERSION",
+    "EDITION_DOCUMENT_V2_SCHEMA_VERSION",
     "PUBLICATION_MANIFEST_SCHEMA_VERSION",
     "EditionDocumentV1",
+    "EditionDocumentV2",
     "EditionPublicationV1",
+    "EditionPublicationV2",
     "EditionRelease",
     "PublicationManifestEntryV1",
     "PublicationManifestExclusionV1",

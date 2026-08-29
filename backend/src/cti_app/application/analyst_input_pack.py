@@ -145,7 +145,6 @@ def build_analyst_input_pack_v1(
         "normalization_version": ANALYST_INPUT_PACK_NORMALIZATION_VERSION,
         "production_run": {
             "id": _id(run.id),
-            "profile": run.profile.value,
             "pipeline_generation": run.pipeline_generation,
         },
         "subject": {"id": _id(run.subject_id), **(subject or {})},

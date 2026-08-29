@@ -11,7 +11,6 @@ from cti_app.domain.editorial import (
     EditorialGroup,
     EditorialGroupStatus,
     EditorialScore,
-    EditorialType,
     GroupingConfidence,
     GroupingOutcome,
     HumanDecision,
@@ -130,7 +129,6 @@ def _editorial_group_values(group: EditorialGroup) -> dict[str, object]:
         "needs_source_expansion": group.needs_source_expansion,
         "grouping_confidence": group.grouping_confidence.value,
         "grouping_justification": group.grouping_justification,
-        "editorial_type": group.editorial_type.value if group.editorial_type else None,
         "subject_id": group.subject_id,
         "discovery_subject_id": group.discovery_subject_id,
         "payload": {
@@ -183,7 +181,6 @@ def _editorial_group_from_row(row: EditorialGroupRow) -> EditorialGroup:
         grouping_confidence=GroupingConfidence(row.grouping_confidence),
         grouping_justification=row.grouping_justification,
         discovery_subject_id=row.discovery_subject_id,
-        editorial_type=EditorialType(row.editorial_type) if row.editorial_type else None,
         subject_id=row.subject_id,
         version=row.version,
         created_at=row.created_at,

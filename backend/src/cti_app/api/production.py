@@ -7,10 +7,11 @@ from typing import Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from cti_app.application.jobs import JobDispatcher, JobService
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_jobs import (
     PRODUCTION_STAGE_MAX_ATTEMPTS,
     ProductionStageParameters,
@@ -27,20 +28,18 @@ from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateImportResult,
     ProductionStateService,
-    ProductionStateSnapshotV1,
+    ProductionStateSnapshotV2,
 )
 from cti_app.application.subject_production import (
     EditionProductionService,
     ProductionRunNotFoundError,
     SubjectProductionService,
 )
-from cti_app.config import get_settings
-from cti_app.domain.editorial import EditorialGroup, EditorialGroupStatus, EditorialType
+from cti_app.domain.editorial import EditorialGroup, EditorialGroupStatus
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -54,12 +53,13 @@ _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 
 
 class StartSubjectProductionRequest(BaseModel):
-    # Edition is resolved from the subject's editorial group, so no edition_id here.
-    profile: ProductionProfile = ProductionProfile.BRIEF_AUTO
+    model_config = ConfigDict(extra="forbid")
 
 
 class StartEditionProductionRequest(BaseModel):
-    # subject_ids omitted -> every selected brief of the edition is produced; else only these.
+    model_config = ConfigDict(extra="forbid")
+
+    # subject_ids omitted -> every selected article of the edition is produced.
     subject_ids: list[UUID] | None = None
 
 
@@ -77,7 +77,6 @@ class StageStatus(BaseModel):
 class ProductionStatus(BaseModel):
     subject_id: str
     title: str
-    editorial_type: str
     status: str  # queued, running, ready, needs_review, failed, cancelled
     current_stage: str
     progress_current: int
@@ -114,7 +113,6 @@ class BatchItemDetail(BaseModel):
 class BatchStatus(BaseModel):
     batch_id: str
     edition_id: str
-    profile: str
     status: str
     items: int
     completed: int
@@ -137,7 +135,7 @@ def _runtime(request: Request) -> tuple[UnitOfWorkFactory, JobService, JobDispat
     )
 
 
-async def _selected_brief_group(request: Request, subject_id: UUID) -> EditorialGroup:
+async def _selected_article_group(request: Request, subject_id: UUID) -> EditorialGroup:
     async with request.app.state.uow_factory() as uow:
         group = cast(EditorialGroup | None, await uow.editorial_groups.get_by_subject(subject_id))
         if group is None:
@@ -149,11 +147,6 @@ async def _selected_brief_group(request: Request, subject_id: UUID) -> Editorial
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Subject is not selected",
-            )
-        if group.editorial_type != EditorialType.BRIEF:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Subject is not a brief",
             )
         return group
 
@@ -194,14 +187,13 @@ def _production_pacing(request: Request) -> ProductionPacingPolicy:
     return getattr(request.app.state, "production_pacing", ProductionPacingPolicy.zero())
 
 
-def _eligible_brief_subject_ids(groups: Iterable[EditorialGroup]) -> list[UUID]:
-    """Subjects of an edition that are selected briefs, in board order."""
+def _eligible_article_subject_ids(groups: Iterable[EditorialGroup]) -> list[UUID]:
+    """Subjects of an edition that are selected articles, in board order."""
     return [
         group.subject_id
         for group in groups
         if group.subject_id is not None
         and group.status == EditorialGroupStatus.SELECTED
-        and group.editorial_type == EditorialType.BRIEF
     ]
 
 
@@ -215,6 +207,16 @@ def _collect_warnings(artifacts: Sequence[Any]) -> list[str]:
     return out
 
 
+def _public_production_stage(stage: SubjectProductionStage) -> SubjectProductionStage:
+    """Hide historical analyst checkpoints from the current read model."""
+    if stage in {
+        SubjectProductionStage.ANALYST_RESEARCH,
+        SubjectProductionStage.ANALYST_NOTE,
+    }:
+        return SubjectProductionStage.ASSEMBLY
+    return stage
+
+
 def _run_view(
     run: SubjectProductionRun, edition_id: UUID, *, job_id: UUID | None
 ) -> dict[str, Any]:
@@ -222,9 +224,8 @@ def _run_view(
         "run_id": str(run.id),
         "subject_id": str(run.subject_id),
         "edition_id": str(edition_id),
-        "profile": run.profile.value,
         "status": run.status.value,
-        "stage": run.current_stage.value,
+        "stage": _public_production_stage(run.current_stage).value,
         "job_id": str(job_id) if job_id else None,
         "created_at": run.created_at.isoformat(),
         "error_code": run.error_code,
@@ -255,7 +256,7 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
                 title=item.title,
                 run_id=str(item.run_id),
                 status=item.status,
-                current_stage=item.current_stage,
+                current_stage=_public_production_stage(item.current_stage),
                 pipeline_generation=item.pipeline_generation,
                 auto_recovery_count=item.auto_recovery_count,
                 error_code=item.error_code,
@@ -265,7 +266,6 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
     return BatchStatus(
         batch_id=str(batch.id),
         edition_id=str(batch.edition_id),
-        profile=batch.profile.value,
         status=batch.status,
         items=len(details),
         completed=completed,
@@ -288,7 +288,6 @@ async def _create_and_start_run(
     *,
     subject_id: UUID,
     edition_id: UUID,
-    profile: ProductionProfile,
     user: str,
 ) -> tuple[SubjectProductionRun, UUID | None]:
     """Creates (or reuses an in-flight) run and submits its SOURCES job.
@@ -301,7 +300,6 @@ async def _create_and_start_run(
     run, created = await service.create_run(
         subject_id=subject_id,
         edition_id=edition_id,
-        profile=profile,
     )
 
     if run.status is SubjectProductionStatus.RUNNING and not created:
@@ -432,20 +430,6 @@ async def start_subject_production(
     body: StartSubjectProductionRequest | None = None,
     user: str = "system",
 ) -> dict[str, Any]:
-    # brief_auto is fully automatic; major_assisted is available behind its feature flag.
-    # Edition is resolved from the subject's editorial group.
-    payload = body or StartSubjectProductionRequest()
-    profile = payload.profile
-
-    if (
-        profile == ProductionProfile.MAJOR_ASSISTED
-        and not get_settings().production_major_assisted_enabled
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail="major_assisted production is disabled",
-        )
-
     uow_factory, jobs, dispatcher = _runtime(request)
 
     async with uow_factory() as uow:
@@ -460,11 +444,6 @@ async def start_subject_production(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Subject is not selected",
             )
-        if group.editorial_type != EditorialType.BRIEF:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Subject is not a brief",
-            )
         edition_id = group.edition_id
 
     try:
@@ -474,7 +453,6 @@ async def start_subject_production(
             dispatcher,
             subject_id=subject_id,
             edition_id=edition_id,
-            profile=profile,
             user=user,
         )
     except ValueError as e:
@@ -490,8 +468,8 @@ async def start_subject_production(
 async def export_subject_production_state(
     subject_id: UUID,
     request: Request,
-) -> ProductionStateSnapshotV1:
-    group = await _selected_brief_group(request, subject_id)
+) -> ProductionStateSnapshotV2:
+    group = await _selected_article_group(request, subject_id)
     service = _production_state_service(request)
     try:
         return await service.export_state(subject_id=subject_id, subject_title=group.title)
@@ -504,24 +482,14 @@ async def import_subject_production_state(
     subject_id: UUID,
     request: Request,
     payload: dict[str, Any],
-    profile: ProductionProfile = ProductionProfile.BRIEF_AUTO,
 ) -> ProductionStateImportResult:
-    group = await _selected_brief_group(request, subject_id)
-    if (
-        profile is ProductionProfile.MAJOR_ASSISTED
-        and not get_settings().production_major_assisted_enabled
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail="major_assisted production is disabled",
-        )
+    group = await _selected_article_group(request, subject_id)
     service = _production_state_service(request)
     try:
         return await service.import_state(
             subject_id=subject_id,
             edition_id=group.edition_id,
             payload=payload,
-            profile=profile,
         )
     except ProductionStateError as exc:
         raise _production_state_error(exc) from exc
@@ -565,13 +533,8 @@ async def get_subject_production(
                 if group
                 else str(run.subject_id)
             ),
-            editorial_type=(
-                group.editorial_type.value
-                if group and group.editorial_type
-                else EditorialType.BRIEF.value
-            ),
             status=run.status.value,
-            current_stage=run.current_stage.value,
+            current_stage=_public_production_stage(run.current_stage).value,
             progress_current=completed_stages,
             progress_total=len(stages),
             references_conversation_id=(
@@ -713,7 +676,11 @@ async def _artifact_view_for_run(
         if not run:
             raise HTTPException(status_code=404, detail="No production run found")
 
-        artifact = await uow.production_artifacts.get_current(run_id, stage)
+        artifact = (
+            await current_publication_artifact(uow.production_artifacts, run_id)
+            if stage == ProductionArtifactStage.PUBLICATION.value
+            else await uow.production_artifacts.get_current(run_id, stage)
+        )
         if not artifact:
             raise HTTPException(status_code=404, detail=f"{stage} artifact not found")
 
@@ -752,14 +719,14 @@ async def get_synthesis_artifact(subject_id: UUID, request: Request) -> dict[str
     return await _artifact_view(request, subject_id, "synthesis")
 
 
-@router.get("/subjects/{subject_id}/production/artifacts/brief")
-async def get_brief_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
-    return await _artifact_view(request, subject_id, "brief")
+@router.get("/subjects/{subject_id}/production/artifacts/publication")
+async def get_publication_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
+    return await _artifact_view(request, subject_id, ProductionArtifactStage.PUBLICATION.value)
 
 
-@router.get("/production/runs/{run_id}/artifacts/brief")
-async def get_run_brief_artifact(run_id: UUID, request: Request) -> dict[str, Any]:
-    return await _artifact_view_for_run(request, run_id, "brief")
+@router.get("/production/runs/{run_id}/artifacts/publication")
+async def get_run_publication_artifact(run_id: UUID, request: Request) -> dict[str, Any]:
+    return await _artifact_view_for_run(request, run_id, ProductionArtifactStage.PUBLICATION.value)
 
 
 class SaveBriefDraftRequest(BaseModel):
@@ -850,8 +817,8 @@ async def get_brief_draft(subject_id: UUID, request: Request) -> dict[str, Any]:
         }
 
 
-@router.post("/editions/{edition_id}/production/briefs")
-async def start_edition_brief_production(
+@router.post("/editions/{edition_id}/production")
+async def start_edition_production(
     edition_id: UUID,
     request: Request,
     body: StartEditionProductionRequest | None = None,
@@ -868,12 +835,12 @@ async def start_edition_brief_production(
             return await _batch_status_view(uow, active_batch)
 
         groups = await uow.editorial_groups.list_for_edition(edition_id)
-        eligible_order = _eligible_brief_subject_ids(groups)
+        eligible_order = _eligible_article_subject_ids(groups)
 
     if not eligible_order:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No selected briefs found for edition",
+            detail="No selected articles found for edition",
         )
 
     if payload.subject_ids:
@@ -882,7 +849,7 @@ async def start_edition_brief_production(
         if unknown:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Some requested subjects are not selected briefs",
+                detail="Some requested subjects are not selected articles",
             )
         subject_ids = [sid for sid in eligible_order if sid in requested]
     else:
@@ -891,7 +858,6 @@ async def start_edition_brief_production(
     try:
         batch = await service.create_batch(
             edition_id=edition_id,
-            profile=ProductionProfile.BRIEF_AUTO,
             subject_ids=subject_ids,
             actor_id=user,
             correlation_id=get_correlation_id(),
@@ -930,12 +896,12 @@ async def start_edition_brief_production(
         return await _batch_status_view(uow, persisted_batch or batch)
 
 
-@router.get("/editions/{edition_id}/production/briefs")
-async def get_edition_brief_production(
+@router.get("/editions/{edition_id}/production")
+async def get_edition_production(
     edition_id: UUID,
     request: Request,
 ) -> BatchStatus:
-    # 404 here is the signal the UI uses to offer "produce all briefs".
+    # 404 here is the signal the UI uses to offer production.
     uow_factory, _, _ = _runtime(request)
     service = EditionProductionService(uow_factory)
 
@@ -950,7 +916,7 @@ async def get_edition_brief_production(
         return await _batch_status_view(uow, batch)
 
 
-@router.post("/editions/{edition_id}/production/briefs/{batch_id}/cancel")
+@router.post("/editions/{edition_id}/production/{batch_id}/cancel")
 async def cancel_edition_batch(
     edition_id: UUID,
     batch_id: UUID,

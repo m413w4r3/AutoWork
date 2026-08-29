@@ -101,7 +101,6 @@ La pipeline cible est :
 SOURCES
   → REFERENCES
   → EXTRACTION
-  → IOC_ENRICHMENT
   → SYNTHESIS
   → ASSEMBLY / QA
 ```
@@ -109,11 +108,8 @@ SOURCES
 Cette séquence est déclarée explicitement dans le domaine. AutoWork ne construit pas de graphe de
 workflow dynamique pour décider du parcours d'un sujet.
 
-`IOC_ENRICHMENT` est un stage de première classe pour tous les sujets. Lorsqu'aucun IOC éligible
-n'est présent, le stage se termine de manière déterministe avec une disposition
-`not_applicable`, sans appel réseau et sans lancer de traitement coûteux. Lorsqu'il existe des IOC
-éligibles, le stage orchestre des services spécialisés de normalisation, d'enrichissement et
-d'acquisition selon les politiques et capacités autorisées.
+L'enrichissement IOC n'est pas encore un stage de cette production. Il fera l'objet du Prompt 7B
+et restera une capacité distincte, raccordée après stabilisation de cette pipeline.
 
 Les différences de traitement sont donc déterminées par les données et les capacités disponibles,
 pas par un type éditorial `brief` ou `major`.
@@ -191,16 +187,15 @@ de sujet ou de publication.
 
 ## Compatibilité temporaire
 
-La migration est volontairement progressive afin de ne pas coupler la refonte UI, la review et le
-DOCX à une migration sémantique massive.
+La migration est désormais au cutover de la pipeline article. Les lecteurs historiques restent
+progressifs afin de ne pas réécrire les documents et releases déjà produits.
 
 Pendant cette période :
 
-- `ProductionProfile.BRIEF_AUTO` et `ProductionProfile.MAJOR_ASSISTED` peuvent continuer à être lus
-  par le code existant ;
+- `ProductionProfile.BRIEF_AUTO` et `ProductionProfile.MAJOR_ASSISTED` ne sont lus que par les
+  compatibilités historiques nécessaires ;
 - aucune nouvelle feature ne doit ajouter une condition fonctionnelle fondée sur ces profils ;
-- `BriefDocumentV1` reste lisible et peut continuer à être produit tant que le cutover V2 n'a pas
-  eu lieu ;
+- `BriefDocumentV1` reste lisible mais n'est plus produit par la pipeline courante ;
 - l'ancien parcours `BriefEvidencePack` / `BriefDraft` reste isolé ; il ne doit pas devenir une
   dépendance de la nouvelle review ou de la nouvelle publication d'édition ;
 - les nouveaux endpoints et composants utilisent une terminologie générique même s'ils s'appuient
@@ -209,17 +204,17 @@ Pendant cette période :
 Un adaptateur temporaire est préférable à un renommage transversal qui mélangerait changement de
 vocabulaire et changement de comportement.
 
-## Migration future de `brief / major`
+## Historique de la migration `brief / major`
 
 Le cutover futur suit quatre étapes conceptuelles.
 
-1. Les nouvelles surfaces UI/API et les nouveaux use cases n'emploient déjà plus la distinction.
+1. Les surfaces UI/API et les nouveaux use cases n'emploient plus la distinction.
 2. `PublicationDocumentV2` devient le seul format écrit pour les nouvelles productions ; V1 reste
    uniquement un format historique lisible si nécessaire.
 3. La configuration éditoriale d'une édition passe d'objectifs distincts `major/brief` à un objectif
    unique d'items/articles, et la production passe à une seule pipeline déclarée.
-4. Lorsque plus aucun caller n'en dépend, les profils legacy, l'ancien `BriefService`, les endpoints
-   et composants exclusivement attachés à ce workflow sont supprimés.
+4. Les profils legacy et les composants exclusivement attachés à ce workflow restent limités à la
+   lecture ou au parcours legacy identifié ; ils ne sont pas une dépendance de la production.
 
 La base étant conçue pour être reconstruite depuis une migration cible sur une base vide, le
 cutover de schéma doit préférer un modèle final propre à des colonnes legacy ou à des backfills de

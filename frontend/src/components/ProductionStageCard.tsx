@@ -12,7 +12,7 @@ const STAGE_NAMES: Record<string, string> = {
   references: "Références",
   extraction: "Extraction CTI",
   synthesis: "Synthèse",
-  assembly: "Brève",
+  assembly: "Assemblage",
 };
 
 const STATUS_LABELS: Record<string, string> = {

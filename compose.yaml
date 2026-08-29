@@ -178,7 +178,6 @@ services:
       dockerfile: infra/backend.Dockerfile
     environment: &backend-environment
       APP_ENV: development
-      PRODUCTION_MAJOR_ASSISTED_ENABLED: ${PRODUCTION_MAJOR_ASSISTED_ENABLED:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       POSTGRES_DSN: postgresql+asyncpg://${POSTGRES_USER:-cti_app}:${POSTGRES_PASSWORD:-local-postgres-only}@postgres:5432/${POSTGRES_DB:-cti_app}
       REDIS_URL: redis://redis:6379/0

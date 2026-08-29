@@ -532,6 +532,107 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
     assert asyncio.run(_trigger_function_pairs(temporary_postgres_url)) == EXPECTED_TRIGGERS
 
 
+def test_unification_migration_refuses_an_active_legacy_run(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "0016_edition_publication")
+
+    async def _insert_active_run() -> None:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO editions "
+                        "(id, country, country_code, period_start, period_end, tlp, languages, "
+                        "target_major_articles, target_briefs, source_profile, status, version, "
+                        "created_at, updated_at) VALUES "
+                        "(:edition_id, 'France', 'FR', '2026-08-01', '2026-08-31', 'GREEN', "
+                        "'[\"fr\"]'::jsonb, 0, 1, 'test', 'production', 1, now(), now())"
+                    ),
+                    {"edition_id": "11111111-1111-4111-8111-111111111111"},
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO subjects (id, external_id, slug, tlp, created_at) VALUES "
+                        "(:subject_id, 'legacy-subject', 'legacy-subject', 'GREEN', now())"
+                    ),
+                    {"subject_id": "22222222-2222-4222-8222-222222222222"},
+                )
+                await connection.execute(
+                    text(
+                        "INSERT INTO subject_production_runs "
+                        "(id, subject_id, edition_id, profile, status, current_stage, run_number, "
+                        "pipeline_generation, created_at, updated_at, version) VALUES "
+                        "(:run_id, :subject_id, :edition_id, 'major_assisted', 'running', "
+                        "'synthesis', 1, 0, now(), now(), 1)"
+                    ),
+                    {
+                        "run_id": "33333333-3333-4333-8333-333333333333",
+                        "subject_id": "22222222-2222-4222-8222-222222222222",
+                        "edition_id": "11111111-1111-4111-8111-111111111111",
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_insert_active_run())
+    with pytest.raises(Exception, match="cannot unify production"):
+        command.upgrade(config, "head")
+    command.downgrade(config, "base")
+
+
+def test_unification_migration_merges_and_removes_legacy_targets(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "0016_edition_publication")
+
+    async def _insert_legacy_edition() -> None:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO editions "
+                        "(id, country, country_code, period_start, period_end, tlp, languages, "
+                        "target_major_articles, target_briefs, source_profile, status, version, "
+                        "created_at, updated_at) VALUES "
+                        "(gen_random_uuid(), 'Targetland', 'TG', '2098-02-01', '2098-02-28', "
+                        "'GREEN', '[\"fr\"]'::jsonb, 7, 9, 'test', 'draft', 1, now(), now())"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_insert_legacy_edition())
+    command.upgrade(config, "head")
+
+    async def _read_unified_edition() -> tuple[int, set[str]]:
+        engine = create_async_engine(temporary_postgres_url)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(
+                    text("SELECT target_articles FROM editions WHERE country_code = 'TG'")
+                )
+                target = int(result.scalar_one())
+                columns = await connection.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'editions'"
+                    )
+                )
+                return target, {str(row[0]) for row in columns}
+        finally:
+            await engine.dispose()
+
+    target, columns = asyncio.run(_read_unified_edition())
+    assert target == 16
+    assert {"target_major_articles", "target_briefs"}.isdisjoint(columns)
+    command.downgrade(config, "base")
+
+
 def test_goodware_v2_downgrade_refuses_existing_baseline(temporary_postgres_url: str) -> None:
     config = _alembic_config(temporary_postgres_url)
     command.upgrade(config, "head")

@@ -16,6 +16,8 @@ from cti_app.domain.discovery import SourceCandidate, SourceRole
 
 
 class ProductionProfile(StrEnum):
+    """Historical profile values accepted only by compatibility readers."""
+
     BRIEF_AUTO = "brief_auto"
     MAJOR_ASSISTED = "major_assisted"
 
@@ -190,17 +192,33 @@ class ProductionInputSnapshot:
         return hashlib.sha256(encoded).hexdigest()
 
 
-def production_stages(profile: ProductionProfile) -> tuple[SubjectProductionStage, ...]:
-    """The ordered, executable-or-manual production pipeline for a profile."""
-    pipelines: dict[ProductionProfile, tuple[SubjectProductionStage, ...]] = {
-        ProductionProfile.BRIEF_AUTO: (
-            SubjectProductionStage.SOURCES,
-            SubjectProductionStage.REFERENCES,
-            SubjectProductionStage.EXTRACTION,
-            SubjectProductionStage.SYNTHESIS,
-            SubjectProductionStage.ASSEMBLY,
-        ),
-        ProductionProfile.MAJOR_ASSISTED: (
+def production_stages(
+    legacy_profile: ProductionProfile | None = None,
+) -> tuple[SubjectProductionStage, ...]:
+    """Return the one executable publication pipeline.
+
+    The argument is a historical compatibility shim and is ignored.
+    """
+    del legacy_profile
+    return (
+        SubjectProductionStage.SOURCES,
+        SubjectProductionStage.REFERENCES,
+        SubjectProductionStage.EXTRACTION,
+        SubjectProductionStage.SYNTHESIS,
+        SubjectProductionStage.ASSEMBLY,
+    )
+
+
+def next_stage(
+    stage_or_legacy_profile: SubjectProductionStage | ProductionProfile,
+    legacy_stage: SubjectProductionStage | None = None,
+) -> SubjectProductionStage | None:
+    """Return the successor in the unified pipeline."""
+    stage = legacy_stage or stage_or_legacy_profile
+    if not isinstance(stage, SubjectProductionStage):
+        raise TypeError("next_stage requires a SubjectProductionStage")
+    stages = (
+        (
             SubjectProductionStage.SOURCES,
             SubjectProductionStage.REFERENCES,
             SubjectProductionStage.EXTRACTION,
@@ -208,20 +226,14 @@ def production_stages(profile: ProductionProfile) -> tuple[SubjectProductionStag
             SubjectProductionStage.ANALYST_RESEARCH,
             SubjectProductionStage.ANALYST_NOTE,
             SubjectProductionStage.ASSEMBLY,
-        ),
-    }
-    return pipelines[profile]
-
-
-def next_stage(
-    profile: ProductionProfile, stage: SubjectProductionStage
-) -> SubjectProductionStage | None:
-    """Return the declared successor for a profile; enum declaration order is irrelevant."""
-    stages = production_stages(profile)
+        )
+        if legacy_stage is not None and stage_or_legacy_profile is ProductionProfile.MAJOR_ASSISTED
+        else production_stages()
+    )
     try:
         index = stages.index(stage)
     except ValueError as exc:
-        raise ValueError(f"Stage {stage.value} is not valid for {profile.value}") from exc
+        raise ValueError(f"Stage {stage.value} is not valid for the publication pipeline") from exc
     return stages[index + 1] if index + 1 < len(stages) else None
 
 
@@ -229,6 +241,7 @@ class ProductionArtifactStage(StrEnum):
     REFERENCES = "references"
     EXTRACTION = "extraction"
     SYNTHESIS = "synthesis"
+    PUBLICATION = "publication"
     BRIEF = "brief"
 
 
@@ -315,7 +328,8 @@ class LoopBudget:
 class SubjectProductionRun:
     subject_id: UUID
     edition_id: UUID
-    profile: ProductionProfile
+    # Historical rows/fixtures only; new persistence has no profile column.
+    profile: ProductionProfile | None = None
     status: SubjectProductionStatus = SubjectProductionStatus.QUEUED
     current_stage: SubjectProductionStage = SubjectProductionStage.SOURCES
     references_conversation_id: UUID | None = None
@@ -358,15 +372,13 @@ class SubjectProductionRun:
         self.version += 1
 
     def resume_verified_import_at_analyst_research(self, *, now: datetime | None = None) -> None:
-        """Resume imported verified artifacts at the major manual checkpoint."""
+        """Historical compatibility transition; current imports stop at assembly."""
         if self.profile is not ProductionProfile.MAJOR_ASSISTED:
             raise ValueError("Only major_assisted runs have an analyst checkpoint")
         if self.status is not SubjectProductionStatus.QUEUED:
             raise ValueError("Imported run must start from QUEUED status")
         if self.current_stage is not SubjectProductionStage.SOURCES:
             raise ValueError("Imported run must start from SOURCES stage")
-        if self.research_date is None:
-            raise ValueError("Analyst handoff requires frozen research_date")
         moment = now or datetime.now(UTC)
         self.status = SubjectProductionStatus.RUNNING
         self.current_stage = SubjectProductionStage.ANALYST_RESEARCH
@@ -379,7 +391,11 @@ class SubjectProductionRun:
         self.version += 1
 
     def advance_stage(self, *, now: datetime | None = None) -> None:
-        successor = next_stage(self.profile, self.current_stage)
+        successor = (
+            next_stage(self.profile, self.current_stage)
+            if self.profile is ProductionProfile.MAJOR_ASSISTED
+            else next_stage(self.current_stage)
+        )
         if successor is not None:
             self.current_stage = successor
         self.updated_at = now or datetime.now(UTC)
@@ -687,7 +703,8 @@ class SampleAcquisitionAttempt:
 @dataclass(slots=True, kw_only=True)
 class EditionProductionBatch:
     edition_id: UUID
-    profile: ProductionProfile
+    # Historical compatibility only; new batches have no profile.
+    profile: ProductionProfile | None = None
     status: str  # queued, running, completed, completed_with_issues, cancelled
     phase: ProductionBatchPhase = ProductionBatchPhase.INITIAL
     next_dispatch_at: datetime | None = None

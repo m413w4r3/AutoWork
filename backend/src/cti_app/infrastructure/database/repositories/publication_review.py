@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import String, and_, cast, func, or_, select
+from sqlalchemy import String, and_, case, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.application.edition_review import EditionReviewReadItem
@@ -90,6 +90,10 @@ class SqlAlchemyEditionReviewReadRepository:
                 .over(
                     partition_by=ProductionArtifactRow.production_run_id,
                     order_by=(
+                        case(
+                            (ProductionArtifactRow.stage == "publication", 1),
+                            else_=0,
+                        ).desc(),
                         ProductionArtifactRow.version.desc(),
                         ProductionArtifactRow.id.desc(),
                     ),
@@ -97,7 +101,7 @@ class SqlAlchemyEditionReviewReadRepository:
                 .label("artifact_rank"),
             )
             .where(
-                ProductionArtifactRow.stage == "brief",
+                ProductionArtifactRow.stage.in_(("publication", "brief")),
                 ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value,
             )
             .subquery("current_review_artifacts")

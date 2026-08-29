@@ -19,13 +19,14 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
 
-PRODUCTION_PROFILE_VALUES_SQL = "'brief_auto', 'major_assisted'"
 PRODUCTION_STATUS_VALUES_SQL = "'queued', 'running', 'ready', 'needs_review', 'failed', 'cancelled'"
 PRODUCTION_STAGE_VALUES_SQL = (
     "'sources', 'references', 'extraction', 'synthesis', 'analyst_research', 'analyst_note', "
     "'assembly'"
 )
-PRODUCTION_ARTIFACT_STAGE_VALUES_SQL = "'references', 'extraction', 'synthesis', 'brief'"
+PRODUCTION_ARTIFACT_STAGE_VALUES_SQL = (
+    "'references', 'extraction', 'synthesis', 'publication', 'brief'"
+)
 PRODUCTION_ARTIFACT_STATUS_VALUES_SQL = "'verified', 'stale', 'needs_review'"
 PRODUCTION_BATCH_STATUS_VALUES_SQL = (
     "'queued', 'running', 'completed', 'completed_with_issues', 'cancelled'"
@@ -58,7 +59,6 @@ class SubjectProductionRunRow(Base):
         CheckConstraint("pipeline_generation >= 0", name="ck_run_pipeline_generation"),
         CheckConstraint(f"status IN ({PRODUCTION_STATUS_VALUES_SQL})", name="ck_run_status"),
         CheckConstraint(f"current_stage IN ({PRODUCTION_STAGE_VALUES_SQL})", name="ck_run_stage"),
-        CheckConstraint(f"profile IN ({PRODUCTION_PROFILE_VALUES_SQL})", name="ck_run_profile"),
         Index("ix_subject_production_runs_subject_id_created_at", "subject_id", "created_at"),
         Index("ix_subject_production_runs_edition_id_status", "edition_id", "status"),
     )
@@ -70,7 +70,6 @@ class SubjectProductionRunRow(Base):
     edition_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
     )
-    profile: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     current_stage: Mapped[str] = mapped_column(String(32), nullable=False)
     references_conversation_id: Mapped[UUID | None] = mapped_column(
@@ -339,7 +338,6 @@ class EditionProductionBatchRow(Base):
         CheckConstraint(
             f"status IN ({PRODUCTION_BATCH_STATUS_VALUES_SQL})", name="ck_batch_status"
         ),
-        CheckConstraint(f"profile IN ({PRODUCTION_PROFILE_VALUES_SQL})", name="ck_batch_profile"),
         CheckConstraint(f"phase IN ({PRODUCTION_BATCH_PHASE_VALUES_SQL})", name="ck_batch_phase"),
         Index("ix_edition_production_batches_edition_id_status", "edition_id", "status"),
     )
@@ -348,7 +346,6 @@ class EditionProductionBatchRow(Base):
     edition_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
     )
-    profile: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     phase: Mapped[str] = mapped_column(String(16), nullable=False, server_default="initial")
     next_dispatch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

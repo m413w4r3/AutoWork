@@ -21,7 +21,6 @@ from cti_app.domain.production import (
     ProductionBatchPhase,
     ProductionInputSnapshot,
     ProductionInputSource,
-    ProductionProfile,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -162,7 +161,6 @@ class SubjectProductionService:
         self,
         subject_id: UUID,
         edition_id: UUID,
-        profile: ProductionProfile,
     ) -> tuple[SubjectProductionRun, bool]:
         """Create a production run for a subject.
 
@@ -189,7 +187,6 @@ class SubjectProductionService:
             run = SubjectProductionRun(
                 subject_id=subject_id,
                 edition_id=edition_id,
-                profile=profile,
                 run_number=next_run_number,
             )
             await uow.subject_production_runs.add(run)
@@ -355,8 +352,8 @@ class SubjectProductionService:
 
         if run.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
             raise ValueError("retry_not_allowed_while_running")
-        if stage not in production_stages(run.profile):
-            raise ValueError("retry_stage_not_in_profile")
+        if stage not in production_stages():
+            raise ValueError("retry_stage_not_in_pipeline")
         if stage is SubjectProductionStage.REFERENCES:
             sources = await uow.source_collections.list_for_subject(run.subject_id)
             source_ready = any(
@@ -418,7 +415,6 @@ class EditionProductionService:
     async def create_batch(
         self,
         edition_id: UUID,
-        profile: ProductionProfile,
         subject_ids: list[UUID],
         *,
         actor_id: str = "system",
@@ -442,7 +438,7 @@ class EditionProductionService:
                     raise ValueError("edition_not_found")
 
             existing = await uow.edition_production_batches.get_active_for_edition(edition_id)
-            if existing and existing.profile == profile:
+            if existing:
                 return existing
 
             if edition is not None and edition.status is not EditionStatus.SELECTION:
@@ -458,7 +454,6 @@ class EditionProductionService:
 
             batch = EditionProductionBatch(
                 edition_id=edition_id,
-                profile=profile,
                 status="queued",
                 phase=ProductionBatchPhase.INITIAL,
                 created_at=created_at,
@@ -483,7 +478,6 @@ class EditionProductionService:
                 run = SubjectProductionRun(
                     subject_id=subject_id,
                     edition_id=edition_id,
-                    profile=profile,
                     research_date=created_at.date(),
                     created_at=created_at,
                     updated_at=created_at,

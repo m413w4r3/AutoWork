@@ -73,24 +73,13 @@ export function EditionCreatePage() {
           <legend>Paramètres indicatifs</legend>
           <p>Ces objectifs ne limitent jamais la sélection éditoriale.</p>
           <label>
-            Objectif indicatif d’articles principaux — sans limite de sélection
+            Objectif indicatif d’articles — sans limite de sélection
             <input
-              name="target_major_articles"
+              name="target_articles"
               type="number"
               min={0}
-              max={20}
-              defaultValue={2}
-              required
-            />
-          </label>
-          <label>
-            Objectif indicatif de brèves — sans limite de sélection
-            <input
-              name="target_briefs"
-              type="number"
-              min={0}
-              max={100}
-              defaultValue={6}
+              max={120}
+              defaultValue={8}
               required
             />
           </label>
@@ -149,8 +138,7 @@ function fieldsFromForm(data: FormData): EditionFields {
       .split(",")
       .map((language) => language.trim())
       .filter(Boolean),
-    target_major_articles: Number(data.get("target_major_articles")),
-    target_briefs: Number(data.get("target_briefs")),
+    target_articles: Number(data.get("target_articles")),
     previous_edition_id: optionalFormValue(data, "previous_edition_id"),
     source_profile: formValue(data, "source_profile").trim(),
   };

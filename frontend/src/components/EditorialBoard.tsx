@@ -70,27 +70,17 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
   const ready = board.data.groups.filter(
     (group) => group.status === "selected",
   );
-  const automaticArticles = ready.filter(
-    (group) => group.editorial_type === "brief" && hasIocSignal(group),
-  );
-  const otherReady = ready.filter(
-    (group) => !automaticArticles.includes(group),
-  );
   const proposedIds = new Set(proposed.map((group) => group.id));
   const activeDraftEntries = draftEntries.filter(([groupId]) =>
     proposedIds.has(groupId),
   );
   const draftArticles = activeDraftEntries.filter(
-    ([, value]) => value === "brief",
-  ).length;
-  const draftMajor = activeDraftEntries.filter(
-    ([, value]) => value === "major",
+    ([, value]) => value === "article",
   ).length;
   const draftIgnored = activeDraftEntries.filter(
     ([, value]) => value === "ignore",
   ).length;
-  const currentArticles = board.data.selected_briefs + draftArticles;
-  const currentMajor = board.data.selected_major + draftMajor;
+  const currentArticles = board.data.selected_articles + draftArticles;
   const currentIgnored =
     (board.data.ignored ??
       board.data.groups.filter((group) => group.status === "rejected").length) +
@@ -110,8 +100,7 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
             <h2 id="editorial-board-heading">Sélection des sujets</h2>
           </div>
           <div className="selection-counter" aria-label="Décisions courantes">
-            <strong>{currentArticles}</strong> articles courts ·{" "}
-            <strong>{currentMajor}</strong> articles approfondis ·{" "}
+            <strong>{currentArticles}</strong> articles ·{" "}
             <strong>{currentIgnored}</strong> ignorés ·{" "}
             <strong>{currentUndecided}</strong> encore à décider
           </div>
@@ -144,7 +133,7 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
                         {
                           group_id: group.id,
                           version: group.version,
-                          decision: "brief",
+                          decision: "article",
                         },
                       ]),
                     )
@@ -186,38 +175,15 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
         </section>
 
         <section className="ready-subjects" aria-labelledby="ready-heading">
-          {automaticArticles.length > 0 ? (
-            <div
-              className="automatic-ioc-subjects"
-              aria-labelledby="automatic-ioc-heading"
-            >
-              <h3 id="automatic-ioc-heading">
-                Ajoutées automatiquement — IOC détectés
-              </h3>
-              <p className="ready-indicator">
-                {automaticArticles.length} article
-                {automaticArticles.length > 1 ? "s" : ""} ajouté
-                {automaticArticles.length > 1 ? "s" : ""} automatiquement.
-              </p>
-              <SubjectList groups={automaticArticles} />
-            </div>
-          ) : null}
           <h3 id="ready-heading">Prêts à traiter</h3>
           <p className="ready-indicator">
-            {ready.length} sujets prêts · {board.data.selected_briefs} article
-            {board.data.selected_briefs > 1 ? "s" : ""} ·{" "}
-            {board.data.selected_major} article
-            {board.data.selected_major > 1 ? "s" : ""} principal
-            {board.data.selected_major > 1 ? "ux" : ""}
+            {ready.length} article{ready.length > 1 ? "s" : ""} prêt
+            {ready.length > 1 ? "s" : ""}
           </p>
           {ready.length === 0 ? (
             <p className="empty-state">Aucun sujet confirmé pour le moment.</p>
-          ) : otherReady.length === 0 ? (
-            <p className="empty-state">
-              Les sujets sélectionnés automatiquement sont listés ci-dessus.
-            </p>
           ) : (
-            <SubjectList groups={otherReady} />
+            <SubjectList groups={ready} />
           )}
         </section>
 
@@ -409,8 +375,7 @@ function EditorialDecisionCard({
         {(
           [
             ["undecided", "À décider"],
-            ["brief", "Article"],
-            ["major", "Article approfondi + pivots"],
+            ["article", "Article"],
             ["ignore", "Ignorer"],
           ] as const
         ).map(([value, label]) => (
@@ -439,11 +404,7 @@ function SubjectList({ groups }: { groups: EditorialGroup[] }) {
           <li key={group.id}>
             <div>
               <strong>{group.title}</strong>
-              <small>
-                {group.editorial_type === "brief"
-                  ? "Article"
-                  : "Article principal + pivots"}
-              </small>
+              <small>Article</small>
             </div>
             {group.subject_id ? (
               <Link to={`/subjects/${group.subject_id}`}>Ouvrir le sujet</Link>
@@ -452,14 +413,6 @@ function SubjectList({ groups }: { groups: EditorialGroup[] }) {
         );
       })}
     </ul>
-  );
-}
-
-function hasIocSignal(group: EditorialGroup): boolean {
-  return (
-    (group.provisional_ioc_count ?? 0) > 0 ||
-    (group.publisher_ioc_count_total ?? 0) > 0 ||
-    (group.publisher_ioc_counts ?? []).some((count) => count > 0)
   );
 }
 

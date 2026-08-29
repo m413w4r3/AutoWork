@@ -13,8 +13,7 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
     period_end: "2026-08-31",
     tlp: "AMBER",
     languages: ["fr", "en", "fa"],
-    target_major_articles: 1,
-    target_briefs: 1,
+    target_articles: 2,
     previous_edition_id: null,
     source_profile: "iran-default",
     status: "selection",
@@ -31,7 +30,7 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
     "Seedworm / MuddyWater",
     "Activité visant des PLC Rockwell",
   ];
-  const decisions = new Map<string, "brief" | "major" | "ignore">();
+  const decisions = new Map<string, "article" | "ignore">();
   const postedBodies: unknown[] = [];
   const score = {
     impact: 3,
@@ -65,10 +64,8 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
             : decision
               ? "selected"
               : "proposed",
-        editorial_type:
-          decision === "brief" || decision === "major" ? decision : null,
         subject_id:
-          decision === "brief" || decision === "major"
+          decision === "article"
             ? `${index + 1}eeeeeee-eeee-4eee-8eee-eeeeeeeeeeee`
             : null,
         presentation: `Présentation neutre de ${title}.`,
@@ -137,7 +134,7 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
         decisions: Array<{
           group_id: string;
           version: number;
-          decision: "brief" | "major" | "ignore";
+          decision: "article" | "ignore";
         }>;
       };
       postedBodies.push(payload);
@@ -148,17 +145,13 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
       return route.fulfill({
         json: {
           groups: groups(),
-          selected_briefs: [...decisions.values()].filter(
-            (item) => item === "brief",
-          ).length,
-          selected_major: [...decisions.values()].filter(
-            (item) => item === "major",
+          selected_articles: [...decisions.values()].filter(
+            (item) => item === "article",
           ).length,
           ignored: [...decisions.values()].filter((item) => item === "ignore")
             .length,
           undecided: titles.length - decisions.size,
-          target_briefs: 1,
-          target_major: 1,
+          target_articles: 2,
           automatic_selection: false,
         },
       });
@@ -176,11 +169,8 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
     .toBe(true);
 
   const cards = page.locator(".editorial-group-card");
-  await cards.nth(0).getByRole("radio", { name: "Brève" }).check();
-  await cards
-    .nth(1)
-    .getByRole("radio", { name: "Article approfondi + pivots" })
-    .check();
+  await cards.nth(0).getByRole("radio", { name: "Article" }).check();
+  await cards.nth(1).getByRole("radio", { name: "Article" }).check();
   for (let index = 2; index < 5; index += 1)
     await cards.nth(index).getByRole("radio", { name: "Ignorer" }).check();
 
@@ -193,9 +183,7 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
     5,
   );
   await expect(page.locator(".editorial-group-card")).toHaveCount(0);
-  await expect(
-    page.getByText("2 sujets prêts · 1 brève · 1 article principal"),
-  ).toBeVisible();
+  await expect(page.getByText("2 articles prêts")).toBeVisible();
   await expect(page.getByRole("link", { name: "Ouvrir le sujet" })).toHaveCount(
     2,
   );

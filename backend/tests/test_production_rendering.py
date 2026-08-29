@@ -22,7 +22,7 @@ from cti_app.application.production_rendering import (
 )
 from cti_app.application.production_stages import ProductionQAService
 from cti_app.application.production_verification import (
-    accepted_for_brief_auto,
+    accepted_for_publication,
     project_review_status,
 )
 from cti_app.domain.collection import ReviewStatus
@@ -299,9 +299,9 @@ def test_a_human_decision_always_wins_over_machine_verification() -> None:
     )
 
 
-def test_brief_auto_accepts_verified_evidence_only() -> None:
-    assert accepted_for_brief_auto(ReviewStatus.MACHINE_VERIFIED)
-    assert accepted_for_brief_auto(ReviewStatus.VALIDATED)
-    assert accepted_for_brief_auto(ReviewStatus.CORRECTED)
-    assert not accepted_for_brief_auto(ReviewStatus.EXTRACTED)
-    assert not accepted_for_brief_auto(ReviewStatus.REJECTED)
+def test_publication_accepts_verified_evidence_only() -> None:
+    assert accepted_for_publication(ReviewStatus.MACHINE_VERIFIED)
+    assert accepted_for_publication(ReviewStatus.VALIDATED)
+    assert accepted_for_publication(ReviewStatus.CORRECTED)
+    assert not accepted_for_publication(ReviewStatus.EXTRACTED)
+    assert not accepted_for_publication(ReviewStatus.REJECTED)

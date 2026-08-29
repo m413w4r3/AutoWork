@@ -21,7 +21,6 @@ from cti_app.domain.production import (
     AnalystInvestigation,
     LoopBudget,
     ProductionArtifact,
-    ProductionProfile,
     SubjectProductionRun,
 )
 
@@ -126,8 +125,6 @@ class AnalystPostSynthesisService:
         policy: AnalystHandoffPolicy,
         uow: ProductionUnitOfWork | None = None,
     ) -> AnalystHandoffResult | None:
-        if run.profile is not ProductionProfile.MAJOR_ASSISTED:
-            return None
         if run.research_date is None:
             raise ValueError("Analyst input pack requires frozen research_date")
 

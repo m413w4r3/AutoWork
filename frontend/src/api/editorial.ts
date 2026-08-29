@@ -1,7 +1,6 @@
 import { ApiError } from "./editions";
 
-export type EditorialType = "brief" | "major";
-export type EditorialDecision = EditorialType | "ignore";
+export type EditorialDecision = "article" | "ignore";
 export type EditorialGroupStatus =
   "proposed" | "rejected" | "selected" | "superseded";
 export type GroupingOutcome =
@@ -37,7 +36,6 @@ export interface EditorialGroup {
   title: string;
   outcome: GroupingOutcome;
   status: EditorialGroupStatus;
-  editorial_type: EditorialType | null;
   subject_id: string | null;
   presentation?: string | null;
   actor_or_campaign?: string | null;
@@ -74,7 +72,6 @@ export interface EditorialGroup {
   historical_comparison: {
     group_id: string;
     title: string;
-    editorial_type: EditorialType | null;
     subject_id: string | null;
   } | null;
   version: number;
@@ -82,12 +79,10 @@ export interface EditorialGroup {
 
 export interface EditorialBoardResult {
   groups: EditorialGroup[];
-  selected_briefs: number;
-  selected_major: number;
-  ignored?: number;
-  undecided?: number;
-  target_briefs: number;
-  target_major: number;
+  selected_articles: number;
+  ignored: number;
+  undecided: number;
+  target_articles: number;
   automatic_selection: false;
 }
 

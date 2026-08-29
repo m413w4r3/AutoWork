@@ -8,6 +8,7 @@ from typing import Protocol
 from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
     ProductionArtifactStatus,
@@ -163,7 +164,7 @@ class EditionReviewService:
                 if get_run_for_update is not None
                 else await runs_repository.get(row.run_id)
             )
-            artifact = await uow.production_artifacts.get_current(row.run_id, "brief")
+            artifact = await current_publication_artifact(uow.production_artifacts, row.run_id)
             if (
                 run is None
                 or row.run_id != production_run_id

@@ -15,13 +15,14 @@ from uuid import UUID, uuid4
 
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateService,
     ProductionStateSnapshotV1,
+    ProductionStateSnapshotV2,
 )
-from cti_app.domain.production import ProductionArtifactStage
 
 _COUNTRY_CODE = re.compile(r"^[A-Z]{2}$")
 _SAFE_COMPONENT = re.compile(r"[^A-Za-z0-9_-]+")
@@ -69,7 +70,7 @@ class EditionWorkspaceMaterializer:
         position: int,
         subject_id: UUID,
         subject_title: str,
-        production_state: ProductionStateSnapshotV1,
+        production_state: ProductionStateSnapshotV1 | ProductionStateSnapshotV2,
         publication: Mapping[str, Any] | None = None,
         rendered_content: str | None = None,
         sources: Sequence[Mapping[str, Any]] = (),
@@ -332,9 +333,7 @@ class EditionProductionCheckpointService:
 
     async def _optional_publication(self, run_id: UUID) -> tuple[dict[str, Any] | None, str | None]:
         async with self._uow_factory() as uow:
-            artifact = await uow.production_artifacts.get_current(
-                run_id, ProductionArtifactStage.BRIEF.value
-            )
+            artifact = await current_publication_artifact(uow.production_artifacts, run_id)
         if artifact is None:
             return None, None
         publication: dict[str, Any] | None = None

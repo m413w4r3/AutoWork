@@ -64,7 +64,7 @@ class ProductionPromptTemplates:
 
 # REFERENCES
 
-editorial-title: <titre français au format [Acteur principal] Titre, ou [Brève] Titre>
+editorial-title: <titre français au format [Acteur principal] Titre, ou [Publication] Titre>
 
 ## SOURCE S1
 
@@ -187,7 +187,7 @@ conflicts with canonical data, canonical data wins. Use only supplied [S#] marke
 {synthesis_evidence_pack}
 </synthesis-evidence-pack>
 
-The CORE sources are the editorial backbone of the brief. Base the main
+The CORE sources are the editorial backbone of the publication. Base the main
 narrative primarily on CORE sources: the central incident or campaign, actor
 or malware relationship, essential chronology, main technical mechanism, and
 impact or victimology when present. SUPPORTING sources are secondary evidence:
@@ -260,7 +260,7 @@ functional description. Return only French prose.
 
     _REFERENCES_STRUCTURE = """# REFERENCES
 
-editorial-title: <titre français au format [Acteur principal] Titre, ou [Brève] Titre>
+editorial-title: <titre français au format [Acteur principal] Titre, ou [Publication] Titre>
 
 ## SOURCE S1
 
