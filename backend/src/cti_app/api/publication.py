@@ -14,6 +14,9 @@ from cti_app.application.edition_publication import (
     PublicationAcceptanceError,
     PublicationManifestNotFoundError,
 )
+from cti_app.application.edition_release_materialization import (
+    EditionReleaseMaterializationError,
+)
 from cti_app.application.edition_review import (
     EditionReview,
     EditionReviewItemNotFoundError,
@@ -138,6 +141,11 @@ class EditionReleaseView(BaseModel):
     can_retry_assembly: bool
 
 
+class EditionReleaseMaterializationView(BaseModel):
+    edition_id: UUID
+    materialized: bool
+
+
 def _service(request: Request) -> EditionReviewService:
     configured = getattr(request.app.state, "edition_review_service", None)
     return configured or EditionReviewService(request.app.state.uow_factory)
@@ -239,6 +247,39 @@ async def get_edition_release(edition_id: UUID, request: Request) -> EditionRele
         return _release_view(release)
     except Exception as exc:
         _raise_publication_error(exc)
+
+
+@router.post(
+    "/editions/{edition_id}/release/materialize",
+    response_model=EditionReleaseMaterializationView,
+)
+async def materialize_edition_release(
+    edition_id: UUID, request: Request
+) -> EditionReleaseMaterializationView:
+    """Rebuild only the disposable release projection from canonical storage."""
+    materializer = getattr(request.app.state, "edition_release_rematerializer", None)
+    if materializer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "release_materialization_unavailable"},
+        )
+    await _actor_id(request)
+    try:
+        await materializer.materialize(edition_id)
+    except EditionReleaseMaterializationError as exc:
+        code = str(exc)
+        status_code = (
+            status.HTTP_404_NOT_FOUND
+            if code in {"edition_not_found", "manifest_not_found", "edition_release_not_found"}
+            else status.HTTP_409_CONFLICT
+        )
+        raise HTTPException(status_code=status_code, detail={"code": code}) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "release_workspace_unavailable"},
+        ) from exc
+    return EditionReleaseMaterializationView(edition_id=edition_id, materialized=True)
 
 
 @router.get("/editions/{edition_id}/release/docx")

@@ -31,6 +31,9 @@ from cti_app.application.edition_publication import (
     EditionAssemblyService,
     EditionPublicationService,
 )
+from cti_app.application.edition_release_materialization import (
+    EditionReleaseRematerializationService,
+)
 from cti_app.application.edition_review import EditionReviewService
 from cti_app.application.edition_workspace import (
     EditionProductionCheckpointService,
@@ -228,10 +231,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.edition_workspace_root,
         diagnostics=production_diagnostics,
     )
+    edition_workspace_materializer = EditionWorkspaceMaterializer(settings.edition_workspace_root)
+    edition_release_rematerializer = EditionReleaseRematerializationService(
+        uow_factory,
+        production_artifact_store,
+        edition_workspace_materializer,
+    )
     publication_assembly = EditionAssemblyService(
         uow_factory,
         production_artifact_store,
-        workspace_materializer=EditionWorkspaceMaterializer(settings.edition_workspace_root),
+        workspace_materializer=edition_workspace_materializer,
+        rematerialization_service=edition_release_rematerializer,
     )
     subject_content_service = SubjectContentService(uow_factory, production_artifact_store)
     production_chain = ProductionStageChain(production_pacing)
@@ -279,6 +289,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         job_service=job_service,
         job_dispatcher=job_dispatcher,
     )
+    app.state.edition_release_rematerializer = edition_release_rematerializer
     yield
     await readiness.close()
     await job_engine.dispose()

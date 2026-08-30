@@ -14,6 +14,9 @@ from uuid import UUID
 
 from pydantic import ConfigDict
 
+from cti_app.application.edition_release_materialization import (
+    EditionReleaseRematerializationService,
+)
 from cti_app.application.edition_review import EditionReviewService
 from cti_app.application.jobs import (
     DuplicateJobError,
@@ -439,10 +442,19 @@ class EditionAssemblyService:
         artifact_store: ProductionArtifactStore,
         *,
         workspace_materializer: _WorkspaceReleaseMaterializer | None = None,
+        rematerialization_service: EditionReleaseRematerializationService | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
-        self._workspace_materializer = workspace_materializer
+        self._rematerialization_service = rematerialization_service or (
+            EditionReleaseRematerializationService(
+                uow_factory,
+                artifact_store,
+                workspace_materializer,
+            )
+            if workspace_materializer is not None
+            else None
+        )
 
     async def assemble(
         self, manifest_id: UUID, *, context: JobExecutionContext | None = None
@@ -549,14 +561,8 @@ class EditionAssemblyService:
                 markdown_sha256=markdown_hash,
                 docx_sha256=docx_hash,
             )
-            workspace_payload = (edition_json, markdown, docx)
-            edition_period = edition.period_start
-            edition_country_code = edition.country_code
         else:
             candidate_release = None
-            workspace_payload = None
-            edition_period = edition.period_start
-            edition_country_code = edition.country_code
 
         correlation_id = await context.correlation_id() if context else "-"
 
@@ -616,17 +622,11 @@ class EditionAssemblyService:
                 )
             await uow.commit()
 
-        if self._workspace_materializer is not None and workspace_payload is not None:
+        if self._rematerialization_service is not None:
             try:
-                edition_payload, markdown, docx = workspace_payload
-                await self._workspace_materializer.materialize_release(
-                    period=edition_period,
-                    country_code=edition_country_code,
-                    edition_id=manifest.edition_id,
-                    manifest=manifest.to_json(),
-                    edition=edition_payload,
-                    markdown=markdown,
-                    docx=docx,
+                await self._rematerialization_service.materialize(
+                    manifest.edition_id,
+                    manifest_id=manifest.id,
                 )
             except Exception:
                 logger.exception("Unable to materialize edition release workspace")

@@ -195,6 +195,14 @@ class _Factory:
         return self.uow
 
 
+class _ReleaseRematerializer:
+    def __init__(self) -> None:
+        self.edition_ids: list[UUID] = []
+
+    async def materialize(self, edition_id: UUID) -> None:
+        self.edition_ids.append(edition_id)
+
+
 async def _review(status: SubjectProductionStatus, **kwargs: Any) -> tuple[Any, _Uow]:
     row = _row(status, **kwargs)
     uow = _Uow(_edition(), row)
@@ -317,6 +325,22 @@ async def test_api_stale_returns_public_409_and_does_not_append() -> None:
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "review_item_stale"
     assert uow.publication_review_decisions.items == []
+
+
+@pytest.mark.asyncio
+async def test_api_rematerializes_release_with_verified_identity() -> None:
+    uow = _Uow(_edition(), _row(SubjectProductionStatus.READY))
+    application = _api(uow)
+    rematerializer = _ReleaseRematerializer()
+    application.state.edition_release_rematerializer = rematerializer
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.post(f"/api/editions/{EDITION_ID}/release/materialize")
+
+    assert response.status_code == 200
+    assert response.json() == {"edition_id": str(EDITION_ID), "materialized": True}
+    assert rematerializer.edition_ids == [EDITION_ID]
 
 
 @pytest.mark.asyncio

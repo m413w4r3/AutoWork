@@ -138,8 +138,8 @@ class EditionWorkspaceMaterializer:
             self._workspace_root, edition_id, period, country_code
         )
         release_path = edition_path / "release"
-        self._write_json(release_path / "publication-manifest.json", manifest)
-        self._write_json(release_path / "edition.json", edition)
+        self._write_canonical_json(release_path / "publication-manifest.json", manifest)
+        self._write_canonical_json(release_path / "edition.json", edition)
         self._write_text(release_path / "edition.md", markdown)
         self._write_bytes(release_path / "bulletin.docx", docx)
         return release_path
@@ -197,6 +197,10 @@ class EditionWorkspaceMaterializer:
     def _write_json(cls, path: Path, payload: Mapping[str, Any]) -> None:
         encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         cls._write_text(path, encoded)
+
+    @classmethod
+    def _write_canonical_json(cls, path: Path, payload: Mapping[str, Any]) -> None:
+        cls._write_bytes(path, ProductionArtifactStore.canonical_json_bytes(dict(payload)))
 
     @classmethod
     def _write_state_if_changed(cls, path: Path, payload: Mapping[str, Any]) -> None:

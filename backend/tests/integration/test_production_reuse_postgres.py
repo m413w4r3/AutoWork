@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import zipfile
 from datetime import UTC, date, datetime, timedelta
+from io import BytesIO
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.edition_publication import EditionPublicationService
+from cti_app.application.edition_publication import (
+    EditionAssemblyService,
+    EditionPublicationService,
+)
+from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import (
     AdapterResult,
@@ -41,7 +47,10 @@ from cti_app.application.production_workflow import (
     _references_input_hash,
     _synthesis_input_hash,
 )
-from cti_app.application.subject_production import SubjectProductionService
+from cti_app.application.subject_production import (
+    EditionProductionService,
+    SubjectProductionService,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, SourceCollection, SourceOriginKind
 from cti_app.domain.discovery import (
@@ -139,7 +148,9 @@ evidence: The selected campaign was reported.
         raise ModelGatewayError("retry test adapter does not support background responses")
 
 
-def _edition(*, country: str = "France", country_code: str = "FR") -> Edition:
+def _edition(
+    *, country: str = "France", country_code: str = "FR", target_articles: int = 1
+) -> Edition:
     return Edition(
         country=country,
         country_code=country_code,
@@ -147,18 +158,18 @@ def _edition(*, country: str = "France", country_code: str = "FR") -> Edition:
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=1,
+        target_articles=target_articles,
         source_profile="test",
         status=EditionStatus.SELECTION,
     )
 
 
 def _production_context_entities(
-    *, edition: Edition, subject: Subject
+    *, edition: Edition, subject: Subject, title: str = "Production subject"
 ) -> tuple[DiscoveryBatch, EditorialGroup, SourceCandidate]:
     source = SourceCandidate(
-        url="https://example.test/article",
-        title="Canonical article",
+        url=f"https://example.test/{subject.slug}",
+        title=f"{title} source",
         publisher="Example publisher",
         role=SourceRole.PRIMARY,
         tlp=TLP.AMBER,
@@ -166,8 +177,8 @@ def _production_context_entities(
         external_llm_allowed=True,
     )
     candidate = CandidateTopic(
-        title="Production subject",
-        summary="A realistic selected subject for reuse integration.",
+        title=title,
+        summary=f"A realistic selected subject for {title}.",
         novelty="new",
         technical_potential=3,
         uncertainties=(),
@@ -188,7 +199,7 @@ def _production_context_entities(
     )
     batch = DiscoveryBatch(
         edition_id=edition.id,
-        request_hash="d" * 64,
+        request_hash=(subject.id.hex * 2)[:64],
         complementary_axis="reuse integration",
         queries=(),
         citations=(),
@@ -204,7 +215,7 @@ def _production_context_entities(
     )
     group = EditorialGroup(
         edition_id=edition.id,
-        title="Production subject",
+        title=title,
         candidate_references=(CandidateReference(batch.id, candidate.id),),
         outcome=GroupingOutcome.NEW_SUBJECT,
         score=EditorialScore(
@@ -293,6 +304,177 @@ async def _seed_computed_run(
             await uow.production_artifacts.append(artifact)
         await uow.commit()
     return run, artifacts
+
+
+async def _seed_reusable_article(
+    uow_factory: UnitOfWorkFactory,
+    store: ProductionArtifactStore,
+    *,
+    edition: Edition,
+    subject: Subject,
+    title: str,
+) -> tuple[
+    SubjectProductionRun,
+    dict[ProductionArtifactStage, ProductionArtifact],
+    ProductionArtifact,
+]:
+    """Create one complete first pass whose costly inputs can be reused."""
+    batch, group, source = _production_context_entities(
+        edition=edition, subject=subject, title=title
+    )
+    discovery_model_run = ModelRun(
+        id=batch.discovery_model_run_id,
+        provider=ModelProvider.FAKE,
+        model_role=ModelRole.RESEARCH,
+        requested_model="fake",
+        prompt_template_id="integration",
+        prompt_template_version="1",
+        authorized_input_hash=(subject.id.hex * 2)[:64],
+        evidence_pack_hash=(batch.id.hex * 2)[:64],
+        parameters={},
+    )
+    collection = SourceCollection(
+        subject_id=subject.id,
+        edition_id=edition.id,
+        group_id=group.id,
+        batch_id=batch.id,
+        source_candidate_id=source.id,
+        requested_url=source.url,
+        canonical_url=source.canonical_url,
+        title=source.title,
+        publisher=source.publisher,
+        published_at=source.published_at,
+        source_tlp=source.tlp,
+        sensitivity=source.sensitivity,
+        external_llm_allowed=True,
+        proposed_role=source.role,
+        origin_kind=SourceOriginKind.DISCOVERY,
+        state=CollectionState.ARCHIVED,
+    )
+    async with uow_factory() as uow:
+        await uow.model_runs.add(discovery_model_run)
+        assert await uow.discovery_batches.add_if_absent(batch)
+        await uow.editorial_groups.add(group)
+        assert await uow.source_collections.add_if_absent(collection)
+        await uow.commit()
+
+    production = SubjectProductionService(uow_factory)
+    source_run, created = await production.create_run(subject.id, edition.id)
+    assert created
+    source_run = await production.start_run(source_run.id)
+    async with uow_factory() as uow:
+        persisted = await uow.subject_production_runs.get_for_update(source_run.id)
+        assert persisted is not None
+        persisted.current_stage = SubjectProductionStage.ASSEMBLY
+        persisted.mark_ready()
+        await uow.subject_production_runs.save(persisted)
+        await uow.commit()
+        snapshot = await uow.production_input_snapshots.get_by_run(source_run.id)
+    assert snapshot is not None
+
+    report = ReferenceReport(
+        sources=(
+            ParsedSource(
+                local_id="S1",
+                title=source.title,
+                url=source.canonical_url,
+                canonical_url=source.canonical_url,
+                publisher=source.publisher,
+                published_at=source.published_at,
+                role=source.role,
+            ),
+        ),
+        events=(
+            ParsedEvent(
+                local_id="R1",
+                event_date=date(2026, 8, 5),
+                source_ids=("S1",),
+                text=f"{title} was reported.",
+            ),
+        ),
+    )
+    extraction = TechnicalExtraction(items=())
+    refs_hash = _references_input_hash(
+        subject_id=subject.id,
+        snapshot=snapshot,
+        subject_title=snapshot.subject_title,
+        subject_description=snapshot.subject_description,
+        research_date=snapshot.research_date,
+    )
+    refs_payload = reference_report_to_json(report)
+    extraction_payload = technical_extraction_to_json(extraction)
+    extraction_hash = _extraction_input_hash(
+        subject_id=subject.id,
+        references_hash=refs_hash,
+        source_urls=[source.canonical_url],
+        references_payload_hash=compute_input_hash(refs_payload),
+    )
+    synthesis_pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
+        report, extraction, {source.canonical_url: "core"}
+    )
+    synthesis_hash = _synthesis_input_hash(
+        subject_id=subject.id,
+        references_hash=refs_hash,
+        reference_report_hash=compute_input_hash(refs_payload),
+        extraction_hash=extraction_hash,
+        technical_extraction_hash=compute_input_hash(extraction_payload),
+        synthesis_evidence_pack_hash=compute_input_hash(synthesis_pack),
+    )
+
+    refs_raw_id, refs_blob_id, _ = await store.store_stage_payloads(
+        raw=f"{title} references", canonical=refs_payload
+    )
+    extraction_raw_id, extraction_blob_id, _ = await store.store_stage_payloads(
+        raw=f"{title} extraction", canonical=extraction_payload
+    )
+    _, _, synthesis_blob_id = await store.store_stage_payloads(
+        raw=f"{title} synthesis", rendered=f"{title} was reported [S1]."
+    )
+    source_artifacts = {
+        ProductionArtifactStage.REFERENCES: ProductionArtifact(
+            production_run_id=source_run.id,
+            subject_id=subject.id,
+            stage=ProductionArtifactStage.REFERENCES,
+            version=1,
+            input_hash=refs_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            raw_blob_id=refs_raw_id,
+            canonical_blob_id=refs_blob_id,
+        ),
+        ProductionArtifactStage.EXTRACTION: ProductionArtifact(
+            production_run_id=source_run.id,
+            subject_id=subject.id,
+            stage=ProductionArtifactStage.EXTRACTION,
+            version=1,
+            input_hash=extraction_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            raw_blob_id=extraction_raw_id,
+            canonical_blob_id=extraction_blob_id,
+        ),
+        ProductionArtifactStage.SYNTHESIS: ProductionArtifact(
+            production_run_id=source_run.id,
+            subject_id=subject.id,
+            stage=ProductionArtifactStage.SYNTHESIS,
+            version=1,
+            input_hash=synthesis_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            rendered_blob_id=synthesis_blob_id,
+        ),
+    }
+    async with uow_factory() as uow:
+        for artifact in source_artifacts.values():
+            await uow.production_artifacts.append(artifact)
+        await uow.commit()
+
+    publication = await PublicationAssemblyService(uow_factory, store).assemble_publication(
+        run_id=source_run.id,
+        subject_id=subject.id,
+        subject_title=title,
+        references_artifact=source_artifacts[ProductionArtifactStage.REFERENCES],
+        extraction_artifact=source_artifacts[ProductionArtifactStage.EXTRACTION],
+        synthesis_artifact=source_artifacts[ProductionArtifactStage.SYNTHESIS],
+    )
+    return source_run, source_artifacts, publication
 
 
 @pytest.mark.asyncio
@@ -813,3 +995,146 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     assert accepted.manifest.entries[0].pipeline_generation == persisted_b.pipeline_generation
     assert accepted.manifest.entries[0].document_artifact_id == publication_b.id
     assert accepted.manifest.entries[0].document_artifact_id != publication_a.id
+
+
+@pytest.mark.asyncio
+async def test_two_article_cached_edition_is_sequential_and_uses_new_publications(
+    uow_factory: UnitOfWorkFactory, tmp_path: Path
+) -> None:
+    """Mirror the low-cost manual batch with two real PostgreSQL-backed runs."""
+    edition = _edition(country="Italy", country_code="IT", target_articles=2)
+    subjects = [
+        Subject(
+            external_id=f"SUBJ-TWO-ARTICLE-{label}-{uuid4()}",
+            slug=f"two-article-{label.lower()}-{uuid4().hex}",
+            tlp=TLP.AMBER,
+        )
+        for label in ("A", "B")
+    ]
+    store = ProductionArtifactStore(
+        BlobCatalogService(FilesystemBlobStore(tmp_path / "blobs"), uow_factory)
+    )
+    async with uow_factory() as uow:
+        await uow.editions.add_if_absent(edition)
+        for subject in subjects:
+            await uow.subjects.add(subject)
+        await uow.commit()
+
+    source_publications: list[ProductionArtifact] = []
+    for subject, title in zip(subjects, ("Article A", "Article B"), strict=True):
+        _source_run, _, source_publication = await _seed_reusable_article(
+            uow_factory,
+            store,
+            edition=edition,
+            subject=subject,
+            title=title,
+        )
+        source_publications.append(source_publication)
+
+    batch_service = EditionProductionService(uow_factory)
+    batch = await batch_service.create_batch(edition.id, [subject.id for subject in subjects])
+    first = await batch_service.start_next(batch.id)
+    assert first is not None
+    assert first.subject_id == subjects[0].id
+
+    async with uow_factory() as uow:
+        batch_items = await uow.edition_production_batch_items.list_for_batch(batch.id)
+        queued_runs = [
+            await uow.subject_production_runs.get(item.production_run_id) for item in batch_items
+        ]
+    assert [run.status for run in queued_runs if run is not None] == [
+        SubjectProductionStatus.RUNNING,
+        SubjectProductionStatus.QUEUED,
+    ]
+    second_id = batch_items[1].production_run_id
+
+    class SentinelModelGateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            self.calls += 1
+            raise AssertionError("no model call expected during cached edition smoke")
+
+    sentinel = SentinelModelGateway()
+    orchestrator = ProductionWorkflowOrchestrator(
+        uow_factory,
+        model_gateway=sentinel,  # type: ignore[arg-type]
+        artifact_store=store,
+    )
+    cached_results: list[dict[str, object]] = []
+
+    async def execute_cached(run_id: UUID) -> None:
+        await SubjectProductionService(uow_factory).advance_stage(run_id)
+        for stage in (
+            SubjectProductionStage.REFERENCES,
+            SubjectProductionStage.EXTRACTION,
+            SubjectProductionStage.SYNTHESIS,
+        ):
+            result = await orchestrator.execute_stage(run_id, stage)
+            cached_results.append(result)
+            assert result["status"] == "reused"
+            if stage is not SubjectProductionStage.SYNTHESIS:
+                await SubjectProductionService(uow_factory).advance_stage(run_id)
+        await SubjectProductionService(uow_factory).advance_stage(run_id)
+        assembly_result = await orchestrator.execute_stage(run_id, SubjectProductionStage.ASSEMBLY)
+        assert assembly_result["status"] == "success"
+
+    await execute_cached(first.id)
+    second = await batch_service.on_subject_terminal(batch.id, first.id)
+    assert second is not None
+    assert second.id == second_id
+    assert second.status is SubjectProductionStatus.RUNNING
+    await execute_cached(second.id)
+    assert await batch_service.on_subject_terminal(batch.id, second.id) is None
+    assert len(cached_results) == 6
+    assert sentinel.calls == 0
+
+    async with uow_factory() as uow:
+        persisted_edition = await uow.editions.get(edition.id)
+        review_rows = await uow.edition_review_read_model.list_for_edition(edition.id)
+        target_publications = []
+        for row in review_rows:
+            artifacts = await uow.production_artifacts.list_for_run(row.run_id)
+            target_publications.append(
+                next(
+                    artifact
+                    for artifact in artifacts
+                    if artifact.stage is ProductionArtifactStage.PUBLICATION
+                    and artifact.status is ProductionArtifactStatus.VERIFIED
+                )
+            )
+    assert persisted_edition is not None
+    assert persisted_edition.status is EditionStatus.REVIEW
+    assert [row.position for row in review_rows] == [1, 2]
+    assert [row.run_id for row in review_rows] == [first.id, second.id]
+    assert [artifact.id for artifact in target_publications] != [
+        publication.id for publication in source_publications
+    ]
+
+    accepted = await EditionPublicationService(uow_factory, store).accept(
+        edition.id, actor_id="reviewer", correlation_id="two-article-cached-smoke"
+    )
+    assert [entry.production_run_id for entry in accepted.manifest.entries] == [
+        first.id,
+        second.id,
+    ]
+    assert [entry.document_artifact_id for entry in accepted.manifest.entries] == [
+        artifact.id for artifact in target_publications
+    ]
+
+    release = await EditionAssemblyService(
+        uow_factory,
+        store,
+        workspace_materializer=EditionWorkspaceMaterializer(tmp_path / "editions"),
+    ).assemble(accepted.manifest.id)
+    edition_json = await store.read_json(release.edition_document_blob_id)
+    assert [item["document"]["title"] for item in edition_json["publications"]] == [
+        "[Publication] Article A",
+        "[Publication] Article B",
+    ]
+    docx = await store.read_bytes(release.docx_blob_id, max_bytes=32 * 1024 * 1024)
+    with zipfile.ZipFile(BytesIO(docx)) as archive:
+        document_xml = archive.read("word/document.xml")
+    assert document_xml.index(b"Article A") < document_xml.index(b"Article B")

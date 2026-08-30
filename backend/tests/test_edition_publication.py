@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
 import zipfile
 from datetime import date
 from io import BytesIO
@@ -61,7 +62,7 @@ DECISION_B = UUID("88888888-8888-4888-8888-888888888888")
 DECISION_C = UUID("88888888-8888-4888-8888-888888888889")
 
 
-def _edition() -> Edition:
+def _edition(*, target_articles: int = 3) -> Edition:
     return Edition(
         id=EDITION_ID,
         country="France",
@@ -70,7 +71,7 @@ def _edition() -> Edition:
         period_end=date(2026, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_articles=3,
+        target_articles=target_articles,
         source_profile="test",
         status=EditionStatus.REVIEW,
     )
@@ -146,6 +147,9 @@ class _BlobStore:
         content = self.blobs[blob_id]
         assert len(content) <= max_bytes
         return content
+
+    async def read_text(self, blob_id: UUID) -> str:
+        return (await self.read_bytes(blob_id, max_bytes=32 * 1024 * 1024)).decode()
 
 
 class _ManifestRepo:
@@ -764,6 +768,88 @@ async def test_assembly_reads_manifest_artifact_id_and_publishes_real_docx(
     assert (release_path / "bulletin.docx").read_bytes() == content
     await assembly.assemble(accepted.manifest_id)
     assert uow.edition_releases.add_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_target_two_articles_is_frozen_and_rematerializable(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        EditionReviewReadItem(
+            position=position,
+            subject_id=subject_id,
+            title=title,
+            run_id=run_id,
+            pipeline_generation=2,
+            run_status=SubjectProductionStatus.READY,
+            document_artifact_id=artifact_id,
+            document_artifact_version=1,
+            document_input_hash="a" * 64,
+            document_artifact_status=ProductionArtifactStatus.VERIFIED,
+            error_code=None,
+            error_message=None,
+            effective_decision=None,
+        )
+        for position, (subject_id, title, run_id, artifact_id) in enumerate(
+            (
+                (SUBJECT_A, "Article A", RUN_A, ARTIFACT_A),
+                (SUBJECT_B, "Article B", RUN_B, ARTIFACT_B),
+            ),
+            start=1,
+        )
+    ]
+    blobs = _BlobStore()
+    uow = _Uow(_edition(target_articles=2), rows, blobs)
+    for artifact_id, title in ((ARTIFACT_A, "Article A"), (ARTIFACT_B, "Article B")):
+        blob_id = uow.production_artifacts.artifacts[artifact_id].canonical_blob_id
+        assert blob_id is not None
+        blobs.blobs[blob_id] = json.dumps(_document(title).to_json()).encode()
+    accepted = await EditionPublicationService(lambda: uow, blobs).accept(
+        EDITION_ID, actor_id="analyst"
+    )  # type: ignore[arg-type]
+    assembly = EditionAssemblyService(
+        lambda: uow,
+        blobs,
+        workspace_materializer=EditionWorkspaceMaterializer(tmp_path / "editions"),
+    )  # type: ignore[arg-type]
+
+    release = await assembly.assemble(accepted.manifest_id)
+    assert [entry.position for entry in accepted.manifest.entries] == [1, 2]
+    assert [entry.subject_id for entry in accepted.manifest.entries] == [SUBJECT_A, SUBJECT_B]
+    edition_payload = await blobs.read_json(release.edition_document_blob_id)
+    assert [item["document"]["title"] for item in edition_payload["publications"]] == [
+        "Article A",
+        "Article B",
+    ]
+    original_docx = await blobs.read_bytes(release.docx_blob_id, max_bytes=32 * 1024 * 1024)
+    with zipfile.ZipFile(BytesIO(original_docx)) as archive:
+        document_xml = archive.read("word/document.xml")
+    assert document_xml.index(b"Article A") < document_xml.index(b"Article B")
+
+    release_path = tmp_path / "editions/2026-08_FR/release"
+    manifest_blob_id = uow.publication_manifests.blob_id
+    assert manifest_blob_id is not None
+    canonical_bytes = {
+        "publication-manifest.json": blobs.blobs[manifest_blob_id],
+        "edition.json": blobs.blobs[release.edition_document_blob_id],
+        "edition.md": blobs.blobs[release.markdown_blob_id],
+        "bulletin.docx": blobs.blobs[release.docx_blob_id],
+    }
+    assert {name: (release_path / name).read_bytes() for name in canonical_bytes} == canonical_bytes
+    manifest_id = accepted.manifest.id
+    release_id = release.id
+    shutil.rmtree(release_path)
+    assert not release_path.exists()
+    assert uow.edition_releases.release is release
+
+    rematerialized = await assembly.assemble(accepted.manifest_id)
+
+    assert rematerialized is release
+    assert rematerialized.id == release_id
+    assert uow.edition_releases.add_calls == 1
+    assert uow.publication_manifests.manifest.id == manifest_id
+    assert {name: (release_path / name).read_bytes() for name in canonical_bytes} == canonical_bytes
+    assert (release_path / "bulletin.docx").read_bytes() == original_docx
 
 
 @pytest.mark.asyncio
