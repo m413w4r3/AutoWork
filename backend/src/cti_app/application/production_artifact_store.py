@@ -16,6 +16,7 @@ from io import BytesIO
 from typing import Any
 from uuid import UUID
 
+from cti_app.application.blob_storage import BlobStorageUnavailableError
 from cti_app.application.blobs import BlobCatalogService
 
 # Production payloads are text; a publication or a reference report never approaches
@@ -25,6 +26,13 @@ MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 _RAW_BUCKET = "production-artifacts-raw"
 _CANONICAL_BUCKET = "production-artifacts-canonical"
 _RENDERED_BUCKET = "production-artifacts-rendered"
+
+
+class ProductionReuseStorageUnavailableError(RuntimeError):
+    """Canonical payload storage is unavailable and the stage must retry."""
+
+    code = "production_reuse_storage_unavailable"
+    retryable = True
 
 
 class ProductionArtifactStore:
@@ -75,7 +83,10 @@ class ProductionArtifactStore:
         return (await self.read_bytes(blob_id)).decode("utf-8")
 
     async def read_bytes(self, blob_id: UUID, *, max_bytes: int = MAX_ARTIFACT_BYTES) -> bytes:
-        return await self._catalog.read(blob_id, max_bytes=max_bytes)
+        try:
+            return await self._catalog.read(blob_id, max_bytes=max_bytes)
+        except BlobStorageUnavailableError as exc:
+            raise ProductionReuseStorageUnavailableError(str(exc)) from exc
 
     async def read_json(self, blob_id: UUID) -> dict[str, Any]:
         payload = json.loads(await self.read_text(blob_id))

@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from uuid import UUID
 
+from cti_app.application.blob_storage import BlobStorageUnavailableError
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.persistence import ProductionUnitOfWork, ProductionUnitOfWorkFactory
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    ProductionArtifactStore,
+    ProductionReuseStorageUnavailableError,
+)
+from cti_app.domain.errors import BlobIntegrityError, EntityNotFoundError
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -65,7 +71,29 @@ class ProductionArtifactReuseService:
 
             current = await uow.production_artifacts.get_current(target_run.id, stage.value)
             if current is not None and current.input_hash == input_hash:
-                return ProductionArtifactReuseResult(current, reused=False)
+                if current.status is ProductionArtifactStatus.VERIFIED:
+                    try:
+                        await self._verify_required_blob(current)
+                    except ProductionReuseStorageUnavailableError:
+                        raise
+                    except BlobStorageUnavailableError as exc:
+                        raise ProductionReuseStorageUnavailableError(str(exc)) from exc
+                    except (
+                        BlobIntegrityError,
+                        EntityNotFoundError,
+                        FileNotFoundError,
+                        ValueError,
+                    ) as exc:
+                        self._record_invalid_candidate(target_run, stage, current, exc)
+                    else:
+                        return ProductionArtifactReuseResult(current, reused=False)
+                else:
+                    self._record_invalid_candidate(
+                        target_run,
+                        stage,
+                        current,
+                        ValueError(f"artifact status is {current.status.value}, not verified"),
+                    )
 
             if (
                 not allow_cross_run
@@ -90,17 +118,17 @@ class ProductionArtifactReuseService:
 
             try:
                 await self._verify_required_blob(candidate)
-            except Exception as exc:
-                self._diagnostics.record(
-                    event="production.reuse_candidate_invalid",
-                    run_id=target_run.id,
-                    subject_id=target_run.subject_id,
-                    stage=stage.value,
-                    candidate_artifact_id=str(candidate.id),
-                    source_run_id=str(candidate.production_run_id),
-                    error_code="production.reuse_candidate_invalid",
-                    error=str(exc),
-                )
+            except ProductionReuseStorageUnavailableError:
+                raise
+            except BlobStorageUnavailableError as exc:
+                raise ProductionReuseStorageUnavailableError(str(exc)) from exc
+            except (
+                BlobIntegrityError,
+                EntityNotFoundError,
+                FileNotFoundError,
+                ValueError,
+            ) as exc:
+                self._record_invalid_candidate(target_run, stage, candidate, exc)
                 return None
 
             prior = await uow.production_artifacts.list_for_run(target_run.id)
@@ -140,19 +168,40 @@ class ProductionArtifactReuseService:
 
     async def _verify_required_blob(self, artifact: ProductionArtifact) -> None:
         if self._artifact_store is None:
-            raise ValueError("artifact store unavailable")
-        blob_id = (
-            artifact.canonical_blob_id
-            if artifact.stage
-            in {
-                ProductionArtifactStage.REFERENCES,
-                ProductionArtifactStage.EXTRACTION,
-            }
-            else artifact.rendered_blob_id
-        )
+            raise ProductionReuseStorageUnavailableError("artifact store is not configured")
+        blob_id = self._required_blob_id(artifact)
         if blob_id is None:
             raise ValueError("required artifact blob is missing")
         await self._artifact_store.read_bytes(blob_id)
+
+    @staticmethod
+    def _required_blob_id(artifact: ProductionArtifact) -> UUID | None:
+        if artifact.stage in {
+            ProductionArtifactStage.REFERENCES,
+            ProductionArtifactStage.EXTRACTION,
+        }:
+            return artifact.canonical_blob_id
+        if artifact.stage is ProductionArtifactStage.SYNTHESIS:
+            return artifact.rendered_blob_id
+        return None
+
+    def _record_invalid_candidate(
+        self,
+        run: SubjectProductionRun,
+        stage: ProductionArtifactStage,
+        candidate: ProductionArtifact,
+        error: Exception,
+    ) -> None:
+        self._diagnostics.record(
+            event="production.reuse_candidate_invalid",
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage.value,
+            candidate_artifact_id=str(candidate.id),
+            source_run_id=str(candidate.production_run_id),
+            error_code="production.reuse_candidate_invalid",
+            error=str(error),
+        )
 
     async def _invalidation_cutoff(
         self,

@@ -27,7 +27,10 @@ from cti_app.application.production_artifact_reuse import (
     ProductionArtifactReuseService,
     cross_run_reuse_allowed,
 )
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    ProductionArtifactStore,
+    ProductionReuseStorageUnavailableError,
+)
 from cti_app.application.production_artifact_verification import (
     ARTIFACT_VERIFIER_VERSION,
     Q2ProposalSubmission,
@@ -204,18 +207,21 @@ class ProductionWorkflowOrchestrator:
                 f"Run on stage {run.current_stage.value}, expected {expected_stage.value}"
             )
 
-        if expected_stage == SubjectProductionStage.SOURCES:
-            result = await self._execute_sources_stage(run, context, snapshot)
-        elif expected_stage == SubjectProductionStage.REFERENCES:
-            result = await self._execute_references_stage(run, context, snapshot)
-        elif expected_stage == SubjectProductionStage.EXTRACTION:
-            result = await self._execute_extraction_stage(run, context, snapshot)
-        elif expected_stage == SubjectProductionStage.SYNTHESIS:
-            result = await self._execute_synthesis_stage(run, snapshot)
-        elif expected_stage == SubjectProductionStage.ASSEMBLY:
-            result = await self._execute_assembly_stage(run, snapshot)
-        else:
-            raise ValueError(f"Unknown stage: {expected_stage.value}")
+        try:
+            if expected_stage == SubjectProductionStage.SOURCES:
+                result = await self._execute_sources_stage(run, context, snapshot)
+            elif expected_stage == SubjectProductionStage.REFERENCES:
+                result = await self._execute_references_stage(run, context, snapshot)
+            elif expected_stage == SubjectProductionStage.EXTRACTION:
+                result = await self._execute_extraction_stage(run, context, snapshot)
+            elif expected_stage == SubjectProductionStage.SYNTHESIS:
+                result = await self._execute_synthesis_stage(run, snapshot)
+            elif expected_stage == SubjectProductionStage.ASSEMBLY:
+                result = await self._execute_assembly_stage(run, snapshot)
+            else:
+                raise ValueError(f"Unknown stage: {expected_stage.value}")
+        except ProductionReuseStorageUnavailableError as exc:
+            result = self._handle_stage_exception(run, expected_stage.value, exc)
 
         self._diagnostics.record_stage_outcome(
             run_id=run.id,
@@ -491,7 +497,7 @@ class ProductionWorkflowOrchestrator:
         try:
             payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
             return reference_report_from_json(payload)
-        except Exception:
+        except (OSError, UnicodeError, ValueError):
             return None
 
     def _log_parse(self, run: SubjectProductionRun, stage: str, result: ParseResult[Any]) -> None:
@@ -1124,24 +1130,15 @@ class ProductionWorkflowOrchestrator:
             synthesis_pack = self._build_synthesis_evidence_pack(
                 report, extraction_payload, source_tiers_by_url
             )
-            synthesis_pack_hash = compute_input_hash(synthesis_pack)
-            input_hash = compute_input_hash(
-                {
-                    "subject_id": str(run.subject_id),
-                    "references_hash": references.input_hash,
-                    "reference_report_hash": compute_input_hash(reference_report_to_json(report)),
-                    "extraction_hash": extraction.input_hash,
-                    "technical_extraction_hash": compute_input_hash(
-                        technical_extraction_to_json(extraction_payload)
-                    ),
-                    "synthesis_evidence_pack_version": "2",
-                    "synthesis_evidence_pack_hash": synthesis_pack_hash,
-                    "prompt_version": SYNTHESIS_PROMPT_VERSION,
-                    "format_repair_version": SYNTHESIS_FORMAT_REPAIR_VERSION,
-                    "web_policy_version": "q4-web-non-authoritative-v1",
-                    "model_routing_policy": "openai-drafting-v1",
-                    "stage": "synthesis",
-                }
+            input_hash = _synthesis_input_hash(
+                subject_id=run.subject_id,
+                references_hash=references.input_hash,
+                reference_report_hash=compute_input_hash(reference_report_to_json(report)),
+                extraction_hash=extraction.input_hash,
+                technical_extraction_hash=compute_input_hash(
+                    technical_extraction_to_json(extraction_payload)
+                ),
+                synthesis_evidence_pack_hash=compute_input_hash(synthesis_pack),
             )
             reused = await self._reuse_artifact(run, "synthesis", input_hash)
             if reused is not None:
@@ -1417,5 +1414,37 @@ def _extraction_input_hash(
             "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
             "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
             "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+        }
+    )
+
+
+def _synthesis_input_hash(
+    *,
+    subject_id: UUID,
+    references_hash: str,
+    reference_report_hash: str,
+    extraction_hash: str,
+    technical_extraction_hash: str,
+    synthesis_evidence_pack_hash: str,
+    prompt_version: str = SYNTHESIS_PROMPT_VERSION,
+    format_repair_version: str = SYNTHESIS_FORMAT_REPAIR_VERSION,
+    web_policy_version: str = "q4-web-non-authoritative-v1",
+    routing_policy_version: str = "openai-drafting-v1",
+) -> str:
+    """Return the functional Q4 identity, excluding run and execution state."""
+    return compute_input_hash(
+        {
+            "subject_id": str(subject_id),
+            "references_hash": references_hash,
+            "reference_report_hash": reference_report_hash,
+            "extraction_hash": extraction_hash,
+            "technical_extraction_hash": technical_extraction_hash,
+            "synthesis_evidence_pack_version": "2",
+            "synthesis_evidence_pack_hash": synthesis_evidence_pack_hash,
+            "prompt_version": prompt_version,
+            "format_repair_version": format_repair_version,
+            "web_policy_version": web_policy_version,
+            "model_routing_policy": routing_policy_version,
+            "stage": "synthesis",
         }
     )

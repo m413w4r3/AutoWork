@@ -119,6 +119,14 @@ class ProductionArtifactRow(Base):
             name="ck_artifact_reuse_not_self",
         ),
         Index("ix_production_artifacts_run_stage_version", "production_run_id", "stage", "version"),
+        Index(
+            "ix_production_artifacts_reuse_lookup",
+            "subject_id",
+            "stage",
+            "input_hash",
+            "created_at",
+            postgresql_where=text("status = 'verified'"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)

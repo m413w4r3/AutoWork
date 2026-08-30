@@ -47,10 +47,12 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchPhase,
+    ProductionReuseInvalidation,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
 )
+from cti_app.logging import CorrelationIdMiddleware
 
 
 def _score() -> EditorialScore:
@@ -307,6 +309,23 @@ class _InputPacks:
         self.items[pack.id] = pack
 
 
+class _ReuseInvalidations:
+    def __init__(self) -> None:
+        self.items: list[ProductionReuseInvalidation] = []
+
+    async def add(self, invalidation: ProductionReuseInvalidation) -> None:
+        self.items.append(invalidation)
+
+    async def list_for_subject(
+        self, edition_id: UUID, subject_id: UUID
+    ) -> Sequence[ProductionReuseInvalidation]:
+        return [
+            item
+            for item in self.items
+            if item.edition_id == edition_id and item.subject_id == subject_id
+        ]
+
+
 class _Uow:
     """Single shared in-memory unit of work; commit is a no-op."""
 
@@ -320,6 +339,7 @@ class _Uow:
         self.source_collections = _SourceCollections()
         self.analyst_investigations = _Investigations()
         self.analyst_input_packs = _InputPacks()
+        self.production_reuse_invalidations = _ReuseInvalidations()
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -454,6 +474,7 @@ def uow() -> _Uow:
 @pytest.fixture
 def production_app(uow: _Uow) -> FastAPI:
     application = FastAPI()
+    application.add_middleware(CorrelationIdMiddleware)
     application.include_router(router)
     application.state.uow_factory = lambda: uow
     application.state.job_service = _Jobs()
@@ -486,6 +507,82 @@ async def test_get_edition_production_without_batch_returns_404(api: AsyncClient
 
     assert response.status_code == 404
     assert response.status_code != 422
+
+
+async def test_invalidate_reuse_without_run_returns_404(api: AsyncClient) -> None:
+    response = await api.post(
+        f"/api/subjects/{uuid4()}/production/reuse/invalidate",
+        json={"from_stage": "references"},
+    )
+
+    assert response.status_code == 404
+
+
+async def test_invalidate_reuse_rejects_active_run(api: AsyncClient, uow: _Uow) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Active", subject_id))
+    await uow.subject_production_runs.add(
+        SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
+    )
+
+    response = await api.post(
+        f"/api/subjects/{subject_id}/production/reuse/invalidate",
+        json={"from_stage": "references"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "reuse_invalidation_run_active"
+
+
+@pytest.mark.parametrize("from_stage", ["sources", "assembly"])
+async def test_invalidate_reuse_rejects_non_costly_stage(
+    api: AsyncClient, uow: _Uow, from_stage: str
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Rejected", subject_id))
+    await uow.subject_production_runs.add(
+        _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
+    )
+
+    response = await api.post(
+        f"/api/subjects/{subject_id}/production/reuse/invalidate",
+        json={"from_stage": from_stage},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "reuse_invalidation_stage_not_allowed"
+    assert uow.production_reuse_invalidations.items == []
+
+
+@pytest.mark.parametrize("from_stage", ["references", "extraction", "synthesis"])
+async def test_invalidate_reuse_persists_identity_from_provider(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+    from_stage: str,
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Accepted", subject_id))
+    run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
+    await uow.subject_production_runs.add(run)
+    production_app.state.identity_provider = LocalIdentityProvider("provider-user")
+
+    response = await api.post(
+        f"/api/subjects/{subject_id}/production/reuse/invalidate",
+        json={"from_stage": from_stage, "actor_id": "spoofed-body-user"},
+        headers={"X-Correlation-ID": "reuse-api-correlation"},
+    )
+
+    assert response.status_code == 200, response.text
+    persisted = uow.production_reuse_invalidations.items
+    assert len(persisted) == 1
+    invalidation = persisted[0]
+    assert invalidation.edition_id == edition_id
+    assert invalidation.subject_id == subject_id
+    assert invalidation.from_stage.value == from_stage
+    assert invalidation.actor_id == "provider-user"
+    assert invalidation.correlation_id == "reuse-api-correlation"
+    assert invalidation.occurred_at.tzinfo is not None
 
 
 async def test_start_subject_production_needs_no_edition_id(api: AsyncClient, uow: _Uow) -> None:

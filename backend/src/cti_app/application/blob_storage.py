@@ -3,6 +3,14 @@ from typing import BinaryIO, Literal, Protocol
 
 from cti_app.domain.blobs import BlobDescriptor
 
+
+class BlobStorageUnavailableError(RuntimeError):
+    """The canonical blob store is temporarily unreachable."""
+
+    code = "blob_storage_unavailable"
+    retryable = True
+
+
 MaterializationMethod = Literal["hardlink", "copy", "existing"]
 
 

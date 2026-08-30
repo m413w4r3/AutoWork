@@ -68,3 +68,39 @@ it("construit la preview de publication depuis le JSON canonique", async () => {
   ).toHaveAttribute("download", "publication-pandoc.md");
   expect(screen.queryByText(/custom-style/)).not.toBeInTheDocument();
 });
+
+it("préserve la provenance visible d'un artifact réutilisé", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      Response.json({
+        artifact_id: "synthesis-b",
+        stage: "synthesis",
+        version: 1,
+        status: "verified",
+        reused: true,
+        reused_from_artifact_id: "synthesis-a",
+        reused_from_created_at: "2026-08-10T10:00:00Z",
+        metadata: {},
+        rendered_content: "Synthèse canonique réutilisée",
+        canonical_content: { body: "Synthèse canonique réutilisée" },
+      }),
+    ),
+  );
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+
+  render(
+    <QueryClientProvider client={client}>
+      <ProductionArtifactView subjectId="subject-1" stage="synthesis" />
+    </QueryClientProvider>,
+  );
+
+  expect(
+    await screen.findByText(/Réutilisé depuis un calcul précédent/),
+  ).toBeInTheDocument();
+  expect(screen.getByText(/artifact source : synthesis-a/)).toBeInTheDocument();
+  expect(screen.getByText(/calcul original/)).toBeInTheDocument();
+  expect(screen.getByText("Synthèse canonique réutilisée")).toBeInTheDocument();
+});
