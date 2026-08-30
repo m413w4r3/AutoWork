@@ -184,7 +184,12 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
   );
   await expect(page.locator(".editorial-group-card")).toHaveCount(0);
   await expect(page.getByText("2 articles prêts")).toBeVisible();
-  await expect(page.getByRole("link", { name: "Ouvrir le sujet" })).toHaveCount(
-    2,
-  );
+  // Scoped to the editorial board's "ready" list: the production-batch
+  // selector below renders its own "Ouvrir le sujet" links for the same
+  // eligible subjects, so an unscoped count would double.
+  await expect(
+    page
+      .locator(".ready-subject-list")
+      .getByRole("link", { name: "Ouvrir le sujet" }),
+  ).toHaveCount(2);
 });

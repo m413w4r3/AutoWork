@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-import { fetchEditorialBoard, type EditorialGroup } from "../../api/editorial";
+import { fetchEditorialBoard } from "../../api/editorial";
 import { startEditionProduction } from "../../api/production";
 import {
   transitionEdition,
@@ -11,6 +11,12 @@ import {
 import { EditorialBoard } from "../../components/EditorialBoard";
 import { DiscoveryPanel } from "../discovery/DiscoveryPanel";
 import { discoveryJobStorageKey } from "../discovery/discoveryStorage";
+import { ProductionBatchSelector } from "./ProductionBatchSelector";
+import {
+  isEligibleSubject,
+  orderedSelection,
+  pruneToEligible,
+} from "./productionBatchSelection";
 import { ProductionConsole } from "./ProductionConsole";
 import { PublicationConsole } from "./PublicationConsole";
 import { ReviewConsole } from "./ReviewConsole";
@@ -131,30 +137,73 @@ function DiscoveryPhase({ edition }: { edition: Edition }) {
   );
 }
 
-function isEligibleSubject(group: EditorialGroup): boolean {
-  return group.status === "selected" && group.subject_id !== null;
-}
-
 function SelectionPhase({ edition }: { edition: Edition }) {
   const queryClient = useQueryClient();
   const board = useQuery({
     queryKey: ["editorial-board", edition.id],
     queryFn: () => fetchEditorialBoard(edition.id),
   });
+
+  // The production-batch selection: which of the editorially eligible
+  // subjects the operator has explicitly checked for the *next* batch.
+  // Starts empty on every mount/reload — opening or refreshing this page
+  // must never silently pre-arm every eligible subject.
+  const [selected, setSelected] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+
+  const eligibleGroups = useMemo(
+    () => board.data?.groups.filter(isEligibleSubject) ?? [],
+    [board.data],
+  );
+  const eligibleIds = useMemo(
+    () => new Set(eligibleGroups.map((group) => group.subject_id)),
+    [eligibleGroups],
+  );
+
+  // If TanStack Query hands back a fresher board, drop any selected id that
+  // is no longer eligible (or gone) — never add ids back in.
+  useEffect(() => {
+    setSelected((current) => {
+      const next = pruneToEligible(current, eligibleIds);
+      return next.size === current.size ? current : next;
+    });
+  }, [eligibleIds]);
+
+  const selectedSubjectIds = useMemo(
+    () => orderedSelection(eligibleGroups, selected),
+    [eligibleGroups, selected],
+  );
+
   const start = useMutation({
-    mutationFn: () => startEditionProduction(edition.id),
+    mutationFn: () => startEditionProduction(edition.id, selectedSubjectIds),
     onSuccess: (batch) => {
       queryClient.setQueryData(["batch", edition.id], batch);
       void queryClient.invalidateQueries({ queryKey: ["batch", edition.id] });
       void queryClient.invalidateQueries({ queryKey: ["edition", edition.id] });
     },
   });
-  const eligibleCount =
-    board.data?.groups.filter(isEligibleSubject).length ?? 0;
+
+  const eligibleCount = eligibleGroups.length;
+  const selectedCount = selectedSubjectIds.length;
 
   return (
     <>
       <EditorialBoard editionId={edition.id} />
+      <ProductionBatchSelector
+        groups={eligibleGroups}
+        selected={selected}
+        onToggle={(subjectId, checked) =>
+          setSelected((current) => {
+            const next = new Set(current);
+            if (checked) next.add(subjectId);
+            else next.delete(subjectId);
+            return next;
+          })
+        }
+        onSelectAll={() => setSelected(new Set(eligibleIds))}
+        onSelectNone={() => setSelected(new Set())}
+      />
       <section
         className="production-start-panel"
         aria-labelledby="production-start-heading"
@@ -164,9 +213,8 @@ function SelectionPhase({ edition }: { edition: Edition }) {
           {eligibleCount} article{eligibleCount > 1 ? "s" : ""} éligible
           {eligibleCount > 1 ? "s" : ""}
         </h2>
-        <p>
-          La sélection éditoriale détermine les sujets qui seront envoyés au lot
-          de production.
+        <p className="production-batch-count" aria-live="polite">
+          {`${selectedCount} sélectionné${selectedCount > 1 ? "s" : ""} pour ce lot`}
         </p>
         {start.error ? (
           <p className="error-message" role="alert">
@@ -175,12 +223,14 @@ function SelectionPhase({ edition }: { edition: Edition }) {
         ) : null}
         <button
           className="button"
-          disabled={start.isPending || eligibleCount === 0}
+          disabled={start.isPending || selectedCount === 0}
           onClick={() => start.mutate()}
         >
           {start.isPending
             ? "Lancement…"
-            : `Lancer la production de ${eligibleCount} article${eligibleCount > 1 ? "s" : ""}`}
+            : selectedCount > 0
+              ? `Lancer la production de ${selectedCount} article${selectedCount > 1 ? "s" : ""}`
+              : "Sélectionnez au moins un article"}
         </button>
       </section>
     </>

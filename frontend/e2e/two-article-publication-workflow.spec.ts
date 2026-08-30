@@ -22,6 +22,7 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
   let releaseReads = 0;
   const openedSubjects: string[] = [];
   const seenPaths: string[] = [];
+  let productionPostBody: unknown = null;
 
   const edition = () => ({
     id: editionId,
@@ -312,6 +313,7 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
       request.method() === "POST"
     ) {
       productionStarted = true;
+      productionPostBody = request.postDataJSON();
       await route.fulfill({
         status: 202,
         json: batchState("running", "queued", 0, "running"),
@@ -404,11 +406,31 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
 
   await page.goto(`/editions/${editionId}`);
   await expect(
+    page.getByRole("heading", { name: "2 articles éligibles" }),
+  ).toBeVisible();
+  await expect(page.getByText("0 sélectionné pour ce lot")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Sélectionnez au moins un article" }),
+  ).toBeDisabled();
+
+  // The real operator gesture: check A and B explicitly. Nothing is
+  // pre-armed by loading or reloading the page.
+  await page.getByRole("checkbox", { name: "Article A" }).check();
+  await page.getByRole("checkbox", { name: "Article B" }).check();
+  await expect(page.getByText("2 sélectionnés pour ce lot")).toBeVisible();
+
+  await expect(
     page.getByRole("button", { name: "Lancer la production de 2 articles" }),
   ).toBeEnabled();
   await page
     .getByRole("button", { name: "Lancer la production de 2 articles" })
     .click();
+
+  await expect
+    .poll(() => productionPostBody)
+    .toEqual({
+      subject_ids: [subjectA, subjectB],
+    });
 
   await expect(
     page.getByRole("heading", { name: "0 / 2 articles traités" }),

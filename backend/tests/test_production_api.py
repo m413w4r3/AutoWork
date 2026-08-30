@@ -682,6 +682,48 @@ async def test_start_edition_honours_subject_selection(api: AsyncClient, uow: _U
     assert produced == {subjects[0], subjects[2]}
 
 
+async def test_start_edition_with_more_eligible_than_selected_runs_only_the_chosen_subset(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    """Reproduces the real operator scenario: 4 editorially eligible articles
+    (A/B/C/D), request only B and D. The batch must contain exactly B and D
+    at positions 1 and 2; A and C must receive no run and no dispatched job."""
+    edition_id = uuid4()
+    subject_a, subject_b, subject_c, subject_d = (uuid4() for _ in range(4))
+    for name, subject_id in zip(
+        ("A", "B", "C", "D"),
+        (subject_a, subject_b, subject_c, subject_d),
+        strict=True,
+    ):
+        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+
+    response = await api.post(
+        f"/api/editions/{edition_id}/production",
+        json={"subject_ids": [str(subject_b), str(subject_d)]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["items"] == 2
+
+    items = sorted(
+        uow.edition_production_batch_items.items, key=lambda item: item.position
+    )
+    assert [item.subject_id for item in items] == [subject_b, subject_d]
+    assert [item.position for item in items] == [1, 2]
+
+    produced_subjects = {
+        run.subject_id for run in uow.subject_production_runs.items.values()
+    }
+    assert produced_subjects == {subject_b, subject_d}
+    assert subject_a not in produced_subjects
+    assert subject_c not in produced_subjects
+
+    jobs = production_app.state.job_service
+    sources_jobs = [job for job in jobs.submitted if job["kind"] == "production.subject.sources"]
+    assert len(sources_jobs) == 1
+    assert sources_jobs[0]["aggregate_id"] == subject_b
+
+
 async def test_start_edition_submits_sources_job_with_standard_retry_policy(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:

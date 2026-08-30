@@ -1356,6 +1356,54 @@ h1 {
   color: #55665c;
 }
 
+.production-batch-selector {
+  display: grid;
+  gap: 0.8rem;
+  padding: 1.5rem;
+  border: 1px solid #d4ded7;
+  border-radius: 1rem;
+  background: #fff;
+}
+
+.production-batch-selector__heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.production-batch-selector__heading h3 {
+  margin: 0;
+}
+
+.production-batch-selector__bulk-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.production-batch-selector__list {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.production-batch-selector__list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid #e2e8e4;
+  border-radius: 0.6rem;
+}
+
+.production-batch-count {
+  margin: 0;
+}
+
 .production-start-panel,
 .workflow-placeholder {
   display: grid;

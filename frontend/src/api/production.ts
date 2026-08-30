@@ -345,17 +345,30 @@ export async function getPublicationArtifact(
 // Edition production API
 
 /**
- * Start batch production for an edition.
+ * Start batch production for an edition, for exactly the given subjects.
  *
- * Without a subject list, every eligible subject of the edition is produced.
+ * `subjectIds` must be the operator's explicit production-batch selection —
+ * a subset of the editorially eligible subjects, in editorial board order.
+ * Editorial eligibility (`EditorialGroup.status === "selected"`) is a
+ * separate notion from this batch selection: subjects left unchecked are
+ * never sent here and keep whatever editorial decision they already have.
+ * An empty selection is refused client-side rather than silently falling
+ * back to "every eligible subject" — the caller must ask the operator to
+ * choose at least one subject.
  */
 export async function startEditionProduction(
   editionId: string,
+  subjectIds: readonly string[],
 ): Promise<BatchStatus> {
+  if (subjectIds.length === 0) {
+    throw new Error(
+      "startEditionProduction requires at least one selected subject",
+    );
+  }
   return request(`/api/editions/${editionId}/production`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ subject_ids: null }),
+    body: JSON.stringify({ subject_ids: subjectIds }),
   });
 }
 

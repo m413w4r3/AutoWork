@@ -40,8 +40,15 @@ du bridge, utiliser `make bridge-logs`.
 Ce scénario vise exactement deux articles sélectionnés, dans l’ordre
 éditorial A puis B.
 
-1. Dans l’interface sur `http://localhost:5173`, ouvrir ou créer une édition
-   en phase Sélection, sélectionner exactement deux sujets, puis noter :
+1. Dans l’interface sur `http://localhost:5173`, ouvrir une édition en phase
+   Sélection. L’édition peut contenir N articles éditorialement éligibles
+   (par exemple les 22 de la base locale actuelle) — ce n’est pas un
+   problème : le sélecteur du lot de production démarre toujours à
+   `0 sélectionné pour ce lot`, aucun article n’étant présélectionné à
+   l’ouverture ou au rechargement de la page.
+
+   Dans le sélecteur du lot de production, cocher exactement deux sujets A et
+   B (case à cocher, pas la sélection éditoriale), puis noter :
 
    ```text
    Edition ID = <edition-id>
@@ -49,8 +56,9 @@ Ce scénario vise exactement deux articles sélectionnés, dans l’ordre
    Subject B ID = <subject-b-id>
    ```
 
-   Vérifier dans le tableau que `selected_articles = 2` et que l’objectif est
-   `target_articles = 2`.
+   Vérifier que le sélecteur affiche `2 sélectionnés pour ce lot` et que le
+   bouton affiche `Lancer la production de 2 articles` — jamais le nombre
+   total d’articles éligibles.
 
 2. Cliquer sur `Lancer la production de 2 articles`. Le premier retour doit
    afficher simultanément :

@@ -167,7 +167,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-it("lance tous les sujets éligibles et invalide Edition après le POST", async () => {
+it("exige de cocher le sujet éligible avant de lancer, puis invalide Edition après le POST", async () => {
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = urlOf(input);
     if (url.includes("/editorial-groups")) return Response.json(board);
@@ -187,13 +187,22 @@ it("lance tous les sujets éligibles et invalide Edition après le POST", async 
     </QueryClientProvider>,
   );
 
+  const disabledStart = await screen.findByRole("button", {
+    name: "Sélectionnez au moins un article",
+  });
+  expect(disabledStart).toBeDisabled();
+  expect(screen.getByText("0 sélectionné pour ce lot")).toBeInTheDocument();
+
+  const checkbox = await screen.findByRole("checkbox", {
+    name: "Campagne A",
+  });
+  expect(checkbox).not.toBeChecked();
+  await user.click(checkbox);
+
   const start = await screen.findByRole("button", {
     name: "Lancer la production de 1 article",
   });
-  expect(
-    screen.queryByRole("button", { name: /traiter/i }),
-  ).not.toBeInTheDocument();
-  expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+  expect(screen.getByText("1 sélectionné pour ce lot")).toBeInTheDocument();
   await user.click(start);
 
   await vi.waitFor(() => {
@@ -202,7 +211,7 @@ it("lance tous les sujets éligibles et invalide Edition après le POST", async 
     });
   });
   const post = fetchMock.mock.calls.find(([, init]) => init?.method === "POST");
-  expect(post?.[1]?.body).toBe(JSON.stringify({ subject_ids: null }));
+  expect(post?.[1]?.body).toBe(JSON.stringify({ subject_ids: ["subject-1"] }));
 });
 
 describe("rendu strict des états Edition", () => {
@@ -300,7 +309,7 @@ describe("rendu strict des états Edition", () => {
     await waitFor(() => expect(openSelection).toBeEnabled());
   });
 
-  it("SELECTION affiche le board et un seul lancement de production", async () => {
+  it("SELECTION affiche le board et un seul sélecteur de lot de production, non pré-armé", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -314,13 +323,14 @@ describe("rendu strict des états Edition", () => {
     );
     renderWorkflow(editionWith("selection", ["production"]));
     expect(
-      await screen.findByRole("button", {
-        name: "Lancer la production de 1 article",
-      }),
+      await screen.findByRole("heading", { name: "1 article éligible" }),
     ).toBeInTheDocument();
+    expect(screen.getByText("0 sélectionné pour ce lot")).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /sélectionner|traiter/i }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "Sélectionnez au moins un article" }),
+    ).toBeDisabled();
+    expect(screen.getAllByRole("checkbox")).toHaveLength(1);
+    expect(screen.getByRole("checkbox")).not.toBeChecked();
   });
 
   it("PRODUCTION affiche uniquement la console métier", async () => {
@@ -383,5 +393,160 @@ describe("rendu strict des états Edition", () => {
       await screen.findByRole("heading", { name: "Édition archivée" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+});
+
+describe("sélecteur du lot de production", () => {
+  function groupOf(id: string, title: string, subjectId: string) {
+    return {
+      id,
+      edition_id: edition.id,
+      title,
+      outcome: "new_subject" as const,
+      status: "selected" as const,
+      subject_id: subjectId,
+      candidates: [],
+      score: {
+        impact: 0,
+        novelty: 0,
+        technical_depth: 0,
+        hunting_potential: 0,
+        actionability: 0,
+        source_quality: 0,
+        total: 0,
+        justifications: {},
+      },
+      source_relationship_status: "verified" as const,
+      needs_source_verification: false,
+      needs_source_expansion: false,
+      grouping_confidence: "high" as const,
+      grouping_justification: "",
+      historical_comparison: null,
+      version: 1,
+    };
+  }
+
+  function boardOf(groups: ReturnType<typeof groupOf>[]) {
+    return {
+      groups,
+      selected_articles: groups.length,
+      ignored: 0,
+      undecided: 0,
+      target_articles: groups.length,
+      automatic_selection: false as const,
+    };
+  }
+
+  const groupA = groupOf("group-a", "Article A", "subject-a");
+  const groupB = groupOf("group-b", "Article B", "subject-b");
+  const groupC = groupOf("group-c", "Article C", "subject-c");
+  const boardABC = boardOf([groupA, groupB, groupC]);
+
+  it("22 articles éligibles démarrent avec zéro présélectionné", async () => {
+    const groups = Array.from({ length: 22 }, (_, index) =>
+      groupOf(`group-${index}`, `Article ${index}`, `subject-${index}`),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(Response.json(boardOf(groups))),
+    );
+    renderWorkflow(editionWith("selection"));
+
+    expect(
+      await screen.findByRole("heading", { name: "22 articles éligibles" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("0 sélectionné pour ce lot")).toBeInTheDocument();
+    const checkboxes = screen.getAllByRole("checkbox");
+    expect(checkboxes).toHaveLength(22);
+    for (const checkbox of checkboxes) expect(checkbox).not.toBeChecked();
+    expect(
+      screen.getByRole("button", { name: "Sélectionnez au moins un article" }),
+    ).toBeDisabled();
+  });
+
+  it("cocher B puis A construit un payload dans l’ordre éditorial A, B", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = urlOf(input);
+      if (url.includes("/editorial-groups")) return Response.json(boardABC);
+      if (init?.method === "POST") return Response.json(batch);
+      throw new Error(`Unexpected GET ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderWorkflow(editionWith("selection"));
+
+    await screen.findByRole("heading", { name: "3 articles éligibles" });
+    await user.click(screen.getByRole("checkbox", { name: "Article B" }));
+    await user.click(screen.getByRole("checkbox", { name: "Article A" }));
+
+    expect(screen.getByText("2 sélectionnés pour ce lot")).toBeInTheDocument();
+    const start = screen.getByRole("button", {
+      name: "Lancer la production de 2 articles",
+    });
+    await user.click(start);
+
+    await vi.waitFor(() => {
+      const post = fetchMock.mock.calls.find(
+        ([, init]) => init?.method === "POST",
+      );
+      expect(post?.[1]?.body).toBe(
+        JSON.stringify({ subject_ids: ["subject-a", "subject-b"] }),
+      );
+    });
+
+    // Editorial decisions of the untouched article C are never mutated: no
+    // POST ever targets the editorial-groups decision/merge/split routes.
+    const editorialMutations = fetchMock.mock.calls.filter(
+      ([input, init]) =>
+        init?.method === "POST" && urlOf(input).includes("/editorial-groups"),
+    );
+    expect(editorialMutations).toHaveLength(0);
+  });
+
+  it("désélectionner B ramène le compteur à 1", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(boardABC)));
+    const user = userEvent.setup();
+    renderWorkflow(editionWith("selection"));
+
+    await screen.findByRole("heading", { name: "3 articles éligibles" });
+    await user.click(screen.getByRole("checkbox", { name: "Article A" }));
+    await user.click(screen.getByRole("checkbox", { name: "Article B" }));
+    expect(screen.getByText("2 sélectionnés pour ce lot")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: "Article B" }));
+    expect(screen.getByText("1 sélectionné pour ce lot")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Lancer la production de 1 article" }),
+    ).toBeInTheDocument();
+  });
+
+  it("un article devenu non éligible est retiré automatiquement de la sélection", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(boardABC)));
+    const user = userEvent.setup();
+    const client = renderWorkflow(editionWith("selection"));
+
+    await screen.findByRole("heading", { name: "3 articles éligibles" });
+    await user.click(screen.getByRole("checkbox", { name: "Article A" }));
+    await user.click(screen.getByRole("checkbox", { name: "Article B" }));
+    expect(screen.getByText("2 sélectionnés pour ce lot")).toBeInTheDocument();
+
+    // The board refreshes and B is no longer an editorially selected
+    // article (still present, but proposed again) — the batch selection
+    // must drop it without ever re-adding it silently.
+    client.setQueryData(["editorial-board", edition.id], {
+      ...boardABC,
+      groups: [groupA, { ...groupB, status: "proposed" as const }, groupC],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("2 articles éligibles")).toBeInTheDocument();
+      expect(screen.getByText("1 sélectionné pour ce lot")).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByRole("checkbox", { name: "Article B" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Lancer la production de 1 article" }),
+    ).toBeInTheDocument();
   });
 });
