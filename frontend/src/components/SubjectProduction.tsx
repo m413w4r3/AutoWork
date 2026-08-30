@@ -242,6 +242,7 @@ export function SubjectProduction({
             status={stages[stage]?.status || "pending"}
             stageNumber={i + 1}
             isActive={status.current_stage === stage}
+            reused={stages[stage]?.reused}
             detail={stageDetail(stage, stages[stage])}
           />
         ))}
@@ -410,6 +411,25 @@ export function SubjectProduction({
             <p>Terminé : {new Date(status.finished_at).toLocaleString()}</p>
           )}
           <p>Tentative pipeline : {status.pipeline_generation}</p>
+          {stageList
+            .filter((stage) => stages[stage]?.reused)
+            .map((stage) => {
+              const entry = stages[stage];
+              return (
+                <p key={stage}>
+                  {STAGE_LABELS[stage]} : réutilisée depuis un calcul précédent
+                  {entry?.reused_from_artifact_id
+                    ? ` (${entry.reused_from_artifact_id})`
+                    : ""}
+                  {entry?.reused_from_created_at
+                    ? ` · calcul original : ${new Date(entry.reused_from_created_at).toLocaleString()}`
+                    : ""}
+                  {entry?.research_date
+                    ? ` · research_date : ${entry.research_date}`
+                    : ""}
+                </p>
+              );
+            })}
         </div>
       </details>
     </section>

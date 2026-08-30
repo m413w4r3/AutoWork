@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from cti_app.domain.production import (
@@ -28,6 +29,7 @@ def build_stage_statuses(
     artifacts: dict[str, ProductionArtifact],
     *,
     archived_sources: int = 0,
+    research_date: date | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Status of each stage, derived from the run's position and its artifacts.
 
@@ -65,6 +67,16 @@ def build_stage_statuses(
             "version": artifact.version if artifact else None,
             "error_code": None,
             "error_message": None,
+            "reused": bool(artifact and artifact.reused_from_artifact_id is not None),
+            "reused_from_artifact_id": (
+                str(artifact.reused_from_artifact_id)
+                if artifact and artifact.reused_from_artifact_id is not None
+                else None
+            ),
+            "reused_from_created_at": (
+                artifact.metadata.get("reused_from_created_at") if artifact else None
+            ),
+            "research_date": research_date.isoformat() if research_date else None,
         }
         if index == current_index and run.status in {
             SubjectProductionStatus.NEEDS_REVIEW,

@@ -155,6 +155,47 @@ async def capture_production_input_snapshot(
     )
 
 
+async def capture_snapshot_for_new_run(
+    uow: ProductionUnitOfWork,
+    *,
+    run: SubjectProductionRun,
+) -> ProductionInputSnapshot:
+    """Capture current inputs, preserving the prior research boundary if safe."""
+    if run.research_date is None:
+        raise ValueError("production_run_research_date_missing")
+    current = await capture_production_input_snapshot(
+        uow,
+        production_run_id=run.id,
+        subject_id=run.subject_id,
+        edition_id=run.edition_id,
+        research_date=run.research_date,
+        captured_at=run.created_at,
+    )
+
+    get_latest = getattr(
+        uow.subject_production_runs, "get_latest_terminal_for_edition_subject", None
+    )
+    snapshots = getattr(uow, "production_input_snapshots", None)
+    if get_latest is None or snapshots is None:
+        return current
+    previous_run = await get_latest(run.edition_id, run.subject_id)
+    if previous_run is None:
+        return current
+    previous = await snapshots.get_by_run(previous_run.id)
+    if previous is None or previous.reuse_basis_hash != current.reuse_basis_hash:
+        return current
+
+    run.research_date = previous.research_date
+    return await capture_production_input_snapshot(
+        uow,
+        production_run_id=run.id,
+        subject_id=run.subject_id,
+        edition_id=run.edition_id,
+        research_date=run.research_date,
+        captured_at=run.created_at,
+    )
+
+
 class SubjectProductionService:
     def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
@@ -198,18 +239,14 @@ class SubjectProductionService:
                     edition_id=edition_id,
                     run_number=next_run_number,
                 )
-                await uow.subject_production_runs.add(run)
                 snapshot_repository = getattr(uow, "production_input_snapshots", None)
-                if snapshot_repository is not None:
-                    assert run.research_date is not None
-                    snapshot = await capture_production_input_snapshot(
-                        uow,
-                        production_run_id=run.id,
-                        subject_id=subject_id,
-                        edition_id=edition_id,
-                        research_date=run.research_date,
-                        captured_at=run.created_at,
-                    )
+                snapshot = (
+                    await capture_snapshot_for_new_run(uow, run=run)
+                    if snapshot_repository is not None
+                    else None
+                )
+                await uow.subject_production_runs.add(run)
+                if snapshot_repository is not None and snapshot is not None:
                     await snapshot_repository.add(snapshot)
                 await uow.commit()
                 return run, True
@@ -363,6 +400,7 @@ class SubjectProductionService:
         stage: SubjectProductionStage,
         *,
         expected_edition_id: UUID | None = None,
+        force_recompute: bool = True,
     ) -> SubjectProductionRetryResult:
         """Shared transaction core for manual and automatic business retries."""
         run = await uow.subject_production_runs.get_for_update(run_id)
@@ -398,7 +436,11 @@ class SubjectProductionService:
         previous_status = run.status
         previous_stage = run.current_stage
         old_generation = run.pipeline_generation
-        run.retry_from_stage(stage, now=datetime.now(UTC))
+        run.retry_from_stage(
+            stage,
+            now=datetime.now(UTC),
+            force_recompute=force_recompute,
+        )
         artifacts = getattr(uow, "production_artifacts", None)
         staled = (
             await artifacts.mark_from_stage_stale(run_id, stage.value)
@@ -508,24 +550,28 @@ class EditionProductionService:
                     SubjectProductionStatus.RUNNING,
                 ):
                     raise ValueError("subject_production_run_active")
+                allocator = getattr(uow.subject_production_runs, "allocate_next_run_number", None)
+                if allocator is not None:
+                    run_number = await allocator(subject_id)
+                else:
+                    all_runs = await uow.subject_production_runs.list_for_edition(edition_id)
+                    run_number = 1 + sum(1 for item in all_runs if item.subject_id == subject_id)
                 run = SubjectProductionRun(
                     subject_id=subject_id,
                     edition_id=edition_id,
+                    run_number=run_number,
                     research_date=created_at.date(),
                     created_at=created_at,
                     updated_at=created_at,
                 )
-                await uow.subject_production_runs.add(run)
                 snapshot_repository = getattr(uow, "production_input_snapshots", None)
-                if snapshot_repository is not None:
-                    snapshot = await capture_production_input_snapshot(
-                        uow,
-                        production_run_id=run.id,
-                        subject_id=subject_id,
-                        edition_id=edition_id,
-                        research_date=created_at.date(),
-                        captured_at=created_at,
-                    )
+                snapshot = (
+                    await capture_snapshot_for_new_run(uow, run=run)
+                    if snapshot_repository is not None
+                    else None
+                )
+                await uow.subject_production_runs.add(run)
+                if snapshot_repository is not None and snapshot is not None:
                     await snapshot_repository.add(snapshot)
 
                 item = EditionProductionBatchItem(
@@ -689,7 +735,7 @@ class EditionProductionService:
             try:
                 retried = await SubjectProductionService(
                     self._uow_factory
-                )._retry_from_stage_in_uow(uow, run.id, run.current_stage)
+                )._retry_from_stage_in_uow(uow, run.id, run.current_stage, force_recompute=False)
             except ValueError as exc:
                 # A policy-approved error can still lack the prerequisite
                 # needed for its stage. It is not an automatic recovery case

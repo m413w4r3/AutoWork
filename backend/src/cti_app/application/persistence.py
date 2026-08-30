@@ -66,6 +66,7 @@ from cti_app.domain.production import (
     EditionProductionBatchItem,
     ProductionArtifact,
     ProductionInputSnapshot,
+    ProductionReuseInvalidation,
     SampleAcquisitionAttempt,
     SubjectProductionRun,
 )
@@ -629,6 +630,7 @@ class UnitOfWork(Protocol):
     subject_production_runs: SubjectProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
+    production_reuse_invalidations: ProductionReuseInvalidationRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
     batch_status_read_model: BatchStatusReadRepository
@@ -733,6 +735,10 @@ class SubjectProductionRunRepository(Protocol):
 
     async def get_current_for_subject(self, subject_id: UUID) -> SubjectProductionRun | None: ...
 
+    async def get_latest_terminal_for_edition_subject(
+        self, edition_id: UUID, subject_id: UUID
+    ) -> SubjectProductionRun | None: ...
+
     async def lock_creation_for_subject(self, subject_id: UUID) -> None: ...
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectProductionRun]: ...
@@ -747,6 +753,16 @@ class ProductionArtifactRepository(Protocol):
 
     async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None: ...
 
+    async def find_reusable(
+        self,
+        *,
+        edition_id: UUID,
+        subject_id: UUID,
+        stage: str,
+        input_hash: str,
+        not_before: datetime | None = None,
+    ) -> ProductionArtifact | None: ...
+
     async def list_for_run(self, run_id: UUID) -> Sequence[ProductionArtifact]: ...
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None: ...
@@ -760,6 +776,14 @@ class ProductionInputSnapshotRepository(Protocol):
     async def get(self, snapshot_id: UUID) -> ProductionInputSnapshot | None: ...
 
     async def get_by_run(self, production_run_id: UUID) -> ProductionInputSnapshot | None: ...
+
+
+class ProductionReuseInvalidationRepository(Protocol):
+    async def add(self, invalidation: ProductionReuseInvalidation) -> None: ...
+
+    async def list_for_subject(
+        self, edition_id: UUID, subject_id: UUID
+    ) -> Sequence[ProductionReuseInvalidation]: ...
 
 
 class AnalystInvestigationRepository(Protocol):
@@ -810,6 +834,7 @@ class ProductionUnitOfWork(Protocol):
     subject_production_runs: SubjectProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
+    production_reuse_invalidations: ProductionReuseInvalidationRepository
     analyst_investigations: AnalystInvestigationRepository
     analyst_decisions: AnalystDecisionRepository
     analyst_input_packs: AnalystInputPackRepository

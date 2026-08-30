@@ -39,6 +39,7 @@ from cti_app.domain.editorial import EditorialGroup, EditorialGroupStatus
 from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionBatchStatus,
+    ProductionReuseInvalidation,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -66,11 +67,19 @@ class RetryProductionStageRequest(BaseModel):
     stage: SubjectProductionStage
 
 
+class ProductionReuseInvalidationRequest(BaseModel):
+    from_stage: SubjectProductionStage
+
+
 class StageStatus(BaseModel):
     status: str  # pending, running, succeeded, needs_review, failed
     version: int | None = None
     error_code: str | None = None
     error_message: str | None = None
+    reused: bool = False
+    reused_from_artifact_id: UUID | None = None
+    reused_from_created_at: str | None = None
+    research_date: str | None = None
 
 
 class ProductionStatus(BaseModel):
@@ -519,7 +528,12 @@ async def get_subject_production(
         collections = await uow.source_collections.list_for_subject(subject_id)
         archived_sources = sum(1 for c in collections if c.state in _ARCHIVED_STATES)
 
-        stages = build_stage_statuses(run, artifacts_by_stage, archived_sources=archived_sources)
+        stages = build_stage_statuses(
+            run,
+            artifacts_by_stage,
+            archived_sources=archived_sources,
+            research_date=snapshot.research_date if snapshot else run.research_date,
+        )
         completed_stages = completed_stage_count(stages)
 
         return ProductionStatus(
@@ -610,6 +624,64 @@ async def retry_production_stage(
     return await _retry_production_run(request, current_run_id, payload, await _actor_id(request))
 
 
+@router.post("/subjects/{subject_id}/production/reuse/invalidate")
+async def invalidate_production_reuse(
+    subject_id: UUID,
+    payload: ProductionReuseInvalidationRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Prevent future cross-run reuse from one costly stage onward."""
+    if payload.from_stage not in {
+        SubjectProductionStage.REFERENCES,
+        SubjectProductionStage.EXTRACTION,
+        SubjectProductionStage.SYNTHESIS,
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "reuse_invalidation_stage_not_allowed"},
+        )
+
+    actor_id = await _actor_id(request)
+    uow_factory, _, _ = _runtime(request)
+    async with uow_factory() as uow:
+        lock_creation = getattr(uow.subject_production_runs, "lock_creation_for_subject", None)
+        if lock_creation is not None:
+            await lock_creation(subject_id)
+        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="No production run found")
+        if run.status in {SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING}:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "reuse_invalidation_run_active"},
+            )
+        repository = getattr(uow, "production_reuse_invalidations", None)
+        if repository is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "production_reuse_invalidation_unavailable"},
+            )
+        occurred_at = datetime.now(UTC)
+        invalidation = ProductionReuseInvalidation(
+            edition_id=run.edition_id,
+            subject_id=subject_id,
+            from_stage=payload.from_stage,
+            actor_id=actor_id,
+            correlation_id=get_correlation_id(),
+            occurred_at=occurred_at,
+        )
+        await repository.add(invalidation)
+        await uow.commit()
+
+    return {
+        "action": "production_reuse_invalidated",
+        "subject_id": str(subject_id),
+        "edition_id": str(run.edition_id),
+        "from_stage": payload.from_stage.value,
+        "occurred_at": occurred_at.isoformat(),
+    }
+
+
 @router.post("/production/runs/{run_id}/retry")
 async def retry_production_run(
     run_id: UUID,
@@ -698,6 +770,13 @@ async def _artifact_view_for_run(
             "stage": artifact.stage.value,
             "version": artifact.version,
             "status": artifact.status.value,
+            "reused": artifact.reused_from_artifact_id is not None,
+            "reused_from_artifact_id": (
+                str(artifact.reused_from_artifact_id)
+                if artifact.reused_from_artifact_id is not None
+                else None
+            ),
+            "reused_from_created_at": artifact.metadata.get("reused_from_created_at"),
             "metadata": artifact.metadata,
             "rendered_content": rendered,
             "canonical_content": canonical,

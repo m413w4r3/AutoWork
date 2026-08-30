@@ -38,6 +38,7 @@ from cti_app.application.persistence import (
     ModelRunRepository,
     ProductionArtifactRepository,
     ProductionInputSnapshotRepository,
+    ProductionReuseInvalidationRepository,
     ProvenanceRepository,
     PublicationManifestEntryRepository,
     PublicationManifestExclusionRepository,
@@ -131,6 +132,7 @@ from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemyEditionProductionBatchRepository,
     SqlAlchemyProductionArtifactRepository,
     SqlAlchemyProductionInputSnapshotRepository,
+    SqlAlchemyProductionReuseInvalidationRepository,
     SqlAlchemySampleAcquisitionAttemptRepository,
     SqlAlchemySubjectProductionRunRepository,
 )
@@ -183,6 +185,7 @@ class SqlAlchemyUnitOfWork:
     subject_production_runs: SubjectProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
+    production_reuse_invalidations: ProductionReuseInvalidationRepository
     analyst_investigations: AnalystInvestigationRepository
     analyst_decisions: AnalystDecisionRepository
     analyst_input_packs: AnalystInputPackRepository
@@ -253,6 +256,9 @@ class SqlAlchemyUnitOfWork:
         self.subject_production_runs = SqlAlchemySubjectProductionRunRepository(self._session)
         self.production_input_snapshots = SqlAlchemyProductionInputSnapshotRepository(self._session)
         self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)
+        self.production_reuse_invalidations = SqlAlchemyProductionReuseInvalidationRepository(
+            self._session
+        )
         self.analyst_investigations = SqlAlchemyAnalystInvestigationRepository(self._session)
         self.analyst_decisions = SqlAlchemyAnalystDecisionRepository(self._session)
         self.analyst_input_packs = SqlAlchemyAnalystInputPackRepository(self._session)

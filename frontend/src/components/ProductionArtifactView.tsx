@@ -372,6 +372,17 @@ export function ProductionArtifactView({
               {STATUS_LABELS[artifact.status] ?? artifact.status}
             </span>
           </p>
+          {artifact.reused ? (
+            <p className="production-reuse-notice">
+              Réutilisé depuis un calcul précédent
+              {artifact.reused_from_artifact_id
+                ? ` · artifact source : ${artifact.reused_from_artifact_id}`
+                : ""}
+              {artifact.reused_from_created_at
+                ? ` · calcul original : ${new Date(artifact.reused_from_created_at).toLocaleString()}`
+                : ""}
+            </p>
+          ) : null}
         </div>
         {onClose && (
           <button className="button button--secondary" onClick={onClose}>

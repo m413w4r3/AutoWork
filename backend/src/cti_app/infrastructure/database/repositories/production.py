@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -20,6 +21,7 @@ from cti_app.domain.production import (
     ProductionBatchStatus,
     ProductionInputSnapshot,
     ProductionInputSource,
+    ProductionReuseInvalidation,
     SampleAcquisitionAttempt,
     SampleAcquisitionOutcome,
     SampleAcquisitionReason,
@@ -36,6 +38,7 @@ from cti_app.infrastructure.database.models.production import (
     EditionProductionBatchRow,
     ProductionArtifactRow,
     ProductionInputSnapshotRow,
+    ProductionReuseInvalidationRow,
     SampleAcquisitionAttemptRow,
     SubjectProductionRunRow,
 )
@@ -196,6 +199,11 @@ class SqlAlchemySubjectProductionRunRepository:
             run_number=run.run_number,
             pipeline_generation=run.pipeline_generation,
             research_date=run.research_date,
+            force_recompute_from_stage=(
+                run.force_recompute_from_stage.value
+                if run.force_recompute_from_stage is not None
+                else None
+            ),
             error_code=run.error_code,
             error_message=run.error_message,
             error_details=run.error_details,
@@ -242,6 +250,11 @@ class SqlAlchemySubjectProductionRunRepository:
                 synthesis_conversation_id=run.synthesis_conversation_id,
                 pipeline_generation=run.pipeline_generation,
                 research_date=run.research_date,
+                force_recompute_from_stage=(
+                    run.force_recompute_from_stage.value
+                    if run.force_recompute_from_stage is not None
+                    else None
+                ),
                 error_code=run.error_code,
                 error_message=run.error_message,
                 error_details=run.error_details,
@@ -257,6 +270,30 @@ class SqlAlchemySubjectProductionRunRepository:
         query = (
             select(SubjectProductionRunRow)
             .where(SubjectProductionRunRow.subject_id == subject_id)
+            .order_by(SubjectProductionRunRow.created_at.desc(), SubjectProductionRunRow.id.desc())
+            .limit(1)
+        )
+        result = await self._session.execute(query)
+        row = result.scalar_one_or_none()
+        return _subject_production_run_from_row(row) if row else None
+
+    async def get_latest_terminal_for_edition_subject(
+        self, edition_id: UUID, subject_id: UUID
+    ) -> SubjectProductionRun | None:
+        query = (
+            select(SubjectProductionRunRow)
+            .where(
+                (SubjectProductionRunRow.edition_id == edition_id)
+                & (SubjectProductionRunRow.subject_id == subject_id)
+                & SubjectProductionRunRow.status.in_(
+                    [
+                        SubjectProductionStatus.READY.value,
+                        SubjectProductionStatus.NEEDS_REVIEW.value,
+                        SubjectProductionStatus.FAILED.value,
+                        SubjectProductionStatus.CANCELLED.value,
+                    ]
+                )
+            )
             .order_by(SubjectProductionRunRow.created_at.desc(), SubjectProductionRunRow.id.desc())
             .limit(1)
         )
@@ -310,6 +347,7 @@ class SqlAlchemyProductionInputSnapshotRepository:
                 research_date=snapshot.research_date,
                 core_sources=[source.payload() for source in snapshot.core_sources],
                 input_hash=snapshot.input_hash,
+                reuse_basis_hash=snapshot.reuse_basis_hash,
                 captured_at=snapshot.captured_at,
             )
         )
@@ -346,6 +384,7 @@ class SqlAlchemyProductionArtifactRepository:
             rendered_blob_id=artifact.rendered_blob_id,
             model_run_id=artifact.model_run_id,
             conversation_turn_id=artifact.conversation_turn_id,
+            reused_from_artifact_id=artifact.reused_from_artifact_id,
             artifact_metadata=artifact.metadata,
             created_at=artifact.created_at,
         )
@@ -369,6 +408,55 @@ class SqlAlchemyProductionArtifactRepository:
             .order_by(ProductionArtifactRow.version.desc())
             .limit(1)
         )
+        result = await self._session.execute(query)
+        row = result.scalar_one_or_none()
+        return _production_artifact_from_row(row) if row else None
+
+    async def find_reusable(
+        self,
+        *,
+        edition_id: UUID,
+        subject_id: UUID,
+        stage: str,
+        input_hash: str,
+        not_before: datetime | None = None,
+    ) -> ProductionArtifact | None:
+        required_blob = {
+            ProductionArtifactStage.REFERENCES.value: ProductionArtifactRow.canonical_blob_id,
+            ProductionArtifactStage.EXTRACTION.value: ProductionArtifactRow.canonical_blob_id,
+            ProductionArtifactStage.SYNTHESIS.value: ProductionArtifactRow.rendered_blob_id,
+        }.get(stage)
+        if required_blob is None:
+            return None
+
+        query = (
+            select(ProductionArtifactRow)
+            .join(
+                SubjectProductionRunRow,
+                SubjectProductionRunRow.id == ProductionArtifactRow.production_run_id,
+            )
+            .where(
+                (SubjectProductionRunRow.edition_id == edition_id)
+                & (SubjectProductionRunRow.subject_id == subject_id)
+                & (ProductionArtifactRow.subject_id == subject_id)
+                & SubjectProductionRunRow.status.in_(
+                    [
+                        SubjectProductionStatus.READY.value,
+                        SubjectProductionStatus.NEEDS_REVIEW.value,
+                        SubjectProductionStatus.FAILED.value,
+                        SubjectProductionStatus.CANCELLED.value,
+                    ]
+                )
+                & (ProductionArtifactRow.stage == stage)
+                & (ProductionArtifactRow.input_hash == input_hash)
+                & (ProductionArtifactRow.status == ProductionArtifactStatus.VERIFIED.value)
+                & required_blob.is_not(None)
+            )
+            .order_by(ProductionArtifactRow.created_at.desc(), ProductionArtifactRow.id.desc())
+            .limit(1)
+        )
+        if not_before is not None:
+            query = query.where(ProductionArtifactRow.created_at > not_before)
         result = await self._session.execute(query)
         row = result.scalar_one_or_none()
         return _production_artifact_from_row(row) if row else None
@@ -434,6 +522,39 @@ class SqlAlchemyProductionArtifactRepository:
             .values(status=ProductionArtifactStatus.STALE.value)
         )
         return affected
+
+
+class SqlAlchemyProductionReuseInvalidationRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, invalidation: ProductionReuseInvalidation) -> None:
+        self._session.add(
+            ProductionReuseInvalidationRow(
+                id=invalidation.id,
+                edition_id=invalidation.edition_id,
+                subject_id=invalidation.subject_id,
+                from_stage=invalidation.from_stage.value,
+                actor_id=invalidation.actor_id,
+                correlation_id=invalidation.correlation_id,
+                occurred_at=invalidation.occurred_at,
+            )
+        )
+        await self._session.flush()
+
+    async def list_for_subject(
+        self, edition_id: UUID, subject_id: UUID
+    ) -> Sequence[ProductionReuseInvalidation]:
+        query = (
+            select(ProductionReuseInvalidationRow)
+            .where(
+                (ProductionReuseInvalidationRow.edition_id == edition_id)
+                & (ProductionReuseInvalidationRow.subject_id == subject_id)
+            )
+            .order_by(ProductionReuseInvalidationRow.occurred_at)
+        )
+        result = await self._session.execute(query)
+        return [_production_reuse_invalidation_from_row(row) for row in result.scalars()]
 
 
 class SqlAlchemyEditionProductionBatchRepository:
@@ -631,6 +752,11 @@ def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectPro
         run_number=row.run_number,
         pipeline_generation=row.pipeline_generation,
         research_date=row.research_date,
+        force_recompute_from_stage=(
+            SubjectProductionStage(row.force_recompute_from_stage)
+            if row.force_recompute_from_stage is not None
+            else None
+        ),
         error_code=row.error_code,
         error_message=row.error_message,
         error_details=row.error_details,
@@ -760,6 +886,7 @@ def _production_artifact_from_row(row: ProductionArtifactRow) -> ProductionArtif
         rendered_blob_id=row.rendered_blob_id,
         model_run_id=row.model_run_id,
         conversation_turn_id=row.conversation_turn_id,
+        reused_from_artifact_id=row.reused_from_artifact_id,
         metadata=row.artifact_metadata,
         created_at=row.created_at,
     )
@@ -819,5 +946,20 @@ def _production_input_snapshot_from_row(
         research_date=row.research_date,
         core_sources=tuple(ProductionInputSource.from_payload(item) for item in row.core_sources),
         input_hash=row.input_hash,
+        reuse_basis_hash=row.reuse_basis_hash,
         captured_at=row.captured_at,
+    )
+
+
+def _production_reuse_invalidation_from_row(
+    row: ProductionReuseInvalidationRow,
+) -> ProductionReuseInvalidation:
+    return ProductionReuseInvalidation(
+        id=row.id,
+        edition_id=row.edition_id,
+        subject_id=row.subject_id,
+        from_stage=SubjectProductionStage(row.from_stage),
+        actor_id=row.actor_id,
+        correlation_id=row.correlation_id,
+        occurred_at=row.occurred_at,
     )

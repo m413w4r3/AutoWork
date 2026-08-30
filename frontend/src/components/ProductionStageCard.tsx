@@ -3,6 +3,7 @@ interface ProductionStageCardProps {
   status: string;
   stageNumber: number;
   isActive?: boolean;
+  reused?: boolean;
   /** Short count line, e.g. "5 archivée(s)". */
   detail?: string;
 }
@@ -40,11 +41,12 @@ export function ProductionStageCard({
   status,
   stageNumber,
   isActive,
+  reused = false,
   detail,
 }: ProductionStageCardProps) {
   return (
     <li
-      className={`production-stage is-${status}${isActive ? " is-active" : ""}`}
+      className={`production-stage is-${status}${reused ? " is-reused" : ""}${isActive ? " is-active" : ""}`}
     >
       <span className="production-stage__icon" aria-hidden="true">
         {STATUS_ICONS[status] ?? "○"}
@@ -53,7 +55,8 @@ export function ProductionStageCard({
         {stageNumber}. {STAGE_NAMES[stage] ?? stage}
       </span>
       <span className="production-stage__status">
-        {STATUS_LABELS[status] ?? status}
+        {reused ? "réutilisée" : (STATUS_LABELS[status] ?? status)}
+        {reused ? " · depuis un calcul précédent" : null}
         {detail ? ` · ${detail}` : ""}
       </span>
     </li>

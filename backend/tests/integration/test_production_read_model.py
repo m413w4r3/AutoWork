@@ -180,6 +180,7 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
             research_date=date(2026, 8, 29),
             core_sources=[],
             input_hash="a" * 64,
+            reuse_basis_hash="b" * 64,
             captured_at=now,
         )
         for run_id, subject_id, group_id, title in (

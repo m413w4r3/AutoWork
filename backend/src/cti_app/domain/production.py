@@ -126,6 +126,7 @@ class ProductionInputSnapshot:
     research_date: date
     core_sources: tuple[ProductionInputSource, ...] = ()
     input_hash: str = ""
+    reuse_basis_hash: str = ""
     id: UUID = field(default_factory=uuid4)
     captured_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -153,12 +154,16 @@ class ProductionInputSnapshot:
             raise ValueError("A production input snapshot requires a subject title")
         if self.captured_at.tzinfo is None or self.captured_at.utcoffset() is None:
             raise ValueError("captured_at must be timezone-aware")
+        computed_basis = self.compute_reuse_basis_hash()
+        if self.reuse_basis_hash and self.reuse_basis_hash != computed_basis:
+            raise ValueError("reuse_basis_hash does not match the functional snapshot payload")
+        object.__setattr__(self, "reuse_basis_hash", computed_basis)
         computed = self.compute_input_hash()
         if self.input_hash and self.input_hash != computed:
             raise ValueError("input_hash does not match the functional snapshot payload")
         object.__setattr__(self, "input_hash", computed)
 
-    def functional_payload(self) -> dict[str, object]:
+    def reuse_basis_payload(self) -> dict[str, object]:
         return {
             "subject_id": str(self.subject_id),
             "edition_id": str(self.edition_id),
@@ -169,9 +174,22 @@ class ProductionInputSnapshot:
             "actor_or_campaign": self.actor_or_campaign,
             "period_start": self.period_start.isoformat(),
             "period_end": self.period_end.isoformat(),
-            "research_date": self.research_date.isoformat(),
             "core_sources": [source.payload() for source in self.core_sources],
         }
+
+    def functional_payload(self) -> dict[str, object]:
+        payload = self.reuse_basis_payload()
+        payload["research_date"] = self.research_date.isoformat()
+        return payload
+
+    def compute_reuse_basis_hash(self) -> str:
+        encoded = json.dumps(
+            self.reuse_basis_payload(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def compute_input_hash(self) -> str:
         encoded = json.dumps(
@@ -307,6 +325,10 @@ class SubjectProductionRun:
     # Frozen when the run starts: a retry after midnight must not shift the
     # boundary used to reject impossible publication dates.
     research_date: date | None = None
+    # A deliberate user retry bypasses cross-run reuse for this stage and all
+    # downstream costly stages.  Technical retries of the same job keep using
+    # the persisted artifact of the same run.
+    force_recompute_from_stage: SubjectProductionStage | None = None
     error_code: str | None = None
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
@@ -392,7 +414,11 @@ class SubjectProductionRun:
         self.version += 1
 
     def retry_from_stage(
-        self, stage: SubjectProductionStage, *, now: datetime | None = None
+        self,
+        stage: SubjectProductionStage,
+        *,
+        now: datetime | None = None,
+        force_recompute: bool = True,
     ) -> None:
         """Start a deliberate new pipeline generation at ``stage``.
 
@@ -404,6 +430,16 @@ class SubjectProductionRun:
         self.status = SubjectProductionStatus.RUNNING
         self.current_stage = stage
         self.pipeline_generation += 1
+        if force_recompute:
+            self.force_recompute_from_stage = {
+                SubjectProductionStage.SOURCES: SubjectProductionStage.REFERENCES,
+                SubjectProductionStage.REFERENCES: SubjectProductionStage.REFERENCES,
+                SubjectProductionStage.EXTRACTION: SubjectProductionStage.EXTRACTION,
+                SubjectProductionStage.SYNTHESIS: SubjectProductionStage.SYNTHESIS,
+                SubjectProductionStage.ASSEMBLY: None,
+            }[stage]
+        else:
+            self.force_recompute_from_stage = None
         if stage is SubjectProductionStage.SOURCES:
             self.references_conversation_id = None
             self.synthesis_conversation_id = None
@@ -437,6 +473,7 @@ class ProductionArtifact:
     rendered_blob_id: UUID | None = None
     model_run_id: UUID | None = None
     conversation_turn_id: UUID | None = None
+    reused_from_artifact_id: UUID | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -446,6 +483,33 @@ class ProductionArtifact:
             raise ValueError("version must be >= 1")
         if len(self.input_hash) != 64 or any(c not in "0123456789abcdef" for c in self.input_hash):
             raise ValueError("input_hash must be lowercase SHA-256")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProductionReuseInvalidation:
+    """Append-only operator request that limits future cross-run reuse."""
+
+    edition_id: UUID
+    subject_id: UUID
+    from_stage: SubjectProductionStage
+    actor_id: str
+    correlation_id: str
+    occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    id: UUID = field(default_factory=uuid4)
+
+    def __post_init__(self) -> None:
+        if self.from_stage not in {
+            SubjectProductionStage.REFERENCES,
+            SubjectProductionStage.EXTRACTION,
+            SubjectProductionStage.SYNTHESIS,
+        }:
+            raise ValueError("Production reuse invalidation must start at a costly stage")
+        if not self.actor_id.strip():
+            raise ValueError("Production reuse invalidation requires an actor")
+        if not self.correlation_id.strip():
+            raise ValueError("Production reuse invalidation requires a correlation id")
+        if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
 
 
 @dataclass(slots=True, kw_only=True)

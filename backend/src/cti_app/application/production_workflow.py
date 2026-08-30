@@ -23,6 +23,10 @@ from cti_app.application.model_conversations import (
 )
 from cti_app.application.model_gateway import ModelGateway, ModelRequest, ModelRoutingHint
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
+from cti_app.application.production_artifact_reuse import (
+    ProductionArtifactReuseService,
+    cross_run_reuse_allowed,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_artifact_verification import (
     ARTIFACT_VERIFIER_VERSION,
@@ -32,6 +36,7 @@ from cti_app.application.production_artifact_verification import (
 from cti_app.application.production_context import build_subject_production_context
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_parsers import (
+    PARSER_VERSION,
     Q2_MARKDOWN_PARSER_VERSION,
     IndicatorStatus,
     ParsedEvent,
@@ -71,6 +76,7 @@ from cti_app.domain.model_conversations import (
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole
 from cti_app.domain.production import (
+    ProductionArtifactStage,
     ProductionInputSnapshot,
     SubjectProductionRun,
     SubjectProductionStage,
@@ -90,6 +96,7 @@ _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 # Its deterministic ModelRun identity includes this routing policy, so changing
 # that policy creates a fresh checkpoint without conversations or repair turns.
 Q2_ROUTING_POLICY_VERSION = "3"
+REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
 
 
 # Bridge and network hiccups are worth retrying; anything else is a dead end
@@ -159,6 +166,9 @@ class ProductionWorkflowOrchestrator:
         self._extraction = ExtractionService(uow_factory, artifact_store)
         self._synthesis = SynthesisService(uow_factory, artifact_store)
         self._assembly = PublicationAssemblyService(uow_factory, artifact_store)
+        self._artifact_reuse = ProductionArtifactReuseService(
+            uow_factory, artifact_store, self._diagnostics
+        )
         self._qa = ProductionQAService(uow_factory)
         self._seed_enrichment = seed_enrichment
         self._pacing = pacing or ProductionPacingPolicy.zero()
@@ -230,6 +240,33 @@ class ProductionWorkflowOrchestrator:
             error=exc,
         )
         return _transient_or_terminal(stage, exc)
+
+    async def _reuse_artifact(
+        self,
+        run: SubjectProductionRun,
+        stage: str,
+        input_hash: str,
+    ) -> dict[str, Any] | None:
+        artifact_stage = ProductionArtifactStage(stage)
+        result = await self._artifact_reuse.find_or_reuse(
+            run=run,
+            stage=artifact_stage,
+            input_hash=input_hash,
+            allow_cross_run=cross_run_reuse_allowed(run, artifact_stage),
+        )
+        if result is None:
+            return None
+        return {
+            "stage": stage,
+            "status": "reused" if result.reused else "cached",
+            "artifact_id": str(result.artifact.id),
+            "reused": result.reused,
+            "reused_from_artifact_id": (
+                str(result.artifact.reused_from_artifact_id)
+                if result.artifact.reused_from_artifact_id is not None
+                else None
+            ),
+        }
 
     async def _ask_with_format_repair(
         self,
@@ -581,13 +618,6 @@ class ProductionWorkflowOrchestrator:
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
-        if not self._model_service:
-            return {
-                "stage": "references",
-                "status": "error",
-                "error": "ModelConversationService not configured",
-            }
-
         async with self._uow_factory() as uow:
             research_date = run.research_date or datetime.now(UTC).date()
             ctx = await build_subject_production_context(
@@ -599,6 +629,24 @@ class ProductionWorkflowOrchestrator:
             )
             subject_title = ctx.subject_title
 
+            input_hash = _references_input_hash(
+                subject_id=run.subject_id,
+                snapshot=snapshot,
+                subject_title=subject_title,
+                subject_description=ctx.subject_description,
+                research_date=research_date,
+            )
+            reused = await self._reuse_artifact(run, "references", input_hash)
+            if reused is not None:
+                return reused
+
+            if not self._model_service:
+                return {
+                    "stage": "references",
+                    "status": "error",
+                    "error": "ModelConversationService not configured",
+                }
+
             # The diffusion policy, not a hardcoded flag, decides whether this
             # subject may be sent to an external model.
             if not ctx.external_llm_allowed:
@@ -607,25 +655,6 @@ class ProductionWorkflowOrchestrator:
                     "status": "needs_review",
                     "error_code": "external_llm_blocked",
                     "error": "Diffusion policy forbids sending this subject to an external model",
-                }
-
-            input_data = {
-                "subject_id": str(run.subject_id),
-                "title": subject_title,
-                "context": ctx.subject_description,
-                "research_date": research_date.isoformat(),
-                "stage": "references",
-                "prompt_version": REFERENCES_PROMPT_VERSION,
-                "pipeline_generation": run.pipeline_generation,
-            }
-            input_hash = compute_input_hash(input_data)
-
-            existing = await uow.production_artifacts.get_current(run.id, "references")
-            if existing and existing.input_hash == input_hash:
-                return {
-                    "stage": "references",
-                    "status": "cached",
-                    "artifact_id": str(existing.id),
                 }
 
             # Q1 has its own research conversation; Q2 remains stateless.
@@ -738,12 +767,6 @@ class ProductionWorkflowOrchestrator:
         self, run: SubjectProductionRun, snapshot: ProductionInputSnapshot | None = None
     ) -> dict[str, Any]:
         """Q2: exactly one fresh, web-enabled model request per Q1 source."""
-        if self._model_gateway is None:
-            return {
-                "stage": "extraction",
-                "status": "error",
-                "error": "ModelGateway not configured",
-            }
         async with self._uow_factory() as uow:
             references = await uow.production_artifacts.get_current(run.id, "references")
             if references is None:
@@ -768,6 +791,21 @@ class ProductionWorkflowOrchestrator:
                 snapshot=snapshot,
                 relevant_source_urls={source.canonical_url for source in report.sources},
             )
+            input_hash = _extraction_input_hash(
+                subject_id=run.subject_id,
+                references_hash=references.input_hash,
+                source_urls=[source.canonical_url for source in report.sources],
+                references_payload_hash=compute_input_hash(reference_report_to_json(report)),
+            )
+            reused = await self._reuse_artifact(run, "extraction", input_hash)
+            if reused is not None:
+                return reused
+            if self._model_gateway is None:
+                return {
+                    "stage": "extraction",
+                    "status": "error",
+                    "error": "ModelGateway not configured",
+                }
             if not policy.external_llm_allowed:
                 return {
                     "stage": "extraction",
@@ -775,15 +813,6 @@ class ProductionWorkflowOrchestrator:
                     "error_code": "external_llm_blocked",
                     "error": "Diffusion policy forbids sending this subject to an external model",
                 }
-            input_hash = _extraction_input_hash(
-                subject_id=run.subject_id,
-                references_hash=references.input_hash,
-                source_urls=[source.canonical_url for source in report.sources],
-                pipeline_generation=run.pipeline_generation,
-            )
-            existing = await uow.production_artifacts.get_current(run.id, "extraction")
-            if existing and existing.input_hash == input_hash:
-                return {"stage": "extraction", "status": "cached", "artifact_id": str(existing.id)}
             subject_title, _ = await self._subject_context(uow, run.subject_id, snapshot)
 
         submissions: list[Q2ProposalSubmission] = []
@@ -1035,13 +1064,6 @@ class ProductionWorkflowOrchestrator:
     async def _execute_synthesis_stage(
         self, run: SubjectProductionRun, snapshot: ProductionInputSnapshot | None = None
     ) -> dict[str, Any]:
-        if not self._model_service:
-            return {
-                "stage": "synthesis",
-                "status": "error",
-                "error": "ModelConversationService not configured",
-            }
-
         async with self._uow_factory() as uow:
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
             references = await uow.production_artifacts.get_current(run.id, "references")
@@ -1079,13 +1101,6 @@ class ProductionWorkflowOrchestrator:
                 relevant_source_urls={source.canonical_url for source in report.sources},
             )
             synthesis_policy_allows = synthesis_ctx.external_llm_allowed
-            if not synthesis_policy_allows:
-                return {
-                    "stage": "synthesis",
-                    "status": "needs_review",
-                    "error_code": "external_llm_blocked",
-                    "error": "Diffusion policy forbids sending this subject to an external model",
-                }
             extraction_payload = technical_extraction_from_json(
                 await self._artifact_store.read_json(extraction.canonical_blob_id)
             )
@@ -1113,10 +1128,8 @@ class ProductionWorkflowOrchestrator:
             input_hash = compute_input_hash(
                 {
                     "subject_id": str(run.subject_id),
-                    "references_version": references.version,
                     "references_hash": references.input_hash,
                     "reference_report_hash": compute_input_hash(reference_report_to_json(report)),
-                    "extraction_version": extraction.version,
                     "extraction_hash": extraction.input_hash,
                     "technical_extraction_hash": compute_input_hash(
                         technical_extraction_to_json(extraction_payload)
@@ -1124,18 +1137,27 @@ class ProductionWorkflowOrchestrator:
                     "synthesis_evidence_pack_version": "2",
                     "synthesis_evidence_pack_hash": synthesis_pack_hash,
                     "prompt_version": SYNTHESIS_PROMPT_VERSION,
+                    "format_repair_version": SYNTHESIS_FORMAT_REPAIR_VERSION,
                     "web_policy_version": "q4-web-non-authoritative-v1",
                     "model_routing_policy": "openai-drafting-v1",
                     "stage": "synthesis",
-                    "pipeline_generation": run.pipeline_generation,
                 }
             )
-            existing = await uow.production_artifacts.get_current(run.id, "synthesis")
-            if existing and existing.input_hash == input_hash:
+            reused = await self._reuse_artifact(run, "synthesis", input_hash)
+            if reused is not None:
+                return reused
+            if not self._model_service:
                 return {
                     "stage": "synthesis",
-                    "status": "cached",
-                    "artifact_id": str(existing.id),
+                    "status": "error",
+                    "error": "ModelConversationService not configured",
+                }
+            if not synthesis_policy_allows:
+                return {
+                    "stage": "synthesis",
+                    "status": "needs_review",
+                    "error_code": "external_llm_blocked",
+                    "error": "Diffusion policy forbids sending this subject to an external model",
                 }
 
             if run.synthesis_conversation_id is None:
@@ -1339,24 +1361,61 @@ def _q2_source_model_run_id(
     return uuid5(NAMESPACE_URL, f"production-q2-source:{identity}")
 
 
+def _references_input_hash(
+    *,
+    subject_id: UUID,
+    snapshot: ProductionInputSnapshot | None,
+    subject_title: str,
+    subject_description: str,
+    research_date: Any,
+) -> str:
+    """Functional Q1 identity; execution/run identities are deliberately absent."""
+    snapshot_hash = (
+        snapshot.input_hash
+        if snapshot is not None
+        else compute_input_hash(
+            {
+                "subject_id": str(subject_id),
+                "title": subject_title,
+                "description": subject_description,
+                "research_date": str(research_date),
+            }
+        )
+    )
+    return compute_input_hash(
+        {
+            "subject_id": str(subject_id),
+            "production_input_snapshot_hash": snapshot_hash,
+            "prompt_version": REFERENCES_PROMPT_VERSION,
+            "format_repair_version": REFERENCES_FORMAT_REPAIR_VERSION,
+            "parser_version": PARSER_VERSION,
+            "routing_policy_version": REFERENCES_ROUTING_POLICY_VERSION,
+            "stage": "references",
+        }
+    )
+
+
 def _extraction_input_hash(
     *,
     subject_id: UUID,
     references_hash: str,
     source_urls: list[str],
-    pipeline_generation: int,
+    references_payload_hash: str | None = None,
+    pipeline_generation: int | None = None,
 ) -> str:
-    """Q2 canonical-artifact identity, distinct from per-source model runs."""
+    """Q2 canonical identity, distinct from per-source model-run identities."""
+    # ``pipeline_generation`` remains accepted for callers using the old
+    # helper signature, but is intentionally not part of this hash.
     return compute_input_hash(
         {
             "subject_id": str(subject_id),
             "references_hash": references_hash,
-            "source_urls": source_urls,
+            "references_payload_hash": references_payload_hash or references_hash,
+            "source_urls": sorted(source_urls),
             "prompt_version": EXTRACTION_PROMPT_VERSION,
             "parser_version": Q2_MARKDOWN_PARSER_VERSION,
             "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
             "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
             "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-            "pipeline_generation": pipeline_generation,
         }
     )

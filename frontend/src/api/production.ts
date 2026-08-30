@@ -22,6 +22,10 @@ export interface StageStatus {
   version: number | null;
   error_code: string | null;
   error_message: string | null;
+  reused?: boolean;
+  reused_from_artifact_id?: string | null;
+  reused_from_created_at?: string | null;
+  research_date?: string | null;
   /** Short user-facing progress detail, when the pipeline exposes one. */
   detail?: string;
   /** Only on the sources stage. */
@@ -91,6 +95,9 @@ export interface ArtifactResponse {
   stage: string;
   version: number;
   status: "verified" | "stale" | "needs_review";
+  reused?: boolean;
+  reused_from_artifact_id?: string | null;
+  reused_from_created_at?: string | null;
   metadata: Record<string, unknown>;
   /** Publication Markdown is downloadable alongside the canonical document. */
   rendered_content: string | null;
@@ -288,6 +295,18 @@ export async function retryProductionStage(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ stage }),
+  });
+}
+
+/** Block future cross-run reuse from this costly stage onward. */
+export async function invalidateProductionReuse(
+  subjectId: string,
+  fromStage: "references" | "extraction" | "synthesis",
+): Promise<{ action: string; from_stage: string; occurred_at: string }> {
+  return request(`/api/subjects/${subjectId}/production/reuse/invalidate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ from_stage: fromStage }),
   });
 }
 
