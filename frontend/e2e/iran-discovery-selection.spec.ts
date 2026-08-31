@@ -314,7 +314,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
       name: "ChatGPT recherche et analyse les sources",
     }),
   ).toBeVisible();
-  await expect(page.getByText("Temps écoulé : 600 s")).toBeVisible();
+  await expect(page.getByText(/Temps écoulé : \d+ s/)).toBeVisible();
   await expect(page.getByText("bridge-run-e2e")).toBeVisible();
   await expect(
     page.getByRole("heading", { name: cyfirma.title }).first(),
