@@ -98,11 +98,10 @@ class _CountingRetryModelAdapter:
 
     def __init__(self) -> None:
         self.calls: list[SafeModelRequest] = []
-        self._extraction_text = """# FACT
-category: actors
-value: Example actor
-context: The selected campaign
-evidence: The selected campaign was reported.
+        self._extraction_text = """# FACTS
+
+## actors
+- Example actor :: The selected campaign
 """
         self._synthesis_text = "The selected campaign was reported [S1]."
 

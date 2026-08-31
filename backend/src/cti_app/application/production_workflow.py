@@ -336,6 +336,9 @@ def plan_q2_extraction_profiles(
     dated core publication and then by the specified deterministic tie-break.
     """
 
+    if snapshot is None:
+        raise ValueError("q2_extraction_plan_missing_snapshot")
+
     def as_date(value: date | str | None) -> date | None:
         if isinstance(value, date):
             return value
@@ -346,17 +349,10 @@ def plan_q2_extraction_profiles(
                 return None
         return None
 
-    start = as_date(period_start) or (snapshot.period_start if snapshot else None)
-    end = as_date(period_end) or (snapshot.period_end if snapshot else None)
-    core_sources = snapshot.core_sources if snapshot else ()
-    # Legacy runs without a frozen snapshot have no authoritative core set;
-    # preserve their former exhaustive Q2 behaviour instead of guessing which
-    # Q1 publication is historical.
-    core_urls = (
-        {source.canonical_url for source in core_sources}
-        if snapshot is not None
-        else {source.canonical_url for source in report.sources}
-    )
+    start = as_date(period_start) or snapshot.period_start
+    end = as_date(period_end) or snapshot.period_end
+    core_sources = snapshot.core_sources
+    core_urls = {source.canonical_url for source in core_sources}
     core_dates = [
         source.published_at
         for source in report.sources
@@ -1358,6 +1354,13 @@ class ProductionWorkflowOrchestrator:
     ) -> dict[str, Any]:
         """Q2: at most one source-level, web-enabled request per Q1 source."""
         await self._check_cancellation(run.id, context)
+        if snapshot is None:
+            return {
+                "stage": "extraction",
+                "status": "needs_review",
+                "error_code": "q2_extraction_plan_missing_snapshot",
+                "error": "Q2 extraction requires the frozen production input snapshot",
+            }
         async with self._uow_factory() as uow:
             references = await uow.production_artifacts.get_current(run.id, "references")
             if references is None:

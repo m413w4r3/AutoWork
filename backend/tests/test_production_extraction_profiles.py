@@ -105,6 +105,36 @@ def test_policy_keeps_all_core_and_only_three_near_supporting_full() -> None:
     assert sum(plan.profile is ExtractionProfile.IOC_RULES for plan in plans[2:]) == 4
 
 
+def test_large_corpus_never_falls_back_to_all_full() -> None:
+    core_url = "https://example.test/core"
+    support_urls = [f"https://example.test/support-{index}" for index in range(100)]
+    report = ReferenceReport(
+        sources=tuple(
+            [_source(core_url, date(2026, 7, 10))]
+            + [_source(url, date(2026, 7, 11)) for url in support_urls]
+        ),
+        events=(),
+    )
+
+    plans = plan_q2_extraction_profiles(
+        report,
+        snapshot=_snapshot((_input_source(core_url, date(2026, 7, 10)),)),
+    )
+
+    assert sum(plan.profile is ExtractionProfile.FULL for plan in plans) == 4
+    assert sum(plan.profile is ExtractionProfile.IOC_RULES for plan in plans) == 97
+
+
+def test_missing_snapshot_fails_q2_planning_instead_of_selecting_all_full() -> None:
+    report = ReferenceReport(
+        sources=(_source("https://example.test/source", date(2026, 7, 10)),),
+        events=(),
+    )
+
+    with pytest.raises(ValueError, match="q2_extraction_plan_missing_snapshot"):
+        plan_q2_extraction_profiles(report)
+
+
 def test_policy_sends_old_and_undated_supporting_to_ioc_rules() -> None:
     report = ReferenceReport(
         sources=(
@@ -385,11 +415,8 @@ class _CacheGateway:
         self.source_ids.append(str(source_id))
         return SimpleNamespace(
             output_text=(
-                "# FACT\ncategory: malware\nvalue: ExampleRAT\ncontext: observed\n"
-                "evidence-quote: observed in source\n"
-                "# ARTIFACT\nartifact-type: domain\nvalue: c2.example.org\n"
-                "indicator-status: confirmed_ioc\ncontext: C2\n"
-                "evidence-quote: c2.example.org\n"
+                "# FACTS\n\n## malware\n- ExampleRAT :: observed\n"
+                "# IOCS\n\n## confirmed\ndomain:\n- c2.example.org\n"
             ),
             run=SimpleNamespace(
                 id=run_id,
@@ -505,8 +532,9 @@ async def test_source_cache_reuses_between_subjects_and_projects_full_for_light(
         return report
 
     orchestrator._load_reference_report = load_report
-    first = await orchestrator._execute_direct_url_extraction(first_run)
-    second = await orchestrator._execute_direct_url_extraction(second_run)
+    snapshot = _snapshot((_input_source(url, date(2026, 7, 10)),))
+    first = await orchestrator._execute_direct_url_extraction(first_run, snapshot=snapshot)
+    second = await orchestrator._execute_direct_url_extraction(second_run, snapshot=snapshot)
 
     assert first["status"] == "success", first
     assert second["status"] == "success"
@@ -633,7 +661,8 @@ async def test_retry_uses_source_cache_for_s1_to_s10_and_calls_only_s11(
         return report
 
     orchestrator._load_reference_report = load_report
-    first = await orchestrator._execute_direct_url_extraction(run)
+    snapshot = _snapshot((_input_source(urls[0], date(2026, 7, 10)),))
+    first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
     missing_document_id = next(
         document_id for document_id, document in docs.items() if document.final_url == urls[-1]
     )
@@ -645,7 +674,7 @@ async def test_retry_uses_source_cache_for_s1_to_s10_and_calls_only_s11(
         force_recompute_from_stage=SubjectProductionStage.EXTRACTION,
     )
     state._runs[retry.id] = retry
-    second = await orchestrator._execute_direct_url_extraction(retry)
+    second = await orchestrator._execute_direct_url_extraction(retry, snapshot=snapshot)
 
     assert first["status"] == "success"
     assert second["status"] == "success"
@@ -677,7 +706,8 @@ async def test_changed_archived_content_hash_requires_new_model_call(
         return report
 
     orchestrator._load_reference_report = load_report
-    first = await orchestrator._execute_direct_url_extraction(run)
+    snapshot = _snapshot((_input_source(url, date(2026, 7, 10)),))
+    first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
     # Same URL, re-archived with different content: a distinct extraction.
     updated_blob_id, updated_sha256 = blobs.add(b"ARCHIVED V2")
     document.decoded_blob_id = updated_blob_id
@@ -688,7 +718,7 @@ async def test_changed_archived_content_hash_requires_new_model_call(
         current_stage=SubjectProductionStage.EXTRACTION,
     )
     state._runs[second_run.id] = second_run
-    result = await orchestrator._execute_direct_url_extraction(second_run)
+    result = await orchestrator._execute_direct_url_extraction(second_run, snapshot=snapshot)
 
     assert result["status"] == "success", result
     assert first["status"] == "success"
@@ -726,7 +756,8 @@ async def test_unreadable_archive_never_caches_under_the_content_hash(
         return report
 
     orchestrator._load_reference_report = load_report
-    result = await orchestrator._execute_direct_url_extraction(run)
+    snapshot = _snapshot((_input_source(url, date(2026, 7, 10)),))
+    result = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
 
     assert result["status"] == "success", result
     assert len(gateway.calls) == 1
@@ -748,7 +779,7 @@ async def test_unreadable_archive_never_caches_under_the_content_hash(
         current_stage=SubjectProductionStage.EXTRACTION,
     )
     state._runs[other_run.id] = other_run
-    second = await orchestrator._execute_direct_url_extraction(other_run)
+    second = await orchestrator._execute_direct_url_extraction(other_run, snapshot=snapshot)
 
     assert second["status"] == "success"
     assert len(gateway.calls) == 2
@@ -779,7 +810,8 @@ async def test_archive_too_large_for_one_request_falls_back_to_live_url(
         return ReferenceReport(sources=(_source(url, date(2026, 7, 10)),), events=())
 
     orchestrator._load_reference_report = load_report
-    result = await orchestrator._execute_direct_url_extraction(run)
+    snapshot = _snapshot((_input_source(url, date(2026, 7, 10)),))
+    result = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
 
     assert result["status"] == "success", result
     assert len(gateway.calls) == 1

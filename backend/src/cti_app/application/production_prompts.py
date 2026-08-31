@@ -7,16 +7,14 @@ from collections.abc import Sequence
 from cti_app.domain.production import ExtractionProfile
 
 REFERENCES_PROMPT_VERSION = "4"
-# Q2 moved off the OpenAI structured-output contract (the bridge does not
-# actually guarantee response_format / JSON Schema) onto free-text GPT plus a
-# permissive Markdown parser (P23.7). EXTRACTION_PROMPT_VERSION now names that
-# Markdown dialect.
-# "10" / "3": Q2 analyses the archived capture inlined in the prompt whenever
+# Q2 uses free-text GPT plus a compact grouped Markdown parser. The bridge does
+# not guarantee response_format / JSON Schema.
+# "11" / "4": Q2 analyses the archived capture inlined in the prompt whenever
 # one is available, so a result cached under a content hash is really produced
 # from that content. Versions bumped so checkpoints written by the previous,
 # live-URL-only prompt are never reused under the same identity.
-EXTRACTION_PROMPT_VERSION = "10"
-IOC_RULES_PROMPT_VERSION = "3"
+EXTRACTION_PROMPT_VERSION = "11"
+IOC_RULES_PROMPT_VERSION = "4"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -103,11 +101,6 @@ Rules:
 - No date after the research date.
 """
 
-    # Free text on purpose: the ChatGPT bridge does not actually enforce
-    # response_format / JSON Schema, only a normal conversational turn. Asking
-    # for JSON here just moves the fragility into a bridge that can't hold the
-    # contract; this asks for the same permissive Markdown dialect as Q1 and
-    # leans on `parse_q2_proposals_markdown` + `verify_q2_proposals` instead.
     TECHNICAL_EXTRACTION_MARKDOWN_V1 = """You are analysing one specific CTI source for a reusable, source-centric extraction.
 
 **Source title**: {source_title}
@@ -117,65 +110,100 @@ Rules:
 Perform an exhaustive IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/
 SHA512 and email addresses, including tables, appendices, images and code.
 Also extract useful malware, tools, files, CVEs, detection rules, TTPs, infrastructure,
-victims and campaign context. Never reconstruct hidden values or emit masked,
-truncated, REDACTED, FUZZ, example or placeholder values.
+victims and campaign context. Omit irrelevant, example-only, placeholder,
+masked, truncated, REDACTED or FUZZ values; never reconstruct hidden values.
 
 Extract the complete literal detection rule when it is visibly published by the
 exact source or its explicitly linked technical annex/repository already admitted
 to the source corpus. For every YARA, Sigma, Suricata or Snort rule:
-- preserve the complete literal body, syntax and line breaks;
-- do not reconstruct truncated content or invent missing variables;
+- preserve the complete literal body, syntax and visible line breaks;
+- do not reconstruct truncated content, invent missing variables, or repair braces;
 - never merge two rules or transform one rule language into another;
 - preserve the visible rule name;
-- report partial/truncated rules in UNCERTAINTIES instead of promoting them as complete.
+- report partial/truncated rules in UNCERTAINTIES instead of promoting them as complete;
+- a flattened one-line YARA rule stays one line, and `hxxps\\://...` stays exactly visible.
 
-**Output format** — plain Markdown, no code fence, no JSON. Repeat as many
-`# FACT` / `# RULE` / `# ARTIFACT` blocks as needed, in any order:
+**Output format** — plain Markdown, no outer code fence, no JSON. Use this
+compact grouped dialect exactly:
 
-# FACT
+# FACTS
 
-category: actors|campaigns|malware|tools|infection_chain|ttps|victimology|protocols|infrastructure|files|commands|persistence|detections|other_technical
-value: <structured fact>
-context: <short French context>
-evidence: <human-audit evidence from this source>
-attack-id: <T1234 optional, only if literally quoted>
+## <category>
+- <value>
+- <value> :: <short useful context, only when needed>
 
-# RULE
+Categories: actors, campaigns, malware, tools, infection_chain, ttps,
+victimology, protocols, infrastructure, files, commands, persistence,
+detections, other_technical.
 
-rule-type: yara|sigma|suricata|snort
-name: <visible rule name, or omit if none>
-context: <short French context>
-evidence: <human-audit evidence from this source>
+# IOCS
 
+## confirmed
+domain:
+- <confirmed domain>
+ip:
+- <confirmed IP>
+url:
+- <confirmed URL>
+email:
+- <confirmed email>
+md5:
+- <confirmed MD5>
+sha1:
+- <confirmed SHA1>
+sha256:
+- <confirmed SHA256>
+sha512:
+- <confirmed SHA512>
+filename:
+- <confirmed filename>
+filepath:
+- <confirmed filepath>
+cve:
+- <confirmed CVE>
+
+## contextual
+domain:
+- <contextual value> :: <short useful context, only when needed>
+cve:
+- <contextual CVE>
+
+# RULES
+
+## yara: <visible name, omit the colon/name if none>
 ```yara
-<complete literal rule body, preserving every line>
+<complete literal rule body, preserving exactly what is visible>
 ```
 
-# ARTIFACT
+## sigma: <visible name, omit the colon/name if none>
+```yaml
+<complete literal rule body, preserving exactly what is visible>
+```
 
-artifact-type: domain|ip|url|email|md5|sha1|sha256|sha512|filename|filepath|cve
-value: <exact literal>
-indicator-status: confirmed_ioc|contextual|excluded|not_applicable
-context: <short French context>
-evidence: <human-audit evidence from this source>
+## suricata: <visible name, omit the colon/name if none>
+```suricata
+<complete literal rule body, preserving exactly what is visible>
+```
+
+## snort: <visible name, omit the colon/name if none>
+```snort
+<complete literal rule body, preserving exactly what is visible>
+```
 
 # UNCERTAINTIES
-- <uncertainty, or omit the section>
+* <only meaningful uncertainty, or omit the section>
 
 Rules:
-- Evidence is for human audit, not deterministic local proof.
-- Never emit a value merely described but not shown.
-- Use contextual for victims, legitimate services/providers/tools, unqualified
-  infrastructure, and CVEs unless the source explicitly says otherwise.
-- Use excluded for examples, tests, navigation, obvious false positives, or
-  irrelevant content.
-- For a hash, artifact-type is the concrete algorithm (md5/sha1/sha256/sha512),
-  never the bare word "hash".
-- Put complete detection rules in dedicated RULE blocks. Do not put rule bodies
-  in ARTIFACT values.
-- Do not emit source_document_id, source_ids, model_run_id,
-  references, or any other internal identifier; the system assigns provenance
-  and verifies your proposals afterwards.
+- The response is bound to this one source. Never repeat its URL, source id,
+  provenance, evidence quote, model run id, or other internal identifier.
+- `confirmed` means confirmed_ioc and `contextual` means contextual. Never
+  emit excluded or not_applicable artifacts; omit unusable values instead.
+- The group header supplies category, IOC type and status. Do not repeat those
+  fields on each value. Do not emit evidence quotes or repeated context.
+- Emit only values literally visible in this source or its admitted technical
+  annex. A value may have one short `:: context` annotation when genuinely useful.
+- Put complete literal detection rules only in RULES. Never refang, reformat,
+  flatten, unflatten, repair, or reconstruct a rule body.
 """
 
     IOC_RULES_EXTRACTION_MARKDOWN_V1 = """You are performing a reusable, source-centric IOC and detection-rule extraction for one CTI source.
@@ -184,59 +212,93 @@ Rules:
 
 {source_access}
 
-Never sacrifice IOC coverage to reduce cost.
+Never sacrifice IOC coverage to reduce cost. This profile emits no narrative
+facts: do not extract FACTS, TTP narrative, victimology, chronology, campaign
+context, tooling narrative, infection chains, or general historical context.
 
 Extract the complete literal detection rule when it is visibly published by the
 exact source or its explicitly linked technical annex/repository already admitted
 to the source corpus. For every YARA, Sigma, Suricata or Snort rule:
-- preserve the complete literal body, syntax and line breaks;
-- do not reconstruct truncated content or invent missing variables;
+- preserve the complete literal body, syntax and visible line breaks;
+- do not reconstruct truncated content, invent missing variables, or repair braces;
 - never merge two rules or transform one rule language into another;
 - preserve the visible rule name;
-- report partial/truncated rules in UNCERTAINTIES instead of promoting them as complete.
+- report partial/truncated rules in UNCERTAINTIES instead of promoting them as complete;
+- a flattened one-line YARA rule stays one line, and `hxxps\\://...` stays exactly visible.
 
-Extract only:
-- every IOC/artifact and detection rule supported by the source;
-- files explicitly presented as indicators;
-- CVEs directly relevant to the source's technical content;
-- uncertainties about access, ambiguity, or IOC interpretation.
+Extract only every source-supported IOC, indicator file, relevant CVE,
+complete detection rule, and meaningful uncertainty. Omit irrelevant,
+example-only, placeholder, masked, truncated, REDACTED or FUZZ values.
 
-Do not extract infection_chain, narrative TTPs, victimology, chronology, campaign
-narrative, tooling narrative, or general historical context. Do not emit internal
-identifiers. Put complete detection rules in dedicated RULE blocks, never in
-ARTIFACT values.
+**Output format** — plain Markdown, no outer code fence, no JSON. Use only:
 
-**Output format** — plain Markdown, no code fence, no JSON. Repeat as many
-`# RULE` / `# ARTIFACT` blocks as needed, in any order:
+# IOCS
 
-# RULE
+## confirmed
+domain:
+- <confirmed domain>
+ip:
+- <confirmed IP>
+url:
+- <confirmed URL>
+email:
+- <confirmed email>
+md5:
+- <confirmed MD5>
+sha1:
+- <confirmed SHA1>
+sha256:
+- <confirmed SHA256>
+sha512:
+- <confirmed SHA512>
+filename:
+- <confirmed filename>
+filepath:
+- <confirmed filepath>
+cve:
+- <confirmed CVE>
 
-rule-type: yara|sigma|suricata|snort
-name: <visible rule name, or omit if none>
-context: <short French context>
-evidence: <human-audit evidence from this source>
+## contextual
+domain:
+- <contextual value> :: <short useful context, only when needed>
+cve:
+- <contextual CVE>
 
-```text
-<complete literal rule body, preserving every line>
+# RULES
+
+## yara: <visible name, omit the colon/name if none>
+```yara
+<complete literal rule body, preserving exactly what is visible>
 ```
 
-# ARTIFACT
+## sigma: <visible name, omit the colon/name if none>
+```yaml
+<complete literal rule body, preserving exactly what is visible>
+```
 
-artifact-type: domain|ip|url|email|md5|sha1|sha256|sha512|filename|filepath|cve
-value: <exact literal>
-indicator-status: confirmed_ioc|contextual|excluded|not_applicable
-context: <short French context>
-evidence: <human-audit evidence from this source>
+## suricata: <visible name, omit the colon/name if none>
+```suricata
+<complete literal rule body, preserving exactly what is visible>
+```
+
+## snort: <visible name, omit the colon/name if none>
+```snort
+<complete literal rule body, preserving exactly what is visible>
+```
 
 # UNCERTAINTIES
-- <uncertainty, or omit the section>
+* <only meaningful uncertainty, or omit the section>
 
 Rules:
-- Never emit a value merely described but not shown.
-- Never reconstruct hidden values or emit masked, truncated, REDACTED, FUZZ,
-  example or placeholder values.
-- For a hash, artifact-type is the concrete algorithm (md5/sha1/sha256/sha512).
-- Use contextual for CVEs unless directly relevant and for unqualified artifacts.
+- The response is bound to this one source. Never repeat its URL, source id,
+  provenance, evidence quote, model run id, or other internal identifier.
+- `confirmed` means confirmed_ioc and `contextual` means contextual. Never
+  emit excluded or not_applicable artifacts; omit unusable values instead.
+- The group header supplies IOC type and status. Do not repeat those fields on
+  each value. Do not emit FACTS or narrative/context extraction.
+- A value may have one short `:: context` annotation only when genuinely useful.
+- Put complete literal detection rules only in RULES. Never refang, reformat,
+  flatten, unflatten, repair, or reconstruct a rule body.
 """
 
     FORMAT_REPAIR_V1 = """Your previous answer could not be read by the automated parser.

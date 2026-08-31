@@ -33,7 +33,7 @@ from cti_app.domain.publication import ArtifactType
 # validation rule, a public-suffix check, or how facts get a semantic type).
 # Participates in the extraction artifact's input_hash so a canonical
 # extraction artifact gets recomputed, without forcing a new Q2 model call.
-ARTIFACT_VERIFIER_VERSION = "2"
+ARTIFACT_VERIFIER_VERSION = "3"
 
 
 class ProposalStatus(StrEnum):
@@ -182,6 +182,10 @@ def _rejection_reason(
     proposal: Q2FactProposal | Q2ArtifactProposal,
 ) -> str | None:
     if isinstance(proposal, Q2ArtifactProposal):
+        if proposal.indicator_status == "excluded":
+            return "excluded_artifact_not_emitted"
+        if proposal.indicator_status == "not_applicable":
+            return "not_applicable_artifact_not_emitted"
         if _is_placeholder(proposal.value):
             return "redacted_placeholder"
         try:
@@ -229,7 +233,14 @@ def _rule_rejection_reason(
 
 def _is_placeholder(value: str) -> bool:
     folded = value.casefold()
-    return bool(re.search(r"redacted|\bfuzz\b|<[^>]+>|example\.(?:com|org|net)", folded))
+    refanged = refang(value).casefold()
+    return bool(
+        re.search(
+            r"redacted|\bfuzz\b|<[^>]+>|\b(?:unknown|inconnu|inconnue|n/?a|none|null)\b|"
+            r"example\.(?:com|org|net)",
+            f"{folded} {refanged}",
+        )
+    )
 
 
 def _to_item(

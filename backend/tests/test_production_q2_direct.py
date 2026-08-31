@@ -1,3 +1,4 @@
+from datetime import date, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -21,6 +22,7 @@ from cti_app.application.production_parsers import (
     parse_q2_proposals_markdown,
 )
 from cti_app.application.production_workflow import _extraction_input_hash, _q2_source_model_run_id
+from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import (
     ModelProvider,
@@ -29,7 +31,12 @@ from cti_app.domain.model_runs import (
     ModelSubmissionState,
     ModelUsage,
 )
-from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
+from cti_app.domain.production import (
+    ProductionInputSnapshot,
+    ProductionInputSource,
+    SubjectProductionRun,
+    SubjectProductionStage,
+)
 from cti_app.integrations.models import (
     BridgeTransportError,
     FakeModelAdapter,
@@ -202,12 +209,11 @@ async def test_q2_model_gateway_reuses_persisted_model_run_across_worker_replay(
     assert len(adapter.calls) == 2
 
 
-def test_q2_markdown_unescapes_tokens_without_changing_windows_paths() -> None:
+def test_q2_markdown_parses_compact_facts_without_changing_windows_paths() -> None:
     parsed = parse_q2_proposals_markdown(
-        """# FACT
-category: infection\\_chain
-value: C:\\Windows uses other\\_technical and count\\_success
-evidence: C:\\inetpub\\wwwroot
+        """# FACTS
+## infection_chain
+- C:\\Windows uses other_technical and count_success
 """
     )
     assert parsed.usable
@@ -215,7 +221,7 @@ evidence: C:\\inetpub\\wwwroot
     fact = parsed.value.facts[0]
     assert fact.category == "infection_chain"
     assert fact.value == "C:\\Windows uses other_technical and count_success"
-    assert fact.evidence_quote == "C:\\inetpub\\wwwroot"
+    assert fact.evidence_quote == ""
 
 
 def test_bridge_timeout_codes_are_preserved() -> None:
@@ -245,10 +251,20 @@ class _Q2Runs:
         return self.run if self.run is not None and run_id == self.run.id else None
 
 
+class _Q2Snapshots:
+    def __init__(self) -> None:
+        self.snapshot: ProductionInputSnapshot | None = None
+
+    async def get_by_run(self, run_id: object) -> ProductionInputSnapshot | None:
+        del run_id
+        return self.snapshot
+
+
 class _Q2UnitOfWork:
     def __init__(self) -> None:
         self.production_artifacts = _Q2Artifacts()
         self.subject_production_runs = _Q2Runs()
+        self.production_input_snapshots = _Q2Snapshots()
 
     async def __aenter__(self) -> "_Q2UnitOfWork":
         return self
@@ -275,13 +291,7 @@ class _Q2Gateway:
             {
                 "output_text": self.output_text
                 if self.output_text is not None
-                else (
-                    "# FACT\n"
-                    "category: malware\n"
-                    "value: ExampleRAT\n"
-                    "context: outil observe\n"
-                    "evidence-quote: outil observe dans la source\n"
-                ),
+                else ("# FACTS\n\n## malware\n- ExampleRAT :: outil observe\n"),
                 "run": type(
                     "Run",
                     (),
@@ -371,6 +381,38 @@ def _q2_report(source_count: int = 5) -> ReferenceReport:
     )
 
 
+def _q2_snapshot() -> ProductionInputSnapshot:
+    return ProductionInputSnapshot(
+        production_run_id=uuid4(),
+        subject_id=uuid4(),
+        edition_id=uuid4(),
+        editorial_group_id=uuid4(),
+        editorial_group_version=1,
+        subject_title="Article",
+        subject_description="",
+        actor_or_campaign="",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        research_date=date(2026, 8, 1),
+        core_sources=(
+            ProductionInputSource(
+                batch_id=uuid4(),
+                candidate_id=uuid4(),
+                source_candidate_id=uuid4(),
+                canonical_url="https://example.test/1",
+                role=SourceRole.PRIMARY,
+                title="Source 1",
+                publisher="Example",
+                published_at=None,
+                tlp=TLP.CLEAR,
+                sensitivity="public",
+                external_llm_allowed=True,
+            ),
+        ),
+        captured_at=datetime.now().astimezone(),
+    )
+
+
 def _q2_orchestrator(
     monkeypatch: pytest.MonkeyPatch,
     gateway: Any,
@@ -417,7 +459,22 @@ def _q2_orchestrator(
         current_stage=SubjectProductionStage.EXTRACTION,
     )
     uow.subject_production_runs.run = run
+    uow.production_input_snapshots.snapshot = _q2_snapshot()
     return orchestrator, run, diagnostics
+
+
+@pytest.mark.asyncio
+async def test_q2_extraction_missing_snapshot_fails_before_any_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _Q2Gateway(None)
+    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(100))
+
+    result = await orchestrator._execute_direct_url_extraction(run)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "q2_extraction_plan_missing_snapshot"
+    assert gateway.calls == []
 
 
 @pytest.mark.parametrize("error_code", ["bridge_ui_timeout", "transport_glitch"])
@@ -436,7 +493,7 @@ async def test_q2_retryable_source_failure_stops_before_s2_and_does_not_create_a
     )
     orchestrator, run, diagnostics = _q2_orchestrator(monkeypatch, gateway, _q2_report())
 
-    result = await orchestrator._execute_direct_url_extraction(run)
+    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
 
     assert gateway.calls == ["S1"]
     assert result["status"] == "transient_error"
@@ -495,13 +552,7 @@ class _PersistentQ2Adapter:
             requested_model=self.requested_model,
             actual_model_version=self.requested_model,
             usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-            output_text=(
-                "# FACT\n"
-                "category: malware\n"
-                "value: ExampleRAT\n"
-                "context: outil observe\n"
-                "evidence-quote: outil observe dans la source\n"
-            ),
+            output_text=("# FACTS\n\n## malware\n- ExampleRAT :: outil observe\n"),
         )
 
     async def resume(
@@ -638,7 +689,7 @@ async def test_q2_succeeded_empty_output_keeps_provider_response_guard(
     gateway = _Q2Gateway(None, output_text="")
     orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
 
-    result = await orchestrator._execute_direct_url_extraction(run)
+    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
 
     assert result["status"] == "needs_review"
     assert result["error_code"] == "q2_provider_response_missing"
@@ -699,7 +750,7 @@ async def test_q2_nonretryable_source_failure_keeps_source_coverage_behavior(
     gateway.execute = execute  # type: ignore[method-assign]
     orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
 
-    result = await orchestrator._execute_direct_url_extraction(run)
+    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
 
     assert gateway.calls == ["S1", "S2"]
     assert result["status"] == "needs_review"

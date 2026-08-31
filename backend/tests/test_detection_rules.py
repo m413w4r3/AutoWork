@@ -61,45 +61,27 @@ def test_q2_rule_parser_preserves_multiline_bodies_and_rule_type_authority() -> 
         "title: Sigma: {quoted}\nlogsource:\n  product: windows\n"
         'detection:\n  selection:\n    CommandLine|contains: "x:y"\n  condition: selection'
     )
-    text = f"""# RULE
+    text = f"""# RULES
 
-rule-type: yara
-name: ExampleRule
-context: published YARA
-evidence: exact source block
+## yara: ExampleRule
 
 ```text
 {yara_body}
 ```
 
-# RULE
-
-rule-type: sigma
-name: SigmaExample
-context: published Sigma
-evidence: exact source block
+## sigma: SigmaExample
 
 ```yaml
 {sigma_body}
 ```
 
-# RULE
-
-rule-type: suricata
-name: alert-example
-context: published Suricata
-evidence: exact source line
+## suricata: alert-example
 
 ```suricata
 alert http any any -> any any (msg:"x:y {{q}}"; content:"abc"; sid:1;)
 ```
 
-# RULE
-
-rule-type: snort
-name: alert-snort
-context: published Snort
-evidence: exact source line
+## snort: alert-snort
 
 ```snort
 alert tcp any any -> any 443 (msg:"snort: {{quoted}}"; sid:2;)
@@ -121,12 +103,9 @@ alert tcp any any -> any 443 (msg:"snort: {{quoted}}"; sid:2;)
 
 def test_q2_truncated_rule_is_warned_and_not_promoted() -> None:
     result = parse_q2_proposals_markdown(
-        """# RULE
+        """# RULES
 
-rule-type: yara
-name: Truncated
-context: partial
-evidence: visible prefix
+## yara: Truncated
 
 ```yara
 rule Truncated {
@@ -135,8 +114,9 @@ rule Truncated {
 """
     )
 
-    assert not result.usable
-    assert result.value is None
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert result.value.rules == []
     assert "rule_truncated_not_promoted" in result.warnings
 
 

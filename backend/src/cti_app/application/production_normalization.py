@@ -15,7 +15,8 @@ _AT = re.compile(r"\[(?:at|@)\]|\((?:at|@)\)", re.IGNORECASE)
 
 def refang(raw: str) -> str:
     """Undo supported CTI defanging without performing validation."""
-    value = _DOT.sub(".", raw.strip())
+    value = raw.strip().replace(r"\:", ":")
+    value = _DOT.sub(".", value)
     value = _COLON.sub(":", value)
     value = _AT.sub("@", value)
     if value.lower().startswith("hxxps://"):
