@@ -84,7 +84,7 @@ from cti_app.domain.model_conversations import (
     ConversationTransport,
     ModelConversation,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelRole
+from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
 from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionInputSnapshot,
@@ -165,6 +165,18 @@ class _Q2ControlFailure(RuntimeError):
     retryable = False
     phase = "model_call"
     submission_state = "post_submission"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        if code:
+            self.code = code[:64]
+        self.details = details or {}
 
 
 def _classify_q2_failure(
@@ -1063,8 +1075,27 @@ class ProductionWorkflowOrchestrator:
                     ModelRole.RESEARCH,
                 )
                 await self._check_cancellation(run.id, context)
+                if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
+                    review_details = dict(execution.run.error_details or {})
+                    review_details.update(execution.metadata)
+                    raise _Q2ControlFailure(
+                        execution.run.error_message or "Model run needs review",
+                        code=execution.run.error_code or "q2_control_failure",
+                        details=review_details,
+                    )
+                if execution.run.status is not ModelRunStatus.SUCCEEDED:
+                    run_status = execution.run.status.value
+                    raise _Q2ControlFailure(
+                        f"Model run reached unexpected status {run_status}",
+                        code=execution.run.error_code or "q2_model_run_not_succeeded",
+                        details={
+                            **(execution.run.error_details or {}),
+                            **execution.metadata,
+                            "model_run_status": run_status,
+                        },
+                    )
                 raw = execution.output_text or ""
-                if not raw:
+                if not raw.strip():
                     raise _Q2ControlFailure("Provider returned no Q2 response")
                 parsed = parse_q2_proposals_markdown(raw)
                 self._log_parse(run, "extraction", parsed)
@@ -1106,11 +1137,15 @@ class ProductionWorkflowOrchestrator:
                 failed_attempts.append(source.local_id)
                 if classification.contributes_to_coverage:
                     failed.append(source.local_id)
+                exception_details = getattr(exc, "details", None)
                 failures[source.local_id] = {
                     "model_run_id": str(model_run_id),
                     "source_url": source.canonical_url,
                     "error_code": classification.error_code,
                     "error": error,
+                    "details": (
+                        dict(exception_details) if isinstance(exception_details, dict) else {}
+                    ),
                     "retryable": classification.retryable,
                     "phase": classification.phase,
                     "submission_state": classification.submission_state,

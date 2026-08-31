@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from cti_app.application.model_gateway import (
     AdapterResultStatus,
+    ModelGatewayError,
     ModelRoutingHint,
     SafeModelRequest,
     StructuredOutputError,
@@ -189,12 +190,48 @@ async def test_openai_structured_rejects_invalid_output() -> None:
             role=ModelRole.STRUCTURED_EXTRACTION,
             output_schema=Extraction,
         )
-
     output_format = transport.created_payloads[0]["text"]["format"]
     assert output_format["type"] == "json_schema"
     assert output_format["strict"] is True
     assert output_format["schema"]["additionalProperties"] is False
     assert output_format["schema"]["required"] == ["title", "score"]
+
+
+async def test_openai_needs_review_preserves_bridge_reason() -> None:
+    transport = FakeResponsesTransport(
+        {
+            "id": "resp_review",
+            "status": "needs_review",
+            "model": "chatgpt-web",
+            "error": {
+                "code": "active_signal_stalled",
+                "message": "ChatGPT s'est arrêté sans réponse finale.",
+            },
+            "metadata": {"completion_signal": "streaming"},
+        }
+    )
+    adapter = OpenAIResearchAdapter(transport, model="chatgpt-web")
+
+    result = await adapter.invoke(safe_request(), role=ModelRole.RESEARCH)
+
+    assert result.status is AdapterResultStatus.NEEDS_REVIEW
+    assert result.output_text is None
+    assert result.metadata["reason"] == "active_signal_stalled"
+
+
+async def test_openai_completed_empty_output_is_a_contract_error() -> None:
+    transport = FakeResponsesTransport(
+        {
+            "id": "resp_empty",
+            "status": "completed",
+            "model": "chatgpt-web",
+            "output_text": "",
+        }
+    )
+    adapter = OpenAIResearchAdapter(transport, model="chatgpt-web")
+
+    with pytest.raises(ModelGatewayError, match="empty output text"):
+        await adapter.invoke(safe_request(), role=ModelRole.RESEARCH)
 
 
 async def test_qwen_protocol_is_confined_to_its_adapter() -> None:

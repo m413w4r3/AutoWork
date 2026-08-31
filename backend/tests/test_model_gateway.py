@@ -161,7 +161,10 @@ class NeedsReviewAdapter:
             requested_model=self.requested_model,
             actual_model_version=self.requested_model,
             usage=ModelUsage(),
-            metadata={"reason": "uncertain"},
+            metadata={
+                "reason": "active_signal_stalled",
+                "completion_signal": "streaming",
+            },
         )
 
     async def resume(
@@ -448,6 +451,11 @@ async def test_needs_review_run_is_never_resubmitted() -> None:
         await gateway.research(model_request)
 
     assert first.run.status is ModelRunStatus.NEEDS_REVIEW
+    assert first.run.error_code == "active_signal_stalled"
+    assert first.run.error_message == ("ChatGPT s'est arrêté sans produire de réponse finale.")
+    assert first.run.error_details == first.metadata
+    assert first.metadata["reason"] == "active_signal_stalled"
+    assert first.output_text is None
     assert adapter.calls == 1
 
 

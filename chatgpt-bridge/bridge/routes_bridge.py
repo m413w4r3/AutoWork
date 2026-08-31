@@ -230,8 +230,16 @@ class BridgeRoutes:
                     "error": {
                         "code": exc.reason,
                         "message": "ChatGPT s'est arrêté sans réponse finale.",
+                        "retryable": False,
+                        "phase": "generation",
+                        "submission_state": "post_submission",
+                        "details": exc.details,
                     },
-                    "metadata": exc.details,
+                    "metadata": {
+                        **exc.details,
+                        "reason": exc.reason,
+                        "submission_state": "post_submission",
+                    },
                 }
                 self.registry.set_state(key, "needs_review", body)
                 logger.warning(

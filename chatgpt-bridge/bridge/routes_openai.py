@@ -190,6 +190,26 @@ class OpenAIRoutes:
                 conversation_result=conversation_result or None,
                 extension_metadata=extension_metadata or None,
             )
+        except NeedsReviewError as exc:
+            await _release_browser_target(self.bridge, browser_target, response_id)
+            response = _response_body(
+                response_id,
+                req,
+                status="needs_review",
+                error="ChatGPT s'est arrêté sans réponse finale.",
+            )
+            response["error"] = {
+                "code": exc.reason,
+                "message": "ChatGPT s'est arrêté sans réponse finale.",
+                "retryable": False,
+                "phase": "generation",
+                "submission_state": "post_submission",
+                "details": exc.details,
+            }
+            response["metadata"].update(exc.details)
+            response["metadata"]["reason"] = exc.reason
+            response["metadata"]["submission_state"] = "post_submission"
+            self.background_responses[response_id] = response
         except HTTPException as exc:
             await _release_browser_target(self.bridge, browser_target, response_id)
             # Un contrôle d'interface refusé est un diagnostic actionnable, pas

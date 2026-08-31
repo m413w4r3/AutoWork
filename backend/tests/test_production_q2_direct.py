@@ -258,8 +258,9 @@ class _Q2UnitOfWork:
 
 
 class _Q2Gateway:
-    def __init__(self, failure: Exception | None) -> None:
+    def __init__(self, failure: Exception | None, *, output_text: str | None = None) -> None:
         self.failure = failure
+        self.output_text = output_text
         self.calls: list[str] = []
 
     async def execute(self, request: ModelRequest, role: ModelRole) -> object:
@@ -272,16 +273,61 @@ class _Q2Gateway:
             "Execution",
             (),
             {
-                "output_text": (
+                "output_text": self.output_text
+                if self.output_text is not None
+                else (
                     "# FACT\n"
                     "category: malware\n"
                     "value: ExampleRAT\n"
                     "context: outil observe\n"
                     "evidence-quote: outil observe dans la source\n"
                 ),
-                "run": type("Run", (), {"id": uuid4()})(),
+                "run": type(
+                    "Run",
+                    (),
+                    {
+                        "id": uuid4(),
+                        "status": ModelRunStatus.SUCCEEDED,
+                        "error_code": None,
+                        "error_message": None,
+                        "error_details": None,
+                    },
+                )(),
+                "metadata": {},
             },
         )()
+
+
+class _NeedsReviewQ2Adapter:
+    provider = ModelProvider.OPENAI
+    requested_model = "chatgpt-web-fake"
+    is_external = True
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    async def invoke(
+        self, request: Any, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del role, output_schema
+        self.calls.append(request)
+        return AdapterResult(
+            status=AdapterResultStatus.NEEDS_REVIEW,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            usage=ModelUsage(input_tokens=1, output_tokens=0, total_tokens=1),
+            metadata={
+                "reason": "active_signal_stalled",
+                "completion_signal": "streaming",
+            },
+        )
+
+    async def resume(
+        self, response_id: str, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del response_id, role, output_schema
+        raise AssertionError("not used")
 
 
 class _Q2Diagnostics:
@@ -466,7 +512,7 @@ class _PersistentQ2Adapter:
 
 
 def _persistent_q2_gateway(
-    adapter: _PersistentQ2Adapter,
+    adapter: Any,
 ) -> tuple[ModelGateway, InMemoryModelRunUnitOfWorkFactory]:
     model_uow = InMemoryModelRunUnitOfWorkFactory()
     gateway = ModelGateway(
@@ -549,6 +595,55 @@ async def test_q2_submission_attempted_requires_reconciliation_and_stops(
         "model_submission_reconciliation_required"
     )
     assert result["source_failures"]["S1"]["failure_class"] == "reconciliation_required"
+
+
+@pytest.mark.asyncio
+async def test_q2_needs_review_preserves_active_signal_reason_and_never_calls_s2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _NeedsReviewQ2Adapter()
+    gateway, model_uow = _persistent_q2_gateway(adapter)
+    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
+
+    result = await orchestrator.execute_stage(
+        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+    )
+
+    model_run_id = _q2_source_model_run_id(
+        production_run_id=run.id,
+        pipeline_generation=run.pipeline_generation,
+        source_id="S1",
+        canonical_url="https://example.test/1",
+    )
+    failure = result["source_failures"]["S1"]
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "active_signal_stalled"
+    assert result["error"] == "ChatGPT s'est arrêté sans produire de réponse finale."
+    assert result["details"]["failure_class"] == "control_invariant_failure"
+    assert failure["error_code"] == "active_signal_stalled"
+    assert failure["retryable"] is False
+    assert failure["submission_state"] == "post_submission"
+    assert failure["failure_class"] == "control_invariant_failure"
+    assert failure["details"]["reason"] == "active_signal_stalled"
+    assert "q2_provider_response_missing" not in str(result)
+    assert [call.metadata["source_id"] for call in adapter.calls] == ["S1"]
+    assert model_uow.state[model_run_id].status is ModelRunStatus.NEEDS_REVIEW
+    assert model_uow.state[model_run_id].error_code == "active_signal_stalled"
+
+
+@pytest.mark.asyncio
+async def test_q2_succeeded_empty_output_keeps_provider_response_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _Q2Gateway(None, output_text="")
+    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
+
+    result = await orchestrator._execute_direct_url_extraction(run)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "q2_provider_response_missing"
+    assert result["source_failures"]["S1"]["failure_class"] == ("control_invariant_failure")
+    assert gateway.calls == ["S1"]
 
 
 @pytest.mark.asyncio

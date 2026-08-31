@@ -15,7 +15,7 @@ from starlette.requests import Request
 
 from bridge.app import BridgeApplication
 from bridge.contracts import ResponseRequest, RunControls
-from bridge.generation import _response_body, _response_chat_request
+from bridge.generation import NeedsReviewError, _response_body, _response_chat_request
 from bridge.ui import prepare_run
 
 
@@ -150,6 +150,37 @@ async def test_responses_facade_completes_background_request_without_network(
     assert completed["status"] == "completed"
     assert completed["output_text"] == "résultat simulé"
     assert completed["usage"]["estimated"] is True
+
+
+async def test_responses_background_preserves_needs_review_reason(
+    runtime: BridgeApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def needs_review_generation(*_: object, **__: object) -> AsyncIterator[str]:
+        raise NeedsReviewError(
+            "active_signal_stalled",
+            {"reason": "active_signal_stalled", "output_chars": 0},
+        )
+        yield "unreachable"
+
+    monkeypatch.setitem(
+        runtime.openai_routes._execute_background_response.__globals__,
+        "run_generation",
+        needs_review_generation,
+    )
+    runtime.bridge.ws = object()
+    request = ResponseRequest(input="Recherche autorisée", background=True)
+
+    queued = await runtime.openai_routes.create_response(request, _request())
+    await runtime.openai_routes.background_tasks[queued["id"]]
+    needs_review = await runtime.openai_routes.retrieve_response(queued["id"])
+
+    assert needs_review["status"] == "needs_review"
+    assert needs_review["error"]["code"] == "active_signal_stalled"
+    assert needs_review["metadata"]["reason"] == "active_signal_stalled"
+
+
+def _request() -> Request:
+    return Request({"type": "http", "method": "POST", "path": "/v1/responses"})
 
 
 def _stub_controls(

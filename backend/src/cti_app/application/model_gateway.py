@@ -618,7 +618,12 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     )
                     await uow.model_runs.save(run)
                     await uow.commit()
-                    return ModelExecution(run, metadata=result.metadata)
+                    return ModelExecution(
+                        run=run,
+                        output_text=None,
+                        conversation=result.conversation,
+                        metadata=dict(result.metadata),
+                    )
                 execution = await self._complete_run(run, result, duration_ms=elapsed_ms)
                 await uow.model_runs.save(run)
                 await uow.commit()
@@ -796,7 +801,12 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     )
                     await uow.model_runs.save(persisted)
                     await uow.commit()
-                    return ModelExecution(persisted, metadata=result.metadata)
+                    return ModelExecution(
+                        run=persisted,
+                        output_text=None,
+                        conversation=result.conversation,
+                        metadata=dict(result.metadata),
+                    )
                 execution = await self._complete_run(
                     persisted,
                     result,

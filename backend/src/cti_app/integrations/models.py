@@ -813,7 +813,10 @@ def _responses_result(
         metadata = _response_metadata(raw)
         error = raw.get("error")
         if isinstance(error, dict):
-            metadata["reason"] = str(error.get("code", "no_final_answer"))
+            reason = error.get("code")
+            metadata["reason"] = (
+                reason[:64] if isinstance(reason, str) and reason else "no_final_answer"
+            )
         return AdapterResult(
             status=AdapterResultStatus.NEEDS_REVIEW,
             provider=provider,
@@ -924,6 +927,8 @@ def _conversation_result(raw: dict[str, Any]) -> ConversationResult | None:
 def _responses_output_text(raw: dict[str, Any]) -> str:
     direct = raw.get("output_text")
     if isinstance(direct, str):
+        if not direct:
+            raise ModelGatewayError("Completed model response contains empty output text")
         return direct
     pieces: list[str] = []
     output = raw.get("output")
@@ -938,9 +943,10 @@ def _responses_output_text(raw: dict[str, Any]) -> str:
                         text = part.get("text")
                         if isinstance(text, str):
                             pieces.append(text)
-    if not pieces:
-        raise ModelGatewayError("Model response does not contain output text")
-    return "".join(pieces)
+    output_text = "".join(pieces)
+    if not output_text:
+        raise ModelGatewayError("Completed model response contains empty output text")
+    return output_text
 
 
 def _chat_output_text(raw: dict[str, Any]) -> str:

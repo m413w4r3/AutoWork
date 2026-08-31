@@ -33,6 +33,7 @@ logger = logging.getLogger("chatgpt_bridge")
 # Parsing des entrées
 # --------------------------------------------------------------------------- #
 _DATA_URI = re.compile(r"^data:([\w.+-]+/[\w.+-]+)?(;base64)?,(.*)$", re.DOTALL)
+_REVIEW_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 def _from_data_uri(url: str, name: Optional[str], prefix: str) -> Optional[FileAttachment]:
@@ -570,14 +571,15 @@ async def run_generation(
                     conversation.id,
                 )
             elif kind == "incomplete":
-                reason = str(packet.get("reason", "no_final_answer"))
-                if reason not in {
-                    "no_final_answer",
-                    "finalization_stalled",
-                    "active_signal_stalled",
-                    "dom_unstable",
-                }:
-                    reason = "no_final_answer"
+                submission_state = "post_submission"
+                submission_phase = "generation"
+                reported_reason = packet.get("reason")
+                reason = (
+                    reported_reason
+                    if isinstance(reported_reason, str)
+                    and _REVIEW_REASON.fullmatch(reported_reason)
+                    else "no_final_answer"
+                )
                 metadata = packet.get("metadata")
                 initial_turn_id = (
                     metadata.get("initial_turn_id") if isinstance(metadata, dict) else None
@@ -598,6 +600,8 @@ async def run_generation(
                     ),
                     "initial_turn_id": initial_turn_id,
                     "output_chars": 0,
+                    "phase": submission_phase,
+                    "submission_state": submission_state,
                 }
                 raise NeedsReviewError(reason, details)
             elif kind == "done":
@@ -609,6 +613,24 @@ async def run_generation(
                         "snapshot final absent ou invalide",
                         phase=submission_phase,
                         submission_state=submission_state,
+                    )
+                if not final_text:
+                    reported_metadata = packet.get("metadata")
+                    metadata = (
+                        reported_metadata if isinstance(reported_metadata, dict) else {}
+                    )
+                    raise NeedsReviewError(
+                        "no_final_answer",
+                        {
+                            "reason": "no_final_answer",
+                            "conversation": dict(conversation_result or {}),
+                            "completion_signal": metadata.get("completion_signal"),
+                            "completion_confidence": metadata.get("completion_confidence"),
+                            "initial_turn_id": metadata.get("initial_turn_id"),
+                            "output_chars": 0,
+                            "phase": submission_phase,
+                            "submission_state": submission_state,
+                        },
                     )
                 reported_metadata = packet.get("metadata")
                 if not isinstance(reported_metadata, dict):

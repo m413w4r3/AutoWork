@@ -231,6 +231,88 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
     assert extension.prompt_count == 1
 
 
+async def test_active_signal_stalled_incomplete_is_native_needs_review(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+
+    class StalledExtension(FakeExtension):
+        async def _respond(self, payload: dict[str, Any]) -> None:
+            if payload["type"] != "prompt":
+                await super()._respond(payload)
+                return
+            self.prompt_count += 1
+            browser_target = payload.get("browser_target")
+            route = (
+                {"target_id": browser_target["id"], "tab_id": 1}
+                if isinstance(browser_target, dict)
+                else {}
+            )
+            self.runtime.bridge.dispatch(
+                {
+                    "type": "incomplete",
+                    "id": payload["id"],
+                    "event_id": "stalled",
+                    "reason": "active_signal_stalled",
+                    "metadata": {"completion_signal": "streaming", "output_chars": 0},
+                    **route,
+                }
+            )
+
+    extension = StalledExtension(runtime)
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="mission"), request_with_key("active-signal-stalled")
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error"]["code"] == "active_signal_stalled"
+    assert result["metadata"]["reason"] == "active_signal_stalled"
+    assert extension.prompt_count == 1
+
+
+async def test_empty_done_is_never_reported_as_completed(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+
+    class EmptyDoneExtension(FakeExtension):
+        async def _respond(self, payload: dict[str, Any]) -> None:
+            if payload["type"] != "prompt":
+                await super()._respond(payload)
+                return
+            self.prompt_count += 1
+            browser_target = payload.get("browser_target")
+            route = (
+                {"target_id": browser_target["id"], "tab_id": 1}
+                if isinstance(browser_target, dict)
+                else {}
+            )
+            self.runtime.bridge.dispatch(
+                {
+                    "type": "done",
+                    "id": payload["id"],
+                    "event_id": "empty",
+                    "text": "",
+                    "metadata": {"output_chars": 0},
+                    **route,
+                }
+            )
+
+    extension = EmptyDoneExtension(runtime)
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="empty final"), request_with_key("empty-done")
+    )
+
+    assert result["status"] != "completed"
+    assert result["status"] == "needs_review"
+    assert result["error"]["code"] == "no_final_answer"
+    assert extension.prompt_count == 1
+
+
 async def test_conversation_binding_precedes_incomplete_and_survives_restart(
     runtime: BridgeApplication, tmp_path: Path
 ) -> None:
