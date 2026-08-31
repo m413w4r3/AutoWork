@@ -182,8 +182,8 @@ async def capture_snapshot_for_new_run(
     get_latest = getattr(
         uow.subject_production_runs, "get_latest_terminal_for_edition_subject", None
     )
-    snapshots = getattr(uow, "production_input_snapshots", None)
-    if get_latest is None or snapshots is None:
+    snapshots = uow.production_input_snapshots
+    if get_latest is None:
         return current
     previous_run = await get_latest(run.edition_id, run.subject_id)
     if previous_run is None:
@@ -246,15 +246,9 @@ class SubjectProductionService:
                     edition_id=edition_id,
                     run_number=next_run_number,
                 )
-                snapshot_repository = getattr(uow, "production_input_snapshots", None)
-                snapshot = (
-                    await capture_snapshot_for_new_run(uow, run=run)
-                    if snapshot_repository is not None
-                    else None
-                )
+                snapshot = await capture_snapshot_for_new_run(uow, run=run)
                 await uow.subject_production_runs.add(run)
-                if snapshot_repository is not None and snapshot is not None:
-                    await snapshot_repository.add(snapshot)
+                await uow.production_input_snapshots.add(snapshot)
                 await uow.commit()
                 return run, True
         except ActiveSubjectProductionRunConflictError:
@@ -587,15 +581,9 @@ class EditionProductionService:
                     created_at=created_at,
                     updated_at=created_at,
                 )
-                snapshot_repository = getattr(uow, "production_input_snapshots", None)
-                snapshot = (
-                    await capture_snapshot_for_new_run(uow, run=run)
-                    if snapshot_repository is not None
-                    else None
-                )
+                snapshot = await capture_snapshot_for_new_run(uow, run=run)
                 await uow.subject_production_runs.add(run)
-                if snapshot_repository is not None and snapshot is not None:
-                    await snapshot_repository.add(snapshot)
+                await uow.production_input_snapshots.add(snapshot)
 
                 item = EditionProductionBatchItem(
                     batch_id=batch.id,

@@ -138,6 +138,7 @@ class _WorkflowUow:
     def __init__(self, run: SubjectProductionRun) -> None:
         self.subject_production_runs = self
         self.run = run
+        self.production_input_snapshots = self
 
     async def __aenter__(self) -> _WorkflowUow:
         return self
@@ -147,6 +148,9 @@ class _WorkflowUow:
 
     async def get(self, run_id: UUID) -> SubjectProductionRun | None:
         return self.run if run_id == self.run.id else None
+
+    async def get_by_run(self, run_id: UUID) -> object | None:
+        return object() if run_id == self.run.id else None
 
 
 def _run(

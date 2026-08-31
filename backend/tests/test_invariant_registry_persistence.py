@@ -36,8 +36,9 @@ def test_registry_tables_are_queryable_and_do_not_own_blobs() -> None:
     }
 
 
-def test_migration_is_the_single_next_revision() -> None:
-    migration = Path(__file__).parents[1] / "migrations" / "versions" / "0011_invariant_registry.py"
+def test_current_schema_is_created_by_the_single_baseline() -> None:
+    migration = Path(__file__).parents[1] / "migrations" / "versions" / "0001_baseline.py"
     source = migration.read_text()
-    assert 'revision = "0011_invariant_registry"' in source
-    assert 'down_revision = "0010_code_features"' in source
+    assert 'revision: str = "0001_baseline"' in source
+    assert "down_revision: str | None = None" in source
+    assert "Base.metadata.create_all" in source

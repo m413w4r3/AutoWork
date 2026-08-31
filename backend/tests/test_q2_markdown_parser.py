@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
+
 from cti_app.application.production_artifact_verification import (
     ProposalStatus,
     Q2ProposalSubmission,
@@ -14,6 +16,7 @@ from cti_app.application.production_parsers import (
     Q2SourceOutput,
     parse_q2_proposals_markdown,
     project_q2_source_output,
+    q2_source_output_from_json,
 )
 from cti_app.application.production_prompts import (
     EXTRACTION_PROMPT_VERSION,
@@ -126,6 +129,31 @@ evidence: source
 
     assert not result.usable
     assert "q2_compact_sections_missing" in result.errors
+
+
+@pytest.mark.parametrize(
+    ("contract_version", "schema_version"),
+    [
+        (None, "3"),
+        ("q2-source-extraction-v2", "3"),
+        ("q2-source-extraction-v3", None),
+        ("q2-source-extraction-v3", "2"),
+    ],
+)
+def test_q2_checkpoint_requires_current_versions(
+    contract_version: str | None, schema_version: str | None
+) -> None:
+    payload = {
+        "contract_version": contract_version,
+        "schema_version": schema_version,
+        "facts": [],
+        "artifacts": [],
+        "rules": [],
+        "uncertainties": [],
+    }
+
+    with pytest.raises(ValueError, match="Q2 source extraction"):
+        q2_source_output_from_json(payload)
 
 
 def test_source_ids_are_attached_by_verifier_not_required_from_model() -> None:

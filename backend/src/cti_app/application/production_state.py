@@ -478,9 +478,8 @@ class ProductionStateService:
                 version=1,
             )
             await uow.subject_production_runs.add(run)
-            snapshot_repository = getattr(uow, "production_input_snapshots", None)
             editorial_group = await uow.editorial_groups.get_by_subject(subject_id)
-            if snapshot_repository is not None and editorial_group is not None:
+            if editorial_group is not None:
                 assert run.research_date is not None
                 input_snapshot = await capture_production_input_snapshot(
                     uow,
@@ -490,7 +489,7 @@ class ProductionStateService:
                     research_date=run.research_date,
                     captured_at=now,
                 )
-                await snapshot_repository.add(input_snapshot)
+                await uow.production_input_snapshots.add(input_snapshot)
             refs = ProductionArtifact(
                 production_run_id=run.id,
                 subject_id=subject_id,

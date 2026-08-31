@@ -656,8 +656,12 @@ async def get_subject_production(
             )
 
         group = await uow.editorial_groups.get_by_subject(subject_id)
-        snapshot_repository = getattr(uow, "production_input_snapshots", None)
-        snapshot = await snapshot_repository.get_by_run(run.id) if snapshot_repository else None
+        snapshot = await uow.production_input_snapshots.get_by_run(run.id)
+        if snapshot is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"code": "production_input_snapshot_missing"},
+            )
 
         # Artifacts evidence the stages that produce one; SOURCES does not.
         artifacts = await uow.production_artifacts.list_for_run(run.id)
@@ -669,7 +673,7 @@ async def get_subject_production(
             run,
             artifacts_by_stage,
             archived_sources=archived_sources,
-            research_date=snapshot.research_date if snapshot else run.research_date,
+            research_date=snapshot.research_date,
         )
         completed_stages = completed_stage_count(stages)
 
@@ -677,7 +681,7 @@ async def get_subject_production(
             subject_id=str(run.subject_id),
             title=(
                 snapshot.subject_title
-                if snapshot
+                if snapshot.subject_title
                 else group.title
                 if group
                 else str(run.subject_id)
@@ -793,12 +797,6 @@ async def invalidate_production_reuse(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "reuse_invalidation_run_active"},
             )
-        repository = getattr(uow, "production_reuse_invalidations", None)
-        if repository is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={"code": "production_reuse_invalidation_unavailable"},
-            )
         occurred_at = datetime.now(UTC)
         invalidation = ProductionReuseInvalidation(
             edition_id=run.edition_id,
@@ -808,7 +806,7 @@ async def invalidate_production_reuse(
             correlation_id=get_correlation_id(),
             occurred_at=occurred_at,
         )
-        await repository.add(invalidation)
+        await uow.production_reuse_invalidations.add(invalidation)
         await uow.commit()
 
     return {

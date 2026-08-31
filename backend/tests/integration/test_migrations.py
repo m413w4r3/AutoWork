@@ -59,6 +59,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     edition_publication,
     editions,
     editorial,
+    invariants,
     jobs,
     model_execution,
     production,
@@ -531,35 +532,3 @@ def test_migration_up_and_down_on_temporary_postgres(temporary_postgres_url: str
     assert asyncio.run(_table_names(temporary_postgres_url)) == EXPECTED_TABLES
     assert asyncio.run(_function_names(temporary_postgres_url)) == EXPECTED_FUNCTIONS
     assert asyncio.run(_trigger_function_pairs(temporary_postgres_url)) == EXPECTED_TRIGGERS
-
-
-def test_goodware_v2_downgrade_refuses_existing_baseline(temporary_postgres_url: str) -> None:
-    config = _alembic_config(temporary_postgres_url)
-    command.upgrade(config, "head")
-
-    async def _insert_baseline() -> None:
-        engine = create_async_engine(temporary_postgres_url)
-        try:
-            async with engine.begin() as connection:
-                await connection.execute(
-                    text(
-                        "INSERT INTO goodware_baselines "
-                        "(id, baseline_fingerprint_sha256, source_set_sha256, "
-                        "normalization_version, record_count, occurrence_sum, pattern_version, "
-                        "created_at) VALUES (gen_random_uuid(), :fingerprint, :source_set, "
-                        ":normalization, 0, 0, :pattern, now())"
-                    ),
-                    {
-                        "fingerprint": "a" * 64,
-                        "source_set": "b" * 64,
-                        "normalization": "autowork-goodware-normalization-v2",
-                        "pattern": "non-discriminant-patterns-v1",
-                    },
-                )
-        finally:
-            await engine.dispose()
-
-    asyncio.run(_insert_baseline())
-    with pytest.raises(RuntimeError, match="v2 downgrade"):
-        command.downgrade(config, "0011_invariant_registry")
-    assert "goodware_baseline_indexes" in asyncio.run(_table_names(temporary_postgres_url))

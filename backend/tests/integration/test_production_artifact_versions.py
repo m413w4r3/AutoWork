@@ -21,8 +21,24 @@ from cti_app.application.production_parsers import (
 from cti_app.application.production_state import ProductionStateService
 from cti_app.application.subject_production import SubjectProductionService
 from cti_app.domain.classification import TLP
+from cti_app.domain.discovery import (
+    CandidateTopic,
+    DiscoveryBatch,
+    DiscoverySourceMode,
+    SourceCandidate,
+    SourceRelationshipStatus,
+    SourceRole,
+)
 from cti_app.domain.editions import Edition
+from cti_app.domain.editorial import (
+    CandidateReference,
+    EditorialGroup,
+    EditorialScore,
+    GroupingConfidence,
+    GroupingOutcome,
+)
 from cti_app.domain.entities import Subject
+from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
 from cti_app.domain.production import (
     AnalystInputPack,
     AnalystInvestigation,
@@ -463,15 +479,93 @@ async def test_concurrent_subject_run_creation_converges_on_one_postgres_run(
         slug=f"concurrent-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
+    source = SourceCandidate(
+        url="https://example.test/concurrent-source",
+        title="Concurrent source",
+        publisher="Example publisher",
+        role=SourceRole.PRIMARY,
+        tlp=TLP.AMBER,
+        sensitivity="public",
+        external_llm_allowed=True,
+    )
+    candidate = CandidateTopic(
+        title="Concurrent subject",
+        summary="A selected subject for the concurrency test.",
+        novelty="new",
+        technical_potential=3,
+        uncertainties=(),
+        relevance_reasons=("test",),
+        actors=(),
+        campaigns=(),
+        malware=(),
+        cves=(),
+        victims=(),
+        sectors=(),
+        countries=(),
+        likely_artifacts=(),
+        sources=[source],
+        tlp=TLP.AMBER,
+        sensitivity="public",
+        external_llm_allowed=True,
+    )
+    discovery_batch = DiscoveryBatch(
+        edition_id=edition.id,
+        request_hash=(subject.id.hex * 2)[:64],
+        complementary_axis="concurrency",
+        queries=(),
+        citations=(),
+        discovery_model_run_id=uuid4(),
+        tlp=TLP.AMBER,
+        sensitivity="public",
+        external_llm_allowed=True,
+        parser_version="test",
+        candidates=[candidate],
+        source_mode=DiscoverySourceMode.NATIVE_COMPLETE,
+        source_coverage_complete=True,
+        source_coverage_incomplete_reason=None,
+    )
+    group = EditorialGroup(
+        edition_id=edition.id,
+        title="Concurrent subject",
+        candidate_references=(CandidateReference(discovery_batch.id, candidate.id),),
+        outcome=GroupingOutcome.NEW_SUBJECT,
+        score=EditorialScore(
+            impact=3,
+            novelty=3,
+            technical_depth=3,
+            hunting_potential=3,
+            actionability=3,
+            source_quality=3,
+            justifications={},
+        ),
+        source_relationship_status=SourceRelationshipStatus.VERIFIED,
+        needs_source_verification=False,
+        needs_source_expansion=False,
+        grouping_confidence=GroupingConfidence.HIGH,
+        grouping_justification="A stable test subject.",
+    )
+    group.select(subject.id)
+    discovery_model_run = ModelRun(
+        provider=ModelProvider.FAKE,
+        model_role=ModelRole.RESEARCH,
+        requested_model="test",
+        prompt_template_id="test",
+        prompt_template_version="1",
+        authorized_input_hash="0" * 64,
+        evidence_pack_hash="0" * 64,
+        parameters={},
+    )
+    discovery_batch.discovery_model_run_id = discovery_model_run.id
 
     async with SqlAlchemyUnitOfWork(session_factory) as uow:
         assert await uow.editions.add_if_absent(edition)
         await uow.subjects.add(subject)
+        await uow.model_runs.add(discovery_model_run)
+        await uow.discovery_batches.add_if_absent(discovery_batch)
+        await uow.editorial_groups.add(group)
         await uow.commit()
 
     class RunCreationUnitOfWork:
-        production_input_snapshots = None
-
         def __init__(self) -> None:
             self._delegate = SqlAlchemyUnitOfWork(session_factory)
 

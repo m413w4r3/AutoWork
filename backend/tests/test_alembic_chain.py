@@ -1,4 +1,4 @@
-"""Static invariants for the intentionally short Alembic chain."""
+"""Static invariants for the single fresh-schema Alembic baseline."""
 
 from pathlib import Path
 
@@ -6,30 +6,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_CHAIN = (
-    "0001_baseline",
-    "0002_virustotal",
-    "0003_analyst_workflow",
-    "0004_sample_lifecycle",
-    "0005_sample_acquisition",
-    "0006_static_analysis",
-    "0007_goodware_baselines",
-    "0008_reference_corpus",
-    "0009_capability_sets",
-    "0010_code_features",
-    "0011_invariant_registry",
-    "0012_goodware_index_artifacts",
-    "0013_production_batch",
-    "0014_publication_review",
-    "0015_nullable_review_document",
-    "0016_edition_publication",
-    "0017_unified_article_production",
-    "0018_subject_active_run",
-    "0019_production_reuse",
-    "0020_model_run_submission",
-    "0021_source_extraction_cache",
-    "0022_extraction_progress",
-)
+EXPECTED_CHAIN = ("0001_baseline",)
 
 
 def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
@@ -45,25 +22,4 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
     assert set(revision_ids) == set(EXPECTED_CHAIN)
     assert {script.revision: script.down_revision for script in revisions} == {
         "0001_baseline": None,
-        "0002_virustotal": "0001_baseline",
-        "0003_analyst_workflow": "0002_virustotal",
-        "0004_sample_lifecycle": "0003_analyst_workflow",
-        "0005_sample_acquisition": "0004_sample_lifecycle",
-        "0006_static_analysis": "0005_sample_acquisition",
-        "0007_goodware_baselines": "0006_static_analysis",
-        "0008_reference_corpus": "0007_goodware_baselines",
-        "0009_capability_sets": "0008_reference_corpus",
-        "0010_code_features": "0009_capability_sets",
-        "0011_invariant_registry": "0010_code_features",
-        "0012_goodware_index_artifacts": "0011_invariant_registry",
-        "0013_production_batch": "0012_goodware_index_artifacts",
-        "0014_publication_review": "0013_production_batch",
-        "0015_nullable_review_document": "0014_publication_review",
-        "0016_edition_publication": "0015_nullable_review_document",
-        "0017_unified_article_production": "0016_edition_publication",
-        "0018_subject_active_run": "0017_unified_article_production",
-        "0019_production_reuse": "0018_subject_active_run",
-        "0020_model_run_submission": "0019_production_reuse",
-        "0021_source_extraction_cache": "0020_model_run_submission",
-        "0022_extraction_progress": "0021_source_extraction_cache",
     }

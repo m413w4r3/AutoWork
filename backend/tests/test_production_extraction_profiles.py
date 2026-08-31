@@ -235,11 +235,6 @@ class _CacheRepository:
     async def get_by_identity(self, **values: str) -> SourceExtraction | None:
         return self.rows.get(self._key(values))
 
-    async def find_any(self, source_content_sha256: str) -> list[SourceExtraction]:
-        return [
-            row for row in self.rows.values() if row.source_content_sha256 == source_content_sha256
-        ]
-
     async def claim(self, extraction: SourceExtraction, *, force: bool = False) -> bool:
         identity = {
             "source_content_sha256": extraction.source_content_sha256,

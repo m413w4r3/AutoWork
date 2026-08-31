@@ -261,9 +261,9 @@ def q2_source_output_to_json(output: Q2SourceOutput) -> dict[str, Any]:
 
 def q2_source_output_from_json(payload: dict[str, Any]) -> Q2SourceOutput:
     """Load a source-centric checkpoint without accepting internal IDs."""
-    if payload.get("contract_version") not in {None, Q2_EXTRACTION_CONTRACT_VERSION}:
+    if payload.get("contract_version") != Q2_EXTRACTION_CONTRACT_VERSION:
         raise ValueError("Q2 source extraction contract is incompatible")
-    if payload.get("schema_version") not in {None, Q2_SCHEMA_VERSION}:
+    if payload.get("schema_version") != Q2_SCHEMA_VERSION:
         raise ValueError("Q2 source extraction schema is incompatible")
     return Q2SourceOutput.model_validate(
         {

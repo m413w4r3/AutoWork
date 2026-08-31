@@ -31,6 +31,7 @@ from cti_app.application.production_state import (
 )
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRelationshipStatus
+from cti_app.domain.editions import EditionStatus
 from cti_app.domain.editorial import (
     CandidateReference,
     EditorialGroup,
@@ -95,6 +96,81 @@ class _Groups:
 
     async def get_by_subject(self, subject_id: UUID) -> EditorialGroup | None:
         return next((g for g in self._groups if g.subject_id == subject_id), None)
+
+
+class _Edition:
+    def __init__(self, edition_id: UUID) -> None:
+        self.id = edition_id
+        self.status = EditionStatus.SELECTION
+        self.version = 1
+        today = datetime.now(UTC).date()
+        self.period_start = today
+        self.period_end = today
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"id": str(self.id), "status": self.status.value, "version": self.version}
+
+    def transition(self, status: EditionStatus, *, now: datetime) -> None:
+        del now
+        self.status = status
+        self.version += 1
+
+
+class _Editions:
+    def __init__(self) -> None:
+        self.items: dict[UUID, _Edition] = {}
+
+    async def get(self, edition_id: UUID) -> _Edition:
+        return self.items.setdefault(edition_id, _Edition(edition_id))
+
+    async def get_for_update(self, edition_id: UUID) -> _Edition:
+        return await self.get(edition_id)
+
+    async def update(self, edition: _Edition, expected_version: int) -> bool:
+        if edition.version != expected_version + 1:
+            return False
+        self.items[edition.id] = edition
+        return True
+
+
+class _Audit:
+    async def append(self, event: Any) -> None:
+        del event
+
+
+class _DiscoveryBatches:
+    def __init__(self, groups: Sequence[EditorialGroup]) -> None:
+        self.groups = groups
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                id=reference.batch_id,
+                candidates=[
+                    SimpleNamespace(
+                        id=reference.candidate_id,
+                        sources=[],
+                        actors=(),
+                        campaigns=(),
+                        actor_or_campaign="unknown",
+                    )
+                ],
+            )
+            for group in self.groups
+            if group.edition_id == edition_id
+            for reference in group.candidate_references
+        ]
+
+
+class _Snapshots:
+    def __init__(self) -> None:
+        self.items: dict[UUID, Any] = {}
+
+    async def add(self, snapshot: Any) -> None:
+        self.items[snapshot.production_run_id] = snapshot
+
+    async def get_by_run(self, run_id: UUID) -> Any | None:
+        return self.items.get(run_id)
 
 
 class _Runs:
@@ -337,10 +413,14 @@ class _Uow:
 
     def __init__(self, groups: list[EditorialGroup]) -> None:
         self.editorial_groups = _Groups(groups)
+        self.editions = _Editions()
+        self.discovery_batches = _DiscoveryBatches(groups)
         self.subject_production_runs = _Runs()
+        self.production_input_snapshots = _Snapshots()
         self.edition_production_batches = _Batches()
         self.edition_production_batch_items = _BatchItems()
         self.production_artifacts = _Artifacts()
+        self.edition_audit = _Audit()
         self.batch_status_read_model = _BatchStatusReadModel(self)
         self.source_collections = _SourceCollections()
         self.analyst_investigations = _Investigations()
@@ -1351,6 +1431,7 @@ async def test_retry_stage_reuses_run_and_stales_selected_stage_and_downstream(
     else:
         run.mark_needs_review(code="extraction_review", message="review")
     await uow.subject_production_runs.add(run)
+    (await uow.editions.get(edition_id)).status = EditionStatus.PRODUCTION
     for artifact_stage in ProductionArtifactStage:
         await uow.production_artifacts.append(_artifact(run, artifact_stage))
 
@@ -1398,6 +1479,7 @@ async def test_retry_stage_rejects_queued_or_running_run(
     if status is SubjectProductionStatus.RUNNING:
         run.start_running()
     await uow.subject_production_runs.add(run)
+    (await uow.editions.get(run.edition_id)).status = EditionStatus.PRODUCTION
 
     response = await api.post(
         f"/api/subjects/{run.subject_id}/production/retry", json={"stage": "extraction"}
@@ -1440,6 +1522,7 @@ async def test_retry_by_run_changes_only_the_requested_run(
     second = _terminal_run(first.edition_id, subject_id, status=SubjectProductionStatus.FAILED)
     await uow.subject_production_runs.add(first)
     await uow.subject_production_runs.add(second)
+    (await uow.editions.get(first.edition_id)).status = EditionStatus.PRODUCTION
     await uow.production_artifacts.append(_artifact(first, ProductionArtifactStage.REFERENCES))
 
     response = await api.post(

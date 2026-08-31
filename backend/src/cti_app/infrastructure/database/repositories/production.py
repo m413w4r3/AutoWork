@@ -562,14 +562,6 @@ class SqlAlchemySourceExtractionRepository:
         )
         return _source_extraction_from_row(row) if row else None
 
-    async def find_any(self, source_content_sha256: str) -> Sequence[SourceExtraction]:
-        rows = await self._session.scalars(
-            select(SourceExtractionRow)
-            .where(SourceExtractionRow.source_content_sha256 == source_content_sha256)
-            .order_by(SourceExtractionRow.created_at, SourceExtractionRow.id)
-        )
-        return [_source_extraction_from_row(row) for row in rows]
-
     async def claim(self, extraction: SourceExtraction, *, force: bool = False) -> bool:
         values = _source_extraction_values(extraction)
         inserted_id = await self._session.scalar(

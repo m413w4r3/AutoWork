@@ -730,14 +730,13 @@ class ProductionWorkflowOrchestrator:
         # lock, in the job handler.
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get(run_id)
-            snapshot_repository = getattr(uow, "production_input_snapshots", None)
             snapshot = (
-                await snapshot_repository.get_by_run(run.id)
-                if run is not None and snapshot_repository is not None
-                else None
+                await uow.production_input_snapshots.get_by_run(run.id) if run is not None else None
             )
         if not run:
             raise ValueError(f"Production run {run_id} not found")
+        if snapshot is None:
+            raise RuntimeError("production_input_snapshot_missing")
 
         await self._check_cancellation(run.id, context)
 
@@ -1394,9 +1393,7 @@ class ProductionWorkflowOrchestrator:
             profiles.append(ExtractionProfile.FULL)
         for profile in profiles:
             async with self._uow_factory() as uow:
-                source_repository = getattr(uow, "source_extractions", None)
-                if source_repository is None:
-                    return None, None, "unavailable"
+                source_repository = uow.source_extractions
                 row = await source_repository.get_by_identity(
                     **self._source_extraction_identity(
                         source_content_sha256=source_content_sha256,
@@ -1411,9 +1408,7 @@ class ProductionWorkflowOrchestrator:
                 for _ in range(150):
                     await asyncio.sleep(0.2)
                     async with self._uow_factory() as uow:
-                        source_repository = getattr(uow, "source_extractions", None)
-                        if source_repository is None:
-                            return None, None, "unavailable"
+                        source_repository = uow.source_extractions
                         row = await source_repository.get_by_identity(
                             **self._source_extraction_identity(
                                 source_content_sha256=source_content_sha256,
@@ -1427,25 +1422,20 @@ class ProductionWorkflowOrchestrator:
             if row is None or row.status is not SourceExtractionStatus.VERIFIED:
                 continue
             if row.canonical_blob_id is None:
-                return None, row, "incompatible"
+                continue
             try:
                 output = q2_source_output_from_json(
                     await self._artifact_store.read_json(row.canonical_blob_id)
                 )
             except Exception:
-                return None, row, "incompatible"
+                continue
             return (
                 project_q2_source_output(output, plan.profile),
                 row,
                 ("cached_full" if profile is ExtractionProfile.FULL else "cached_light"),
             )
 
-        async with self._uow_factory() as uow:
-            source_repository = getattr(uow, "source_extractions", None)
-            if source_repository is None:
-                return None, None, "unavailable"
-            existing = await source_repository.find_any(source_content_sha256)
-        return None, (existing[0] if existing else None), ("incompatible" if existing else "miss")
+        return None, None, "miss"
 
     async def _claim_source_extraction(
         self,
@@ -1470,9 +1460,7 @@ class ProductionWorkflowOrchestrator:
             model_run_id=model_run_id,
         )
         async with self._uow_factory() as uow:
-            source_repository = getattr(uow, "source_extractions", None)
-            if source_repository is None:
-                return None, False
+            source_repository = uow.source_extractions
             claimed = await source_repository.claim(candidate, force=force)
             current = await source_repository.get_by_identity(
                 **self._source_extraction_identity(
@@ -1506,19 +1494,15 @@ class ProductionWorkflowOrchestrator:
             canonical_blob_id=canonical_blob_id,
         )
         async with self._uow_factory() as uow:
-            source_repository = getattr(uow, "source_extractions", None)
-            if source_repository is not None:
-                await source_repository.save(completed)
-                await uow.commit()
+            await uow.source_extractions.save(completed)
+            await uow.commit()
 
     async def _fail_source_extraction(self, checkpoint: SourceExtraction) -> None:
         async with self._uow_factory() as uow:
-            source_repository = getattr(uow, "source_extractions", None)
-            if source_repository is not None:
-                await source_repository.save(
-                    replace(checkpoint, status=SourceExtractionStatus.NEEDS_REVIEW)
-                )
-                await uow.commit()
+            await uow.source_extractions.save(
+                replace(checkpoint, status=SourceExtractionStatus.NEEDS_REVIEW)
+            )
+            await uow.commit()
 
     async def _execute_direct_url_extraction(
         self,
@@ -1614,7 +1598,8 @@ class ProductionWorkflowOrchestrator:
             await self._persist_extraction_progress(run.id, progress)
             # Provenance rule: a result may only be stored under a content hash
             # when the archived content behind that hash is what we send to the
-            # model. Without a readable archive the source stays subject-local.
+            # model. Without a readable archive this is a live URL request and
+            # cannot enter the global source-content cache.
             archived = archived_sources.get(source.canonical_url)
             archived_text = await self._load_archived_source_text(archived)
             source_content_sha256 = (
@@ -1625,18 +1610,14 @@ class ProductionWorkflowOrchestrator:
             # VERIFIED source checkpoint; a source-level FORCE command would
             # need its own explicit control, which the current product does
             # not expose.
-            force_source_cache = False
-            if force_source_cache:
-                cached_output, cache_checkpoint, cache_status = None, None, "forced"
-            else:
-                (
-                    cached_output,
-                    cache_checkpoint,
-                    cache_status,
-                ) = await self._read_source_extraction_cache(
-                    plan=plan,
-                    source_content_sha256=source_content_sha256,
-                )
+            (
+                cached_output,
+                cache_checkpoint,
+                cache_status,
+            ) = await self._read_source_extraction_cache(
+                plan=plan,
+                source_content_sha256=source_content_sha256,
+            )
             self._diagnostics.record(
                 event="q2.source.plan",
                 run_id=run.id,
@@ -1703,13 +1684,8 @@ class ProductionWorkflowOrchestrator:
                     "source_id": source.local_id,
                     "source_url": source.canonical_url,
                 }
-            cache_event = (
-                "q2.source.cache_incompatible"
-                if cache_status == "incompatible"
-                else "q2.source.cache_miss"
-            )
             self._diagnostics.record(
-                event=cache_event,
+                event="q2.source.cache_miss",
                 run_id=run.id,
                 subject_id=run.subject_id,
                 stage="extraction",
@@ -1718,7 +1694,7 @@ class ProductionWorkflowOrchestrator:
                 source_url=source.canonical_url,
                 source_content_sha256=source_content_sha256,
                 profile=plan.profile.value,
-                reason=("force_recompute" if cache_status == "forced" else cache_status),
+                reason=cache_status,
                 cache_status=cache_status,
             )
 
@@ -1732,17 +1708,12 @@ class ProductionWorkflowOrchestrator:
                 source_model_run_id = _source_extraction_model_run_id(
                     source_content_sha256=source_content_sha256,
                     profile=plan.profile,
-                    force_nonce=(
-                        str(run.id)
-                        if force_source_cache or cache_status == "incompatible"
-                        else None
-                    ),
                 )
                 cache_checkpoint, claimed = await self._claim_source_extraction(
                     plan=plan,
                     source_content_sha256=source_content_sha256,
                     model_run_id=source_model_run_id,
-                    force=force_source_cache or cache_status == "incompatible",
+                    force=cache_status == "miss",
                 )
                 if not claimed:
                     (
@@ -1843,6 +1814,7 @@ class ProductionWorkflowOrchestrator:
             raw = ""
             try:
                 request_metadata: dict[str, object] = {
+                    "source_id": source.local_id,
                     "source_url": source.canonical_url,
                     "profile": plan.profile.value,
                     "source_content_sha256": source_content_sha256,
@@ -1850,16 +1822,6 @@ class ProductionWorkflowOrchestrator:
                     "parser_version": Q2_MARKDOWN_PARSER_VERSION,
                     "verifier_version": ARTIFACT_VERIFIER_VERSION,
                 }
-                if source_content_sha256 is None:
-                    # This is the legacy, subject-local fallback used only
-                    # when no reliable archived content hash exists.
-                    request_metadata.update(
-                        {
-                            "subject_id": str(run.subject_id),
-                            "source_id": source.local_id,
-                            "pipeline_generation": run.pipeline_generation,
-                        }
-                    )
                 execution = await self._model_gateway.execute(
                     ModelRequest(
                         text=prompt,
@@ -2540,7 +2502,6 @@ def _source_extraction_model_run_id(
     *,
     source_content_sha256: str,
     profile: ExtractionProfile,
-    force_nonce: str | None = None,
     provider: ModelProvider = ModelProvider.OPENAI,
 ) -> UUID:
     """Stable model checkpoint identity for the source-level cache key.
@@ -2559,7 +2520,6 @@ def _source_extraction_model_run_id(
             "verifier_version": ARTIFACT_VERIFIER_VERSION,
             "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
             "provider": provider.value,
-            "force_nonce": force_nonce,
         },
         sort_keys=True,
         separators=(",", ":"),
