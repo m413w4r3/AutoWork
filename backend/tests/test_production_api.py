@@ -20,6 +20,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from cti_app.api import production as production_api
 from cti_app.api.production import router
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.production_parsers import technical_extraction_from_json
@@ -47,6 +48,7 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchPhase,
+    ProductionBatchStatus,
     ProductionReuseInvalidation,
     SubjectProductionRun,
     SubjectProductionStage,
@@ -166,6 +168,9 @@ class _BatchItems:
 
     async def list_for_batch(self, batch_id: UUID) -> Sequence[EditionProductionBatchItem]:
         return [i for i in self.items if i.batch_id == batch_id]
+
+    async def get_by_run(self, run_id: UUID) -> EditionProductionBatchItem | None:
+        return next((item for item in self.items if item.production_run_id == run_id), None)
 
 
 class _BatchStatusReadModel:
@@ -1433,6 +1438,157 @@ async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
     assert str(first_run.id) == exact_job.input_parameters["run_id"]
     assert exact_job.id in jobs.cancelled
     assert unrelated.id not in jobs.cancelled
+
+
+async def test_exact_run_cancel_hands_off_to_the_next_batch_subject(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subjects = [uuid4(), uuid4()]
+    for name, subject_id in zip(("A", "B"), subjects, strict=True):
+        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+    jobs = _CancelableJobs()
+    production_app.state.job_service = jobs
+
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert started.status_code == 200, started.text
+    batch = next(iter(uow.edition_production_batches.items.values()))
+    first, second = (
+        uow.subject_production_runs.items[item.production_run_id]
+        for item in sorted(
+            uow.edition_production_batch_items.items, key=lambda item: item.position
+        )
+    )
+
+    response = await api.post(f"/api/production/runs/{first.id}/cancel")
+
+    assert response.status_code == 200, response.text
+    assert uow.subject_production_runs.items[first.id].status is SubjectProductionStatus.CANCELLED
+    assert uow.subject_production_runs.items[second.id].status is SubjectProductionStatus.RUNNING
+    assert batch.status is ProductionBatchStatus.RUNNING
+    assert [
+        job.input_parameters["run_id"]
+        for job in jobs.jobs
+        if job.input_parameters["run_id"] == str(second.id)
+    ] == [str(second.id)]
+    assert sum(job.input_parameters["run_id"] == str(first.id) for job in jobs.jobs) == 1
+
+
+async def test_exact_run_cancel_twice_does_not_repeat_batch_handoff(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subjects = [uuid4(), uuid4(), uuid4()]
+    for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
+        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+    jobs = _CancelableJobs()
+    production_app.state.job_service = jobs
+
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert started.status_code == 200, started.text
+    runs = [
+        uow.subject_production_runs.items[item.production_run_id]
+        for item in sorted(
+            uow.edition_production_batch_items.items, key=lambda item: item.position
+        )
+    ]
+
+    first = await api.post(f"/api/production/runs/{runs[0].id}/cancel")
+    repeated = await api.post(f"/api/production/runs/{runs[0].id}/cancel")
+
+    assert first.status_code == 200, first.text
+    assert repeated.status_code == 200, repeated.text
+    assert sum(job.input_parameters["run_id"] == str(runs[1].id) for job in jobs.jobs) == 1
+    assert sum(job.input_parameters["run_id"] == str(runs[2].id) for job in jobs.jobs) == 0
+
+
+async def test_exact_run_cancel_of_last_subject_closes_batch(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    jobs = _CancelableJobs()
+    production_app.state.job_service = jobs
+
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert started.status_code == 200, started.text
+    batch = next(iter(uow.edition_production_batches.items.values()))
+    run = uow.subject_production_runs.items[
+        uow.edition_production_batch_items.items[0].production_run_id
+    ]
+
+    response = await api.post(f"/api/production/runs/{run.id}/cancel")
+
+    assert response.status_code == 200, response.text
+    assert uow.subject_production_runs.items[run.id].status is SubjectProductionStatus.CANCELLED
+    assert batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
+    assert batch.phase is ProductionBatchPhase.REVIEW
+    assert jobs.jobs[-1].input_parameters["run_id"] == str(run.id)
+    assert len(jobs.jobs) == 1
+
+
+async def test_exact_run_cancel_does_not_dispatch_after_batch_cancel_fence(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    edition_id = uuid4()
+    subjects = [uuid4(), uuid4()]
+    for name, subject_id in zip(("A", "B"), subjects, strict=True):
+        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+    jobs = _CancelableJobs()
+    production_app.state.job_service = jobs
+
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert started.status_code == 200, started.text
+    batch = next(iter(uow.edition_production_batches.items.values()))
+    first, second = (
+        uow.subject_production_runs.items[item.production_run_id]
+        for item in sorted(
+            uow.edition_production_batch_items.items, key=lambda item: item.position
+        )
+    )
+    dispatcher = production_app.state.job_dispatcher
+    dispatcher.dispatched.clear()
+    original_cancel_jobs = production_api._cancel_non_terminal_run_jobs
+
+    def uow_factory() -> _Uow:
+        return uow
+
+    async def cancel_jobs_then_cancel_batch(
+        jobs_arg: Any,
+        runs: Sequence[tuple[UUID, UUID]],
+        *,
+        actor_id: str,
+    ) -> None:
+        await original_cancel_jobs(jobs_arg, runs, actor_id=actor_id)
+        async with uow_factory() as race_uow:
+            batch.cancel(now=datetime.now(UTC))
+            await race_uow.edition_production_batches.save(batch)
+            queued = await race_uow.subject_production_runs.get_for_update(second.id)
+            assert queued is not None
+            queued.mark_cancelled(now=datetime.now(UTC))
+            await race_uow.subject_production_runs.save(queued)
+            await race_uow.commit()
+
+    monkeypatch.setattr(
+        production_api, "_cancel_non_terminal_run_jobs", cancel_jobs_then_cancel_batch
+    )
+
+    response = await api.post(f"/api/production/runs/{first.id}/cancel")
+
+    assert response.status_code == 200, response.text
+    assert batch.status is ProductionBatchStatus.CANCELLED
+    assert uow.subject_production_runs.items[second.id].status is SubjectProductionStatus.CANCELLED
+    assert dispatcher.dispatched == []
+    assert sum(job.input_parameters["run_id"] == str(second.id) for job in jobs.jobs) == 0
 
 
 async def test_subject_cancel_marks_run_and_cancels_its_exact_job(

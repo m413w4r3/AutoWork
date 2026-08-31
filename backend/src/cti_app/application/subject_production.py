@@ -57,6 +57,13 @@ class SubjectProductionRetryResult:
         yield self.staled_artifacts
 
 
+@dataclass(frozen=True, slots=True)
+class SubjectProductionCancellationResult:
+    run: SubjectProductionRun
+    batch_id: UUID | None
+    changed: bool
+
+
 async def capture_production_input_snapshot(
     uow: ProductionUnitOfWork,
     *,
@@ -337,6 +344,11 @@ class SubjectProductionService:
             return run
 
     async def cancel_run(self, run_id: UUID) -> SubjectProductionRun:
+        return (await self.cancel_run_with_result(run_id)).run
+
+    async def cancel_run_with_result(
+        self, run_id: UUID
+    ) -> SubjectProductionCancellationResult:
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:
@@ -346,8 +358,14 @@ class SubjectProductionService:
             run.mark_cancelled(now=datetime.now(UTC))
             if not was_cancelled:
                 await uow.subject_production_runs.save(run)
+            get_by_run = getattr(uow.edition_production_batch_items, "get_by_run", None)
+            item = await get_by_run(run_id) if get_by_run is not None else None
             await uow.commit()
-            return run
+            return SubjectProductionCancellationResult(
+                run=run,
+                batch_id=item.batch_id if item is not None else None,
+                changed=not was_cancelled,
+            )
 
     async def retry_from_stage(
         self, run_id: UUID, stage: SubjectProductionStage

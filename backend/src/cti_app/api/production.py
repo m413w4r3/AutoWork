@@ -9,11 +9,17 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict
 
 from cti_app.application.identity import IdentityProvider
-from cti_app.application.jobs import DuplicateJobError, JobDispatcher, JobService
+from cti_app.application.jobs import (
+    DuplicateJobError,
+    JobCancelledError,
+    JobDispatcher,
+    JobService,
+)
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_jobs import (
     PRODUCTION_STAGE_MAX_ATTEMPTS,
+    ProductionStageChain,
     ProductionStageParameters,
     production_stage_idempotency_key,
     stage_job_kind,
@@ -366,6 +372,50 @@ async def _production_run_can_dispatch(
         }
 
 
+async def _dispatch_handed_off_production_run(
+    request: Request,
+    started: SubjectProductionRun,
+    batch_id: UUID,
+    *,
+    actor_id: str,
+) -> None:
+    """Submit a hand-off stage only after revalidating the exact run/batch."""
+    uow_factory, jobs, dispatcher = _runtime(request)
+    async with uow_factory() as uow:
+        latest = await uow.subject_production_runs.get(started.id)
+    if latest is None or latest.status is SubjectProductionStatus.CANCELLED:
+        return
+    if not await _production_run_can_dispatch(uow_factory, latest.id, batch_id=batch_id):
+        return
+
+    pacing = _production_pacing(request)
+    batch_service = EditionProductionService(uow_factory, pacing)
+    delay_ms = await batch_service.next_dispatch_delay_ms(batch_id)
+    if latest.current_stage in {
+        SubjectProductionStage.REFERENCES,
+        SubjectProductionStage.SYNTHESIS,
+    }:
+        delay_ms += pacing.model_delay_ms(latest.current_stage)
+
+    chain = ProductionStageChain(pacing)
+    chain.bind(jobs, dispatcher)
+    try:
+        await chain.submit(
+            run=latest,
+            stage=latest.current_stage,
+            correlation_id=get_correlation_id(),
+            actor_id=actor_id,
+            delay_ms=delay_ms,
+            before_dispatch=lambda: _production_run_can_dispatch(
+                uow_factory, latest.id, batch_id=batch_id
+            ),
+        )
+    except (DuplicateJobError, JobCancelledError):
+        # Another worker may have completed this hand-off, or cancellation may
+        # have won the final fence.  Both outcomes are already persisted.
+        return
+
+
 async def _retry_production_run(
     request: Request,
     run_id: UUID,
@@ -468,7 +518,7 @@ async def _cancel_production_run(
     uow_factory, jobs, _ = _runtime(request)
     service = SubjectProductionService(uow_factory)
     try:
-        cancelled = await service.cancel_run(run_id)
+        cancellation = await service.cancel_run_with_result(run_id)
     except ProductionRunNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -487,12 +537,27 @@ async def _cancel_production_run(
 
     await _cancel_non_terminal_run_jobs(
         jobs,
-        [(cancelled.id, cancelled.subject_id)],
+        [(cancellation.run.id, cancellation.run.subject_id)],
         actor_id=actor_id,
     )
+    if cancellation.changed and cancellation.batch_id is not None:
+        batch_service = EditionProductionService(uow_factory, _production_pacing(request))
+        started = await batch_service.on_subject_terminal(
+            cancellation.batch_id,
+            cancellation.run.id,
+            actor_id=actor_id,
+            correlation_id=get_correlation_id(),
+        )
+        if started is not None:
+            await _dispatch_handed_off_production_run(
+                request,
+                started,
+                cancellation.batch_id,
+                actor_id=actor_id,
+            )
     return {
         "action": "cancel",
-        "run_id": str(cancelled.id),
+        "run_id": str(cancellation.run.id),
         "status": SubjectProductionStatus.CANCELLED.value,
     }
 

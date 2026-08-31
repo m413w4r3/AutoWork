@@ -280,6 +280,32 @@ async def test_cancelled_run_is_a_worker_fence(uow: _Uow, monkeypatch: pytest.Mo
     assert jobs.submitted == []
 
 
+async def test_cancelled_worker_cannot_repeat_an_existing_batch_handoff(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, jobs, orchestrator = _build(
+        uow, monkeypatch, {"stage": "assembly", "status": "success"}
+    )
+    first = _run(uow, SubjectProductionStage.ASSEMBLY)
+    second = _batch_of(uow, first)
+    first.mark_cancelled()
+    second.start_running()
+
+    result = await registry.handler(stage_job_kind(SubjectProductionStage.ASSEMBLY))(
+        ProductionStageParameters(
+            run_id=first.id,
+            expected_stage=SubjectProductionStage.ASSEMBLY.value,
+            pipeline_generation=first.pipeline_generation,
+        ),
+        _Context(),  # type: ignore[arg-type]
+    )
+
+    assert result.endswith("#cancelled")
+    assert second.status is SubjectProductionStatus.RUNNING
+    assert orchestrator.calls == []
+    assert jobs.submitted == []
+
+
 async def test_inflight_result_never_advances_a_cancelled_run(
     uow: _Uow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
