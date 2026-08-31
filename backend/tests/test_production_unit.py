@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application.subject_production import SubjectProductionService
 from cti_app.domain.production import (
     AnalystInvestigation,
     AnalystInvestigationStatus,
@@ -262,6 +263,102 @@ class TestProductionArtifactValidation:
         )
 
         assert artifact.input_hash == valid_hash
+
+
+@pytest.mark.asyncio
+async def test_retry_from_extraction_stales_downstream_artifacts_only() -> None:
+    run = SubjectProductionRun(
+        subject_id=uuid4(),
+        edition_id=uuid4(),
+        current_stage=SubjectProductionStage.ASSEMBLY,
+    )
+    run.start_running()
+    run.mark_ready()
+    artifacts = [
+        ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage,
+            version=1,
+            input_hash="a" * 64,
+        )
+        for stage in (
+            ProductionArtifactStage.REFERENCES,
+            ProductionArtifactStage.EXTRACTION,
+            ProductionArtifactStage.SYNTHESIS,
+            ProductionArtifactStage.PUBLICATION,
+        )
+    ]
+
+    class Runs:
+        async def get(self, run_id: object) -> SubjectProductionRun | None:
+            return run if run_id == run.id else None
+
+        async def get_for_update(self, run_id: object) -> SubjectProductionRun | None:
+            return await self.get(run_id)
+
+        async def save(self, saved: SubjectProductionRun) -> None:
+            assert saved is run
+
+    class Artifacts:
+        async def get_current(self, run_id: object, stage: str) -> ProductionArtifact | None:
+            if run_id != run.id:
+                return None
+            return next(
+                (
+                    artifact
+                    for artifact in artifacts
+                    if artifact.stage.value == stage
+                    and artifact.status is ProductionArtifactStatus.VERIFIED
+                ),
+                None,
+            )
+
+        async def mark_from_stage_stale(self, run_id: object, stage: str) -> list[str]:
+            assert run_id == run.id
+            assert stage == SubjectProductionStage.EXTRACTION.value
+            affected = ["extraction", "synthesis", "publication"]
+            for artifact in artifacts:
+                if artifact.stage.value in affected:
+                    artifact.status = ProductionArtifactStatus.STALE
+            return affected
+
+    class Uow:
+        subject_production_runs = Runs()
+        production_artifacts = Artifacts()
+
+        async def __aenter__(self) -> Uow:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def commit(self) -> None:
+            return None
+
+    references = next(
+        artifact for artifact in artifacts if artifact.stage is ProductionArtifactStage.REFERENCES
+    )
+    artifact_ids = {artifact.stage: artifact.id for artifact in artifacts}
+    result = await SubjectProductionService(lambda: Uow()).retry_from_stage(
+        run.id, SubjectProductionStage.EXTRACTION
+    )
+
+    assert result.staled_artifacts == ["extraction", "synthesis", "publication"]
+    assert run.current_stage is SubjectProductionStage.EXTRACTION
+    assert run.pipeline_generation == 1
+    assert references.status is ProductionArtifactStatus.VERIFIED
+    assert references.id == artifact_ids[ProductionArtifactStage.REFERENCES]
+    assert {
+        artifact.stage
+        for artifact in artifacts
+        if artifact.status is ProductionArtifactStatus.STALE
+    } == {
+        ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.SYNTHESIS,
+        ProductionArtifactStage.PUBLICATION,
+    }
+    assert {artifact.stage: artifact.id for artifact in artifacts} == artifact_ids
 
 
 class TestBatchSequentialProcessing:

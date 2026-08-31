@@ -952,6 +952,9 @@ _CERTAIN_PRE_SUBMISSION_CODES = frozenset(
     {
         "bridge_auth_failed",
         "bridge_rate_limited",
+        # A connection failure occurs before the bridge can receive the
+        # request, so its deterministic ModelRun is safe to resubmit.
+        "bridge_unreachable",
     }
 )
 

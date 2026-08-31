@@ -8,7 +8,9 @@ import json
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -21,7 +23,12 @@ from cti_app.application.model_conversations import (
     ConversationTurnFailedError,
     ModelConversationService,
 )
-from cti_app.application.model_gateway import ModelGateway, ModelRequest, ModelRoutingHint
+from cti_app.application.model_gateway import (
+    ModelGateway,
+    ModelGatewayError,
+    ModelRequest,
+    ModelRoutingHint,
+)
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_reuse import (
     ProductionArtifactReuseService,
@@ -123,6 +130,139 @@ _REVIEW_CODES = {
     "conversation_busy",
     "external_llm_blocked",
 }
+
+_MODEL_SUBMISSION_RECONCILIATION_CODE = "model_submission_reconciliation_required"
+_SOURCE_CONTENT_CODES = frozenset({"source_content_invalid"})
+
+
+class _Q2FailureClass(StrEnum):
+    GLOBAL_TRANSIENT_PRE_SUBMISSION = "global_transient_pre_submission"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
+    SOURCE_CONTENT_FAILURE = "source_content_failure"
+    CONTROL_INVARIANT_FAILURE = "control_invariant_failure"
+
+
+@dataclass(frozen=True, slots=True)
+class _Q2FailureClassification:
+    failure_class: _Q2FailureClass
+    status: str
+    error_code: str
+    retryable: bool
+    phase: str
+    submission_state: str
+    contributes_to_coverage: bool
+
+
+class _Q2SourceContentFailure(ValueError):
+    code = "source_content_invalid"
+    retryable = False
+    phase = "response_validation"
+    submission_state = "post_submission"
+
+
+class _Q2ControlFailure(RuntimeError):
+    code = "q2_provider_response_missing"
+    retryable = False
+    phase = "model_call"
+    submission_state = "post_submission"
+
+
+def _classify_q2_failure(
+    exc: Exception,
+    *,
+    provider_response_produced: bool = False,
+) -> _Q2FailureClassification:
+    """Classify one Q2 source failure before it can affect coverage.
+
+    The caller supplies only the fact that a provider response was available;
+    submission safety remains the ModelGateway's responsibility.  In
+    particular, a previously persisted ModelRun error is always a control or
+    reconciliation outcome, never a source-content failure.
+    """
+    details = getattr(exc, "details", None)
+    detail_state = details.get("submission_state") if isinstance(details, dict) else None
+    detail_phase = details.get("phase") if isinstance(details, dict) else None
+    code = str(getattr(exc, "code", "") or "")
+    retryable = bool(getattr(exc, "retryable", False))
+    phase = str(getattr(exc, "phase", None) or detail_phase or "model_call")[:64]
+    submission_state = str(
+        getattr(exc, "submission_state", None) or detail_state or "unknown"
+    )[:32]
+
+    if code == _MODEL_SUBMISSION_RECONCILIATION_CODE:
+        return _Q2FailureClassification(
+            _Q2FailureClass.RECONCILIATION_REQUIRED,
+            "needs_review",
+            code,
+            False,
+            "reconciliation",
+            submission_state,
+            False,
+        )
+
+    # The HTTP client raises bridge_unreachable on a failed connection before
+    # it can send bytes, so this code is a safe pre-submit transport signal
+    # even though that low-level exception has no explicit state field.  The
+    # gateway remains the authority that persists NOT_SUBMITTED.
+    if (
+        submission_state == "pre_submission"
+        or (submission_state == "unknown" and code == "bridge_unreachable")
+    ) and (retryable or code in _TRANSIENT_CODES):
+        return _Q2FailureClassification(
+            _Q2FailureClass.GLOBAL_TRANSIENT_PRE_SUBMISSION,
+            "transient_error",
+            code or "q2_global_transient",
+            True,
+            phase,
+            submission_state,
+            False,
+        )
+
+    # An explicit source-content code is accepted only after submission.  A
+    # ModelGatewayError from a checkpoint state has no such proof and falls
+    # through to the control/invariant class below.
+    if (
+        not retryable
+        and code in _SOURCE_CONTENT_CODES
+        and submission_state in {"post_submission", "submitted_or_unknown"}
+    ) or (
+        provider_response_produced
+        and not retryable
+        and not isinstance(exc, ModelGatewayError)
+    ):
+        return _Q2FailureClassification(
+            _Q2FailureClass.SOURCE_CONTENT_FAILURE,
+            "source_failure",
+            code if code in _SOURCE_CONTENT_CODES else "source_content_invalid",
+            False,
+            phase,
+            submission_state,
+            True,
+        )
+
+    if (
+        submission_state in {"submission_attempted", "submitted_or_unknown", "post_submission"}
+        and (retryable or code in _TRANSIENT_CODES)
+    ):
+        return _Q2FailureClassification(
+            _Q2FailureClass.RECONCILIATION_REQUIRED,
+            "needs_review",
+            _MODEL_SUBMISSION_RECONCILIATION_CODE,
+            False,
+            "reconciliation",
+            submission_state,
+            False,
+        )
+
+    return _Q2FailureClassification(
+        _Q2FailureClass.CONTROL_INVARIANT_FAILURE,
+        "needs_review",
+        code or "q2_control_failure",
+        False,
+        phase,
+        submission_state,
+        False,
+    )
 
 
 def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
@@ -829,6 +969,7 @@ class ProductionWorkflowOrchestrator:
         warnings: list[str] = []
         completed: list[str] = []
         failed: list[str] = []
+        failed_attempts: list[str] = []
         failures: dict[str, dict[str, Any]] = {}
         for source_index, source in enumerate(report.sources):
             if source_index:
@@ -857,6 +998,7 @@ class ProductionWorkflowOrchestrator:
                 web_search=True,
             )
             started_at = time.monotonic()
+            raw = ""
             try:
                 execution = await self._model_gateway.execute(
                     ModelRequest(
@@ -869,6 +1011,10 @@ class ProductionWorkflowOrchestrator:
                         provider=ModelProvider.OPENAI,
                         web_search=True,
                         run_id=model_run_id,
+                        # The deterministic Q2 checkpoint is deliberately
+                        # retried across technical job attempts.  The
+                        # gateway still decides whether FAILED is safe.
+                        allow_failed_resubmit=True,
                         metadata={
                             "subject_id": str(run.subject_id),
                             "source_id": source.local_id,
@@ -879,10 +1025,14 @@ class ProductionWorkflowOrchestrator:
                     ModelRole.RESEARCH,
                 )
                 raw = execution.output_text or ""
+                if not raw:
+                    raise _Q2ControlFailure("Provider returned no Q2 response")
                 parsed = parse_q2_proposals_markdown(raw)
                 self._log_parse(run, "extraction", parsed)
                 if not parsed.usable or parsed.value is None:
-                    raise ValueError("; ".join(parsed.errors) or "source_unavailable")
+                    raise _Q2SourceContentFailure(
+                        "; ".join(parsed.errors) or "source_unavailable"
+                    )
                 submissions.append(
                     Q2ProposalSubmission(
                         output=parsed.value,
@@ -907,21 +1057,25 @@ class ProductionWorkflowOrchestrator:
                     duration_ms=int((time.monotonic() - started_at) * 1000),
                 )
             except Exception as exc:
-                error_code = str(getattr(exc, "code", "") or "q2_source_failed")
+                classification = _classify_q2_failure(
+                    exc,
+                    provider_response_produced=bool(raw),
+                )
                 error = str(exc)[:1000]
-                retryable = bool(getattr(exc, "retryable", False))
-                phase = str(getattr(exc, "phase", "model_call"))[:64]
-                submission_state = str(getattr(exc, "submission_state", "unknown"))[:32]
                 duration_ms = int((time.monotonic() - started_at) * 1000)
-                failed.append(source.local_id)
+                failed_attempts.append(source.local_id)
+                if classification.contributes_to_coverage:
+                    failed.append(source.local_id)
                 failures[source.local_id] = {
                     "model_run_id": str(model_run_id),
                     "source_url": source.canonical_url,
-                    "error_code": error_code,
+                    "error_code": classification.error_code,
                     "error": error,
-                    "retryable": retryable,
-                    "phase": phase,
-                    "submission_state": submission_state,
+                    "retryable": classification.retryable,
+                    "phase": classification.phase,
+                    "submission_state": classification.submission_state,
+                    "failure_class": classification.failure_class.value,
+                    "contributes_to_coverage": classification.contributes_to_coverage,
                     "duration_ms": duration_ms,
                 }
                 self._diagnostics.record(
@@ -933,31 +1087,50 @@ class ProductionWorkflowOrchestrator:
                     source_id=source.local_id,
                     source_url=source.canonical_url,
                     model_run_id=str(model_run_id),
-                    error_code=error_code,
+                    error_code=classification.error_code,
                     error=error,
-                    retryable=retryable,
-                    phase=phase,
-                    submission_state=submission_state,
+                    retryable=classification.retryable,
+                    phase=classification.phase,
+                    submission_state=classification.submission_state,
+                    failure_class=classification.failure_class.value,
                     duration_ms=duration_ms,
                 )
-                # A retryable transport failure describes the bridge/model
-                # path, not the source content. Stop Q2 at once so S2+ are not
-                # sent through the same broken infrastructure and do not turn
-                # a global outage into a misleading coverage failure.
-                if retryable or error_code in _TRANSIENT_CODES:
+                # Transport, reconciliation, and control failures describe the
+                # request/checkpoint path, not source content. Stop Q2 at once
+                # so S2+ cannot turn an infrastructure failure into coverage.
+                if classification.failure_class is _Q2FailureClass.GLOBAL_TRANSIENT_PRE_SUBMISSION:
                     return {
                         "stage": "extraction",
                         "status": "transient_error",
-                        "error_code": error_code,
+                        "error_code": classification.error_code,
                         "error": error,
                         "details": {
                             "completed_source_ids": completed,
-                            "failed_source_ids": failed,
+                            "failed_source_ids": failed_attempts,
                             "source_failures": failures,
-                            "failure_class": "global_transient",
+                            "failure_class": classification.failure_class.value,
                         },
                         "completed_source_ids": completed,
-                        "failed_source_ids": failed,
+                        "failed_source_ids": failed_attempts,
+                        "source_failures": failures,
+                    }
+                if classification.failure_class in {
+                    _Q2FailureClass.RECONCILIATION_REQUIRED,
+                    _Q2FailureClass.CONTROL_INVARIANT_FAILURE,
+                }:
+                    return {
+                        "stage": "extraction",
+                        "status": classification.status,
+                        "error_code": classification.error_code,
+                        "error": error,
+                        "details": {
+                            "completed_source_ids": completed,
+                            "failed_source_ids": failed_attempts,
+                            "source_failures": failures,
+                            "failure_class": classification.failure_class.value,
+                        },
+                        "completed_source_ids": completed,
+                        "failed_source_ids": failed_attempts,
                         "source_failures": failures,
                     }
         if failed:

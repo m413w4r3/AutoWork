@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -5,10 +6,14 @@ import pytest
 
 from cti_app.application import production_workflow
 from cti_app.application.model_gateway import (
+    AdapterResult,
+    AdapterResultStatus,
     ModelGateway,
+    ModelGatewayError,
     ModelRequest,
     ModelRouter,
     ModelRoutingHint,
+    ModelSubmissionReconciliationRequiredError,
 )
 from cti_app.application.production_parsers import (
     ParsedSource,
@@ -17,7 +22,13 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.application.production_workflow import _extraction_input_hash, _q2_source_model_run_id
 from cti_app.domain.discovery import SourceRole
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
+from cti_app.domain.model_runs import (
+    ModelProvider,
+    ModelRole,
+    ModelRunStatus,
+    ModelSubmissionState,
+    ModelUsage,
+)
 from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
 from cti_app.integrations.models import (
     BridgeTransportError,
@@ -70,6 +81,43 @@ def test_q2_source_model_run_id_changes_when_routing_policy_changes(
         canonical_url="https://example.test/report",
     )
     assert after != before
+
+
+def test_q2_failure_classification_keeps_checkpoint_errors_out_of_coverage() -> None:
+    transient = production_workflow._classify_q2_failure(
+        BridgeTransportError(
+            "bridge_ui_timeout",
+            "transport failure",
+            retryable=True,
+            phase="pre_submission",
+            submission_state="pre_submission",
+        )
+    )
+    reconciliation = production_workflow._classify_q2_failure(
+        ModelSubmissionReconciliationRequiredError()
+    )
+    content = production_workflow._classify_q2_failure(
+        BridgeTransportError(
+            "source_content_invalid",
+            "source response is unusable",
+            retryable=False,
+            phase="response_validation",
+            submission_state="post_submission",
+        )
+    )
+    control = production_workflow._classify_q2_failure(
+        ModelGatewayError("Failed ModelRun is not safe to resubmit")
+    )
+
+    assert transient.status == "transient_error"
+    assert transient.failure_class.value == "global_transient_pre_submission"
+    assert not transient.contributes_to_coverage
+    assert reconciliation.error_code == "model_submission_reconciliation_required"
+    assert reconciliation.failure_class.value == "reconciliation_required"
+    assert content.failure_class.value == "source_content_failure"
+    assert content.contributes_to_coverage
+    assert control.failure_class.value == "control_invariant_failure"
+    assert not control.contributes_to_coverage
 
 
 def test_iana_snapshot_bump_recomputes_extraction_without_new_q2_provider_call(
@@ -189,9 +237,18 @@ class _Q2Artifacts:
         )()
 
 
+class _Q2Runs:
+    def __init__(self) -> None:
+        self.run: SubjectProductionRun | None = None
+
+    async def get(self, run_id: object) -> SubjectProductionRun | None:
+        return self.run if self.run is not None and run_id == self.run.id else None
+
+
 class _Q2UnitOfWork:
     def __init__(self) -> None:
         self.production_artifacts = _Q2Artifacts()
+        self.subject_production_runs = _Q2Runs()
 
     async def __aenter__(self) -> "_Q2UnitOfWork":
         return self
@@ -237,6 +294,9 @@ class _Q2Diagnostics:
     def record_parse(self, **fields: object) -> None:
         del fields
 
+    def record_stage_outcome(self, **fields: object) -> None:
+        self.events.append(fields)
+
 
 class _Q2Extraction:
     def __init__(self) -> None:
@@ -267,7 +327,7 @@ def _q2_report(source_count: int = 5) -> ReferenceReport:
 
 def _q2_orchestrator(
     monkeypatch: pytest.MonkeyPatch,
-    gateway: _Q2Gateway,
+    gateway: Any,
     report: ReferenceReport,
 ) -> tuple[
     production_workflow.ProductionWorkflowOrchestrator, SubjectProductionRun, _Q2Diagnostics
@@ -310,6 +370,7 @@ def _q2_orchestrator(
         edition_id=uuid4(),
         current_stage=SubjectProductionStage.EXTRACTION,
     )
+    uow.subject_production_runs.run = run
     return orchestrator, run, diagnostics
 
 
@@ -323,8 +384,8 @@ async def test_q2_retryable_source_failure_stops_before_s2_and_does_not_create_a
             error_code,
             "transport failure",
             retryable=True,
-            phase="submission_confirmation",
-            submission_state="submission_attempted",
+            phase="pre_submission",
+            submission_state="pre_submission",
         )
     )
     orchestrator, run, diagnostics = _q2_orchestrator(monkeypatch, gateway, _q2_report())
@@ -336,8 +397,12 @@ async def test_q2_retryable_source_failure_stops_before_s2_and_does_not_create_a
     assert result["error_code"] == error_code
     assert result["error_code"] != "q2_source_coverage_failed"
     assert result["failed_source_ids"] == ["S1"]
-    assert result["source_failures"]["S1"]["submission_state"] == "submission_attempted"
-    assert result["source_failures"]["S1"]["phase"] == "submission_confirmation"
+    assert result["source_failures"]["S1"]["submission_state"] == "pre_submission"
+    assert result["source_failures"]["S1"]["phase"] == "pre_submission"
+    assert (
+        result["source_failures"]["S1"]["failure_class"]
+        == "global_transient_pre_submission"
+    )
     assert orchestrator._extraction.store_calls == []
     failed_events = [
         event for event in diagnostics.events if event.get("event") == "q2.source.failed"
@@ -347,6 +412,176 @@ async def test_q2_retryable_source_failure_stops_before_s2_and_does_not_create_a
     assert failed_events[0]["retryable"] is True
     assert isinstance(failed_events[0]["duration_ms"], int)
     assert failed_events[0]["duration_ms"] >= 0
+
+
+class _PersistentQ2Adapter:
+    provider = ModelProvider.OPENAI
+    requested_model = "chatgpt-web-fake"
+    is_external = True
+
+    def __init__(
+        self,
+        *,
+        first_error_code: str = "bridge_ui_timeout",
+        first_submission_state: str | None = "pre_submission",
+    ) -> None:
+        self.first_error_code = first_error_code
+        self.first_submission_state = first_submission_state
+        self.calls: list[Any] = []
+
+    async def invoke(
+        self, request: Any, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del role, output_schema
+        self.calls.append(request)
+        if len(self.calls) == 1:
+            raise BridgeTransportError(
+                self.first_error_code,
+                "fake bridge failure",
+                retryable=True,
+                phase=(
+                    "pre_submission"
+                    if self.first_submission_state == "pre_submission"
+                    else "generation"
+                ),
+                submission_state=self.first_submission_state,
+            )
+        return AdapterResult(
+            status=AdapterResultStatus.COMPLETED,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            output_text=(
+                "# FACT\n"
+                "category: malware\n"
+                "value: ExampleRAT\n"
+                "context: outil observe\n"
+                "evidence-quote: outil observe dans la source\n"
+            ),
+        )
+
+    async def resume(
+        self, response_id: str, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del response_id, role, output_schema
+        raise AssertionError("not used")
+
+
+def _persistent_q2_gateway(
+    adapter: _PersistentQ2Adapter,
+) -> tuple[ModelGateway, InMemoryModelRunUnitOfWorkFactory]:
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=adapter,
+            openai_structured=adapter,
+            qwen=adapter,
+            fake=adapter,
+        ),
+        model_uow,
+        InMemoryModelOutputStore(),
+    )
+    return gateway, model_uow
+
+
+@pytest.mark.asyncio
+async def test_q2_pre_submission_retry_reuses_model_run_across_job_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persisted pre-submit failure is retried by the same Q2 checkpoint."""
+    adapter = _PersistentQ2Adapter()
+    gateway, model_uow = _persistent_q2_gateway(adapter)
+    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
+    s1_model_run_id = _q2_source_model_run_id(
+        production_run_id=run.id,
+        pipeline_generation=run.pipeline_generation,
+        source_id="S1",
+        canonical_url="https://example.test/1",
+    )
+
+    first = await orchestrator.execute_stage(
+        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+    )
+
+    assert first["status"] == "transient_error"
+    assert first["failed_source_ids"] == ["S1"]
+    assert [call.metadata["source_id"] for call in adapter.calls] == ["S1"]
+    first_run = model_uow.state[s1_model_run_id]
+    assert first_run.status is ModelRunStatus.FAILED
+    assert first_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
+    assert first_run.submission_attempt == 1
+    assert adapter.calls[0].request_id == f"{s1_model_run_id}:a1"
+
+    second = await orchestrator.execute_stage(
+        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+    )
+
+    assert second["status"] == "success"
+    assert [call.metadata["source_id"] for call in adapter.calls] == ["S1", "S1", "S2"]
+    assert adapter.calls[1].request_id == f"{s1_model_run_id}:a2"
+    assert model_uow.state[s1_model_run_id].id == s1_model_run_id
+    assert model_uow.state[s1_model_run_id].status is ModelRunStatus.SUCCEEDED
+    assert model_uow.state[s1_model_run_id].submission_attempt == 2
+    assert "Failed ModelRun is not safe to resubmit" not in str(second)
+
+
+@pytest.mark.asyncio
+async def test_q2_submission_attempted_requires_reconciliation_and_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _PersistentQ2Adapter(first_submission_state="submission_attempted")
+    gateway, model_uow = _persistent_q2_gateway(adapter)
+    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
+
+    result = await orchestrator.execute_stage(
+        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "model_submission_reconciliation_required"
+    assert [call.metadata["source_id"] for call in adapter.calls] == ["S1"]
+    s1_model_run_id = _q2_source_model_run_id(
+        production_run_id=run.id,
+        pipeline_generation=run.pipeline_generation,
+        source_id="S1",
+        canonical_url="https://example.test/1",
+    )
+    assert model_uow.state[s1_model_run_id].status is ModelRunStatus.NEEDS_REVIEW
+    assert model_uow.state[s1_model_run_id].error_code == (
+        "model_submission_reconciliation_required"
+    )
+    assert result["source_failures"]["S1"]["failure_class"] == "reconciliation_required"
+
+
+@pytest.mark.asyncio
+async def test_q2_bridge_unreachable_before_submit_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _PersistentQ2Adapter(
+        first_error_code="bridge_unreachable", first_submission_state=None
+    )
+    gateway, model_uow = _persistent_q2_gateway(adapter)
+    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(1))
+
+    first = await orchestrator.execute_stage(
+        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+    )
+    model_run_id = _q2_source_model_run_id(
+        production_run_id=run.id,
+        pipeline_generation=run.pipeline_generation,
+        source_id="S1",
+        canonical_url="https://example.test/1",
+    )
+    assert model_uow.state[model_run_id].submission_state is ModelSubmissionState.NOT_SUBMITTED
+    second = await orchestrator.execute_stage(
+        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+    )
+
+    assert first["status"] == "transient_error"
+    assert second["status"] == "success"
+    assert [call.metadata["source_id"] for call in adapter.calls] == ["S1", "S1"]
+    assert model_uow.state[model_run_id].status is ModelRunStatus.SUCCEEDED
 
 
 async def test_q2_nonretryable_source_failure_keeps_source_coverage_behavior(
@@ -380,4 +615,7 @@ async def test_q2_nonretryable_source_failure_keeps_source_coverage_behavior(
     assert result["completed_source_ids"] == ["S2"]
     assert result["failed_source_ids"] == ["S1"]
     assert result["details"]["source_failures"]["S1"]["error_code"] == "source_content_invalid"
+    assert result["details"]["source_failures"]["S1"]["failure_class"] == (
+        "source_content_failure"
+    )
     assert orchestrator._extraction.store_calls == []

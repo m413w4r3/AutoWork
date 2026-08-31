@@ -19,6 +19,14 @@ class ProductionRecoveryDisposition(StrEnum):
 class ProductionRecoveryPolicyV1:
     """Allow exactly one automatic retry for known operational failures."""
 
+    MANUAL_ONLY_ERROR_CODES = frozenset(
+        {
+            # A provider request may already exist outside our database. No
+            # automatic retry can safely resolve that ambiguity.
+            "model_submission_reconciliation_required",
+        }
+    )
+
     AUTO_ERROR_CODES = frozenset(
         {
             "bridge_server_error",
@@ -46,6 +54,8 @@ class ProductionRecoveryPolicyV1:
 
     @classmethod
     def disposition(cls, error_code: str | None) -> ProductionRecoveryDisposition:
+        if error_code in cls.MANUAL_ONLY_ERROR_CODES:
+            return cls.MANUAL_ONLY
         if error_code in cls.AUTO_ERROR_CODES:
             return cls.AUTO
         return cls.MANUAL_ONLY

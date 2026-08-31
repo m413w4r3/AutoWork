@@ -162,6 +162,25 @@ def test_recovery_policy_is_allow_list_only() -> None:
         assert ProductionRecoveryPolicyV1.is_auto_recoverable(code)
     assert ProductionRecoveryPolicyV1.is_auto_recoverable("synthesis_validation_failed")
     assert not ProductionRecoveryPolicyV1.is_auto_recoverable("unknown_code")
+    assert not ProductionRecoveryPolicyV1.is_auto_recoverable(
+        "model_submission_reconciliation_required"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_failure_is_never_automatically_recovered() -> None:
+    uow, runs = _batch_uow(["model_submission_reconciliation_required"])
+    service = EditionProductionService(lambda: uow)
+
+    assert (
+        await service.on_subject_terminal(uow.edition_production_batches.item.id, runs[0].id)
+        is None
+    )
+
+    item = uow.edition_production_batch_items.items[0]
+    assert item.auto_recovery_count == 0
+    assert runs[0].pipeline_generation == 0
+    assert uow.edition_production_batches.item.phase is ProductionBatchPhase.REVIEW
 
 
 @pytest.mark.asyncio

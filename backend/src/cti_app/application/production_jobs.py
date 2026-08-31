@@ -289,6 +289,7 @@ def register_production_jobs(
                 code=error_code,
                 public_message=f"Erreur temporaire lors de l'étape {stage.value}",
                 transient=True,
+                details=error_details,
             )
 
         # needs_review is a business outcome, not a crash: the subject stops

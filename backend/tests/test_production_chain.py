@@ -445,7 +445,12 @@ async def test_transient_error_stays_retryable_and_keeps_the_run_alive(
     registry, jobs, _ = _build(
         uow,
         monkeypatch,
-        {"stage": "references", "status": "transient_error", "error_code": "bridge_timeout"},
+        {
+            "stage": "references",
+            "status": "transient_error",
+            "error_code": "bridge_timeout",
+            "details": {"failure_class": "global_transient_pre_submission"},
+        },
     )
     run = _run(uow, SubjectProductionStage.REFERENCES)
     context = _Context()
@@ -461,6 +466,7 @@ async def test_transient_error_stays_retryable_and_keeps_the_run_alive(
         )
 
     assert excinfo.value.transient is True
+    assert excinfo.value.details == {"failure_class": "global_transient_pre_submission"}
     # The run must not be terminated: the job will be retried.
     assert uow.subject_production_runs.items[run.id].status is SubjectProductionStatus.RUNNING
     assert jobs.submitted == []
