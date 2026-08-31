@@ -632,6 +632,7 @@ class UnitOfWork(Protocol):
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_reuse_invalidations: ProductionReuseInvalidationRepository
+    source_extractions: SourceExtractionRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
     batch_status_read_model: BatchStatusReadRepository

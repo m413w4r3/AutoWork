@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from datetime import date, datetime
 from types import SimpleNamespace
@@ -321,15 +322,63 @@ class _CacheState:
         return self._runs.get(run_id)
 
 
+class _ArchivedBlobs:
+    """Blob catalog holding the archived captures Q2 must analyse."""
+
+    def __init__(self) -> None:
+        self.contents: dict[UUID, bytes] = {}
+
+    def add(self, content: bytes) -> tuple[UUID, str]:
+        blob_id = uuid4()
+        self.contents[blob_id] = content
+        return blob_id, hashlib.sha256(content).hexdigest()
+
+    async def read_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        del max_bytes
+        content = self.contents.get(blob_id)
+        if content is None:
+            raise KeyError(blob_id)
+        return content
+
+
+def _archived_document(
+    blobs: _ArchivedBlobs,
+    *,
+    subject_id: UUID,
+    url: str,
+    content: bytes,
+) -> SimpleNamespace:
+    blob_id, sha256 = blobs.add(content)
+    return SimpleNamespace(
+        id=uuid4(),
+        subject_id=subject_id,
+        final_url=url,
+        decoded_sha256=sha256,
+        decoded_blob_id=blob_id,
+        detected_mime_type="text/plain",
+    )
+
+
+def _collection_for(document: SimpleNamespace, url: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        subject_id=document.subject_id,
+        canonical_url=url,
+        source_document_id=document.id,
+        decoded_blob_id=document.decoded_blob_id,
+    )
+
+
 class _CacheGateway:
     def __init__(self) -> None:
         self.calls: list[UUID] = []
         self.source_ids: list[str] = []
+        self.prompts: list[str] = []
 
     async def execute(self, request: object, role: object) -> object:
         del role
         run_id = request.run_id
         self.calls.append(run_id)
+        self.prompts.append(request.text)
         source_id = (
             request.metadata.get("source_id") or request.metadata["source_url"].rsplit("/", 1)[-1]
         )
@@ -376,10 +425,12 @@ def _cached_orchestrator(
     store: _CacheStore,
     sink: _ExtractionSink,
     monkeypatch: pytest.MonkeyPatch,
+    blobs: _ArchivedBlobs | None = None,
 ) -> production_workflow.ProductionWorkflowOrchestrator:
     orchestrator = production_workflow.ProductionWorkflowOrchestrator.__new__(
         production_workflow.ProductionWorkflowOrchestrator
     )
+    orchestrator._blob_reader = blobs
     orchestrator._uow_factory = lambda: _CacheUow(state)
     orchestrator._model_gateway = gateway
     orchestrator._artifact_store = store
@@ -421,39 +472,19 @@ async def test_source_cache_reuses_between_subjects_and_projects_full_for_light(
 ) -> None:
     first_subject, second_subject = uuid4(), uuid4()
     url = "https://example.test/shared"
-    docs = {
-        uuid4(): SimpleNamespace(
-            id=uuid4(),
-            subject_id=first_subject,
-            final_url=url,
-            decoded_sha256="a" * 64,
-        ),
-        uuid4(): SimpleNamespace(
-            id=uuid4(),
-            subject_id=second_subject,
-            final_url=url,
-            decoded_sha256="a" * 64,
-        ),
-    }
+    blobs = _ArchivedBlobs()
+    content = b"ARCHIVED VERSION"
+    first_document = _archived_document(blobs, subject_id=first_subject, url=url, content=content)
+    # Two subjects, one identical archived capture: the same content hash.
+    second_document = _archived_document(blobs, subject_id=second_subject, url=url, content=content)
+    docs = {first_document.id: first_document, second_document.id: second_document}
     collections = {
-        uuid4(): SimpleNamespace(
-            subject_id=first_subject,
-            canonical_url=url,
-            source_document_id=next(
-                doc.id for doc in docs.values() if doc.subject_id == first_subject
-            ),
-        ),
-        uuid4(): SimpleNamespace(
-            subject_id=second_subject,
-            canonical_url=url,
-            source_document_id=next(
-                doc.id for doc in docs.values() if doc.subject_id == second_subject
-            ),
-        ),
+        uuid4(): _collection_for(first_document, url),
+        uuid4(): _collection_for(second_document, url),
     }
     state = _CacheState(docs, collections)
     gateway, store, sink = _CacheGateway(), _CacheStore(), _ExtractionSink()
-    orchestrator = _cached_orchestrator(state, gateway, store, sink, monkeypatch)
+    orchestrator = _cached_orchestrator(state, gateway, store, sink, monkeypatch, blobs)
     report = ReferenceReport(sources=(_source(url, date(2026, 7, 10)),), events=())
 
     first_run = SubjectProductionRun(
@@ -481,6 +512,13 @@ async def test_source_cache_reuses_between_subjects_and_projects_full_for_light(
     assert second["status"] == "success"
     assert len(gateway.calls) == 1
     assert second["model_calls_avoided"] == 1
+    # The archived capture is what the model was given, and the checkpoint is
+    # recorded under the hash of exactly that content.
+    assert "ARCHIVED VERSION" in gateway.prompts[0]
+    assert "<ARCHIVED_SOURCE>" in gateway.prompts[0]
+    stored = list(state.extractions.rows.values())
+    assert [row.source_content_sha256 for row in stored] == [first_document.decoded_sha256]
+    assert stored[0].status is SourceExtractionStatus.VERIFIED
     second_items = sink.calls[-1]["canonical_json"]["items"]  # type: ignore[index]
     assert all(item["source_ids"] == [report.sources[0].local_id] for item in second_items)
     cached_payload = next(iter(store.payloads.values()))
@@ -517,15 +555,14 @@ async def test_ioc_rules_cache_does_not_satisfy_full(
 ) -> None:
     subject = uuid4()
     url = "https://example.test/profile-change"
-    document = SimpleNamespace(
-        id=uuid4(), subject_id=subject, final_url=url, decoded_sha256="d" * 64
+    blobs = _ArchivedBlobs()
+    document = _archived_document(
+        blobs, subject_id=subject, url=url, content=b"ARCHIVED PROFILE CHANGE"
     )
-    collection = SimpleNamespace(
-        subject_id=subject, canonical_url=url, source_document_id=document.id
-    )
+    collection = _collection_for(document, url)
     state = _CacheState({document.id: document}, {uuid4(): collection})
     gateway, store, sink = _CacheGateway(), _CacheStore(), _ExtractionSink()
-    orchestrator = _cached_orchestrator(state, gateway, store, sink, monkeypatch)
+    orchestrator = _cached_orchestrator(state, gateway, store, sink, monkeypatch, blobs)
 
     async def load_report(*args: object) -> ReferenceReport:
         del args
@@ -566,24 +603,21 @@ async def test_retry_uses_source_cache_for_s1_to_s10_and_calls_only_s11(
 ) -> None:
     subject = uuid4()
     urls = [f"https://example.test/S{index}" for index in range(1, 12)]
+    blobs = _ArchivedBlobs()
     docs: dict[UUID, SimpleNamespace] = {}
     collections: dict[UUID, SimpleNamespace] = {}
     for url in urls:
-        document = SimpleNamespace(
-            id=uuid4(),
+        document = _archived_document(
+            blobs,
             subject_id=subject,
-            final_url=url,
-            decoded_sha256=("a" * 63) + format(urls.index(url) + 1, "x"),
+            url=url,
+            content=f"ARCHIVED {url}".encode(),
         )
         docs[document.id] = document
-        collections[uuid4()] = SimpleNamespace(
-            subject_id=subject,
-            canonical_url=url,
-            source_document_id=document.id,
-        )
+        collections[uuid4()] = _collection_for(document, url)
     state = _CacheState(docs, collections)
     gateway, store, sink = _CacheGateway(), _CacheStore(), _ExtractionSink()
-    orchestrator = _cached_orchestrator(state, gateway, store, sink, monkeypatch)
+    orchestrator = _cached_orchestrator(state, gateway, store, sink, monkeypatch, blobs)
     report = ReferenceReport(
         sources=tuple(_source(url, date(2026, 7, 10)) for url in urls), events=()
     )
@@ -626,15 +660,12 @@ async def test_changed_archived_content_hash_requires_new_model_call(
 ) -> None:
     subject = uuid4()
     url = "https://example.test/changed"
-    document = SimpleNamespace(
-        id=uuid4(), subject_id=subject, final_url=url, decoded_sha256="b" * 64
-    )
-    collection = SimpleNamespace(
-        subject_id=subject, canonical_url=url, source_document_id=document.id
-    )
+    blobs = _ArchivedBlobs()
+    document = _archived_document(blobs, subject_id=subject, url=url, content=b"ARCHIVED V1")
+    collection = _collection_for(document, url)
     state = _CacheState({document.id: document}, {uuid4(): collection})
     gateway, store, sink = _CacheGateway(), _CacheStore(), _ExtractionSink()
-    orchestrator = _cached_orchestrator(state, gateway, store, sink, monkeypatch)
+    orchestrator = _cached_orchestrator(state, gateway, store, sink, monkeypatch, blobs)
     report = ReferenceReport(sources=(_source(url, date(2026, 7, 10)),), events=())
     run = SubjectProductionRun(
         subject_id=subject, edition_id=uuid4(), current_stage=SubjectProductionStage.EXTRACTION
@@ -647,7 +678,10 @@ async def test_changed_archived_content_hash_requires_new_model_call(
 
     orchestrator._load_reference_report = load_report
     first = await orchestrator._execute_direct_url_extraction(run)
-    document.decoded_sha256 = "c" * 64
+    # Same URL, re-archived with different content: a distinct extraction.
+    updated_blob_id, updated_sha256 = blobs.add(b"ARCHIVED V2")
+    document.decoded_blob_id = updated_blob_id
+    document.decoded_sha256 = updated_sha256
     second_run = SubjectProductionRun(
         subject_id=subject,
         edition_id=uuid4(),
@@ -659,3 +693,131 @@ async def test_changed_archived_content_hash_requires_new_model_call(
     assert result["status"] == "success", result
     assert first["status"] == "success"
     assert len(gateway.calls) == 2
+    assert "ARCHIVED V1" in gateway.prompts[0]
+    assert "ARCHIVED V2" in gateway.prompts[1]
+    assert sorted(row.source_content_sha256 for row in state.extractions.rows.values()) == sorted(
+        {hashlib.sha256(b"ARCHIVED V1").hexdigest(), updated_sha256}
+    )
+
+
+@pytest.mark.asyncio
+async def test_unreadable_archive_never_caches_under_the_content_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hash without readable archived content stays outside the global cache."""
+    subject = uuid4()
+    url = "https://example.test/unreadable"
+    blobs = _ArchivedBlobs()
+    document = _archived_document(blobs, subject_id=subject, url=url, content=b"ARCHIVED BODY")
+    # The hash is still recorded, but the archived bytes are gone.
+    blobs.contents.pop(document.decoded_blob_id)
+    collection = _collection_for(document, url)
+    state = _CacheState({document.id: document}, {uuid4(): collection})
+    gateway, store, sink = _CacheGateway(), _CacheStore(), _ExtractionSink()
+    orchestrator = _cached_orchestrator(state, gateway, store, sink, monkeypatch, blobs)
+    report = ReferenceReport(sources=(_source(url, date(2026, 7, 10)),), events=())
+    run = SubjectProductionRun(
+        subject_id=subject, edition_id=uuid4(), current_stage=SubjectProductionStage.EXTRACTION
+    )
+    state._runs[run.id] = run
+
+    async def load_report(*args: object) -> ReferenceReport:
+        del args
+        return report
+
+    orchestrator._load_reference_report = load_report
+    result = await orchestrator._execute_direct_url_extraction(run)
+
+    assert result["status"] == "success", result
+    assert len(gateway.calls) == 1
+    assert state.extractions.rows == {}
+    assert "<ARCHIVED_SOURCE>" not in gateway.prompts[0]
+    assert url in gateway.prompts[0]
+
+    # A second subject on the same URL cannot inherit anything either.
+    other_subject = uuid4()
+    other_document = _archived_document(
+        blobs, subject_id=other_subject, url=url, content=b"ARCHIVED BODY"
+    )
+    blobs.contents.pop(other_document.decoded_blob_id)
+    state._docs_by_id[other_document.id] = other_document
+    state._collections_by_id[uuid4()] = _collection_for(other_document, url)
+    other_run = SubjectProductionRun(
+        subject_id=other_subject,
+        edition_id=uuid4(),
+        current_stage=SubjectProductionStage.EXTRACTION,
+    )
+    state._runs[other_run.id] = other_run
+    second = await orchestrator._execute_direct_url_extraction(other_run)
+
+    assert second["status"] == "success"
+    assert len(gateway.calls) == 2
+    assert state.extractions.rows == {}
+
+
+@pytest.mark.asyncio
+async def test_archive_too_large_for_one_request_falls_back_to_live_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No partial reading is ever stored under the hash of a whole document."""
+    subject = uuid4()
+    url = "https://example.test/oversized"
+    blobs = _ArchivedBlobs()
+    oversized = b"A" * (production_workflow.MAX_ARCHIVED_SOURCE_PROMPT_CHARS + 1)
+    document = _archived_document(blobs, subject_id=subject, url=url, content=oversized)
+    collection = _collection_for(document, url)
+    state = _CacheState({document.id: document}, {uuid4(): collection})
+    gateway, store, sink = _CacheGateway(), _CacheStore(), _ExtractionSink()
+    orchestrator = _cached_orchestrator(state, gateway, store, sink, monkeypatch, blobs)
+    run = SubjectProductionRun(
+        subject_id=subject, edition_id=uuid4(), current_stage=SubjectProductionStage.EXTRACTION
+    )
+    state._runs[run.id] = run
+
+    async def load_report(*args: object) -> ReferenceReport:
+        del args
+        return ReferenceReport(sources=(_source(url, date(2026, 7, 10)),), events=())
+
+    orchestrator._load_reference_report = load_report
+    result = await orchestrator._execute_direct_url_extraction(run)
+
+    assert result["status"] == "success", result
+    assert len(gateway.calls) == 1
+    assert "<ARCHIVED_SOURCE>" not in gateway.prompts[0]
+    assert state.extractions.rows == {}
+
+
+@pytest.mark.asyncio
+async def test_archived_prompt_is_used_for_the_ioc_rules_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = uuid4()
+    url = "https://example.test/light-archived"
+    blobs = _ArchivedBlobs()
+    document = _archived_document(
+        blobs, subject_id=subject, url=url, content=b"ARCHIVED LIGHT VERSION"
+    )
+    collection = _collection_for(document, url)
+    state = _CacheState({document.id: document}, {uuid4(): collection})
+    gateway, store, sink = _CacheGateway(), _CacheStore(), _ExtractionSink()
+    orchestrator = _cached_orchestrator(state, gateway, store, sink, monkeypatch, blobs)
+    run = SubjectProductionRun(
+        subject_id=subject, edition_id=uuid4(), current_stage=SubjectProductionStage.EXTRACTION
+    )
+    state._runs[run.id] = run
+
+    async def load_report(*args: object) -> ReferenceReport:
+        del args
+        return ReferenceReport(sources=(_source(url, date(2025, 1, 1)),), events=())
+
+    orchestrator._load_reference_report = load_report
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/other", date(2026, 7, 10)),)),
+    )
+
+    assert result["status"] == "success", result
+    assert "ARCHIVED LIGHT VERSION" in gateway.prompts[0]
+    stored = list(state.extractions.rows.values())
+    assert [row.profile for row in stored] == [ExtractionProfile.IOC_RULES]
+    assert stored[0].source_content_sha256 == document.decoded_sha256

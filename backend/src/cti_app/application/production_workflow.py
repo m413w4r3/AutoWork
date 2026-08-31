@@ -11,12 +11,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.extraction import DocumentParsingError, parse_document
 from cti_app.application.iana_tlds_snapshot import IANA_TLD_SNAPSHOT_VERSION
 from cti_app.application.jobs import JobCancelledError, JobExecutionContext
 from cti_app.application.model_conversations import (
@@ -82,7 +83,7 @@ from cti_app.application.production_stages import (
     SynthesisService,
     compute_input_hash,
 )
-from cti_app.domain.collection import SourceOriginKind
+from cti_app.domain.collection import DetectedMimeType, SourceOriginKind
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
@@ -116,6 +117,16 @@ _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 # that policy creates a fresh checkpoint without conversations or repair turns.
 Q2_ROUTING_POLICY_VERSION = "3"
 REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
+
+# Archived captures are read back and inlined in the Q2 prompt. A capture the
+# existing single-request path cannot carry whole is not analysed from the
+# archive at all: Q2 falls back to the live URL and to the subject-local,
+# non-content-addressed identity, rather than caching a partial reading under
+# the hash of the complete document. Chunking is deliberately out of scope, so
+# the text budget stays under the 100 000-character message ceiling one model
+# turn already accepts, leaving room for the instructions around it.
+MAX_ARCHIVED_SOURCE_BYTES = 25 * 1024 * 1024
+MAX_ARCHIVED_SOURCE_PROMPT_CHARS = 80_000
 
 
 # Bridge and network hiccups are worth retrying; anything else is a dead end
@@ -416,9 +427,24 @@ def plan_q2_extraction_profiles(
 select_q2_extraction_profiles = plan_q2_extraction_profiles
 
 
-async def _source_content_sha256_by_url(
+@dataclass(frozen=True, slots=True)
+class _ArchivedSource:
+    """The archived capture backing one Q1 source, as held by this system."""
+
+    content_sha256: str
+    blob_id: UUID | None
+    mime_type: str | None
+
+
+class BlobContentReader(Protocol):
+    """Narrow read port over the blob catalog, for archived source content."""
+
+    async def read_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes: ...
+
+
+async def _archived_sources_by_url(
     uow: UnitOfWork, subject_id: UUID, report: ReferenceReport
-) -> dict[str, str]:
+) -> dict[str, _ArchivedSource]:
     """Resolve only reliable archived content identities for this subject."""
     collections_repository = getattr(uow, "source_collections", None)
     documents_repository = getattr(uow, "source_documents", None)
@@ -433,7 +459,7 @@ async def _source_content_sha256_by_url(
         for document in documents
         if getattr(document, "final_url", None)
     }
-    hashes: dict[str, str] = {}
+    archived: dict[str, _ArchivedSource] = {}
     for source in report.sources:
         collection = next(
             (item for item in collections if item.canonical_url == source.canonical_url),
@@ -445,11 +471,22 @@ async def _source_content_sha256_by_url(
             else by_url.get(source.canonical_url)
         )
         content_hash = getattr(document, "decoded_sha256", None)
-        if isinstance(content_hash, str):
-            normalized_hash = content_hash.casefold()
-            if re.fullmatch(r"[0-9a-f]{64}", normalized_hash):
-                hashes[source.canonical_url] = normalized_hash
-    return hashes
+        if not isinstance(content_hash, str):
+            continue
+        normalized_hash = content_hash.casefold()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized_hash):
+            continue
+        # `decoded_sha256` is the document's own decoded blob; prefer it, so the
+        # bytes read back are the bytes the hash names.
+        blob_id = getattr(document, "decoded_blob_id", None) or getattr(
+            collection, "decoded_blob_id", None
+        )
+        archived[source.canonical_url] = _ArchivedSource(
+            content_sha256=normalized_hash,
+            blob_id=blob_id if isinstance(blob_id, UUID) else None,
+            mime_type=getattr(document, "detected_mime_type", None),
+        )
+    return archived
 
 
 class ProductionWorkflowOrchestrator:
@@ -465,8 +502,14 @@ class ProductionWorkflowOrchestrator:
         diagnostics: DiagnosticsLog | None = None,
         seed_enrichment: VirusTotalSeedEnrichmentService | None = None,
         pacing: ProductionPacingPolicy | None = None,
+        blob_reader: BlobContentReader | None = None,
     ) -> None:
         self._uow_factory = uow_factory
+        # The collection service owns the blob catalog that archived captures
+        # were written through; Q2 only ever reads from it.
+        self._blob_reader: BlobContentReader | None = blob_reader or cast(
+            "BlobContentReader | None", collection_service
+        )
         self._model_service = model_service
         self._model_gateway = model_gateway or getattr(model_service, "_gateway", None)
         self._collection_service = collection_service
@@ -1117,6 +1160,37 @@ class ProductionWorkflowOrchestrator:
     ) -> dict[str, Any]:
         return await self._execute_direct_url_extraction(run, context, snapshot)
 
+    async def _load_archived_source_text(self, archived: _ArchivedSource | None) -> str | None:
+        """Return the archived text this content hash actually names, or None.
+
+        None means "no provenance-safe archive": Q2 then falls back to the live
+        URL and must not write a content-addressed checkpoint.
+        """
+        reader = getattr(self, "_blob_reader", None)
+        if archived is None or archived.blob_id is None or reader is None:
+            return None
+        try:
+            content = await reader.read_blob(archived.blob_id, max_bytes=MAX_ARCHIVED_SOURCE_BYTES)
+        except Exception:
+            return None
+        if hashlib.sha256(content).hexdigest() != archived.content_sha256:
+            # The bytes we can read are not the bytes the cache key names.
+            return None
+        try:
+            mime_type = DetectedMimeType(archived.mime_type or DetectedMimeType.HTML.value)
+        except ValueError:
+            return None
+        try:
+            text = parse_document(content, mime_type).text
+        except (DocumentParsingError, ValueError):
+            return None
+        text = text.strip()
+        if not text or len(text) > MAX_ARCHIVED_SOURCE_PROMPT_CHARS:
+            # Chunking is out of scope: an archive that does not fit whole is
+            # never analysed partially under the hash of the whole document.
+            return None
+        return text
+
     @staticmethod
     def _source_extraction_identity(
         *,
@@ -1314,7 +1388,7 @@ class ProductionWorkflowOrchestrator:
                 period_start=getattr(policy, "period_start", None),
                 period_end=getattr(policy, "period_end", None),
             )
-            source_content_hashes = await _source_content_sha256_by_url(uow, run.subject_id, report)
+            archived_sources = await _archived_sources_by_url(uow, run.subject_id, report)
             input_hash = _extraction_input_hash(
                 subject_id=run.subject_id,
                 references_hash=references.input_hash,
@@ -1353,8 +1427,15 @@ class ProductionWorkflowOrchestrator:
         model_calls_avoided = 0
         for source_index, source in enumerate(report.sources):
             plan = plans_by_url[source.canonical_url]
-            source_content_sha256 = source_content_hashes.get(source.canonical_url)
             await self._check_cancellation(run.id, context)
+            # Provenance rule: a result may only be stored under a content hash
+            # when the archived content behind that hash is what we send to the
+            # model. Without a readable archive the source stays subject-local.
+            archived = archived_sources.get(source.canonical_url)
+            archived_text = await self._load_archived_source_text(archived)
+            source_content_sha256 = (
+                archived.content_sha256 if archived is not None and archived_text else None
+            )
             # ``force_recompute_from_stage`` invalidates subject-level
             # ProductionArtifacts. A manual stage retry must still reuse a
             # VERIFIED source checkpoint; a source-level FORCE command would
@@ -1458,7 +1539,6 @@ class ProductionWorkflowOrchestrator:
                 source_model_run_id = _source_extraction_model_run_id(
                     source_content_sha256=source_content_sha256,
                     profile=plan.profile,
-                    canonical_url=plan.canonical_url,
                     force_nonce=(
                         str(run.id)
                         if force_source_cache or cache_status == "incompatible"
@@ -1534,6 +1614,7 @@ class ProductionWorkflowOrchestrator:
                 source.title,
                 source.canonical_url,
                 profile=plan.profile,
+                archived_source_content=archived_text,
             )
             if plan.profile is ExtractionProfile.FULL:
                 full_calls += 1
@@ -1552,6 +1633,7 @@ class ProductionWorkflowOrchestrator:
                 model_run_id=str(model_run_id),
                 profile=plan.profile.value,
                 web_search=True,
+                archived_content=archived_text is not None,
             )
             started_at = time.monotonic()
             raw = ""
@@ -2237,15 +2319,18 @@ def _source_extraction_model_run_id(
     *,
     source_content_sha256: str,
     profile: ExtractionProfile,
-    canonical_url: str = "",
     force_nonce: str | None = None,
     provider: ModelProvider = ModelProvider.OPENAI,
 ) -> UUID:
-    """Stable model checkpoint identity for the source-level cache key."""
+    """Stable model checkpoint identity for the source-level cache key.
+
+    Content-addressed on purpose: no subject, source id, pipeline generation or
+    URL takes part, so two subjects analysing the same archived content share
+    the same checkpoint.
+    """
     identity = json.dumps(
         {
             "source_content_sha256": source_content_sha256,
-            "canonical_url": canonical_url,
             "profile": profile.value,
             "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
             "prompt_version": EXTRACTION_PROMPT_VERSION_BY_PROFILE[profile],

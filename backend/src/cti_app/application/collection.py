@@ -144,6 +144,10 @@ class SubjectCollectionService:
         )
         self._policy_snapshot = self._collector.policy.snapshot()
 
+    async def read_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        """Read archived content back, for consumers holding only a blob id."""
+        return await self._catalog.read(blob_id, max_bytes=max_bytes)
+
     async def initialize(self, subject_id: UUID) -> list[SourceCollection]:
         async with self._uow_factory() as uow:
             group = await uow.editorial_groups.get_by_subject(subject_id)

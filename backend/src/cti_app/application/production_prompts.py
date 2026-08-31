@@ -11,8 +11,12 @@ REFERENCES_PROMPT_VERSION = "4"
 # actually guarantee response_format / JSON Schema) onto free-text GPT plus a
 # permissive Markdown parser (P23.7). EXTRACTION_PROMPT_VERSION now names that
 # Markdown dialect.
-EXTRACTION_PROMPT_VERSION = "9"
-IOC_RULES_PROMPT_VERSION = "2"
+# "10" / "3": Q2 analyses the archived capture inlined in the prompt whenever
+# one is available, so a result cached under a content hash is really produced
+# from that content. Versions bumped so checkpoints written by the previous,
+# live-URL-only prompt are never reused under the same identity.
+EXTRACTION_PROMPT_VERSION = "10"
+IOC_RULES_PROMPT_VERSION = "3"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -108,14 +112,7 @@ Rules:
 
 **Source title**: {source_title}
 
-Open this exact source:
-{source_url}
-
-Analyse the source itself. Read the complete accessible page; inspect technical
-tables, code blocks and visible images/screenshots when available. Do not
-replace it with unrelated search results or use memory as evidence. If the
-exact source cannot be accessed, report `source_unavailable` in UNCERTAINTIES
-and do not invent an extraction.
+{source_access}
 
 Perform an exhaustive IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/
 SHA512 and email addresses, including tables, appendices, images and code.
@@ -185,16 +182,9 @@ Rules:
 
 **Source title**: {source_title}
 
-Open this exact source:
-{source_url}
+{source_access}
 
-Perform an exhaustive IOC and detection-rule pass over the complete accessible source.
-Read the body, technical tables, visible appendices/annexes, code blocks, lists of
-indicators, visible images/screenshots, and first-level technical resources already
-included in the corpus. Never sacrifice IOC coverage to reduce cost. Do not replace
-the source with unrelated search results or use memory as evidence. If the exact
-source cannot be accessed, report `source_unavailable` in UNCERTAINTIES and do not
-invent an extraction.
+Never sacrifice IOC coverage to reduce cost.
 
 Extract the complete literal detection rule when it is visibly published by the
 exact source or its explicitly linked technical annex/repository already admitted
@@ -340,6 +330,38 @@ functional description. Return only French prose.
             supporting_sources=supporting_sources_text or "- None supplied.",
         )
 
+    # No archived capture is usable: the model has to open the live page, and
+    # the result stays subject-local (never content-addressed), because what it
+    # actually read cannot be tied to any content hash we hold.
+    LIVE_SOURCE_ACCESS_V1 = """Open this exact source:
+{source_url}
+
+Analyse the source itself. Read the complete accessible page; inspect technical
+tables, code blocks and visible images/screenshots when available. Do not
+replace it with unrelated search results or use memory as evidence. If the
+exact source cannot be accessed, report `source_unavailable` in UNCERTAINTIES
+and do not invent an extraction."""
+
+    # The archived capture is the analysed document, so the extraction really is
+    # a function of the content hash it is cached under.
+    ARCHIVED_SOURCE_ACCESS_V1 = """Source URL (context and provenance only):
+{source_url}
+
+The archived capture of this exact source is reproduced below, between the
+`<ARCHIVED_SOURCE>` markers. That archived content is the document to analyse:
+read it completely, including technical tables, code blocks, appendices/annexes
+and indicator lists. Do not replace it with the current live page, unrelated
+search results, or memory. Web access may only help you interpret what the
+archived content already contains; never add a fact, indicator or rule that is
+absent from it. If the archived content is unusable, report `source_unavailable`
+in UNCERTAINTIES and do not invent an extraction.
+
+Archived source content:
+
+<ARCHIVED_SOURCE>
+{archived_source_content}
+</ARCHIVED_SOURCE>"""
+
     @classmethod
     def get_extraction_prompt(
         cls,
@@ -348,6 +370,7 @@ functional description. Return only French prose.
         source_title: str = "",
         source_url: str = "",
         profile: ExtractionProfile = ExtractionProfile.FULL,
+        archived_source_content: str | None = None,
     ) -> str:
         del subject_title, source_id
         template = (
@@ -355,9 +378,18 @@ functional description. Return only French prose.
             if profile is ExtractionProfile.FULL
             else cls.IOC_RULES_EXTRACTION_MARKDOWN_V1
         )
+        source_access = (
+            cls.LIVE_SOURCE_ACCESS_V1.format(source_url=source_url)
+            if archived_source_content is None
+            else cls.ARCHIVED_SOURCE_ACCESS_V1.format(
+                source_url=source_url,
+                archived_source_content=archived_source_content,
+            )
+        )
         return template.format(
             source_title=source_title,
             source_url=source_url,
+            source_access=source_access,
         )
 
     _REFERENCES_STRUCTURE = """# REFERENCES
