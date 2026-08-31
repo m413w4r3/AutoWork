@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, datetime
 from typing import Any
 from uuid import uuid4
@@ -473,6 +474,28 @@ async def test_q2_extraction_missing_snapshot_fails_before_any_model_call(
 
     assert result["status"] == "needs_review"
     assert result["error_code"] == "q2_extraction_plan_missing_snapshot"
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_q2_duplicate_reference_source_id_fails_closed_before_batching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _Q2Gateway(None)
+    report = _q2_report(2)
+    duplicate_report = replace(
+        report,
+        sources=(
+            report.sources[0],
+            replace(report.sources[1], local_id=report.sources[0].local_id),
+        ),
+    )
+    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, duplicate_report)
+
+    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "duplicate_reference_source_id"
     assert gateway.calls == []
 
 

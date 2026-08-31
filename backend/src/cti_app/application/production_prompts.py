@@ -15,6 +15,7 @@ REFERENCES_PROMPT_VERSION = "4"
 # live-URL-only prompt are never reused under the same identity.
 EXTRACTION_PROMPT_VERSION = "12"
 IOC_RULES_PROMPT_VERSION = "5"
+IOC_RULES_BATCH_PROMPT_VERSION = "1"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -58,6 +59,20 @@ UNCERTAINTIES
 Or, when applicable, return exactly one of these terminal responses:
 EMPTY
 
+UNAVAILABLE"""
+
+_Q2_IOC_RULES_BATCH_WIRE_FORMAT = """SOURCE B1
+IOC <confirmed|contextual> <type>
+- <value>
+
+RULE <yara|sigma|suricata|snort>[: <visible name>]
+```<language>
+<literal body>
+
+SOURCE B2
+EMPTY
+
+SOURCE B3
 UNAVAILABLE"""
 
 
@@ -138,7 +153,8 @@ Rules:
 - No date after the research date.
 """
 
-    TECHNICAL_EXTRACTION_MARKDOWN_V1 = """You are analysing one specific CTI source for a reusable, source-centric extraction.
+    TECHNICAL_EXTRACTION_MARKDOWN_V1 = (
+        """You are analysing one specific CTI source for a reusable, source-centric extraction.
 
 **Source title**: {source_title}
 
@@ -163,7 +179,9 @@ to the source corpus. For every YARA, Sigma, Suricata or Snort rule:
 **Output format** — plain Markdown, no outer code fence, no JSON. Use only this
 wire format:
 
-""" + _Q2_WIRE_FORMAT + """
+"""
+        + _Q2_WIRE_FORMAT
+        + """
 
 Rules:
 - The response is bound to this one source. Never repeat its URL, source id,
@@ -195,8 +213,10 @@ Rules:
   UNAVAILABLE means the source could not actually be analysed. Either terminal
   response must be alone except for surrounding whitespace.
 """
+    )
 
-    IOC_RULES_EXTRACTION_MARKDOWN_V1 = """You are performing a reusable, source-centric IOC and detection-rule extraction for one CTI source.
+    IOC_RULES_EXTRACTION_MARKDOWN_V1 = (
+        """You are performing a reusable, source-centric IOC and detection-rule extraction for one CTI source.
 
 **Source title**: {source_title}
 
@@ -223,7 +243,9 @@ example-only, placeholder, masked, truncated, REDACTED or FUZZ values.
 **Output format** — plain Markdown, no outer code fence, no JSON. Use this
 wire format, but never emit a FACT group:
 
-""" + _Q2_IOC_RULES_WIRE_FORMAT + """
+"""
+        + _Q2_IOC_RULES_WIRE_FORMAT
+        + """
 
 Rules:
 - The response is bound to this one source. Never repeat its URL, source id,
@@ -250,6 +272,45 @@ Rules:
   UNAVAILABLE means the source could not actually be analysed. Either terminal
   response must be alone except for surrounding whitespace.
 """
+    )
+
+    IOC_RULES_BATCH_EXTRACTION_MARKDOWN_V1 = (
+        """You are performing an IOC and detection-rule extraction over several independent CTI documents.
+
+Each input between Q2_SOURCE markers is a separate document. Treat every
+document independently and process all documents.
+
+Never use B2 to interpret or classify B1. Never move an IOC or rule between
+documents. Emit no FACT and no narrative context. Produce a compact response.
+The only provenance labels you may emit are the local SOURCE B# labels shown in
+the output format. Do not emit Q1 ids, URLs, hashes, model ids or other
+internal identifiers.
+
+For every document, emit exactly one SOURCE B# section. Use EMPTY only after
+analysing that document and finding no IOC or rule. Use UNAVAILABLE only when
+that document was not analysed. Do not let one document's failure suppress the
+other documents.
+
+Extract every source-supported literal IOC and every complete literal YARA,
+Sigma, Suricata or Snort rule. Preserve rule syntax, visible line breaks and
+visible names. Never invent, repair, refang, reformat, flatten, merge or
+transform a rule. Put partial rules in no RULE block.
+
+Output format, with one independent section per input:
+
+"""
+        + _Q2_IOC_RULES_BATCH_WIRE_FORMAT
+        + """
+
+IOC types are exactly domain, ip, url, email, md5, sha1, sha256, sha512,
+filename, filepath and cve. Mark each IOC confirmed or contextual. Do not add
+annotations to value lines. The rule fence is mandatory. Do not place a SOURCE
+header inside a rule fence.
+
+Inputs:
+{batch_sources}
+"""
+    )
 
     FORMAT_REPAIR_V1 = """Your previous answer could not be read by the automated parser.
 
@@ -403,6 +464,20 @@ Archived source content:
             source_url=source_url,
             source_access=source_access,
         )
+
+    @classmethod
+    def get_ioc_rules_batch_prompt(
+        cls,
+        batch_sources: Sequence[tuple[str, str]],
+    ) -> str:
+        """Render an archive-only IOC_RULES batch using local B# labels."""
+        blocks = "\n\n".join(
+            f"<Q2_SOURCE {batch_id}>\n{archived_text}\n</Q2_SOURCE>"
+            for batch_id, archived_text in batch_sources
+        )
+        if not blocks.strip():
+            raise ValueError("A Q2 batch prompt requires at least one source")
+        return cls.IOC_RULES_BATCH_EXTRACTION_MARKDOWN_V1.format(batch_sources=blocks)
 
     _REFERENCES_STRUCTURE = """# REFERENCES
 

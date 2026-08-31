@@ -69,11 +69,27 @@ from cti_app.application.production_parsers import (
 from cti_app.application.production_prompts import (
     EXTRACTION_PROMPT_VERSION,
     EXTRACTION_PROMPT_VERSION_BY_PROFILE,
+    IOC_RULES_BATCH_PROMPT_VERSION,
+    IOC_RULES_PROMPT_VERSION,
     REFERENCES_FORMAT_REPAIR_VERSION,
     REFERENCES_PROMPT_VERSION,
     SYNTHESIS_FORMAT_REPAIR_VERSION,
     SYNTHESIS_PROMPT_VERSION,
     ProductionPromptTemplates,
+)
+from cti_app.application.production_q2_batch import (
+    MAX_Q2_BATCH_ARCHIVED_CHARS,
+    Q2_BATCH_PARSER_VERSION,
+    Q2BatchCandidate,
+    Q2BatchSource,
+    make_q2_batch,
+    parse_q2_batch_response,
+    partition_q2_batch_candidates,
+    q2_batch_model_run_id,
+)
+from cti_app.application.production_source_evidence import (
+    SOURCE_EVIDENCE_VERSION,
+    verify_ioc_rules_output_against_source,
 )
 from cti_app.application.production_stages import (
     ExtractionService,
@@ -112,9 +128,10 @@ _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 
 # Version routing decision separately from prompt/schema: changing provider policy
 # must produce a distinct persisted Q2 checkpoint.
-# "3": Q2 is one direct, web-enabled ModelGateway request per Q1 source.
-# Its deterministic ModelRun identity includes this routing policy, so changing
-# that policy creates a fresh checkpoint without conversations or repair turns.
+# "3": Q2 uses direct stateless ModelGateway requests; IOC_RULES may use an
+# archive-only batch. Its deterministic ModelRun identities include this
+# routing policy, so changing it creates fresh executions without conversations
+# or repair turns.
 Q2_ROUTING_POLICY_VERSION = "3"
 REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
 
@@ -455,6 +472,8 @@ def _new_extraction_progress(
         "ioc_rules_completed": 0,
         "cache_hits": 0,
         "model_calls": 0,
+        "light_batches": 0,
+        "light_sources_batched": 0,
         "confirmed_iocs": 0,
         "contextual_iocs": 0,
         "rules_total": 0,
@@ -579,6 +598,16 @@ class _ArchivedSource:
     content_sha256: str
     blob_id: UUID | None
     mime_type: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _Q2SourceWork:
+    """Resolved Q2 input retained after the source-by-source cache lookup."""
+
+    source: ParsedSource
+    plan: Q2SourcePlan
+    archived_text: str | None
+    source_content_sha256: str | None
 
 
 class BlobContentReader(Protocol):
@@ -1571,6 +1600,7 @@ class ProductionWorkflowOrchestrator:
                 "status": "error",
                 "error": "ModelGateway not configured",
             }
+        model_gateway = cast(ModelGateway, self._model_gateway)
         if not policy.external_llm_allowed:
             return {
                 "stage": "extraction",
@@ -1589,121 +1619,109 @@ class ProductionWorkflowOrchestrator:
         plans_by_url = {plan.canonical_url: plan for plan in source_plans}
         full_calls = 0
         light_calls = 0
+        light_batches = 0
+        light_sources_batched = 0
         cache_hits = 0
         model_calls_avoided = 0
-        for source_index, source in enumerate(report.sources):
-            plan = plans_by_url[source.canonical_url]
-            await self._check_cancellation(run.id, context)
-            _mark_extraction_source_running(progress, source, plan)
-            await self._persist_extraction_progress(run.id, progress)
-            # Provenance rule: a result may only be stored under a content hash
-            # when the archived content behind that hash is what we send to the
-            # model. Without a readable archive this is a live URL request and
-            # cannot enter the global source-content cache.
-            archived = archived_sources.get(source.canonical_url)
-            archived_text = await self._load_archived_source_text(archived)
-            source_content_sha256 = (
-                archived.content_sha256 if archived is not None and archived_text else None
-            )
-            # ``force_recompute_from_stage`` invalidates subject-level
-            # ProductionArtifacts. A manual stage retry must still reuse a
-            # VERIFIED source checkpoint; a source-level FORCE command would
-            # need its own explicit control, which the current product does
-            # not expose.
-            (
-                cached_output,
-                cache_checkpoint,
-                cache_status,
-            ) = await self._read_source_extraction_cache(
-                plan=plan,
-                source_content_sha256=source_content_sha256,
-            )
-            self._diagnostics.record(
-                event="q2.source.plan",
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage="extraction",
-                correlation_id=self._correlation_id,
-                pipeline_generation=run.pipeline_generation,
-                source_id=source.local_id,
-                source_url=source.canonical_url,
-                source_content_sha256=source_content_sha256,
-                profile=plan.profile.value,
-                reason=plan.reason,
-                cache_status=cache_status,
-            )
-            if cache_status.startswith("cached_") and cached_output is not None:
-                cache_hits += 1
-                model_calls_avoided += 1
-                source_submission = Q2ProposalSubmission(
-                    output=cached_output,
-                    source_ids=(source.local_id,),
-                    model_run_id=(
-                        str(cache_checkpoint.model_run_id)
-                        if cache_checkpoint and cache_checkpoint.model_run_id
-                        else None
-                    ),
-                )
-                submissions.append(source_submission)
-                completed.append(source.local_id)
-                _mark_extraction_source_complete(
-                    progress,
-                    source,
-                    status="cached",
-                    counts=_source_progress_counts(cached_output, source.local_id),
-                    cache_hit=True,
-                )
-                await self._persist_extraction_progress(run.id, progress)
-                self._diagnostics.record(
-                    event="q2.source.cache_hit",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    source_id=source.local_id,
-                    source_url=source.canonical_url,
-                    source_content_sha256=source_content_sha256,
-                    profile=plan.profile.value,
-                    reason=cache_status,
-                    cache_status=cache_status,
-                    model_run_id=(
-                        str(cache_checkpoint.model_run_id)
-                        if cache_checkpoint and cache_checkpoint.model_run_id
-                        else None
-                    ),
-                )
-                continue
-            if cache_status == "in_progress":
-                _mark_extraction_source_failed(progress, source.local_id, "needs_review")
-                await self._persist_extraction_progress(run.id, progress)
-                return {
-                    "stage": "extraction",
-                    "status": "needs_review",
-                    "error_code": "source_extraction_in_progress",
-                    "error": "A concurrent source extraction is still running",
-                    "source_id": source.local_id,
-                    "source_url": source.canonical_url,
-                }
-            self._diagnostics.record(
-                event="q2.source.cache_miss",
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage="extraction",
-                correlation_id=self._correlation_id,
-                source_id=source.local_id,
-                source_url=source.canonical_url,
-                source_content_sha256=source_content_sha256,
-                profile=plan.profile.value,
-                reason=cache_status,
-                cache_status=cache_status,
-            )
+        light_batches_by_first_source: dict[str, tuple[Q2BatchSource, ...]] = {}
+        individual_source_ids: set[str] = set()
+        batch_candidates: list[Q2BatchCandidate] = []
+        pending: dict[str, _Q2SourceWork] = {}
 
-            if source_index:
-                # Q2 stays one request per source; pacing is between requests,
-                # never before the first source.
+        def metrics() -> dict[str, int]:
+            return {
+                "model_calls": progress["model_calls"],
+                "full_calls": full_calls,
+                "light_calls": light_calls,
+                "light_batches": light_batches,
+                "light_sources_batched": light_sources_batched,
+                "cache_hits": cache_hits,
+                "model_calls_avoided": model_calls_avoided,
+            }
+
+        async def pace_before_model_call() -> None:
+            if progress["model_calls"]:
                 await self._check_cancellation(run.id, context)
                 await asyncio.sleep(self._pacing.model_delay_seconds())
 
+        def remove_persisted_model_call(
+            execution: Any,
+            *,
+            profile: ExtractionProfile,
+            batched_source_count: int = 0,
+        ) -> None:
+            """Do not count a ModelRun registry hit as a provider call."""
+            nonlocal full_calls, light_calls, light_batches, light_sources_batched
+            if execution.metadata.get("checkpoint") != "hit":
+                return
+            progress["model_calls"] = max(0, progress["model_calls"] - 1)
+            if profile is ExtractionProfile.FULL:
+                full_calls -= 1
+            else:
+                light_calls -= 1
+                if batched_source_count:
+                    light_batches -= 1
+                    light_sources_batched -= batched_source_count
+                    progress["light_batches"] = light_batches
+                    progress["light_sources_batched"] = light_sources_batched
+
+        async def record_batch_source_failure(
+            item: Q2BatchSource,
+            *,
+            error_code: str,
+            model_run_id: UUID,
+            details: dict[str, Any] | None = None,
+        ) -> None:
+            source = item.source
+            _mark_extraction_source_failed(progress, source.local_id, "failed")
+            await self._persist_extraction_progress(run.id, progress)
+            failed_attempts.append(source.local_id)
+            failed.append(source.local_id)
+            failure_details = details or {}
+            failures[source.local_id] = {
+                "model_run_id": str(model_run_id),
+                "batch_id": item.batch_id,
+                "source_url": source.canonical_url,
+                "error_code": error_code,
+                "error": error_code,
+                "details": failure_details,
+                "retryable": False,
+                "phase": "response_validation",
+                "submission_state": "post_submission",
+                "failure_class": _Q2FailureClass.SOURCE_CONTENT_FAILURE.value,
+                "contributes_to_coverage": True,
+                "duration_ms": 0,
+            }
+            self._diagnostics.record(
+                event="q2.source.failed",
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage="extraction",
+                correlation_id=self._correlation_id,
+                source_id=source.local_id,
+                source_url=source.canonical_url,
+                source_content_sha256=item.source_content_sha256,
+                model_run_id=str(model_run_id),
+                batch_id=item.batch_id,
+                profile=ExtractionProfile.IOC_RULES.value,
+                error_code=error_code,
+                error=error_code,
+                retryable=False,
+                phase="response_validation",
+                submission_state="post_submission",
+                failure_class=_Q2FailureClass.SOURCE_CONTENT_FAILURE.value,
+                duration_ms=0,
+            )
+
+        async def execute_individual(work: _Q2SourceWork) -> dict[str, Any] | None:
+            nonlocal full_calls, light_calls, cache_hits, model_calls_avoided
+            source = work.source
+            plan = work.plan
+            archived_text = work.archived_text
+            source_content_sha256 = work.source_content_sha256
+            _mark_extraction_source_running(progress, source, plan)
+            await self._persist_extraction_progress(run.id, progress)
+            cache_checkpoint: SourceExtraction | None = None
             if source_content_sha256 is not None and self._artifact_store is not None:
                 source_model_run_id = _source_extraction_model_run_id(
                     source_content_sha256=source_content_sha256,
@@ -1713,7 +1731,7 @@ class ProductionWorkflowOrchestrator:
                     plan=plan,
                     source_content_sha256=source_content_sha256,
                     model_run_id=source_model_run_id,
-                    force=cache_status == "miss",
+                    force=True,
                 )
                 if not claimed:
                     (
@@ -1727,16 +1745,17 @@ class ProductionWorkflowOrchestrator:
                     if cached_output is not None and cache_checkpoint is not None:
                         cache_hits += 1
                         model_calls_avoided += 1
-                        source_submission = Q2ProposalSubmission(
-                            output=cached_output,
-                            source_ids=(source.local_id,),
-                            model_run_id=(
-                                str(cache_checkpoint.model_run_id)
-                                if cache_checkpoint.model_run_id
-                                else None
-                            ),
+                        submissions.append(
+                            Q2ProposalSubmission(
+                                output=cached_output,
+                                source_ids=(source.local_id,),
+                                model_run_id=(
+                                    str(cache_checkpoint.model_run_id)
+                                    if cache_checkpoint.model_run_id
+                                    else None
+                                ),
+                            )
                         )
-                        submissions.append(source_submission)
                         completed.append(source.local_id)
                         _mark_extraction_source_complete(
                             progress,
@@ -1759,7 +1778,7 @@ class ProductionWorkflowOrchestrator:
                             reason="cached_after_claim_race",
                             cache_status=cache_status,
                         )
-                        continue
+                        return None
                     _mark_extraction_source_failed(progress, source.local_id, "needs_review")
                     await self._persist_extraction_progress(run.id, progress)
                     return {
@@ -1769,6 +1788,7 @@ class ProductionWorkflowOrchestrator:
                         "error": "A concurrent source extraction is still running",
                         "source_id": source.local_id,
                         "source_url": source.canonical_url,
+                        **metrics(),
                     }
                 assert cache_checkpoint is not None
                 model_run_id = cache_checkpoint.model_run_id or source_model_run_id
@@ -1793,6 +1813,7 @@ class ProductionWorkflowOrchestrator:
                 full_calls += 1
             else:
                 light_calls += 1
+            await pace_before_model_call()
             progress["model_calls"] += 1
             await self._persist_extraction_progress(run.id, progress)
             self._diagnostics.record(
@@ -1813,16 +1834,7 @@ class ProductionWorkflowOrchestrator:
             started_at = time.monotonic()
             raw = ""
             try:
-                request_metadata: dict[str, object] = {
-                    "source_id": source.local_id,
-                    "source_url": source.canonical_url,
-                    "profile": plan.profile.value,
-                    "source_content_sha256": source_content_sha256,
-                    "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-                    "parser_version": Q2_MARKDOWN_PARSER_VERSION,
-                    "verifier_version": ARTIFACT_VERIFIER_VERSION,
-                }
-                execution = await self._model_gateway.execute(
+                execution = await model_gateway.execute(
                     ModelRequest(
                         text=prompt,
                         prompt_template_id="production-q2-url",
@@ -1833,14 +1845,20 @@ class ProductionWorkflowOrchestrator:
                         provider=ModelProvider.OPENAI,
                         web_search=True,
                         run_id=model_run_id,
-                        # The deterministic Q2 checkpoint is deliberately
-                        # retried across technical job attempts.  The
-                        # gateway still decides whether FAILED is safe.
                         allow_failed_resubmit=True,
-                        metadata=request_metadata,
+                        metadata={
+                            "source_id": source.local_id,
+                            "source_url": source.canonical_url,
+                            "profile": plan.profile.value,
+                            "source_content_sha256": source_content_sha256,
+                            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+                            "parser_version": Q2_MARKDOWN_PARSER_VERSION,
+                            "verifier_version": ARTIFACT_VERIFIER_VERSION,
+                        },
                     ),
                     ModelRole.RESEARCH,
                 )
+                remove_persisted_model_call(execution, profile=plan.profile)
                 await self._check_cancellation(run.id, context)
                 if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
                     review_details = dict(execution.run.error_details or {})
@@ -1874,12 +1892,13 @@ class ProductionWorkflowOrchestrator:
                         raw=raw,
                         output=parsed.value,
                     )
-                source_submission = Q2ProposalSubmission(
-                    output=parsed.value,
-                    source_ids=(source.local_id,),
-                    model_run_id=str(execution.run.id),
+                submissions.append(
+                    Q2ProposalSubmission(
+                        output=parsed.value,
+                        source_ids=(source.local_id,),
+                        model_run_id=str(execution.run.id),
+                    )
                 )
-                submissions.append(source_submission)
                 completed.append(source.local_id)
                 _mark_extraction_source_complete(
                     progress,
@@ -1906,6 +1925,7 @@ class ProductionWorkflowOrchestrator:
                     rules_count=len(parsed.value.rules),
                     duration_ms=int((time.monotonic() - started_at) * 1000),
                 )
+                return None
             except JobCancelledError:
                 raise
             except Exception as exc:
@@ -1962,9 +1982,6 @@ class ProductionWorkflowOrchestrator:
                     failure_class=classification.failure_class.value,
                     duration_ms=duration_ms,
                 )
-                # Transport, reconciliation, and control failures describe the
-                # request/checkpoint path, not source content. Stop Q2 at once
-                # so S2+ cannot turn an infrastructure failure into coverage.
                 if classification.failure_class is _Q2FailureClass.GLOBAL_TRANSIENT_PRE_SUBMISSION:
                     return {
                         "stage": "extraction",
@@ -1980,10 +1997,7 @@ class ProductionWorkflowOrchestrator:
                         "completed_source_ids": completed,
                         "failed_source_ids": failed_attempts,
                         "source_failures": failures,
-                        "full_calls": full_calls,
-                        "light_calls": light_calls,
-                        "cache_hits": cache_hits,
-                        "model_calls_avoided": model_calls_avoided,
+                        **metrics(),
                     }
                 if classification.failure_class in {
                     _Q2FailureClass.RECONCILIATION_REQUIRED,
@@ -2003,11 +2017,421 @@ class ProductionWorkflowOrchestrator:
                         "completed_source_ids": completed,
                         "failed_source_ids": failed_attempts,
                         "source_failures": failures,
-                        "full_calls": full_calls,
-                        "light_calls": light_calls,
-                        "cache_hits": cache_hits,
-                        "model_calls_avoided": model_calls_avoided,
+                        **metrics(),
                     }
+                return None
+
+        async def execute_batch(batch_sources: tuple[Q2BatchSource, ...]) -> dict[str, Any] | None:
+            nonlocal light_calls, light_batches, light_sources_batched
+            batch = make_q2_batch(tuple(item.candidate for item in batch_sources))
+            # ``batch_sources`` already carries B# labels; rebuild only guards
+            # that a caller cannot accidentally submit a differently labelled
+            # batch to the parser.
+            if tuple(item.batch_id for item in batch.sources) != tuple(
+                item.batch_id for item in batch_sources
+            ):
+                raise _Q2ControlFailure("Batch source mapping is not deterministic")
+            prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
+                [(item.batch_id, item.archived_text) for item in batch_sources]
+            )
+            model_run_id = _q2_batch_model_run_id(
+                source_content_sha256=tuple(item.source_content_sha256 for item in batch_sources)
+            )
+            light_calls += 1
+            light_batches += 1
+            light_sources_batched += len(batch_sources)
+            await pace_before_model_call()
+            progress["model_calls"] += 1
+            progress["light_batches"] = light_batches
+            progress["light_sources_batched"] = light_sources_batched
+            await self._persist_extraction_progress(run.id, progress)
+            self._diagnostics.record(
+                event="q2.batch.started",
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage="extraction",
+                correlation_id=self._correlation_id,
+                batch_model_run_id=str(model_run_id),
+                batch_source_ids=[item.source.local_id for item in batch_sources],
+                source_content_sha256=[item.source_content_sha256 for item in batch_sources],
+                source_count=len(batch_sources),
+                archived_chars=sum(len(item.archived_text) for item in batch_sources),
+            )
+            started_at = time.monotonic()
+            raw = ""
+            try:
+                execution = await model_gateway.execute(
+                    ModelRequest(
+                        text=prompt,
+                        prompt_template_id="production-q2-ioc-batch",
+                        prompt_template_version=IOC_RULES_BATCH_PROMPT_VERSION,
+                        evidence_pack_hash=hashlib.sha256(prompt.encode()).hexdigest(),
+                        external_llm_allowed=True,
+                        routing_hint=ModelRoutingHint.BULK_EXTRACTION,
+                        provider=ModelProvider.OPENAI,
+                        web_search=False,
+                        run_id=model_run_id,
+                        allow_failed_resubmit=True,
+                        metadata={
+                            # Keep the gateway's authorized input hash
+                            # content-addressed too: Q1 local ids belong to
+                            # the caller and must not prevent ModelRun reuse
+                            # for the same exact batch in another subject.
+                            "source_id": f"batch:{model_run_id!s}",
+                            "batch_id": str(model_run_id),
+                            "batch_source_count": len(batch_sources),
+                            "source_content_sha256": [
+                                item.source_content_sha256 for item in batch_sources
+                            ],
+                            "ioc_rules_prompt_version": IOC_RULES_PROMPT_VERSION,
+                            "ioc_rules_batch_prompt_version": IOC_RULES_BATCH_PROMPT_VERSION,
+                            "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
+                            "q2_batch_parser_version": Q2_BATCH_PARSER_VERSION,
+                            "source_evidence_version": SOURCE_EVIDENCE_VERSION,
+                            "verifier_version": ARTIFACT_VERIFIER_VERSION,
+                        },
+                    ),
+                    ModelRole.RESEARCH,
+                )
+                remove_persisted_model_call(
+                    execution,
+                    profile=ExtractionProfile.IOC_RULES,
+                    batched_source_count=len(batch_sources),
+                )
+                await self._check_cancellation(run.id, context)
+                if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
+                    review_details = dict(execution.run.error_details or {})
+                    review_details.update(execution.metadata)
+                    raise _Q2ControlFailure(
+                        execution.run.error_message or "Model run needs review",
+                        code=execution.run.error_code or "q2_control_failure",
+                        details=review_details,
+                    )
+                if execution.run.status is not ModelRunStatus.SUCCEEDED:
+                    run_status = execution.run.status.value
+                    raise _Q2ControlFailure(
+                        f"Model run reached unexpected status {run_status}",
+                        code=execution.run.error_code or "q2_model_run_not_succeeded",
+                        details={
+                            **(execution.run.error_details or {}),
+                            **execution.metadata,
+                            "model_run_status": run_status,
+                        },
+                    )
+                raw = execution.output_text or ""
+                if not raw.strip():
+                    raise _Q2ControlFailure("Provider returned no Q2 response")
+                url_raw_parts.append(raw)
+                parsed = parse_q2_batch_response(raw, batch.source_mapping)
+                self._diagnostics.record(
+                    event="q2.batch.parsed",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    batch_model_run_id=str(execution.run.id),
+                    warnings=list(parsed.warnings),
+                    errors=list(parsed.errors),
+                )
+                warnings.extend(parsed.warnings)
+                if not parsed.usable:
+                    raise _Q2ControlFailure(
+                        "Batch response did not contain a readable expected source",
+                        code="batch_response_failure",
+                        details={"errors": list(parsed.errors)},
+                    )
+                by_id = {item.batch_id: item for item in batch_sources}
+                for source_result in parsed.sources:
+                    item = by_id[source_result.batch_id]
+                    warnings.extend(source_result.warnings)
+                    if not source_result.usable or source_result.output is None:
+                        await record_batch_source_failure(
+                            item,
+                            error_code=source_result.error_code or "batch_source_invalid",
+                            model_run_id=execution.run.id,
+                            details={"errors": list(source_result.errors)},
+                        )
+                        continue
+                    evidence = verify_ioc_rules_output_against_source(
+                        source_result.output,
+                        item.archived_text,
+                    )
+                    filtered_output = evidence.filtered_output
+                    warnings.extend(evidence.warnings)
+                    warnings.extend(
+                        f"q2_batch:{item.batch_id}:{rejection.reason_code}"
+                        for rejection in evidence.rejections
+                    )
+                    submissions.append(
+                        Q2ProposalSubmission(
+                            output=filtered_output,
+                            source_ids=(item.source.local_id,),
+                            model_run_id=str(execution.run.id),
+                        )
+                    )
+                    completed.append(item.source.local_id)
+                    _mark_extraction_source_complete(
+                        progress,
+                        item.source,
+                        status="succeeded",
+                        counts=_source_progress_counts(filtered_output, item.source.local_id),
+                    )
+                    await self._persist_extraction_progress(run.id, progress)
+                    self._diagnostics.record(
+                        event="q2.source.completed",
+                        run_id=run.id,
+                        subject_id=run.subject_id,
+                        stage="extraction",
+                        correlation_id=self._correlation_id,
+                        source_id=item.source.local_id,
+                        source_content_sha256=item.source_content_sha256,
+                        model_run_id=str(execution.run.id),
+                        batch_model_run_id=str(model_run_id),
+                        batch_id=item.batch_id,
+                        profile=ExtractionProfile.IOC_RULES.value,
+                        answer_chars=len(source_result.raw_block),
+                        facts_count=0,
+                        artifacts_count=len(filtered_output.artifacts),
+                        rules_count=len(filtered_output.rules),
+                        duration_ms=int((time.monotonic() - started_at) * 1000),
+                    )
+                return None
+            except JobCancelledError:
+                raise
+            except Exception as exc:
+                await self._check_cancellation(run.id, context)
+                classification = _classify_q2_failure(exc, provider_response_produced=False)
+                error = str(exc)[:1000]
+                duration_ms = int((time.monotonic() - started_at) * 1000)
+                exception_details = getattr(exc, "details", None)
+                batch_failure = {
+                    "batch_model_run_id": str(model_run_id),
+                    "source_ids": [item.source.local_id for item in batch_sources],
+                    "error_code": classification.error_code,
+                    "error": error,
+                    "details": (
+                        dict(exception_details) if isinstance(exception_details, dict) else {}
+                    ),
+                    "retryable": classification.retryable,
+                    "phase": classification.phase,
+                    "submission_state": classification.submission_state,
+                    "failure_class": classification.failure_class.value,
+                    "duration_ms": duration_ms,
+                }
+                for item in batch_sources:
+                    if _progress_source(progress, item.source.local_id)["status"] not in {
+                        "cached",
+                        "succeeded",
+                    }:
+                        _mark_extraction_source_failed(
+                            progress,
+                            item.source.local_id,
+                            "needs_review",
+                        )
+                await self._persist_extraction_progress(run.id, progress)
+                self._diagnostics.record(
+                    event="q2.batch.failed",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    batch_model_run_id=batch_failure["batch_model_run_id"],
+                    source_ids=batch_failure["source_ids"],
+                    error_code=batch_failure["error_code"],
+                    error=error,
+                    details=batch_failure["details"],
+                    retryable=classification.retryable,
+                    phase=classification.phase,
+                    submission_state=classification.submission_state,
+                    failure_class=classification.failure_class.value,
+                    duration_ms=duration_ms,
+                )
+                return {
+                    "stage": "extraction",
+                    "status": (
+                        "transient_error"
+                        if classification.failure_class
+                        is _Q2FailureClass.GLOBAL_TRANSIENT_PRE_SUBMISSION
+                        else classification.status
+                    ),
+                    "error_code": classification.error_code,
+                    "error": error,
+                    "details": {
+                        "completed_source_ids": completed,
+                        "failed_source_ids": failed_attempts,
+                        "source_failures": failures,
+                        "batch_failure": batch_failure,
+                        "failure_class": classification.failure_class.value,
+                    },
+                    "completed_source_ids": completed,
+                    "failed_source_ids": failed_attempts,
+                    "source_failures": failures,
+                    **metrics(),
+                }
+
+        # Q1 ids are provenance keys.  Refuse the whole extraction before a
+        # batch can make two indistinguishable submissions.
+        if len({source.local_id for source in report.sources}) != len(report.sources):
+            return {
+                "stage": "extraction",
+                "status": "needs_review",
+                "error_code": "duplicate_reference_source_id",
+                "error": "Q1 source ids must be unique before Q2 extraction",
+                "completed_source_ids": [],
+                "failed_source_ids": [],
+                **metrics(),
+            }
+
+        # First pass: resolve every source archive and perform every source
+        # cache lookup.  Hits are consumed immediately and are never candidates
+        # for a multi-source request.
+        for source in report.sources:
+            plan = plans_by_url[source.canonical_url]
+            await self._check_cancellation(run.id, context)
+            _mark_extraction_source_running(progress, source, plan)
+            await self._persist_extraction_progress(run.id, progress)
+            archived = archived_sources.get(source.canonical_url)
+            archived_text = await self._load_archived_source_text(archived)
+            source_content_sha256 = (
+                archived.content_sha256 if archived is not None and archived_text else None
+            )
+            (
+                cached_output,
+                cache_checkpoint,
+                cache_status,
+            ) = await self._read_source_extraction_cache(
+                plan=plan,
+                source_content_sha256=source_content_sha256,
+            )
+            self._diagnostics.record(
+                event="q2.source.plan",
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage="extraction",
+                correlation_id=self._correlation_id,
+                pipeline_generation=run.pipeline_generation,
+                source_id=source.local_id,
+                source_url=source.canonical_url,
+                source_content_sha256=source_content_sha256,
+                profile=plan.profile.value,
+                reason=plan.reason,
+                cache_status=cache_status,
+            )
+            if cache_status.startswith("cached_") and cached_output is not None:
+                cache_hits += 1
+                model_calls_avoided += 1
+                submissions.append(
+                    Q2ProposalSubmission(
+                        output=cached_output,
+                        source_ids=(source.local_id,),
+                        model_run_id=(
+                            str(cache_checkpoint.model_run_id)
+                            if cache_checkpoint and cache_checkpoint.model_run_id
+                            else None
+                        ),
+                    )
+                )
+                completed.append(source.local_id)
+                _mark_extraction_source_complete(
+                    progress,
+                    source,
+                    status="cached",
+                    counts=_source_progress_counts(cached_output, source.local_id),
+                    cache_hit=True,
+                )
+                await self._persist_extraction_progress(run.id, progress)
+                self._diagnostics.record(
+                    event="q2.source.cache_hit",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    source_id=source.local_id,
+                    source_url=source.canonical_url,
+                    source_content_sha256=source_content_sha256,
+                    profile=plan.profile.value,
+                    reason=cache_status,
+                    cache_status=cache_status,
+                    model_run_id=(
+                        str(cache_checkpoint.model_run_id)
+                        if cache_checkpoint and cache_checkpoint.model_run_id
+                        else None
+                    ),
+                )
+                continue
+            if cache_status == "in_progress":
+                _mark_extraction_source_failed(progress, source.local_id, "needs_review")
+                await self._persist_extraction_progress(run.id, progress)
+                return {
+                    "stage": "extraction",
+                    "status": "needs_review",
+                    "error_code": "source_extraction_in_progress",
+                    "error": "A concurrent source extraction is still running",
+                    "source_id": source.local_id,
+                    "source_url": source.canonical_url,
+                    **metrics(),
+                }
+            self._diagnostics.record(
+                event="q2.source.cache_miss",
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage="extraction",
+                correlation_id=self._correlation_id,
+                source_id=source.local_id,
+                source_url=source.canonical_url,
+                source_content_sha256=source_content_sha256,
+                profile=plan.profile.value,
+                reason=cache_status,
+                cache_status=cache_status,
+            )
+            work = _Q2SourceWork(
+                source=source,
+                plan=plan,
+                archived_text=archived_text,
+                source_content_sha256=source_content_sha256,
+            )
+            pending[source.local_id] = work
+            if (
+                plan.profile is ExtractionProfile.IOC_RULES
+                and archived_text is not None
+                and source_content_sha256 is not None
+                and len(archived_text) <= MAX_Q2_BATCH_ARCHIVED_CHARS
+            ):
+                batch_candidates.append(
+                    Q2BatchCandidate(
+                        source=source,
+                        archived_text=archived_text,
+                        source_content_sha256=source_content_sha256,
+                    )
+                )
+            else:
+                individual_source_ids.add(source.local_id)
+
+        for candidate_group in partition_q2_batch_candidates(batch_candidates):
+            if len(candidate_group) < 2:
+                individual_source_ids.add(candidate_group[0].source.local_id)
+                continue
+            local_batch = make_q2_batch(candidate_group)
+            light_batches_by_first_source[local_batch.sources[0].source.local_id] = (
+                local_batch.sources
+            )
+
+        handled_source_ids = set(completed)
+        for source in report.sources:
+            if source.local_id in handled_source_ids:
+                continue
+            batch_sources = light_batches_by_first_source.get(source.local_id)
+            if batch_sources is not None:
+                early_result = await execute_batch(batch_sources)
+                if early_result is not None:
+                    return early_result
+                handled_source_ids.update(item.source.local_id for item in batch_sources)
+                continue
+            if source.local_id in individual_source_ids:
+                early_result = await execute_individual(pending[source.local_id])
+                if early_result is not None:
+                    return early_result
+                handled_source_ids.add(source.local_id)
         if failed:
             return {
                 "stage": "extraction",
@@ -2022,8 +2446,11 @@ class ProductionWorkflowOrchestrator:
                 "completed_source_ids": completed,
                 "failed_source_ids": failed,
                 "source_failures": failures,
+                "model_calls": progress["model_calls"],
                 "full_calls": full_calls,
                 "light_calls": light_calls,
+                "light_batches": light_batches,
+                "light_sources_batched": light_sources_batched,
                 "cache_hits": cache_hits,
                 "model_calls_avoided": model_calls_avoided,
             }
@@ -2033,8 +2460,11 @@ class ProductionWorkflowOrchestrator:
             subject_id=run.subject_id,
             stage="extraction",
             correlation_id=self._correlation_id,
+            model_calls=progress["model_calls"],
             full_calls=full_calls,
             light_calls=light_calls,
+            light_batches=light_batches,
+            light_sources_batched=light_sources_batched,
             cache_hits=cache_hits,
             model_calls_avoided=model_calls_avoided,
         )
@@ -2066,8 +2496,11 @@ class ProductionWorkflowOrchestrator:
                 "extraction_profiles": {
                     plan.canonical_url: plan.profile.value for plan in source_plans
                 },
+                "model_calls": progress["model_calls"],
                 "full_calls": full_calls,
                 "light_calls": light_calls,
+                "light_batches": light_batches,
+                "light_sources_batched": light_sources_batched,
                 "cache_hits": cache_hits,
                 "model_calls_avoided": model_calls_avoided,
                 "completed_source_ids": completed,
@@ -2096,8 +2529,11 @@ class ProductionWorkflowOrchestrator:
             "status_totals": status_totals,
             "completed_source_ids": completed,
             "failed_source_ids": failed,
+            "model_calls": progress["model_calls"],
             "full_calls": full_calls,
             "light_calls": light_calls,
+            "light_batches": light_batches,
+            "light_sources_batched": light_sources_batched,
             "cache_hits": cache_hits,
             "model_calls_avoided": model_calls_avoided,
         }
@@ -2496,6 +2932,30 @@ def _q2_source_model_run_id(
         separators=(",", ":"),
     )
     return uuid5(NAMESPACE_URL, f"production-q2-source:{identity}")
+
+
+def _q2_batch_model_run_id(
+    *,
+    source_content_sha256: tuple[str, ...] | list[str],
+    provider: ModelProvider = ModelProvider.OPENAI,
+) -> UUID:
+    """Stable identity for an archive-only IOC_RULES batch.
+
+    Unlike ``_source_extraction_model_run_id``, this identity is never usable
+    as a SourceExtraction checkpoint key: it represents several documents.
+    """
+    return q2_batch_model_run_id(
+        source_content_sha256=source_content_sha256,
+        routing_policy_version=Q2_ROUTING_POLICY_VERSION,
+        provider=provider,
+        ioc_rules_prompt_version=IOC_RULES_PROMPT_VERSION,
+        ioc_rules_batch_prompt_version=IOC_RULES_BATCH_PROMPT_VERSION,
+        q2_markdown_parser_version=Q2_MARKDOWN_PARSER_VERSION,
+        q2_batch_parser_version=Q2_BATCH_PARSER_VERSION,
+        source_evidence_version=SOURCE_EVIDENCE_VERSION,
+        artifact_verifier_version=ARTIFACT_VERIFIER_VERSION,
+        parser_version=PARSER_VERSION,
+    )
 
 
 def _source_extraction_model_run_id(
