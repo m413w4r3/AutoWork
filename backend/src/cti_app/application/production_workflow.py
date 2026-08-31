@@ -185,9 +185,7 @@ def _classify_q2_failure(
     code = str(getattr(exc, "code", "") or "")
     retryable = bool(getattr(exc, "retryable", False))
     phase = str(getattr(exc, "phase", None) or detail_phase or "model_call")[:64]
-    submission_state = str(
-        getattr(exc, "submission_state", None) or detail_state or "unknown"
-    )[:32]
+    submission_state = str(getattr(exc, "submission_state", None) or detail_state or "unknown")[:32]
 
     if code == _MODEL_SUBMISSION_RECONCILIATION_CODE:
         return _Q2FailureClassification(
@@ -225,11 +223,7 @@ def _classify_q2_failure(
         not retryable
         and code in _SOURCE_CONTENT_CODES
         and submission_state in {"post_submission", "submitted_or_unknown"}
-    ) or (
-        provider_response_produced
-        and not retryable
-        and not isinstance(exc, ModelGatewayError)
-    ):
+    ) or (provider_response_produced and not retryable and not isinstance(exc, ModelGatewayError)):
         return _Q2FailureClassification(
             _Q2FailureClass.SOURCE_CONTENT_FAILURE,
             "source_failure",
@@ -240,9 +234,8 @@ def _classify_q2_failure(
             True,
         )
 
-    if (
-        submission_state in {"submission_attempted", "submitted_or_unknown", "post_submission"}
-        and (retryable or code in _TRANSIENT_CODES)
+    if submission_state in {"submission_attempted", "submitted_or_unknown", "post_submission"} and (
+        retryable or code in _TRANSIENT_CODES
     ):
         return _Q2FailureClassification(
             _Q2FailureClass.RECONCILIATION_REQUIRED,
@@ -319,9 +312,7 @@ class ProductionWorkflowOrchestrator:
         self._seed_enrichment = seed_enrichment
         self._pacing = pacing or ProductionPacingPolicy.zero()
 
-    async def _check_cancellation(
-        self, run_id: UUID, context: JobExecutionContext | None
-    ) -> None:
+    async def _check_cancellation(self, run_id: UUID, context: JobExecutionContext | None) -> None:
         """Fence both the job cancellation flag and the persistent run state."""
         if context is not None:
             await context.check_cancelled()
@@ -1078,9 +1069,7 @@ class ProductionWorkflowOrchestrator:
                 parsed = parse_q2_proposals_markdown(raw)
                 self._log_parse(run, "extraction", parsed)
                 if not parsed.usable or parsed.value is None:
-                    raise _Q2SourceContentFailure(
-                        "; ".join(parsed.errors) or "source_unavailable"
-                    )
+                    raise _Q2SourceContentFailure("; ".join(parsed.errors) or "source_unavailable")
                 submissions.append(
                     Q2ProposalSubmission(
                         output=parsed.value,

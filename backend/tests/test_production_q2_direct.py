@@ -399,10 +399,7 @@ async def test_q2_retryable_source_failure_stops_before_s2_and_does_not_create_a
     assert result["failed_source_ids"] == ["S1"]
     assert result["source_failures"]["S1"]["submission_state"] == "pre_submission"
     assert result["source_failures"]["S1"]["phase"] == "pre_submission"
-    assert (
-        result["source_failures"]["S1"]["failure_class"]
-        == "global_transient_pre_submission"
-    )
+    assert result["source_failures"]["S1"]["failure_class"] == "global_transient_pre_submission"
     assert orchestrator._extraction.store_calls == []
     failed_events = [
         event for event in diagnostics.events if event.get("event") == "q2.source.failed"
@@ -615,7 +612,5 @@ async def test_q2_nonretryable_source_failure_keeps_source_coverage_behavior(
     assert result["completed_source_ids"] == ["S2"]
     assert result["failed_source_ids"] == ["S1"]
     assert result["details"]["source_failures"]["S1"]["error_code"] == "source_content_invalid"
-    assert result["details"]["source_failures"]["S1"]["failure_class"] == (
-        "source_content_failure"
-    )
+    assert result["details"]["source_failures"]["S1"]["failure_class"] == ("source_content_failure")
     assert orchestrator._extraction.store_calls == []

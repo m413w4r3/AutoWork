@@ -928,9 +928,7 @@ async def start_edition_production(
         # start_next promotes the first one to RUNNING.
         first_run = await service.start_next(batch.id)
         if first_run is not None:
-            if await _production_run_can_dispatch(
-                uow_factory, first_run.id, batch_id=batch.id
-            ):
+            if await _production_run_can_dispatch(uow_factory, first_run.id, batch_id=batch.id):
                 parameters = ProductionStageParameters(
                     run_id=first_run.id,
                     expected_stage=SubjectProductionStage.SOURCES.value,
@@ -948,9 +946,7 @@ async def start_edition_production(
                     max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
                     actor_id=actor_id,
                 )
-                if await _production_run_can_dispatch(
-                    uow_factory, first_run.id, batch_id=batch.id
-                ):
+                if await _production_run_can_dispatch(uow_factory, first_run.id, batch_id=batch.id):
                     await dispatcher.dispatch(job.id)
                 else:
                     await _cancel_non_terminal_run_jobs(

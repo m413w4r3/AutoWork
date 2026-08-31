@@ -259,9 +259,7 @@ async def test_successful_stage_queues_the_next_one(
     )
 
 
-async def test_cancelled_run_is_a_worker_fence(
-    uow: _Uow, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_cancelled_run_is_a_worker_fence(uow: _Uow, monkeypatch: pytest.MonkeyPatch) -> None:
     registry, jobs, orchestrator = _build(
         uow, monkeypatch, {"stage": "sources", "status": "success"}
     )
@@ -370,9 +368,7 @@ async def test_assembly_stage_queues_no_further_stage(
 async def test_cancelled_batch_never_starts_or_dispatches_the_next_subject(
     uow: _Uow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry, jobs, _ = _build(
-        uow, monkeypatch, {"stage": "assembly", "status": "success"}
-    )
+    registry, jobs, _ = _build(uow, monkeypatch, {"stage": "assembly", "status": "success"})
     first = _run(uow, SubjectProductionStage.ASSEMBLY)
     first.mark_ready()
     second = _batch_of(uow, first)
