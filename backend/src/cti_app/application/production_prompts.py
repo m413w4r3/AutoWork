@@ -7,14 +7,14 @@ from collections.abc import Sequence
 from cti_app.domain.production import ExtractionProfile
 
 REFERENCES_PROMPT_VERSION = "4"
-# Q2 uses free-text GPT plus a compact grouped Markdown parser. The bridge does
+# Q2 uses free-text GPT plus a stateless Markdown wire-format parser. The bridge does
 # not guarantee response_format / JSON Schema.
-# "11" / "4": Q2 analyses the archived capture inlined in the prompt whenever
+# "12" / "5": Q2 analyses the archived capture inlined in the prompt whenever
 # one is available, so a result cached under a content hash is really produced
 # from that content. Versions bumped so checkpoints written by the previous,
 # live-URL-only prompt are never reused under the same identity.
-EXTRACTION_PROMPT_VERSION = "11"
-IOC_RULES_PROMPT_VERSION = "4"
+EXTRACTION_PROMPT_VERSION = "12"
+IOC_RULES_PROMPT_VERSION = "5"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -22,6 +22,43 @@ EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
 SYNTHESIS_PROMPT_VERSION = "5"
 REFERENCES_FORMAT_REPAIR_VERSION = "1"
 SYNTHESIS_FORMAT_REPAIR_VERSION = "2"
+
+
+_Q2_WIRE_FORMAT = """FACT <category>
+- <value>
+- <value> :: <short context>
+
+IOC <confirmed|contextual> <type>
+- <value>
+- <value> :: <short context>
+
+RULE <yara|sigma|suricata|snort>[: <visible name>]
+```<language>
+<literal body>
+
+UNCERTAINTIES
+- <uncertainty>
+
+Or, when applicable, return exactly one of these terminal responses:
+EMPTY
+
+UNAVAILABLE"""
+
+_Q2_IOC_RULES_WIRE_FORMAT = """IOC <confirmed|contextual> <type>
+- <value>
+- <value> :: <short context>
+
+RULE <yara|sigma|suricata|snort>[: <visible name>]
+```<language>
+<literal body>
+
+UNCERTAINTIES
+- <uncertainty>
+
+Or, when applicable, return exactly one of these terminal responses:
+EMPTY
+
+UNAVAILABLE"""
 
 
 class ProductionPromptTemplates:
@@ -123,87 +160,40 @@ to the source corpus. For every YARA, Sigma, Suricata or Snort rule:
 - report partial/truncated rules in UNCERTAINTIES instead of promoting them as complete;
 - a flattened one-line YARA rule stays one line, and `hxxps\\://...` stays exactly visible.
 
-**Output format** — plain Markdown, no outer code fence, no JSON. Use this
-compact grouped dialect exactly:
+**Output format** — plain Markdown, no outer code fence, no JSON. Use only this
+wire format:
 
-# FACTS
-
-## <category>
-- <value>
-- <value> :: <short useful context, only when needed>
-
-Categories: actors, campaigns, malware, tools, infection_chain, ttps,
-victimology, protocols, infrastructure, files, commands, persistence,
-detections, other_technical.
-
-# IOCS
-
-## confirmed
-domain:
-- <confirmed domain>
-ip:
-- <confirmed IP>
-url:
-- <confirmed URL>
-email:
-- <confirmed email>
-md5:
-- <confirmed MD5>
-sha1:
-- <confirmed SHA1>
-sha256:
-- <confirmed SHA256>
-sha512:
-- <confirmed SHA512>
-filename:
-- <confirmed filename>
-filepath:
-- <confirmed filepath>
-cve:
-- <confirmed CVE>
-
-## contextual
-domain:
-- <contextual value> :: <short useful context, only when needed>
-cve:
-- <contextual CVE>
-
-# RULES
-
-## yara: <visible name, omit the colon/name if none>
-```yara
-<complete literal rule body, preserving exactly what is visible>
-```
-
-## sigma: <visible name, omit the colon/name if none>
-```yaml
-<complete literal rule body, preserving exactly what is visible>
-```
-
-## suricata: <visible name, omit the colon/name if none>
-```suricata
-<complete literal rule body, preserving exactly what is visible>
-```
-
-## snort: <visible name, omit the colon/name if none>
-```snort
-<complete literal rule body, preserving exactly what is visible>
-```
-
-# UNCERTAINTIES
-* <only meaningful uncertainty, or omit the section>
+""" + _Q2_WIRE_FORMAT + """
 
 Rules:
 - The response is bound to this one source. Never repeat its URL, source id,
   provenance, evidence quote, model run id, or other internal identifier.
-- `confirmed` means confirmed_ioc and `contextual` means contextual. Never
-  emit excluded or not_applicable artifacts; omit unusable values instead.
-- The group header supplies category, IOC type and status. Do not repeat those
-  fields on each value. Do not emit evidence quotes or repeated context.
-- Emit only values literally visible in this source or its admitted technical
-  annex. A value may have one short `:: context` annotation when genuinely useful.
-- Put complete literal detection rules only in RULES. Never refang, reformat,
-  flatten, unflatten, repair, or reconstruct a rule body.
+- Emit only non-empty FACT, IOC and RULE groups. FACT categories are exactly:
+  actors, campaigns, malware, tools, infection_chain, ttps, victimology,
+  protocols, infrastructure, files, commands, persistence, detections,
+  other_technical.
+- IOC types are exactly: domain, ip, url, email, md5, sha1, sha256, sha512,
+  filename, filepath, cve. `confirmed` means confirmed IOC and `contextual`
+  means contextual IOC. IOC_RULES output must contain no FACT group.
+- The complete header is authoritative and self-contained. Do not rely on a
+  previous header and do not repeat category, status or type on value lines.
+- Emit no source id, URL, provenance, evidence quote or model id. Emit only
+  values literally visible in this source or its admitted technical annex.
+- Use `:: short context` only when useful, with whitespace on both sides of
+  `::`. Keep every IPv6 literal intact.
+- Perform an exhaustive IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/
+  SHA512 and email addresses, including tables, appendices, images and code.
+  Omit irrelevant, example-only, placeholder, masked, truncated, REDACTED or
+  FUZZ values; never reconstruct hidden values.
+- Put complete literal detection rules only in RULE. The fence is mandatory.
+  Preserve the complete literal body, syntax, visible line breaks and visible
+  rule name. Never refang, reformat, flatten, unflatten, repair, reconstruct,
+  merge or transform a rule. Report partial/truncated rules in UNCERTAINTIES,
+  never as complete rules. A flattened one-line YARA rule stays one line, and
+  `hxxps\\://...` stays exactly visible.
+- EMPTY means the source was actually analysed and contained nothing relevant.
+  UNAVAILABLE means the source could not actually be analysed. Either terminal
+  response must be alone except for surrounding whitespace.
 """
 
     IOC_RULES_EXTRACTION_MARKDOWN_V1 = """You are performing a reusable, source-centric IOC and detection-rule extraction for one CTI source.
@@ -230,75 +220,35 @@ Extract only every source-supported IOC, indicator file, relevant CVE,
 complete detection rule, and meaningful uncertainty. Omit irrelevant,
 example-only, placeholder, masked, truncated, REDACTED or FUZZ values.
 
-**Output format** — plain Markdown, no outer code fence, no JSON. Use only:
+**Output format** — plain Markdown, no outer code fence, no JSON. Use this
+wire format, but never emit a FACT group:
 
-# IOCS
-
-## confirmed
-domain:
-- <confirmed domain>
-ip:
-- <confirmed IP>
-url:
-- <confirmed URL>
-email:
-- <confirmed email>
-md5:
-- <confirmed MD5>
-sha1:
-- <confirmed SHA1>
-sha256:
-- <confirmed SHA256>
-sha512:
-- <confirmed SHA512>
-filename:
-- <confirmed filename>
-filepath:
-- <confirmed filepath>
-cve:
-- <confirmed CVE>
-
-## contextual
-domain:
-- <contextual value> :: <short useful context, only when needed>
-cve:
-- <contextual CVE>
-
-# RULES
-
-## yara: <visible name, omit the colon/name if none>
-```yara
-<complete literal rule body, preserving exactly what is visible>
-```
-
-## sigma: <visible name, omit the colon/name if none>
-```yaml
-<complete literal rule body, preserving exactly what is visible>
-```
-
-## suricata: <visible name, omit the colon/name if none>
-```suricata
-<complete literal rule body, preserving exactly what is visible>
-```
-
-## snort: <visible name, omit the colon/name if none>
-```snort
-<complete literal rule body, preserving exactly what is visible>
-```
-
-# UNCERTAINTIES
-* <only meaningful uncertainty, or omit the section>
+""" + _Q2_IOC_RULES_WIRE_FORMAT + """
 
 Rules:
 - The response is bound to this one source. Never repeat its URL, source id,
   provenance, evidence quote, model run id, or other internal identifier.
-- `confirmed` means confirmed_ioc and `contextual` means contextual. Never
-  emit excluded or not_applicable artifacts; omit unusable values instead.
-- The group header supplies IOC type and status. Do not repeat those fields on
-  each value. Do not emit FACTS or narrative/context extraction.
-- A value may have one short `:: context` annotation only when genuinely useful.
-- Put complete literal detection rules only in RULES. Never refang, reformat,
-  flatten, unflatten, repair, or reconstruct a rule body.
+- Emit only non-empty IOC and RULE groups. IOC types are exactly: domain, ip,
+  url, email, md5, sha1, sha256, sha512, filename, filepath, cve. `confirmed`
+  means confirmed IOC and `contextual` means contextual IOC.
+- The complete header is authoritative and self-contained. Do not rely on a
+  previous header and do not repeat status or type on value lines.
+- Emit no source id, URL, provenance, evidence quote or model id. Emit only
+  values literally visible in this source or its admitted technical annex.
+- Perform an exhaustive IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/
+  SHA512 and email addresses, including tables, appendices, images and code.
+  Omit irrelevant, example-only, placeholder, masked, truncated, REDACTED or
+  FUZZ values; never reconstruct hidden values.
+- Use `:: short context` only when useful, with whitespace on both sides of
+  `::`. Keep every IPv6 literal intact.
+- Put complete literal detection rules only in RULE. The fence is mandatory.
+  Preserve the complete literal body, syntax, visible line breaks and visible
+  rule name. Never refang, reformat, flatten, unflatten, repair, reconstruct,
+  merge or transform a rule. Report partial/truncated rules in UNCERTAINTIES,
+  never as complete rules.
+- EMPTY means the source was actually analysed and contained nothing relevant.
+  UNAVAILABLE means the source could not actually be analysed. Either terminal
+  response must be alone except for surrounding whitespace.
 """
 
     FORMAT_REPAIR_V1 = """Your previous answer could not be read by the automated parser.
@@ -401,8 +351,8 @@ functional description. Return only French prose.
 Analyse the source itself. Read the complete accessible page; inspect technical
 tables, code blocks and visible images/screenshots when available. Do not
 replace it with unrelated search results or use memory as evidence. If the
-exact source cannot be accessed, report `source_unavailable` in UNCERTAINTIES
-and do not invent an extraction."""
+exact source cannot be accessed, return `UNAVAILABLE` alone and do not invent
+an extraction."""
 
     # The archived capture is the analysed document, so the extraction really is
     # a function of the content hash it is cached under.
@@ -415,8 +365,8 @@ read it completely, including technical tables, code blocks, appendices/annexes
 and indicator lists. Do not replace it with the current live page, unrelated
 search results, or memory. Web access may only help you interpret what the
 archived content already contains; never add a fact, indicator or rule that is
-absent from it. If the archived content is unusable, report `source_unavailable`
-in UNCERTAINTIES and do not invent an extraction.
+absent from it. If the archived content is unusable, return `UNAVAILABLE` alone
+and do not invent an extraction.
 
 Archived source content:
 

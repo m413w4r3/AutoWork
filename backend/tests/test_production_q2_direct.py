@@ -211,8 +211,7 @@ async def test_q2_model_gateway_reuses_persisted_model_run_across_worker_replay(
 
 def test_q2_markdown_parses_compact_facts_without_changing_windows_paths() -> None:
     parsed = parse_q2_proposals_markdown(
-        """# FACTS
-## infection_chain
+        """FACT infection_chain
 - C:\\Windows uses other_technical and count_success
 """
     )
@@ -291,7 +290,7 @@ class _Q2Gateway:
             {
                 "output_text": self.output_text
                 if self.output_text is not None
-                else ("# FACTS\n\n## malware\n- ExampleRAT :: outil observe\n"),
+                else ("FACT malware\n- ExampleRAT :: outil observe\n"),
                 "run": type(
                     "Run",
                     (),
@@ -552,7 +551,7 @@ class _PersistentQ2Adapter:
             requested_model=self.requested_model,
             actual_model_version=self.requested_model,
             usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-            output_text=("# FACTS\n\n## malware\n- ExampleRAT :: outil observe\n"),
+            output_text=("FACT malware\n- ExampleRAT :: outil observe\n"),
         )
 
     async def resume(

@@ -10,6 +10,7 @@ from cti_app.application.production_artifact_verification import (
     verify_q2_proposals,
 )
 from cti_app.application.production_parsers import (
+    Q2_MARKDOWN_PARSER_VERSION,
     DetectionRule,
     Q2ArtifactProposal,
     Q2RuleProposal,
@@ -43,12 +44,15 @@ def test_full_prompt_requires_compact_facts_iocs_and_rules() -> None:
         archived_source_content="archived source",
     )
 
-    assert "# FACTS" in prompt
-    assert "# IOCS" in prompt
-    assert "# RULES" in prompt
-    assert "# FACT\n" not in prompt
+    assert "FACT <category>" in prompt
+    assert "IOC <confirmed|contextual> <type>" in prompt
+    assert "RULE <yara|sigma|suricata|snort>" in prompt
+    assert "# FACTS" not in prompt
+    assert "# IOCS" not in prompt
+    assert "# RULES" not in prompt
     assert "indicator-status" not in prompt
-    assert EXTRACTION_PROMPT_VERSION == "11"
+    assert EXTRACTION_PROMPT_VERSION == "12"
+    assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v4"
 
 
 def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
@@ -60,33 +64,31 @@ def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
         archived_source_content="archived source",
     )
 
-    assert "# IOCS" in prompt
-    assert "# RULES" in prompt
-    assert "# FACTS" not in prompt
-    assert "Do not emit FACTS" in prompt
+    assert "IOC <confirmed|contextual> <type>" in prompt
+    assert "RULE <yara|sigma|suricata|snort>" in prompt
+    assert "FACT <category>" not in prompt
+    assert "# IOCS" not in prompt
+    assert "# RULES" not in prompt
+    assert "do not extract FACTS" in prompt
     assert "narrative" in prompt
-    assert IOC_RULES_PROMPT_VERSION == "4"
+    assert IOC_RULES_PROMPT_VERSION == "5"
 
 
-def test_compact_grouped_lists_parse_100_confirmed_iocs() -> None:
+def test_ioc_group_parses_100_confirmed_iocs() -> None:
     values = "\n".join(f"- 192.0.2.{index + 1}" for index in range(100))
-    output = _parse(f"# IOCS\n\n## confirmed\n\nip:\n{values}\n")
+    output = _parse(f"IOC confirmed ip\n{values}\n")
 
     assert len(output.artifacts) == 100
     assert all(item.indicator_status == "confirmed_ioc" for item in output.artifacts)
     assert all(item.context == "" and item.evidence_quote == "" for item in output.artifacts)
 
 
-def test_status_is_inferred_and_optional_context_is_supported() -> None:
+def test_ioc_status_is_header_data_and_optional_context_is_supported() -> None:
     output = _parse(
-        """# IOCS
-
-## confirmed
-domain:
+        """IOC confirmed domain
 - evil.example :: C2
 
-## contextual
-domain:
+IOC contextual domain
 - provider.example
 """
     )
@@ -97,14 +99,12 @@ domain:
     assert output.artifacts[1].context == ""
 
 
-def test_full_facts_are_grouped_without_required_evidence() -> None:
+def test_fact_groups_are_self_contained_without_required_evidence() -> None:
     output = _parse(
-        """# FACTS
-
-## malware
+        """FACT malware
 - ExampleRAT :: payload family
 
-## ttps
+FACT ttps
 - T1059 :: shell
 """
     )
@@ -114,6 +114,202 @@ def test_full_facts_are_grouped_without_required_evidence() -> None:
         ("ttps", "T1059", "shell"),
     ]
     assert output.facts[1].attack_id == "T1059"
+
+
+def test_groups_are_order_independent_and_omitted_groups_stay_empty() -> None:
+    output = _parse(
+        """IOC contextual domain
+- contextual.example
+
+FACT malware
+- ExampleRAT
+
+IOC confirmed ip
+- 192.0.2.10
+"""
+    )
+
+    assert [fact.value for fact in output.facts] == ["ExampleRAT"]
+    assert [artifact.value for artifact in output.artifacts] == [
+        "contextual.example",
+        "192.0.2.10",
+    ]
+    assert output.rules == []
+
+
+def test_markdown_hashes_are_optional_for_complete_headers() -> None:
+    without_hashes = _parse("IOC confirmed domain\n- evil.example\n")
+    with_hashes = _parse("## IOC confirmed domain\n- evil.example\n")
+
+    assert with_hashes.artifacts == without_hashes.artifacts
+
+
+def test_all_ioc_types_are_exact_and_hash_types_map_to_internal_hash() -> None:
+    values = {
+        "domain": "evil.example",
+        "ip": "192.0.2.10",
+        "url": "https://evil.example/path",
+        "email": "analyst@evil.example",
+        "md5": "a" * 32,
+        "sha1": "b" * 40,
+        "sha256": "c" * 64,
+        "sha512": "d" * 128,
+        "filename": "dropper.exe",
+        "filepath": r"C:\\Windows\\dropper.exe",
+        "cve": "CVE-2026-1234",
+    }
+    output = _parse(
+        "\n\n".join(
+            f"IOC confirmed {type_token}\n- {value}"
+            for type_token, value in values.items()
+        )
+    )
+
+    assert len(output.artifacts) == len(values)
+    assert [artifact.artifact_type for artifact in output.artifacts] == [
+        "hash" if type_token in {"md5", "sha1", "sha256", "sha512"} else type_token
+        for type_token in values
+    ]
+
+
+def test_ipv6_is_not_split_as_context() -> None:
+    output = _parse("IOC confirmed ip\n- 2001:db8::1\n")
+
+    assert output.artifacts[0].value == "2001:db8::1"
+    assert output.artifacts[0].context == ""
+
+
+def test_unknown_heading_terminates_only_the_current_group() -> None:
+    result = parse_q2_proposals_markdown(
+        """FACT malware
+- kept
+## UNKNOWN
+- ignored
+IOC confirmed domain
+- next.example
+"""
+    )
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert [fact.value for fact in result.value.facts] == ["kept"]
+    assert [artifact.value for artifact in result.value.artifacts] == ["next.example"]
+    assert "q2_unknown_heading" in result.warnings
+
+
+@pytest.mark.parametrize(
+    ("header", "warning"),
+    [
+        ("FACT unknown_category", "q2_unknown_fact_category"),
+        ("IOC unknown domain", "q2_unknown_ioc_status"),
+        ("IOC confirmed unknown", "q2_unknown_ioc_type"),
+    ],
+)
+def test_unknown_group_metadata_drops_locally_and_does_not_inherit(
+    header: str, warning: str
+) -> None:
+    result = parse_q2_proposals_markdown(
+        f"""{header}
+- ignored.example
+IOC contextual domain
+- valid.example
+"""
+    )
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert [artifact.value for artifact in result.value.artifacts] == ["valid.example"]
+    assert [fact.value for fact in result.value.facts] == []
+    assert warning in result.warnings
+
+
+def test_unexpected_structure_ends_group_and_bullets_do_not_inherit_metadata() -> None:
+    result = parse_q2_proposals_markdown(
+        """IOC confirmed domain
+- kept.example
+type: domain
+- ignored.example
+FACT tools
+* ToolName
+"""
+    )
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert [artifact.value for artifact in result.value.artifacts] == ["kept.example"]
+    assert [fact.value for fact in result.value.facts] == ["ToolName"]
+    assert "q2_unexpected_structure" in result.warnings
+
+
+def test_rule_without_fence_drops_locally_and_next_group_is_parsed() -> None:
+    result = parse_q2_proposals_markdown(
+        """RULE yara: Broken
+not a fence
+IOC confirmed domain
+- valid.example
+"""
+    )
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert result.value.rules == []
+    assert [artifact.value for artifact in result.value.artifacts] == ["valid.example"]
+    assert "rule_without_body_fence" in result.warnings
+
+
+def test_empty_is_a_usable_empty_source_output() -> None:
+    result = parse_q2_proposals_markdown("  EMPTY\n")
+
+    assert result.usable
+    assert result.value == Q2SourceOutput()
+
+
+def test_unavailable_is_non_usable_with_a_specific_error() -> None:
+    result = parse_q2_proposals_markdown("\nUNAVAILABLE\n")
+
+    assert not result.usable
+    assert result.value is None
+    assert result.errors == ["q2_source_unavailable"]
+
+
+@pytest.mark.parametrize("marker", ["EMPTY", "UNAVAILABLE"])
+def test_terminal_marker_mixed_with_groups_is_rejected(marker: str) -> None:
+    result = parse_q2_proposals_markdown(
+        f"""{marker}
+FACT malware
+- ExampleRAT
+"""
+    )
+
+    assert not result.usable
+    assert result.errors == ["q2_terminal_marker_mixed"]
+
+
+def test_terminal_marker_inside_rule_body_is_not_a_terminal_response() -> None:
+    result = parse_q2_proposals_markdown(
+        """RULE sigma: Literal
+```yaml
+title: EMPTY
+```
+"""
+    )
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert result.value.rules[0].body == "title: EMPTY"
+
+
+def test_headers_inside_an_unrelated_fence_are_not_parsed() -> None:
+    result = parse_q2_proposals_markdown(
+        """```markdown
+FACT malware
+- not-a-proposal
+```
+"""
+    )
+
+    assert not result.usable
+    assert result.errors == ["q2_compact_sections_missing"]
 
 
 def test_old_verbose_q2_dialect_is_not_supported() -> None:
@@ -129,6 +325,18 @@ evidence: source
 
     assert not result.usable
     assert "q2_compact_sections_missing" in result.errors
+
+
+def test_old_q2_v3_grouped_sections_are_not_supported() -> None:
+    result = parse_q2_proposals_markdown(
+        """# FACTS
+## malware
+- ExampleRAT
+"""
+    )
+
+    assert not result.usable
+    assert result.value is None
 
 
 @pytest.mark.parametrize(
@@ -157,7 +365,7 @@ def test_q2_checkpoint_requires_current_versions(
 
 
 def test_source_ids_are_attached_by_verifier_not_required_from_model() -> None:
-    output = _parse("# IOCS\n\n## confirmed\n\nip:\n- 192.0.2.10\n")
+    output = _parse("IOC confirmed ip\n- 192.0.2.10\n")
     result = verify_q2_proposals(
         (Q2ProposalSubmission(output=output, source_ids=("S42",), model_run_id="run-1"),)
     )
@@ -171,10 +379,7 @@ def test_source_ids_are_attached_by_verifier_not_required_from_model() -> None:
 
 def test_excluded_and_placeholder_values_are_rejected_or_omitted() -> None:
     output = _parse(
-        """# IOCS
-
-## confirmed
-domain:
+        """IOC confirmed domain
 - example[.]com
 - <redacted>
 """
@@ -200,7 +405,7 @@ domain:
 
 def test_defanged_ioc_literal_is_preserved_while_normalizing_locally() -> None:
     visible = r"hxxps\://evil[.]com/path"
-    output = _parse(f"# IOCS\n\n## confirmed\n\nurl:\n- {visible}\n")
+    output = _parse(f"IOC confirmed url\n- {visible}\n")
     assert output.artifacts[0].value == visible
 
     result = verify_q2_proposals((Q2ProposalSubmission(output=output, source_ids=("S1",)),))
@@ -216,8 +421,8 @@ def test_rule_bodies_are_literal_for_all_supported_languages() -> None:
         "suricata": 'alert tcp any any -> any 443 (msg:"x"; sid:1;)',
         "snort": 'alert tcp any any -> any 443 (msg:"x"; sid:2;)',
     }
-    text = "# RULES\n\n" + "\n\n".join(
-        f"## {rule_type}: Example\n```{rule_type}\n{body}\n```"
+    text = "\n\n".join(
+        f"RULE {rule_type}: Example\n```{rule_type}\n{body}\n```"
         for rule_type, body in bodies.items()
     )
     output = _parse(text)
@@ -234,7 +439,7 @@ def test_rule_bodies_are_literal_for_all_supported_languages() -> None:
 
 def test_flattened_yara_stays_flattened_and_defanged_rule_text_stays_visible() -> None:
     body = r'rule Flat { strings: $u = "hxxps\://evil[.]com" condition: $u }'
-    output = _parse(f"# RULES\n\n## yara: Flat\n```yara\n{body}\n```")
+    output = _parse(f"RULE yara: Flat\n```yara\n{body}\n```")
 
     assert len(output.rules) == 1
     assert output.rules[0].body == body
@@ -243,9 +448,7 @@ def test_flattened_yara_stays_flattened_and_defanged_rule_text_stays_visible() -
 
 def test_incomplete_rule_goes_to_uncertainties_not_rules() -> None:
     result = parse_q2_proposals_markdown(
-        """# RULES
-
-## yara: Broken
+        """RULE yara: Broken
 ```yara
 rule Broken {
   condition: true

@@ -244,7 +244,7 @@ Q2_EXTRACTION_CONTRACT_VERSION = "q2-source-extraction-v3"
 
 # Bump whenever the Q2 Markdown dialect or its lexing rules change. Participates
 # in the Q2 checkpoint identity so a parser change forces a fresh model call.
-Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v3"
+Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v4"
 
 
 def q2_source_output_to_json(output: Q2SourceOutput) -> dict[str, Any]:
@@ -693,12 +693,12 @@ def _editorial_title(body: str) -> str | None:
     return None
 
 
-# --- Q2 compact grouped Markdown -------------------------------------------
+# --- Q2 stateless Markdown wire format -------------------------------------
 #
 # Q2 is a small, source-bound wire format. A response is already associated
 # with one source by the orchestrator, so source ids, URLs, evidence,
 # provenance and per-value status are intentionally absent from the model
-# output. This parser expands grouped lists into the existing proposal
+# output. This parser expands self-contained groups into the existing proposal
 # objects; the verifier assigns canonical provenance and normalization.
 
 _Q2_FACT_CATEGORIES = frozenset(
@@ -720,28 +720,21 @@ _Q2_FACT_CATEGORIES = frozenset(
     }
 )
 
-# The bridge cannot be trusted to keep a single "hash" word; the prompt asks
-# for the concrete algorithm instead. All of it normalizes to the internal
-# ArtifactType the rest of the pipeline already understands.
-_Q2_ARTIFACT_TYPE_ALIASES = {
+_Q2_IOC_TYPE_TO_ARTIFACT_TYPE = {
     "domain": "domain",
     "ip": "ip",
-    "ip_address": "ip",
     "url": "url",
     "email": "email",
-    "hash": "hash",
     "md5": "hash",
     "sha1": "hash",
     "sha256": "hash",
     "sha512": "hash",
     "filename": "filename",
-    "file_name": "filename",
     "filepath": "filepath",
-    "file_path": "filepath",
     "cve": "cve",
 }
 
-_Q2_RULE_TYPE_ALIASES = {
+_Q2_RULE_TYPES = {
     "yara": DetectionRuleType.YARA,
     "sigma": DetectionRuleType.SIGMA,
     "suricata": DetectionRuleType.SURICATA,
@@ -754,13 +747,11 @@ MAX_TOTAL_RULE_CONTENT_BYTES_PER_SOURCE = 2 * 1024 * 1024
 
 _ATTACK_ID = re.compile(r"T\d{4}(?:\.\d{3})?")
 
-_Q2_TOP_SECTIONS = frozenset({"facts", "iocs", "rules", "uncertainties", "incertitudes"})
-_Q2_IOC_STATUSES = {"confirmed": "confirmed_ioc", "contextual": "contextual"}
-_Q2_COMPACT_TYPE_ALIASES = frozenset(_Q2_ARTIFACT_TYPE_ALIASES)
-_Q2_RULE_HEADING = re.compile(
-    r"^(?P<type>yara|sigma|suricata|snort)(?:\s*:\s*(?P<name>.*))?$", re.IGNORECASE
-)
-_Q2_TYPE_LINE = re.compile(r"^\s*(?P<type>[A-Za-z][A-Za-z0-9 _-]*)\s*:\s*$")
+_Q2_HEADER_TEXT = re.compile(r"^\s*(?:#{1,6}\s+)?(?P<text>.+?)\s*#*\s*$")
+_Q2_FACT_HEADER = re.compile(r"^FACT(?:\s+(?P<category>.+))?$")
+_Q2_RULE_HEADER = re.compile(r"^RULE(?:\s+(?P<spec>.+))?$")
+_Q2_RULE_FENCE_OPEN = re.compile(r"^\s*```(?P<language>[A-Za-z0-9_-]+)\s*$")
+_Q2_TERMINAL_MARKERS = frozenset({"EMPTY", "UNAVAILABLE"})
 
 
 def _rule_issue(result: ParseResult[Q2SourceOutput], code: str) -> None:
@@ -768,37 +759,115 @@ def _rule_issue(result: ParseResult[Q2SourceOutput], code: str) -> None:
     result.uncertainties.append(code)
 
 
-def _normalize_token(raw: str) -> str:
-    """Fold a field value onto the underscored vocabulary the schema expects."""
-    return _normalize_key(raw).replace("-", "_")
-
-
 def _normalize_q2_input(raw: str) -> str:
-    """Normalize transport whitespace without changing visible rule literals."""
+    """Normalize only transport line endings around the Q2 wire format."""
     text = raw.replace("\r\n", "\n").replace("\r", "\n")
-    for exotic in (_NBSP, _NARROW_NBSP):
-        text = text.replace(exotic, " ")
-    text = text.replace(_BOM, "").strip()
-    fenced = _FENCE.match(text)
-    return fenced.group("body").strip() if fenced else text
+    if text.startswith(_BOM):
+        text = text[1:]
+    return text.strip()
 
 
-def _q2_compact_heading(line: str) -> tuple[int, str] | None:
-    """Read a compact heading, tolerating the bridge's lost hash markers."""
-    match = re.match(r"^\s{0,3}(?P<hashes>#{1,6})\s+(?P<text>.+?)\s*#*\s*$", line)
-    if match:
-        return len(match.group("hashes")), match.group("text").strip()
+@dataclass(frozen=True)
+class _Q2Header:
+    kind: str
+    category: str | None = None
+    indicator_status: str | None = None
+    artifact_type: str | None = None
+    rule_type: DetectionRuleType | None = None
+    name: str | None = None
+    error_code: str | None = None
 
-    candidate = line.strip().rstrip("#").strip()
-    folded = _fold(candidate)
-    token = _normalize_token(candidate)
-    if folded in _Q2_TOP_SECTIONS or token in _Q2_FACT_CATEGORIES:
-        return 1, candidate
-    if folded in _Q2_IOC_STATUSES or token in _Q2_COMPACT_TYPE_ALIASES:
-        return 2, candidate
-    if _Q2_RULE_HEADING.fullmatch(candidate):
-        return 2, candidate
+
+def _q2_header_text(line: str) -> str | None:
+    """Return a header candidate, accepting optional Markdown hashes."""
+    if not line.strip() or _BULLET.match(line):
+        return None
+    match = _Q2_HEADER_TEXT.fullmatch(line)
+    return match.group("text").strip() if match else None
+
+
+def _parse_q2_header(line: str) -> _Q2Header | None:
+    candidate = _q2_header_text(line)
+    if candidate is None:
+        return None
+
+    if candidate == "UNCERTAINTIES":
+        return _Q2Header(kind="uncertainties")
+
+    fact_match = _Q2_FACT_HEADER.fullmatch(candidate)
+    if fact_match is not None:
+        category = fact_match.group("category")
+        if category in _Q2_FACT_CATEGORIES:
+            return _Q2Header(kind="fact", category=category)
+        return _Q2Header(kind="invalid", error_code="q2_unknown_fact_category")
+
+    parts = candidate.split()
+    if parts and parts[0] == "IOC":
+        status = parts[1] if len(parts) > 1 else ""
+        type_token = parts[2] if len(parts) > 2 else ""
+        if status not in {"confirmed", "contextual"}:
+            return _Q2Header(kind="invalid", error_code="q2_unknown_ioc_status")
+        artifact_type = _Q2_IOC_TYPE_TO_ARTIFACT_TYPE.get(type_token)
+        if artifact_type is None or len(parts) != 3:
+            return _Q2Header(kind="invalid", error_code="q2_unknown_ioc_type")
+        return _Q2Header(
+            kind="ioc",
+            indicator_status=(
+                "confirmed_ioc" if status == "confirmed" else "contextual"
+            ),
+            artifact_type=artifact_type,
+        )
+
+    rule_match = _Q2_RULE_HEADER.fullmatch(candidate)
+    if rule_match is not None:
+        specification = rule_match.group("spec")
+        if not specification:
+            return _Q2Header(kind="invalid", error_code="q2_unknown_rule_type")
+        raw_type, separator, raw_name = specification.partition(":")
+        rule_type = _Q2_RULE_TYPES.get(raw_type.strip())
+        if rule_type is None:
+            return _Q2Header(kind="invalid", error_code="q2_unknown_rule_type")
+        if separator and not raw_name.strip():
+            return _Q2Header(kind="invalid", error_code="q2_rule_name_missing")
+        return _Q2Header(
+            kind="rule",
+            rule_type=rule_type,
+            name=raw_name.strip() if separator else None,
+        )
+
     return None
+
+
+def _q2_is_markdown_heading(line: str) -> bool:
+    return bool(re.match(r"^\s*#{1,6}(?:\s+|$)", line))
+
+
+def _q2_terminal_markers_outside_fences(lines: list[str]) -> tuple[str, ...]:
+    markers: list[str] = []
+    in_fence = False
+    for line in lines:
+        if in_fence:
+            if _FENCE_CLOSE.fullmatch(line):
+                in_fence = False
+            continue
+        if _Q2_RULE_FENCE_OPEN.fullmatch(line):
+            in_fence = True
+            continue
+        marker = line.strip()
+        if marker in _Q2_TERMINAL_MARKERS:
+            markers.append(marker)
+    return tuple(markers)
+
+
+def _q2_fence_close(lines: list[str], opening_index: int) -> int | None:
+    return next(
+        (
+            candidate
+            for candidate in range(opening_index + 1, len(lines))
+            if _FENCE_CLOSE.fullmatch(lines[candidate])
+        ),
+        None,
+    )
 
 
 def _q2_value_and_context(raw: str) -> tuple[str, str]:
@@ -810,168 +879,190 @@ def _q2_value_and_context(raw: str) -> tuple[str, str]:
 
 
 def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
-    """Parse one source-bound Q2 compact grouped response.
-
-    The old per-item field dialect is intentionally not recognized. A compact
-    response may contain facts, IOC groups, rules, uncertainties, or any
-    combination of those sections; omitted values are simply absent proposals.
-    """
+    """Parse the stateless Q2 wire format, failing closed at group boundaries."""
     result: ParseResult[Q2SourceOutput] = ParseResult()
     body = _normalize_q2_input(text)
     if not body:
         result.errors.append("empty_response")
         return result
 
+    if body == "EMPTY":
+        result.value = Q2SourceOutput()
+        return result
+    if body == "UNAVAILABLE":
+        result.errors.append("q2_source_unavailable")
+        return result
+
     facts: list[Q2FactProposal] = []
     artifacts: list[Q2ArtifactProposal] = []
     rules: list[Q2RuleProposal] = []
     uncertainties: list[str] = []
-    recognized_sections: set[str] = set()
-    section: str | None = None
-    fact_category: str | None = None
-    ioc_status: str | None = None
-    artifact_type: str | None = None
-    total_rule_content_bytes = 0
     lines = body.split("\n")
+    if _q2_terminal_markers_outside_fences(lines):
+        result.errors.append("q2_terminal_marker_mixed")
+        return result
+
+    recognized_groups = 0
+    current: _Q2Header | None = None
+    total_rule_content_bytes = 0
     i = 0
     while i < len(lines):
-        heading = _q2_compact_heading(lines[i])
-        if heading is not None:
-            _level, heading_text = heading
-            top = _fold(heading_text)
-            token = _normalize_token(heading_text)
-            if top in _Q2_TOP_SECTIONS:
-                section = "uncertainties" if top == "incertitudes" else top
-                recognized_sections.add(section)
-                fact_category = None
-                ioc_status = None
-                artifact_type = None
-                i += 1
-                continue
-            if section == "facts" and token in _Q2_FACT_CATEGORIES:
-                fact_category = token
-                i += 1
-                continue
-            if section == "iocs" and top in _Q2_IOC_STATUSES:
-                ioc_status = _Q2_IOC_STATUSES[top]
-                artifact_type = None
-                i += 1
-                continue
-            if section == "rules":
-                match = _Q2_RULE_HEADING.fullmatch(heading_text.strip())
-                if match is not None:
-                    rule_type = _Q2_RULE_TYPE_ALIASES[match.group("type").casefold()]
-                    name = match.group("name").strip() or None if match.group("name") else None
-                    opening_index = i + 1
-                    while opening_index < len(lines) and not lines[opening_index].strip():
-                        opening_index += 1
-                    if (
-                        opening_index >= len(lines)
-                        or _FENCE_OPEN.fullmatch(lines[opening_index]) is None
-                    ):
-                        _rule_issue(result, "rule_without_body_fence")
-                        i = opening_index
-                        continue
-                    closing_index: int | None = None
-                    for candidate in range(opening_index + 1, len(lines)):
-                        if _FENCE_CLOSE.fullmatch(lines[candidate]):
-                            closing_index = candidate
-                            break
-                    if closing_index is None:
-                        _rule_issue(result, "rule_truncated_not_promoted")
-                        i = len(lines)
-                        continue
-                    # Preserve the literal body. Do not strip, refang,
-                    # reconstruct or insert newlines into it.
-                    body_value = "\n".join(lines[opening_index + 1 : closing_index])
-                    body_bytes = len(body_value.encode("utf-8"))
-                    if not body_value.strip():
-                        _rule_issue(result, "rule_body_empty")
-                    elif body_bytes > MAX_SINGLE_RULE_BODY_BYTES:
-                        _rule_issue(result, "rule_limit_single_body")
-                    elif rule_type is DetectionRuleType.YARA and not _yara_body_is_balanced(
-                        body_value
-                    ):
-                        _rule_issue(result, "rule_truncated_not_promoted")
-                    elif len(rules) >= MAX_RULES_PER_SOURCE:
-                        _rule_issue(result, "rule_limit_max_rules_per_source")
-                    elif (
-                        total_rule_content_bytes + body_bytes
-                        > MAX_TOTAL_RULE_CONTENT_BYTES_PER_SOURCE
-                    ):
-                        _rule_issue(result, "rule_limit_total_content_per_source")
-                    else:
-                        try:
-                            rule = Q2RuleProposal(
-                                rule_type=rule_type,
-                                name=name,
-                                body=body_value,
-                                context="",
-                                evidence_quote="",
-                            )
-                        except ValidationError:
-                            _rule_issue(result, "rule_schema_invalid")
-                        else:
-                            rules.append(rule)
-                            total_rule_content_bytes += body_bytes
-                    i = closing_index + 1
-                    continue
+        if _FENCE_OPEN.fullmatch(lines[i]) and not _FENCE_CLOSE.fullmatch(lines[i]):
+            if current is not None:
+                result.warnings.append("q2_unexpected_structure")
+                result.dropped_blocks.append(lines[i].strip())
+                current = None
+            closing_index = _q2_fence_close(lines, i)
+            i = len(lines) if closing_index is None else closing_index + 1
+            continue
+        if _FENCE_CLOSE.fullmatch(lines[i]):
+            if current is not None:
+                result.warnings.append("q2_unexpected_structure")
+                result.dropped_blocks.append(lines[i].strip())
+                current = None
+            i += 1
+            continue
 
-        if section == "facts" and fact_category is not None:
-            bullet = _BULLET.match(lines[i])
-            if bullet:
-                value, context = _q2_value_and_context(bullet.group("text"))
-                if value:
-                    attack_id = (
-                        value if fact_category == "ttps" and _ATTACK_ID.fullmatch(value) else None
-                    )
-                    try:
-                        fact = Q2FactProposal(
-                            category=cast(Any, fact_category),
-                            value=value,
-                            attack_id=attack_id,
-                            context=context,
-                            evidence_quote="",
-                        )
-                    except ValidationError:
-                        result.warnings.append("fact_schema_invalid")
-                    else:
-                        facts.append(fact)
+        header = _parse_q2_header(lines[i])
+        if header is not None:
+            if header.kind == "invalid":
+                result.warnings.append(header.error_code or "q2_invalid_group")
+                result.dropped_blocks.append(lines[i].strip())
+                current = None
+                i += 1
+                continue
+
+            recognized_groups += 1
+            current = header
+            if header.kind != "rule":
+                i += 1
+                continue
+
+            opening_index = i + 1
+            while opening_index < len(lines) and not lines[opening_index].strip():
+                opening_index += 1
+            if (
+                opening_index >= len(lines)
+                or _Q2_RULE_FENCE_OPEN.fullmatch(lines[opening_index]) is None
+            ):
+                _rule_issue(result, "rule_without_body_fence")
+                result.dropped_blocks.append(lines[i].strip())
+                current = None
+                # A malformed fence still encloses opaque text until its close.
+                if opening_index < len(lines) and lines[opening_index].lstrip().startswith("```"):
+                    closing_index = _q2_fence_close(lines, opening_index)
+                    i = len(lines) if closing_index is None else closing_index + 1
                 else:
-                    result.warnings.append("fact_without_value")
-        elif section == "iocs" and ioc_status is not None:
-            type_line = _Q2_TYPE_LINE.match(lines[i])
-            if type_line:
-                type_token = _normalize_token(type_line.group("type"))
-                artifact_type = _Q2_ARTIFACT_TYPE_ALIASES.get(type_token)
-                if artifact_type is None:
-                    result.warnings.append("unknown_artifact_type")
+                    i += 1
+                continue
+
+            closing_index = _q2_fence_close(lines, opening_index)
+            if closing_index is None:
+                _rule_issue(result, "rule_truncated_not_promoted")
+                result.dropped_blocks.append(lines[i].strip())
+                current = None
+                i = len(lines)
+                continue
+
+            # Preserve the body literally. Only line endings were normalized
+            # before this point; do not strip or otherwise rewrite it.
+            body_value = "\n".join(lines[opening_index + 1 : closing_index])
+            body_bytes = len(body_value.encode("utf-8"))
+            rule_type = header.rule_type
+            if not body_value.strip():
+                _rule_issue(result, "rule_body_empty")
+            elif body_bytes > MAX_SINGLE_RULE_BODY_BYTES:
+                _rule_issue(result, "rule_limit_single_body")
+            elif rule_type is DetectionRuleType.YARA and not _yara_body_is_balanced(
+                body_value
+            ):
+                _rule_issue(result, "rule_truncated_not_promoted")
+            elif len(rules) >= MAX_RULES_PER_SOURCE:
+                _rule_issue(result, "rule_limit_max_rules_per_source")
+            elif (
+                total_rule_content_bytes + body_bytes
+                > MAX_TOTAL_RULE_CONTENT_BYTES_PER_SOURCE
+            ):
+                _rule_issue(result, "rule_limit_total_content_per_source")
             else:
-                bullet = _BULLET.match(lines[i])
-                if bullet and artifact_type is not None:
-                    value, context = _q2_value_and_context(bullet.group("text"))
-                    if value:
-                        try:
-                            artifact = Q2ArtifactProposal(
-                                value=value,
-                                artifact_type=cast(Any, artifact_type),
-                                indicator_status=cast(Any, ioc_status),
-                                context=context,
-                                evidence_quote="",
-                            )
-                        except ValidationError:
-                            result.warnings.append("artifact_schema_invalid")
-                        else:
-                            artifacts.append(artifact)
-                    else:
-                        result.warnings.append("artifact_without_value")
-        elif section == "uncertainties":
-            bullet = _BULLET.match(lines[i])
-            if bullet and bullet.group("text").strip():
-                uncertainties.append(bullet.group("text").strip())
+                try:
+                    rule = Q2RuleProposal(
+                        rule_type=cast(Any, rule_type),
+                        name=header.name,
+                        body=body_value,
+                        context="",
+                        evidence_quote="",
+                    )
+                except ValidationError:
+                    _rule_issue(result, "rule_schema_invalid")
+                else:
+                    rules.append(rule)
+                    total_rule_content_bytes += body_bytes
+            current = None
+            i = closing_index + 1
+            continue
+
+        if not lines[i].strip():
+            i += 1
+            continue
+
+        if current is None:
+            i += 1
+            continue
+
+        bullet = _BULLET.match(lines[i])
+        if bullet is None:
+            result.warnings.append(
+                "q2_unknown_heading"
+                if _q2_is_markdown_heading(lines[i])
+                else "q2_unexpected_structure"
+            )
+            result.dropped_blocks.append(lines[i].strip())
+            current = None
+            i += 1
+            continue
+
+        value, context = _q2_value_and_context(bullet.group("text"))
+        if not value:
+            result.warnings.append("q2_bullet_without_value")
+            current = None
+            i += 1
+            continue
+
+        if current.kind == "fact":
+            attack_id = (
+                value if current.category == "ttps" and _ATTACK_ID.fullmatch(value) else None
+            )
+            try:
+                fact = Q2FactProposal(
+                    category=cast(Any, current.category),
+                    value=value,
+                    attack_id=attack_id,
+                    context=context,
+                    evidence_quote="",
+                )
+            except ValidationError:
+                result.warnings.append("fact_schema_invalid")
+            else:
+                facts.append(fact)
+        elif current.kind == "ioc":
+            try:
+                artifact = Q2ArtifactProposal(
+                    value=value,
+                    artifact_type=cast(Any, current.artifact_type),
+                    indicator_status=cast(Any, current.indicator_status),
+                    context=context,
+                    evidence_quote="",
+                )
+            except ValidationError:
+                result.warnings.append("artifact_schema_invalid")
+            else:
+                artifacts.append(artifact)
+        elif current.kind == "uncertainties":
+            uncertainties.append(bullet.group("text").strip())
         i += 1
 
-    if not recognized_sections:
+    if not recognized_groups:
         result.errors.append("q2_compact_sections_missing")
         return result
 
