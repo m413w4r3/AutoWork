@@ -8,10 +8,10 @@ import json
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
@@ -47,13 +47,18 @@ from cti_app.application.production_context import build_subject_production_cont
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_parsers import (
     PARSER_VERSION,
+    Q2_EXTRACTION_CONTRACT_VERSION,
     Q2_MARKDOWN_PARSER_VERSION,
     IndicatorStatus,
     ParsedEvent,
+    ParsedSource,
     ParseResult,
     ReferenceReport,
     parse_q2_proposals_markdown,
     parse_reference_report,
+    project_q2_source_output,
+    q2_source_output_from_json,
+    q2_source_output_to_json,
     reference_report_from_json,
     reference_report_to_json,
     technical_extraction_from_json,
@@ -62,6 +67,7 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.application.production_prompts import (
     EXTRACTION_PROMPT_VERSION,
+    EXTRACTION_PROMPT_VERSION_BY_PROFILE,
     REFERENCES_FORMAT_REPAIR_VERSION,
     REFERENCES_PROMPT_VERSION,
     SYNTHESIS_FORMAT_REPAIR_VERSION,
@@ -86,8 +92,11 @@ from cti_app.domain.model_conversations import (
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
 from cti_app.domain.production import (
+    ExtractionProfile,
     ProductionArtifactStage,
     ProductionInputSnapshot,
+    SourceExtraction,
+    SourceExtractionStatus,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -292,6 +301,157 @@ def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class Q2SourcePlan:
+    """Deterministic profile assignment for one Q1 publication."""
+
+    source_id: str
+    canonical_url: str
+    profile: ExtractionProfile
+    reason: str
+
+
+def plan_q2_extraction_profiles(
+    report: ReferenceReport,
+    *,
+    snapshot: ProductionInputSnapshot | None = None,
+    period_start: date | str | None = None,
+    period_end: date | str | None = None,
+) -> tuple[Q2SourcePlan, ...]:
+    """Assign FULL/IOC_RULES without subject or model state.
+
+    Core publications always consume FULL. At most three dated, in-period
+    supporting publications receive FULL, ordered by distance from the closest
+    dated core publication and then by the specified deterministic tie-break.
+    """
+
+    def as_date(value: date | str | None) -> date | None:
+        if isinstance(value, date):
+            return value
+        if value:
+            try:
+                return date.fromisoformat(value)
+            except ValueError:
+                return None
+        return None
+
+    start = as_date(period_start) or (snapshot.period_start if snapshot else None)
+    end = as_date(period_end) or (snapshot.period_end if snapshot else None)
+    core_sources = snapshot.core_sources if snapshot else ()
+    # Legacy runs without a frozen snapshot have no authoritative core set;
+    # preserve their former exhaustive Q2 behaviour instead of guessing which
+    # Q1 publication is historical.
+    core_urls = (
+        {source.canonical_url for source in core_sources}
+        if snapshot is not None
+        else {source.canonical_url for source in report.sources}
+    )
+    core_dates = [
+        source.published_at
+        for source in report.sources
+        if source.canonical_url in core_urls and source.published_at
+    ]
+    if not core_dates:
+        core_dates = [source.published_at for source in core_sources if source.published_at]
+
+    midpoint: date | None = None
+    if start is not None and end is not None:
+        midpoint = start + (end - start) / 2
+
+    def distance(source: ParsedSource) -> float:
+        reference_dates: list[date] = core_dates or ([midpoint] if midpoint else [])
+        if not reference_dates or source.published_at is None:
+            return float("inf")
+        return float(
+            min(abs(source.published_at - reference).days for reference in reference_dates)
+        )
+
+    def published_ordinal(source: ParsedSource) -> int:
+        return source.published_at.toordinal() if source.published_at is not None else 0
+
+    dated_in_period = [
+        source
+        for source in report.sources
+        if source.canonical_url not in core_urls
+        and source.published_at is not None
+        and (start is None or source.published_at >= start)
+        and (end is None or source.published_at <= end)
+    ]
+    full_supporting_urls = {
+        source.canonical_url
+        for source in sorted(
+            dated_in_period,
+            key=lambda source: (
+                distance(source),
+                -published_ordinal(source),
+                source.canonical_url,
+            ),
+        )[:3]
+    }
+
+    return tuple(
+        Q2SourcePlan(
+            source_id=source.local_id,
+            canonical_url=source.canonical_url,
+            profile=(
+                ExtractionProfile.FULL
+                if source.canonical_url in core_urls or source.canonical_url in full_supporting_urls
+                else ExtractionProfile.IOC_RULES
+            ),
+            reason=(
+                "core_source"
+                if source.canonical_url in core_urls
+                else (
+                    "near_period_supporting"
+                    if source.canonical_url in full_supporting_urls
+                    else "historical_supporting"
+                )
+            ),
+        )
+        for source in report.sources
+    )
+
+
+# A descriptive alias keeps the policy easy to discover from callers/tests.
+select_q2_extraction_profiles = plan_q2_extraction_profiles
+
+
+async def _source_content_sha256_by_url(
+    uow: UnitOfWork, subject_id: UUID, report: ReferenceReport
+) -> dict[str, str]:
+    """Resolve only reliable archived content identities for this subject."""
+    collections_repository = getattr(uow, "source_collections", None)
+    documents_repository = getattr(uow, "source_documents", None)
+    if collections_repository is None or documents_repository is None:
+        return {}
+
+    collections = await collections_repository.list_for_subject(subject_id)
+    documents = await documents_repository.list_for_subject(subject_id)
+    by_id = {document.id: document for document in documents}
+    by_url = {
+        document.final_url: document
+        for document in documents
+        if getattr(document, "final_url", None)
+    }
+    hashes: dict[str, str] = {}
+    for source in report.sources:
+        collection = next(
+            (item for item in collections if item.canonical_url == source.canonical_url),
+            None,
+        )
+        document = (
+            by_id.get(collection.source_document_id)
+            if collection is not None and collection.source_document_id is not None
+            else by_url.get(source.canonical_url)
+        )
+        content_hash = getattr(document, "decoded_sha256", None)
+        if isinstance(content_hash, str):
+            normalized_hash = content_hash.casefold()
+            if re.fullmatch(r"[0-9a-f]{64}", normalized_hash):
+                hashes[source.canonical_url] = normalized_hash
+    return hashes
+
+
 class ProductionWorkflowOrchestrator:
     """Orchestrates the single article publication workflow."""
 
@@ -313,14 +473,15 @@ class ProductionWorkflowOrchestrator:
         self._artifact_store = artifact_store
         self._diagnostics = diagnostics or DiagnosticsLog(None)
         self._correlation_id = "-"
-        self._references = ReferenceResearchService(uow_factory, artifact_store)
-        self._extraction = ExtractionService(uow_factory, artifact_store)
-        self._synthesis = SynthesisService(uow_factory, artifact_store)
-        self._assembly = PublicationAssemblyService(uow_factory, artifact_store)
+        production_uow_factory = cast(Any, uow_factory)
+        self._references = ReferenceResearchService(production_uow_factory, artifact_store)
+        self._extraction = ExtractionService(production_uow_factory, artifact_store)
+        self._synthesis = SynthesisService(production_uow_factory, artifact_store)
+        self._assembly = PublicationAssemblyService(production_uow_factory, artifact_store)
         self._artifact_reuse = ProductionArtifactReuseService(
-            uow_factory, artifact_store, self._diagnostics
+            production_uow_factory, artifact_store, self._diagnostics
         )
-        self._qa = ProductionQAService(uow_factory)
+        self._qa = ProductionQAService(production_uow_factory)
         self._seed_enrichment = seed_enrichment
         self._pacing = pacing or ProductionPacingPolicy.zero()
 
@@ -956,13 +1117,172 @@ class ProductionWorkflowOrchestrator:
     ) -> dict[str, Any]:
         return await self._execute_direct_url_extraction(run, context, snapshot)
 
+    @staticmethod
+    def _source_extraction_identity(
+        *,
+        source_content_sha256: str,
+        profile: ExtractionProfile,
+    ) -> dict[str, str]:
+        return {
+            "source_content_sha256": source_content_sha256,
+            "profile": profile.value,
+            "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+            "prompt_version": EXTRACTION_PROMPT_VERSION_BY_PROFILE[profile],
+            "parser_version": Q2_MARKDOWN_PARSER_VERSION,
+            "verifier_version": ARTIFACT_VERIFIER_VERSION,
+        }
+
+    async def _read_source_extraction_cache(
+        self,
+        *,
+        plan: Q2SourcePlan,
+        source_content_sha256: str | None,
+        wait_for_running: bool = True,
+    ) -> tuple[Any | None, SourceExtraction | None, str]:
+        """Read a verified source checkpoint, including FULL -> IOC_RULES."""
+        repository = getattr(self, "_uow_factory", None)
+        if source_content_sha256 is None or self._artifact_store is None or repository is None:
+            return None, None, "unavailable"
+
+        source_repository = None
+        profiles = [plan.profile]
+        if plan.profile is ExtractionProfile.IOC_RULES:
+            profiles.append(ExtractionProfile.FULL)
+        for profile in profiles:
+            async with self._uow_factory() as uow:
+                source_repository = getattr(uow, "source_extractions", None)
+                if source_repository is None:
+                    return None, None, "unavailable"
+                row = await source_repository.get_by_identity(
+                    **self._source_extraction_identity(
+                        source_content_sha256=source_content_sha256,
+                        profile=profile,
+                    )
+                )
+            if row is None:
+                continue
+            if row.status is SourceExtractionStatus.RUNNING:
+                if not wait_for_running:
+                    return None, row, "in_progress"
+                for _ in range(150):
+                    await asyncio.sleep(0.2)
+                    async with self._uow_factory() as uow:
+                        source_repository = getattr(uow, "source_extractions", None)
+                        if source_repository is None:
+                            return None, None, "unavailable"
+                        row = await source_repository.get_by_identity(
+                            **self._source_extraction_identity(
+                                source_content_sha256=source_content_sha256,
+                                profile=profile,
+                            )
+                        )
+                    if row is None or row.status is not SourceExtractionStatus.RUNNING:
+                        break
+                if row is not None and row.status is SourceExtractionStatus.RUNNING:
+                    return None, row, "in_progress"
+            if row is None or row.status is not SourceExtractionStatus.VERIFIED:
+                continue
+            if row.canonical_blob_id is None:
+                return None, row, "incompatible"
+            try:
+                output = q2_source_output_from_json(
+                    await self._artifact_store.read_json(row.canonical_blob_id)
+                )
+            except Exception:
+                return None, row, "incompatible"
+            return (
+                project_q2_source_output(output, plan.profile),
+                row,
+                ("cached_full" if profile is ExtractionProfile.FULL else "cached_light"),
+            )
+
+        async with self._uow_factory() as uow:
+            source_repository = getattr(uow, "source_extractions", None)
+            if source_repository is None:
+                return None, None, "unavailable"
+            existing = await source_repository.find_any(source_content_sha256)
+        return None, (existing[0] if existing else None), ("incompatible" if existing else "miss")
+
+    async def _claim_source_extraction(
+        self,
+        *,
+        plan: Q2SourcePlan,
+        source_content_sha256: str,
+        model_run_id: UUID,
+        force: bool,
+    ) -> tuple[SourceExtraction | None, bool]:
+        identity = self._source_extraction_identity(
+            source_content_sha256=source_content_sha256,
+            profile=plan.profile,
+        )
+        candidate = SourceExtraction(
+            canonical_url=plan.canonical_url,
+            source_content_sha256=source_content_sha256,
+            profile=plan.profile,
+            contract_version=identity["contract_version"],
+            prompt_version=identity["prompt_version"],
+            parser_version=identity["parser_version"],
+            verifier_version=identity["verifier_version"],
+            model_run_id=model_run_id,
+        )
+        async with self._uow_factory() as uow:
+            source_repository = getattr(uow, "source_extractions", None)
+            if source_repository is None:
+                return None, False
+            claimed = await source_repository.claim(candidate, force=force)
+            current = await source_repository.get_by_identity(
+                **self._source_extraction_identity(
+                    source_content_sha256=source_content_sha256,
+                    profile=plan.profile,
+                )
+            )
+            await uow.commit()
+        return current or candidate, claimed
+
+    async def _complete_source_extraction(
+        self,
+        checkpoint: SourceExtraction,
+        *,
+        raw: str,
+        output: Any,
+    ) -> None:
+        if self._artifact_store is None:
+            return
+        (
+            raw_blob_id,
+            canonical_blob_id,
+        ) = await self._artifact_store.store_source_extraction_payloads(
+            raw=raw,
+            canonical=q2_source_output_to_json(output),
+        )
+        completed = replace(
+            checkpoint,
+            status=SourceExtractionStatus.VERIFIED,
+            raw_blob_id=raw_blob_id,
+            canonical_blob_id=canonical_blob_id,
+        )
+        async with self._uow_factory() as uow:
+            source_repository = getattr(uow, "source_extractions", None)
+            if source_repository is not None:
+                await source_repository.save(completed)
+                await uow.commit()
+
+    async def _fail_source_extraction(self, checkpoint: SourceExtraction) -> None:
+        async with self._uow_factory() as uow:
+            source_repository = getattr(uow, "source_extractions", None)
+            if source_repository is not None:
+                await source_repository.save(
+                    replace(checkpoint, status=SourceExtractionStatus.NEEDS_REVIEW)
+                )
+                await uow.commit()
+
     async def _execute_direct_url_extraction(
         self,
         run: SubjectProductionRun,
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
-        """Q2: exactly one fresh, web-enabled model request per Q1 source."""
+        """Q2: at most one source-level, web-enabled request per Q1 source."""
         await self._check_cancellation(run.id, context)
         async with self._uow_factory() as uow:
             references = await uow.production_artifacts.get_current(run.id, "references")
@@ -988,6 +1308,13 @@ class ProductionWorkflowOrchestrator:
                 snapshot=snapshot,
                 relevant_source_urls={source.canonical_url for source in report.sources},
             )
+            source_plans = plan_q2_extraction_profiles(
+                report,
+                snapshot=snapshot,
+                period_start=getattr(policy, "period_start", None),
+                period_end=getattr(policy, "period_end", None),
+            )
+            source_content_hashes = await _source_content_sha256_by_url(uow, run.subject_id, report)
             input_hash = _extraction_input_hash(
                 subject_id=run.subject_id,
                 references_hash=references.input_hash,
@@ -1019,22 +1346,199 @@ class ProductionWorkflowOrchestrator:
         failed: list[str] = []
         failed_attempts: list[str] = []
         failures: dict[str, dict[str, Any]] = {}
+        plans_by_url = {plan.canonical_url: plan for plan in source_plans}
+        full_calls = 0
+        light_calls = 0
+        cache_hits = 0
+        model_calls_avoided = 0
         for source_index, source in enumerate(report.sources):
+            plan = plans_by_url[source.canonical_url]
+            source_content_sha256 = source_content_hashes.get(source.canonical_url)
+            await self._check_cancellation(run.id, context)
+            # ``force_recompute_from_stage`` invalidates subject-level
+            # ProductionArtifacts. A manual stage retry must still reuse a
+            # VERIFIED source checkpoint; a source-level FORCE command would
+            # need its own explicit control, which the current product does
+            # not expose.
+            force_source_cache = False
+            if force_source_cache:
+                cached_output, cache_checkpoint, cache_status = None, None, "forced"
+            else:
+                (
+                    cached_output,
+                    cache_checkpoint,
+                    cache_status,
+                ) = await self._read_source_extraction_cache(
+                    plan=plan,
+                    source_content_sha256=source_content_sha256,
+                )
+            self._diagnostics.record(
+                event="q2.source.plan",
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage="extraction",
+                correlation_id=self._correlation_id,
+                pipeline_generation=run.pipeline_generation,
+                source_id=source.local_id,
+                source_url=source.canonical_url,
+                source_content_sha256=source_content_sha256,
+                profile=plan.profile.value,
+                reason=plan.reason,
+                cache_status=cache_status,
+            )
+            if cache_status.startswith("cached_") and cached_output is not None:
+                cache_hits += 1
+                model_calls_avoided += 1
+                submissions.append(
+                    Q2ProposalSubmission(
+                        output=cached_output,
+                        source_ids=(source.local_id,),
+                        model_run_id=(
+                            str(cache_checkpoint.model_run_id)
+                            if cache_checkpoint and cache_checkpoint.model_run_id
+                            else None
+                        ),
+                    )
+                )
+                completed.append(source.local_id)
+                self._diagnostics.record(
+                    event="q2.source.cache_hit",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    source_id=source.local_id,
+                    source_url=source.canonical_url,
+                    source_content_sha256=source_content_sha256,
+                    profile=plan.profile.value,
+                    reason=cache_status,
+                    cache_status=cache_status,
+                    model_run_id=(
+                        str(cache_checkpoint.model_run_id)
+                        if cache_checkpoint and cache_checkpoint.model_run_id
+                        else None
+                    ),
+                )
+                continue
+            if cache_status == "in_progress":
+                return {
+                    "stage": "extraction",
+                    "status": "needs_review",
+                    "error_code": "source_extraction_in_progress",
+                    "error": "A concurrent source extraction is still running",
+                    "source_id": source.local_id,
+                    "source_url": source.canonical_url,
+                }
+            cache_event = (
+                "q2.source.cache_incompatible"
+                if cache_status == "incompatible"
+                else "q2.source.cache_miss"
+            )
+            self._diagnostics.record(
+                event=cache_event,
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage="extraction",
+                correlation_id=self._correlation_id,
+                source_id=source.local_id,
+                source_url=source.canonical_url,
+                source_content_sha256=source_content_sha256,
+                profile=plan.profile.value,
+                reason=("force_recompute" if cache_status == "forced" else cache_status),
+                cache_status=cache_status,
+            )
+
             if source_index:
                 # Q2 stays one request per source; pacing is between requests,
                 # never before the first source.
                 await self._check_cancellation(run.id, context)
                 await asyncio.sleep(self._pacing.model_delay_seconds())
-            await self._check_cancellation(run.id, context)
+
+            if source_content_sha256 is not None and self._artifact_store is not None:
+                source_model_run_id = _source_extraction_model_run_id(
+                    source_content_sha256=source_content_sha256,
+                    profile=plan.profile,
+                    canonical_url=plan.canonical_url,
+                    force_nonce=(
+                        str(run.id)
+                        if force_source_cache or cache_status == "incompatible"
+                        else None
+                    ),
+                )
+                cache_checkpoint, claimed = await self._claim_source_extraction(
+                    plan=plan,
+                    source_content_sha256=source_content_sha256,
+                    model_run_id=source_model_run_id,
+                    force=force_source_cache or cache_status == "incompatible",
+                )
+                if not claimed:
+                    (
+                        cached_output,
+                        cache_checkpoint,
+                        cache_status,
+                    ) = await self._read_source_extraction_cache(
+                        plan=plan,
+                        source_content_sha256=source_content_sha256,
+                    )
+                    if cached_output is not None and cache_checkpoint is not None:
+                        cache_hits += 1
+                        model_calls_avoided += 1
+                        submissions.append(
+                            Q2ProposalSubmission(
+                                output=cached_output,
+                                source_ids=(source.local_id,),
+                                model_run_id=(
+                                    str(cache_checkpoint.model_run_id)
+                                    if cache_checkpoint.model_run_id
+                                    else None
+                                ),
+                            )
+                        )
+                        completed.append(source.local_id)
+                        self._diagnostics.record(
+                            event="q2.source.cache_hit",
+                            run_id=run.id,
+                            subject_id=run.subject_id,
+                            stage="extraction",
+                            correlation_id=self._correlation_id,
+                            source_id=source.local_id,
+                            source_url=source.canonical_url,
+                            source_content_sha256=source_content_sha256,
+                            profile=plan.profile.value,
+                            reason="cached_after_claim_race",
+                            cache_status=cache_status,
+                        )
+                        continue
+                    return {
+                        "stage": "extraction",
+                        "status": "needs_review",
+                        "error_code": "source_extraction_in_progress",
+                        "error": "A concurrent source extraction is still running",
+                        "source_id": source.local_id,
+                        "source_url": source.canonical_url,
+                    }
+                assert cache_checkpoint is not None
+                model_run_id = cache_checkpoint.model_run_id or source_model_run_id
+            else:
+                model_run_id = _q2_source_model_run_id(
+                    production_run_id=run.id,
+                    pipeline_generation=run.pipeline_generation,
+                    source_id=source.local_id,
+                    canonical_url=source.canonical_url,
+                    profile=plan.profile,
+                )
+            prompt_version = EXTRACTION_PROMPT_VERSION_BY_PROFILE[plan.profile]
             prompt = ProductionPromptTemplates.get_extraction_prompt(
-                subject_title, source.local_id, source.title, source.canonical_url
+                subject_title,
+                source.local_id,
+                source.title,
+                source.canonical_url,
+                profile=plan.profile,
             )
-            model_run_id = _q2_source_model_run_id(
-                production_run_id=run.id,
-                pipeline_generation=run.pipeline_generation,
-                source_id=source.local_id,
-                canonical_url=source.canonical_url,
-            )
+            if plan.profile is ExtractionProfile.FULL:
+                full_calls += 1
+            else:
+                light_calls += 1
             self._diagnostics.record(
                 event="q2.source.started",
                 run_id=run.id,
@@ -1044,17 +1548,37 @@ class ProductionWorkflowOrchestrator:
                 pipeline_generation=run.pipeline_generation,
                 source_id=source.local_id,
                 source_url=source.canonical_url,
+                source_content_sha256=source_content_sha256,
                 model_run_id=str(model_run_id),
+                profile=plan.profile.value,
                 web_search=True,
             )
             started_at = time.monotonic()
             raw = ""
             try:
+                request_metadata: dict[str, object] = {
+                    "source_url": source.canonical_url,
+                    "profile": plan.profile.value,
+                    "source_content_sha256": source_content_sha256,
+                    "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+                    "parser_version": Q2_MARKDOWN_PARSER_VERSION,
+                    "verifier_version": ARTIFACT_VERIFIER_VERSION,
+                }
+                if source_content_sha256 is None:
+                    # This is the legacy, subject-local fallback used only
+                    # when no reliable archived content hash exists.
+                    request_metadata.update(
+                        {
+                            "subject_id": str(run.subject_id),
+                            "source_id": source.local_id,
+                            "pipeline_generation": run.pipeline_generation,
+                        }
+                    )
                 execution = await self._model_gateway.execute(
                     ModelRequest(
                         text=prompt,
                         prompt_template_id="production-q2-url",
-                        prompt_template_version=EXTRACTION_PROMPT_VERSION,
+                        prompt_template_version=prompt_version,
                         evidence_pack_hash=hashlib.sha256(prompt.encode()).hexdigest(),
                         external_llm_allowed=True,
                         routing_hint=ModelRoutingHint.WEB_RESEARCH,
@@ -1065,12 +1589,7 @@ class ProductionWorkflowOrchestrator:
                         # retried across technical job attempts.  The
                         # gateway still decides whether FAILED is safe.
                         allow_failed_resubmit=True,
-                        metadata={
-                            "subject_id": str(run.subject_id),
-                            "source_id": source.local_id,
-                            "source_url": source.canonical_url,
-                            "pipeline_generation": run.pipeline_generation,
-                        },
+                        metadata=request_metadata,
                     ),
                     ModelRole.RESEARCH,
                 )
@@ -1101,6 +1620,12 @@ class ProductionWorkflowOrchestrator:
                 self._log_parse(run, "extraction", parsed)
                 if not parsed.usable or parsed.value is None:
                     raise _Q2SourceContentFailure("; ".join(parsed.errors) or "source_unavailable")
+                if cache_checkpoint is not None:
+                    await self._complete_source_extraction(
+                        cache_checkpoint,
+                        raw=raw,
+                        output=parsed.value,
+                    )
                 submissions.append(
                     Q2ProposalSubmission(
                         output=parsed.value,
@@ -1118,7 +1643,9 @@ class ProductionWorkflowOrchestrator:
                     stage="extraction",
                     correlation_id=self._correlation_id,
                     source_id=source.local_id,
+                    source_content_sha256=source_content_sha256,
                     model_run_id=str(model_run_id),
+                    profile=plan.profile.value,
                     answer_chars=len(raw),
                     facts_count=len(parsed.value.facts),
                     artifacts_count=len(parsed.value.artifacts),
@@ -1132,6 +1659,8 @@ class ProductionWorkflowOrchestrator:
                     exc,
                     provider_response_produced=bool(raw),
                 )
+                if cache_checkpoint is not None:
+                    await self._fail_source_extraction(cache_checkpoint)
                 error = str(exc)[:1000]
                 duration_ms = int((time.monotonic() - started_at) * 1000)
                 failed_attempts.append(source.local_id)
@@ -1161,7 +1690,9 @@ class ProductionWorkflowOrchestrator:
                     correlation_id=self._correlation_id,
                     source_id=source.local_id,
                     source_url=source.canonical_url,
+                    source_content_sha256=source_content_sha256,
                     model_run_id=str(model_run_id),
+                    profile=plan.profile.value,
                     error_code=classification.error_code,
                     error=error,
                     retryable=classification.retryable,
@@ -1188,6 +1719,10 @@ class ProductionWorkflowOrchestrator:
                         "completed_source_ids": completed,
                         "failed_source_ids": failed_attempts,
                         "source_failures": failures,
+                        "full_calls": full_calls,
+                        "light_calls": light_calls,
+                        "cache_hits": cache_hits,
+                        "model_calls_avoided": model_calls_avoided,
                     }
                 if classification.failure_class in {
                     _Q2FailureClass.RECONCILIATION_REQUIRED,
@@ -1207,6 +1742,10 @@ class ProductionWorkflowOrchestrator:
                         "completed_source_ids": completed,
                         "failed_source_ids": failed_attempts,
                         "source_failures": failures,
+                        "full_calls": full_calls,
+                        "light_calls": light_calls,
+                        "cache_hits": cache_hits,
+                        "model_calls_avoided": model_calls_avoided,
                     }
         if failed:
             return {
@@ -1222,7 +1761,22 @@ class ProductionWorkflowOrchestrator:
                 "completed_source_ids": completed,
                 "failed_source_ids": failed,
                 "source_failures": failures,
+                "full_calls": full_calls,
+                "light_calls": light_calls,
+                "cache_hits": cache_hits,
+                "model_calls_avoided": model_calls_avoided,
             }
+        self._diagnostics.record(
+            event="q2.extraction.metrics",
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage="extraction",
+            correlation_id=self._correlation_id,
+            full_calls=full_calls,
+            light_calls=light_calls,
+            cache_hits=cache_hits,
+            model_calls_avoided=model_calls_avoided,
+        )
         verification = verify_q2_proposals(submissions)
         extraction = verification.canonical
         status_totals = {
@@ -1244,6 +1798,13 @@ class ProductionWorkflowOrchestrator:
             verification_diagnostics={
                 "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
                 "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
+                "extraction_profiles": {
+                    plan.canonical_url: plan.profile.value for plan in source_plans
+                },
+                "full_calls": full_calls,
+                "light_calls": light_calls,
+                "cache_hits": cache_hits,
+                "model_calls_avoided": model_calls_avoided,
                 "completed_source_ids": completed,
                 "failed_source_ids": failed,
                 "q2_proposal_diagnostics": [
@@ -1268,6 +1829,10 @@ class ProductionWorkflowOrchestrator:
             "status_totals": status_totals,
             "completed_source_ids": completed,
             "failed_source_ids": failed,
+            "full_calls": full_calls,
+            "light_calls": light_calls,
+            "cache_hits": cache_hits,
+            "model_calls_avoided": model_calls_avoided,
         }
 
     @staticmethod
@@ -1642,8 +2207,9 @@ def _q2_source_model_run_id(
     pipeline_generation: int,
     source_id: str,
     canonical_url: str,
-    prompt_version: str = EXTRACTION_PROMPT_VERSION,
+    prompt_version: str | None = None,
     parser_version: str = Q2_MARKDOWN_PARSER_VERSION,
+    profile: ExtractionProfile = ExtractionProfile.FULL,
     provider: ModelProvider = ModelProvider.OPENAI,
 ) -> UUID:
     """Stable ModelRun identity for one Q1 source in a Q2 generation."""
@@ -1653,7 +2219,8 @@ def _q2_source_model_run_id(
             "pipeline_generation": pipeline_generation,
             "source_id": source_id,
             "canonical_url": canonical_url,
-            "prompt_version": prompt_version,
+            "profile": profile.value,
+            "prompt_version": prompt_version or EXTRACTION_PROMPT_VERSION_BY_PROFILE[profile],
             "parser_version": parser_version,
             "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
             "provider": provider.value,
@@ -1662,6 +2229,34 @@ def _q2_source_model_run_id(
         separators=(",", ":"),
     )
     return uuid5(NAMESPACE_URL, f"production-q2-source:{identity}")
+
+
+def _source_extraction_model_run_id(
+    *,
+    source_content_sha256: str,
+    profile: ExtractionProfile,
+    canonical_url: str = "",
+    force_nonce: str | None = None,
+    provider: ModelProvider = ModelProvider.OPENAI,
+) -> UUID:
+    """Stable model checkpoint identity for the source-level cache key."""
+    identity = json.dumps(
+        {
+            "source_content_sha256": source_content_sha256,
+            "canonical_url": canonical_url,
+            "profile": profile.value,
+            "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+            "prompt_version": EXTRACTION_PROMPT_VERSION_BY_PROFILE[profile],
+            "parser_version": Q2_MARKDOWN_PARSER_VERSION,
+            "verifier_version": ARTIFACT_VERIFIER_VERSION,
+            "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+            "provider": provider.value,
+            "force_nonce": force_nonce,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return uuid5(NAMESPACE_URL, f"source-extraction-q2:{identity}")
 
 
 def _references_input_hash(

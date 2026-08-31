@@ -27,6 +27,7 @@ EXPECTED_CHAIN = (
     "0018_subject_active_run",
     "0019_production_reuse",
     "0020_model_run_submission",
+    "0021_source_extraction_cache",
 )
 
 
@@ -62,4 +63,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0018_subject_active_run": "0017_unified_article_production",
         "0019_production_reuse": "0018_subject_active_run",
         "0020_model_run_submission": "0019_production_reuse",
+        "0021_source_extraction_cache": "0020_model_run_submission",
     }

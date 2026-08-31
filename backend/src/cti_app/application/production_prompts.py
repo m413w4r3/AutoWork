@@ -4,12 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from cti_app.domain.production import ExtractionProfile
+
 REFERENCES_PROMPT_VERSION = "4"
 # Q2 moved off the OpenAI structured-output contract (the bridge does not
 # actually guarantee response_format / JSON Schema) onto free-text GPT plus a
 # permissive Markdown parser (P23.7). EXTRACTION_PROMPT_VERSION now names that
 # Markdown dialect.
 EXTRACTION_PROMPT_VERSION = "8"
+IOC_RULES_PROMPT_VERSION = "1"
+EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
+    ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
+    ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
+}
 SYNTHESIS_PROMPT_VERSION = "5"
 REFERENCES_FORMAT_REPAIR_VERSION = "1"
 SYNTHESIS_FORMAT_REPAIR_VERSION = "2"
@@ -97,10 +104,8 @@ Rules:
     # for JSON here just moves the fragility into a bridge that can't hold the
     # contract; this asks for the same permissive Markdown dialect as Q1 and
     # leans on `parse_q2_proposals_markdown` + `verify_q2_proposals` instead.
-    TECHNICAL_EXTRACTION_MARKDOWN_V1 = """You are analysing one specific CTI source.
+    TECHNICAL_EXTRACTION_MARKDOWN_V1 = """You are analysing one specific CTI source for a reusable, source-centric extraction.
 
-**Subject**: {subject_title}
-**Source ID**: {source_id}
 **Source title**: {source_title}
 
 Open this exact source:
@@ -154,6 +159,54 @@ Rules:
 - Do not emit source_document_id, source_ids, model_run_id,
   references, or any other internal identifier; the system assigns provenance
   and verifies your proposals afterwards.
+"""
+
+    IOC_RULES_EXTRACTION_MARKDOWN_V1 = """You are performing a reusable, source-centric IOC and detection-rule extraction for one CTI source.
+
+**Source title**: {source_title}
+
+Open this exact source:
+{source_url}
+
+Perform an exhaustive IOC and detection-rule pass over the complete accessible source.
+Read the body, technical tables, visible appendices/annexes, code blocks, lists of
+indicators, visible images/screenshots, and first-level technical resources already
+included in the corpus. Never sacrifice IOC coverage to reduce cost. Do not replace
+the source with unrelated search results or use memory as evidence. If the exact
+source cannot be accessed, report `source_unavailable` in UNCERTAINTIES and do not
+invent an extraction.
+
+Extract only:
+- every IOC/artifact and detection rule supported by the source;
+- files explicitly presented as indicators;
+- CVEs directly relevant to the source's technical content;
+- uncertainties about access, ambiguity, or IOC interpretation.
+
+Do not extract infection_chain, narrative TTPs, victimology, chronology, campaign
+narrative, tooling narrative, or general historical context. Do not emit internal
+identifiers. For YARA/Sigma/Suricata, value is the rule name or identifier, never the
+full rule body.
+
+**Output format** — plain Markdown, no code fence, no JSON. Repeat as many
+`# ARTIFACT` blocks as needed, in any order:
+
+# ARTIFACT
+
+artifact-type: domain|ip|url|email|md5|sha1|sha256|sha512|filename|filepath|cve|yara_rule|sigma_rule|suricata_rule
+value: <exact literal>
+indicator-status: confirmed_ioc|contextual|excluded|not_applicable
+context: <short French context>
+evidence: <human-audit evidence from this source>
+
+# UNCERTAINTIES
+- <uncertainty, or omit the section>
+
+Rules:
+- Never emit a value merely described but not shown.
+- Never reconstruct hidden values or emit masked, truncated, REDACTED, FUZZ,
+  example or placeholder values.
+- For a hash, artifact-type is the concrete algorithm (md5/sha1/sha256/sha512).
+- Use contextual for CVEs unless directly relevant and for unqualified artifacts.
 """
 
     FORMAT_REPAIR_V1 = """Your previous answer could not be read by the automated parser.
@@ -249,11 +302,20 @@ functional description. Return only French prose.
 
     @classmethod
     def get_extraction_prompt(
-        cls, subject_title: str, source_id: str = "", source_title: str = "", source_url: str = ""
+        cls,
+        subject_title: str,
+        source_id: str = "",
+        source_title: str = "",
+        source_url: str = "",
+        profile: ExtractionProfile = ExtractionProfile.FULL,
     ) -> str:
-        return cls.TECHNICAL_EXTRACTION_MARKDOWN_V1.format(
-            subject_title=subject_title,
-            source_id=source_id,
+        del subject_title, source_id
+        template = (
+            cls.TECHNICAL_EXTRACTION_MARKDOWN_V1
+            if profile is ExtractionProfile.FULL
+            else cls.IOC_RULES_EXTRACTION_MARKDOWN_V1
+        )
+        return template.format(
             source_title=source_title,
             source_url=source_url,
         )

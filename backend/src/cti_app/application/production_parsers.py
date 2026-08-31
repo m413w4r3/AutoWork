@@ -27,6 +27,7 @@ from cti_app.application.production_normalization import (
     normalize_indicator_value,
 )
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.production import ExtractionProfile
 from cti_app.domain.publication import ArtifactType
 
 PARSER_VERSION = "production-markdown-v2"
@@ -221,10 +222,53 @@ class Q2SourceOutput(BaseModel):
 
 # Bump whenever Q2SourceOutput contract changes. Checkpoints validate against it.
 Q2_SCHEMA_VERSION = "1"
+Q2_EXTRACTION_CONTRACT_VERSION = "q2-source-extraction-v1"
 
 # Bump whenever the Q2 Markdown dialect or its lexing rules change. Participates
 # in the Q2 checkpoint identity so a parser change forces a fresh model call.
 Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v1"
+
+
+def q2_source_output_to_json(output: Q2SourceOutput) -> dict[str, Any]:
+    """Serialize only source-centric Q2 proposals for the global cache."""
+    return {
+        "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+        "schema_version": Q2_SCHEMA_VERSION,
+        "facts": [fact.model_dump(mode="json") for fact in output.facts],
+        "artifacts": [artifact.model_dump(mode="json") for artifact in output.artifacts],
+        "uncertainties": list(output.uncertainties),
+    }
+
+
+def q2_source_output_from_json(payload: dict[str, Any]) -> Q2SourceOutput:
+    """Load a source-centric checkpoint without accepting internal IDs."""
+    if payload.get("contract_version") not in {None, Q2_EXTRACTION_CONTRACT_VERSION}:
+        raise ValueError("Q2 source extraction contract is incompatible")
+    if payload.get("schema_version") not in {None, Q2_SCHEMA_VERSION}:
+        raise ValueError("Q2 source extraction schema is incompatible")
+    return Q2SourceOutput.model_validate(
+        {
+            "facts": payload.get("facts", []),
+            "artifacts": payload.get("artifacts", []),
+            "uncertainties": payload.get("uncertainties", []),
+        }
+    )
+
+
+def project_q2_source_output(output: Q2SourceOutput, profile: ExtractionProfile) -> Q2SourceOutput:
+    """Project a FULL result for IOC_RULES consumers without reprompting."""
+    if profile is ExtractionProfile.FULL:
+        return output
+    if profile is not ExtractionProfile.IOC_RULES:
+        raise ValueError(f"Unsupported extraction profile: {profile}")
+    return Q2SourceOutput(
+        # Artifact proposals are the exhaustive IOC/rule channel. File and
+        # detection facts are retained when a FULL result used a fact rather
+        # than an ARTIFACT block for that narrow light-profile scope.
+        facts=[fact for fact in output.facts if fact.category in {"files", "detections"}],
+        artifacts=list(output.artifacts),
+        uncertainties=list(output.uncertainties),
+    )
 
 
 # --- Shared lexing ---------------------------------------------------------

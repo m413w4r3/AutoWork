@@ -68,6 +68,7 @@ from cti_app.domain.production import (
     ProductionInputSnapshot,
     ProductionReuseInvalidation,
     SampleAcquisitionAttempt,
+    SourceExtraction,
     SubjectProductionRun,
 )
 from cti_app.domain.publication_review import PublicationReviewDecision
@@ -770,6 +771,27 @@ class ProductionArtifactRepository(Protocol):
     async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]: ...
 
 
+class SourceExtractionRepository(Protocol):
+    """Persistent, subject-independent Q2 source checkpoint catalog."""
+
+    async def get_by_identity(
+        self,
+        *,
+        source_content_sha256: str,
+        profile: str,
+        contract_version: str,
+        prompt_version: str,
+        parser_version: str,
+        verifier_version: str,
+    ) -> SourceExtraction | None: ...
+
+    async def find_any(self, source_content_sha256: str) -> Sequence[SourceExtraction]: ...
+
+    async def claim(self, extraction: SourceExtraction, *, force: bool = False) -> bool: ...
+
+    async def save(self, extraction: SourceExtraction) -> None: ...
+
+
 class ProductionInputSnapshotRepository(Protocol):
     async def add(self, snapshot: ProductionInputSnapshot) -> None: ...
 
@@ -834,6 +856,7 @@ class ProductionUnitOfWork(Protocol):
     subject_production_runs: SubjectProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
+    source_extractions: SourceExtractionRepository
     production_reuse_invalidations: ProductionReuseInvalidationRepository
     analyst_investigations: AnalystInvestigationRepository
     analyst_decisions: AnalystDecisionRepository

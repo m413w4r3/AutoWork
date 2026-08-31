@@ -4,6 +4,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +16,7 @@ from cti_app.domain.production import (
     AnalystInvestigation,
     EditionProductionBatch,
     EditionProductionBatchItem,
+    ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -25,6 +27,8 @@ from cti_app.domain.production import (
     SampleAcquisitionAttempt,
     SampleAcquisitionOutcome,
     SampleAcquisitionReason,
+    SourceExtraction,
+    SourceExtractionStatus,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -40,6 +44,7 @@ from cti_app.infrastructure.database.models.production import (
     ProductionInputSnapshotRow,
     ProductionReuseInvalidationRow,
     SampleAcquisitionAttemptRow,
+    SourceExtractionRow,
     SubjectProductionRunRow,
 )
 
@@ -524,6 +529,99 @@ class SqlAlchemyProductionArtifactRepository:
         return affected
 
 
+class SqlAlchemySourceExtractionRepository:
+    """Repository for the subject-independent Q2 checkpoint catalog."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_by_identity(
+        self,
+        *,
+        source_content_sha256: str,
+        profile: str,
+        contract_version: str,
+        prompt_version: str,
+        parser_version: str,
+        verifier_version: str,
+    ) -> SourceExtraction | None:
+        values = {
+            "source_content_sha256": source_content_sha256,
+            "profile": profile,
+            "contract_version": contract_version,
+            "prompt_version": prompt_version,
+            "parser_version": parser_version,
+            "verifier_version": verifier_version,
+        }
+        row = await self._session.scalar(
+            select(SourceExtractionRow).where(
+                *(getattr(SourceExtractionRow, key) == value for key, value in values.items())
+            )
+        )
+        return _source_extraction_from_row(row) if row else None
+
+    async def find_any(self, source_content_sha256: str) -> Sequence[SourceExtraction]:
+        rows = await self._session.scalars(
+            select(SourceExtractionRow)
+            .where(SourceExtractionRow.source_content_sha256 == source_content_sha256)
+            .order_by(SourceExtractionRow.created_at, SourceExtractionRow.id)
+        )
+        return [_source_extraction_from_row(row) for row in rows]
+
+    async def claim(self, extraction: SourceExtraction, *, force: bool = False) -> bool:
+        values = _source_extraction_values(extraction)
+        inserted_id = await self._session.scalar(
+            insert(SourceExtractionRow)
+            .values(**values)
+            .on_conflict_do_nothing(constraint="uq_source_extractions_identity")
+            .returning(SourceExtractionRow.id)
+        )
+        if inserted_id is not None:
+            await self._session.flush()
+            return True
+
+        row = await self._session.scalar(
+            select(SourceExtractionRow)
+            .where(
+                SourceExtractionRow.source_content_sha256 == extraction.source_content_sha256,
+                SourceExtractionRow.profile == extraction.profile.value,
+                SourceExtractionRow.contract_version == extraction.contract_version,
+                SourceExtractionRow.prompt_version == extraction.prompt_version,
+                SourceExtractionRow.parser_version == extraction.parser_version,
+                SourceExtractionRow.verifier_version == extraction.verifier_version,
+            )
+            .with_for_update()
+        )
+        if row is None:
+            # A concurrent transaction can only reach this branch if its
+            # insert was rolled back. Let the caller retry the claim.
+            return False
+        if (
+            row.status
+            in {
+                SourceExtractionStatus.VERIFIED.value,
+                SourceExtractionStatus.RUNNING.value,
+            }
+            and not force
+        ):
+            return False
+
+        for key, value in values.items():
+            if key in {"id", "created_at"}:
+                continue
+            setattr(row, key, value)
+        await self._session.flush()
+        return True
+
+    async def save(self, extraction: SourceExtraction) -> None:
+        row = await self._session.get(SourceExtractionRow, extraction.id)
+        if row is None:
+            raise LookupError(f"Source extraction {extraction.id} does not exist")
+        for key, value in _source_extraction_values(extraction).items():
+            setattr(row, key, value)
+        await self._session.flush()
+
+
 class SqlAlchemyProductionReuseInvalidationRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -862,6 +960,42 @@ def _analyst_input_pack_from_row(row: AnalystInputPackRow) -> AnalystInputPack:
         blob_id=row.blob_id,
         sha256=row.sha256,
         schema_version=row.schema_version,
+        created_at=row.created_at,
+    )
+
+
+def _source_extraction_values(extraction: SourceExtraction) -> dict[str, object]:
+    return {
+        "id": extraction.id,
+        "canonical_url": extraction.canonical_url,
+        "source_content_sha256": extraction.source_content_sha256,
+        "profile": extraction.profile.value,
+        "contract_version": extraction.contract_version,
+        "prompt_version": extraction.prompt_version,
+        "parser_version": extraction.parser_version,
+        "verifier_version": extraction.verifier_version,
+        "status": extraction.status.value,
+        "canonical_blob_id": extraction.canonical_blob_id,
+        "raw_blob_id": extraction.raw_blob_id,
+        "model_run_id": extraction.model_run_id,
+        "created_at": extraction.created_at,
+    }
+
+
+def _source_extraction_from_row(row: SourceExtractionRow) -> SourceExtraction:
+    return SourceExtraction(
+        id=row.id,
+        canonical_url=row.canonical_url,
+        source_content_sha256=row.source_content_sha256,
+        profile=ExtractionProfile(row.profile),
+        contract_version=row.contract_version,
+        prompt_version=row.prompt_version,
+        parser_version=row.parser_version,
+        verifier_version=row.verifier_version,
+        status=SourceExtractionStatus(row.status),
+        canonical_blob_id=row.canonical_blob_id,
+        raw_blob_id=row.raw_blob_id,
+        model_run_id=row.model_run_id,
         created_at=row.created_at,
     )
 

@@ -24,6 +24,8 @@ PRODUCTION_STAGE_VALUES_SQL = "'sources', 'references', 'extraction', 'synthesis
 PRODUCTION_ARTIFACT_STAGE_VALUES_SQL = "'references', 'extraction', 'synthesis', 'publication'"
 PRODUCTION_REUSE_STAGE_VALUES_SQL = "'references', 'extraction', 'synthesis'"
 PRODUCTION_ARTIFACT_STATUS_VALUES_SQL = "'verified', 'stale', 'needs_review'"
+SOURCE_EXTRACTION_STATUS_VALUES_SQL = "'running', 'verified', 'needs_review', 'failed'"
+EXTRACTION_PROFILE_VALUES_SQL = "'full', 'ioc_rules'"
 PRODUCTION_BATCH_STATUS_VALUES_SQL = (
     "'queued', 'running', 'completed', 'completed_with_issues', 'cancelled'"
 )
@@ -163,6 +165,59 @@ class ProductionArtifactRow(Base):
     artifact_metadata: Mapped[dict[str, Any]] = mapped_column(
         JSONB, name="metadata", nullable=False
     )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SourceExtractionRow(Base):
+    """Canonical extraction checkpoint keyed only by source content and contract."""
+
+    __tablename__ = "source_extractions"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_content_sha256",
+            "profile",
+            "contract_version",
+            "prompt_version",
+            "parser_version",
+            "verifier_version",
+            name="uq_source_extractions_identity",
+        ),
+        CheckConstraint(
+            "char_length(source_content_sha256) = 64 AND source_content_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_source_extractions_content_sha256",
+        ),
+        CheckConstraint(
+            f"profile IN ({EXTRACTION_PROFILE_VALUES_SQL})",
+            name="ck_source_extractions_profile",
+        ),
+        CheckConstraint(
+            f"status IN ({SOURCE_EXTRACTION_STATUS_VALUES_SQL})",
+            name="ck_source_extractions_status",
+        ),
+        Index(
+            "ix_source_extractions_content_profile",
+            "source_content_sha256",
+            "profile",
+            "status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
+    source_content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    profile: Mapped[str] = mapped_column(String(32), nullable=False)
+    contract_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    parser_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    verifier_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    canonical_blob_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT")
+    )
+    raw_blob_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="SET NULL")
+    )
+    model_run_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 

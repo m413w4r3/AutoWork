@@ -38,6 +38,22 @@ class ProductionBatchPhase(StrEnum):
     REVIEW = "review"
 
 
+class ExtractionProfile(StrEnum):
+    """The explicit scope of a source-level Q2 extraction."""
+
+    FULL = "full"
+    IOC_RULES = "ioc_rules"
+
+
+class SourceExtractionStatus(StrEnum):
+    """Lifecycle of a source-level extraction checkpoint."""
+
+    RUNNING = "running"
+    VERIFIED = "verified"
+    NEEDS_REVIEW = "needs_review"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ProductionInputSource:
     """The source-candidate metadata captured for a production run."""
@@ -235,6 +251,39 @@ class ProductionArtifactStatus(StrEnum):
     VERIFIED = "verified"
     STALE = "stale"
     NEEDS_REVIEW = "needs_review"
+
+
+@dataclass(slots=True, kw_only=True)
+class SourceExtraction:
+    """Subject-independent, content-addressed Q2 extraction checkpoint."""
+
+    canonical_url: str
+    source_content_sha256: str
+    profile: ExtractionProfile
+    contract_version: str
+    prompt_version: str
+    parser_version: str
+    verifier_version: str
+    status: SourceExtractionStatus = SourceExtractionStatus.RUNNING
+    canonical_blob_id: UUID | None = None
+    raw_blob_id: UUID | None = None
+    model_run_id: UUID | None = None
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        if not self.canonical_url.strip():
+            raise ValueError("A source extraction requires a canonical URL")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.source_content_sha256):
+            raise ValueError("source_content_sha256 must be a lowercase SHA-256")
+        for name, value in (
+            ("contract_version", self.contract_version),
+            ("prompt_version", self.prompt_version),
+            ("parser_version", self.parser_version),
+            ("verifier_version", self.verifier_version),
+        ):
+            if not value.strip():
+                raise ValueError(f"{name} is required")
 
 
 class AnalystInvestigationStatus(StrEnum):

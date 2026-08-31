@@ -26,6 +26,8 @@ MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 _RAW_BUCKET = "production-artifacts-raw"
 _CANONICAL_BUCKET = "production-artifacts-canonical"
 _RENDERED_BUCKET = "production-artifacts-rendered"
+_SOURCE_EXTRACTION_RAW_BUCKET = "source-extractions-raw"
+_SOURCE_EXTRACTION_CANONICAL_BUCKET = "source-extractions-canonical"
 
 
 class ProductionReuseStorageUnavailableError(RuntimeError):
@@ -110,3 +112,11 @@ class ProductionArtifactStore:
         )
         rendered_id = await self.put_text(rendered, bucket=_RENDERED_BUCKET) if rendered else None
         return raw_id, canonical_id, rendered_id
+
+    async def store_source_extraction_payloads(
+        self, *, raw: str, canonical: dict[str, Any]
+    ) -> tuple[UUID | None, UUID]:
+        """Store source-centric Q2 payloads in buckets separate from artifacts."""
+        raw_id = await self.put_text(raw, bucket=_SOURCE_EXTRACTION_RAW_BUCKET) if raw else None
+        canonical_id = await self.put_json(canonical, bucket=_SOURCE_EXTRACTION_CANONICAL_BUCKET)
+        return raw_id, canonical_id
