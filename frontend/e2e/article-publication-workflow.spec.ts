@@ -255,9 +255,7 @@ test("Article : sélection, production, revue et publication DOCX", async ({
 
   await page.goto(`/editions/${editionId}`);
   await expect(page.getByText("0 sélectionné pour ce lot")).toBeVisible();
-  await page
-    .getByRole("checkbox", { name: "Campagne Iranian Proxy" })
-    .check();
+  await page.getByRole("checkbox", { name: "Campagne Iranian Proxy" }).check();
   await expect(
     page.getByRole("button", { name: "Lancer la production de 1 article" }),
   ).toBeEnabled();

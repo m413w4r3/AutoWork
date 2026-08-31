@@ -705,15 +705,11 @@ async def test_start_edition_with_more_eligible_than_selected_runs_only_the_chos
     assert response.status_code == 200, response.text
     assert response.json()["items"] == 2
 
-    items = sorted(
-        uow.edition_production_batch_items.items, key=lambda item: item.position
-    )
+    items = sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
     assert [item.subject_id for item in items] == [subject_b, subject_d]
     assert [item.position for item in items] == [1, 2]
 
-    produced_subjects = {
-        run.subject_id for run in uow.subject_production_runs.items.values()
-    }
+    produced_subjects = {run.subject_id for run in uow.subject_production_runs.items.values()}
     assert produced_subjects == {subject_b, subject_d}
     assert subject_a not in produced_subjects
     assert subject_c not in produced_subjects
