@@ -32,6 +32,7 @@ clean:
 	@for path in $(CLEAN_PATHS); do \
 		rm -rf -- "$$path"; \
 	done
+	@cat /dev/null > var/diagnostics/events.jsonl
 	@echo "Données applicatives effacées. Session du bridge ChatGPT conservée."
 
 # Full reset: wipe the application data, then bring the stack back up.

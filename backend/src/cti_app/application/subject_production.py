@@ -346,9 +346,7 @@ class SubjectProductionService:
     async def cancel_run(self, run_id: UUID) -> SubjectProductionRun:
         return (await self.cancel_run_with_result(run_id)).run
 
-    async def cancel_run_with_result(
-        self, run_id: UUID
-    ) -> SubjectProductionCancellationResult:
+    async def cancel_run_with_result(self, run_id: UUID) -> SubjectProductionCancellationResult:
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:

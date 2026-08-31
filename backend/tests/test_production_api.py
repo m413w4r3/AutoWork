@@ -1457,9 +1457,7 @@ async def test_exact_run_cancel_hands_off_to_the_next_batch_subject(
     batch = next(iter(uow.edition_production_batches.items.values()))
     first, second = (
         uow.subject_production_runs.items[item.production_run_id]
-        for item in sorted(
-            uow.edition_production_batch_items.items, key=lambda item: item.position
-        )
+        for item in sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
     )
 
     response = await api.post(f"/api/production/runs/{first.id}/cancel")
@@ -1492,9 +1490,7 @@ async def test_exact_run_cancel_twice_does_not_repeat_batch_handoff(
     assert started.status_code == 200, started.text
     runs = [
         uow.subject_production_runs.items[item.production_run_id]
-        for item in sorted(
-            uow.edition_production_batch_items.items, key=lambda item: item.position
-        )
+        for item in sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
     ]
 
     first = await api.post(f"/api/production/runs/{runs[0].id}/cancel")
@@ -1551,9 +1547,7 @@ async def test_exact_run_cancel_does_not_dispatch_after_batch_cancel_fence(
     batch = next(iter(uow.edition_production_batches.items.values()))
     first, second = (
         uow.subject_production_runs.items[item.production_run_id]
-        for item in sorted(
-            uow.edition_production_batch_items.items, key=lambda item: item.position
-        )
+        for item in sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
     )
     dispatcher = production_app.state.job_dispatcher
     dispatcher.dispatched.clear()
