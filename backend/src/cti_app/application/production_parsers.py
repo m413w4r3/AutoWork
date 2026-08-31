@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Any, Literal, cast
@@ -31,7 +31,7 @@ from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import DetectionRule, DetectionRuleType, ExtractionProfile
 from cti_app.domain.publication import ArtifactType
 
-PARSER_VERSION = "production-markdown-v3"
+PARSER_VERSION = "production-markdown-v4"
 
 # Whitespace a chat model routinely emits and that would break field parsing.
 _NBSP = "\u00a0"
@@ -91,6 +91,18 @@ class ReferenceReport:
 
     def source_ids(self) -> set[str]:
         return {source.local_id for source in self.sources}
+
+
+@dataclass(frozen=True)
+class _SourceCandidate:
+    """A parsed publication before canonical source IDs are assigned."""
+
+    model_alias: str | None
+    title: str
+    canonical_url: str
+    publisher: str | None
+    published_at: date | None
+    role: SourceRole
 
 
 # --- Technical extraction (Q2) ---------------------------------------------
@@ -332,7 +344,6 @@ _BULLET = re.compile(r"^\s*[-*•]\s+(?P<text>.+?)\s*$")
 # URL extraction is shared with the discovery parser: a real ChatGPT answer
 # writes `[https://x](https://x)`, which a naive regex turns into garbage.
 _LOCAL_ID = re.compile(r"\b([SR])\s*[-_]?\s*(\d{1,3})\b", re.IGNORECASE)
-_ID_TOKEN = re.compile(r"[SR]\d{1,3}", re.IGNORECASE)
 
 
 def normalize_text(raw: str) -> str:
@@ -520,7 +531,7 @@ def _collect_uncertainties(text: str) -> tuple[str, ...]:
 def _reference_tokens(value: str) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
-            f"{m.group(0)[0].upper()}{int(m.group(0)[1:])}" for m in _ID_TOKEN.finditer(value)
+            f"{match.group(1).upper()}{int(match.group(2))}" for match in _LOCAL_ID.finditer(value)
         )
     )
 
@@ -554,10 +565,7 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
         result.errors.append("no_source_or_event_block")
         return result
 
-    sources: list[ParsedSource] = []
-    canonical_to_id: dict[str, str] = {}
-    alias: dict[str, str] = {}
-    auto_source = 0
+    source_candidates: list[_SourceCandidate] = []
 
     for block in (b for b in blocks if b.kind == "source"):
         values = _fields(block.lines)
@@ -574,18 +582,6 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
             continue
         _raw_url, canonical = urls[0]
 
-        auto_source += 1
-        local_id = block.local_id
-        if local_id is None:
-            local_id = f"S{auto_source}"
-            result.warnings.append("source_id_generated")
-
-        if canonical in canonical_to_id:
-            # Same publication announced twice: keep one, remap the other.
-            alias[local_id] = canonical_to_id[canonical]
-            result.warnings.append("duplicate_source_merged")
-            continue
-
         published_at = None
         raw_date = values.get("published-at") or values.get("date") or ""
         if raw_date and not _is_explicit_unknown(raw_date):
@@ -600,16 +596,10 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
             role = SourceRole.UNKNOWN
             result.warnings.append("source_role_unknown")
 
-        canonical_to_id[canonical] = local_id
-        alias[local_id] = local_id
-        sources.append(
-            ParsedSource(
-                local_id=local_id,
+        source_candidates.append(
+            _SourceCandidate(
+                model_alias=block.local_id,
                 title=(values.get("title") or values.get("titre") or "").strip(),
-                # Subject Production never exposes the model's tracking URL.
-                # The canonical URL is also the user-visible URL and the URL
-                # handed to Q2.
-                url=canonical,
                 canonical_url=canonical,
                 publisher=(values.get("publisher") or values.get("editeur") or "").strip() or None,
                 published_at=published_at,
@@ -617,16 +607,79 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
             )
         )
 
-    known_ids = {source.local_id for source in sources}
-    events: list[ParsedEvent] = []
-    auto_event = 0
+    # Model IDs are transport aliases only. Make missing aliases usable for
+    # references, while reserving every explicit alias so no generated alias
+    # can silently change the meaning of an explicit one.
+    reserved_aliases = {
+        candidate.model_alias
+        for candidate in source_candidates
+        if candidate.model_alias is not None
+    }
+    next_generated_alias = 1
+    source_candidates_with_aliases: list[_SourceCandidate] = []
+    for candidate in source_candidates:
+        model_alias = candidate.model_alias
+        if model_alias is None:
+            while f"S{next_generated_alias}" in reserved_aliases:
+                next_generated_alias += 1
+            model_alias = f"S{next_generated_alias}"
+            reserved_aliases.add(model_alias)
+            next_generated_alias += 1
+            result.warnings.append("source_id_generated")
+        source_candidates_with_aliases.append(replace(candidate, model_alias=model_alias))
+
+    # Deduplicate after every publication has been parsed, preserving the
+    # first occurrence as the surviving publication.
+    surviving_candidates: list[_SourceCandidate] = []
+    seen_canonical_urls: set[str] = set()
+    for candidate in source_candidates_with_aliases:
+        if candidate.canonical_url in seen_canonical_urls:
+            result.warnings.append("duplicate_source_merged")
+            continue
+        seen_canonical_urls.add(candidate.canonical_url)
+        surviving_candidates.append(candidate)
+
+    canonical_id_by_url = {
+        candidate.canonical_url: f"S{index}"
+        for index, candidate in enumerate(surviving_candidates, 1)
+    }
+    sources = [
+        ParsedSource(
+            local_id=canonical_id_by_url[candidate.canonical_url],
+            title=candidate.title,
+            # Subject Production never exposes the model's tracking URL. The
+            # canonical URL is also the user-visible URL and the URL handed to Q2.
+            url=candidate.canonical_url,
+            canonical_url=candidate.canonical_url,
+            publisher=candidate.publisher,
+            published_at=candidate.published_at,
+            role=candidate.role,
+        )
+        for candidate in surviving_candidates
+    ]
+
+    alias_targets: dict[str, set[str]] = {}
+    for candidate in source_candidates_with_aliases:
+        assert candidate.model_alias is not None
+        alias_targets.setdefault(candidate.model_alias, set()).add(
+            canonical_id_by_url[candidate.canonical_url]
+        )
+    alias = {
+        model_alias: next(iter(canonical_ids))
+        for model_alias, canonical_ids in alias_targets.items()
+        if len(canonical_ids) == 1
+    }
+    ambiguous_aliases = {
+        model_alias
+        for model_alias, canonical_ids in alias_targets.items()
+        if len(canonical_ids) > 1
+    }
+    known_ids = set(canonical_id_by_url.values())
+    event_candidates: list[tuple[date | None, tuple[str, ...], str]] = []
 
     for block in (b for b in blocks if b.kind == "event"):
         values = _fields(block.lines)
-        auto_event += 1
-        local_id = block.local_id
-        if local_id is None:
-            local_id = f"R{auto_event}"
+        if block.local_id is None:
             result.warnings.append("event_id_generated")
 
         event_text = (values.get("text") or values.get("texte") or "").strip()
@@ -637,6 +690,10 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
 
         raw_sources = values.get("sources") or values.get("source") or ""
         cited = _reference_tokens(raw_sources)
+        if any(token in ambiguous_aliases for token in cited):
+            result.dropped_blocks.append(block.raw())
+            result.warnings.append("event_ambiguous_source_alias_dropped")
+            continue
         resolved = tuple(
             dict.fromkeys(
                 alias[token] for token in cited if token in alias and alias[token] in known_ids
@@ -660,14 +717,17 @@ def parse_reference_report(text: str, research_date: date) -> ParseResult[Refere
                 result.warnings.append("event_with_future_date_dropped")
                 continue
 
-        events.append(
-            ParsedEvent(
-                local_id=local_id,
-                event_date=event_date,
-                source_ids=resolved,
-                text=event_text,
-            )
+        event_candidates.append((event_date, resolved, event_text))
+
+    events = [
+        ParsedEvent(
+            local_id=f"R{index}",
+            event_date=event_date,
+            source_ids=source_ids,
+            text=event_text,
         )
+        for index, (event_date, source_ids, event_text) in enumerate(event_candidates, 1)
+    ]
 
     if not sources:
         result.errors.append("no_usable_source")

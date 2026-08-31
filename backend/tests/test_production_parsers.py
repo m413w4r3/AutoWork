@@ -19,6 +19,7 @@ from cti_app.application.production_parsers import (
     parse_reference_report,
     validate_synthesis,
 )
+from cti_app.application.production_prompts import ProductionPromptTemplates
 from cti_app.domain.discovery import SourceRole
 
 RESEARCH_DATE = date(2026, 8, 1)
@@ -68,10 +69,21 @@ def test_perfect_report_is_parsed() -> None:
     report = _report()
 
     assert [s.local_id for s in report.sources] == ["S1", "S2"]
+    assert report.sources[0].title == "Rapport ExampleRAT"
     assert report.sources[0].role is SourceRole.PRIMARY
     assert report.sources[0].published_at == date(2026, 7, 1)
     assert report.events[0].source_ids == ("S1", "S2")
     assert report.uncertainties == ("Attribution non confirmee",)
+
+
+def test_reference_prompt_keeps_ids_as_compact_transport_aliases() -> None:
+    prompt = ProductionPromptTemplates.REFERENCES_RESEARCH_V2
+
+    assert "## SOURCE S1" in prompt
+    assert "## EVENT R1" in prompt
+    assert "sources: S1, S2" in prompt
+    assert "compact transport aliases only" in prompt
+    assert "not canonical identifiers" in prompt
 
 
 def test_outer_markdown_fence_is_stripped() -> None:
@@ -122,8 +134,25 @@ def test_missing_ids_are_generated() -> None:
     result = parse_reference_report(text, RESEARCH_DATE)
 
     assert result.usable
+    assert result.value is not None
+    assert [source.local_id for source in result.value.sources] == ["S1", "S2"]
+    assert result.value.events[0].local_id == "R1"
     assert "source_id_generated" in result.warnings
     assert "event_id_generated" in result.warnings
+
+
+@pytest.mark.parametrize("alias", ("S1", "S-1", "S_1", "S 1"))
+def test_source_alias_variants_are_normalized_in_headings_and_events(alias: str) -> None:
+    text = PERFECT_Q1.replace("## SOURCE S1", f"## SOURCE {alias}").replace(
+        "sources: S1, S2", f"sources: {alias}, S2"
+    )
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert [source.local_id for source in result.value.sources] == ["S1", "S2"]
+    assert result.value.events[0].source_ids == ("S1", "S2")
 
 
 def test_duplicate_url_is_merged_and_events_remapped() -> None:
@@ -141,6 +170,90 @@ def test_duplicate_url_is_merged_and_events_remapped() -> None:
     assert "duplicate_source_merged" in result.warnings
     # The event cited S1 and S2; both now resolve to the single surviving source.
     assert result.value.events[0].source_ids == ("S1",)
+
+
+def test_duplicate_url_with_normalized_aliases_maps_to_one_canonical_source() -> None:
+    text = (
+        PERFECT_Q1.replace("## SOURCE S2", "## SOURCE S-1")
+        .replace(
+            "url: https://other.example/analyse",
+            "url: https://research.example/rapport?utm_source=x",
+        )
+        .replace("sources: S1, S2", "sources: S1, S_1")
+    )
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert [source.local_id for source in result.value.sources] == ["S1"]
+    assert result.value.events[0].source_ids == ("S1",)
+
+
+def test_canonical_source_ids_are_continuous_after_url_deduplication() -> None:
+    third_source = """## SOURCE S42
+
+title: Troisieme publication
+url: https://third.example/article
+publisher: Third
+published-at: 2026-07-06
+role: relay
+
+"""
+    text = (
+        PERFECT_Q1.replace("## SOURCE S1", "## SOURCE S9")
+        .replace(
+            "url: https://other.example/analyse",
+            "url: https://research.example/rapport?utm_medium=x",
+        )
+        .replace("## EVENT R1", third_source + "## EVENT R77")
+        .replace("sources: S1, S2", "sources: S9, S2, S42")
+    )
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert [source.local_id for source in result.value.sources] == ["S1", "S2"]
+    assert result.value.events[0].source_ids == ("S1", "S2")
+
+
+def test_same_model_alias_for_different_urls_drops_citing_event() -> None:
+    text = PERFECT_Q1.replace("## SOURCE S2", "## SOURCE S-1").replace(
+        "sources: S1, S2", "sources: S_1"
+    )
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert not result.usable
+    assert "no_usable_event" in result.errors
+    assert "event_ambiguous_source_alias_dropped" in result.warnings
+
+
+def test_canonical_event_ids_are_continuous_after_dropped_events() -> None:
+    extra_events = """## EVENT R99
+
+date: 2027-01-01
+sources: S1
+text: Événement futur.
+
+## EVENT R42
+
+date: 2026-07-02
+sources: S1
+text: Deuxième observation.
+"""
+    text = PERFECT_Q1.replace("## EVENT R1", extra_events + "## EVENT R7")
+
+    result = parse_reference_report(text, RESEARCH_DATE)
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert [event.local_id for event in result.value.events] == ["R1", "R2"]
+    assert [event.text for event in result.value.events] == [
+        "Deuxième observation.",
+        "Premiere observation de la campagne.",
+    ]
 
 
 def test_url_is_recovered_from_free_text() -> None:

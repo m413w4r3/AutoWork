@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 from cti_app.domain.production import ExtractionProfile
 
-REFERENCES_PROMPT_VERSION = "4"
+REFERENCES_PROMPT_VERSION = "5"
 # Q2 uses free-text GPT plus a stateless Markdown wire-format parser. The bridge does
 # not guarantee response_format / JSON Schema.
 # "12" / "5": Q2 analyses the archived capture inlined in the prompt whenever
@@ -146,10 +146,10 @@ text: <one chronological event, in French>
 
 Rules:
 - Produce the editorial title during this references step.
-- One `## SOURCE` block per publication, numbered S1, S2, ...
-- One `## EVENT` block per dated event, numbered R1, R2, ...
-- Every event must cite at least one source id you defined above.
-- Never cite a source id you did not define.
+- Keep S1, S2, ... and R1, R2, ... as compact transport aliases only; they
+  are not canonical identifiers and must never be presented as such.
+- Every event must cite at least one source alias defined above; never cite an
+  alias you did not define.
 - No date after the research date.
 """
 
