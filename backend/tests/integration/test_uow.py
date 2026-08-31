@@ -213,6 +213,8 @@ async def test_model_run_round_trip_never_persists_prompt_content(
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             persisted = await uow.model_runs.get_for_update(run.id)
             assert persisted is not None
+            assert persisted.submission_attempt == 0
+            assert persisted.begin_submission_attempt() == 1
             persisted.wait_for_background(
                 response_id="resp_integration",
                 actual_model_version="chatgpt-web",
@@ -242,6 +244,7 @@ async def test_model_run_round_trip_never_persists_prompt_content(
             persisted = await uow.model_runs.get(run.id)
         assert persisted is not None
         assert persisted.status is ModelRunStatus.WAITING_BACKGROUND
+        assert persisted.submission_attempt == 1
         assert persisted.response_id == "resp_integration"
         assert persisted.raw_output_sha256 == "c" * 64
         assert persisted.validation_errors[0]["code"] == "value_error"

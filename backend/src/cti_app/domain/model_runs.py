@@ -74,6 +74,7 @@ class ModelRun:
     usage: ModelUsage | None = None
     status: ModelRunStatus = ModelRunStatus.RUNNING
     submission_state: ModelSubmissionState = ModelSubmissionState.NOT_SUBMITTED
+    submission_attempt: int = 0
     response_id: str | None = None
     output_references: tuple[str, ...] = ()
     error_code: str | None = None
@@ -103,6 +104,8 @@ class ModelRun:
             raise ValueError("Requested model must not be empty")
         if not self.prompt_template_id.strip() or not self.prompt_template_version.strip():
             raise ValueError("Prompt template identity and version are required")
+        if self.submission_attempt < 0:
+            raise ValueError("Submission attempt cannot be negative")
         for name, value in (
             ("authorized_input_hash", self.authorized_input_hash),
             ("evidence_pack_hash", self.evidence_pack_hash),
@@ -276,12 +279,16 @@ class ModelRun:
         self.finished_at = None
         self.updated_at = timestamp
 
-    def mark_submission_uncertain(self, *, now: datetime | None = None) -> None:
-        """Persist before contacting a provider without server-side deduplication."""
+    def begin_submission_attempt(self, *, now: datetime | None = None) -> int:
+        """Claim and persist a new provider submission before contacting it."""
         if self.status is not ModelRunStatus.RUNNING:
             raise ValueError("Only running ModelRuns can be submitted")
+        if self.submission_state is not ModelSubmissionState.NOT_SUBMITTED:
+            raise ValueError("ModelRun submission is already claimed")
+        self.submission_attempt += 1
         self.submission_state = ModelSubmissionState.SUBMITTED_OR_UNKNOWN
         self.updated_at = now or datetime.now(UTC)
+        return self.submission_attempt
 
     def _require_active(self) -> None:
         if self.status not in {ModelRunStatus.RUNNING, ModelRunStatus.WAITING_BACKGROUND}:

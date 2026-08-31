@@ -46,6 +46,7 @@ class ModelRunRow(Base):
             "submission_state IN ('not_submitted', 'submitted_or_unknown')",
             name="ck_model_runs_submission_state",
         ),
+        CheckConstraint("submission_attempt >= 0", name="ck_model_runs_submission_attempt"),
         CheckConstraint("duration_ms IS NULL OR duration_ms >= 0", name="ck_model_runs_duration"),
         CheckConstraint(
             "char_length(authorized_input_hash) = 64",
@@ -85,6 +86,7 @@ class ModelRunRow(Base):
     usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     submission_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    submission_attempt: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     response_id: Mapped[str | None] = mapped_column(String(255), unique=True)
     output_references: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
     error_code: Mapped[str | None] = mapped_column(String(64))

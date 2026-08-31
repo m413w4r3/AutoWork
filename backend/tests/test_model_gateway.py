@@ -22,6 +22,7 @@ from cti_app.application.model_gateway import (
     ModelRequest,
     ModelRouter,
     ModelRoutingHint,
+    ModelSubmissionReconciliationRequiredError,
     sanitize_model_request,
 )
 from cti_app.domain.jobs import JobStatus
@@ -44,13 +45,14 @@ class SequencedResponsesTransport:
         self._responses = responses
         self.create_calls = 0
         self.retrieve_calls = 0
+        self.idempotency_keys: list[str | None] = []
 
     async def create(
         self, payload: dict[str, Any], *, idempotency_key: str | None = None
     ) -> dict[str, Any]:
-        del idempotency_key
         del payload
         self.create_calls += 1
+        self.idempotency_keys.append(idempotency_key)
         return self._responses[0]
 
     async def retrieve(self, response_id: str) -> dict[str, Any]:
@@ -81,12 +83,14 @@ class SubmissionAwareResponsesTransport:
     def __init__(self, *, submission_state: str) -> None:
         self.submission_state = submission_state
         self.calls = 0
+        self.idempotency_keys: list[str | None] = []
 
     async def create(
         self, payload: dict[str, Any], *, idempotency_key: str | None = None
     ) -> dict[str, Any]:
-        del payload, idempotency_key
+        del payload
         self.calls += 1
+        self.idempotency_keys.append(idempotency_key)
         if self.calls == 1:
             raise BridgeTransportError(
                 "bridge_ui_timeout",
@@ -242,25 +246,56 @@ async def test_typed_bridge_error_details_are_persisted_safely() -> None:
     }
 
 
+async def test_first_submission_uses_attempt_one_bridge_identity() -> None:
+    transport = SequencedResponsesTransport(
+        [
+            {
+                "id": "resp_first",
+                "status": "completed",
+                "model": "chatgpt-web",
+                "output_text": "first",
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }
+        ]
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    await gateway.research(model_request)
+
+    assert model_request.run_id is not None
+    run = model_uow.state[model_request.run_id]
+    assert run.submission_attempt == 1
+    assert transport.idempotency_keys == [f"{run.id}:a1"]
+
+
 async def test_attempted_bridge_failure_is_reconciliation_only_and_keeps_diagnostics() -> None:
     transport = SubmissionAwareResponsesTransport(submission_state="submission_attempted")
     gateway, model_uow, _ = gateway_with_transport(transport)
     model_request = request(external_llm_allowed=True, run_id=uuid4())
 
-    with pytest.raises(BridgeTransportError):
+    with pytest.raises(ModelSubmissionReconciliationRequiredError) as caught:
         await gateway.research(model_request)
-    with pytest.raises(ModelGatewayError, match="not safe"):
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
         await gateway.research(model_request)
 
     run = model_uow.state[model_request.run_id]
     assert transport.calls == 1
+    assert caught.value.code == "model_submission_reconciliation_required"
+    assert caught.value.retryable is False
+    assert caught.value.phase == "reconciliation"
+    assert run.status is ModelRunStatus.NEEDS_REVIEW
+    assert run.error_code == "model_submission_reconciliation_required"
     assert run.submission_state.value == "submitted_or_unknown"
+    assert run.submission_attempt == 1
     assert run.error_details == {
         "provider": "openai_chatgpt_bridge",
         "phase": "submission_confirmation",
         "retryable": True,
         "attempts": 1,
         "submission_state": "submission_attempted",
+        "bridge_request_id": f"{run.id}:a1",
+        "reconciliation_phase": "reconciliation",
         "bridge_diagnostics": {"user_turns_before": 1},
     }
 
@@ -275,6 +310,8 @@ async def test_proven_pre_submission_bridge_failure_can_be_explicitly_retried() 
 
     run = model_uow.state[model_request.run_id]
     assert run.submission_state.value == "not_submitted"
+    assert run.submission_attempt == 1
+    assert transport.idempotency_keys == [f"{run.id}:a1"]
 
     replay = request(
         external_llm_allowed=True,
@@ -285,6 +322,8 @@ async def test_proven_pre_submission_bridge_failure_can_be_explicitly_retried() 
 
     assert execution.output_text == "recovered"
     assert transport.calls == 2
+    assert execution.run.submission_attempt == 2
+    assert transport.idempotency_keys == [f"{run.id}:a1", f"{run.id}:a2"]
 
 
 async def test_qwen_trusted_gateway_runs_when_external_llm_is_forbidden() -> None:
@@ -386,6 +425,7 @@ async def test_succeeded_run_reloads_persisted_output_without_network_call() -> 
     assert first.run.id == second.run.id == run_id
     assert second.output_text == first.output_text
     assert len(fake.calls) == 1
+    assert second.run.submission_attempt == 1
     assert second.metadata["checkpoint"] == "hit"
 
 
@@ -473,14 +513,16 @@ async def test_running_submitted_or_unknown_run_is_never_resubmitted() -> None:
     )
     assert model_request.run_id is not None
     pre_persisted = gateway.build_run(model_request, ModelRole.DRAFTING)
-    pre_persisted.mark_submission_uncertain()
+    pre_persisted.begin_submission_attempt()
     assert pre_persisted.submission_state.value == "submitted_or_unknown"
     model_uow.state[pre_persisted.id] = pre_persisted
 
-    with pytest.raises(ModelGatewayError, match="reconciliation"):
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
         await gateway.draft(model_request)
 
     assert len(fake.calls) == 0
+    assert model_uow.state[pre_persisted.id].status is ModelRunStatus.NEEDS_REVIEW
+    assert model_uow.state[pre_persisted.id].submission_attempt == 1
 
 
 async def test_qwen_unknown_failure_is_not_resubmitted() -> None:
@@ -503,14 +545,16 @@ async def test_qwen_unknown_failure_is_not_resubmitted() -> None:
     )
     assert model_request.run_id is not None
 
-    with pytest.raises(ModelGatewayError, match="Qwen outcome"):
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
         await gateway.draft(model_request)
-    with pytest.raises(ModelGatewayError, match="not safe"):
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
         await gateway.draft(model_request)
 
     run = model_uow.state[model_request.run_id]
-    assert run.status is ModelRunStatus.FAILED
+    assert run.status is ModelRunStatus.NEEDS_REVIEW
+    assert run.error_code == "model_submission_reconciliation_required"
     assert run.submission_state.value == "submitted_or_unknown"
+    assert run.submission_attempt == 1
     assert transport.calls == 1
 
 

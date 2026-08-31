@@ -424,10 +424,17 @@ async def test_bridge_429_honours_retry_after_and_reuses_key(
     monkeypatch.setattr("cti_app.integrations.models.asyncio.sleep", fake_sleep)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
-        await transport.create({"input": "secret"}, idempotency_key="stable-429")
+        await transport.create(
+            {"input": "secret"}, idempotency_key="00000000-0000-4000-8000-000000000001:a1"
+        )
 
     assert delays == [2]
     assert [request.headers["X-Idempotency-Key"] for request in requests] == [
-        "stable-429",
-        "stable-429",
+        "00000000-0000-4000-8000-000000000001:a1",
+        "00000000-0000-4000-8000-000000000001:a1",
     ]
+    assert [json.loads(request.content)["request_id"] for request in requests] == [
+        "00000000-0000-4000-8000-000000000001:a1",
+        "00000000-0000-4000-8000-000000000001:a1",
+    ]
+    assert all(":a2" not in request.headers["X-Idempotency-Key"] for request in requests)

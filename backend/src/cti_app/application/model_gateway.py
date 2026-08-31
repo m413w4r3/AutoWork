@@ -34,6 +34,26 @@ class ModelGatewayError(RuntimeError):
     attempts = 1
 
 
+_MODEL_SUBMISSION_RECONCILIATION_MESSAGE = (
+    "La soumission du modèle doit être réconciliée avant toute nouvelle tentative."
+)
+
+
+class ModelSubmissionReconciliationRequiredError(ModelGatewayError):
+    code = "model_submission_reconciliation_required"
+    retryable = False
+    phase = "reconciliation"
+
+    def __init__(
+        self,
+        message: str = _MODEL_SUBMISSION_RECONCILIATION_MESSAGE,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.details = details or {}
+
+
 class ExternalModelBlockedError(ModelGatewayError):
     pass
 
@@ -654,12 +674,14 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     # RUNNING covers two very different situations:
                     # - SUBMITTED_OR_UNKNOWN: the prompt may already be in flight at
                     #   the provider. Posting again could double-submit, so this is
-                    #   never resubmitted — it needs reconciliation.
+                    #   never resubmitted — it is immediately sealed for
+                    #   reconciliation.
                     # - NOT_SUBMITTED: ModelConversationService.add_turn pre-persists
                     #   the ModelRun (for its FK) before ever calling the gateway.
                     #   Nothing has been sent to a provider yet, so this is a first
                     #   submission, not a replay, and is allowed exactly once.
                     if run.submission_state is not ModelSubmissionState.NOT_SUBMITTED:
+                        details = _reconciliation_details(run)
                         self._diagnostics.record(
                             event="model.reconciliation_required",
                             run_id=run.id,
@@ -672,9 +694,14 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                             correlation_id=get_correlation_id(),
                             recovery_action="reconciliation_required",
                         )
-                        raise ModelGatewayError(
-                            "Model run needs reconciliation before resubmission"
+                        run.require_review(
+                            ModelSubmissionReconciliationRequiredError.code,
+                            _MODEL_SUBMISSION_RECONCILIATION_MESSAGE,
+                            details=details,
                         )
+                        await uow.model_runs.save(run)
+                        await uow.commit()
+                        raise ModelSubmissionReconciliationRequiredError(details=details)
                     self._diagnostics.record(
                         event="model.initial_submission_claim",
                         run_id=run.id,
@@ -700,6 +727,8 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         correlation_id=get_correlation_id(),
                         recovery_action="reconciliation_required",
                     )
+                    if run.error_code == ModelSubmissionReconciliationRequiredError.code:
+                        raise ModelSubmissionReconciliationRequiredError(details=run.error_details)
                     raise ModelGatewayError("Model run needs reconciliation before resubmission")
                 elif run.status is ModelRunStatus.FAILED:
                     if not (
@@ -726,7 +755,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 await uow.commit()
                 raise ExternalModelBlockedError(run.error_message)
             if persisted_success is None and resume_run_id is None:
-                run.mark_submission_uncertain()
+                run.begin_submission_attempt()
                 await uow.model_runs.save(run)
             await uow.commit()
 
@@ -735,9 +764,12 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         if resume_run_id is not None:
             return await self.resume(resume_run_id, output_schema=output_schema)
 
-        # L'identité du ModelRun est créée une seule fois et devient la clé
-        # stable de toutes les tentatives réseau de ce même appel.
-        safe_request = replace(safe_request, request_id=str(run.id))
+        # A new submission gets a new bridge identity. Transport retries reuse
+        # this exact key because the adapter receives it as request_id.
+        request_id = _bridge_request_id(run)
+        if request_id is None:
+            raise ModelGatewayError("Model submission attempt was not allocated")
+        safe_request = replace(safe_request, request_id=request_id)
         started = time.monotonic()
         try:
             result = await adapter.invoke(safe_request, role=role, output_schema=output_schema)
@@ -788,26 +820,46 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 conversation_mode=(request.conversation.mode if request.conversation else None),
                 duration_ms=max(0, int((time.monotonic() - started) * 1000)),
             )
+            reconciliation_error: ModelSubmissionReconciliationRequiredError | None = None
             async with self._uow_factory() as uow:
                 persisted = await uow.model_runs.get_for_update(run.id)
                 if persisted and persisted.status in {
                     ModelRunStatus.RUNNING,
                     ModelRunStatus.WAITING_BACKGROUND,
                 }:
-                    # The bridge may prove that the browser never reached the
-                    # composer click. Preserve that proof so an explicit
-                    # allow_failed_resubmit can use the safe NOT_SUBMITTED
-                    # path; an attempted or post-submission failure remains
-                    # SUBMITTED_OR_UNKNOWN and therefore needs reconciliation.
-                    if getattr(exc, "submission_state", None) == "pre_submission":
+                    if _is_certain_pre_submission_failure(exc):
+                        # Only an explicit proof that the provider was not
+                        # reached permits the FAILED/NOT_SUBMITTED state.
                         persisted.submission_state = ModelSubmissionState.NOT_SUBMITTED
-                    persisted.fail(
-                        str(getattr(exc, "code", "model_call_failed")),
-                        _public_error(exc),
-                        details=_error_details(exc),
-                    )
+                        persisted.fail(
+                            str(getattr(exc, "code", "model_call_failed")),
+                            _public_error(exc),
+                            details=_error_details(exc),
+                        )
+                    elif _submission_may_have_started(exc):
+                        details = _reconciliation_details(
+                            persisted,
+                            exc=exc,
+                            request_id=safe_request.request_id,
+                        )
+                        persisted.require_review(
+                            ModelSubmissionReconciliationRequiredError.code,
+                            _MODEL_SUBMISSION_RECONCILIATION_MESSAGE,
+                            details=details,
+                        )
+                        reconciliation_error = ModelSubmissionReconciliationRequiredError(
+                            details=details
+                        )
+                    else:
+                        persisted.fail(
+                            str(getattr(exc, "code", "model_call_failed")),
+                            _public_error(exc),
+                            details=_error_details(exc),
+                        )
                     await uow.model_runs.save(persisted)
                     await uow.commit()
+            if reconciliation_error is not None:
+                raise reconciliation_error from exc
             raise
 
     async def _persisted_execution(
@@ -895,6 +947,12 @@ _SENSITIVE_KEYS = (
     "actor_id",
     "correlation_id",
     "tenant_id",
+)
+_CERTAIN_PRE_SUBMISSION_CODES = frozenset(
+    {
+        "bridge_auth_failed",
+        "bridge_rate_limited",
+    }
 )
 
 
@@ -994,10 +1052,69 @@ def _public_error(exc: Exception) -> str:
     return "L'appel au modèle a échoué."
 
 
-def _error_details(exc: Exception) -> dict[str, Any]:
+def _is_certain_pre_submission_failure(exc: Exception) -> bool:
+    submission_state = getattr(exc, "submission_state", None)
+    if submission_state == "pre_submission":
+        return True
+    return submission_state is None and getattr(exc, "code", None) in (
+        _CERTAIN_PRE_SUBMISSION_CODES
+    )
+
+
+def _submission_may_have_started(exc: Exception) -> bool:
+    submission_state = getattr(exc, "submission_state", None)
+    if submission_state in {
+        "submission_attempted",
+        "post_submission",
+        "submitted_or_unknown",
+    }:
+        return True
+    return not _is_certain_pre_submission_failure(exc)
+
+
+def _bridge_request_id(run: ModelRun) -> str | None:
+    if run.submission_attempt < 1:
+        return None
+    return f"{run.id}:a{run.submission_attempt}"
+
+
+def _reconciliation_details(
+    run: ModelRun,
+    *,
+    exc: Exception | None = None,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    effective_request_id = request_id or _bridge_request_id(run)
+    if exc is None:
+        details: dict[str, Any] = {
+            "provider": run.provider.value[:64],
+            "phase": "reconciliation",
+            "retryable": False,
+            "attempts": 1,
+        }
+    else:
+        details = _error_details(
+            exc,
+            bridge_request_id=effective_request_id,
+        )
+        details.setdefault("submission_state", run.submission_state.value)
+    details["submission_state"] = details.get("submission_state", run.submission_state.value)
+    details["reconciliation_phase"] = "reconciliation"
+    if effective_request_id and "bridge_request_id" not in details:
+        details["bridge_request_id"] = effective_request_id[:255]
+    return details
+
+
+def _error_details(
+    exc: Exception,
+    *,
+    bridge_request_id: str | None = None,
+    submission_state: str | None = None,
+    phase: str | None = None,
+) -> dict[str, Any]:
     details: dict[str, Any] = {
         "provider": str(getattr(exc, "provider", "unknown"))[:64],
-        "phase": str(getattr(exc, "phase", "model_call"))[:64],
+        "phase": str(phase or getattr(exc, "phase", "model_call"))[:64],
         "retryable": bool(getattr(exc, "retryable", False)),
         "attempts": max(1, int(getattr(exc, "attempts", 1))),
     }
@@ -1005,9 +1122,11 @@ def _error_details(exc: Exception) -> dict[str, Any]:
         value = getattr(exc, key, None)
         if isinstance(value, str) and value:
             details[key] = value[:128]
-    submission_state = getattr(exc, "submission_state", None)
-    if isinstance(submission_state, str) and submission_state:
-        details["submission_state"] = submission_state[:32]
+    source_submission_state = submission_state or getattr(exc, "submission_state", None)
+    if isinstance(source_submission_state, str) and source_submission_state:
+        details["submission_state"] = source_submission_state[:32]
+    if isinstance(bridge_request_id, str) and bridge_request_id:
+        details["bridge_request_id"] = bridge_request_id[:255]
     diagnostics = getattr(exc, "diagnostics", None)
     if isinstance(diagnostics, dict) and diagnostics:
         details["bridge_diagnostics"] = _safe_error_diagnostics(diagnostics)
