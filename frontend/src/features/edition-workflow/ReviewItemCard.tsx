@@ -3,6 +3,7 @@ import { useState } from "react";
 
 import { ApiError } from "../../api/editions";
 import {
+  cancelProductionRun,
   excludeReviewItem,
   includeReviewItem,
   retryProductionRun,
@@ -44,6 +45,29 @@ function invalidateReview(
 }
 
 function invalidateAfterRetry(
+  queryClient: ReturnType<typeof useQueryClient>,
+  editionId: string,
+  subjectId: string,
+) {
+  void queryClient.invalidateQueries({
+    queryKey: ["edition-review", editionId],
+  });
+  void queryClient.invalidateQueries({ queryKey: ["batch", editionId] });
+  void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
+  if (queryClient.getQueryState(["subject-production", subjectId])) {
+    void queryClient.invalidateQueries({
+      queryKey: ["subject-production", subjectId],
+    });
+  }
+  void queryClient.invalidateQueries({
+    queryKey: ["subject-content", subjectId],
+  });
+  void queryClient.invalidateQueries({
+    queryKey: ["subject-indicators", subjectId],
+  });
+}
+
+function invalidateAfterCancel(
   queryClient: ReturnType<typeof useQueryClient>,
   editionId: string,
   subjectId: string,
@@ -115,6 +139,16 @@ export function ReviewItemCard({
     onError: handleError,
   });
 
+  const cancel = useMutation({
+    mutationFn: () => cancelProductionRun(item.run_id),
+    retry: false,
+    onSuccess: () => {
+      setStaleMessage(null);
+      invalidateAfterCancel(queryClient, editionId, item.subject_id);
+    },
+    onError: handleError,
+  });
+
   const isActive =
     item.run_status === "queued" || item.run_status === "running";
   const isExcluded = item.effective_decision === "exclude";
@@ -135,8 +169,12 @@ export function ReviewItemCard({
         ? "Prêt"
         : "À corriger";
   const actionPending =
-    include.isPending || exclude.isPending || retry.isPending;
-  const mutationError = include.error ?? exclude.error ?? retry.error;
+    include.isPending ||
+    exclude.isPending ||
+    retry.isPending ||
+    cancel.isPending;
+  const mutationError =
+    include.error ?? exclude.error ?? retry.error ?? cancel.error;
 
   const confirmExclude = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -163,6 +201,16 @@ export function ReviewItemCard({
 
       <div className="review-item-card__actions">
         <Link to={`/subjects/${item.subject_id}`}>Ouvrir</Link>
+        {isActive ? (
+          <button
+            className="button button--danger"
+            type="button"
+            disabled={actionPending}
+            onClick={() => cancel.mutate()}
+          >
+            {cancel.isPending ? "Arrêt…" : "Arrêter cette tentative"}
+          </button>
+        ) : null}
         {!isActive && isReadyIncluded ? (
           <button
             className="button button--danger"

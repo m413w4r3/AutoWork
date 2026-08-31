@@ -1454,3 +1454,105 @@ async def test_subject_cancel_marks_run_and_cancels_its_exact_job(
     assert response.status_code == 200, response.text
     assert uow.subject_production_runs.items[run_id].status is SubjectProductionStatus.CANCELLED
     assert jobs.cancelled == [jobs.jobs[0].id]
+
+
+async def test_exact_run_cancel_is_idempotent_and_never_touches_same_subject_history(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    old_run = SubjectProductionRun(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        run_number=1,
+    )
+    old_run.start_running()
+    current_run = SubjectProductionRun(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        run_number=2,
+        status=SubjectProductionStatus.FAILED,
+    )
+    current_run.started_at = old_run.started_at
+    current_run.finished_at = datetime.now(UTC)
+    await uow.subject_production_runs.add(old_run)
+    await uow.subject_production_runs.add(current_run)
+
+    jobs = _CancelableJobs()
+    production_app.state.job_service = jobs
+    old_job = _TrackedJob(subject_id=subject_id, run_id=old_run.id)
+    current_job = _TrackedJob(subject_id=subject_id, run_id=current_run.id)
+    jobs.jobs.extend((old_job, current_job))
+
+    response = await api.post(f"/api/production/runs/{old_run.id}/cancel")
+    repeated = await api.post(f"/api/production/runs/{old_run.id}/cancel")
+
+    assert response.status_code == 200, response.text
+    assert repeated.status_code == 200, repeated.text
+    assert response.json() == {
+        "action": "cancel",
+        "run_id": str(old_run.id),
+        "status": "cancelled",
+    }
+    assert uow.subject_production_runs.items[old_run.id].status is (
+        SubjectProductionStatus.CANCELLED
+    )
+    assert uow.subject_production_runs.items[current_run.id].status is (
+        SubjectProductionStatus.FAILED
+    )
+    assert jobs.cancelled == [old_job.id]
+    assert current_job.id not in jobs.cancelled
+
+
+async def test_exact_run_cancel_preserves_existing_artifacts(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    run = SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
+    run.start_running()
+    await uow.subject_production_runs.add(run)
+    references = _artifact(run, ProductionArtifactStage.REFERENCES)
+    extraction = _artifact(run, ProductionArtifactStage.EXTRACTION)
+    await uow.production_artifacts.append(references)
+    await uow.production_artifacts.append(extraction)
+    production_app.state.job_service = _CancelableJobs()
+
+    response = await api.post(f"/api/production/runs/{run.id}/cancel")
+
+    assert response.status_code == 200, response.text
+    assert [artifact.status for artifact in uow.production_artifacts.items] == [
+        ProductionArtifactStatus.VERIFIED,
+        ProductionArtifactStatus.VERIFIED,
+    ]
+    assert len(uow.production_artifacts.items) == 2
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    (
+        SubjectProductionStatus.READY,
+        SubjectProductionStatus.FAILED,
+        SubjectProductionStatus.NEEDS_REVIEW,
+    ),
+)
+async def test_exact_run_cancel_rejects_inactive_terminal_run(
+    api: AsyncClient,
+    uow: _Uow,
+    terminal_status: SubjectProductionStatus,
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    run = (
+        _ready_run(edition_id, subject_id)
+        if terminal_status is SubjectProductionStatus.READY
+        else _terminal_run(edition_id, subject_id, status=terminal_status)
+    )
+    await uow.subject_production_runs.add(run)
+
+    response = await api.post(f"/api/production/runs/{run.id}/cancel")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "production_run_not_cancellable"

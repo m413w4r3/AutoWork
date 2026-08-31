@@ -268,6 +268,9 @@ class SubjectProductionService:
             if not run:
                 raise ValueError(f"Production run {run_id} not found")
 
+            if run.status is SubjectProductionStatus.CANCELLED:
+                await uow.commit()
+                return run
             if run.status is not SubjectProductionStatus.RUNNING:
                 run.start_running(now=datetime.now(UTC))
                 await uow.subject_production_runs.save(run)
@@ -337,10 +340,12 @@ class SubjectProductionService:
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:
-                raise ValueError(f"Production run {run_id} not found")
+                raise ProductionRunNotFoundError(str(run_id))
 
+            was_cancelled = run.status is SubjectProductionStatus.CANCELLED
             run.mark_cancelled(now=datetime.now(UTC))
-            await uow.subject_production_runs.save(run)
+            if not was_cancelled:
+                await uow.subject_production_runs.save(run)
             await uow.commit()
             return run
 
@@ -409,6 +414,8 @@ class SubjectProductionService:
         if expected_edition_id is not None and run.edition_id != expected_edition_id:
             raise ValueError("production_run_edition_changed")
 
+        if run.status is SubjectProductionStatus.CANCELLED:
+            raise ValueError("production_run_cancelled")
         if run.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
             raise ValueError("retry_not_allowed_while_running")
         if stage not in production_stages():

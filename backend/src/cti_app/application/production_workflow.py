@@ -18,7 +18,7 @@ from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentSe
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.iana_tlds_snapshot import IANA_TLD_SNAPSHOT_VERSION
-from cti_app.application.jobs import JobExecutionContext
+from cti_app.application.jobs import JobCancelledError, JobExecutionContext
 from cti_app.application.model_conversations import (
     ConversationTurnFailedError,
     ModelConversationService,
@@ -319,6 +319,23 @@ class ProductionWorkflowOrchestrator:
         self._seed_enrichment = seed_enrichment
         self._pacing = pacing or ProductionPacingPolicy.zero()
 
+    async def _check_cancellation(
+        self, run_id: UUID, context: JobExecutionContext | None
+    ) -> None:
+        """Fence both the job cancellation flag and the persistent run state."""
+        if context is not None:
+            await context.check_cancelled()
+        uow_factory = getattr(self, "_uow_factory", None)
+        if uow_factory is None:
+            return
+        async with uow_factory() as uow:
+            runs = getattr(uow, "subject_production_runs", None)
+            if runs is None:
+                return
+            run = await runs.get(run_id)
+        if run is not None and run.status is SubjectProductionStatus.CANCELLED:
+            raise JobCancelledError
+
     async def execute_stage(
         self,
         run_id: UUID,
@@ -345,6 +362,8 @@ class ProductionWorkflowOrchestrator:
         if not run:
             raise ValueError(f"Production run {run_id} not found")
 
+        await self._check_cancellation(run.id, context)
+
         if run.current_stage != expected_stage:
             raise ValueError(
                 f"Run on stage {run.current_stage.value}, expected {expected_stage.value}"
@@ -358,9 +377,9 @@ class ProductionWorkflowOrchestrator:
             elif expected_stage == SubjectProductionStage.EXTRACTION:
                 result = await self._execute_extraction_stage(run, context, snapshot)
             elif expected_stage == SubjectProductionStage.SYNTHESIS:
-                result = await self._execute_synthesis_stage(run, snapshot)
+                result = await self._execute_synthesis_stage(run, context, snapshot)
             elif expected_stage == SubjectProductionStage.ASSEMBLY:
-                result = await self._execute_assembly_stage(run, snapshot)
+                result = await self._execute_assembly_stage(run, context, snapshot)
             else:
                 raise ValueError(f"Unknown stage: {expected_stage.value}")
         except ProductionReuseStorageUnavailableError as exc:
@@ -432,6 +451,7 @@ class ProductionWorkflowOrchestrator:
         web_search: bool = False,
         request_identity: str | None = None,
         lifecycle_policy: ConversationPolicy = ConversationPolicy.KEEP,
+        context: JobExecutionContext | None = None,
     ) -> tuple[Any | None, str, UUID | None, UUID | None]:
         """Ask the model, and give it exactly one chance to fix its formatting.
 
@@ -444,6 +464,7 @@ class ProductionWorkflowOrchestrator:
         assert self._model_service is not None
         identity = f"-{request_identity}" if request_identity else ""
         idempotency_key = f"{stage}-{run.id}-v{prompt_version}{identity}"
+        await self._check_cancellation(run.id, context)
         turn = await self._model_service.add_turn(
             conversation_id=conversation_id,
             message=prompt,
@@ -457,6 +478,7 @@ class ProductionWorkflowOrchestrator:
         )
         model_run_id = getattr(turn, "model_run_id", None)
         raw = await self._turn_output_text(conversation_id, turn.id) or ""
+        await self._check_cancellation(run.id, context)
         self._diagnostics.record_model_answer(
             run_id=run.id,
             subject_id=run.subject_id,
@@ -482,6 +504,7 @@ class ProductionWorkflowOrchestrator:
             if request_identity
             else f"{stage}-format-repair-{run.id}-v{repair_version}"
         )
+        await self._check_cancellation(run.id, context)
         repair_turn = await self._model_service.add_turn(
             conversation_id=conversation_id,
             message=repair_prompt,
@@ -494,6 +517,7 @@ class ProductionWorkflowOrchestrator:
         )
         repair_model_run_id = getattr(repair_turn, "model_run_id", None)
         repaired_raw = await self._turn_output_text(conversation_id, repair_turn.id) or ""
+        await self._check_cancellation(run.id, context)
         self._diagnostics.record_model_answer(
             run_id=run.id,
             subject_id=run.subject_id,
@@ -539,6 +563,7 @@ class ProductionWorkflowOrchestrator:
                 for source in report.sources
             ]
             try:
+                await self._check_cancellation(run.id, context)
                 added = await self._collection_service.add_supplemental_sources(
                     run.subject_id, supplemental
                 )
@@ -552,6 +577,7 @@ class ProductionWorkflowOrchestrator:
                         ):
                             continue
                         try:
+                            await self._check_cancellation(run.id, context)
                             await self._collection_service.collect_subject(
                                 run.subject_id,
                                 context.job_id,
@@ -559,10 +585,14 @@ class ProductionWorkflowOrchestrator:
                                 collection_id=collection.id,
                                 snapshot=snapshot,
                             )
+                        except JobCancelledError:
+                            raise
                         except Exception as exc:
                             warnings.append(
                                 f"supplemental_collection_failed:{collection.canonical_url}:{exc}"
                             )
+            except JobCancelledError:
+                raise
             except Exception as exc:
                 warnings.append(f"supplemental_collection_failed:{exc}")
 
@@ -726,6 +756,7 @@ class ProductionWorkflowOrchestrator:
                 "error": "Job context required for source collection",
             }
 
+        await self._check_cancellation(run.id, context)
         try:
             await self._collection_service.collect_subject(
                 run.subject_id,
@@ -737,6 +768,8 @@ class ProductionWorkflowOrchestrator:
             if snapshot is not None:
                 snapshot_urls = {source.canonical_url for source in snapshot.core_sources}
                 sources = [source for source in sources if source.canonical_url in snapshot_urls]
+        except JobCancelledError:
+            raise
         except Exception as e:
             return {
                 "stage": "sources",
@@ -747,6 +780,7 @@ class ProductionWorkflowOrchestrator:
             }
 
         archived = sum(1 for source in sources if source.state in _ARCHIVED_STATES)
+        await self._check_cancellation(run.id, context)
         if archived == 0:
             return {
                 "stage": "sources",
@@ -767,6 +801,7 @@ class ProductionWorkflowOrchestrator:
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
+        await self._check_cancellation(run.id, context)
         async with self._uow_factory() as uow:
             research_date = run.research_date or datetime.now(UTC).date()
             ctx = await build_subject_production_context(
@@ -843,8 +878,12 @@ class ProductionWorkflowOrchestrator:
                     external_llm_allowed=ctx.external_llm_allowed,
                     web_search=True,
                     request_identity=f"g{run.pipeline_generation}",
+                    context=context,
                 )
+            except JobCancelledError:
+                raise
             except Exception as e:
+                await self._check_cancellation(run.id, context)
                 return self._handle_stage_exception(run, "references", e)
 
             if parsed is None:
@@ -870,6 +909,7 @@ class ProductionWorkflowOrchestrator:
             # Order matters: the new publications must be attached, downloaded
             # and archived before Q1 is recorded, so extraction only ever sees
             # events backed by a source we actually hold.
+            await self._check_cancellation(run.id, context)
             integration = await self._integrate_reference_sources(run, report, context, snapshot)
             parsed.warnings.extend(integration["warnings"])
             if not integration["kept_events"]:
@@ -882,6 +922,7 @@ class ProductionWorkflowOrchestrator:
                 }
             report = integration["report"]
 
+            await self._check_cancellation(run.id, context)
             artifact = await self._references.store_references_result(
                 run_id=run.id,
                 subject_id=run.subject_id,
@@ -907,15 +948,19 @@ class ProductionWorkflowOrchestrator:
     async def _execute_extraction_stage(
         self,
         run: SubjectProductionRun,
-        context: JobExecutionContext | None,
+        context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
-        return await self._execute_direct_url_extraction(run, snapshot)
+        return await self._execute_direct_url_extraction(run, context, snapshot)
 
     async def _execute_direct_url_extraction(
-        self, run: SubjectProductionRun, snapshot: ProductionInputSnapshot | None = None
+        self,
+        run: SubjectProductionRun,
+        context: JobExecutionContext | None = None,
+        snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
         """Q2: exactly one fresh, web-enabled model request per Q1 source."""
+        await self._check_cancellation(run.id, context)
         async with self._uow_factory() as uow:
             references = await uow.production_artifacts.get_current(run.id, "references")
             if references is None:
@@ -975,7 +1020,9 @@ class ProductionWorkflowOrchestrator:
             if source_index:
                 # Q2 stays one request per source; pacing is between requests,
                 # never before the first source.
+                await self._check_cancellation(run.id, context)
                 await asyncio.sleep(self._pacing.model_delay_seconds())
+            await self._check_cancellation(run.id, context)
             prompt = ProductionPromptTemplates.get_extraction_prompt(
                 subject_title, source.local_id, source.title, source.canonical_url
             )
@@ -1024,6 +1071,7 @@ class ProductionWorkflowOrchestrator:
                     ),
                     ModelRole.RESEARCH,
                 )
+                await self._check_cancellation(run.id, context)
                 raw = execution.output_text or ""
                 if not raw:
                     raise _Q2ControlFailure("Provider returned no Q2 response")
@@ -1056,7 +1104,10 @@ class ProductionWorkflowOrchestrator:
                     artifacts_count=len(parsed.value.artifacts),
                     duration_ms=int((time.monotonic() - started_at) * 1000),
                 )
+            except JobCancelledError:
+                raise
             except Exception as exc:
+                await self._check_cancellation(run.id, context)
                 classification = _classify_q2_failure(
                     exc,
                     provider_response_produced=bool(raw),
@@ -1154,6 +1205,7 @@ class ProductionWorkflowOrchestrator:
             status.value: sum(item.indicator_status is status for item in extraction.items)
             for status in IndicatorStatus
         }
+        await self._check_cancellation(run.id, context)
         artifact = await self._extraction.store_extraction_result(
             run_id=run.id,
             subject_id=run.subject_id,
@@ -1277,8 +1329,12 @@ class ProductionWorkflowOrchestrator:
         }
 
     async def _execute_synthesis_stage(
-        self, run: SubjectProductionRun, snapshot: ProductionInputSnapshot | None = None
+        self,
+        run: SubjectProductionRun,
+        context: JobExecutionContext | None = None,
+        snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
+        await self._check_cancellation(run.id, context)
         async with self._uow_factory() as uow:
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
             references = await uow.production_artifacts.get_current(run.id, "references")
@@ -1398,7 +1454,9 @@ class ProductionWorkflowOrchestrator:
                     external_llm_allowed=synthesis_policy_allows,
                     web_search=True,
                     request_identity=f"g{run.pipeline_generation}",
+                    context=context,
                 )
+                await self._check_cancellation(run.id, context)
                 if parsed is None:
                     return {
                         "stage": "synthesis",
@@ -1463,13 +1521,20 @@ class ProductionWorkflowOrchestrator:
                     "repair_actions": parsed.repair_actions,
                 }
                 return result
+            except JobCancelledError:
+                raise
             except Exception as e:
+                await self._check_cancellation(run.id, context)
                 return self._handle_stage_exception(run, "synthesis", e)
 
     async def _execute_assembly_stage(
-        self, run: SubjectProductionRun, snapshot: ProductionInputSnapshot | None = None
+        self,
+        run: SubjectProductionRun,
+        context: JobExecutionContext | None = None,
+        snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
         """Deterministic: pure rendering from artifacts, no LLM call."""
+        await self._check_cancellation(run.id, context)
         async with self._uow_factory() as uow:
             references = await uow.production_artifacts.get_current(run.id, "references")
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
@@ -1510,9 +1575,17 @@ class ProductionWorkflowOrchestrator:
                 **qa_inputs,
             )
 
+            await self._check_cancellation(run.id, context)
+            ending = await uow.subject_production_runs.get_for_update(run.id)
+            if ending is None or ending.status is SubjectProductionStatus.CANCELLED:
+                return {
+                    "stage": "assembly",
+                    "status": "cancelled",
+                }
+
             if qa_result["passed"]:
-                run.mark_ready(now=datetime.now(UTC))
-                await uow.subject_production_runs.save(run)
+                ending.mark_ready(now=datetime.now(UTC))
+                await uow.subject_production_runs.save(ending)
                 await uow.commit()
 
                 return {
@@ -1522,13 +1595,13 @@ class ProductionWorkflowOrchestrator:
                     "qa": qa_result,
                 }
             else:
-                run.mark_needs_review(
+                ending.mark_needs_review(
                     code="qa_failed",
                     message="; ".join(qa_result["errors"]),
                     details=qa_result,
                     now=datetime.now(UTC),
                 )
-                await uow.subject_production_runs.save(run)
+                await uow.subject_production_runs.save(ending)
                 await uow.commit()
 
                 return {

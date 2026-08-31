@@ -184,6 +184,23 @@ async def test_reconciliation_failure_is_never_automatically_recovered() -> None
 
 
 @pytest.mark.asyncio
+async def test_cancelled_run_is_never_automatically_recovered() -> None:
+    uow, runs = _batch_uow(["bridge_timeout"])
+    runs[0].status = SubjectProductionStatus.CANCELLED
+    service = EditionProductionService(lambda: uow)
+
+    assert (
+        await service.on_subject_terminal(uow.edition_production_batches.item.id, runs[0].id)
+        is None
+    )
+
+    item = uow.edition_production_batch_items.items[0]
+    assert item.auto_recovery_count == 0
+    assert runs[0].pipeline_generation == 0
+    assert uow.edition_production_batches.item.phase is ProductionBatchPhase.REVIEW
+
+
+@pytest.mark.asyncio
 async def test_recovery_runs_candidates_in_editorial_order_and_finishes_review() -> None:
     uow, runs = _batch_uow(["bridge_timeout", "no_model_response"])
     service = EditionProductionService(

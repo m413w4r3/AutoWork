@@ -313,6 +313,9 @@ async def _create_and_start_run(
         # not the stale QUEUED one create_run returned.
         run = await service.start_run(run.id)
 
+    if not await _production_run_can_dispatch(uow_factory, run.id):
+        return run, None
+
     # The idempotency key makes a concurrent duplicate POST reuse this job.
     parameters = ProductionStageParameters(
         run_id=run.id,
@@ -332,8 +335,35 @@ async def _create_and_start_run(
         )
     except DuplicateJobError as exc:
         return run, exc.existing_job_id
+    if not await _production_run_can_dispatch(uow_factory, run.id):
+        await _cancel_non_terminal_run_jobs(
+            jobs,
+            [(run.id, run.subject_id)],
+            actor_id=actor_id,
+        )
+        return run, job.id
     await dispatcher.dispatch(job.id)
     return run, job.id
+
+
+async def _production_run_can_dispatch(
+    uow_factory: UnitOfWorkFactory,
+    run_id: UUID,
+    *,
+    batch_id: UUID | None = None,
+) -> bool:
+    """Re-read the exact run (and batch, when applicable) before dispatch."""
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get(run_id)
+        if run is None or run.status is not SubjectProductionStatus.RUNNING:
+            return False
+        if batch_id is None:
+            return True
+        batch = await uow.edition_production_batches.get(batch_id)
+        return batch is not None and batch.status in {
+            ProductionBatchStatus.QUEUED,
+            ProductionBatchStatus.RUNNING,
+        }
 
 
 async def _retry_production_run(
@@ -426,6 +456,45 @@ async def _cancel_non_terminal_run_jobs(
                     await cancel_job(job.id, actor_id=actor_id)
                 except (LookupError, ValueError):
                     pass
+
+
+async def _cancel_production_run(
+    request: Request,
+    run_id: UUID,
+    *,
+    actor_id: str,
+) -> dict[str, Any]:
+    """Cancel one exact run, then request cancellation of its exact jobs."""
+    uow_factory, jobs, _ = _runtime(request)
+    service = SubjectProductionService(uow_factory)
+    try:
+        cancelled = await service.cancel_run(run_id)
+    except ProductionRunNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No production run found for run {run_id}",
+        ) from exc
+    except ValueError as exc:
+        if str(exc) != "production_run_not_cancellable":
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "production_run_not_cancellable",
+                "message": "Cette tentative de production n'est plus active.",
+            },
+        ) from exc
+
+    await _cancel_non_terminal_run_jobs(
+        jobs,
+        [(cancelled.id, cancelled.subject_id)],
+        actor_id=actor_id,
+    )
+    return {
+        "action": "cancel",
+        "run_id": str(cancelled.id),
+        "status": SubjectProductionStatus.CANCELLED.value,
+    }
 
 
 # Subject Production Endpoints
@@ -691,13 +760,20 @@ async def retry_production_run(
     return await _retry_production_run(request, run_id, payload, await _actor_id(request))
 
 
+@router.post("/production/runs/{run_id}/cancel")
+async def cancel_production_run(
+    run_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    return await _cancel_production_run(request, run_id, actor_id=await _actor_id(request))
+
+
 @router.post("/subjects/{subject_id}/production/cancel")
 async def cancel_production(
     subject_id: UUID,
     request: Request,
 ) -> dict[str, Any]:
-    uow_factory, jobs, _ = _runtime(request)
-    service = SubjectProductionService(uow_factory)
+    uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
         run = await uow.subject_production_runs.get_current_for_subject(subject_id)
@@ -706,19 +782,13 @@ async def cancel_production(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No production run found for subject {subject_id}",
             )
+        current_run_id = run.id
 
-    cancelled = await service.cancel_run(run.id)
-    await _cancel_non_terminal_run_jobs(
-        jobs,
-        [(cancelled.id, cancelled.subject_id)],
+    return await _cancel_production_run(
+        request,
+        current_run_id,
         actor_id=await _actor_id(request),
     )
-
-    return {
-        "action": "cancel",
-        "run_id": str(run.id),
-        "status": SubjectProductionStatus.CANCELLED.value,
-    }
 
 
 async def _artifact_view(
@@ -858,24 +928,36 @@ async def start_edition_production(
         # start_next promotes the first one to RUNNING.
         first_run = await service.start_next(batch.id)
         if first_run is not None:
-            parameters = ProductionStageParameters(
-                run_id=first_run.id,
-                expected_stage=SubjectProductionStage.SOURCES.value,
-                pipeline_generation=first_run.pipeline_generation,
-            )
-            job = await jobs.submit(
-                kind="production.subject.sources",
-                aggregate_type="subject",
-                aggregate_id=first_run.subject_id,
-                idempotency_key=production_stage_idempotency_key(
-                    first_run, SubjectProductionStage.SOURCES
-                ),
-                correlation_id=get_correlation_id(),
-                input_parameters=parameters.model_dump(mode="json"),
-                max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
-                actor_id=actor_id,
-            )
-            await dispatcher.dispatch(job.id)
+            if await _production_run_can_dispatch(
+                uow_factory, first_run.id, batch_id=batch.id
+            ):
+                parameters = ProductionStageParameters(
+                    run_id=first_run.id,
+                    expected_stage=SubjectProductionStage.SOURCES.value,
+                    pipeline_generation=first_run.pipeline_generation,
+                )
+                job = await jobs.submit(
+                    kind="production.subject.sources",
+                    aggregate_type="subject",
+                    aggregate_id=first_run.subject_id,
+                    idempotency_key=production_stage_idempotency_key(
+                        first_run, SubjectProductionStage.SOURCES
+                    ),
+                    correlation_id=get_correlation_id(),
+                    input_parameters=parameters.model_dump(mode="json"),
+                    max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
+                    actor_id=actor_id,
+                )
+                if await _production_run_can_dispatch(
+                    uow_factory, first_run.id, batch_id=batch.id
+                ):
+                    await dispatcher.dispatch(job.id)
+                else:
+                    await _cancel_non_terminal_run_jobs(
+                        jobs,
+                        [(first_run.id, first_run.subject_id)],
+                        actor_id=actor_id,
+                    )
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -915,6 +997,7 @@ async def cancel_edition_batch(
 ) -> dict[str, Any]:
     uow_factory, jobs, _ = _runtime(request)
     runs_to_cancel: list[tuple[UUID, UUID]] = []
+    actor_id = await _actor_id(request)
 
     async with uow_factory() as uow:
         batch = await uow.edition_production_batches.get_for_update(batch_id)
@@ -949,7 +1032,7 @@ async def cancel_edition_batch(
     await _cancel_non_terminal_run_jobs(
         jobs,
         runs_to_cancel,
-        actor_id=await _actor_id(request),
+        actor_id=actor_id,
     )
 
     return {

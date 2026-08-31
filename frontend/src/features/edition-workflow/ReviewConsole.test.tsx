@@ -77,7 +77,7 @@ function decisionResponse() {
 
 function renderReview(
   review: EditionReview,
-  postResponse: () => Response = decisionResponse,
+  postResponse: () => Response | Promise<Response> = decisionResponse,
 ) {
   const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
     init?.method === "POST"
@@ -351,6 +351,83 @@ describe("ReviewConsole", () => {
     expect(
       screen.queryByRole("button", { name: "Réessayer" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("arrête exclusivement le run_id affiché et invalide les vues liées", async () => {
+    const item = makeItem({
+      subject_id: "subject-stale-card",
+      run_id: "run-old",
+      run_status: "running",
+    });
+    const { client, fetchMock } = renderReview(makeReview([item]));
+    client.setQueryData(["subject-production", item.subject_id], {
+      run_id: "run-new",
+      status: "running",
+    });
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Arrêter cette tentative",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([, init]) => init?.method === "POST"),
+      ).toHaveLength(1),
+    );
+    const [url] = postCall(fetchMock);
+    expect(url).toBe("/api/production/runs/run-old/cancel");
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["edition-review", EDITION_ID],
+    });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["batch", EDITION_ID],
+    });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["edition", EDITION_ID],
+    });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["subject-production", item.subject_id],
+    });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["subject-content", item.subject_id],
+    });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["subject-indicators", item.subject_id],
+    });
+  });
+
+  it("affiche Arrêt… pendant l’annulation et rend l’erreur sans retry", async () => {
+    let resolvePost: (response: Response) => void = () => undefined;
+    const pendingPost = new Promise<Response>((resolve) => {
+      resolvePost = resolve;
+    });
+    const item = makeItem({ run_status: "queued", run_id: "run-pending" });
+    const { fetchMock } = renderReview(makeReview([item]), () => pendingPost);
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Arrêter cette tentative",
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Arrêt…" })).toBeDisabled();
+
+    resolvePost(
+      Response.json(
+        { detail: { code: "production_run_not_cancellable" } },
+        { status: 409 },
+      ),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "La revue de publication n’a pas pu être mise à jour.",
+    );
+    expect(
+      fetchMock.mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toHaveLength(1);
   });
 
   it("polling seulement quand un item est queued ou running", () => {

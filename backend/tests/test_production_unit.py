@@ -130,6 +130,25 @@ class TestSubjectProductionRunStates:
         assert run.status == SubjectProductionStatus.CANCELLED
         assert run.finished_at is not None
 
+    def test_mark_cancelled_is_idempotent_and_terminal(self) -> None:
+        run = SubjectProductionRun(
+            subject_id=uuid4(),
+            edition_id=uuid4(),
+        )
+        run.start_running(now=datetime.now(UTC))
+        run.mark_cancelled(now=datetime.now(UTC))
+        finished_at = run.finished_at
+        version = run.version
+
+        run.mark_cancelled(now=datetime.now(UTC))
+
+        assert run.finished_at == finished_at
+        assert run.version == version
+        with pytest.raises(ValueError, match="production_run_cancelled"):
+            run.retry_from_stage(SubjectProductionStage.REFERENCES)
+        with pytest.raises(ValueError, match="production_run_cancelled"):
+            run.mark_ready()
+
     def test_cannot_transition_from_terminal_state(self) -> None:
         run = SubjectProductionRun(
             subject_id=uuid4(),

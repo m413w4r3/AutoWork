@@ -66,6 +66,11 @@ class ProductionRecoveryPolicyV1:
 
     @classmethod
     def eligible(cls, item: EditionProductionBatchItem, run: SubjectProductionRun) -> bool:
+        # Cancellation is an absolute terminal decision.  Keep this explicit
+        # even though CANCELLED is not one of the allow-listed statuses: it is
+        # a fence against future policy additions accidentally reviving a run.
+        if run.status is SubjectProductionStatus.CANCELLED:
+            return False
         return (
             item.auto_recovery_count == 0
             and run.status

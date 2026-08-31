@@ -318,6 +318,15 @@ export async function cancelSubjectProduction(
   });
 }
 
+export async function cancelProductionBatch(
+  editionId: string,
+  batchId: string,
+): Promise<{ action: string; batch_id: string; status: "cancelled" }> {
+  return request(`/api/editions/${editionId}/production/${batchId}/cancel`, {
+    method: "POST",
+  });
+}
+
 export async function getReferencesArtifact(
   subjectId: string,
 ): Promise<ArtifactResponse> {

@@ -1,12 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { BatchStatus } from "../../api/production";
-import {
-  ProductionConsole,
-  productionBatchPollingInterval,
-} from "./ProductionConsole";
+import { ProductionConsole } from "./ProductionConsole";
+import { productionBatchPollingInterval } from "./productionPolling";
 
 const EDITION_ID = "edition-1";
 
@@ -14,11 +13,13 @@ function renderConsole(batch: BatchStatus | null) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  const fetchMock = vi
-    .fn()
-    .mockResolvedValue(
+  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    void input;
+    void init;
+    return Promise.resolve(
       batch ? Response.json(batch) : new Response(null, { status: 404 }),
     );
+  });
   vi.stubGlobal("fetch", fetchMock);
   render(
     <QueryClientProvider client={client}>
@@ -132,6 +133,9 @@ describe("ProductionConsole", () => {
     expect(
       screen.getByText(/Démarrage du prochain article dans 00:4[12]/),
     ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Arrêter le lot" }),
+    ).toBeInTheDocument();
   });
 
   it("ne présente pas une étape active pendant le délai avant le prochain article", async () => {
@@ -205,6 +209,9 @@ describe("ProductionConsole", () => {
     const invalidate = vi.spyOn(client, "invalidateQueries");
 
     await screen.findByRole("heading", { name: "0 / 0 articles traités" });
+    expect(
+      screen.queryByRole("button", { name: "Arrêter le lot" }),
+    ).not.toBeInTheDocument();
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({
         queryKey: ["edition", EDITION_ID],
@@ -218,6 +225,55 @@ describe("ProductionConsole", () => {
       ),
     ).toHaveLength(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("arrête le lot exact et invalide le batch, l’édition et la revue", async () => {
+    const batch: BatchStatus = {
+      batch_id: "batch-stop",
+      edition_id: EDITION_ID,
+      status: "running",
+      phase: "initial",
+      next_dispatch_at: null,
+      items: 1,
+      completed: 0,
+      needs_review: 0,
+      failed: 0,
+      cancelled: 0,
+      item_details: [],
+      created_at: "2026-08-29T10:00:00Z",
+      started_at: "2026-08-29T10:00:00Z",
+      finished_at: null,
+    };
+    const { client, fetchMock } = renderConsole(batch);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Arrêter le lot" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([, init]) => init?.method === "POST"),
+      ).toBe(true),
+    );
+    const post = fetchMock.mock.calls.find(
+      ([, init]) => init?.method === "POST",
+    );
+    expect(post?.[0]).toBe(
+      `/api/editions/${EDITION_ID}/production/${batch.batch_id}/cancel`,
+    );
+    await waitFor(() => {
+      expect(invalidate).toHaveBeenCalledWith({
+        queryKey: ["batch", EDITION_ID],
+      });
+      expect(invalidate).toHaveBeenCalledWith({
+        queryKey: ["edition", EDITION_ID],
+      });
+      expect(invalidate).toHaveBeenCalledWith({
+        queryKey: ["edition-review", EDITION_ID],
+      });
+    });
   });
 
   it.each([

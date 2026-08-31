@@ -360,6 +360,8 @@ class SubjectProductionRun:
         self.version += 1
 
     def advance_stage(self, *, now: datetime | None = None) -> None:
+        if self.status is SubjectProductionStatus.CANCELLED:
+            raise ValueError("production_run_cancelled")
         successor = next_stage(self.current_stage)
         if successor is not None:
             self.current_stage = successor
@@ -370,6 +372,8 @@ class SubjectProductionRun:
         """READY implies assembly complete and QA passed."""
         if self.status is SubjectProductionStatus.READY:
             return
+        if self.status is SubjectProductionStatus.CANCELLED:
+            raise ValueError("production_run_cancelled")
         self.status = SubjectProductionStatus.READY
         self.finished_at = now or datetime.now(UTC)
         self.updated_at = self.finished_at
@@ -383,6 +387,8 @@ class SubjectProductionRun:
         details: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> None:
+        if self.status is SubjectProductionStatus.CANCELLED:
+            raise ValueError("production_run_cancelled")
         self.status = SubjectProductionStatus.NEEDS_REVIEW
         self.error_code = code[:64]
         self.error_message = " ".join(message.replace("\x00", "").split())[:500]
@@ -399,6 +405,8 @@ class SubjectProductionRun:
         details: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> None:
+        if self.status is SubjectProductionStatus.CANCELLED:
+            raise ValueError("production_run_cancelled")
         self.status = SubjectProductionStatus.FAILED
         self.error_code = code[:64]
         self.error_message = " ".join(message.replace("\x00", "").split())[:500]
@@ -408,6 +416,13 @@ class SubjectProductionRun:
         self.version += 1
 
     def mark_cancelled(self, *, now: datetime | None = None) -> None:
+        if self.status is SubjectProductionStatus.CANCELLED:
+            return
+        if self.status not in {
+            SubjectProductionStatus.QUEUED,
+            SubjectProductionStatus.RUNNING,
+        }:
+            raise ValueError("production_run_not_cancellable")
         self.status = SubjectProductionStatus.CANCELLED
         self.finished_at = now or datetime.now(UTC)
         self.updated_at = self.finished_at
@@ -425,6 +440,8 @@ class SubjectProductionRun:
         Unlike a worker retry, this invalidates the selected stage and its
         downstream outputs.  Callers must validate prerequisites first.
         """
+        if self.status is SubjectProductionStatus.CANCELLED:
+            raise ValueError("production_run_cancelled")
         if self.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
             raise ValueError("Cannot retry a queued or running production")
         self.status = SubjectProductionStatus.RUNNING
@@ -752,6 +769,8 @@ class EditionProductionBatch:
         self.version += 1
 
     def cancel(self, *, now: datetime | None = None) -> None:
+        if self.status is ProductionBatchStatus.CANCELLED:
+            return
         self.status = ProductionBatchStatus.CANCELLED
         self.next_dispatch_at = None
         self.finished_at = now or datetime.now(UTC)

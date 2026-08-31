@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from uuid import UUID
 
 from pydantic import ConfigDict, Field
@@ -12,6 +13,7 @@ from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.edition_workspace import EditionProductionCheckpointService
 from cti_app.application.jobs import (
     DuplicateJobError,
+    JobCancelledError,
     JobDispatcher,
     JobExecutionContext,
     JobHandlerError,
@@ -103,10 +105,13 @@ class ProductionStageChain:
         correlation_id: str,
         actor_id: str = "system",
         delay_ms: int | None = None,
+        before_dispatch: Callable[[], Awaitable[bool]] | None = None,
     ) -> UUID | None:
         """Worker attempts share a generation; manual retries get a new one."""
         if self._jobs is None or self._dispatcher is None:
             return None
+        if run.status is SubjectProductionStatus.CANCELLED:
+            raise JobCancelledError
         parameters = ProductionStageParameters(
             run_id=run.id,
             expected_stage=stage.value,
@@ -122,6 +127,11 @@ class ProductionStageChain:
             max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
             actor_id=actor_id,
         )
+        if before_dispatch is not None and not await before_dispatch():
+            cancel = getattr(self._jobs, "cancel", None)
+            if cancel is not None:
+                await cancel(job.id, actor_id=actor_id)
+            raise JobCancelledError
         await self._dispatcher.dispatch(
             job.id,
             delay_ms=(self._pacing.model_delay_ms(stage) if delay_ms is None else max(0, delay_ms)),
@@ -147,13 +157,29 @@ def register_production_jobs(
     stage_chain = chain or ProductionStageChain()
     production_pacing = pacing or stage_chain.pacing
 
-    async def advance_batch(run_id: UUID, correlation_id: str) -> None:
+    async def can_dispatch(run_id: UUID, context: JobExecutionContext) -> bool:
+        """Re-read the exact run immediately before creating/dispatching a job."""
+        await context.check_cancelled()
+        async with uow_factory() as uow:
+            run = await uow.subject_production_runs.get(run_id)
+        return run is not None and run.status is SubjectProductionStatus.RUNNING
+
+    async def advance_batch(
+        run_id: UUID,
+        correlation_id: str,
+        context: JobExecutionContext,
+    ) -> None:
         """Start the next subject of the batch this run belongs to.
 
         A subject that ends in needs_review or failed must not block the queue,
         so this runs on every terminal outcome, not only on success.
         """
         batches = EditionProductionService(uow_factory, production_pacing)
+        await context.check_cancelled()
+        async with uow_factory() as uow:
+            current = await uow.subject_production_runs.get(run_id)
+        if current is None or current.status is SubjectProductionStatus.CANCELLED:
+            return
         if checkpoint is not None:
             # The projection is deliberately outside the batch transaction and
             # is never allowed to change the terminal production outcome.
@@ -163,6 +189,7 @@ def register_production_jobs(
                 # The concrete service is best-effort too; this guard keeps
                 # alternate/test implementations from changing batch semantics.
                 pass
+        await context.check_cancelled()
         async with uow_factory() as uow:
             item = await uow.edition_production_batch_items.get_by_run(run_id)
             if item is None:
@@ -178,18 +205,24 @@ def register_production_jobs(
         )
         if started is None:
             return
+        await context.check_cancelled()
+        async with uow_factory() as uow:
+            latest = await uow.subject_production_runs.get(started.id)
+        if latest is None or latest.status is SubjectProductionStatus.CANCELLED:
+            return
         subject_delay_ms = await batches.next_dispatch_delay_ms(batch_id)
-        if started.current_stage in {
+        if latest.current_stage in {
             SubjectProductionStage.REFERENCES,
             SubjectProductionStage.SYNTHESIS,
         }:
-            subject_delay_ms += production_pacing.model_delay_ms(started.current_stage)
+            subject_delay_ms += production_pacing.model_delay_ms(latest.current_stage)
         try:
             await stage_chain.submit(
-                run=started,
-                stage=started.current_stage,
+                run=latest,
+                stage=latest.current_stage,
                 correlation_id=correlation_id,
                 delay_ms=subject_delay_ms,
+                before_dispatch=lambda: can_dispatch(started.id, context),
             )
         except DuplicateJobError:
             # A recovered worker may reach this hand-off after the original
@@ -205,24 +238,38 @@ def register_production_jobs(
             raise TypeError("Invalid production stage parameters")
 
         stage = SubjectProductionStage(parameters.expected_stage)
+        await context.check_cancelled()
         async with uow_factory() as uow:
             current = await uow.subject_production_runs.get(parameters.run_id)
         if current is None or current.pipeline_generation != parameters.pipeline_generation:
             return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
+        if current.status is SubjectProductionStatus.CANCELLED:
+            return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
         if current.current_stage is not stage:
             if (
                 current.status is SubjectProductionStatus.RUNNING
                 and current.current_stage in production_stages()
             ):
+                await context.check_cancelled()
+                async with uow_factory() as uow:
+                    current = await uow.subject_production_runs.get(parameters.run_id)
+                if current is None or current.status is SubjectProductionStatus.CANCELLED:
+                    return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
                 try:
                     await stage_chain.submit(
                         run=current,
                         stage=current.current_stage,
                         correlation_id=await context.correlation_id(),
+                        before_dispatch=lambda: can_dispatch(parameters.run_id, context),
                     )
                 except DuplicateJobError:
                     pass
             return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
+        await context.check_cancelled()
+        async with uow_factory() as uow:
+            current = await uow.subject_production_runs.get(parameters.run_id)
+        if current is None or current.status is SubjectProductionStatus.CANCELLED:
+            return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
         await EditionProductionService(uow_factory).clear_next_dispatch(parameters.run_id)
         orchestrator = ProductionWorkflowOrchestrator(
             uow_factory,
@@ -243,6 +290,8 @@ def register_production_jobs(
             correlation_id=correlation_id,
         )
 
+        await context.check_cancelled()
+
         stages = list(production_stages())
         stage_index = stages.index(stage)
         await context.report_progress(
@@ -259,6 +308,8 @@ def register_production_jobs(
                 public_message="Le run de production est introuvable.",
                 transient=False,
             )
+        if run.status is SubjectProductionStatus.CANCELLED:
+            return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
         outcome = str(result.get("status", "success"))
         error_code = str(result.get("error_code") or f"{stage.value}_error")
         error_message = str(result.get("error", "unknown error"))
@@ -268,6 +319,11 @@ def register_production_jobs(
         # A transient failure must stay retryable and must NOT end the run:
         # the batch keeps its slot and the job is retried.
         if outcome == "transient_error":
+            await context.check_cancelled()
+            async with uow_factory() as uow:
+                current = await uow.subject_production_runs.get(parameters.run_id)
+            if current is None or current.status is SubjectProductionStatus.CANCELLED:
+                return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
             # The generic job service exhausts retries only after the handler
             # returns. Finish the production aggregate here on its last
             # attempt so it cannot remain RUNNING behind a failed terminal job.
@@ -283,7 +339,7 @@ def register_production_jobs(
                         )
                         await uow.subject_production_runs.save(ending)
                         await uow.commit()
-                await advance_batch(parameters.run_id, correlation_id)
+                await advance_batch(parameters.run_id, correlation_id, context)
                 return f"production-stage://{parameters.run_id}/{stage.value}#needs_review"
             raise JobHandlerError(
                 code=error_code,
@@ -295,6 +351,7 @@ def register_production_jobs(
         # needs_review is a business outcome, not a crash: the subject stops
         # here for a human, and the batch moves on.
         if outcome in {"needs_review", "terminal_error", "error"}:
+            await context.check_cancelled()
             async with uow_factory() as uow:
                 ending = await uow.subject_production_runs.get_for_update(parameters.run_id)
                 if ending is not None and ending.status not in _TERMINAL_STATUSES:
@@ -308,7 +365,7 @@ def register_production_jobs(
                         )
                     await uow.subject_production_runs.save(ending)
                     await uow.commit()
-            await advance_batch(parameters.run_id, correlation_id)
+            await advance_batch(parameters.run_id, correlation_id, context)
             if outcome == "needs_review":
                 return f"production-stage://{parameters.run_id}/{stage.value}#needs_review"
             raise JobHandlerError(
@@ -320,9 +377,10 @@ def register_production_jobs(
         # Assembly is the last stage: it already marked the run ready or
         # needs_review, so the batch moves to the next subject.
         if stage is SubjectProductionStage.ASSEMBLY:
-            await advance_batch(parameters.run_id, correlation_id)
+            await advance_batch(parameters.run_id, correlation_id, context)
             return f"production-stage://{parameters.run_id}/{stage.value}"
 
+        await context.check_cancelled()
         async with uow_factory() as uow:
             advancing = await uow.subject_production_runs.get_for_update(parameters.run_id)
             if advancing is None or advancing.status is not SubjectProductionStatus.RUNNING:
@@ -332,10 +390,16 @@ def register_production_jobs(
             await uow.commit()
             next_stage = advancing.current_stage
 
+        await context.check_cancelled()
+        async with uow_factory() as uow:
+            latest = await uow.subject_production_runs.get(parameters.run_id)
+        if latest is None or latest.status is SubjectProductionStatus.CANCELLED:
+            return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
         job_id = await stage_chain.submit(
-            run=advancing,
+            run=latest,
             stage=next_stage,
             correlation_id=correlation_id,
+            before_dispatch=lambda: can_dispatch(parameters.run_id, context),
         )
         if job_id is None:
             raise JobHandlerError(

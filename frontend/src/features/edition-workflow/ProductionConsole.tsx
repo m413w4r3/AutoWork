@@ -1,8 +1,9 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 
 import {
   getEditionProduction,
+  cancelProductionBatch,
   type BatchItemDetail,
   type BatchStatus,
   type ProductionBatchPhase,
@@ -10,6 +11,7 @@ import {
   type SubjectProductionStatus,
 } from "../../api/production";
 import { Link } from "../../routing";
+import { productionBatchPollingInterval } from "./productionPolling";
 
 const STATUS_LABELS: Record<SubjectProductionStatus, string> = {
   queued: "En attente",
@@ -39,12 +41,6 @@ const TERMINAL_BATCH_STATUSES = new Set([
   "completed_with_issues",
   "cancelled",
 ]);
-
-export function productionBatchPollingInterval(
-  status: BatchStatus["status"] | undefined,
-): number | false {
-  return status === "queued" || status === "running" ? 2_000 : false;
-}
 
 function formatCountdown(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
@@ -167,6 +163,20 @@ export function ProductionConsole({ editionId }: { editionId: string }) {
       return productionBatchPollingInterval(status);
     },
   });
+  const cancel = useMutation({
+    mutationFn: () =>
+      batch.data
+        ? cancelProductionBatch(editionId, batch.data.batch_id)
+        : Promise.reject(new Error("Aucun lot de production actif.")),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["batch", editionId] });
+      void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
+      void queryClient.invalidateQueries({
+        queryKey: ["edition-review", editionId],
+      });
+    },
+  });
 
   useEffect(() => {
     if (
@@ -220,7 +230,25 @@ export function ProductionConsole({ editionId }: { editionId: string }) {
           <span>Phase courante</span>
           <strong>{PHASE_LABELS[currentBatch.phase]}</strong>
         </div>
+        {currentBatch.status === "queued" ||
+        currentBatch.status === "running" ? (
+          <button
+            className="button button--danger"
+            type="button"
+            disabled={cancel.isPending}
+            onClick={() => cancel.mutate()}
+          >
+            {cancel.isPending ? "Arrêt…" : "Arrêter le lot"}
+          </button>
+        ) : null}
       </div>
+      {cancel.error ? (
+        <p className="error-message" role="alert">
+          {cancel.error instanceof Error
+            ? cancel.error.message
+            : "Le lot n’a pas pu être arrêté."}
+        </p>
+      ) : null}
       {currentBatch.phase === "recovery" ? (
         <p className="production-recovery-note" role="status">
           Une récupération automatique est en cours. La production reprend son

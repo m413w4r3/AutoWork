@@ -89,6 +89,12 @@ export interface RetryProductionRunResponse {
   pipeline_generation: number;
 }
 
+export interface CancelProductionRunResponse {
+  action: "cancel";
+  run_id: string;
+  status: "cancelled";
+}
+
 interface ReviewDocumentIdentity {
   document_artifact_id: string;
   document_artifact_version: number;
@@ -189,6 +195,14 @@ export async function retryProductionRun(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ stage }),
+  });
+}
+
+export async function cancelProductionRun(
+  runId: string,
+): Promise<CancelProductionRunResponse> {
+  return request(`/api/production/runs/${runId}/cancel`, {
+    method: "POST",
   });
 }
 

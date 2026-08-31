@@ -7,6 +7,7 @@ subject — including when it failed, so one bad subject cannot block the queue.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -173,6 +174,7 @@ class _Orchestrator:
     def __init__(self, result: dict[str, Any]) -> None:
         self.result = result
         self.calls: list[SubjectProductionStage] = []
+        self.after_execute: Callable[[], None] | None = None
 
     async def execute_stage(
         self,
@@ -182,6 +184,8 @@ class _Orchestrator:
         correlation_id: str = "-",
     ) -> dict[str, Any]:
         self.calls.append(expected_stage)
+        if self.after_execute is not None:
+            self.after_execute()
         return self.result
 
 
@@ -255,6 +259,53 @@ async def test_successful_stage_queues_the_next_one(
     )
 
 
+async def test_cancelled_run_is_a_worker_fence(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, jobs, orchestrator = _build(
+        uow, monkeypatch, {"stage": "sources", "status": "success"}
+    )
+    run = _run(uow, SubjectProductionStage.SOURCES)
+    run.mark_cancelled()
+
+    result = await registry.handler(stage_job_kind(SubjectProductionStage.SOURCES))(
+        ProductionStageParameters(
+            run_id=run.id,
+            expected_stage=SubjectProductionStage.SOURCES.value,
+            pipeline_generation=run.pipeline_generation,
+        ),
+        _Context(),  # type: ignore[arg-type]
+    )
+
+    assert result.endswith("#cancelled")
+    assert orchestrator.calls == []
+    assert jobs.submitted == []
+
+
+async def test_inflight_result_never_advances_a_cancelled_run(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, jobs, orchestrator = _build(
+        uow, monkeypatch, {"stage": "sources", "status": "success"}
+    )
+    run = _run(uow, SubjectProductionStage.SOURCES)
+    orchestrator.after_execute = run.mark_cancelled
+
+    result = await registry.handler(stage_job_kind(SubjectProductionStage.SOURCES))(
+        ProductionStageParameters(
+            run_id=run.id,
+            expected_stage=SubjectProductionStage.SOURCES.value,
+            pipeline_generation=run.pipeline_generation,
+        ),
+        _Context(),  # type: ignore[arg-type]
+    )
+
+    assert result.endswith("#cancelled")
+    assert run.status is SubjectProductionStatus.CANCELLED
+    assert run.current_stage is SubjectProductionStage.SOURCES
+    assert jobs.submitted == []
+
+
 async def test_recovered_old_stage_job_resubmits_the_current_stage_without_failing_run(
     uow: _Uow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -313,6 +364,31 @@ async def test_assembly_stage_queues_no_further_stage(
         _Context(),  # type: ignore[arg-type]
     )
 
+    assert jobs.submitted == []
+
+
+async def test_cancelled_batch_never_starts_or_dispatches_the_next_subject(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, jobs, _ = _build(
+        uow, monkeypatch, {"stage": "assembly", "status": "success"}
+    )
+    first = _run(uow, SubjectProductionStage.ASSEMBLY)
+    first.mark_ready()
+    second = _batch_of(uow, first)
+    batch = next(iter(uow.edition_production_batches.items.values()))
+    batch.cancel()
+
+    await registry.handler(stage_job_kind(SubjectProductionStage.ASSEMBLY))(
+        ProductionStageParameters(
+            run_id=first.id,
+            expected_stage=SubjectProductionStage.ASSEMBLY.value,
+            pipeline_generation=first.pipeline_generation,
+        ),
+        _Context(),  # type: ignore[arg-type]
+    )
+
+    assert second.status is SubjectProductionStatus.CANCELLED
     assert jobs.submitted == []
 
 
