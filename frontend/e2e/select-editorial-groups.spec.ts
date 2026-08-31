@@ -1,4 +1,14 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+
+async function expectNoHorizontalOverflow(page: Page) {
+  await expect
+    .poll(() =>
+      page.evaluate<boolean>(
+        "document.documentElement.scrollWidth <= window.innerWidth",
+      ),
+    )
+    .toBe(true);
+}
 
 test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent responsives", async ({
   page,
@@ -23,8 +33,13 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
     created_at: "2026-08-08T00:00:00Z",
     updated_at: "2026-08-10T00:00:00Z",
   };
+  const hostileTitle = "Cyber Isnaad Front " + "T".repeat(160);
+  const hostilePublisher = "Publisher-" + "P".repeat(120);
+  const hostileUrl = `https://vendor.example/report-${"u".repeat(160)}`;
+  const hostileIoc = "ioc-" + "x".repeat(160) + ".example";
+  const hostileJustification = "Bloc S1 — " + "J".repeat(160);
   const titles = [
-    "Cyber Isnaad Front",
+    hostileTitle,
     "Nimbus Manticore / UNC1549",
     "MuddyWater reconnaissance/OWA",
     "Seedworm / MuddyWater",
@@ -76,8 +91,11 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
         publications: [
           {
             title: `Rapport ${title}`,
-            url: `https://vendor.example/report-${index + 1}`,
-            publisher: "Vendor Research",
+            url:
+              index === 0
+                ? hostileUrl
+                : `https://vendor.example/report-${index + 1}`,
+            publisher: index === 0 ? hostilePublisher : "Vendor Research",
             role: "primary",
             published_at: "2026-08-05",
           },
@@ -88,8 +106,9 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
         provisional_ioc_type_counts: { domain: 1 },
         provisional_iocs: [
           {
-            raw_value: `ioc-${index + 1}.example`,
-            normalized_value: `ioc-${index + 1}.example`,
+            raw_value: index === 0 ? hostileIoc : `ioc-${index + 1}.example`,
+            normalized_value:
+              index === 0 ? hostileIoc : `ioc-${index + 1}.example`,
             proposed_type: "domain",
             declared_type: "domain",
             warnings: [],
@@ -111,7 +130,8 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
         needs_source_verification: true,
         needs_source_expansion: true,
         grouping_confidence: "high",
-        grouping_justification: `Bloc ChatGPT S${index + 1}`,
+        grouping_justification:
+          index === 0 ? hostileJustification : `Bloc ChatGPT S${index + 1}`,
         historical_comparison: null,
         version: decision ? 2 : 1,
       };
@@ -160,13 +180,7 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
 
   await page.goto(`/editions/${editionId}`);
   await expect(page.locator(".editorial-group-card")).toHaveCount(5);
-  await expect
-    .poll(() =>
-      page.evaluate<boolean>(
-        "document.documentElement.scrollWidth <= window.innerWidth",
-      ),
-    )
-    .toBe(true);
+  await expectNoHorizontalOverflow(page);
 
   const cards = page.locator(".editorial-group-card");
   await cards.nth(0).getByRole("radio", { name: "Article" }).check();
@@ -192,4 +206,5 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
       .locator(".ready-subject-list")
       .getByRole("link", { name: "Ouvrir le sujet" }),
   ).toHaveCount(2);
+  await expectNoHorizontalOverflow(page);
 });

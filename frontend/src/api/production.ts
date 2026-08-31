@@ -310,14 +310,6 @@ export async function invalidateProductionReuse(
   });
 }
 
-export async function cancelSubjectProduction(
-  subjectId: string,
-): Promise<{ status: string }> {
-  return request(`/api/subjects/${subjectId}/production/cancel`, {
-    method: "POST",
-  });
-}
-
 export async function cancelProductionBatch(
   editionId: string,
   batchId: string,

@@ -70,6 +70,13 @@ class Extension:
         self.mode = "silent"
         self.task: asyncio.Task[None] | None = None
 
+    @staticmethod
+    def route(message: dict[str, Any]) -> dict[str, Any]:
+        browser_target = message.get("browser_target")
+        if not isinstance(browser_target, dict) or not browser_target.get("id"):
+            return {}
+        return {"target_id": browser_target["id"], "tab_id": 1}
+
     async def serve(self) -> None:
         async for raw in self.socket:
             message = json.loads(raw)
@@ -84,13 +91,16 @@ class Extension:
                             "id": message["id"],
                             "applied": {},
                             "state": {"model": {}, "profile": {}, "web_search": {}},
+                            **self.route(message),
                         }
                     )
                 )
             elif kind == "prompt" and self.mode != "silent":
-                self.task = asyncio.create_task(self.generate(message["id"]))
+                self.task = asyncio.create_task(
+                    self.generate(message["id"], self.route(message))
+                )
 
-    async def generate(self, request_id: str) -> None:
+    async def generate(self, request_id: str, route: dict[str, Any]) -> None:
         elapsed = 0.0
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -111,6 +121,7 @@ class Extension:
                                 "visible_citation_count": 0,
                                 "content_script_version": "soak",
                             },
+                            **route,
                         }
                     )
                 )
@@ -129,6 +140,7 @@ class Extension:
                             "completion_signal": "streaming",
                             "completion_confidence": "high",
                         },
+                        **route,
                     }
                 )
             )

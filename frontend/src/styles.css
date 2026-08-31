@@ -246,6 +246,8 @@ a:focus-visible {
 
 .editorial-board {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
   gap: 1rem;
   margin-top: 2rem;
   padding: 1.25rem;
@@ -272,6 +274,7 @@ a:focus-visible {
 
 .editorial-group-list {
   display: grid;
+  min-width: 0;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
   gap: 1rem;
   align-items: start;
@@ -279,6 +282,8 @@ a:focus-visible {
 
 .editorial-group-card {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
   gap: 0.8rem;
   padding: 1.1rem;
   border: 1px solid #d4ded7;
@@ -291,8 +296,16 @@ a:focus-visible {
   margin: 0;
 }
 
+.editorial-group-card h4,
+.editorial-group-card p,
+.group-facts dd {
+  overflow-wrap: anywhere;
+}
+
 .group-facts {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
   gap: 0.6rem;
   margin: 0;
 }
@@ -328,7 +341,6 @@ a:focus-visible {
   padding: 0.8rem;
   border-left: 4px solid #c47a00;
   background: #fffaf0;
-  overflow: hidden;
 }
 
 .provisional-ioc-summary code {
@@ -338,6 +350,7 @@ a:focus-visible {
 
 .decision-options {
   display: grid;
+  min-width: 0;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.55rem;
   margin: 0;
@@ -385,6 +398,7 @@ a:focus-visible {
 
 .ready-subject-list {
   display: grid;
+  min-width: 0;
   gap: 0.7rem;
   padding: 0;
   list-style: none;
@@ -392,6 +406,7 @@ a:focus-visible {
 
 .ready-subject-list li {
   display: flex;
+  min-width: 0;
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
@@ -402,7 +417,12 @@ a:focus-visible {
 
 .ready-subject-list div {
   display: grid;
+  min-width: 0;
   gap: 0.2rem;
+}
+
+.ready-subject-list strong {
+  overflow-wrap: anywhere;
 }
 
 .advanced-editorial-panel > summary,
@@ -414,6 +434,7 @@ a:focus-visible {
 
 .advanced-group-list {
   display: grid;
+  min-width: 0;
   gap: 0.8rem;
   margin-top: 1rem;
 }
@@ -423,6 +444,18 @@ a:focus-visible {
   padding: 1rem;
   border: 1px solid #d4ded7;
   border-radius: 0.75rem;
+}
+
+.advanced-group-card {
+  min-width: 0;
+}
+
+.advanced-group-card h4,
+.advanced-group-card p,
+.group-check,
+.group-candidates label {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .technical-discovery-details[open],
@@ -451,6 +484,7 @@ a:focus-visible {
 
 .score-details,
 .group-candidates {
+  min-width: 0;
   margin: 1rem 0;
   padding: 0.8rem;
   border: 1px solid #d4ded7;
@@ -1358,6 +1392,7 @@ h1 {
 
 .production-batch-selector {
   display: grid;
+  min-width: 0;
   gap: 0.8rem;
   padding: 1.5rem;
   border: 1px solid #d4ded7;
@@ -1384,6 +1419,7 @@ h1 {
 
 .production-batch-selector__list {
   display: grid;
+  min-width: 0;
   gap: 0.4rem;
   margin: 0;
   padding: 0;
@@ -1392,6 +1428,7 @@ h1 {
 
 .production-batch-selector__list li {
   display: flex;
+  min-width: 0;
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
@@ -1406,6 +1443,7 @@ h1 {
   align-items: center;
   gap: 0.6rem;
   cursor: pointer;
+  overflow-wrap: anywhere;
 }
 
 .production-batch-selector__choice input[type="checkbox"] {

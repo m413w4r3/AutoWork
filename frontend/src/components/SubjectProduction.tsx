@@ -2,10 +2,10 @@ import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   getSubjectProduction,
   retryProductionStage,
-  cancelSubjectProduction,
   startSubjectProduction,
   shouldPollProduction,
 } from "../api/production";
+import { cancelProductionRun } from "../api/publication";
 import type { StageStatus } from "../api/production";
 import { ProductionStageCard } from "./ProductionStageCard";
 import { ProductionStateTransfer } from "./ProductionStateTransfer";
@@ -127,7 +127,7 @@ export function SubjectProduction({
   });
 
   const cancelMutation = useMutation({
-    mutationFn: () => cancelSubjectProduction(subjectId),
+    mutationFn: (runId: string) => cancelProductionRun(runId),
     onSuccess: () => {
       void refetch();
       setTimeout(() => onClose?.(), 1000);
@@ -380,7 +380,7 @@ export function SubjectProduction({
         {status.status === "running" && (
           <button
             className="button button--danger"
-            onClick={() => cancelMutation.mutate()}
+            onClick={() => cancelMutation.mutate(status.run_id)}
             disabled={cancelMutation.isPending}
           >
             {cancelMutation.isPending ? "Annulation…" : "Annuler"}

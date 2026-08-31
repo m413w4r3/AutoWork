@@ -153,6 +153,31 @@ describe("SubjectProduction retry from stage", () => {
     ).toBeNull();
   });
 
+  it("RUNNING annule la tentative exacte exposée par le statut", async () => {
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+      init?.method === "POST"
+        ? Promise.resolve(
+            Response.json({
+              action: "cancel",
+              run_id: "r-1",
+              status: "cancelled",
+            }),
+          )
+        : Promise.resolve(Response.json(status("running"))),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderProduction();
+    await screen.findByText("TAG-182 et MarkiRAT");
+    await user.click(screen.getByRole("button", { name: "Annuler" }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/production/runs/r-1/cancel",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+  });
+
   it("après une relance refetch le nouveau run et reprend le polling", async () => {
     let reads = 0;
     const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
