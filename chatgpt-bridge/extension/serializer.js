@@ -2,7 +2,7 @@
 (() => {
   "use strict";
 
-  const SERIALIZER_VERSION = "chatgpt-dom-v2";
+  const SERIALIZER_VERSION = "chatgpt-dom-v3";
   const BLOCK_TAGS = new Set([
     "P",
     "DIV",
@@ -93,16 +93,52 @@
   function serializeResponse(root, openPre = null) {
     const citationsByUrl = new Map();
 
+    function prose(text) {
+      return text ? [{ kind: "prose", text }] : [];
+    }
+
+    function protectedRegion(text) {
+      return text ? [{ kind: "protected", text }] : [];
+    }
+
+    function appendSegments(target, segments) {
+      for (const segment of segments) {
+        if (!segment.text) continue;
+        const previous = target[target.length - 1];
+        if (previous && previous.kind === segment.kind) {
+          previous.text += segment.text;
+        } else {
+          target.push({ ...segment });
+        }
+      }
+      return target;
+    }
+
+    function containsProtected(segments) {
+      return segments.some((segment) => segment.kind === "protected");
+    }
+
+    function segmentText(segments) {
+      return segments.map((segment) => segment.text).join("");
+    }
+
+    function surround(prefix, segments, suffix) {
+      const output = prose(prefix);
+      appendSegments(output, segments);
+      appendSegments(output, prose(suffix));
+      return output;
+    }
+
     function visit(node) {
-      if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || "";
-      if (node.nodeType !== Node.ELEMENT_NODE) return "";
+      if (node.nodeType === Node.TEXT_NODE) return prose(node.nodeValue || "");
+      if (node.nodeType !== Node.ELEMENT_NODE) return [];
       const tag = node.tagName;
       if (isCitationControl(node)) {
         const citation = citationFrom(node);
         if (citation && !citationsByUrl.has(citation.canonical_url)) {
           citationsByUrl.set(citation.canonical_url, citation);
         }
-        return "";
+        return [];
       }
       if (
         tag === "BUTTON" ||
@@ -110,35 +146,68 @@
         node.classList.contains("sr-only") ||
         node.hasAttribute("aria-live")
       ) {
-        return "";
+        return [];
       }
-      if (tag === "BR") return "\n";
+      if (tag === "BR") return prose("\n");
       if (tag === "PRE") {
         const code = node.querySelector("code");
-        const raw = (code ? code.textContent : node.textContent).replace(/\n+$/, "");
+        const raw = String(code ? code.textContent || "" : node.textContent || "");
         const language = codeLanguage(node, code);
-        if (node === openPre) return language ? `\n\`\`\`${language}\n${raw}` : "";
-        return `\n\`\`\`${language}\n${raw}\n\`\`\`\n`;
+        if (node === openPre) {
+          return language
+            ? surround(`\n`, protectedRegion(`\`\`\`${language}\n${raw}`), "")
+            : [];
+        }
+        // The newline after the body is structural: keeping it separate from
+        // the protected region makes a final newline in textContent
+        // distinguishable from a code block without one.
+        return surround(
+          "\n",
+          protectedRegion(`\`\`\`${language}\n${raw}\n\`\`\``),
+          "\n",
+        );
       }
 
-      let output = "";
-      for (const child of node.childNodes) output += visit(child);
+      const output = [];
+      for (const child of node.childNodes) appendSegments(output, visit(child));
       if (tag === "A") {
         const rawUrl = node.getAttribute("href") || "";
         const destination = canonicalizeHttpsUrl(rawUrl);
-        return destination && output.trim() ? `[${output.trim()}](${rawUrl})` : output;
+        return destination && !containsProtected(output) && segmentText(output).trim()
+          ? prose(`[${segmentText(output).trim()}](${rawUrl})`)
+          : output;
       }
-      if (tag === "CODE") return `\`${output}\``;
-      if (tag === "LI") return `\n- ${output.trim()}`;
-      if (tag === "TD" || tag === "TH") return `${output} | `;
-      if (BLOCK_TAGS.has(tag)) return `\n${output}\n`;
+      if (tag === "CODE") {
+        return containsProtected(output)
+          ? output
+          : prose(`\`${segmentText(output)}\``);
+      }
+      if (tag === "LI") {
+        return containsProtected(output)
+          ? surround("\n- ", output, "")
+          : prose(`\n- ${segmentText(output).trim()}`);
+      }
+      if (tag === "TD" || tag === "TH") return surround("", output, " | ");
+      if (/^H[1-6]$/.test(tag)) {
+        return surround(`\n${"#".repeat(Number(tag[1]))} `, output, "\n");
+      }
+      if (BLOCK_TAGS.has(tag)) return surround("\n", output, "\n");
       return output;
     }
 
-    const text = visit(root)
-      .replace(/[ \t]+$/gm, "")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
+    const segments = visit(root);
+    for (const segment of segments) {
+      if (segment.kind === "prose") {
+        segment.text = segment.text
+          .replace(/[ \t]+$/gm, "")
+          .replace(/\n{3,}/g, "\n\n");
+      }
+    }
+    const firstProse = segments.find((segment) => segment.kind === "prose");
+    const lastProse = [...segments].reverse().find((segment) => segment.kind === "prose");
+    if (firstProse) firstProse.text = firstProse.text.trimStart();
+    if (lastProse) lastProse.text = lastProse.text.trimEnd();
+    const text = segments.map((segment) => segment.text).join("");
     return {
       text,
       visible_citations: [...citationsByUrl.values()],

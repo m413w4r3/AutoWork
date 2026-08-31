@@ -59,7 +59,7 @@ describe("ChatGPT DOM serializer", () => {
         position: null,
       },
     ]);
-    expect(result.serializer_version).toBe("chatgpt-dom-v2");
+    expect(result.serializer_version).toBe("chatgpt-dom-v3");
   });
 
   it("keeps ordinary HTTPS links and rejects unsafe citation destinations", () => {

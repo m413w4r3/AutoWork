@@ -130,6 +130,119 @@ function page({
 
 const WATCHED = `document.querySelector("[data-testid='conversation-turn-3'] [data-message-author-role='assistant']")`;
 
+function serializeMarkup(body) {
+  const { run } = loadExtension(body);
+  return run(
+    `ChatGPTBridgeSerializer.serializeResponse(document.querySelector("#serialize-root"))`,
+  );
+}
+
+function serializeCode(raw, className = "") {
+  const classAttribute = className ? ` class="${className}"` : "";
+  const { run } = loadExtension(
+    `<div id="serialize-root"><pre><code${classAttribute}></code></pre></div>`,
+  );
+  run(
+    `document.querySelector("#serialize-root code").textContent = ${JSON.stringify(raw)}`,
+  );
+  return run(
+    `ChatGPTBridgeSerializer.serializeResponse(document.querySelector("#serialize-root"))`,
+  );
+}
+
+function recoverFencedCode(markdown) {
+  const openingLineEnd = markdown.indexOf("\n");
+  const closingFence = "\n```";
+  assert.ok(openingLineEnd >= 0, "le code doit avoir une ligne d'ouverture");
+  assert.ok(markdown.endsWith(closingFence), "le code doit avoir une fence fermante");
+  return markdown.slice(openingLineEnd + 1, -closingFence.length);
+}
+
+// --- Fidélité du serializer Markdown ------------------------------------- //
+{
+  const serialized = serializeMarkup(`
+    <div id="serialize-root">
+      <h1>Premier</h1>
+      <h2>Deuxième</h2>
+      <h3>Troisième</h3>
+      <h6>Sixième</h6>
+    </div>`);
+  assert.equal(
+    serialized.text,
+    "# Premier\n\n## Deuxième\n\n### Troisième\n\n###### Sixième",
+  );
+  assert.equal(serialized.serializer_version, "chatgpt-dom-v3");
+}
+
+{
+  const serialized = serializeMarkup(`
+    <div id="serialize-root">
+      <h2>Liste</h2>
+      <ul><li>un</li><li>deux</li></ul>
+    </div>`);
+  assert.equal(serialized.text, "## Liste\n\n- un\n- deux");
+}
+
+{
+  const raw = "  const answer = 42;  \n    return answer;";
+  const { run } = loadExtension(
+    `<div id="serialize-root"><h2>Exemple</h2><pre><code class="language-js"></code></pre></div>`,
+  );
+  run(`document.querySelector("#serialize-root code").textContent = ${JSON.stringify(raw)}`);
+  const serialized = run(
+    `ChatGPTBridgeSerializer.serializeResponse(document.querySelector("#serialize-root"))`,
+  );
+  assert.equal(
+    serialized.text,
+    `## Exemple\n\n\`\`\`js\n${raw}\n\`\`\``,
+  );
+  assert.equal(recoverFencedCode(serialized.text.split("\n\n")[1]), raw);
+}
+
+{
+  const raw = `  trailing spaces  \n\n\n\n  backslashes C:\\tmp\\file  \nhxxps\\://example.test/path  \n`;
+  const serialized = serializeCode(raw);
+  assert.equal(recoverFencedCode(serialized.text), raw);
+  assert.equal(serialized.text, `\`\`\`\n${raw}\n\`\`\``);
+}
+
+{
+  const withoutFinalNewline = serializeCode("ligne");
+  const withFinalNewline = serializeCode("ligne\n");
+  assert.equal(withoutFinalNewline.text, "\`\`\`\nligne\n\`\`\`");
+  assert.equal(withFinalNewline.text, "\`\`\`\nligne\n\n\`\`\`");
+  assert.equal(recoverFencedCode(withoutFinalNewline.text), "ligne");
+  assert.equal(recoverFencedCode(withFinalNewline.text), "ligne\n");
+}
+
+{
+  const serialized = serializeMarkup(
+    `<div id="serialize-root">prose   \n\n\nprose hxxps\\://example.test</div>`,
+  );
+  assert.equal(serialized.text, "prose\n\nprose hxxps\\://example.test");
+}
+
+{
+  const serialized = serializeMarkup(`
+    <div id="serialize-root">
+      <p>Voir <a href="https://example.test/page?utm_source=chatgpt&amp;b=2">la page</a>
+        <sup data-testid="citation"><a href="https://example.test/source">[1]</a></sup>
+      </p>
+    </div>`);
+  assert.equal(
+    serialized.text,
+    "Voir [la page](https://example.test/page?utm_source=chatgpt&b=2)",
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(serialized.visible_citations)), [
+    {
+      label: "[1]",
+      url: "https://example.test/source",
+      canonical_url: "https://example.test/source",
+      position: null,
+    },
+  ]);
+}
+
 // --- Périmètre du streaming : le tour surveillé, pas la page entière -------- //
 {
   const { state } = loadExtension(
