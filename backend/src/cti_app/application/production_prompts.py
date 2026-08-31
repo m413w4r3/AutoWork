@@ -11,8 +11,8 @@ REFERENCES_PROMPT_VERSION = "4"
 # actually guarantee response_format / JSON Schema) onto free-text GPT plus a
 # permissive Markdown parser (P23.7). EXTRACTION_PROMPT_VERSION now names that
 # Markdown dialect.
-EXTRACTION_PROMPT_VERSION = "8"
-IOC_RULES_PROMPT_VERSION = "1"
+EXTRACTION_PROMPT_VERSION = "9"
+IOC_RULES_PROMPT_VERSION = "2"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -119,12 +119,21 @@ and do not invent an extraction.
 
 Perform an exhaustive IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/
 SHA512 and email addresses, including tables, appendices, images and code.
-Also extract useful malware, tools, files, CVEs, rules, TTPs, infrastructure,
+Also extract useful malware, tools, files, CVEs, detection rules, TTPs, infrastructure,
 victims and campaign context. Never reconstruct hidden values or emit masked,
 truncated, REDACTED, FUZZ, example or placeholder values.
 
+Extract the complete literal detection rule when it is visibly published by the
+exact source or its explicitly linked technical annex/repository already admitted
+to the source corpus. For every YARA, Sigma, Suricata or Snort rule:
+- preserve the complete literal body, syntax and line breaks;
+- do not reconstruct truncated content or invent missing variables;
+- never merge two rules or transform one rule language into another;
+- preserve the visible rule name;
+- report partial/truncated rules in UNCERTAINTIES instead of promoting them as complete.
+
 **Output format** — plain Markdown, no code fence, no JSON. Repeat as many
-`# FACT` / `# ARTIFACT` blocks as needed, in any order:
+`# FACT` / `# RULE` / `# ARTIFACT` blocks as needed, in any order:
 
 # FACT
 
@@ -134,9 +143,20 @@ context: <short French context>
 evidence: <human-audit evidence from this source>
 attack-id: <T1234 optional, only if literally quoted>
 
+# RULE
+
+rule-type: yara|sigma|suricata|snort
+name: <visible rule name, or omit if none>
+context: <short French context>
+evidence: <human-audit evidence from this source>
+
+```yara
+<complete literal rule body, preserving every line>
+```
+
 # ARTIFACT
 
-artifact-type: domain|ip|url|email|md5|sha1|sha256|sha512|filename|filepath|cve|yara_rule|sigma_rule|suricata_rule
+artifact-type: domain|ip|url|email|md5|sha1|sha256|sha512|filename|filepath|cve
 value: <exact literal>
 indicator-status: confirmed_ioc|contextual|excluded|not_applicable
 context: <short French context>
@@ -154,8 +174,8 @@ Rules:
   irrelevant content.
 - For a hash, artifact-type is the concrete algorithm (md5/sha1/sha256/sha512),
   never the bare word "hash".
-- For YARA/Sigma/Suricata, value is the rule name/identifier, never the full
-  rule body.
+- Put complete detection rules in dedicated RULE blocks. Do not put rule bodies
+  in ARTIFACT values.
 - Do not emit source_document_id, source_ids, model_run_id,
   references, or any other internal identifier; the system assigns provenance
   and verifies your proposals afterwards.
@@ -176,6 +196,15 @@ the source with unrelated search results or use memory as evidence. If the exact
 source cannot be accessed, report `source_unavailable` in UNCERTAINTIES and do not
 invent an extraction.
 
+Extract the complete literal detection rule when it is visibly published by the
+exact source or its explicitly linked technical annex/repository already admitted
+to the source corpus. For every YARA, Sigma, Suricata or Snort rule:
+- preserve the complete literal body, syntax and line breaks;
+- do not reconstruct truncated content or invent missing variables;
+- never merge two rules or transform one rule language into another;
+- preserve the visible rule name;
+- report partial/truncated rules in UNCERTAINTIES instead of promoting them as complete.
+
 Extract only:
 - every IOC/artifact and detection rule supported by the source;
 - files explicitly presented as indicators;
@@ -184,15 +213,26 @@ Extract only:
 
 Do not extract infection_chain, narrative TTPs, victimology, chronology, campaign
 narrative, tooling narrative, or general historical context. Do not emit internal
-identifiers. For YARA/Sigma/Suricata, value is the rule name or identifier, never the
-full rule body.
+identifiers. Put complete detection rules in dedicated RULE blocks, never in
+ARTIFACT values.
 
 **Output format** — plain Markdown, no code fence, no JSON. Repeat as many
-`# ARTIFACT` blocks as needed, in any order:
+`# RULE` / `# ARTIFACT` blocks as needed, in any order:
+
+# RULE
+
+rule-type: yara|sigma|suricata|snort
+name: <visible rule name, or omit if none>
+context: <short French context>
+evidence: <human-audit evidence from this source>
+
+```text
+<complete literal rule body, preserving every line>
+```
 
 # ARTIFACT
 
-artifact-type: domain|ip|url|email|md5|sha1|sha256|sha512|filename|filepath|cve|yara_rule|sigma_rule|suricata_rule
+artifact-type: domain|ip|url|email|md5|sha1|sha256|sha512|filename|filepath|cve
 value: <exact literal>
 indicator-status: confirmed_ioc|contextual|excluded|not_applicable
 context: <short French context>

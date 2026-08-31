@@ -88,6 +88,12 @@ def collect_indicators(extraction: TechnicalExtraction) -> list[ExtractionItem]:
             if isinstance(item.artifact_type, ArtifactType)
             else ArtifactType(item.artifact_type)
         )
+        if artifact_type in {
+            ArtifactType.YARA_RULE,
+            ArtifactType.SIGMA_RULE,
+            ArtifactType.SURICATA_RULE,
+        }:
+            continue
         try:
             key = (artifact_type.value, canonical_indicator_key(item.value, artifact_type))
         except ValueError:

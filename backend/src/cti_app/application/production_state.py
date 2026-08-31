@@ -280,14 +280,15 @@ def _snapshot_metadata(
 def _portable_extraction_content(content: dict[str, Any]) -> dict[str, Any]:
     """Keep canonical extraction data, excluding model-run provenance."""
     portable = dict(content)
-    items = portable.get("items")
-    if isinstance(items, list):
-        portable["items"] = [
-            {key: value for key, value in item.items() if key != "model_run_ids"}
-            if isinstance(item, dict)
-            else item
-            for item in items
-        ]
+    for collection_name in ("items", "rules"):
+        collection = portable.get(collection_name)
+        if isinstance(collection, list):
+            portable[collection_name] = [
+                {key: value for key, value in item.items() if key != "model_run_ids"}
+                if isinstance(item, dict)
+                else item
+                for item in collection
+            ]
     return portable
 
 

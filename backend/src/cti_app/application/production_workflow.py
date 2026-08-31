@@ -1649,6 +1649,7 @@ class ProductionWorkflowOrchestrator:
                     answer_chars=len(raw),
                     facts_count=len(parsed.value.facts),
                     artifacts_count=len(parsed.value.artifacts),
+                    rules_count=len(parsed.value.rules),
                     duration_ms=int((time.monotonic() - started_at) * 1000),
                 )
             except JobCancelledError:
@@ -1825,6 +1826,7 @@ class ProductionWorkflowOrchestrator:
             "status": "success",
             "artifact_id": str(artifact.id),
             "items_count": len(extraction.items),
+            "rules_count": len(extraction.rules),
             "supported_items": len(extraction.supported_items()),
             "status_totals": status_totals,
             "completed_source_ids": completed,

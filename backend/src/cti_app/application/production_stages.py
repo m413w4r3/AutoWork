@@ -458,10 +458,17 @@ class ProductionQAService:
                     set(item.reference_ids) <= known_events
                     and set(item.source_ids) <= known_sources
                     for item in extraction.supported_items()
+                )
+                and all(
+                    set(rule.source_ids) <= known_sources
+                    for rule in extraction.rules
+                    if rule.supported
                 ),
                 "Un élément d'extraction cite une référence inconnue",
             )
-            if not extraction.supported_items():
+            if not extraction.supported_items() and not any(
+                rule.supported for rule in extraction.rules
+            ):
                 warnings.append("Aucun élément d'extraction n'est étayé")
 
         if synthesis_text:

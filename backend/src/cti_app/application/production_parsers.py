@@ -12,6 +12,7 @@ reference the report does not define.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -27,10 +28,10 @@ from cti_app.application.production_normalization import (
     normalize_indicator_value,
 )
 from cti_app.domain.discovery import SourceRole
-from cti_app.domain.production import ExtractionProfile
+from cti_app.domain.production import DetectionRule, DetectionRuleType, ExtractionProfile
 from cti_app.domain.publication import ArtifactType
 
-PARSER_VERSION = "production-markdown-v2"
+PARSER_VERSION = "production-markdown-v3"
 
 # Whitespace a chat model routinely emits and that would break field parsing.
 _NBSP = "\u00a0"
@@ -52,6 +53,7 @@ class ParseResult[T]:
     repair_actions: list[str] = field(default_factory=list)
     dropped_blocks: list[str] = field(default_factory=list)
     violations: list[SynthesisViolation] = field(default_factory=list)
+    uncertainties: list[str] = field(default_factory=list)
 
     @property
     def usable(self) -> bool:
@@ -152,6 +154,7 @@ class ExtractionItem:
 class TechnicalExtraction:
     items: tuple[ExtractionItem, ...]
     uncertainties: tuple[str, ...] = ()
+    rules: tuple[DetectionRule, ...] = ()
 
     def supported_items(self) -> tuple[ExtractionItem, ...]:
         return tuple(item for item in self.items if item.supported)
@@ -201,11 +204,25 @@ class Q2ArtifactProposal(BaseModel):
         "filename",
         "filepath",
         "cve",
-        "yara_rule",
-        "sigma_rule",
-        "suricata_rule",
     ]
     indicator_status: Literal["confirmed_ioc", "contextual", "excluded", "not_applicable"]
+    context: str = Field(min_length=1, max_length=4000)
+    evidence_quote: str = Field(min_length=1, max_length=8000)
+
+
+class Q2RuleProposal(BaseModel):
+    """One complete, literal detection rule proposed by Q2.
+
+    Rule bodies are deliberately separate from IOC/artifact values. The model
+    supplies no internal provenance identifiers; orchestration attaches those
+    after deterministic verification.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule_type: DetectionRuleType
+    name: str | None = Field(default=None, max_length=4000)
+    body: str = Field(min_length=1, max_length=131072)
     context: str = Field(min_length=1, max_length=4000)
     evidence_quote: str = Field(min_length=1, max_length=8000)
 
@@ -217,16 +234,17 @@ class Q2SourceOutput(BaseModel):
 
     facts: list[Q2FactProposal] = Field(default_factory=list)
     artifacts: list[Q2ArtifactProposal] = Field(default_factory=list)
+    rules: list[Q2RuleProposal] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
 
 
 # Bump whenever Q2SourceOutput contract changes. Checkpoints validate against it.
-Q2_SCHEMA_VERSION = "1"
-Q2_EXTRACTION_CONTRACT_VERSION = "q2-source-extraction-v1"
+Q2_SCHEMA_VERSION = "2"
+Q2_EXTRACTION_CONTRACT_VERSION = "q2-source-extraction-v2"
 
 # Bump whenever the Q2 Markdown dialect or its lexing rules change. Participates
 # in the Q2 checkpoint identity so a parser change forces a fresh model call.
-Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v1"
+Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v2"
 
 
 def q2_source_output_to_json(output: Q2SourceOutput) -> dict[str, Any]:
@@ -236,6 +254,7 @@ def q2_source_output_to_json(output: Q2SourceOutput) -> dict[str, Any]:
         "schema_version": Q2_SCHEMA_VERSION,
         "facts": [fact.model_dump(mode="json") for fact in output.facts],
         "artifacts": [artifact.model_dump(mode="json") for artifact in output.artifacts],
+        "rules": [rule.model_dump(mode="json") for rule in output.rules],
         "uncertainties": list(output.uncertainties),
     }
 
@@ -250,6 +269,7 @@ def q2_source_output_from_json(payload: dict[str, Any]) -> Q2SourceOutput:
         {
             "facts": payload.get("facts", []),
             "artifacts": payload.get("artifacts", []),
+            "rules": payload.get("rules", []),
             "uncertainties": payload.get("uncertainties", []),
         }
     )
@@ -267,6 +287,7 @@ def project_q2_source_output(output: Q2SourceOutput, profile: ExtractionProfile)
         # than an ARTIFACT block for that narrow light-profile scope.
         facts=[fact for fact in output.facts if fact.category in {"files", "detections"}],
         artifacts=list(output.artifacts),
+        rules=list(output.rules),
         uncertainties=list(output.uncertainties),
     )
 
@@ -274,6 +295,8 @@ def project_q2_source_output(output: Q2SourceOutput, profile: ExtractionProfile)
 # --- Shared lexing ---------------------------------------------------------
 
 _FENCE = re.compile(r"^\s*```[^\n]*\n(?P<body>.*?)\n\s*```\s*$", re.DOTALL)
+_FENCE_OPEN = re.compile(r"^\s*```(?P<language>[A-Za-z0-9_-]*)\s*$")
+_FENCE_CLOSE = re.compile(r"^\s*```\s*$")
 # The bridge serialises ChatGPT's rendered DOM, where headings have already
 # lost their `#` markers: `## SOURCE S1` reaches us as `SOURCE S1`. The hash
 # is therefore optional, and a heading is told apart from prose by the fact
@@ -301,6 +324,7 @@ _HEADING_WORDS = frozenset(
         "fact",
         "artifact",
         "artefact",
+        "rule",
     }
 )
 _FIELD = re.compile(r"^\s{0,3}(?P<key>[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 _-]{0,40}?)\s*[:=]\s*(?P<value>.*)$")
@@ -435,8 +459,20 @@ def _split_blocks(text: str, block_keywords: dict[str, str]) -> tuple[list[_Bloc
     section = "root"
     sections: list[str] = []
     current: _Block | None = None
+    in_fence = False
 
     for line in text.split("\n"):
+        if in_fence:
+            if current is not None:
+                current.lines.append(line)
+            if _FENCE_CLOSE.fullmatch(line):
+                in_fence = False
+            continue
+        if _FENCE_OPEN.fullmatch(line):
+            if current is not None:
+                current.lines.append(line)
+            in_fence = True
+            continue
         heading = _heading_text(line)
         if heading is not None:
             folded = _fold(heading)
@@ -673,6 +709,7 @@ _Q2_BLOCKS = {
     "fact": "fact",
     "artifact": "artifact",
     "artefact": "artifact",
+    "rule": "rule",
 }
 
 _Q2_FACT_CATEGORIES = frozenset(
@@ -720,6 +757,32 @@ _Q2_ARTIFACT_TYPE_ALIASES = {
     "suricata_rule": "suricata_rule",
     "suricata": "suricata_rule",
 }
+
+_Q2_RULE_TYPE_ALIASES = {
+    "yara": DetectionRuleType.YARA,
+    "sigma": DetectionRuleType.SIGMA,
+    "suricata": DetectionRuleType.SURICATA,
+    "snort": DetectionRuleType.SNORT,
+}
+
+MAX_RULES_PER_SOURCE = 100
+MAX_SINGLE_RULE_BODY_BYTES = 128 * 1024
+MAX_TOTAL_RULE_CONTENT_BYTES_PER_SOURCE = 2 * 1024 * 1024
+
+_Q2_RULE_KNOWN_FIELDS = frozenset(
+    {
+        "rule-type",
+        "type",
+        "name",
+        "rule-name",
+        "context",
+        "contexte",
+        "evidence-quote",
+        "evidence",
+        "quote",
+        "citation",
+    }
+)
 
 _Q2_INDICATOR_STATUSES = frozenset({"confirmed_ioc", "contextual", "excluded", "not_applicable"})
 # A status the model left out or misspelled must never be silently promoted to
@@ -777,6 +840,11 @@ def _q2_field(values: dict[str, str], *keys: str) -> str:
     return ""
 
 
+def _rule_issue(result: ParseResult[Q2SourceOutput], code: str) -> None:
+    result.warnings.append(code)
+    result.uncertainties.append(code)
+
+
 def _normalize_token(raw: str) -> str:
     """Fold a field value onto the underscored vocabulary the schema expects."""
     return _normalize_key(raw).replace("-", "_")
@@ -803,7 +871,23 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
 
     facts: list[Q2FactProposal] = []
     artifacts: list[Q2ArtifactProposal] = []
+    rules: list[Q2RuleProposal] = []
+    total_rule_content_bytes = 0
     for block in blocks:
+        if block.kind == "rule":
+            rule = _parse_q2_rule(block, result)
+            if rule is None:
+                continue
+            if len(rules) >= MAX_RULES_PER_SOURCE:
+                _rule_issue(result, "rule_limit_max_rules_per_source")
+                continue
+            body_bytes = len(rule.body.encode("utf-8"))
+            if total_rule_content_bytes + body_bytes > MAX_TOTAL_RULE_CONTENT_BYTES_PER_SOURCE:
+                _rule_issue(result, "rule_limit_total_content_per_source")
+                continue
+            rules.append(rule)
+            total_rule_content_bytes += body_bytes
+            continue
         values = _fields(block.lines)
         if not values:
             result.dropped_blocks.append(block.raw())
@@ -818,14 +902,127 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
             if artifact is not None:
                 artifacts.append(artifact)
 
-    if not facts and not artifacts:
+    if not facts and not artifacts and not rules:
         result.errors.append("no_usable_proposal")
         return result
 
     result.value = Q2SourceOutput(
-        facts=facts, artifacts=artifacts, uncertainties=list(_collect_uncertainties(body))
+        facts=facts,
+        artifacts=artifacts,
+        rules=rules,
+        uncertainties=list(dict.fromkeys((*_collect_uncertainties(body), *result.uncertainties))),
     )
     return result
+
+
+def _parse_q2_rule(block: _Block, result: ParseResult[Q2SourceOutput]) -> Q2RuleProposal | None:
+    """Parse a RULE block without flattening its fenced body."""
+    opening_index: int | None = None
+    opening_language = ""
+    for index, line in enumerate(block.lines):
+        opening = _FENCE_OPEN.fullmatch(line)
+        if opening is not None:
+            opening_index = index
+            opening_language = opening.group("language").casefold()
+            break
+    if opening_index is None:
+        _rule_issue(result, "rule_without_body_fence")
+        result.dropped_blocks.append(block.raw())
+        return None
+
+    closing_index: int | None = None
+    for index in range(opening_index + 1, len(block.lines)):
+        if _FENCE_CLOSE.fullmatch(block.lines[index]):
+            closing_index = index
+            break
+    if closing_index is None:
+        _rule_issue(result, "rule_truncated_not_promoted")
+        result.dropped_blocks.append(block.raw())
+        return None
+
+    # The language tag is intentionally informational. `rule-type` below is
+    # the authority, so text/yaml fences can carry YARA and vice versa.
+    del opening_language
+    values = _fields(block.lines[:opening_index])
+    _warn_unknown_fields(values, _Q2_RULE_KNOWN_FIELDS, result)
+    rule_type_raw = _q2_field(values, "rule-type", "type")
+    rule_type = _Q2_RULE_TYPE_ALIASES.get(_normalize_token(rule_type_raw))
+    name = _q2_field(values, "name", "rule-name") or None
+    context = _q2_field(values, "context", "contexte")
+    quote = _q2_field(values, "evidence-quote", "evidence", "quote", "citation")
+    body = "\n".join(block.lines[opening_index + 1 : closing_index])
+
+    if rule_type is None:
+        _rule_issue(result, "unknown_rule_type")
+        result.dropped_blocks.append(block.raw())
+        return None
+    if not body.strip():
+        _rule_issue(result, "rule_body_empty")
+        result.dropped_blocks.append(block.raw())
+        return None
+    if len(body.encode("utf-8")) > MAX_SINGLE_RULE_BODY_BYTES:
+        _rule_issue(result, "rule_limit_single_body")
+        result.dropped_blocks.append(block.raw())
+        return None
+    if rule_type is DetectionRuleType.YARA and not _yara_body_is_balanced(body):
+        _rule_issue(result, "rule_truncated_not_promoted")
+        result.dropped_blocks.append(block.raw())
+        return None
+    if not quote:
+        _rule_issue(result, "rule_without_evidence_quote")
+        result.dropped_blocks.append(block.raw())
+        return None
+
+    try:
+        return Q2RuleProposal(
+            rule_type=rule_type,
+            name=name,
+            body=body,
+            context=context or name or rule_type.value,
+            evidence_quote=quote,
+        )
+    except ValidationError:
+        _rule_issue(result, "rule_schema_invalid")
+        result.dropped_blocks.append(block.raw())
+        return None
+
+
+def _yara_body_is_balanced(body: str) -> bool:
+    """Spot an obviously incomplete YARA body without parsing/compiling it."""
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    in_line_comment = False
+    index = 0
+    while index < len(body):
+        character = body[index]
+        if in_line_comment:
+            if character == "\n":
+                in_line_comment = False
+            index += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character == "/" and body[index : index + 2] == "//":
+            in_line_comment = True
+            index += 1
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+        index += 1
+    return quote is None and depth == 0
 
 
 def _parse_q2_fact(
@@ -1127,7 +1324,7 @@ def reference_report_from_json(payload: dict[str, Any]) -> ReferenceReport:
 def technical_extraction_to_json(extraction: TechnicalExtraction) -> dict[str, Any]:
     return {
         "parser_version": PARSER_VERSION,
-        "schema_version": "2",
+        "schema_version": "3",
         "items": [
             {
                 "id": item.local_id,
@@ -1148,6 +1345,20 @@ def technical_extraction_to_json(extraction: TechnicalExtraction) -> dict[str, A
                 "supported": item.supported,
             }
             for item in extraction.items
+        ],
+        "rules": [
+            {
+                "rule_type": rule.rule_type.value,
+                "name": rule.name,
+                "body": rule.body,
+                "source_ids": list(rule.source_ids),
+                "context": rule.context,
+                "evidence_quote": rule.evidence_quote,
+                "supported": rule.supported,
+                "model_run_ids": list(rule.model_run_ids),
+                "sha256": rule.sha256,
+            }
+            for rule in extraction.rules
         ],
         "uncertainties": list(extraction.uncertainties),
     }
@@ -1193,7 +1404,34 @@ def technical_extraction_from_json(payload: dict[str, Any]) -> TechnicalExtracti
             model_run_ids=tuple(item.get("model_run_ids", [])),
         )
 
+    def read_rule(item: dict[str, Any]) -> DetectionRule:
+        rule_type = DetectionRuleType(item["rule_type"])
+        body = str(item["body"]).replace("\r\n", "\n").replace("\r", "\n")
+        if not body.strip():
+            raise ValueError("Detection rule body must not be empty")
+        if len(body.encode("utf-8")) > MAX_SINGLE_RULE_BODY_BYTES:
+            raise ValueError("Detection rule body exceeds its size limit")
+        sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        stored_sha256 = item.get("sha256")
+        if stored_sha256 is not None and stored_sha256 != sha256:
+            raise ValueError("Detection rule sha256 does not match its body")
+        name = item.get("name")
+        if name is not None and not isinstance(name, str):
+            raise ValueError("Detection rule name must be a string or null")
+        return DetectionRule(
+            rule_type=rule_type,
+            name=name,
+            body=body,
+            source_ids=tuple(str(source_id) for source_id in item.get("source_ids", [])),
+            context=str(item.get("context", "")),
+            evidence_quote=str(item.get("evidence_quote", "")),
+            supported=bool(item.get("supported", False)),
+            model_run_ids=tuple(str(run_id) for run_id in item.get("model_run_ids", [])),
+            sha256=sha256,
+        )
+
     return TechnicalExtraction(
         items=tuple(read_item(item) for item in payload.get("items", [])),
         uncertainties=tuple(payload.get("uncertainties", [])),
+        rules=tuple(read_rule(item) for item in payload.get("rules", [])),
     )

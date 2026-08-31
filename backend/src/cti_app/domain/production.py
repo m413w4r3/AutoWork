@@ -45,6 +45,28 @@ class ExtractionProfile(StrEnum):
     IOC_RULES = "ioc_rules"
 
 
+class DetectionRuleType(StrEnum):
+    YARA = "yara"
+    SIGMA = "sigma"
+    SURICATA = "suricata"
+    SNORT = "snort"
+
+
+@dataclass(frozen=True)
+class DetectionRule:
+    """A published detection rule kept as canonical, inert source data."""
+
+    rule_type: DetectionRuleType
+    name: str | None
+    body: str
+    source_ids: tuple[str, ...]
+    context: str
+    evidence_quote: str
+    supported: bool
+    model_run_ids: tuple[str, ...]
+    sha256: str
+
+
 class SourceExtractionStatus(StrEnum):
     """Lifecycle of a source-level extraction checkpoint."""
 

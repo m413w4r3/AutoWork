@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import re
 from collections.abc import Mapping, Sequence
@@ -12,22 +13,27 @@ from urllib.parse import urlsplit
 from cti_app.application.iana_tlds_snapshot import IANA_TLDS
 from cti_app.application.production_normalization import normalize_indicator_value, refang
 from cti_app.application.production_parsers import (
+    MAX_RULES_PER_SOURCE,
+    MAX_SINGLE_RULE_BODY_BYTES,
+    MAX_TOTAL_RULE_CONTENT_BYTES_PER_SOURCE,
     DisplayPolicy,
     ExtractionItem,
     IndicatorStatus,
     Q2ArtifactProposal,
     Q2FactProposal,
+    Q2RuleProposal,
     Q2SourceOutput,
     SemanticType,
     TechnicalExtraction,
 )
+from cti_app.domain.production import DetectionRule, DetectionRuleType
 from cti_app.domain.publication import ArtifactType
 
 # Bump whenever deterministic verification/normalization rules change (e.g. a
 # validation rule, a public-suffix check, or how facts get a semantic type).
 # Participates in the extraction artifact's input_hash so a canonical
 # extraction artifact gets recomputed, without forcing a new Q2 model call.
-ARTIFACT_VERIFIER_VERSION = "1"
+ARTIFACT_VERIFIER_VERSION = "2"
 
 
 class ProposalStatus(StrEnum):
@@ -89,28 +95,48 @@ def verify_q2_proposals(
 ) -> ArtifactVerificationResult:
     """Validate IOC shape and system-assigned provenance, not local evidence."""
     verified: list[ExtractionItem] = []
+    verified_rules: list[DetectionRule] = []
     diagnostics: list[ProposalDiagnostic] = []
+    warnings: list[str] = []
     for submission in submissions:
-        proposals: list[Q2FactProposal | Q2ArtifactProposal] = [
+        proposals: list[Q2FactProposal | Q2ArtifactProposal | Q2RuleProposal] = [
             *submission.output.facts,
             *submission.output.artifacts,
+            *submission.output.rules,
         ]
+        rule_count = 0
+        rule_content_bytes = 0
         for index, proposal in enumerate(proposals, start=1):
-            rejection = _rejection_reason(proposal)
+            if isinstance(proposal, Q2RuleProposal):
+                rule_count += 1
+                rejection = _rule_rejection_reason(
+                    proposal,
+                    rule_count=rule_count,
+                    rule_content_bytes=rule_content_bytes,
+                )
+            else:
+                rejection = _rejection_reason(proposal)
             if rejection is not None:
+                if isinstance(proposal, Q2RuleProposal) and rejection.startswith("rule_limit"):
+                    warnings.append(rejection)
                 diagnostics.append(
                     ProposalDiagnostic(
                         ProposalStatus.REJECTED,
                         index,
                         proposal_kind=_proposal_kind(proposal),
                         artifact_type=_artifact_type(proposal),
-                        value_hash=_value_hash(proposal.value),
+                        value_hash=_value_hash(_proposal_body_or_value(proposal)),
                         reason_code=rejection,
                     )
                 )
                 continue
             try:
-                verified.append(_to_item(proposal, index, submission))
+                if isinstance(proposal, Q2RuleProposal):
+                    rule = _to_rule(proposal, submission, warnings)
+                    verified_rules.append(rule)
+                    rule_content_bytes += len(rule.body.encode("utf-8"))
+                else:
+                    verified.append(_to_item(proposal, index, submission))
             except ValueError:
                 diagnostics.append(
                     ProposalDiagnostic(
@@ -118,7 +144,7 @@ def verify_q2_proposals(
                         index,
                         proposal_kind=_proposal_kind(proposal),
                         artifact_type=_artifact_type(proposal),
-                        value_hash=_value_hash(proposal.value),
+                        value_hash=_value_hash(_proposal_body_or_value(proposal)),
                         reason_code="normalization_error",
                     )
                 )
@@ -129,10 +155,11 @@ def verify_q2_proposals(
                     index,
                     _proposal_kind(proposal),
                     _artifact_type(proposal),
-                    _value_hash(proposal.value),
+                    _value_hash(_proposal_body_or_value(proposal)),
                 )
             )
-    merged, warnings = _merge_verified(verified)
+    merged, item_warnings = _merge_verified(verified)
+    merged_rules, rule_warnings = _merge_rules(verified_rules)
     uncertainties = tuple(
         dict.fromkeys(
             uncertainty
@@ -141,7 +168,13 @@ def verify_q2_proposals(
         )
     )
     return ArtifactVerificationResult(
-        TechnicalExtraction(tuple(merged), uncertainties), tuple(diagnostics), tuple(warnings)
+        TechnicalExtraction(
+            items=tuple(merged),
+            uncertainties=uncertainties,
+            rules=tuple(merged_rules),
+        ),
+        tuple(diagnostics),
+        tuple(dict.fromkeys((*item_warnings, *warnings, *rule_warnings))),
     )
 
 
@@ -163,6 +196,34 @@ def _rejection_reason(
             normalize_indicator_value(proposal.value, artifact_type)
         except ValueError:
             return "normalization_error"
+    return None
+
+
+def _normalize_rule_body(body: str) -> str:
+    """Apply only the line-ending normalization used for rule identity."""
+    return body.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _rule_rejection_reason(
+    proposal: Q2RuleProposal,
+    *,
+    rule_count: int,
+    rule_content_bytes: int,
+) -> str | None:
+    body = _normalize_rule_body(proposal.body)
+    if not body.strip():
+        return "rule_body_empty"
+    body_bytes = len(body.encode("utf-8"))
+    if body_bytes > MAX_SINGLE_RULE_BODY_BYTES:
+        return "rule_limit_single_body"
+    if rule_count > MAX_RULES_PER_SOURCE:
+        return "rule_limit_max_rules_per_source"
+    if rule_content_bytes + body_bytes > MAX_TOTAL_RULE_CONTENT_BYTES_PER_SOURCE:
+        return "rule_limit_total_content_per_source"
+    try:
+        DetectionRuleType(proposal.rule_type)
+    except ValueError:
+        return "invalid_rule_type"
     return None
 
 
@@ -216,6 +277,37 @@ def _to_item(
     )
 
 
+def _yara_declared_name(body: str) -> str | None:
+    match = re.search(r"(?m)^\s*(?:(?:private|global)\s+)*rule\s+([A-Za-z_][A-Za-z0-9_]*)\b", body)
+    return match.group(1) if match else None
+
+
+def _to_rule(
+    proposal: Q2RuleProposal,
+    submission: Q2ProposalSubmission,
+    warnings: list[str],
+) -> DetectionRule:
+    body = _normalize_rule_body(proposal.body)
+    rule_type = DetectionRuleType(proposal.rule_type)
+    name = proposal.name.strip() if proposal.name and proposal.name.strip() else None
+    declared_name = _yara_declared_name(body) if rule_type is DetectionRuleType.YARA else None
+    if declared_name and name and declared_name != name:
+        # Keep both the literal body and proposed metadata. Review can resolve
+        # the discrepancy; deterministic verification must not invent a fix.
+        warnings.append("rule_name_mismatch")
+    return DetectionRule(
+        rule_type=rule_type,
+        name=name,
+        body=body,
+        source_ids=submission.source_ids,
+        context=proposal.context,
+        evidence_quote=proposal.evidence_quote,
+        supported=bool(submission.source_ids),
+        model_run_ids=(submission.model_run_id,) if submission.model_run_id else (),
+        sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    )
+
+
 def _validate_value(raw: str, artifact_type: ArtifactType) -> None:
     value = refang(raw)
     if artifact_type is ArtifactType.IP:
@@ -264,18 +356,30 @@ def _validate_hostname(raw: str) -> None:
         raise ValueError("file or prose fragment")
 
 
-def _proposal_kind(proposal: Q2FactProposal | Q2ArtifactProposal) -> str:
+def _proposal_kind(
+    proposal: Q2FactProposal | Q2ArtifactProposal | Q2RuleProposal,
+) -> str:
+    if isinstance(proposal, Q2RuleProposal):
+        return "rule"
     return "artifact" if isinstance(proposal, Q2ArtifactProposal) else "fact"
 
 
-def _artifact_type(proposal: Q2FactProposal | Q2ArtifactProposal) -> str | None:
+def _artifact_type(
+    proposal: Q2FactProposal | Q2ArtifactProposal | Q2RuleProposal,
+) -> str | None:
+    if isinstance(proposal, Q2RuleProposal):
+        return proposal.rule_type.value
     return proposal.artifact_type if isinstance(proposal, Q2ArtifactProposal) else None
 
 
 def _value_hash(value: str) -> str:
-    import hashlib
-
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _proposal_body_or_value(
+    proposal: Q2FactProposal | Q2ArtifactProposal | Q2RuleProposal,
+) -> str:
+    return proposal.body if isinstance(proposal, Q2RuleProposal) else proposal.value
 
 
 def _artifact_fields(
@@ -350,6 +454,38 @@ def _merge_verified(items: Sequence[ExtractionItem]) -> tuple[list[ExtractionIte
             local_id = f"Q2A{artifact_number}"
         canonical.append(replace(item, local_id=local_id))
     return canonical, list(dict.fromkeys(warnings))
+
+
+def _merge_rules(rules: Sequence[DetectionRule]) -> tuple[list[DetectionRule], list[str]]:
+    """Deduplicate by rule type and body hash, retaining all source evidence."""
+    merged: dict[tuple[DetectionRuleType, str], DetectionRule] = {}
+    warnings: list[str] = []
+    for rule in rules:
+        key = (rule.rule_type, rule.sha256)
+        previous = merged.get(key)
+        if previous is None:
+            merged[key] = rule
+            continue
+        if previous.name and rule.name and previous.name != rule.name:
+            warnings.append("rule_name_conflict")
+        merged[key] = replace(
+            previous,
+            name=previous.name or rule.name,
+            context=" | ".join(
+                dict.fromkeys(part for part in (previous.context, rule.context) if part)
+            ),
+            evidence_quote=" | ".join(
+                dict.fromkeys(
+                    part for part in (previous.evidence_quote, rule.evidence_quote) if part
+                )
+            ),
+            source_ids=tuple(sorted(set(previous.source_ids + rule.source_ids))),
+            model_run_ids=tuple(sorted(set(previous.model_run_ids + rule.model_run_ids))),
+            supported=previous.supported or rule.supported,
+        )
+    return [merged[key] for key in sorted(merged, key=lambda item: (item[0].value, item[1]))], list(
+        dict.fromkeys(warnings)
+    )
 
 
 def _merged_status(statuses: set[IndicatorStatus]) -> IndicatorStatus:
