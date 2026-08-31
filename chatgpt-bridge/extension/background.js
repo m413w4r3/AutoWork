@@ -396,17 +396,14 @@ async function routeTab(msg) {
   return msg.conversation ? resolveConversationTab(msg.conversation) : findChatTab();
 }
 
-/** Envoie au content script, en l'injectant si l'onglet a été chargé avant l'extension. */
+/** Envoie une seule fois au content script déjà installé par le manifest. */
 async function sendToTab(tabId, msg) {
-  try {
-    return await chrome.tabs.sendMessage(tabId, msg);
-  } catch {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["serializer.js", "completion.js", "final-output.js", "content.js"],
-    });
-    return await chrome.tabs.sendMessage(tabId, msg);
-  }
+  // Une erreur de réponse après livraison est ambiguë : réinjecter puis
+  // renvoyer le prompt pourrait provoquer un second clic UI. Le manifest
+  // installe déjà le content script sur les onglets ChatGPT ; une nouvelle
+  // tentative passe par la clé d'idempotence du même run, jamais par un
+  // deuxième POST DOM implicite.
+  return await chrome.tabs.sendMessage(tabId, msg);
 }
 
 async function cleanupFreshReservationAfterDeliveryFailure(msg) {
@@ -455,13 +452,40 @@ async function handlePrompt(msg) {
   } catch (err) {
     requestStates.set(msg.id, "failed");
     persistRequestStates();
-    send({ type: "error", id: msg.id, code: err.code || "bridge_server_error", message: err.message });
+    send({
+      type: "error",
+      id: msg.id,
+      code: err.code || "bridge_server_error",
+      message: err.message,
+      phase: "pre_submission",
+      submission_state: "pre_submission",
+    });
     return;
   }
   if (!tab) {
     requestStates.set(msg.id, "failed");
     persistRequestStates();
-    send({ type: "error", id: msg.id, message: "Aucun onglet chatgpt.com ouvert" });
+    send({
+      type: "error",
+      id: msg.id,
+      code: "bridge_extension_disconnected",
+      message: "Aucun onglet chatgpt.com ouvert",
+      phase: "pre_submission",
+      submission_state: "pre_submission",
+    });
+    return;
+  }
+  if (busyTabs.has(tab.id)) {
+    requestStates.set(msg.id, "failed");
+    persistRequestStates();
+    send({
+      type: "error",
+      id: msg.id,
+      code: "conversation_busy",
+      message: "l'onglet ChatGPT traite déjà une requête",
+      phase: "pre_submission",
+      submission_state: "pre_submission",
+    });
     return;
   }
   inflight.set(msg.id, tab.id);
@@ -490,6 +514,8 @@ async function handlePrompt(msg) {
       id: msg.id,
       code: "bridge_server_error",
       message: `Onglet injoignable : ${err.message}`,
+      phase: "pre_submission",
+      submission_state: "pre_submission",
     });
   }
 }

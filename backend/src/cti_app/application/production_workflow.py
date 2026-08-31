@@ -110,6 +110,9 @@ _TRANSIENT_CODES = {
     "bridge_total_timeout",
     "bridge_timeout",
     "bridge_ui_timeout",
+    "bridge_extension_disconnected",
+    "bridge_unreachable",
+    "bridge_rate_limited",
 }
 
 # The conversation itself is the problem, not the pipeline: retrying the same
@@ -826,7 +829,7 @@ class ProductionWorkflowOrchestrator:
         warnings: list[str] = []
         completed: list[str] = []
         failed: list[str] = []
-        failures: dict[str, dict[str, str]] = {}
+        failures: dict[str, dict[str, Any]] = {}
         for source_index, source in enumerate(report.sources):
             if source_index:
                 # Q2 stays one request per source; pacing is between requests,
@@ -906,11 +909,20 @@ class ProductionWorkflowOrchestrator:
             except Exception as exc:
                 error_code = str(getattr(exc, "code", "") or "q2_source_failed")
                 error = str(exc)[:1000]
+                retryable = bool(getattr(exc, "retryable", False))
+                phase = str(getattr(exc, "phase", "model_call"))[:64]
+                submission_state = str(getattr(exc, "submission_state", "unknown"))[:32]
+                duration_ms = int((time.monotonic() - started_at) * 1000)
                 failed.append(source.local_id)
                 failures[source.local_id] = {
                     "model_run_id": str(model_run_id),
+                    "source_url": source.canonical_url,
                     "error_code": error_code,
                     "error": error,
+                    "retryable": retryable,
+                    "phase": phase,
+                    "submission_state": submission_state,
+                    "duration_ms": duration_ms,
                 }
                 self._diagnostics.record(
                     event="q2.source.failed",
@@ -919,11 +931,35 @@ class ProductionWorkflowOrchestrator:
                     stage="extraction",
                     correlation_id=self._correlation_id,
                     source_id=source.local_id,
+                    source_url=source.canonical_url,
                     model_run_id=str(model_run_id),
                     error_code=error_code,
                     error=error,
-                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    retryable=retryable,
+                    phase=phase,
+                    submission_state=submission_state,
+                    duration_ms=duration_ms,
                 )
+                # A retryable transport failure describes the bridge/model
+                # path, not the source content. Stop Q2 at once so S2+ are not
+                # sent through the same broken infrastructure and do not turn
+                # a global outage into a misleading coverage failure.
+                if retryable or error_code in _TRANSIENT_CODES:
+                    return {
+                        "stage": "extraction",
+                        "status": "transient_error",
+                        "error_code": error_code,
+                        "error": error,
+                        "details": {
+                            "completed_source_ids": completed,
+                            "failed_source_ids": failed,
+                            "source_failures": failures,
+                            "failure_class": "global_transient",
+                        },
+                        "completed_source_ids": completed,
+                        "failed_source_ids": failed,
+                        "source_failures": failures,
+                    }
         if failed:
             return {
                 "stage": "extraction",

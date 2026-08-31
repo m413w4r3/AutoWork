@@ -191,6 +191,8 @@ class BridgeTransportError(ModelGatewayError):
         phase: str = "generation",
         bridge_run_id: str | None = None,
         bridge_status: str | None = None,
+        submission_state: str | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(safe_description)
         self.code = code
@@ -200,6 +202,8 @@ class BridgeTransportError(ModelGatewayError):
         self.phase = phase
         self.bridge_run_id = bridge_run_id
         self.bridge_status = bridge_status
+        self.submission_state = submission_state
+        self.diagnostics = diagnostics or {}
 
 
 def _bounded_backoff(attempt: int) -> float:
@@ -230,6 +234,9 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
     bridge_run_id: str | None = None
     bridge_status: str | None = None
     phase = "generation"
+    submission_state: str | None = None
+    diagnostics: dict[str, Any] = {}
+    explicit_retryable: bool | None = None
     try:
         body = response.json()
         detail = body.get("detail") if isinstance(body, dict) else None
@@ -241,8 +248,21 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
             metadata = source.get("metadata")
             if isinstance(metadata, dict) and isinstance(metadata.get("phase"), str):
                 phase = metadata["phase"][:64]
-        if isinstance(error, dict) and isinstance(error.get("code"), str):
-            server_code = error["code"]
+        if isinstance(error, dict):
+            if isinstance(error.get("code"), str):
+                server_code = error["code"]
+            if isinstance(error.get("phase"), str):
+                phase = error["phase"][:64]
+            if error.get("submission_state") in {
+                "pre_submission",
+                "submission_attempted",
+                "post_submission",
+            }:
+                submission_state = error["submission_state"]
+            if isinstance(error.get("details"), dict):
+                diagnostics = _safe_bridge_diagnostics(error["details"])
+            if isinstance(error.get("retryable"), bool):
+                explicit_retryable = error["retryable"]
     except ValueError:
         pass
     if server_code in {
@@ -274,7 +294,11 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         code = "bridge_server_error"
     else:
         code = "bridge_protocol_error"
-    retryable = status in {408, 429, 502, 503, 504} or status >= 500
+    retryable = (
+        explicit_retryable
+        if explicit_retryable is not None
+        else status in {408, 429, 502, 503, 504} or status >= 500
+    )
     if code in {
         "bridge_auth_failed",
         "bridge_payload_conflict",
@@ -311,7 +335,35 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         phase=phase,
         bridge_run_id=bridge_run_id,
         bridge_status=bridge_status,
+        submission_state=submission_state,
+        diagnostics=diagnostics,
     )
+
+
+def _safe_bridge_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
+    """Bound diagnostics crossing the bridge; prompt content is never retained."""
+
+    def clean(item: Any, depth: int = 0) -> Any:
+        if depth > 3:
+            return None
+        if isinstance(item, dict):
+            result: dict[str, Any] = {}
+            for key, child in list(item.items())[:50]:
+                name = str(key)
+                if any(marker in name.casefold() for marker in ("prompt", "composer_text")):
+                    continue
+                cleaned = clean(child, depth + 1)
+                if cleaned is not None:
+                    result[name[:64]] = cleaned
+            return result
+        if isinstance(item, list):
+            return [clean(child, depth + 1) for child in item[:50]]
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            return item[:256] if isinstance(item, str) else item
+        return None
+
+    result = clean(value)
+    return result if isinstance(result, dict) else {}
 
 
 class ChatGPTBridgeTransport(HttpResponsesTransport):
@@ -835,7 +887,12 @@ def _response_metadata(raw: dict[str, Any]) -> dict[str, Any]:
             and isinstance(citation.get("url"), str)
             and isinstance(citation.get("canonical_url"), str)
         ]
-    for name in ("completion_signal", "completion_confidence", "content_script_version"):
+    for name in (
+        "completion_signal",
+        "completion_confidence",
+        "content_script_version",
+        "submission_state",
+    ):
         value = metadata.get(name)
         if isinstance(value, str):
             result[name] = value[:64]

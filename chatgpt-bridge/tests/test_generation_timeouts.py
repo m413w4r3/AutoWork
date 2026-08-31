@@ -34,6 +34,35 @@ class SilentExtension:
         self.closed = (code, reason)
 
 
+class TypedErrorExtension:
+    """Extension-side typed failure used to verify the submission boundary."""
+
+    def __init__(self, runtime: BridgeApplication) -> None:
+        self.runtime = runtime
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        if payload.get("type") == "prompt":
+            self.runtime.bridge.dispatch(
+                {
+                    "type": "error",
+                    "id": payload["id"],
+                    "event_id": "typed-error",
+                    "code": "bridge_ui_timeout",
+                    "message": "confirmation impossible",
+                    "retryable": True,
+                    "phase": "submission_confirmation",
+                    "submission_state": "submission_attempted",
+                    "diagnostics": {
+                        "composer_text": "secret prompt must not escape",
+                        "user_turns_before": 2,
+                    },
+                }
+            )
+
+    async def close(self, code: int, reason: str) -> None:
+        del code, reason
+
+
 async def test_idle_timeout_does_not_send_abort_to_extension(
     runtime: BridgeApplication,
 ) -> None:
@@ -203,6 +232,26 @@ async def _generate(
         if hasattr(extension, "stop"):
             extension.stop()
     return chunks, failure, elapsed
+
+
+async def test_typed_extension_error_preserves_submission_state_and_safe_diagnostics(
+    runtime: BridgeApplication,
+) -> None:
+    _, failure, _ = await _generate(
+        runtime,
+        TypedErrorExtension(runtime),
+        "typed-error",
+        total_timeout=1.0,
+        idle_timeout=0.2,
+    )
+
+    assert isinstance(failure, UpstreamError)
+    assert failure.code == "bridge_ui_timeout"
+    assert failure.retryable is True
+    assert failure.phase == "submission_confirmation"
+    assert failure.submission_state == "submission_attempted"
+    assert "composer_text" not in failure.details
+    assert failure.details["user_turns_before"] == 2
 
 
 async def test_live_generation_reaching_the_total_deadline_is_never_called_idle(

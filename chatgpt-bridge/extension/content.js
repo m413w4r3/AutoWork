@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "21";
+const VERSION = "22";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -35,6 +35,7 @@ const SELECTORS = {
   ],
   fileInput: ["input[type='file']"],
   assistant: "[data-message-author-role='assistant']",
+  user: "[data-message-author-role='user']",
   markdown: ".markdown",
   newChat: [
     "a[data-testid='create-new-chat-button']",
@@ -111,7 +112,11 @@ const MOTS_PLUS_MODELES = /plus de mod|autres mod|more models|legacy models/;
 
 const POLL_MS = 120;
 const APPEAR_TIMEOUT_MS = 30000; // délai d'apparition de la bulle de réponse
+// La première fenêtre reste courte pour rendre rapidement un diagnostic, mais
+// elle n'est plus la borne de la soumission. Après celle-ci, on conserve le
+// même job et le même onglet dans une phase ambiguë jusqu'à cette borne finale.
 const SUBMISSION_CONFIRMATION_TIMEOUT_MS = 5000;
+const SUBMISSION_CONFIRMATION_FINAL_TIMEOUT_MS = 20000;
 const UPLOAD_TIMEOUT_MS = 120000; // upload des pièces jointes
 
 const SETTLE_MS = 2000; // fin UI confirmée
@@ -225,38 +230,144 @@ function triggerComposerSubmission(composer, sendBtn) {
   return method;
 }
 
-async function waitForSubmissionConfirmation(composer, assistantTurnsBefore, method) {
-  const deadline = Date.now() + SUBMISSION_CONFIRMATION_TIMEOUT_MS;
-  const form = composer?.closest("form");
-  while (Date.now() < deadline) {
-    const turns = document.querySelectorAll(SELECTORS.assistant).length;
-    const stopRoot = form || composer?.parentElement || composer;
-    const stop = stopRoot ? $in(stopRoot, SELECTORS.stop) : null;
+function submissionSignalVisible(element) {
+  if (!element || element.getAttribute?.("aria-hidden") === "true") return false;
+  const style = globalThis.getComputedStyle?.(element);
+  if (style?.display === "none" || style?.visibility === "hidden") return false;
+  return (
+    typeof element.getClientRects !== "function" ||
+    element.getClientRects().length > 0
+  );
+}
+
+function activeSubmissionSignals(selectors, predicate = submissionSignalVisible) {
+  const result = [];
+  for (const selector of selectors) {
+    for (const element of document.querySelectorAll(selector)) {
+      if (predicate(element)) result.push(element);
+    }
+  }
+  return result;
+}
+
+function activeReasoningSignal(element) {
+  if (element?.tagName === "DETAILS" && !element.open) return false;
+  if (["closed", "collapsed"].includes(element?.getAttribute?.("data-state"))) {
+    return false;
+  }
+  return submissionSignalVisible(element);
+}
+
+function captureSubmissionSnapshot(composer, sendBtn) {
+  const stopSignals = activeSubmissionSignals(SELECTORS.stop);
+  const reasoningSignals = activeSubmissionSignals(
+    SELECTORS.reasoning,
+    activeReasoningSignal,
+  );
+  const generationSignals = [
+    ...stopSignals,
+    ...reasoningSignals,
+    ...activeSubmissionSignals([
+      ".streaming-animation",
+      ".result-streaming",
+      "[data-is-streaming='true']",
+    ]),
+  ];
+  return {
+    userTurns: document.querySelectorAll(SELECTORS.user).length,
+    assistantTurns: document.querySelectorAll(SELECTORS.assistant).length,
+    composerText: composerText(composer),
+    sendState: {
+      disabled: sendBtn?.disabled ?? null,
+      ariaDisabled: sendBtn?.getAttribute("aria-disabled") ?? null,
+      ready: isSendButtonReady(sendBtn),
+    },
+    generation: {
+      stop: stopSignals.length > 0,
+      reasoning: reasoningSignals.length > 0,
+      present: generationSignals.length > 0,
+      elements: new Set(generationSignals),
+    },
+  };
+}
+
+function newSubmissionGenerationSignal(before) {
+  const current = [
+    ...activeSubmissionSignals(SELECTORS.stop),
+    ...activeSubmissionSignals(SELECTORS.reasoning, activeReasoningSignal),
+    ...activeSubmissionSignals([
+      ".streaming-animation",
+      ".result-streaming",
+      "[data-is-streaming='true']",
+    ]),
+  ];
+  return current.some((element) => !before.generation.elements.has(element));
+}
+
+function submissionDiagnostics(snapshot, method, after) {
+  return {
+    method,
+    assistant_turns_before: snapshot.assistantTurns,
+    assistant_turns_after: after.assistantTurns,
+    user_turns_before: snapshot.userTurns,
+    user_turns_after: after.userTurns,
+    composer_was_non_empty: Boolean(snapshot.composerText.trim()),
+    composer_still_has_text: Boolean(after.composerText.trim()),
+    send_before: snapshot.sendState,
+    send_after: after.sendState,
+    generation_before: {
+      stop: snapshot.generation.stop,
+      reasoning: snapshot.generation.reasoning,
+      present: snapshot.generation.present,
+    },
+    generation_after: {
+      stop: after.generation.stop,
+      reasoning: after.generation.reasoning,
+      present: after.generation.present,
+    },
+    content_script_version: VERSION,
+  };
+}
+
+async function waitForSubmissionConfirmation(composer, sendBtn, snapshot, method) {
+  const startedAt = Date.now();
+  const rapidDeadline = startedAt + SUBMISSION_CONFIRMATION_TIMEOUT_MS;
+  const finalDeadline = startedAt + SUBMISSION_CONFIRMATION_FINAL_TIMEOUT_MS;
+  let uncertainAnnounced = false;
+  while (Date.now() < finalDeadline) {
+    const after = captureSubmissionSnapshot(composer, sendBtn);
     let signal = null;
-    if (!composerText(composer).trim()) signal = "composer_cleared";
-    else if (stop) signal = "stop_button";
-    else if (turns > assistantTurnsBefore) signal = "assistant_turn";
+    if (after.userTurns > snapshot.userTurns) signal = "user_turn";
+    else if (!after.composerText.trim()) signal = "composer_cleared";
+    else if (newSubmissionGenerationSignal(snapshot)) signal = "generation_signal";
+    else if (after.assistantTurns > snapshot.assistantTurns) signal = "assistant_turn";
     if (signal) {
-      console.log("bridge_run_phase", { phase: "submission_confirmed", signal });
+      console.log("bridge_run_phase", {
+        phase: "submission_confirmed",
+        signal,
+        submission_state: "post_submission",
+      });
       return signal;
+    }
+    if (!uncertainAnnounced && Date.now() >= rapidDeadline) {
+      uncertainAnnounced = true;
+      console.warn("bridge_run_phase", {
+        phase: "submission_uncertain",
+        submission_state: "submission_attempted",
+        ...submissionDiagnostics(snapshot, method, after),
+      });
     }
     await sleep(100);
   }
-  const turnsAfter = document.querySelectorAll(SELECTORS.assistant).length;
-  const stopRoot = form || composer?.parentElement || composer;
-  const stopFound = Boolean(stopRoot && $in(stopRoot, SELECTORS.stop));
-  console.warn("submission_confirmation_failed", {
-    method,
-    composer_still_has_text: Boolean(composerText(composer).trim()),
-    stop_found: stopFound,
-    assistant_turns_before: assistantTurnsBefore,
-    assistant_turns_after: turnsAfter,
-    content_script_version: VERSION,
-  });
-  throw new BridgeError(
+  const after = captureSubmissionSnapshot(composer, sendBtn);
+  const diagnostics = submissionDiagnostics(snapshot, method, after);
+  console.warn("submission_confirmation_failed", diagnostics);
+  const error = new BridgeError(
     "bridge_ui_timeout",
     "soumission du prompt non confirmée par l'interface ChatGPT",
   );
+  error.diagnostics = diagnostics;
+  throw error;
 }
 
 /**
@@ -1384,15 +1495,35 @@ async function handlePrompt({
   files,
   conversation,
 }) {
+  if (currentJob) {
+    // L'observation post-clic garde l'onglet réservé : un second prompt ne doit
+    // ni interrompre cette observation ni toucher au composer avant sa fin.
+    if (currentJob.id === id) {
+      reply({ type: "ack", id, state: "duplicate", duplicate: true });
+      return;
+    }
+    reply({
+      type: "error",
+      id,
+      code: "conversation_busy",
+      message: "un prompt est déjà en cours de confirmation",
+      phase: currentJob.phase,
+      submission_state: currentJob.submissionState,
+    });
+    return;
+  }
+  const job = {
+    id,
+    aborted: false,
+    phase: "pre_submission",
+    submissionState: "pre_submission",
+  };
+  currentJob = job;
   if (!(await claimPrompt(id))) {
+    if (currentJob === job) currentJob = null;
     reply({ type: "ack", id, state: "duplicate", duplicate: true });
     return;
   }
-  if (currentJob) currentJob.aborted = true;
-  const job = { id, aborted: false };
-  let submissionAttempted = false;
-  let submissionConfirmed = false;
-  currentJob = job;
 
   try {
     console.log("bridge_run_phase", { phase: "prompt_received" });
@@ -1451,7 +1582,8 @@ async function handlePrompt({
       "composer introuvable",
     );
     console.log("bridge_run_phase", { phase: "composer" });
-    const before = document.querySelectorAll(SELECTORS.assistant).length;
+    const assistantTurnsBefore = document.querySelectorAll(SELECTORS.assistant).length;
+    const before = assistantTurnsBefore;
     if (!baselineTurn && before) {
       baselineTurn = document.querySelectorAll(SELECTORS.assistant)[before - 1];
     }
@@ -1474,14 +1606,25 @@ async function handlePrompt({
         ? "upload des pièces jointes non terminé"
         : "bouton d'envoi jamais actif",
     );
-    submissionAttempted = true;
+    // Capture after typing/upload and immediately before the one allowed
+    // trigger: the composer text and send state must describe the actual click.
+    const submissionBaseline = captureSubmissionSnapshot(composer, sendBtn);
+    job.submissionState = "submission_attempted";
+    job.phase = "submission_confirmation";
     const submissionMethod = triggerComposerSubmission(composer, sendBtn);
     console.log("bridge_run_phase", {
       phase: "submission_attempted",
+      submission_state: "submission_attempted",
       method: submissionMethod,
     });
-    await waitForSubmissionConfirmation(composer, before, submissionMethod);
-    submissionConfirmed = true;
+    await waitForSubmissionConfirmation(
+      composer,
+      sendBtn,
+      submissionBaseline,
+      submissionMethod,
+    );
+    job.submissionState = "post_submission";
+    job.phase = "generation";
 
     if (conversation) {
       reply({
@@ -1535,6 +1678,7 @@ async function handlePrompt({
             globalThis.ChatGPTBridgeFinalOutput.outputChars(serialized.text),
           visible_citation_count: serialized.visible_citations.length,
           content_script_version: VERSION,
+          submission_state: "post_submission",
           initial_turn_id: externalTurnId,
         },
         conversation: conversation
@@ -1556,14 +1700,12 @@ async function handlePrompt({
         id,
         code: err.code || "bridge_server_error",
         message: err.message,
+        phase: job.phase,
+        diagnostics: err.diagnostics || null,
         conversation: conversation
           ? { id: conversation.id, mode: conversation.mode }
           : null,
-        submission_state: submissionConfirmed
-          ? "post_submission"
-          : submissionAttempted
-            ? "submission_attempted"
-            : "pre_submission",
+        submission_state: job.submissionState,
       });
     }
   } finally {

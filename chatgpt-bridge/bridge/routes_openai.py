@@ -39,6 +39,19 @@ from bridge.ui import (
 logger = logging.getLogger("chatgpt_bridge")
 
 
+def _upstream_error_detail(exc: UpstreamError) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "code": exc.code,
+        "message": str(exc),
+        "retryable": exc.retryable,
+        "phase": exc.phase,
+        "submission_state": exc.submission_state,
+    }
+    if exc.details:
+        detail["details"] = exc.details
+    return detail
+
+
 class OpenAIRoutes:
     """Propriétaire des quatre endpoints compatibles OpenAI.
 
@@ -167,6 +180,8 @@ class OpenAIRoutes:
                     "code": "bridge_extension_disconnected",
                     "message": "Extension Chrome non connectée : ouvre un onglet chatgpt.com.",
                     "retryable": True,
+                    "phase": "pre_submission",
+                    "submission_state": "pre_submission",
                 },
             )
         controls = controls or RunControls()
@@ -221,7 +236,7 @@ class OpenAIRoutes:
             except UpstreamError as exc:
                 raise HTTPException(
                     status_code=502,
-                    detail={"code": exc.code, "message": str(exc), "retryable": exc.retryable},
+                    detail=_upstream_error_detail(exc),
                 ) from exc
         return _response_body(
             response_id,
@@ -257,7 +272,13 @@ class OpenAIRoutes:
         if not self.bridge.online:
             raise HTTPException(
                 status_code=503,
-                detail="Extension Chrome non connectée : ouvre un onglet chatgpt.com.",
+                detail={
+                    "code": "bridge_extension_disconnected",
+                    "message": "Extension Chrome non connectée : ouvre un onglet chatgpt.com.",
+                    "retryable": True,
+                    "phase": "pre_submission",
+                    "submission_state": "pre_submission",
+                },
             )
 
         cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -278,7 +299,12 @@ class OpenAIRoutes:
                         ):
                             yield sse_chunk(cid, req.model, created, {"content": text}, None)
                     except UpstreamError as exc:
-                        err = {"error": {"message": str(exc), "type": "bridge_error"}}
+                        err = {
+                            "error": {
+                                **_upstream_error_detail(exc),
+                                "type": "bridge_error",
+                            }
+                        }
                         yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
@@ -298,7 +324,9 @@ class OpenAIRoutes:
                     async for text in run_generation(self.bridge, self.registry, cid, req, http_req)
                 ]
             except UpstreamError as exc:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
+                raise HTTPException(
+                    status_code=502, detail=_upstream_error_detail(exc)
+                ) from exc
 
         return completion_body(cid, req.model, created, "".join(parts), prompt_tokens)
 

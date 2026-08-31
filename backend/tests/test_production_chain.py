@@ -466,6 +466,34 @@ async def test_transient_error_stays_retryable_and_keeps_the_run_alive(
     assert jobs.submitted == []
 
 
+async def test_transient_extraction_failure_holds_the_batch_slot_until_retry_exhaustion(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, jobs, _ = _build(
+        uow,
+        monkeypatch,
+        {"stage": "extraction", "status": "transient_error", "error_code": "bridge_ui_timeout"},
+    )
+    first = _run(uow, SubjectProductionStage.EXTRACTION)
+    second = _batch_of(uow, first)
+    context = _Context()
+    uow.jobs.items[context.job_id] = _ExecutionJob(attempt=1, max_attempts=3)
+
+    handler = registry.handler(stage_job_kind(SubjectProductionStage.EXTRACTION))
+    with pytest.raises(JobHandlerError) as excinfo:
+        await handler(
+            ProductionStageParameters(
+                run_id=first.id, expected_stage=SubjectProductionStage.EXTRACTION.value
+            ),
+            context,  # type: ignore[arg-type]
+        )
+
+    assert excinfo.value.transient is True
+    assert uow.subject_production_runs.items[first.id].status is SubjectProductionStatus.RUNNING
+    assert uow.subject_production_runs.items[second.id].status is SubjectProductionStatus.QUEUED
+    assert jobs.submitted == []
+
+
 @pytest.mark.parametrize(
     ("recovery_stage", "expected_delay"),
     (

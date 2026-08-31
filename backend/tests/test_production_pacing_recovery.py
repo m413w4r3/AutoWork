@@ -154,6 +154,12 @@ def _batch_uow(codes: list[str]) -> tuple[_Uow, list[SubjectProductionRun]]:
 
 def test_recovery_policy_is_allow_list_only() -> None:
     assert ProductionRecoveryPolicyV1.is_auto_recoverable("bridge_server_error")
+    for code in (
+        "bridge_extension_disconnected",
+        "bridge_unreachable",
+        "bridge_rate_limited",
+    ):
+        assert ProductionRecoveryPolicyV1.is_auto_recoverable(code)
     assert ProductionRecoveryPolicyV1.is_auto_recoverable("synthesis_validation_failed")
     assert not ProductionRecoveryPolicyV1.is_auto_recoverable("unknown_code")
 

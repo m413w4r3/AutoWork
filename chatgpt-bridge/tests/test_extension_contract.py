@@ -30,7 +30,11 @@ def test_extension_reserves_request_before_real_send_trigger() -> None:
     assert content.index('type: "heartbeat"') < content.index("if (!turn) continue;")
     assert 'type: "chunk"' not in content
     assert "text: serialized.text" in content
-    assert '"final-output.js"' in background
+    send_start = background.index("async function sendToTab(")
+    send_end = background.index("\nasync function cleanupFreshReservationAfterDeliveryFailure", send_start)
+    send_body = background[send_start:send_end]
+    assert "chrome.scripting.executeScript" not in send_body
+    assert send_body.count("chrome.tabs.sendMessage") == 1
 
 
 def test_fresh_conversations_are_temporary_chat_url_based() -> None:

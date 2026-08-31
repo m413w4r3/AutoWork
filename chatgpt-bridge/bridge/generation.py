@@ -156,10 +156,22 @@ def sse_chunk(cid: str, model: str, created: int, delta: dict, finish: Optional[
 # Génération
 # --------------------------------------------------------------------------- #
 class UpstreamError(RuntimeError):
-    def __init__(self, message: str, *, code: str = "bridge_server_error", retryable: bool = True):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "bridge_server_error",
+        retryable: bool = True,
+        phase: str = "generation",
+        submission_state: str = "pre_submission",
+        details: Optional[dict[str, Any]] = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        self.phase = phase
+        self.submission_state = submission_state
+        self.details = details or {}
 
 
 class NeedsReviewError(RuntimeError):
@@ -248,6 +260,32 @@ def generation_progress(request_id: str) -> dict[str, Any]:
     return _live_progress.get(request_id, {})
 
 
+def _safe_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep transport diagnostics bounded and never persist prompt content."""
+
+    def clean(item: Any, depth: int = 0) -> Any:
+        if depth > 3:
+            return None
+        if isinstance(item, dict):
+            result: dict[str, Any] = {}
+            for key, child in list(item.items())[:50]:
+                name = str(key)
+                if any(marker in name.casefold() for marker in ("prompt", "composer_text")):
+                    continue
+                cleaned = clean(child, depth + 1)
+                if cleaned is not None:
+                    result[name[:64]] = cleaned
+            return result
+        if isinstance(item, list):
+            return [clean(child, depth + 1) for child in item[:50]]
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            return item[:256] if isinstance(item, str) else item
+        return None
+
+    result = clean(value)
+    return result if isinstance(result, dict) else {}
+
+
 async def run_generation(
     bridge: Bridge,
     registry: RunRegistry,
@@ -270,18 +308,31 @@ async def run_generation(
     started_at = time.monotonic()
     total_deadline = started_at + TOTAL_TIMEOUT
     last_packet_at = started_at
+    submission_state = "pre_submission"
+    submission_phase = "pre_submission"
     try:
         logger.info("bridge_run_phase bridge_run_id=%s phase=submission", request_id)
-        await bridge.send(
-            {
-                "type": "prompt",
-                "id": request_id,
-                "prompt": prompt,
-                "new_chat": req.new_chat,
-                "files": [f.model_dump() for f in attachments],
-                "conversation": conversation.model_dump(mode="json") if conversation else None,
-            }
-        )
+        submission_state = "submission_attempted"
+        submission_phase = "submission_confirmation"
+        try:
+            await bridge.send(
+                {
+                    "type": "prompt",
+                    "id": request_id,
+                    "prompt": prompt,
+                    "new_chat": req.new_chat,
+                    "files": [f.model_dump() for f in attachments],
+                    "conversation": conversation.model_dump(mode="json") if conversation else None,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - delivery is ambiguous after send
+            raise UpstreamError(
+                "l'extension ChatGPT n'a pas accepté la livraison du prompt",
+                code="bridge_extension_disconnected",
+                retryable=True,
+                phase=submission_phase,
+                submission_state=submission_state,
+            ) from exc
         generation_announced = False
 
         def expired(code: str, now: float) -> UpstreamError:
@@ -317,15 +368,23 @@ async def run_generation(
                 return UpstreamError(
                     f"génération non terminée après {TOTAL_TIMEOUT:.0f}s",
                     code=code,
+                    phase=submission_phase,
+                    submission_state=submission_state,
                 )
             return UpstreamError(
                 f"aucune donnée de l'extension depuis {IDLE_TIMEOUT:.0f}s",
                 code=code,
+                phase=submission_phase,
+                submission_state=submission_state,
             )
 
         while True:
             if await http_req.is_disconnected():
-                raise UpstreamError("client parti")
+                raise UpstreamError(
+                    "client parti",
+                    phase=submission_phase,
+                    submission_state=submission_state,
+                )
             now = time.monotonic()
             if now >= total_deadline:
                 raise expired("bridge_total_timeout", now)
@@ -356,6 +415,7 @@ async def run_generation(
 
             kind = packet.get("type")
             if kind == "heartbeat":
+                submission_phase = "generation"
                 if not generation_announced:
                     logger.info(
                         "bridge_run_phase bridge_run_id=%s phase=generation",
@@ -385,20 +445,36 @@ async def run_generation(
                         if isinstance(value, int) and 0 <= value <= ceiling:
                             _live_progress[request_id][field] = value
             elif kind == "conversation_bound":
+                submission_state = "post_submission"
+                submission_phase = "generation"
                 reported = packet.get("conversation")
                 if conversation is None or not isinstance(reported, dict):
                     continue
                 if reported.get("id") != str(conversation.id):
-                    raise UpstreamError("rattachement de conversation incohérent")
+                    raise UpstreamError(
+                        "rattachement de conversation incohérent",
+                        phase=submission_phase,
+                        submission_state=submission_state,
+                    )
                 if reported.get("verified") is not True:
-                    raise UpstreamError("conversation non vérifiée par l'extension")
+                    raise UpstreamError(
+                        "conversation non vérifiée par l'extension",
+                        phase=submission_phase,
+                        submission_state=submission_state,
+                    )
                 if reported.get("ephemeral") is not True:
-                    raise UpstreamError("conversation non éphémère (Temporary Chat requis)")
+                    raise UpstreamError(
+                        "conversation non éphémère (Temporary Chat requis)",
+                        phase=submission_phase,
+                        submission_state=submission_state,
+                    )
                 if conversation.mode == "continue" and reported.get(
                     "expected_turn_id"
                 ) != conversation.expected_turn_id:
                     raise UpstreamError(
-                        "rattachement de conversation incohérent : expected_turn_id ne correspond pas"
+                        "rattachement de conversation incohérent : expected_turn_id ne correspond pas",
+                        phase=submission_phase,
+                        submission_state=submission_state,
                     )
                 sanitized = dict(reported)
                 sanitized["external_locator"] = _sanitize_diagnostic_locator(
@@ -444,15 +520,29 @@ async def run_generation(
                 }
                 raise NeedsReviewError(reason, details)
             elif kind == "done":
+                submission_state = "post_submission"
+                submission_phase = "generation"
                 final_text = packet.get("text")
                 if not isinstance(final_text, str):
-                    raise UpstreamError("snapshot final absent ou invalide")
+                    raise UpstreamError(
+                        "snapshot final absent ou invalide",
+                        phase=submission_phase,
+                        submission_state=submission_state,
+                    )
                 reported_metadata = packet.get("metadata")
                 if not isinstance(reported_metadata, dict):
-                    raise UpstreamError("métadonnées de fin absentes ou invalides")
+                    raise UpstreamError(
+                        "métadonnées de fin absentes ou invalides",
+                        phase=submission_phase,
+                        submission_state=submission_state,
+                    )
                 output_chars = reported_metadata.get("output_chars")
                 if not isinstance(output_chars, int) or output_chars != len(final_text):
-                    raise UpstreamError("longueur du snapshot final incohérente")
+                    raise UpstreamError(
+                        "longueur du snapshot final incohérente",
+                        phase=submission_phase,
+                        submission_state=submission_state,
+                    )
                 if extension_metadata is not None:
                     citations = reported_metadata.get("visible_citations")
                     serializer_version = reported_metadata.get("serializer_version")
@@ -465,6 +555,7 @@ async def run_generation(
                     stable_for_ms = reported_metadata.get("stable_for_ms")
                     visible_citation_count = reported_metadata.get("visible_citation_count")
                     content_script_version = reported_metadata.get("content_script_version")
+                    reported_submission_state = reported_metadata.get("submission_state")
                     if completion_signal in {
                         "assistant_actions",
                         "stop_button",
@@ -485,6 +576,15 @@ async def run_generation(
                         extension_metadata["visible_citation_count"] = visible_citation_count
                     if isinstance(content_script_version, str):
                         extension_metadata["content_script_version"] = content_script_version[:64]
+                    extension_metadata["submission_state"] = (
+                        reported_submission_state
+                        if reported_submission_state in {
+                            "pre_submission",
+                            "submission_attempted",
+                            "post_submission",
+                        }
+                        else submission_state
+                    )
                 reported = packet.get("conversation")
                 if conversation is not None:
                     if (
@@ -494,11 +594,23 @@ async def run_generation(
                         or not isinstance(reported.get("turn_id"), str)
                         or not reported["turn_id"]
                     ):
-                        raise UpstreamError("métadonnées de conversation absentes ou incohérentes")
+                        raise UpstreamError(
+                            "métadonnées de conversation absentes ou incohérentes",
+                            phase=submission_phase,
+                            submission_state=submission_state,
+                        )
                     if reported.get("verified") is not True:
-                        raise UpstreamError("conversation non vérifiée par l'extension")
+                        raise UpstreamError(
+                            "conversation non vérifiée par l'extension",
+                            phase=submission_phase,
+                            submission_state=submission_state,
+                        )
                     if reported.get("ephemeral") is not True:
-                        raise UpstreamError("conversation non éphémère (Temporary Chat requis)")
+                        raise UpstreamError(
+                            "conversation non éphémère (Temporary Chat requis)",
+                            phase=submission_phase,
+                            submission_state=submission_state,
+                        )
                     # Pour continue, expected_turn_id a déjà été validé au moment
                     # de conversation_bound : pas de revérification ici.
                     sanitized = dict(reported)
@@ -518,12 +630,57 @@ async def run_generation(
                     "conversation_busy",
                     "conversation_profile_mismatch",
                     "bridge_ui_timeout",
+                    "bridge_idle_timeout",
+                    "bridge_total_timeout",
+                    "bridge_timeout",
+                    "bridge_extension_disconnected",
+                    "bridge_unreachable",
+                    "bridge_rate_limited",
+                    "bridge_server_error",
                 }:
                     code = "bridge_server_error"
+                reported_state = packet.get("submission_state")
+                if reported_state in {
+                    "pre_submission",
+                    "submission_attempted",
+                    "post_submission",
+                }:
+                    submission_state = reported_state
+                reported_phase = packet.get("phase")
+                if isinstance(reported_phase, str) and reported_phase:
+                    submission_phase = reported_phase[:64]
+                elif submission_state == "submission_attempted":
+                    submission_phase = "submission_confirmation"
+                elif submission_state == "post_submission":
+                    submission_phase = "generation"
+                diagnostics = packet.get("diagnostics")
+                if not isinstance(diagnostics, dict):
+                    diagnostics = packet.get("details")
+                safe_diagnostics = (
+                    _safe_diagnostics(diagnostics) if isinstance(diagnostics, dict) else {}
+                )
+                transient_codes = {
+                    "bridge_server_error",
+                    "bridge_idle_timeout",
+                    "bridge_total_timeout",
+                    "bridge_timeout",
+                    "bridge_ui_timeout",
+                    "bridge_extension_disconnected",
+                    "bridge_unreachable",
+                    "bridge_rate_limited",
+                }
+                reported_retryable = packet.get("retryable")
                 raise UpstreamError(
                     packet.get("message", "erreur côté extension"),
                     code=code,
-                    retryable=code == "bridge_server_error",
+                    retryable=(
+                        reported_retryable
+                        if isinstance(reported_retryable, bool)
+                        else code in transient_codes
+                    ),
+                    phase=submission_phase,
+                    submission_state=submission_state,
+                    details=safe_diagnostics,
                 )
     finally:
         # Une erreur interne du bridge ou la fermeture du canal HTTP ne doit
@@ -681,5 +838,6 @@ def _response_body(
             "content_script_version": (extension_metadata or {}).get(
                 "content_script_version"
             ),
+            "submission_state": (extension_metadata or {}).get("submission_state"),
         },
     }

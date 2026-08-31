@@ -54,7 +54,7 @@ export function ProductionBatchSelector({
         <ul className="production-batch-selector__list">
           {groups.map((group) => (
             <li key={group.id}>
-              <label>
+              <label className="production-batch-selector__choice">
                 <input
                   type="checkbox"
                   checked={selected.has(group.subject_id)}

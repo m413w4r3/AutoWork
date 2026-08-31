@@ -113,11 +113,14 @@ function ItemError({ item }: { item: BatchItemDetail }) {
 function ProductionItem({
   item,
   total,
+  dispatchPending,
 }: {
   item: BatchItemDetail;
   total: number;
+  dispatchPending: boolean;
 }) {
-  const isActive = item.status === "running";
+  const isActive = item.status === "running" && !dispatchPending;
+  const isWaitingForDispatch = item.status === "running" && dispatchPending;
   return (
     <li className={`production-item production-item--${item.status}`}>
       <div className="production-item__main">
@@ -125,13 +128,21 @@ function ProductionItem({
           {item.position}/{total}
         </span>
         <Link to={`/subjects/${item.subject_id}`}>{item.title}</Link>
-        <span className={`production-item__status is-${item.status}`}>
-          {STATUS_LABELS[item.status]}
+        <span
+          className={`production-item__status is-${item.status}${
+            isWaitingForDispatch ? " is-dispatch-pending" : ""
+          }`}
+        >
+          {isWaitingForDispatch
+            ? "Démarrage planifié"
+            : STATUS_LABELS[item.status]}
         </span>
       </div>
       <div className="production-item__details">
         {isActive ? (
           <span>Étape : {STAGE_LABELS[item.current_stage]}</span>
+        ) : isWaitingForDispatch ? (
+          <span>En attente du démarrage</span>
         ) : null}
         {item.auto_recovery_count > 0 ? (
           <span>
@@ -218,7 +229,7 @@ export function ProductionConsole({ editionId }: { editionId: string }) {
       ) : null}
       {countdown !== null ? (
         <p className="production-next-dispatch">
-          Prochain article dans {formatCountdown(countdown)}
+          Démarrage du prochain article dans {formatCountdown(countdown)}
         </p>
       ) : null}
       <progress max={100} value={progress}>
@@ -232,6 +243,7 @@ export function ProductionConsole({ editionId }: { editionId: string }) {
               key={item.run_id}
               item={item}
               total={currentBatch.items}
+              dispatchPending={countdown !== null}
             />
           ))}
         </ol>

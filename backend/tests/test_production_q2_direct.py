@@ -10,10 +10,17 @@ from cti_app.application.model_gateway import (
     ModelRouter,
     ModelRoutingHint,
 )
-from cti_app.application.production_parsers import parse_q2_proposals_markdown
+from cti_app.application.production_parsers import (
+    ParsedSource,
+    ReferenceReport,
+    parse_q2_proposals_markdown,
+)
 from cti_app.application.production_workflow import _extraction_input_hash, _q2_source_model_run_id
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
+from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
 from cti_app.integrations.models import (
+    BridgeTransportError,
     FakeModelAdapter,
     InMemoryModelOutputStore,
     _bridge_http_error,
@@ -170,3 +177,207 @@ def test_bridge_timeout_codes_are_preserved() -> None:
             httpx.Response(502, request=request, json={"error": {"code": code}}), 1
         )
         assert error.code == code
+
+
+class _Q2Artifacts:
+    async def get_current(self, run_id: object, stage: str) -> object:
+        del run_id, stage
+        return type(
+            "ReferenceArtifact",
+            (),
+            {"canonical_blob_id": uuid4(), "input_hash": "a" * 64},
+        )()
+
+
+class _Q2UnitOfWork:
+    def __init__(self) -> None:
+        self.production_artifacts = _Q2Artifacts()
+
+    async def __aenter__(self) -> "_Q2UnitOfWork":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        del args
+
+
+class _Q2Gateway:
+    def __init__(self, failure: Exception | None) -> None:
+        self.failure = failure
+        self.calls: list[str] = []
+
+    async def execute(self, request: ModelRequest, role: ModelRole) -> object:
+        del role
+        source_id = str(request.metadata["source_id"])
+        self.calls.append(source_id)
+        if self.failure is not None:
+            raise self.failure
+        return type(
+            "Execution",
+            (),
+            {
+                "output_text": (
+                    "# FACT\n"
+                    "category: malware\n"
+                    "value: ExampleRAT\n"
+                    "context: outil observe\n"
+                    "evidence-quote: outil observe dans la source\n"
+                ),
+                "run": type("Run", (), {"id": uuid4()})(),
+            },
+        )()
+
+
+class _Q2Diagnostics:
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def record(self, **fields: object) -> None:
+        self.events.append(fields)
+
+    def record_parse(self, **fields: object) -> None:
+        del fields
+
+
+class _Q2Extraction:
+    def __init__(self) -> None:
+        self.store_calls: list[dict[str, object]] = []
+
+    async def store_extraction_result(self, **fields: object) -> object:
+        self.store_calls.append(fields)
+        return type("ExtractionArtifact", (), {"id": uuid4()})()
+
+
+def _q2_report(source_count: int = 5) -> ReferenceReport:
+    return ReferenceReport(
+        sources=tuple(
+            ParsedSource(
+                local_id=f"S{index}",
+                title=f"Source {index}",
+                url=f"https://example.test/{index}",
+                canonical_url=f"https://example.test/{index}",
+                publisher="Example",
+                published_at=None,
+                role=SourceRole.PRIMARY,
+            )
+            for index in range(1, source_count + 1)
+        ),
+        events=(),
+    )
+
+
+def _q2_orchestrator(
+    monkeypatch: pytest.MonkeyPatch,
+    gateway: _Q2Gateway,
+    report: ReferenceReport,
+) -> tuple[
+    production_workflow.ProductionWorkflowOrchestrator, SubjectProductionRun, _Q2Diagnostics
+]:
+    uow = _Q2UnitOfWork()
+    diagnostics = _Q2Diagnostics()
+    orchestrator = production_workflow.ProductionWorkflowOrchestrator.__new__(
+        production_workflow.ProductionWorkflowOrchestrator
+    )
+    orchestrator._uow_factory = lambda: uow
+    orchestrator._artifact_store = None
+    orchestrator._diagnostics = diagnostics
+    orchestrator._correlation_id = "test"
+    orchestrator._model_gateway = gateway
+    orchestrator._pacing = type("Pacing", (), {"model_delay_seconds": lambda self: 0.0})()
+    orchestrator._extraction = _Q2Extraction()
+
+    async def load_reference(*args: object) -> ReferenceReport:
+        del args
+        return report
+
+    async def no_reuse(*args: object) -> None:
+        del args
+        return None
+
+    async def subject_context(*args: object) -> tuple[str, str]:
+        del args
+        return "Article", ""
+
+    async def production_context(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return type("Context", (), {"external_llm_allowed": True, "subject_title": "Article"})()
+
+    monkeypatch.setattr(orchestrator, "_load_reference_report", load_reference)
+    monkeypatch.setattr(orchestrator, "_reuse_artifact", no_reuse)
+    monkeypatch.setattr(orchestrator, "_subject_context", subject_context)
+    monkeypatch.setattr(production_workflow, "build_subject_production_context", production_context)
+    run = SubjectProductionRun(
+        subject_id=uuid4(),
+        edition_id=uuid4(),
+        current_stage=SubjectProductionStage.EXTRACTION,
+    )
+    return orchestrator, run, diagnostics
+
+
+@pytest.mark.parametrize("error_code", ["bridge_ui_timeout", "transport_glitch"])
+async def test_q2_retryable_source_failure_stops_before_s2_and_does_not_create_artifact(
+    monkeypatch: pytest.MonkeyPatch, error_code: str
+) -> None:
+    """A global retryable bridge failure must not become source coverage loss."""
+    gateway = _Q2Gateway(
+        BridgeTransportError(
+            error_code,
+            "transport failure",
+            retryable=True,
+            phase="submission_confirmation",
+            submission_state="submission_attempted",
+        )
+    )
+    orchestrator, run, diagnostics = _q2_orchestrator(monkeypatch, gateway, _q2_report())
+
+    result = await orchestrator._execute_direct_url_extraction(run)
+
+    assert gateway.calls == ["S1"]
+    assert result["status"] == "transient_error"
+    assert result["error_code"] == error_code
+    assert result["error_code"] != "q2_source_coverage_failed"
+    assert result["failed_source_ids"] == ["S1"]
+    assert result["source_failures"]["S1"]["submission_state"] == "submission_attempted"
+    assert result["source_failures"]["S1"]["phase"] == "submission_confirmation"
+    assert orchestrator._extraction.store_calls == []
+    failed_events = [
+        event for event in diagnostics.events if event.get("event") == "q2.source.failed"
+    ]
+    assert failed_events[0]["source_id"] == "S1"
+    assert failed_events[0]["model_run_id"]
+    assert failed_events[0]["retryable"] is True
+    assert isinstance(failed_events[0]["duration_ms"], int)
+    assert failed_events[0]["duration_ms"] >= 0
+
+
+async def test_q2_nonretryable_source_failure_keeps_source_coverage_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _Q2Gateway(
+        BridgeTransportError(
+            "source_content_invalid",
+            "source-specific response is unusable",
+            retryable=False,
+            phase="model_call",
+            submission_state="post_submission",
+        )
+    )
+    # The fake gateway fails only S1; S2 must still be requested and parsed.
+    original_execute = gateway.execute
+
+    async def execute(request: ModelRequest, role: ModelRole) -> object:
+        if request.metadata["source_id"] != "S1":
+            gateway.failure = None
+        return await original_execute(request, role)
+
+    gateway.execute = execute  # type: ignore[method-assign]
+    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
+
+    result = await orchestrator._execute_direct_url_extraction(run)
+
+    assert gateway.calls == ["S1", "S2"]
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "q2_source_coverage_failed"
+    assert result["completed_source_ids"] == ["S2"]
+    assert result["failed_source_ids"] == ["S1"]
+    assert result["details"]["source_failures"]["S1"]["error_code"] == "source_content_invalid"
+    assert orchestrator._extraction.store_calls == []

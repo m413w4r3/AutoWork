@@ -794,6 +794,13 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     ModelRunStatus.RUNNING,
                     ModelRunStatus.WAITING_BACKGROUND,
                 }:
+                    # The bridge may prove that the browser never reached the
+                    # composer click. Preserve that proof so an explicit
+                    # allow_failed_resubmit can use the safe NOT_SUBMITTED
+                    # path; an attempted or post-submission failure remains
+                    # SUBMITTED_OR_UNKNOWN and therefore needs reconciliation.
+                    if getattr(exc, "submission_state", None) == "pre_submission":
+                        persisted.submission_state = ModelSubmissionState.NOT_SUBMITTED
                     persisted.fail(
                         str(getattr(exc, "code", "model_call_failed")),
                         _public_error(exc),
@@ -987,8 +994,8 @@ def _public_error(exc: Exception) -> str:
     return "L'appel au modèle a échoué."
 
 
-def _error_details(exc: Exception) -> dict[str, str | bool | int]:
-    details: dict[str, str | bool | int] = {
+def _error_details(exc: Exception) -> dict[str, Any]:
+    details: dict[str, Any] = {
         "provider": str(getattr(exc, "provider", "unknown"))[:64],
         "phase": str(getattr(exc, "phase", "model_call"))[:64],
         "retryable": bool(getattr(exc, "retryable", False)),
@@ -998,7 +1005,39 @@ def _error_details(exc: Exception) -> dict[str, str | bool | int]:
         value = getattr(exc, key, None)
         if isinstance(value, str) and value:
             details[key] = value[:128]
+    submission_state = getattr(exc, "submission_state", None)
+    if isinstance(submission_state, str) and submission_state:
+        details["submission_state"] = submission_state[:32]
+    diagnostics = getattr(exc, "diagnostics", None)
+    if isinstance(diagnostics, dict) and diagnostics:
+        details["bridge_diagnostics"] = _safe_error_diagnostics(diagnostics)
     return details
+
+
+def _safe_error_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep bridge diagnostics bounded and exclude any accidental prompt data."""
+
+    def clean(item: Any, depth: int = 0) -> Any:
+        if depth > 3:
+            return None
+        if isinstance(item, dict):
+            result: dict[str, Any] = {}
+            for key, child in list(item.items())[:50]:
+                name = str(key)
+                if any(marker in name.casefold() for marker in ("prompt", "composer_text")):
+                    continue
+                cleaned = clean(child, depth + 1)
+                if cleaned is not None:
+                    result[name[:64]] = cleaned
+            return result
+        if isinstance(item, list):
+            return [clean(child, depth + 1) for child in item[:50]]
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            return item[:256] if isinstance(item, str) else item
+        return None
+
+    result = clean(value)
+    return result if isinstance(result, dict) else {}
 
 
 def _optional_metadata_text(metadata: dict[str, Any], key: str) -> str | None:

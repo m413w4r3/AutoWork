@@ -362,6 +362,105 @@ function useVirtualClock(window) {
     assert.equal(sent.some((message) => message.type === "done"), true, "le chemin comportemental doit terminer");
   }
 
+  // 10a. Le tour utilisateur est la preuve la plus forte : le composer peut
+  // rester rempli, le Stop peut être hors formulaire et l'assistant peut ne
+  // pas encore être apparu.
+  {
+    const body = `<aside><button data-testid="stop-button">ancien Stop</button></aside>
+      <form id="composer-form"><textarea data-id="prompt">bonjour</textarea>
+        <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    let submitEvents = 0;
+    const form = window.document.querySelector("#composer-form");
+    form.addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      form.insertAdjacentHTML(
+        "beforeend",
+        `<div data-message-author-role="user">bonjour</div>`,
+      );
+    });
+    const signal = await run(`(async () => {
+      const composer = document.querySelector("textarea[data-id='prompt']");
+      const send = document.querySelector("button[data-testid='send-button']");
+      const before = captureSubmissionSnapshot(composer, send);
+      triggerComposerSubmission(composer, send);
+      return waitForSubmissionConfirmation(composer, send, before, "requestSubmit");
+    })()`);
+    assert.equal(signal, "user_turn");
+    assert.equal(submitEvents, 1);
+  }
+
+  // 10a-bis. Une preuve qui arrive après l'ancienne fenêtre de 5 s reste
+  // attachée au même run et réussit sans second trigger.
+  {
+    const body = `<form id="composer-form"><textarea data-id="prompt">bonjour</textarea>
+      <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    let clock = 0;
+    let polls = 0;
+    let userAdded = false;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      polls += 1;
+      if (!userAdded && clock > 5_000) {
+        userAdded = true;
+        window.document.body.insertAdjacentHTML(
+          "beforeend",
+          `<div data-message-author-role="user">bonjour</div>`,
+        );
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+    let submitEvents = 0;
+    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+    });
+    const signal = await run(`(async () => {
+      const composer = document.querySelector("textarea[data-id='prompt']");
+      const send = document.querySelector("button[data-testid='send-button']");
+      const before = captureSubmissionSnapshot(composer, send);
+      triggerComposerSubmission(composer, send);
+      return waitForSubmissionConfirmation(composer, send, before, "requestSubmit");
+    })()`);
+    assert.equal(signal, "user_turn");
+    assert.equal(submitEvents, 1, "un seul triggerComposerSubmission");
+    assert.ok(clock > 5_000);
+    assert.ok(polls > 0);
+  }
+
+  // 10a-ter. La borne finale sans preuve produit une erreur typée après un
+  // seul trigger ; l'absence de confirmation n'autorise aucun rejeu.
+  {
+    const body = `<textarea data-id="prompt">bonjour</textarea>
+      <button aria-disabled="false" data-testid="send-button">Send</button>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    let clicks = 0;
+    window.document.querySelector("button[data-testid='send-button']").addEventListener(
+      "click",
+      () => { clicks += 1; },
+    );
+    let error;
+    try {
+      await run(`(async () => {
+        const composer = document.querySelector("textarea[data-id='prompt']");
+        const send = document.querySelector("button[data-testid='send-button']");
+        const before = captureSubmissionSnapshot(composer, send);
+        triggerComposerSubmission(composer, send);
+        return waitForSubmissionConfirmation(composer, send, before, "click");
+      })()`);
+    } catch (caught) {
+      error = caught;
+    }
+    assert.equal(error.code, "bridge_ui_timeout");
+    assert.equal(error.diagnostics.composer_still_has_text, true);
+    assert.equal(clicks, 1, "aucun second clic après un timeout ambigu");
+  }
+
   // 10b. Un click observé sans effet de soumission ne suffit jamais : aucune
   // seconde méthode ne doit être tentée après l'échec de confirmation.
   {

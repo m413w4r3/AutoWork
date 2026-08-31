@@ -130,8 +130,58 @@ describe("ProductionConsole", () => {
       "/subjects/subject-1",
     );
     expect(
-      screen.getByText(/Prochain article dans 00:4[12]/),
+      screen.getByText(/Démarrage du prochain article dans 00:4[12]/),
     ).toBeInTheDocument();
+  });
+
+  it("ne présente pas une étape active pendant le délai avant le prochain article", async () => {
+    const batch: BatchStatus = {
+      batch_id: "batch-pacing",
+      edition_id: EDITION_ID,
+      status: "running",
+      phase: "initial",
+      next_dispatch_at: new Date(Date.now() + 42_000).toISOString(),
+      items: 2,
+      completed: 1,
+      needs_review: 0,
+      failed: 0,
+      cancelled: 0,
+      item_details: [
+        {
+          position: 1,
+          subject_id: "subject-done",
+          title: "Article terminé",
+          run_id: "run-done",
+          status: "ready",
+          current_stage: "assembly",
+          pipeline_generation: 0,
+          auto_recovery_count: 0,
+          error_code: null,
+          error_message: null,
+        },
+        {
+          position: 2,
+          subject_id: "subject-next",
+          title: "Article suivant",
+          run_id: "run-next",
+          status: "running",
+          current_stage: "sources",
+          pipeline_generation: 0,
+          auto_recovery_count: 0,
+          error_code: null,
+          error_message: null,
+        },
+      ],
+      created_at: "2026-08-29T10:00:00Z",
+      started_at: "2026-08-29T10:00:00Z",
+      finished_at: null,
+    };
+
+    renderConsole(batch);
+
+    expect(await screen.findByText("Démarrage planifié")).toBeInTheDocument();
+    expect(screen.getByText("En attente du démarrage")).toBeInTheDocument();
+    expect(screen.queryByText("Étape : Sources")).not.toBeInTheDocument();
   });
 
   it("invalide l’édition une seule fois quand le lot est terminal", async () => {

@@ -502,11 +502,16 @@ class ModelConversationService:
                     )
             return persisted_turn
         except Exception as exc:
-            uncertain = bool(getattr(exc, "retryable", False)) or getattr(exc, "code", "") in {
-                "bridge_server_error",
-                "bridge_timeout",
-                "bridge_ui_timeout",
-            }
+            pre_submission = getattr(exc, "submission_state", None) == "pre_submission"
+            uncertain = not pre_submission and (
+                bool(getattr(exc, "retryable", False))
+                or getattr(exc, "code", "")
+                in {
+                    "bridge_server_error",
+                    "bridge_timeout",
+                    "bridge_ui_timeout",
+                }
+            )
             blocked = getattr(exc, "code", "") == "external_llm_blocked"
             async with self._uow_factory() as uow:
                 persisted_conversation = await uow.model_conversations.get_for_update(

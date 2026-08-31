@@ -476,7 +476,14 @@ describe("sélecteur du lot de production", () => {
     renderWorkflow(editionWith("selection"));
 
     await screen.findByRole("heading", { name: "3 articles éligibles" });
-    await user.click(screen.getByRole("checkbox", { name: "Article B" }));
+    const checkboxB = screen.getByRole("checkbox", { name: "Article B" });
+    expect(checkboxB.closest("label")).toHaveClass(
+      "production-batch-selector__choice",
+    );
+    expect(checkboxB.closest("section")).toHaveClass(
+      "production-batch-selector",
+    );
+    await user.click(checkboxB);
     await user.click(screen.getByRole("checkbox", { name: "Article A" }));
 
     expect(screen.getByText("2 sélectionnés pour ce lot")).toBeInTheDocument();

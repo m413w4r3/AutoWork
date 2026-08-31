@@ -23,6 +23,7 @@ from cti_app.integrations.models import (
     OpenAIResearchAdapter,
     OpenAIStructuredAdapter,
     QwenAdapter,
+    _bridge_http_error,
 )
 
 
@@ -354,6 +355,37 @@ async def test_bridge_classifies_http_errors_and_never_retries_auth(
     assert caught.value.retryable is (status >= 500)
     assert calls == attempts
     assert "unsafe" not in str(caught.value)
+
+
+async def test_bridge_http_error_preserves_submission_boundary_and_safe_diagnostics() -> None:
+    request = httpx.Request("POST", "https://bridge.test/v1/responses")
+    response = httpx.Response(
+        502,
+        request=request,
+        json={
+            "detail": {
+                "error": {
+                    "code": "bridge_ui_timeout",
+                    "message": "safe message",
+                    "retryable": True,
+                    "phase": "submission_confirmation",
+                    "submission_state": "submission_attempted",
+                    "details": {
+                        "user_turns_before": 1,
+                        "composer_text": "must not persist",
+                    },
+                }
+            }
+        },
+    )
+
+    error = _bridge_http_error(response, attempts=1)
+
+    assert error.code == "bridge_ui_timeout"
+    assert error.retryable is True
+    assert error.phase == "submission_confirmation"
+    assert error.submission_state == "submission_attempted"
+    assert error.diagnostics == {"user_turns_before": 1}
 
 
 async def test_bridge_connect_error_is_typed_and_post_without_key_is_not_retried() -> None:

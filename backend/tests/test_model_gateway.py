@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -70,6 +71,42 @@ class FailingResponsesTransport:
             attempts=1,
             phase="generation",
         )
+
+    async def retrieve(self, response_id: str) -> dict[str, Any]:
+        del response_id
+        raise AssertionError("not used")
+
+
+class SubmissionAwareResponsesTransport:
+    def __init__(self, *, submission_state: str) -> None:
+        self.submission_state = submission_state
+        self.calls = 0
+
+    async def create(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        del payload, idempotency_key
+        self.calls += 1
+        if self.calls == 1:
+            raise BridgeTransportError(
+                "bridge_ui_timeout",
+                "bridge failure",
+                retryable=True,
+                attempts=1,
+                phase="submission_confirmation",
+                submission_state=self.submission_state,
+                diagnostics={
+                    "user_turns_before": 1,
+                    "composer_text": "must not persist",
+                },
+            )
+        return {
+            "id": "resp_recovered",
+            "status": "completed",
+            "model": "chatgpt-web",
+            "output_text": "recovered",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        }
 
     async def retrieve(self, response_id: str) -> dict[str, Any]:
         del response_id
@@ -203,6 +240,51 @@ async def test_typed_bridge_error_details_are_persisted_safely() -> None:
         "retryable": False,
         "attempts": 1,
     }
+
+
+async def test_attempted_bridge_failure_is_reconciliation_only_and_keeps_diagnostics() -> None:
+    transport = SubmissionAwareResponsesTransport(submission_state="submission_attempted")
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    with pytest.raises(BridgeTransportError):
+        await gateway.research(model_request)
+    with pytest.raises(ModelGatewayError, match="not safe"):
+        await gateway.research(model_request)
+
+    run = model_uow.state[model_request.run_id]
+    assert transport.calls == 1
+    assert run.submission_state.value == "submitted_or_unknown"
+    assert run.error_details == {
+        "provider": "openai_chatgpt_bridge",
+        "phase": "submission_confirmation",
+        "retryable": True,
+        "attempts": 1,
+        "submission_state": "submission_attempted",
+        "bridge_diagnostics": {"user_turns_before": 1},
+    }
+
+
+async def test_proven_pre_submission_bridge_failure_can_be_explicitly_retried() -> None:
+    transport = SubmissionAwareResponsesTransport(submission_state="pre_submission")
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    with pytest.raises(BridgeTransportError):
+        await gateway.research(model_request)
+
+    run = model_uow.state[model_request.run_id]
+    assert run.submission_state.value == "not_submitted"
+
+    replay = request(
+        external_llm_allowed=True,
+        run_id=model_request.run_id,
+    )
+    replay = replace(replay, allow_failed_resubmit=True)
+    execution = await gateway.research(replay)
+
+    assert execution.output_text == "recovered"
+    assert transport.calls == 2
 
 
 async def test_qwen_trusted_gateway_runs_when_external_llm_is_forbidden() -> None:
