@@ -32,6 +32,104 @@ function renderConsole(batch: BatchStatus | null) {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("ProductionConsole", () => {
+  it("affiche le détail compact de l’extraction de l’article actif", async () => {
+    const batch: BatchStatus = {
+      batch_id: "batch-extraction",
+      edition_id: EDITION_ID,
+      status: "running",
+      phase: "initial",
+      next_dispatch_at: null,
+      items: 1,
+      completed: 0,
+      needs_review: 0,
+      failed: 0,
+      cancelled: 0,
+      item_details: [
+        {
+          position: 1,
+          subject_id: "subject-extraction",
+          title: "Article en extraction",
+          run_id: "run-extraction",
+          status: "running",
+          current_stage: "extraction",
+          pipeline_generation: 0,
+          auto_recovery_count: 0,
+          error_code: null,
+          error_message: null,
+          extraction_progress: {
+            total_sources: 3,
+            completed_sources: 2,
+            full_total: 1,
+            full_completed: 1,
+            ioc_rules_total: 2,
+            ioc_rules_completed: 1,
+            cache_hits: 1,
+            model_calls: 1,
+            confirmed_iocs: 184,
+            contextual_iocs: 12,
+            rules_total: 5,
+            yara_rules: 3,
+            sigma_rules: 1,
+            suricata_rules: 1,
+            snort_rules: 0,
+            active_source_id: "S3",
+            active_source_title: "Third source",
+            active_profile: "ioc_rules",
+            sources: [
+              {
+                source_id: "S1",
+                title: "First source",
+                profile: "full",
+                status: "succeeded",
+                ioc_count: 100,
+                rule_count: 3,
+              },
+              {
+                source_id: "S2",
+                title: "Second source",
+                profile: "ioc_rules",
+                status: "cached",
+                ioc_count: 96,
+                rule_count: 2,
+              },
+              {
+                source_id: "S3",
+                title: "Third source",
+                profile: "ioc_rules",
+                status: "running",
+                ioc_count: 0,
+                rule_count: 0,
+              },
+            ],
+          },
+        },
+      ],
+      created_at: "2026-08-29T10:00:00Z",
+      started_at: "2026-08-29T10:00:00Z",
+      finished_at: null,
+    };
+
+    renderConsole(batch);
+
+    const progress = await screen.findByLabelText(
+      "Progression de l’extraction",
+    );
+    expect(await screen.findByText("Extraction 2 / 3")).toBeInTheDocument();
+    expect(screen.getByText("FULL 1 / 1")).toBeInTheDocument();
+    expect(screen.getByText("IOC uniquement 1 / 2")).toBeInTheDocument();
+    expect(progress).toHaveTextContent(
+      "Active : S3 — Third source · IOC uniquement",
+    );
+    expect(progress).toHaveTextContent("IOCs : 184 confirmés · 12 contextuels");
+    expect(progress).toHaveTextContent(
+      "Règles : 5 · YARA 3 · Sigma 1 · Suricata 1 · Snort 0",
+    );
+    expect(progress).toHaveTextContent("Cache : 1 · Appels modèle : 1");
+    expect(screen.getByText("S2")).toBeInTheDocument();
+    expect(progress).toHaveTextContent("Cache");
+    expect(progress).toHaveTextContent("En cours");
+  });
+
   it("affiche la phase, les compteurs, les récupérations et les erreurs", async () => {
     const batch: BatchStatus = {
       batch_id: "batch-1",

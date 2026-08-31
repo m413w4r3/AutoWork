@@ -212,6 +212,7 @@ class SqlAlchemySubjectProductionRunRepository:
             error_code=run.error_code,
             error_message=run.error_message,
             error_details=run.error_details,
+            extraction_progress=run.extraction_progress,
             started_at=run.started_at,
             finished_at=run.finished_at,
             created_at=run.created_at,
@@ -263,6 +264,7 @@ class SqlAlchemySubjectProductionRunRepository:
                 error_code=run.error_code,
                 error_message=run.error_message,
                 error_details=run.error_details,
+                extraction_progress=run.extraction_progress,
                 started_at=run.started_at,
                 finished_at=run.finished_at,
                 updated_at=run.updated_at,
@@ -806,6 +808,7 @@ class SqlAlchemyBatchStatusReadRepository:
                 EditionProductionBatchItemRow.auto_recovery_count.label("auto_recovery_count"),
                 SubjectProductionRunRow.error_code.label("error_code"),
                 SubjectProductionRunRow.error_message.label("error_message"),
+                SubjectProductionRunRow.extraction_progress.label("extraction_progress"),
             )
             .select_from(EditionProductionBatchItemRow)
             .join(
@@ -833,6 +836,7 @@ class SqlAlchemyBatchStatusReadRepository:
                 auto_recovery_count=row["auto_recovery_count"],
                 error_code=row["error_code"],
                 error_message=row["error_message"],
+                extraction_progress=row.get("extraction_progress"),
             )
             for row in rows
         ]
@@ -858,6 +862,7 @@ def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectPro
         error_code=row.error_code,
         error_message=row.error_message,
         error_details=row.error_details,
+        extraction_progress=row.extraction_progress,
         started_at=row.started_at,
         finished_at=row.finished_at,
         created_at=row.created_at,

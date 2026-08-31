@@ -215,6 +215,7 @@ class _BatchStatusReadModel:
                     auto_recovery_count=item.auto_recovery_count,
                     error_code=run.error_code,
                     error_message=run.error_message,
+                    extraction_progress=run.extraction_progress,
                 )
             )
         return result
@@ -769,6 +770,57 @@ async def test_batch_status_exposes_phase_schedule_and_item_error_details(
     assert body["item_details"][0]["error_code"] == "bridge_timeout"
     assert body["item_details"][0]["error_message"] == "bridge stopped"
     assert "error_details" not in body["item_details"][0]
+
+
+async def test_subject_and_batch_status_expose_extraction_progress(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert started.status_code == 200, started.text
+
+    run = uow.subject_production_runs.items[next(iter(uow.subject_production_runs.items))]
+    progress = {
+        "total_sources": 1,
+        "completed_sources": 0,
+        "full_total": 1,
+        "full_completed": 0,
+        "ioc_rules_total": 0,
+        "ioc_rules_completed": 0,
+        "cache_hits": 0,
+        "model_calls": 1,
+        "confirmed_iocs": 0,
+        "contextual_iocs": 0,
+        "rules_total": 0,
+        "yara_rules": 0,
+        "sigma_rules": 0,
+        "suricata_rules": 0,
+        "snort_rules": 0,
+        "active_source_id": "S1",
+        "active_source_title": "Source 1",
+        "active_profile": "full",
+        "sources": [
+            {
+                "source_id": "S1",
+                "title": "Source 1",
+                "profile": "full",
+                "status": "running",
+                "ioc_count": 0,
+                "rule_count": 0,
+            }
+        ],
+    }
+    run.extraction_progress = progress
+
+    subject_response = await api.get(f"/api/subjects/{subject_id}/production")
+    batch_response = await api.get(f"/api/editions/{edition_id}/production")
+
+    assert subject_response.status_code == 200, subject_response.text
+    assert subject_response.json()["extraction_progress"] == progress
+    assert batch_response.status_code == 200, batch_response.text
+    assert batch_response.json()["item_details"][0]["extraction_progress"] == progress
 
 
 async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_titles(

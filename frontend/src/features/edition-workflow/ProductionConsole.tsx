@@ -10,6 +10,7 @@ import {
   type SubjectProductionStage,
   type SubjectProductionStatus,
 } from "../../api/production";
+import { ExtractionProgressView } from "../../components/ExtractionProgress";
 import { Link } from "../../routing";
 import { productionBatchPollingInterval } from "./productionPolling";
 
@@ -147,6 +148,11 @@ function ProductionItem({
           </span>
         ) : null}
       </div>
+      {isActive &&
+      item.current_stage === "extraction" &&
+      item.extraction_progress ? (
+        <ExtractionProgressView progress={item.extraction_progress} />
+      ) : null}
       <ItemError item={item} />
     </li>
   );

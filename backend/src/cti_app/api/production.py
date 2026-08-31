@@ -105,6 +105,7 @@ class ProductionStatus(BaseModel):
     error_code: str | None = None
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
+    extraction_progress: dict[str, Any] | None = None
     # Parser recoveries worth showing to an analyst, never blocking.
     warnings: list[str] = []
     stages: dict[str, StageStatus]
@@ -122,6 +123,7 @@ class BatchItemDetail(BaseModel):
     auto_recovery_count: int
     error_code: str | None = None
     error_message: str | None = None
+    extraction_progress: dict[str, Any] | None = None
 
 
 class BatchStatus(BaseModel):
@@ -269,6 +271,7 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
                 auto_recovery_count=item.auto_recovery_count,
                 error_code=item.error_code,
                 error_message=item.error_message,
+                extraction_progress=item.extraction_progress,
             )
         )
     return BatchStatus(
@@ -697,6 +700,7 @@ async def get_subject_production(
             error_code=run.error_code,
             error_message=run.error_message,
             error_details=run.error_details,
+            extraction_progress=run.extraction_progress,
             warnings=_collect_warnings(artifacts),
             stages={name: StageStatus(**stage) for name, stage in stages.items()},
         )

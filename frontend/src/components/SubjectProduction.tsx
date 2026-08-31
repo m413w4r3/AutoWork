@@ -7,6 +7,7 @@ import {
 } from "../api/production";
 import { cancelProductionRun } from "../api/publication";
 import type { StageStatus } from "../api/production";
+import { ExtractionProgressView } from "./ExtractionProgress";
 import { ProductionStageCard } from "./ProductionStageCard";
 import { ProductionStateTransfer } from "./ProductionStateTransfer";
 
@@ -233,6 +234,10 @@ export function SubjectProduction({
       <progress max={stageList.length} value={completedStages}>
         {completedStages}/{stageList.length}
       </progress>
+
+      {status.current_stage === "extraction" && status.extraction_progress ? (
+        <ExtractionProgressView progress={status.extraction_progress} />
+      ) : null}
 
       <ol className="production-stage-list">
         {stageList.map((stage, i) => (

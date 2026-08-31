@@ -540,6 +540,14 @@ async def test_source_cache_reuses_between_subjects_and_projects_full_for_light(
     assert second["status"] == "success"
     assert len(gateway.calls) == 1
     assert second["model_calls_avoided"] == 1
+    assert first_run.extraction_progress is not None
+    assert first_run.extraction_progress["model_calls"] == 1
+    assert first_run.extraction_progress["cache_hits"] == 0
+    assert first_run.extraction_progress["completed_sources"] == 1
+    assert second_run.extraction_progress is not None
+    assert second_run.extraction_progress["model_calls"] == 0
+    assert second_run.extraction_progress["cache_hits"] == 1
+    assert second_run.extraction_progress["sources"][0]["status"] == "cached"
     # The archived capture is what the model was given, and the checkpoint is
     # recorded under the hash of exactly that content.
     assert "ARCHIVED VERSION" in gateway.prompts[0]
@@ -681,6 +689,10 @@ async def test_retry_uses_source_cache_for_s1_to_s10_and_calls_only_s11(
     assert gateway.source_ids[:11] == [f"S{index}" for index in range(1, 12)]
     assert gateway.source_ids[11:] == ["S11"]
     assert second["model_calls_avoided"] == 10
+    assert retry.extraction_progress is not None
+    assert retry.extraction_progress["completed_sources"] == 11
+    assert retry.extraction_progress["cache_hits"] == 10
+    assert retry.extraction_progress["model_calls"] == 1
 
 
 @pytest.mark.asyncio

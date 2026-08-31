@@ -423,6 +423,155 @@ def plan_q2_extraction_profiles(
 select_q2_extraction_profiles = plan_q2_extraction_profiles
 
 
+_EXTRACTION_PROGRESS_COMPLETED_STATUSES = {"cached", "succeeded"}
+
+
+def _new_extraction_progress(
+    report: ReferenceReport,
+    plans: tuple[Q2SourcePlan, ...],
+) -> dict[str, Any]:
+    plans_by_url = {plan.canonical_url: plan for plan in plans}
+    sources = [
+        {
+            "source_id": source.local_id,
+            "title": source.title,
+            "profile": plans_by_url[source.canonical_url].profile.value,
+            "status": "pending",
+            "ioc_count": 0,
+            "rule_count": 0,
+        }
+        for source in report.sources
+    ]
+    full_total = sum(source["profile"] == ExtractionProfile.FULL.value for source in sources)
+    ioc_rules_total = sum(
+        source["profile"] == ExtractionProfile.IOC_RULES.value for source in sources
+    )
+    return {
+        "total_sources": len(sources),
+        "completed_sources": 0,
+        "full_total": full_total,
+        "full_completed": 0,
+        "ioc_rules_total": ioc_rules_total,
+        "ioc_rules_completed": 0,
+        "cache_hits": 0,
+        "model_calls": 0,
+        "confirmed_iocs": 0,
+        "contextual_iocs": 0,
+        "rules_total": 0,
+        "yara_rules": 0,
+        "sigma_rules": 0,
+        "suricata_rules": 0,
+        "snort_rules": 0,
+        "active_source_id": None,
+        "active_source_title": None,
+        "active_profile": None,
+        "sources": sources,
+    }
+
+
+def _canonical_extraction_progress_counts(extraction: Any) -> dict[str, int]:
+    """Count only deterministic canonical extraction objects."""
+    items = getattr(extraction, "items", ())
+    rules = getattr(extraction, "rules", ())
+    counts = {
+        "confirmed_iocs": sum(
+            item.artifact_type is not None
+            and item.indicator_status is IndicatorStatus.CONFIRMED_IOC
+            for item in items
+        ),
+        "contextual_iocs": sum(
+            item.artifact_type is not None and item.indicator_status is IndicatorStatus.CONTEXTUAL
+            for item in items
+        ),
+        "rules_total": len(rules),
+        "yara_rules": sum(rule.rule_type.value == "yara" for rule in rules),
+        "sigma_rules": sum(rule.rule_type.value == "sigma" for rule in rules),
+        "suricata_rules": sum(rule.rule_type.value == "suricata" for rule in rules),
+        "snort_rules": sum(rule.rule_type.value == "snort" for rule in rules),
+    }
+    return counts
+
+
+def _source_progress_counts(output: Any, source_id: str) -> dict[str, int]:
+    """Count deterministically accepted proposals from one parsed source."""
+    verified = verify_q2_proposals([Q2ProposalSubmission(output=output, source_ids=(source_id,))])
+    counts = _canonical_extraction_progress_counts(verified.canonical)
+    return {
+        **counts,
+        "ioc_count": counts["confirmed_iocs"] + counts["contextual_iocs"],
+        "rule_count": counts["rules_total"],
+    }
+
+
+def _progress_source(
+    progress: dict[str, Any],
+    source_id: str,
+) -> dict[str, Any]:
+    for source in cast(list[dict[str, Any]], progress["sources"]):
+        if source["source_id"] == source_id:
+            return source
+    raise ValueError(f"Unknown extraction progress source {source_id}")
+
+
+def _mark_extraction_source_running(
+    progress: dict[str, Any],
+    source: ParsedSource,
+    plan: Q2SourcePlan,
+) -> None:
+    entry = _progress_source(progress, source.local_id)
+    entry["status"] = "running"
+    progress["active_source_id"] = source.local_id
+    progress["active_source_title"] = source.title
+    progress["active_profile"] = plan.profile.value
+
+
+def _mark_extraction_source_complete(
+    progress: dict[str, Any],
+    source: ParsedSource,
+    *,
+    status: str,
+    counts: dict[str, int],
+    cache_hit: bool = False,
+) -> None:
+    entry = _progress_source(progress, source.local_id)
+    was_complete = entry["status"] in _EXTRACTION_PROGRESS_COMPLETED_STATUSES
+    entry["status"] = status
+    entry["ioc_count"] = counts["ioc_count"]
+    entry["rule_count"] = counts["rule_count"]
+    if not was_complete:
+        progress["confirmed_iocs"] += counts.get("confirmed_iocs", 0)
+        progress["contextual_iocs"] += counts.get("contextual_iocs", 0)
+        progress["rules_total"] += counts.get("rules_total", 0)
+        progress["yara_rules"] += counts.get("yara_rules", 0)
+        progress["sigma_rules"] += counts.get("sigma_rules", 0)
+        progress["suricata_rules"] += counts.get("suricata_rules", 0)
+        progress["snort_rules"] += counts.get("snort_rules", 0)
+    if cache_hit:
+        progress["cache_hits"] += 1
+    progress["completed_sources"] = sum(
+        item["status"] in _EXTRACTION_PROGRESS_COMPLETED_STATUSES
+        for item in cast(list[dict[str, Any]], progress["sources"])
+    )
+    progress["full_completed"] = sum(
+        item["profile"] == ExtractionProfile.FULL.value
+        and item["status"] in _EXTRACTION_PROGRESS_COMPLETED_STATUSES
+        for item in cast(list[dict[str, Any]], progress["sources"])
+    )
+    progress["ioc_rules_completed"] = sum(
+        item["profile"] == ExtractionProfile.IOC_RULES.value
+        and item["status"] in _EXTRACTION_PROGRESS_COMPLETED_STATUSES
+        for item in cast(list[dict[str, Any]], progress["sources"])
+    )
+
+
+def _mark_extraction_source_failed(
+    progress: dict[str, Any],
+    source_id: str,
+    status: str,
+) -> None:
+    _progress_source(progress, source_id)["status"] = status
+
+
 @dataclass(frozen=True, slots=True)
 class _ArchivedSource:
     """The archived capture backing one Q1 source, as held by this system."""
@@ -538,6 +687,31 @@ class ProductionWorkflowOrchestrator:
             run = await runs.get(run_id)
         if run is not None and run.status is SubjectProductionStatus.CANCELLED:
             raise JobCancelledError
+
+    async def _persist_extraction_progress(
+        self,
+        run_id: UUID,
+        progress: dict[str, Any],
+    ) -> None:
+        """Write one compact progress snapshot in its own short transaction."""
+        async with self._uow_factory() as uow:
+            runs = getattr(uow, "subject_production_runs", None)
+            if runs is None:
+                return
+            get_for_update = getattr(runs, "get_for_update", None)
+            get_run = get_for_update or getattr(runs, "get", None)
+            if get_run is None:
+                return
+            persisted = await get_run(run_id)
+            if persisted is None:
+                return
+            persisted.set_extraction_progress(progress)
+            save = getattr(runs, "save", None)
+            if save is not None:
+                await save(persisted)
+            commit = getattr(uow, "commit", None)
+            if commit is not None:
+                await commit()
 
     async def execute_stage(
         self,
@@ -1398,23 +1572,28 @@ class ProductionWorkflowOrchestrator:
                 source_urls=[source.canonical_url for source in report.sources],
                 references_payload_hash=compute_input_hash(reference_report_to_json(report)),
             )
-            reused = await self._reuse_artifact(run, "extraction", input_hash)
-            if reused is not None:
-                return reused
-            if self._model_gateway is None:
-                return {
-                    "stage": "extraction",
-                    "status": "error",
-                    "error": "ModelGateway not configured",
-                }
-            if not policy.external_llm_allowed:
-                return {
-                    "stage": "extraction",
-                    "status": "needs_review",
-                    "error_code": "external_llm_blocked",
-                    "error": "Diffusion policy forbids sending this subject to an external model",
-                }
             subject_title, _ = await self._subject_context(uow, run.subject_id, snapshot)
+            progress = _new_extraction_progress(report, source_plans)
+
+        # The plan is visible before cache lookup or the first provider call.
+        await self._persist_extraction_progress(run.id, progress)
+
+        reused = await self._reuse_artifact(run, "extraction", input_hash)
+        if reused is not None:
+            return reused
+        if self._model_gateway is None:
+            return {
+                "stage": "extraction",
+                "status": "error",
+                "error": "ModelGateway not configured",
+            }
+        if not policy.external_llm_allowed:
+            return {
+                "stage": "extraction",
+                "status": "needs_review",
+                "error_code": "external_llm_blocked",
+                "error": "Diffusion policy forbids sending this subject to an external model",
+            }
 
         submissions: list[Q2ProposalSubmission] = []
         url_raw_parts: list[str] = []
@@ -1431,6 +1610,8 @@ class ProductionWorkflowOrchestrator:
         for source_index, source in enumerate(report.sources):
             plan = plans_by_url[source.canonical_url]
             await self._check_cancellation(run.id, context)
+            _mark_extraction_source_running(progress, source, plan)
+            await self._persist_extraction_progress(run.id, progress)
             # Provenance rule: a result may only be stored under a content hash
             # when the archived content behind that hash is what we send to the
             # model. Without a readable archive the source stays subject-local.
@@ -1473,18 +1654,25 @@ class ProductionWorkflowOrchestrator:
             if cache_status.startswith("cached_") and cached_output is not None:
                 cache_hits += 1
                 model_calls_avoided += 1
-                submissions.append(
-                    Q2ProposalSubmission(
-                        output=cached_output,
-                        source_ids=(source.local_id,),
-                        model_run_id=(
-                            str(cache_checkpoint.model_run_id)
-                            if cache_checkpoint and cache_checkpoint.model_run_id
-                            else None
-                        ),
-                    )
+                source_submission = Q2ProposalSubmission(
+                    output=cached_output,
+                    source_ids=(source.local_id,),
+                    model_run_id=(
+                        str(cache_checkpoint.model_run_id)
+                        if cache_checkpoint and cache_checkpoint.model_run_id
+                        else None
+                    ),
                 )
+                submissions.append(source_submission)
                 completed.append(source.local_id)
+                _mark_extraction_source_complete(
+                    progress,
+                    source,
+                    status="cached",
+                    counts=_source_progress_counts(cached_output, source.local_id),
+                    cache_hit=True,
+                )
+                await self._persist_extraction_progress(run.id, progress)
                 self._diagnostics.record(
                     event="q2.source.cache_hit",
                     run_id=run.id,
@@ -1505,6 +1693,8 @@ class ProductionWorkflowOrchestrator:
                 )
                 continue
             if cache_status == "in_progress":
+                _mark_extraction_source_failed(progress, source.local_id, "needs_review")
+                await self._persist_extraction_progress(run.id, progress)
                 return {
                     "stage": "extraction",
                     "status": "needs_review",
@@ -1566,18 +1756,25 @@ class ProductionWorkflowOrchestrator:
                     if cached_output is not None and cache_checkpoint is not None:
                         cache_hits += 1
                         model_calls_avoided += 1
-                        submissions.append(
-                            Q2ProposalSubmission(
-                                output=cached_output,
-                                source_ids=(source.local_id,),
-                                model_run_id=(
-                                    str(cache_checkpoint.model_run_id)
-                                    if cache_checkpoint.model_run_id
-                                    else None
-                                ),
-                            )
+                        source_submission = Q2ProposalSubmission(
+                            output=cached_output,
+                            source_ids=(source.local_id,),
+                            model_run_id=(
+                                str(cache_checkpoint.model_run_id)
+                                if cache_checkpoint.model_run_id
+                                else None
+                            ),
                         )
+                        submissions.append(source_submission)
                         completed.append(source.local_id)
+                        _mark_extraction_source_complete(
+                            progress,
+                            source,
+                            status="cached",
+                            counts=_source_progress_counts(cached_output, source.local_id),
+                            cache_hit=True,
+                        )
+                        await self._persist_extraction_progress(run.id, progress)
                         self._diagnostics.record(
                             event="q2.source.cache_hit",
                             run_id=run.id,
@@ -1592,6 +1789,8 @@ class ProductionWorkflowOrchestrator:
                             cache_status=cache_status,
                         )
                         continue
+                    _mark_extraction_source_failed(progress, source.local_id, "needs_review")
+                    await self._persist_extraction_progress(run.id, progress)
                     return {
                         "stage": "extraction",
                         "status": "needs_review",
@@ -1623,6 +1822,8 @@ class ProductionWorkflowOrchestrator:
                 full_calls += 1
             else:
                 light_calls += 1
+            progress["model_calls"] += 1
+            await self._persist_extraction_progress(run.id, progress)
             self._diagnostics.record(
                 event="q2.source.started",
                 run_id=run.id,
@@ -1711,14 +1912,20 @@ class ProductionWorkflowOrchestrator:
                         raw=raw,
                         output=parsed.value,
                     )
-                submissions.append(
-                    Q2ProposalSubmission(
-                        output=parsed.value,
-                        source_ids=(source.local_id,),
-                        model_run_id=str(execution.run.id),
-                    )
+                source_submission = Q2ProposalSubmission(
+                    output=parsed.value,
+                    source_ids=(source.local_id,),
+                    model_run_id=str(execution.run.id),
                 )
+                submissions.append(source_submission)
                 completed.append(source.local_id)
+                _mark_extraction_source_complete(
+                    progress,
+                    source,
+                    status="succeeded",
+                    counts=_source_progress_counts(parsed.value, source.local_id),
+                )
+                await self._persist_extraction_progress(run.id, progress)
                 url_raw_parts.append(raw)
                 warnings.extend(parsed.warnings)
                 self._diagnostics.record(
@@ -1747,6 +1954,12 @@ class ProductionWorkflowOrchestrator:
                 )
                 if cache_checkpoint is not None:
                     await self._fail_source_extraction(cache_checkpoint)
+                _mark_extraction_source_failed(
+                    progress,
+                    source.local_id,
+                    "needs_review" if classification.status == "needs_review" else "failed",
+                )
+                await self._persist_extraction_progress(run.id, progress)
                 error = str(exc)[:1000]
                 duration_ms = int((time.monotonic() - started_at) * 1000)
                 failed_attempts.append(source.local_id)
@@ -1865,6 +2078,10 @@ class ProductionWorkflowOrchestrator:
         )
         verification = verify_q2_proposals(submissions)
         extraction = verification.canonical
+        progress.update(_canonical_extraction_progress_counts(extraction))
+        progress["active_source_id"] = None
+        progress["active_source_title"] = None
+        progress["active_profile"] = None
         status_totals = {
             status.value: sum(item.indicator_status is status for item in extraction.items)
             for status in IndicatorStatus
@@ -1906,6 +2123,7 @@ class ProductionWorkflowOrchestrator:
                 ],
             },
         )
+        await self._persist_extraction_progress(run.id, progress)
         return {
             "stage": "extraction",
             "status": "success",

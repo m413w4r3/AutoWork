@@ -8,6 +8,41 @@ export type SubjectProductionStage =
 
 export type ProductionBatchPhase = "initial" | "recovery" | "review";
 
+export type ExtractionProgressProfile = "full" | "ioc_rules";
+export type ExtractionProgressSourceStatus =
+  "pending" | "running" | "cached" | "succeeded" | "needs_review" | "failed";
+
+export interface ExtractionProgressSource {
+  source_id: string;
+  title: string;
+  profile: ExtractionProgressProfile;
+  status: ExtractionProgressSourceStatus;
+  ioc_count: number;
+  rule_count: number;
+}
+
+export interface ExtractionProgress {
+  total_sources: number;
+  completed_sources: number;
+  full_total: number;
+  full_completed: number;
+  ioc_rules_total: number;
+  ioc_rules_completed: number;
+  cache_hits: number;
+  model_calls: number;
+  confirmed_iocs: number;
+  contextual_iocs: number;
+  rules_total: number;
+  yara_rules: number;
+  sigma_rules: number;
+  suricata_rules: number;
+  snort_rules: number;
+  active_source_id: string | null;
+  active_source_title: string | null;
+  active_profile: ExtractionProgressProfile | null;
+  sources: ExtractionProgressSource[];
+}
+
 type ProductionBatchStatus =
   "queued" | "running" | "completed" | "completed_with_issues" | "cancelled";
 
@@ -49,6 +84,7 @@ export interface ProductionStatus {
   error_code: string | null;
   error_message: string | null;
   error_details: Record<string, unknown> | null;
+  extraction_progress?: ExtractionProgress | null;
   /** Parser recoveries worth showing, never blocking. */
   warnings: string[];
   stages: Record<string, StageStatus>;
@@ -71,6 +107,7 @@ export interface BatchItemDetail {
   auto_recovery_count: number;
   error_code: string | null;
   error_message: string | null;
+  extraction_progress?: ExtractionProgress | null;
 }
 
 export interface BatchStatus {

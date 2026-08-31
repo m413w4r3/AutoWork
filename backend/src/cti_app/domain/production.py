@@ -403,6 +403,7 @@ class SubjectProductionRun:
     error_code: str | None = None
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
+    extraction_progress: dict[str, Any] | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
     id: UUID = field(default_factory=uuid4)
@@ -436,6 +437,17 @@ class SubjectProductionRun:
         successor = next_stage(self.current_stage)
         if successor is not None:
             self.current_stage = successor
+        self.updated_at = now or datetime.now(UTC)
+        self.version += 1
+
+    def set_extraction_progress(
+        self,
+        progress: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Persist the current compact Q2 source-progress snapshot."""
+        self.extraction_progress = progress
         self.updated_at = now or datetime.now(UTC)
         self.version += 1
 

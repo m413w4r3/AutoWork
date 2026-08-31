@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.domain.production import SubjectProductionStage, SubjectProductionStatus
@@ -29,6 +29,7 @@ class BatchStatusItem:
     auto_recovery_count: int
     error_code: str | None
     error_message: str | None
+    extraction_progress: dict[str, Any] | None = None
 
 
 class BatchStatusReadRepository(Protocol):
