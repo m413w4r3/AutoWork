@@ -13,7 +13,12 @@ from typing import Any, AsyncIterator, Callable, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from bridge.contracts import ChatRequest, ResponseRequest, RunControls
+from bridge.contracts import (
+    BridgeBrowserTarget,
+    ChatRequest,
+    ResponseRequest,
+    RunControls,
+)
 from bridge.generation import (
     NeedsReviewError,
     UpstreamError,
@@ -37,6 +42,38 @@ from bridge.ui import (
 )
 
 logger = logging.getLogger("chatgpt_bridge")
+
+
+def _browser_target_for_run(
+    run_id: str, conversation: object | None
+) -> BridgeBrowserTarget | None:
+    """Construit une seule identité Chrome pour une génération stateless."""
+    if conversation is not None:
+        return None
+    return BridgeBrowserTarget(id=f"bridge-run-{run_id}")
+
+
+async def _release_browser_target(
+    bridge: Bridge, target: BridgeBrowserTarget | None, run_id: str
+) -> None:
+    if target is None:
+        return
+    try:
+        await bridge.send(
+            {
+                "type": "browser_target_release",
+                "id": f"{run_id}:release",
+                "browser_target": target.model_dump(mode="json"),
+                "run_id": run_id,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - best effort après l'erreur initiale
+        logger.warning(
+            "bridge_browser_target_release_failed bridge_run_id=%s target_id=%s error=%s",
+            run_id,
+            target.id,
+            type(exc).__name__,
+        )
 
 
 def _upstream_error_detail(exc: UpstreamError) -> dict[str, Any]:
@@ -106,6 +143,7 @@ class OpenAIRoutes:
         req: ResponseRequest,
         controls: RunControls,
         allow_unverified_model: bool,
+        browser_target: BridgeBrowserTarget | None,
     ) -> None:
         self.background_responses[response_id] = _response_body(
             response_id, req, status="in_progress"
@@ -117,6 +155,13 @@ class OpenAIRoutes:
                     controls,
                     allow_unverified_model=allow_unverified_model,
                     conversation=req.conversation,
+                    browser_target=browser_target,
+                )
+                logger.info(
+                    "bridge_run_phase bridge_run_id=%s phase=ui_controls_verified target_id=%s tab_id=%s",
+                    response_id,
+                    report.target_id,
+                    report.tab_id,
                 )
                 chat_request = _response_chat_request(req)
                 conversation_result: dict = {}
@@ -130,6 +175,8 @@ class OpenAIRoutes:
                         chat_request,
                         _BackgroundRequest(),
                         conversation=req.conversation,
+                        browser_target=browser_target,
+                        expected_tab_id=report.tab_id,
                         conversation_result=conversation_result,
                         extension_metadata=extension_metadata,
                     )
@@ -144,6 +191,7 @@ class OpenAIRoutes:
                 extension_metadata=extension_metadata or None,
             )
         except HTTPException as exc:
+            await _release_browser_target(self.bridge, browser_target, response_id)
             # Un contrôle d'interface refusé est un diagnostic actionnable, pas
             # une fuite : on le rend tel quel, contrairement aux erreurs de
             # génération.
@@ -152,6 +200,7 @@ class OpenAIRoutes:
             )
             print(f"⚠️  Réponse de fond {response_id} refusée : {exc.detail}")
         except Exception as exc:  # noqa: BLE001 - erreur publique nettoyée ci-dessous
+            await _release_browser_target(self.bridge, browser_target, response_id)
             self.background_responses[response_id] = _response_body(
                 response_id,
                 req,
@@ -186,6 +235,7 @@ class OpenAIRoutes:
             )
         controls = controls or RunControls()
         response_id = response_id or f"resp_{uuid.uuid4().hex[:24]}"
+        browser_target = _browser_target_for_run(response_id, req.conversation)
         # Valide immédiatement outils, entrées et schéma, avant de mettre en file.
         _response_chat_request(req)
         if req.background:
@@ -194,7 +244,11 @@ class OpenAIRoutes:
             )
             self.background_tasks[response_id] = asyncio.create_task(
                 self._execute_background_response(
-                    response_id, req, controls, allow_unverified_model
+                    response_id,
+                    req,
+                    controls,
+                    allow_unverified_model,
+                    browser_target,
                 )
             )
             return self.background_responses[response_id]
@@ -204,16 +258,28 @@ class OpenAIRoutes:
         queued_at = time.monotonic()
         async with self.bridge.slot:
             logger.info(
-                "bridge_run_phase bridge_run_id=%s phase=ui_controls queue_wait_ms=%s",
+                "bridge_run_phase bridge_run_id=%s phase=ui_controls target_id=%s queue_wait_ms=%s",
                 response_id,
+                browser_target.id if browser_target else None,
                 int((time.monotonic() - queued_at) * 1000),
             )
-            report = await prepare_run(
-                self.bridge,
-                controls,
-                allow_unverified_model=allow_unverified_model,
-                conversation=req.conversation,
-            )
+            try:
+                report = await prepare_run(
+                    self.bridge,
+                    controls,
+                    allow_unverified_model=allow_unverified_model,
+                    conversation=req.conversation,
+                    browser_target=browser_target,
+                )
+                logger.info(
+                    "bridge_run_phase bridge_run_id=%s phase=ui_controls_verified target_id=%s tab_id=%s",
+                    response_id,
+                    report.target_id,
+                    report.tab_id,
+                )
+            except Exception:
+                await _release_browser_target(self.bridge, browser_target, response_id)
+                raise
             chat_request = _response_chat_request(req)
             try:
                 conversation_result: dict = {}
@@ -227,13 +293,17 @@ class OpenAIRoutes:
                         chat_request,
                         http_req,
                         conversation=req.conversation,
+                        browser_target=browser_target,
+                        expected_tab_id=report.tab_id,
                         conversation_result=conversation_result,
                         extension_metadata=extension_metadata,
                     )
                 ]
             except NeedsReviewError:
+                await _release_browser_target(self.bridge, browser_target, response_id)
                 raise
             except UpstreamError as exc:
+                await _release_browser_target(self.bridge, browser_target, response_id)
                 raise HTTPException(
                     status_code=502,
                     detail=_upstream_error_detail(exc),
@@ -284,6 +354,7 @@ class OpenAIRoutes:
         cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         prompt_tokens = _tokens(parse_messages(req.messages)[0])
+        browser_target = _browser_target_for_run(cid, None)
 
         if req.stream:
             async def event_stream() -> AsyncIterator[str]:
@@ -295,10 +366,16 @@ class OpenAIRoutes:
                     )
                     try:
                         async for text in run_generation(
-                            self.bridge, self.registry, cid, req, http_req
+                            self.bridge,
+                            self.registry,
+                            cid,
+                            req,
+                            http_req,
+                            browser_target=browser_target,
                         ):
                             yield sse_chunk(cid, req.model, created, {"content": text}, None)
                     except UpstreamError as exc:
+                        await _release_browser_target(self.bridge, browser_target, cid)
                         err = {
                             "error": {
                                 **_upstream_error_detail(exc),
@@ -321,9 +398,17 @@ class OpenAIRoutes:
             try:
                 parts = [
                     text
-                    async for text in run_generation(self.bridge, self.registry, cid, req, http_req)
+                    async for text in run_generation(
+                        self.bridge,
+                        self.registry,
+                        cid,
+                        req,
+                        http_req,
+                        browser_target=browser_target,
+                    )
                 ]
             except UpstreamError as exc:
+                await _release_browser_target(self.bridge, browser_target, cid)
                 raise HTTPException(
                     status_code=502, detail=_upstream_error_detail(exc)
                 ) from exc

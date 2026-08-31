@@ -16,7 +16,7 @@ import pytest
 from conftest import request_with_key
 
 from bridge.app import BridgeApplication
-from bridge.contracts import ChatRequest
+from bridge.contracts import BridgeBrowserTarget, ChatRequest
 from bridge.generation import UpstreamError, run_generation
 
 
@@ -114,6 +114,68 @@ async def test_idle_timeout_does_not_send_abort_to_extension(
     assert [msg for msg in silent.sent if msg.get("type") == "prompt"], (
         "Le prompt aurait dû être transmis à l'extension"
     )
+
+
+async def test_stateless_generation_carries_one_browser_target(
+    runtime: BridgeApplication,
+) -> None:
+    silent = SilentExtension()
+    runtime.bridge.ws = silent
+    chat_request = ChatRequest(
+        messages=[{"role": "user", "content": "test"}],
+        new_chat=True,
+    )
+    target = BridgeBrowserTarget(id="bridge-attempt-1")
+    http_req = request_with_key("target-contract")
+
+    async def never_disconnects() -> dict[str, Any]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    http_req._receive = never_disconnects
+
+    old_idle = run_generation.__globals__["IDLE_TIMEOUT"]
+    run_generation.__globals__["IDLE_TIMEOUT"] = 0.01
+    try:
+        with pytest.raises(UpstreamError):
+            async for _ in run_generation(
+                runtime.bridge,
+                runtime.registry,
+                "target-contract",
+                chat_request,
+                http_req,
+                browser_target=target,
+            ):
+                pass
+    finally:
+        run_generation.__globals__["IDLE_TIMEOUT"] = old_idle
+
+    prompt = next(msg for msg in silent.sent if msg.get("type") == "prompt")
+    assert prompt["browser_target"] == target.model_dump(mode="json")
+    assert prompt["conversation"] is None
+
+
+async def test_stateless_new_chat_without_browser_target_fails_pre_submission(
+    runtime: BridgeApplication,
+) -> None:
+    runtime.bridge.ws = SilentExtension()
+    chat_request = ChatRequest(
+        messages=[{"role": "user", "content": "test"}],
+        new_chat=True,
+    )
+
+    with pytest.raises(UpstreamError) as caught:
+        async for _ in run_generation(
+            runtime.bridge,
+            runtime.registry,
+            "missing-target",
+            chat_request,
+            request_with_key("missing-target"),
+        ):
+            pass
+
+    assert caught.value.code == "bridge_browser_target_required"
+    assert caught.value.submission_state == "pre_submission"
 
 
 class HeartbeatingExtension:

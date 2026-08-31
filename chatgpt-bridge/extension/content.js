@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "22";
+const VERSION = "23";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -37,10 +37,6 @@ const SELECTORS = {
   assistant: "[data-message-author-role='assistant']",
   user: "[data-message-author-role='user']",
   markdown: ".markdown",
-  newChat: [
-    "a[data-testid='create-new-chat-button']",
-    "button[data-testid='create-new-chat-button']",
-  ],
   // Conteneurs de la phase de réflexion : leur texte n'est pas la réponse.
   reasoning: [
     "[data-testid*='thinking']",
@@ -1100,6 +1096,14 @@ async function applyControls(controls) {
 async function handleUi(msg) {
   try {
     console.log("bridge_run_phase", { phase: "ui_controls" });
+    if (msg.browser_target) {
+      if (!isBrowserTarget(msg.browser_target)) {
+        throw new BridgeError("bridge_browser_target_required", "browser_target invalide");
+      }
+      // Une target réservée peut avoir été naviguée dans ChatGPT entre deux
+      // paquets : aucun contrôle ne doit alors réussir sur une surface normale.
+      await ensureTemporaryChat();
+    }
     const applied =
       msg.type === "ui_control"
         ? await applyControls(msg.controls || {})
@@ -1488,12 +1492,28 @@ async function ensureTemporaryChat() {
   throw new BridgeError("bridge_ui_timeout", "composer Temporary Chat introuvable");
 }
 
+function isBrowserTarget(value) {
+  if (!value || typeof value !== "object") return false;
+  const keys = Object.keys(value).sort();
+  return (
+    keys.length === 2 &&
+    keys[0] === "id" &&
+    keys[1] === "kind" &&
+    value.kind === "temporary_chat_run" &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    value.id.length <= 255 &&
+    /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value.id)
+  );
+}
+
 async function handlePrompt({
   id,
   prompt,
   new_chat: newChat,
   files,
   conversation,
+  browser_target: browserTarget,
 }) {
   if (currentJob) {
     // L'observation post-clic garde l'onglet réservé : un second prompt ne doit
@@ -1527,33 +1547,30 @@ async function handlePrompt({
 
   try {
     console.log("bridge_run_phase", { phase: "prompt_received" });
-    const willClickNewChat = Boolean(newChat && !conversation);
     console.log("bridge_prompt_navigation", {
       conversation_mode: conversation?.mode ?? null,
       has_conversation: Boolean(conversation),
       requested_new_chat: Boolean(newChat),
-      will_click_new_chat: willClickNewChat,
+      browser_target_id: browserTarget?.id ?? null,
     });
+    if (!conversation && newChat && !browserTarget) {
+      throw new BridgeError(
+        "bridge_browser_target_required",
+        "un prompt stateless/new_chat exige une browser_target dédiée",
+      );
+    }
+    if (browserTarget && !isBrowserTarget(browserTarget)) {
+      throw new BridgeError("bridge_browser_target_required", "browser_target invalide");
+    }
     if (newChat && conversation) {
       console.warn("conversation_new_chat_ignored", {
         conversation_id: conversation.id,
         mode: conversation.mode,
       });
     }
-    if (willClickNewChat) {
-      const link = $(SELECTORS.newChat);
-      if (link) {
-        link.click();
-      } else {
-        throw new Error("bouton nouveau chat introuvable");
-      }
-      await sleep(1200);
-    }
-
-    // Toute conversation liée au bridge (fresh, continue, ou newChat
-    // explicite) doit être un Temporary Chat, positivement confirmé avant
-    // Send — jamais best-effort. Voir ensureTemporaryChat() ci-dessus.
-    if (conversation || newChat) await ensureTemporaryChat();
+    // Toute cible liée au bridge (conversation ou browser_target) doit être
+    // positivement confirmée Temporary Chat avant Send — jamais best-effort.
+    if (conversation || newChat || browserTarget) await ensureTemporaryChat();
 
     // CONTINUE : le tour précédent attendu doit exister exactement dans cet
     // onglet, par identité stable — jamais par index ou par comptage — avant
@@ -1702,6 +1719,7 @@ async function handlePrompt({
         message: err.message,
         phase: job.phase,
         diagnostics: err.diagnostics || null,
+        target_id: browserTarget?.id ?? null,
         conversation: conversation
           ? { id: conversation.id, mode: conversation.mode }
           : null,

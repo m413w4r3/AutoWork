@@ -15,6 +15,7 @@ from fastapi import HTTPException, Request
 
 from bridge.config import IDLE_TIMEOUT, TOTAL_TIMEOUT
 from bridge.contracts import (
+    BridgeBrowserTarget,
     BridgeConversationTarget,
     ChatMessage,
     ChatRequest,
@@ -294,10 +295,26 @@ async def run_generation(
     http_req: Request,
     *,
     conversation: Optional[BridgeConversationTarget] = None,
+    browser_target: Optional[BridgeBrowserTarget] = None,
+    expected_tab_id: Optional[int] = None,
     conversation_result: Optional[dict] = None,
     extension_metadata: Optional[dict] = None,
 ) -> AsyncIterator[str]:
     """Envoie le prompt et restitue uniquement le snapshot final autoritaire."""
+    if conversation is not None and browser_target is not None:
+        raise UpstreamError(
+            "conversation et browser_target sont mutuellement exclusifs",
+            code="bridge_browser_target_required",
+            phase="pre_submission",
+            submission_state="pre_submission",
+        )
+    if conversation is None and req.new_chat and browser_target is None:
+        raise UpstreamError(
+            "un prompt stateless/new_chat exige une browser_target dédiée",
+            code="bridge_browser_target_required",
+            phase="pre_submission",
+            submission_state="pre_submission",
+        )
     prompt, medias = parse_messages(req.messages)
     # Médias extraits des blocs OpenAI + pièces jointes du champ maison `files`.
     attachments = medias + list(req.files)
@@ -311,7 +328,12 @@ async def run_generation(
     submission_state = "pre_submission"
     submission_phase = "pre_submission"
     try:
-        logger.info("bridge_run_phase bridge_run_id=%s phase=submission", request_id)
+        logger.info(
+            "bridge_run_phase bridge_run_id=%s phase=submission target_id=%s tab_id=%s",
+            request_id,
+            browser_target.id if browser_target else None,
+            expected_tab_id,
+        )
         submission_state = "submission_attempted"
         submission_phase = "submission_confirmation"
         try:
@@ -323,6 +345,9 @@ async def run_generation(
                     "new_chat": req.new_chat,
                     "files": [f.model_dump() for f in attachments],
                     "conversation": conversation.model_dump(mode="json") if conversation else None,
+                    "browser_target": (
+                        browser_target.model_dump(mode="json") if browser_target else None
+                    ),
                 }
             )
         except Exception as exc:  # noqa: BLE001 - delivery is ambiguous after send
@@ -378,6 +403,61 @@ async def run_generation(
                 submission_state=submission_state,
             )
 
+        routed_tab_id = expected_tab_id
+
+        def verify_routing(packet: dict) -> None:
+            """Refuse tout paquet stateless provenant d'un autre onglet."""
+            nonlocal routed_tab_id
+            if browser_target is None:
+                return
+            # Le premier ACK est émis avant la résolution de l'onglet ; l'ACK
+            # routé suivant porte le binding complet et devient obligatoire.
+            if packet.get("type") == "ack" and packet.get("state") == "received":
+                return
+            if packet.get("target_id") != browser_target.id:
+                if (
+                    packet.get("type") == "error"
+                    and packet.get("submission_state") == "pre_submission"
+                    and packet.get("target_id") is None
+                ):
+                    return
+                raise UpstreamError(
+                    "paquet reçu pour une autre browser_target",
+                    code="bridge_tab_mismatch",
+                    phase=submission_phase,
+                    submission_state=submission_state,
+                    details={"target_id": browser_target.id},
+                )
+            tab_id = packet.get("tab_id")
+            if (
+                packet.get("type") == "error"
+                and packet.get("submission_state") == "pre_submission"
+                and tab_id is None
+            ):
+                return
+            if not isinstance(tab_id, int) or tab_id < 0:
+                raise UpstreamError(
+                    "paquet stateless sans tab_id routé",
+                    code="bridge_tab_mismatch",
+                    phase=submission_phase,
+                    submission_state=submission_state,
+                    details={"target_id": browser_target.id},
+                )
+            if routed_tab_id is None:
+                routed_tab_id = tab_id
+            elif routed_tab_id != tab_id:
+                raise UpstreamError(
+                    "le tab_id du run stateless a changé en cours de route",
+                    code="bridge_tab_mismatch",
+                    phase=submission_phase,
+                    submission_state=submission_state,
+                    details={
+                        "target_id": browser_target.id,
+                        "expected_tab_id": routed_tab_id,
+                        "reported_tab_id": tab_id,
+                    },
+                )
+
         while True:
             if await http_req.is_disconnected():
                 raise UpstreamError(
@@ -414,6 +494,7 @@ async def run_generation(
             last_packet_at = time.monotonic()
 
             kind = packet.get("type")
+            verify_routing(packet)
             if kind == "heartbeat":
                 submission_phase = "generation"
                 if not generation_announced:
@@ -636,6 +717,8 @@ async def run_generation(
                     "bridge_extension_disconnected",
                     "bridge_unreachable",
                     "bridge_rate_limited",
+                    "bridge_browser_target_required",
+                    "bridge_tab_mismatch",
                     "bridge_server_error",
                 }:
                     code = "bridge_server_error"

@@ -20,9 +20,13 @@ def test_extension_reserves_request_before_real_send_trigger() -> None:
     assert content.index("await claimPrompt(id)") < content.index("const submissionMethod = triggerComposerSubmission(composer, sendBtn)")
     assert "submittedRequestIds" in content
     assert "bridgeConversationRegistry" in background
-    assert (
-        "msg.conversation ? resolveConversationTab(msg.conversation) : findChatTab()" in background
-    )
+    assert "bridgeBrowserTargetRegistry" in background
+    route_start = background.index("async function routeTab(")
+    route_body = background[route_start : background.index("\n\n/** Envoie", route_start)]
+    assert "if (msg.conversation) return resolveConversationTab(msg.conversation);" in route_body
+    assert "if (msg.browser_target) return resolveBrowserTarget(msg.browser_target);" in route_body
+    assert "if (msg.type === \"prompt\")" in route_body
+    assert "return findChatTab();" in route_body
     # P0 : le heartbeat est un signal de liveness de l'extension. Il doit être
     # émis avant tout `continue` dépendant du DOM, sinon une phase de recherche
     # web qui remplace le tour assistant provoque un faux idle timeout.
@@ -31,7 +35,7 @@ def test_extension_reserves_request_before_real_send_trigger() -> None:
     assert 'type: "chunk"' not in content
     assert "text: serialized.text" in content
     send_start = background.index("async function sendToTab(")
-    send_end = background.index("\nasync function cleanupFreshReservationAfterDeliveryFailure", send_start)
+    send_end = background.index("\nasync function cleanupReservationAfterDeliveryFailure", send_start)
     send_body = background[send_start:send_end]
     assert "chrome.scripting.executeScript" not in send_body
     assert send_body.count("chrome.tabs.sendMessage") == 1
@@ -59,6 +63,15 @@ def test_conversation_registry_lives_in_session_storage_only() -> None:
     assert 'chrome.storage.session.set({\n    bridgeConversationRegistry' in background
     # The live registry must never be persisted to chrome.storage.local.
     assert "bridgeConversationRegistry" not in _local_storage_calls(background)
+
+
+def test_stateless_target_registry_lives_in_session_storage_only() -> None:
+    root = Path(__file__).parents[1] / "extension"
+    background = (root / "background.js").read_text()
+
+    assert 'chrome.storage.session\n  .get("bridgeBrowserTargetRegistry")' in background
+    assert "bridgeBrowserTargetRegistry: Object.fromEntries" in background
+    assert "bridgeBrowserTargetRegistry" not in _local_storage_calls(background)
 
 
 def _local_storage_calls(source: str) -> str:
@@ -111,3 +124,16 @@ def test_no_locator_based_identity_concepts_remain() -> None:
     assert "verifiedLocator" not in content
     assert "window.location.href !== conversation.external_locator" not in content
     assert "locator de conversation non attribué" not in content
+
+
+def test_stateless_prompt_never_uses_new_chat_dom_click() -> None:
+    root = Path(__file__).parents[1] / "extension"
+    background = (root / "background.js").read_text()
+    content = (root / "content.js").read_text()
+
+    assert "SELECTORS.newChat" not in content
+    assert "will_click_new_chat" not in content
+    route_start = background.index("async function routeTab(")
+    route_end = background.index("\n\n/** Envoie", route_start)
+    route_body = background[route_start:route_end]
+    assert route_body.index('if (msg.type === "prompt")') < route_body.index("return findChatTab();")

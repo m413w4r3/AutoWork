@@ -362,6 +362,54 @@ function useVirtualClock(window) {
     assert.equal(sent.some((message) => message.type === "done"), true, "le chemin comportemental doit terminer");
   }
 
+  // 10b. Un run stateless reçoit sa cible déjà réservée : il n'a aucune
+  // autorisation de fabriquer un Temporary Chat par clic DOM.
+  {
+    const body = `<form id="composer-form">
+      <textarea data-id="prompt"></textarea>
+      <button aria-disabled="false" data-testid="send-button">Send</button>
+    </form><button data-testid="create-new-chat-button">New chat</button>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    let newChatClicks = 0;
+    let submitEvents = 0;
+    window.document.querySelector("button[data-testid='create-new-chat-button']").addEventListener("click", () => {
+      newChatClicks += 1;
+    });
+    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      window.document.querySelector("textarea[data-id='prompt']").value = "";
+      window.document.body.insertAdjacentHTML("beforeend", `
+        <article data-testid="conversation-turn-stateless">
+          <div data-message-author-role="assistant" data-message-id="msg-stateless">
+            <div class="markdown"><p>réponse finale</p></div>
+          </div>${copyButton}
+        </article>`);
+    });
+    await run(`handlePrompt({ id: "req-stateless", prompt: "bonjour", new_chat: true, browser_target: { kind: "temporary_chat_run", id: "target-stateless" } })`);
+    assert.equal(newChatClicks, 0, "un run stateless ne doit jamais cliquer New Chat");
+    assert.equal(submitEvents, 1, "le run stateless doit soumettre une seule fois");
+    assert.equal(sent.some((message) => message.type === "error"), false);
+    assert.equal(sent.some((message) => message.type === "done"), true);
+  }
+
+  // 10c. La surface stateless sans browser_target est une erreur PRE_SUBMISSION.
+  {
+    const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
+      <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    await run(`handlePrompt({ id: "req-no-target", prompt: "bonjour", new_chat: true })`);
+    const error = sent.find((message) => message.type === "error");
+    assert.equal(error.code, "bridge_browser_target_required");
+    assert.equal(error.phase, "pre_submission");
+    assert.equal(error.submission_state, "pre_submission");
+  }
+
   // 10a. Le tour utilisateur est la preuve la plus forte : le composer peut
   // rester rempli, le Stop peut être hors formulaire et l'assistant peut ne
   // pas encore être apparu.
@@ -569,6 +617,7 @@ function useVirtualClock(window) {
     const source = fs.readFileSync(path.join(EXTENSION, "content.js"), "utf8");
     assert.equal(source.includes("toggle.click()"), false, "le bridge ne doit jamais cliquer le toggle Temporary");
     assert.equal(source.includes("temporaryChatCheckedIcon"), false, "l'ancien signal SVG ne doit plus exister");
+    assert.equal(source.includes("SELECTORS.newChat"), false, "New Chat ne doit plus faire partie du chemin stateless");
     assert.ok(
       !source.includes("locator de conversation non attribué"),
       "l'ancienne attente de locator de conversation ne doit plus exister",

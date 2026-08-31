@@ -375,6 +375,117 @@ async function main() {
     assert.equal(await run('conversationRegistry.get("conv-A").state'), "submitted");
   }
 
+  // 12. Stateless A, sans onglet initial : une seule target réserve un seul
+  // Temporary Chat, et UI preflight -> contrôle -> prompt restent sur ce tab.
+  {
+    const mock = makeChromeMock();
+    const sentToTabs = [];
+    mock.chrome.tabs.sendMessage = async (tabId, msg) => {
+      sentToTabs.push({ tabId, msg });
+      if (msg.type === "ui_state" || msg.type === "ui_control") {
+        return { ok: true, state: {}, applied: {} };
+      }
+      return {};
+    };
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-A" };
+    await run(`handleUiRequest(${JSON.stringify({ type: "ui_state", id: "ui-A", browser_target: target })})`);
+    await run(`handleUiRequest(${JSON.stringify({ type: "ui_control", id: "control-A", controls: { web_search: true }, browser_target: target })})`);
+    await run(`handlePrompt(${JSON.stringify({ type: "prompt", id: "run-A", prompt: "bonjour", new_chat: true, browser_target: target })})`);
+
+    assert.equal(mock.tabsById.size, 1, "un run stateless ne doit créer qu'un Temporary Chat");
+    const tab = [...mock.tabsById.values()][0];
+    assert.equal(tab.url, "https://chatgpt.com/?temporary-chat=true");
+    assert.equal(tab.active, false);
+    assert.deepEqual(
+      sentToTabs.map(({ tabId }) => tabId),
+      [tab.id, tab.id, tab.id],
+      "ui_state, ui_control et prompt doivent partager le tab exact",
+    );
+    assert.ok(sentToTabs.every(({ msg }) => msg.browser_target?.id === target.id));
+    assert.equal(sentToTabs.filter(({ msg }) => msg.type === "prompt").length, 1);
+
+    const listener = mock.messageListeners[0];
+    listener(
+      { type: "done", id: "run-A", text: "ok", conversation: null, metadata: { output_chars: 2 } },
+      { tab: { id: tab.id, windowId: tab.windowId } },
+      () => {},
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    const doneEvent = await run('enAttente.find((message) => message.type === "done" && message.id === "run-A")');
+    assert.equal(doneEvent.target_id, target.id);
+    assert.equal(doneEvent.tab_id, tab.id, "le submit/fin doit rester sur le tab du prompt");
+    assert.equal(mock.tabsById.size, 0, "done doit fermer le Temporary Chat exact");
+    assert.equal(await run('browserTargetRegistry.has("target-A")'), false);
+  }
+
+  // 13. Un onglet normal préexistant reste intact : le run stateless ouvre sa
+  // propre target et ne lui envoie ni contrôle ni prompt.
+  {
+    const mock = makeChromeMock();
+    const normal = await mock.chrome.tabs.create({ url: "https://chatgpt.com/", active: true });
+    const sentToTabs = [];
+    mock.chrome.tabs.sendMessage = async (tabId, msg) => {
+      sentToTabs.push({ tabId, msg });
+      return msg.type === "ui_state" || msg.type === "ui_control" ? { ok: true, state: {}, applied: {} } : {};
+    };
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-B" };
+    await run(`handleUiRequest(${JSON.stringify({ type: "ui_control", id: "control-B", controls: { web_search: true }, browser_target: target })})`);
+    await run(`handlePrompt(${JSON.stringify({ type: "prompt", id: "run-B", prompt: "bonjour", new_chat: true, browser_target: target })})`);
+
+    assert.equal(mock.tabsById.size, 2);
+    const temporary = [...mock.tabsById.values()].find((tab) => tab.id !== normal.id);
+    assert.equal(temporary.url, "https://chatgpt.com/?temporary-chat=true");
+    assert.ok(sentToTabs.every(({ tabId }) => tabId === temporary.id));
+    assert.ok(mock.tabsById.has(normal.id), "l'onglet normal ne doit pas être fermé");
+    assert.equal(normal.url, "https://chatgpt.com/");
+  }
+
+  // 14. Deux targets stateless sont deux bindings indépendants, même si leurs
+  // onglets partagent exactement la même URL.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const targetA = { kind: "temporary_chat_run", id: "target-C-A" };
+    const targetB = { kind: "temporary_chat_run", id: "target-C-B" };
+    const tabA = await run(`resolveBrowserTarget(${JSON.stringify(targetA)})`);
+    const tabB = await run(`resolveBrowserTarget(${JSON.stringify(targetB)})`);
+    assert.notEqual(tabA.id, tabB.id);
+    assert.equal(await run('browserTargetRegistry.get("target-C-A").tab_id'), tabA.id);
+    assert.equal(await run('browserTargetRegistry.get("target-C-B").tab_id'), tabB.id);
+  }
+
+  // 15. PRE_SUBMISSION supprime la réservation exacte ; un nouvel id crée une
+  // nouvelle target et ne réanime jamais l'ancien onglet.
+  {
+    const mock = makeChromeMock();
+    mock.chrome.tabs.sendMessage = async () => ({});
+    const { run } = loadBackground(mock.chrome);
+    const targetA = { kind: "temporary_chat_run", id: "target-D-A" };
+    await run(`handlePrompt(${JSON.stringify({ type: "prompt", id: "run-D-A", prompt: "bonjour", new_chat: true, browser_target: targetA })})`);
+    const tabA = [...mock.tabsById.values()][0];
+    mock.messageListeners[0](
+      {
+        type: "error",
+        id: "run-D-A",
+        code: "bridge_browser_target_required",
+        conversation: null,
+        submission_state: "pre_submission",
+      },
+      { tab: { id: tabA.id, windowId: tabA.windowId } },
+      () => {},
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(mock.tabsById.has(tabA.id), false);
+    assert.equal(await run('browserTargetRegistry.has("target-D-A")'), false);
+
+    const targetB = { kind: "temporary_chat_run", id: "target-D-B" };
+    const tabB = await run(`resolveBrowserTarget(${JSON.stringify(targetB)})`);
+    assert.notEqual(tabA.id, tabB.id);
+    assert.equal(mock.tabsById.size, 1);
+  }
+
   console.log("background conversation routing contract: ok");
 }
 

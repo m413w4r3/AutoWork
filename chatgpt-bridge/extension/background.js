@@ -42,6 +42,12 @@ const requestConversationResults = new Map();
 const requestExtensionMetadata = new Map();
 const requestFinalOutputs = new Map();
 const requestConversationBindings = new Map();
+/** target_id de run stateless -> onglet Temporary Chat exact. */
+const browserTargetRegistry = new Map();
+/** id de requête -> binding de routage observé (diagnostics same-tab). */
+const requestRoutes = new Map();
+/** Sérialise la réservation initiale d'une même target dans un service worker. */
+const browserTargetReservations = new Map();
 
 /** Erreur de routage typée : `.code` est ce que le serveur doit voir, jamais aplati. */
 class BridgeRoutingError extends Error {
@@ -97,6 +103,14 @@ const conversationRegistryReady = chrome.storage.session
     }
   });
 
+const browserTargetRegistryReady = chrome.storage.session
+  .get("bridgeBrowserTargetRegistry")
+  .then(({ bridgeBrowserTargetRegistry }) => {
+    for (const [id, entry] of Object.entries(bridgeBrowserTargetRegistry || {})) {
+      browserTargetRegistry.set(id, entry);
+    }
+  });
+
 function persistRequestStates() {
   const entries = [...requestStates.entries()].slice(-1000);
   chrome.storage.local.set({ bridgeRequestStates: Object.fromEntries(entries) });
@@ -116,6 +130,12 @@ function persistReplayMetadata() {
 function persistConversationRegistry() {
   chrome.storage.session.set({
     bridgeConversationRegistry: Object.fromEntries(conversationRegistry.entries()),
+  });
+}
+
+function persistBrowserTargetRegistry() {
+  chrome.storage.session.set({
+    bridgeBrowserTargetRegistry: Object.fromEntries(browserTargetRegistry.entries()),
   });
 }
 
@@ -182,6 +202,8 @@ async function connect() {
       handleConversationArchive(msg);
     } else if (msg.type === "recovery_capture") {
       handleRecoveryCapture(msg);
+    } else if (msg.type === "browser_target_release") {
+      handleBrowserTargetRelease(msg);
     } else if (msg.type === "abort") {
       const tabId = inflight.get(msg.id);
       inflight.delete(msg.id);
@@ -311,6 +333,91 @@ async function waitForTab(tabId) {
   throw new Error("chargement de la conversation expiré");
 }
 
+function isBrowserTarget(value) {
+  if (!value || typeof value !== "object") return false;
+  const keys = Object.keys(value).sort();
+  return (
+    keys.length === 2 &&
+    keys[0] === "id" &&
+    keys[1] === "kind" &&
+    value.kind === "temporary_chat_run" &&
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    value.id.length <= 255 &&
+    /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value.id)
+  );
+}
+
+async function reserveBrowserTarget(browserTarget) {
+  const targetId = browserTarget.id;
+  const created = await chrome.tabs.create({ url: TEMPORARY_CHAT_URL, active: false });
+  try {
+    const loaded = await waitForTab(created.id);
+    if (!isAllowedChatOrigin(loaded.url)) {
+      throw new BridgeRoutingError(
+        "conversation_unavailable",
+        "l'onglet Temporary Chat créé n'est pas sur une origine ChatGPT",
+      );
+    }
+    browserTargetRegistry.set(targetId, {
+      target_id: targetId,
+      tab_id: loaded.id,
+      window_id: loaded.windowId,
+      state: "reserved",
+      last_verified_at: Date.now(),
+    });
+    persistBrowserTargetRegistry();
+    console.log("bridge_run_phase", {
+      phase: "browser_target_reserved",
+      target_id: targetId,
+      tab_id: loaded.id,
+    });
+    return loaded;
+  } catch (err) {
+    await chrome.tabs.remove(created.id).catch(() => {});
+    if (err instanceof BridgeRoutingError) throw err;
+    throw new BridgeRoutingError(
+      "conversation_unavailable",
+      `réservation Temporary Chat impossible : ${err.message}`,
+    );
+  }
+}
+
+/** Résout exclusivement le binding exact d'une cible stateless request-scoped. */
+async function resolveBrowserTarget(browserTarget) {
+  if (!isBrowserTarget(browserTarget)) {
+    throw new BridgeRoutingError("bridge_browser_target_required", "browser_target invalide");
+  }
+  await browserTargetRegistryReady;
+  const targetId = browserTarget.id;
+  const known = browserTargetRegistry.get(targetId);
+  if (known) {
+    try {
+      const tab = await chrome.tabs.get(known.tab_id);
+      if (!isAllowedChatOrigin(tab.url)) throw new Error("origine invalide");
+      return tab;
+    } catch {
+      // Une target connue mais perdue ne doit jamais être réparée par une
+      // recherche d'URL ou par la création d'un second onglet sous la même id.
+      browserTargetRegistry.delete(targetId);
+      persistBrowserTargetRegistry();
+      throw new BridgeRoutingError(
+        "conversation_unavailable",
+        "l'onglet exact de la browser_target n'existe plus",
+      );
+    }
+  }
+  const pending = browserTargetReservations.get(targetId);
+  if (pending) return pending;
+  const reservation = reserveBrowserTarget(browserTarget);
+  browserTargetReservations.set(targetId, reservation);
+  try {
+    return await reservation;
+  } finally {
+    browserTargetReservations.delete(targetId);
+  }
+}
+
 /**
  * Résout l'onglet exact d'une conversation identifiée par conversation.id.
  * L'URL n'est jamais une identité : `fresh` ouvre toujours un Temporary Chat
@@ -393,7 +500,17 @@ async function resolveConversationTab(conversation) {
 }
 
 async function routeTab(msg) {
-  return msg.conversation ? resolveConversationTab(msg.conversation) : findChatTab();
+  if (msg.conversation) return resolveConversationTab(msg.conversation);
+  if (msg.browser_target) return resolveBrowserTarget(msg.browser_target);
+  // Un prompt est toujours un run et ne bénéficie d'aucun fallback vers un
+  // onglet choisi par URL/activité. `findChatTab` reste réservé aux sondes UI.
+  if (msg.type === "prompt") {
+    throw new BridgeRoutingError(
+      "bridge_browser_target_required",
+      "un run stateless exige une browser_target dédiée",
+    );
+  }
+  return findChatTab();
 }
 
 /** Envoie une seule fois au content script déjà installé par le manifest. */
@@ -406,17 +523,51 @@ async function sendToTab(tabId, msg) {
   return await chrome.tabs.sendMessage(tabId, msg);
 }
 
-async function cleanupFreshReservationAfterDeliveryFailure(msg) {
-  if (msg.conversation?.mode !== "fresh") return;
-  const binding = conversationRegistry.get(msg.conversation.id);
-  if (binding?.state !== "submitted" || binding.bridge_run_id !== msg.id) return;
+async function cleanupReservationAfterDeliveryFailure(msg, route) {
+  if (msg.conversation?.mode === "fresh") {
+    const binding = conversationRegistry.get(msg.conversation.id);
+    if (binding?.state === "submitted" && binding.bridge_run_id === msg.id) {
+      await chrome.tabs.remove(binding.tab_id).catch(() => {});
+      conversationRegistry.delete(msg.conversation.id);
+      persistConversationRegistry();
+    }
+  }
+  await cleanupBrowserTargetForRequest(msg.id, route);
+}
+
+async function cleanupBrowserTargetForRequest(requestId, route = requestRoutes.get(requestId)) {
+  const targetId = route?.target_id;
+  if (!targetId) return;
+  await browserTargetRegistryReady;
+  const binding = browserTargetRegistry.get(targetId);
+  if (!binding) return;
+  if (binding.bridge_run_id && binding.bridge_run_id !== requestId) return;
   await chrome.tabs.remove(binding.tab_id).catch(() => {});
-  conversationRegistry.delete(msg.conversation.id);
-  persistConversationRegistry();
+  browserTargetRegistry.delete(targetId);
+  persistBrowserTargetRegistry();
+  console.log("bridge_run_phase", {
+    phase: "browser_target_released",
+    target_id: targetId,
+    tab_id: binding.tab_id,
+  });
+}
+
+async function handleBrowserTargetRelease(msg) {
+  if (!isBrowserTarget(msg.browser_target)) {
+    return;
+  }
+  await cleanupBrowserTargetForRequest(msg.run_id || msg.id, {
+    target_id: msg.browser_target.id,
+  });
 }
 
 async function handlePrompt(msg) {
-  await Promise.all([requestStatesReady, replayMetadataReady, conversationRegistryReady]);
+  await Promise.all([
+    requestStatesReady,
+    replayMetadataReady,
+    conversationRegistryReady,
+    browserTargetRegistryReady,
+  ]);
   const known = requestStates.get(msg.id);
   if (known) {
     send({ type: "ack", id: msg.id, state: known, duplicate: true });
@@ -445,7 +596,13 @@ async function handlePrompt(msg) {
   // Réserver synchroniquement avant tout await ferme la course de deux paquets.
   requestStates.set(msg.id, "received");
   persistRequestStates();
-  send({ type: "ack", id: msg.id, state: "received", duplicate: false });
+  send({
+    type: "ack",
+    id: msg.id,
+    state: "received",
+    duplicate: false,
+    target_id: msg.browser_target?.id || null,
+  });
   let tab;
   try {
     tab = await routeTab(msg);
@@ -459,6 +616,8 @@ async function handlePrompt(msg) {
       message: err.message,
       phase: "pre_submission",
       submission_state: "pre_submission",
+      target_id: msg.browser_target?.id || null,
+      tab_id: null,
     });
     return;
   }
@@ -472,6 +631,8 @@ async function handlePrompt(msg) {
       message: "Aucun onglet chatgpt.com ouvert",
       phase: "pre_submission",
       submission_state: "pre_submission",
+      target_id: msg.browser_target?.id || null,
+      tab_id: null,
     });
     return;
   }
@@ -485,10 +646,16 @@ async function handlePrompt(msg) {
       message: "l'onglet ChatGPT traite déjà une requête",
       phase: "pre_submission",
       submission_state: "pre_submission",
+      target_id: msg.browser_target?.id || null,
+      tab_id: null,
     });
     return;
   }
   inflight.set(msg.id, tab.id);
+  requestRoutes.set(msg.id, {
+    target_id: msg.browser_target?.id || null,
+    tab_id: tab.id,
+  });
   busyTabs.add(tab.id);
   if (msg.conversation?.mode === "fresh") {
     const binding = conversationRegistry.get(msg.conversation.id);
@@ -499,6 +666,30 @@ async function handlePrompt(msg) {
       console.log("bridge_run_phase", { phase: "conversation_submitted", conversation_id: msg.conversation.id, tab_id: tab.id });
     }
   }
+  if (msg.browser_target) {
+    const binding = browserTargetRegistry.get(msg.browser_target.id);
+    if (binding) {
+      browserTargetRegistry.set(msg.browser_target.id, {
+        ...binding,
+        state: "submitted",
+        bridge_run_id: msg.id,
+      });
+      persistBrowserTargetRegistry();
+    }
+  }
+  console.log("bridge_run_phase", {
+    phase: "prompt_routed",
+    target_id: msg.browser_target?.id || null,
+    tab_id: tab.id,
+  });
+  send({
+    type: "ack",
+    id: msg.id,
+    state: "running",
+    duplicate: false,
+    target_id: msg.browser_target?.id || null,
+    tab_id: tab.id,
+  });
   requestStates.set(msg.id, "running");
   persistRequestStates();
   try {
@@ -506,7 +697,8 @@ async function handlePrompt(msg) {
   } catch (err) {
     inflight.delete(msg.id);
     busyTabs.delete(tab.id);
-    await cleanupFreshReservationAfterDeliveryFailure(msg);
+    await cleanupReservationAfterDeliveryFailure(msg, requestRoutes.get(msg.id));
+    requestRoutes.delete(msg.id);
     requestStates.set(msg.id, "failed");
     persistRequestStates();
     send({
@@ -516,6 +708,8 @@ async function handlePrompt(msg) {
       message: `Onglet injoignable : ${err.message}`,
       phase: "pre_submission",
       submission_state: "pre_submission",
+      target_id: msg.browser_target?.id || null,
+      tab_id: tab.id,
     });
   }
 }
@@ -531,19 +725,49 @@ async function handleUiRequest(msg) {
   try {
     tab = await routeTab(msg);
   } catch (err) {
-    send({ type: msg.type, id: msg.id, ok: false, state: null, error: err.message });
+    send({
+      type: msg.type,
+      id: msg.id,
+      ok: false,
+      state: null,
+      error: err.message,
+      target_id: msg.browser_target?.id || null,
+      tab_id: null,
+    });
     return;
   }
   if (!tab) {
-    send({ type: msg.type, id: msg.id, ok: false, state: null, error: "Aucun onglet chatgpt.com ouvert" });
+    send({
+      type: msg.type,
+      id: msg.id,
+      ok: false,
+      state: null,
+      error: "Aucun onglet chatgpt.com ouvert",
+      target_id: msg.browser_target?.id || null,
+      tab_id: null,
+    });
     return;
   }
+  const route = {
+    target_id: msg.browser_target?.id || null,
+    tab_id: tab.id,
+  };
+  requestRoutes.set(msg.id, route);
   try {
     const answer = await sendToTab(tab.id, msg);
     if (!answer) throw new Error("aucune réponse du content script");
-    send({ ...answer, type: msg.type, id: msg.id });
+    send({ ...answer, type: msg.type, id: msg.id, ...route });
   } catch (err) {
-    send({ type: msg.type, id: msg.id, ok: false, state: null, error: `Onglet injoignable : ${err.message}` });
+    send({
+      type: msg.type,
+      id: msg.id,
+      ok: false,
+      state: null,
+      error: `Onglet injoignable : ${err.message}`,
+      ...route,
+    });
+  } finally {
+    requestRoutes.delete(msg.id);
   }
 }
 
@@ -571,6 +795,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       "error",
     ].includes(msg?.type)
   ) {
+    const route = requestRoutes.get(msg.id);
+    const senderTabId = sender.tab?.id ?? null;
+    if (route?.target_id && senderTabId !== route.tab_id) {
+      const mismatch = {
+        type: "error",
+        id: msg.id,
+        code: "bridge_tab_mismatch",
+        message: "un événement stateless provient d'un autre onglet que le prompt",
+        phase: msg.phase || "generation",
+        submission_state: msg.submission_state || "post_submission",
+        target_id: route.target_id,
+        tab_id: senderTabId,
+      };
+      requestStates.set(msg.id, "failed");
+      persistRequestStates();
+      void cleanupBrowserTargetForRequest(msg.id, route);
+      requestRoutes.delete(msg.id);
+      send(mismatch);
+      sendResponse({ ok: true });
+      return true;
+    }
     const sequence = (eventCounters.get(msg.id) || 0) + 1;
     eventCounters.set(msg.id, sequence);
     if (msg.type === "conversation_bound" && msg.conversation?.id) {
@@ -654,9 +899,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           persistConversationRegistry();
         }
       }
+      const targetRoute = route;
       persistRequestStates();
+      if (targetRoute?.target_id) void cleanupBrowserTargetForRequest(msg.id, targetRoute);
+      requestRoutes.delete(msg.id);
     }
-    send({ ...msg, event_id: `${msg.id}:${sequence}` });
+    send({
+      ...msg,
+      target_id: route?.target_id ?? msg.target_id ?? null,
+      tab_id: senderTabId ?? route?.tab_id ?? null,
+      event_id: `${msg.id}:${sequence}`,
+    });
   }
   sendResponse({ ok: true });
   return true;
@@ -673,6 +926,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     }
   }
   if (changed) persistConversationRegistry();
+  let browserChanged = false;
+  for (const [targetId, entry] of browserTargetRegistry.entries()) {
+    if (entry.tab_id === tabId) {
+      browserTargetRegistry.delete(targetId);
+      browserChanged = true;
+    }
+  }
+  if (browserChanged) persistBrowserTargetRegistry();
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
@@ -688,6 +949,14 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     }
   }
   if (changed) persistConversationRegistry();
+  let browserChanged = false;
+  for (const [targetId, entry] of browserTargetRegistry.entries()) {
+    if (entry.tab_id === tabId) {
+      browserTargetRegistry.delete(targetId);
+      browserChanged = true;
+    }
+  }
+  if (browserChanged) persistBrowserTargetRegistry();
 });
 
 // Réveils : le service worker MV3 peut être arrêté quand il est inactif.

@@ -1,7 +1,7 @@
 """Modèles et types de contrat du bridge."""
 
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -46,6 +46,23 @@ class BridgeConversationTarget(BaseModel):
         if self.mode == "continue" and not self.expected_turn_id:
             raise ValueError("continue exige expected_turn_id")
         return self
+
+
+class BridgeBrowserTarget(BaseModel):
+    """Cible Chrome éphémère d'une tentative stateless.
+
+    Cette identité ne représente aucune conversation métier. Elle ne porte que
+    le binding request-scoped vers un onglet Temporary Chat côté extension.
+    """
+
+    kind: Literal["temporary_chat_run"] = "temporary_chat_run"
+    id: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+
+    model_config = {"extra": "forbid", "frozen": True}
 
 
 class ChatRequest(BaseModel):
@@ -167,6 +184,9 @@ class UiState(BaseModel):
     observed_at: Optional[float] = None
     url: Optional[str] = None
     content_script_version: Optional[str] = None
+    # Diagnostics de routage request-scoped, jamais une identité métier.
+    target_id: Optional[str] = None
+    tab_id: Optional[int] = None
     probed: bool = False
     model: UiPickerState = Field(default_factory=UiPickerState)
     profile: UiPickerState = Field(default_factory=UiPickerState)
@@ -181,6 +201,10 @@ class RunReport(BaseModel):
     model_observed: Optional[str] = None
     model_source: str = "unknown"
     web_search_mode: str = "untouched"
+    # Diagnostics de routage du run ; `tab_id` n'est pas persisté comme
+    # identité de conversation.
+    target_id: Optional[str] = None
+    tab_id: Optional[int] = None
     controls: Outcomes = Field(default_factory=dict)
 
     # `model_*` est un espace de noms réservé par pydantic ; ici ce sont bien

@@ -187,6 +187,7 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
             self.prompt_count += 1
             generation_started.set()
             await release_generation.wait()
+            browser_target = payload.get("browser_target")
             self.runtime.bridge.dispatch(
                 {
                     "type": "done",
@@ -201,6 +202,8 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
                         "visible_citation_count": 0,
                         "content_script_version": "14",
                     },
+                    "target_id": browser_target["id"],
+                    "tab_id": 1,
                 }
             )
 
@@ -347,6 +350,7 @@ async def test_done_rejects_incoherent_output_chars(
                 await super()._respond(payload)
                 return
             self.prompt_count += 1
+            browser_target = payload.get("browser_target")
             self.runtime.bridge.dispatch(
                 {
                     "type": "done",
@@ -354,6 +358,8 @@ async def test_done_rejects_incoherent_output_chars(
                     "text": "final",
                     "event_id": "1",
                     "metadata": {"output_chars": 99},
+                    "target_id": browser_target["id"],
+                    "tab_id": 1,
                 }
             )
 

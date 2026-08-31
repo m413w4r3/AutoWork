@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from bridge.config import UI_PROBE_TTL, UI_TIMEOUT
 from bridge.contracts import (
+    BridgeBrowserTarget,
     BridgeConversationTarget,
     ControlOutcome,
     Outcomes,
@@ -40,25 +41,59 @@ async def _ui_roundtrip(bridge: Bridge, payload: dict) -> dict:
 
 def _ui_state_of(packet: dict) -> Optional[UiState]:
     state = packet.get("state")
-    return UiState.model_validate(state) if isinstance(state, dict) else None
+    if not isinstance(state, dict):
+        return None
+    # Le background ajoute ces champs à la réponse, plutôt qu'au DOM state,
+    # pour rendre le binding observable sans en faire une identité métier.
+    state_with_route = dict(state)
+    for field in ("target_id", "tab_id"):
+        if field in packet:
+            state_with_route[field] = packet[field]
+    return UiState.model_validate(state_with_route)
+
+
+def _routing_payload(
+    conversation: Optional[BridgeConversationTarget],
+    browser_target: Optional[BridgeBrowserTarget],
+) -> dict:
+    if conversation is not None and browser_target is not None:
+        raise UiUnavailable("conversation et browser_target sont mutuellement exclusifs")
+    return {
+        "conversation": conversation.model_dump(mode="json") if conversation else None,
+        "browser_target": browser_target.model_dump(mode="json") if browser_target else None,
+    }
+
+
+def _verify_target_packet(
+    packet: dict, browser_target: Optional[BridgeBrowserTarget]
+) -> Optional[int]:
+    if browser_target is None:
+        return None
+    if packet.get("target_id") != browser_target.id:
+        raise UiUnavailable("la réponse UI ne correspond pas à la cible browser du run")
+    tab_id = packet.get("tab_id")
+    if not isinstance(tab_id, int) or tab_id < 0:
+        raise UiUnavailable("la réponse UI ne contient pas de tab_id routé")
+    return tab_id
 
 
 async def fetch_ui_state(
     bridge: Bridge,
     probe: bool = False,
     conversation: Optional[BridgeConversationTarget] = None,
+    browser_target: Optional[BridgeBrowserTarget] = None,
 ) -> UiState:
     """Lit l'état de l'UI. `probe` ouvre les menus pour énumérer les choix."""
-    state = _ui_state_of(
-        await _ui_roundtrip(
-            bridge,
-            {
-                "type": "ui_state",
-                "probe": probe,
-                "conversation": conversation.model_dump(mode="json") if conversation else None,
-            },
-        )
+    packet = await _ui_roundtrip(
+        bridge,
+        {
+            "type": "ui_state",
+            "probe": probe,
+            **_routing_payload(conversation, browser_target),
+        },
     )
+    _verify_target_packet(packet, browser_target)
+    state = _ui_state_of(packet)
     if state is None:
         raise UiUnavailable("l'extension n'a renvoyé aucun état")
     bridge.last_ui_state = state
@@ -84,18 +119,22 @@ async def apply_controls(
     bridge: Bridge,
     controls: RunControls,
     conversation: Optional[BridgeConversationTarget] = None,
+    browser_target: Optional[BridgeBrowserTarget] = None,
 ) -> tuple[Outcomes, Optional[UiState]]:
     wanted = controls.wanted()
     if not wanted:
-        return {}, await fetch_ui_state(bridge, conversation=conversation)
+        return {}, await fetch_ui_state(
+            bridge, conversation=conversation, browser_target=browser_target
+        )
     packet = await _ui_roundtrip(
         bridge,
         {
             "type": "ui_control",
             "controls": wanted,
-            "conversation": conversation.model_dump(mode="json") if conversation else None,
+            **_routing_payload(conversation, browser_target),
         },
     )
+    _verify_target_packet(packet, browser_target)
     outcomes = {
         name: ControlOutcome.model_validate(value)
         for name, value in (packet.get("applied") or {}).items()
@@ -122,6 +161,7 @@ async def prepare_run(
     *,
     allow_unverified_model: bool,
     conversation: Optional[BridgeConversationTarget] = None,
+    browser_target: Optional[BridgeBrowserTarget] = None,
 ) -> RunReport:
     """Applique les contrôles avant la génération, à l'intérieur du slot.
 
@@ -129,11 +169,15 @@ async def prepare_run(
     une chaîne CTI, un run attribué au mauvais modèle est pire qu'un run manquant.
     """
     try:
-        outcomes, state = (
-            await apply_controls(bridge, controls, conversation)
-            if conversation is not None
-            else await apply_controls(bridge, controls)
-        )
+        if conversation is not None or browser_target is not None:
+            outcomes, state = await apply_controls(
+                bridge,
+                controls,
+                conversation,
+                browser_target=browser_target,
+            )
+        else:
+            outcomes, state = await apply_controls(bridge, controls)
     except UiUnavailable as exc:
         # Modèle et profil sont des exigences : sans pilotage de l'UI, le run
         # n'a pas lieu. La recherche web, elle, a un repli par le prompt, et
@@ -163,6 +207,8 @@ async def prepare_run(
         model_observed=observed,
         model_source="ui_observed" if observed else "unknown",
         web_search_mode=_web_search_mode(controls, outcomes),
+        target_id=browser_target.id if browser_target else None,
+        tab_id=state.tab_id if state else None,
         controls=outcomes,
     )
 

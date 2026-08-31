@@ -54,6 +54,12 @@ class FakeExtension:
     async def _respond(self, payload: dict[str, Any]) -> None:
         if payload["type"] in {"ui_control", "ui_state"}:
             await asyncio.sleep(0)
+            browser_target = payload.get("browser_target")
+            route = (
+                {"target_id": browser_target["id"], "tab_id": 1}
+                if isinstance(browser_target, dict) and browser_target.get("id")
+                else {}
+            )
             applied = {}
             if payload["type"] == "ui_control":
                 applied = {
@@ -77,13 +83,25 @@ class FakeExtension:
                         "profile": {},
                         "web_search": {},
                     },
+                    **route,
                 }
             )
         elif payload["type"] == "prompt":
             self.prompt_count += 1
             await asyncio.sleep(self.prompt_delay)
+            browser_target = payload.get("browser_target")
+            route = (
+                {"target_id": browser_target["id"], "tab_id": 1}
+                if isinstance(browser_target, dict) and browser_target.get("id")
+                else {}
+            )
             self.runtime.bridge.dispatch(
-                {"type": "heartbeat", "id": payload["id"], "event_id": "1"}
+                {
+                    "type": "heartbeat",
+                    "id": payload["id"],
+                    "event_id": "1",
+                    **route,
+                }
             )
             target = payload.get("conversation")
             conversation = None
@@ -138,6 +156,7 @@ class FakeExtension:
                         "content_script_version": "14",
                     },
                     "conversation": conversation,
+                    **route,
                 }
             )
 
