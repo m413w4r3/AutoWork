@@ -1,0 +1,270 @@
+from __future__ import annotations
+
+import hashlib
+from types import SimpleNamespace
+from uuid import UUID, uuid4
+
+import pytest
+
+from cti_app.application import production_workflow
+from cti_app.application.production_parsers import ReferenceReport
+from cti_app.application.production_q2_batch import q2_batch_output_marker
+from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
+from tests.test_production_extraction_profiles import (
+    _archived_document,
+    _cached_orchestrator,
+    _CacheState,
+    _CacheStore,
+    _collection_for,
+    _ExtractionSink,
+    _input_source,
+    _snapshot,
+)
+from tests.test_production_q2_batch import _source
+
+
+class _ArchiveReader:
+    def __init__(self) -> None:
+        self.contents: dict[UUID, bytes] = {}
+
+    async def read_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        content = self.contents[blob_id]
+        if len(content) > max_bytes:
+            raise ValueError("archive is too large")
+        return content
+
+
+class _Gateway:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.requests: list[object] = []
+
+    async def execute(self, request: object, role: object) -> object:
+        del role
+        self.requests.append(request)
+        return SimpleNamespace(
+            output_text=self.response,
+            run=SimpleNamespace(
+                id=request.run_id,
+                status=production_workflow.ModelRunStatus.SUCCEEDED,
+                error_code=None,
+                error_message=None,
+                error_details=None,
+            ),
+            metadata={},
+        )
+
+
+def _block(number: int, body: str) -> str:
+    return f"{q2_batch_output_marker(f'B{number}')}\n{body}"
+
+
+def _batch_response(*bodies: str) -> str:
+    return "\n\n".join(_block(index, body) for index, body in enumerate(bodies, 1))
+
+
+def _workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    archives: list[bytes],
+    response: str,
+) -> tuple[object, SubjectProductionRun, _CacheState, _ExtractionSink, _ArchiveReader]:
+    subject = uuid4()
+    documents: dict[UUID, SimpleNamespace] = {}
+    collections: dict[UUID, SimpleNamespace] = {}
+    reader = _ArchiveReader()
+    for index, content in enumerate(archives, 1):
+        source = _source(index)
+        document = _archived_document(
+            subject_id=subject,
+            url=source.canonical_url,
+            content=content,
+        )
+        documents[document.id] = document
+        reader.contents[document.decoded_blob_id] = content
+        collections[uuid4()] = _collection_for(document, source.canonical_url)
+
+    state = _CacheState(documents, collections)
+    sink = _ExtractionSink()
+    gateway = _Gateway(response)
+    orchestrator = _cached_orchestrator(
+        state,
+        gateway,  # type: ignore[arg-type]
+        _CacheStore(),
+        sink,
+        monkeypatch,
+    )
+    orchestrator._blob_reader = reader
+    report = ReferenceReport(
+        sources=tuple(_source(index) for index in range(1, len(archives) + 1)),
+        events=(),
+    )
+
+    async def load_report(*args: object) -> ReferenceReport:
+        del args
+        return report
+
+    orchestrator._load_reference_report = load_report
+    run = SubjectProductionRun(
+        subject_id=subject,
+        edition_id=uuid4(),
+        current_stage=SubjectProductionStage.EXTRACTION,
+    )
+    state._runs[run.id] = run
+    return orchestrator, run, state, sink, reader
+
+
+@pytest.mark.asyncio
+async def test_batch_gate_uses_the_archive_of_the_framed_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator, run, _state, sink, _reader = _workflow(
+        monkeypatch,
+        [b"b1.security-lab.io", b"b2.security-lab.io"],
+        _batch_response(
+            "IOC confirmed domain\n- b2.security-lab.io",
+            "IOC confirmed domain\n- b2.security-lab.io",
+        ),
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", None),)),
+    )
+
+    assert result["status"] == "success", result
+    items = sink.calls[-1]["canonical_json"]["items"]
+    assert [item["value"] for item in items] == ["b2.security-lab.io"]
+    assert items[0]["source_ids"] == ["S2"]
+    assert any(
+        "q2_batch:B1:S1:source_evidence_missing" in warning
+        for warning in sink.calls[-1]["warnings"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_shared_ioc_keeps_both_real_source_provenances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator, run, _state, sink, _reader = _workflow(
+        monkeypatch,
+        [b"shared.security-lab.io", b"shared.security-lab.io"],
+        _batch_response(
+            "IOC confirmed domain\n- shared.security-lab.io",
+            "IOC confirmed domain\n- shared.security-lab.io",
+        ),
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", None),)),
+    )
+
+    assert result["status"] == "success", result
+    item = sink.calls[-1]["canonical_json"]["items"][0]
+    assert item["source_ids"] == ["S1", "S2"]
+
+
+@pytest.mark.asyncio
+async def test_batch_gate_keeps_valid_ioc_when_a_sibling_is_foreign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator, run, _state, sink, _reader = _workflow(
+        monkeypatch,
+        [b"valid.security-lab.io"],
+        "IOC confirmed domain\n- valid.security-lab.io\n"
+        "IOC confirmed domain\n- foreign.security-lab.io",
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", None),)),
+    )
+
+    assert result["status"] == "success", result
+    assert [item["value"] for item in sink.calls[-1]["canonical_json"]["items"]] == [
+        "valid.security-lab.io"
+    ]
+    assert run.extraction_progress["confirmed_iocs"] == 1
+    assert run.extraction_progress["sources"][0]["ioc_count"] == 1
+    assert sink.calls[-1]["canonical_json"]["rules"] == []
+
+
+@pytest.mark.asyncio
+async def test_batch_gate_applies_literal_rule_matching_per_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body_one = "rule One { condition: true }"
+    body_two = "rule Two { condition: true }"
+    response = _batch_response(
+        f"RULE yara: One\n```yara\n{body_two}\n```",
+        f"RULE yara: Two\n```yara\n{body_two}\n```",
+    )
+    orchestrator, run, _state, sink, _reader = _workflow(
+        monkeypatch,
+        [body_one.encode(), body_two.encode()],
+        response,
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", None),)),
+    )
+
+    assert result["status"] == "success", result
+    rules = sink.calls[-1]["canonical_json"]["rules"]
+    assert [rule["body"] for rule in rules] == [body_two]
+    assert rules[0]["source_ids"] == ["S2"]
+
+
+@pytest.mark.asyncio
+async def test_full_gate_preserves_facts_but_filters_structured_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator, run, _state, sink, _reader = _workflow(
+        monkeypatch,
+        [b"confirmed.security-lab.io"],
+        "FACT malware\n- ExampleRAT\nIOC confirmed domain\n- confirmed.security-lab.io\n"
+        "IOC confirmed domain\n- foreign.security-lab.io",
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source(_source(1).canonical_url, None),)),
+    )
+
+    assert result["status"] == "success", result
+    items = sink.calls[-1]["canonical_json"]["items"]
+    assert [item["value"] for item in items] == [
+        "ExampleRAT",
+        "confirmed.security-lab.io",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["missing", "sha"])
+async def test_archive_unavailable_or_tampered_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    orchestrator, run, state, sink, reader = _workflow(
+        monkeypatch,
+        [b"valid.security-lab.io"],
+        "IOC confirmed domain\n- valid.security-lab.io",
+    )
+    document = next(iter(state._docs_by_id.values()))
+    if tamper == "missing":
+        del reader.contents[document.decoded_blob_id]
+    else:
+        document.decoded_sha256 = hashlib.sha256(b"different").hexdigest()
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", None),)),
+    )
+
+    assert result["status"] == "needs_review", result
+    assert result["source_failures"]["S1"]["error_code"] == (
+        "q2_source_evidence_unavailable"
+    )
+    assert sink.calls == []
+    assert run.extraction_progress["sources"][0]["status"] == "failed"

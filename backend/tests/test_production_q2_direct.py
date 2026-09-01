@@ -1,7 +1,9 @@
+import hashlib
 from dataclasses import replace
 from datetime import date, datetime
+from types import SimpleNamespace
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -263,19 +265,77 @@ class _Q2Snapshots:
 
 
 class _Q2UnitOfWork:
-    def __init__(self, model_run_state: dict[Any, Any] | None = None) -> None:
+    def __init__(
+        self,
+        model_run_state: dict[Any, Any] | None = None,
+        report: ReferenceReport | None = None,
+    ) -> None:
         self.production_artifacts = _Q2Artifacts()
         self.subject_production_runs = _Q2Runs()
         self.production_input_snapshots = _Q2Snapshots()
         self.model_runs = InMemoryModelRunRepository(
             model_run_state if model_run_state is not None else {}
         )
+        self.archive_reader = _Q2ArchiveReader()
+        self.source_documents = _Q2SourceDocuments(report, self.archive_reader)
+        self.source_collections = _Q2SourceCollections(self.source_documents.documents)
 
     async def __aenter__(self) -> "_Q2UnitOfWork":
         return self
 
     async def __aexit__(self, *args: object) -> None:
         del args
+
+
+class _Q2ArchiveReader:
+    def __init__(self) -> None:
+        self.contents: dict[UUID, bytes] = {}
+
+    async def read_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        del max_bytes
+        return self.contents[blob_id]
+
+
+class _Q2SourceDocuments:
+    def __init__(
+        self,
+        report: ReferenceReport | None,
+        reader: _Q2ArchiveReader,
+    ) -> None:
+        self.documents: list[SimpleNamespace] = []
+        for source in report.sources if report is not None else ():
+            content = b"ExampleRAT" if source.local_id == "S1" else b""
+            blob_id = uuid4()
+            reader.contents[blob_id] = content
+            self.documents.append(
+                SimpleNamespace(
+                    id=uuid4(),
+                    final_url=source.canonical_url,
+                    decoded_sha256=hashlib.sha256(content).hexdigest(),
+                    decoded_blob_id=blob_id,
+                    detected_mime_type="text/plain",
+                )
+            )
+
+    async def list_for_subject(self, subject_id: UUID) -> list[SimpleNamespace]:
+        del subject_id
+        return self.documents
+
+
+class _Q2SourceCollections:
+    def __init__(self, documents: list[SimpleNamespace]) -> None:
+        self.collections = [
+            SimpleNamespace(
+                canonical_url=document.final_url,
+                source_document_id=document.id,
+                decoded_blob_id=document.decoded_blob_id,
+            )
+            for document in documents
+        ]
+
+    async def list_for_subject(self, subject_id: UUID) -> list[SimpleNamespace]:
+        del subject_id
+        return self.collections
 
 
 class _Q2Gateway:
@@ -427,7 +487,7 @@ def _q2_orchestrator(
 ) -> tuple[
     production_workflow.ProductionWorkflowOrchestrator, SubjectProductionRun, _Q2Diagnostics
 ]:
-    uow = _Q2UnitOfWork(model_run_state)
+    uow = _Q2UnitOfWork(model_run_state, report)
     diagnostics = _Q2Diagnostics()
     orchestrator = production_workflow.ProductionWorkflowOrchestrator.__new__(
         production_workflow.ProductionWorkflowOrchestrator
@@ -437,6 +497,7 @@ def _q2_orchestrator(
     orchestrator._diagnostics = diagnostics
     orchestrator._correlation_id = "test"
     orchestrator._model_gateway = gateway
+    orchestrator._blob_reader = uow.archive_reader
     orchestrator._pacing = type("Pacing", (), {"model_delay_seconds": lambda self: 0.0})()
     orchestrator._extraction = _Q2Extraction()
 
@@ -734,6 +795,41 @@ async def test_manual_extraction_retry_reuses_successful_full_source(
     assert second["status"] == "success", second
     assert second["cache_hits"] == 1
     assert second["model_calls"] == 0
+    assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_q2_checkpoint_is_created_only_after_local_archive_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeModelAdapter(research_text="FACT malware\n- ExampleRAT\n")
+    gateway, model_uow = _persistent_q2_gateway(adapter)
+    orchestrator, run, _ = _q2_orchestrator(
+        monkeypatch,
+        gateway,
+        _q2_report(1),
+        model_run_state=model_uow.state,
+    )
+
+    first = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
+
+    assert first["status"] == "success", first
+    model_run_id = _q2_source_model_run_id(
+        production_run_id=run.id,
+        pipeline_generation=run.pipeline_generation,
+        source_id="S1",
+        canonical_url="https://example.test/1",
+    )
+    assert model_uow.state[model_run_id].parameters.get("q2_checkpoint_keys")
+
+    orchestrator._blob_reader.contents.clear()  # type: ignore[attr-defined]
+    second = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
+
+    assert second["status"] == "needs_review", second
+    assert second["source_failures"]["S1"]["error_code"] == (
+        "q2_source_evidence_unavailable"
+    )
+    assert model_uow.state[model_run_id].parameters.get("q2_checkpoint_keys") == []
     assert len(adapter.calls) == 1
 
 

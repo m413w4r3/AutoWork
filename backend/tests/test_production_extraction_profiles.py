@@ -328,6 +328,20 @@ class _CacheStore:
         return raw_id, canonical_id
 
 
+class _ArchivedBlobs:
+    def __init__(self) -> None:
+        self.contents: dict[UUID, bytes] = {}
+
+    def add(self, content: bytes) -> tuple[UUID, str]:
+        blob_id = uuid4()
+        self.contents[blob_id] = content
+        return blob_id, hashlib.sha256(content).hexdigest()
+
+    async def read_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        del max_bytes
+        return self.contents[blob_id]
+
+
 class _CacheUow:
     def __init__(self, state: _CacheState) -> None:
         self._state = state
@@ -391,14 +405,20 @@ def _archived_document(
     subject_id: UUID,
     url: str,
     content: bytes,
+    blobs: _ArchivedBlobs | None = None,
 ) -> SimpleNamespace:
-    """One collected SourceDocument: Q2 only ever reads its hash, as provenance."""
+    """One collected SourceDocument and its canonical decoded blob."""
+    if blobs is None:
+        blob_id = uuid4()
+        content_sha256 = hashlib.sha256(content).hexdigest()
+    else:
+        blob_id, content_sha256 = blobs.add(content)
     return SimpleNamespace(
         id=uuid4(),
         subject_id=subject_id,
         final_url=url,
-        decoded_sha256=hashlib.sha256(content).hexdigest(),
-        decoded_blob_id=uuid4(),
+        decoded_sha256=content_sha256,
+        decoded_blob_id=blob_id,
         detected_mime_type="text/plain",
     )
 
@@ -470,10 +490,12 @@ def _cached_orchestrator(
     store: _CacheStore,
     sink: _ExtractionSink,
     monkeypatch: pytest.MonkeyPatch,
+    blobs: _ArchivedBlobs | None = None,
 ) -> production_workflow.ProductionWorkflowOrchestrator:
     orchestrator = production_workflow.ProductionWorkflowOrchestrator.__new__(
         production_workflow.ProductionWorkflowOrchestrator
     )
+    orchestrator._blob_reader = blobs
     orchestrator._uow_factory = lambda: _CacheUow(state)
     orchestrator._model_gateway = gateway
     orchestrator._artifact_store = store
@@ -524,7 +546,13 @@ def _individual_setup(
 ]:
     """One archived Q1 source analysed through the individual Q2 path."""
     subject = uuid4()
-    document = _archived_document(subject_id=subject, url=url, content=archived_text)
+    blobs = _ArchivedBlobs()
+    document = _archived_document(
+        subject_id=subject,
+        url=url,
+        content=archived_text,
+        blobs=blobs,
+    )
     state = _CacheState({document.id: document}, {uuid4(): _collection_for(document, url)})
     sink = _ExtractionSink()
     orchestrator = _cached_orchestrator(
@@ -533,6 +561,7 @@ def _individual_setup(
         _CacheStore(),
         sink,
         monkeypatch,
+        blobs,
     )
 
     async def load_report(*args: object) -> ReferenceReport:
@@ -585,7 +614,7 @@ async def test_individual_request_carries_the_exact_url_and_never_the_archive(
 
 
 @pytest.mark.asyncio
-async def test_ioc_visible_only_in_an_image_is_not_dropped_by_the_archived_text(
+async def test_ioc_missing_from_the_archive_is_filtered_after_live_extraction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The archived text is not a complete representation of the publication."""
@@ -606,7 +635,7 @@ async def test_ioc_visible_only_in_an_image_is_not_dropped_by_the_archived_text(
 
     assert result["status"] == "success", result
     canonical = sink.calls[-1]["canonical_json"]
-    assert [item["value"] for item in canonical["items"]] == ["visual-ioc.security-lab.io"]
+    assert canonical["items"] == []
 
 
 @pytest.mark.asyncio
@@ -632,7 +661,7 @@ async def test_individual_ioc_rules_drops_facts_before_canonical_extraction(
 
     assert result["status"] == "success", result
     canonical = sink.calls[-1]["canonical_json"]
-    assert [item["value"] for item in canonical["items"]] == ["evil.security-lab.io"]
+    assert canonical["items"] == []
     warnings = sink.calls[-1]["warnings"]
     assert isinstance(warnings, list)
     assert warnings.count("q2_ioc_rules_fact_dropped") == 1

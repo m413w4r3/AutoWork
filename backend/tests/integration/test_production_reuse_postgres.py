@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import zipfile
 from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
@@ -69,7 +70,7 @@ from cti_app.domain.editorial import (
     GroupingConfidence,
     GroupingOutcome,
 )
-from cti_app.domain.entities import Subject
+from cti_app.domain.entities import SourceDocument, Subject
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
 from cti_app.domain.production import (
     EditionProductionBatch,
@@ -662,10 +663,51 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         state=CollectionState.ARCHIVED,
     )
 
+    # The retry extraction is deliberately live-model based, but its
+    # structured output must still be checked against the exact archived
+    # decoded bytes for this source.
+    archived_content = b"archived source evidence"
+    raw_blob = await catalog.ingest(
+        BytesIO(archived_content),
+        logical_bucket="source-raw",
+        mime_type="application/octet-stream",
+    )
+    decoded_blob = await catalog.ingest(
+        BytesIO(archived_content),
+        logical_bucket="source-decoded",
+        mime_type="text/plain",
+    )
+    source_document = SourceDocument(
+        subject_id=subject.id,
+        blob_id=raw_blob.id,
+        original_name="source.txt",
+        origin=source.canonical_url,
+        acquired_at=datetime(2026, 8, 5, tzinfo=UTC),
+        license_restriction=None,
+        tlp=source.tlp,
+        do_not_submit=False,
+        external_llm_allowed=True,
+        source_collection_id=collection.id,
+        source_candidate_id=source.id,
+        decoded_blob_id=decoded_blob.id,
+        title=source.title,
+        publisher=source.publisher,
+        published_at=source.published_at,
+        final_url=source.canonical_url,
+        detected_mime_type="text/plain",
+        encoded_sha256=hashlib.sha256(archived_content).hexdigest(),
+        decoded_sha256=hashlib.sha256(archived_content).hexdigest(),
+        encoded_size=len(archived_content),
+        decoded_size=len(archived_content),
+    )
+    collection.source_document_id = source_document.id
+    collection.decoded_blob_id = decoded_blob.id
+
     async with uow_factory() as uow:
         await uow.model_runs.add(discovery_model_run)
         assert await uow.discovery_batches.add_if_absent(batch)
         await uow.editorial_groups.add(group)
+        await uow.source_documents.add(source_document)
         assert await uow.source_collections.add_if_absent(collection)
         await uow.commit()
 

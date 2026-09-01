@@ -45,6 +45,7 @@ from cti_app.integrations.models import FakeModelAdapter, InMemoryModelOutputSto
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
 from tests.test_production_extraction_profiles import (
     _archived_document,
+    _ArchivedBlobs,
     _cached_orchestrator,
     _CacheState,
     _CacheStore,
@@ -414,6 +415,7 @@ def _batch_workflow(
     gateway: _BatchGateway | None = None,
 ) -> tuple[object, SubjectProductionRun, _CacheState, _ExtractionSink, _BatchGateway]:
     subject = uuid4()
+    blobs = _ArchivedBlobs()
     documents: dict[UUID, SimpleNamespace] = {}
     collections: dict[UUID, SimpleNamespace] = {}
     for index in range(1, count + 1):
@@ -422,6 +424,7 @@ def _batch_workflow(
             subject_id=subject,
             url=source.canonical_url,
             content=f"ARCHIVED {source.canonical_url}".encode(),
+            blobs=blobs,
         )
         documents[document.id] = document
         collections[uuid4()] = _collection_for(document, source.canonical_url)
@@ -434,6 +437,7 @@ def _batch_workflow(
         _CacheStore(),
         sink,
         monkeypatch,
+        blobs,
     )
     report = ReferenceReport(
         sources=tuple(_source(index) for index in range(1, count + 1)), events=()
@@ -485,7 +489,7 @@ async def test_five_light_sources_use_one_web_batch_of_urls(
     assert state.extractions.rows == {}
     assert state.extractions.lookups == 0
     assert run.extraction_progress["model_calls"] == 1  # type: ignore[index]
-    assert len(sink.calls[-1]["canonical_json"]["items"]) == 5  # type: ignore[index]
+    assert len(sink.calls[-1]["canonical_json"]["items"]) == 0  # type: ignore[index]
 
 
 @pytest.mark.asyncio
@@ -651,7 +655,7 @@ async def test_single_light_candidate_uses_the_individual_path(
 
 
 @pytest.mark.asyncio
-async def test_batch_ioc_absent_from_the_local_archive_is_kept(
+async def test_batch_ioc_absent_from_the_local_archive_is_filtered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The archived text of a batched source never gates its web reading."""
@@ -669,10 +673,7 @@ async def test_batch_ioc_absent_from_the_local_archive_is_kept(
     assert result["status"] == "success", result
     assert len(gateway.calls) == 1
     canonical = sink.calls[-1]["canonical_json"]  # type: ignore[index]
-    assert sorted(item["value"] for item in canonical["items"]) == [
-        "visual-1.security-lab.io",
-        "visual-2.security-lab.io",
-    ]
+    assert canonical["items"] == []
 
 
 @pytest.mark.asyncio
@@ -693,10 +694,7 @@ async def test_batch_ioc_rules_drops_fact_from_one_source_without_affecting_sibl
     assert result["status"] == "success", result
     assert len(gateway.calls) == 1
     canonical = sink.calls[-1]["canonical_json"]
-    assert [item["value"] for item in canonical["items"]] == [
-        "evil.security-lab.io",
-        "sibling.security-lab.io",
-    ]
+    assert canonical["items"] == []
     assert all(item["category"] != "actors" for item in canonical["items"])
     warnings = sink.calls[-1]["warnings"]
     assert isinstance(warnings, list)

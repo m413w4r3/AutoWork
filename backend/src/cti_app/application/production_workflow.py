@@ -11,12 +11,13 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.extraction import parse_document
 from cti_app.application.iana_tlds_snapshot import IANA_TLD_SNAPSHOT_VERSION
 from cti_app.application.jobs import JobCancelledError, JobExecutionContext
 from cti_app.application.model_conversations import (
@@ -83,6 +84,12 @@ from cti_app.application.production_q2_batch import (
     partition_q2_batch_candidates,
     q2_batch_model_run_id,
 )
+from cti_app.application.production_source_evidence import (
+    SOURCE_EVIDENCE_VERSION,
+    SourceEvidenceResult,
+    verify_ioc_rules_output_against_source,
+    verify_q2_output_against_source,
+)
 from cti_app.application.production_stages import (
     ExtractionService,
     ProductionQAService,
@@ -91,7 +98,7 @@ from cti_app.application.production_stages import (
     SynthesisService,
     compute_input_hash,
 )
-from cti_app.domain.collection import SourceOriginKind
+from cti_app.domain.collection import DetectedMimeType, SourceOriginKind
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
@@ -130,6 +137,11 @@ Q2_MODEL_POLICY_VERSION = "openai-web-research-v1"
 Q2_SUCCESSFUL_CHECKPOINT_VERSION = "q2-run-local-v1"
 REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
 
+# Keep archive reads within the same decoded-document limit as collection and
+# deterministic source processing. This is a local proof read, never prompt
+# material.
+MAX_ARCHIVED_SOURCE_BYTES = 25 * 1024 * 1024
+
 # Bridge and network hiccups are worth retrying; anything else is a dead end
 # for this attempt and must not silently burn the subject.
 _TRANSIENT_CODES = {
@@ -153,7 +165,23 @@ _REVIEW_CODES = {
 }
 
 _MODEL_SUBMISSION_RECONCILIATION_CODE = "model_submission_reconciliation_required"
-_SOURCE_CONTENT_CODES = frozenset({"source_content_invalid"})
+_SOURCE_CONTENT_CODES = frozenset(
+    {"source_content_invalid", "q2_source_evidence_unavailable"}
+)
+
+
+def _gate_archived_q2_output(
+    output: Q2SourceOutput,
+    *,
+    source_text: str,
+    profile: ExtractionProfile,
+) -> SourceEvidenceResult:
+    """Apply the profile-specific source-local gate to one parsed output."""
+    if profile is ExtractionProfile.FULL:
+        return verify_q2_output_against_source(output, source_text)
+    if profile is ExtractionProfile.IOC_RULES:
+        return verify_ioc_rules_output_against_source(output, source_text)
+    raise ValueError(f"Unsupported extraction profile: {profile}")
 
 
 class _Q2FailureClass(StrEnum):
@@ -179,6 +207,30 @@ class _Q2SourceContentFailure(ValueError):
     retryable = False
     phase = "response_validation"
     submission_state = "post_submission"
+
+
+class _Q2SourceEvidenceUnavailable(_Q2SourceContentFailure):
+    """A live Q2 response cannot be locally validated for its source."""
+
+    code = "q2_source_evidence_unavailable"
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        expected_sha256: str | None = None,
+        blob_id: UUID | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.details = {
+            "reason": reason,
+            **(
+                {"expected_decoded_sha256": expected_sha256}
+                if expected_sha256 is not None
+                else {}
+            ),
+            **({"decoded_blob_id": str(blob_id)} if blob_id is not None else {}),
+        }
 
 
 class _Q2ControlFailure(RuntimeError):
@@ -612,6 +664,8 @@ class _ArchivedSource:
     """The archived capture backing one Q1 source, as held by this system."""
 
     content_sha256: str
+    decoded_blob_id: UUID | None = None
+    mime_type: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -633,14 +687,16 @@ class _Q2ReusableSource:
     warnings: tuple[str, ...] = ()
 
 
+class BlobContentReader(Protocol):
+    """Narrow read port over the canonical blob catalog."""
+
+    async def read_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes: ...
+
+
 async def _archived_sources_by_url(
     uow: UnitOfWork, subject_id: UUID, report: ReferenceReport
 ) -> dict[str, _ArchivedSource]:
-    """Resolve the collection provenance hash of each Q1 source, when held.
-
-    Q2 analyses the live publication; this identity is recorded as proof of
-    collection only, and never gates or caches a Q2 result.
-    """
+    """Resolve the local capture identity needed by the post-response gate."""
     collections_repository = getattr(uow, "source_collections", None)
     documents_repository = getattr(uow, "source_documents", None)
     if collections_repository is None or documents_repository is None:
@@ -671,7 +727,14 @@ async def _archived_sources_by_url(
         normalized_hash = content_hash.casefold()
         if not re.fullmatch(r"[0-9a-f]{64}", normalized_hash):
             continue
-        archived[source.canonical_url] = _ArchivedSource(content_sha256=normalized_hash)
+        decoded_blob_id = getattr(collection, "decoded_blob_id", None) or getattr(
+            document, "decoded_blob_id", None
+        )
+        archived[source.canonical_url] = _ArchivedSource(
+            content_sha256=normalized_hash,
+            decoded_blob_id=decoded_blob_id if isinstance(decoded_blob_id, UUID) else None,
+            mime_type=getattr(document, "detected_mime_type", None),
+        )
     return archived
 
 
@@ -688,8 +751,16 @@ class ProductionWorkflowOrchestrator:
         diagnostics: DiagnosticsLog | None = None,
         seed_enrichment: VirusTotalSeedEnrichmentService | None = None,
         pacing: ProductionPacingPolicy | None = None,
+        blob_reader: BlobContentReader | None = None,
     ) -> None:
         self._uow_factory = uow_factory
+        # The collection service owns the canonical blob catalog used for
+        # archived captures. The artifact store is the equivalent fallback for
+        # callers that do not construct a collection service. Q2 only reads
+        # from either after a live model response.
+        self._blob_reader: BlobContentReader | None = blob_reader or cast(
+            "BlobContentReader | None", collection_service or artifact_store
+        )
         self._model_service = model_service
         self._model_gateway = model_gateway or getattr(model_service, "_gateway", None)
         self._collection_service = collection_service
@@ -1364,6 +1435,69 @@ class ProductionWorkflowOrchestrator:
     ) -> dict[str, Any]:
         return await self._execute_direct_url_extraction(run, context, snapshot)
 
+    async def _load_archived_source_text(self, archived: _ArchivedSource | None) -> str:
+        """Read and integrity-check one decoded archive for local validation.
+
+        The returned text is never put in a ModelRequest. It is read only after
+        a live Q2 response exists, and the digest is checked before parsing it.
+        """
+        if archived is None:
+            raise _Q2SourceEvidenceUnavailable("Archived source is missing")
+        if archived.decoded_blob_id is None:
+            raise _Q2SourceEvidenceUnavailable(
+                "Archived decoded blob is missing",
+                expected_sha256=archived.content_sha256,
+            )
+
+        reader = getattr(self, "_blob_reader", None)
+        read_blob = getattr(reader, "read_blob", None)
+        if not callable(read_blob):
+            # ProductionArtifactStore exposes the same canonical catalog via
+            # read_bytes; accepting it keeps the workflow easy to exercise in
+            # isolation while the collection service remains the normal port.
+            read_blob = getattr(reader, "read_bytes", None)
+        if not callable(read_blob):
+            raise _Q2SourceEvidenceUnavailable(
+                "Archived blob reader is unavailable",
+                expected_sha256=archived.content_sha256,
+                blob_id=archived.decoded_blob_id,
+            )
+
+        try:
+            content = await read_blob(
+                archived.decoded_blob_id,
+                max_bytes=MAX_ARCHIVED_SOURCE_BYTES,
+            )
+        except Exception as exc:
+            raise _Q2SourceEvidenceUnavailable(
+                "Archived decoded blob is unreadable",
+                expected_sha256=archived.content_sha256,
+                blob_id=archived.decoded_blob_id,
+            ) from exc
+        if not isinstance(content, bytes):
+            raise _Q2SourceEvidenceUnavailable(
+                "Archived decoded blob did not return bytes",
+                expected_sha256=archived.content_sha256,
+                blob_id=archived.decoded_blob_id,
+            )
+        actual_sha256 = hashlib.sha256(content).hexdigest()
+        if actual_sha256 != archived.content_sha256:
+            raise _Q2SourceEvidenceUnavailable(
+                "Archived decoded blob integrity check failed",
+                expected_sha256=archived.content_sha256,
+                blob_id=archived.decoded_blob_id,
+            )
+
+        try:
+            mime_type = DetectedMimeType(archived.mime_type or DetectedMimeType.HTML.value)
+            return parse_document(content, mime_type).text
+        except Exception as exc:
+            raise _Q2SourceEvidenceUnavailable(
+                "Archived source text is unreadable",
+                expected_sha256=archived.content_sha256,
+                blob_id=archived.decoded_blob_id,
+            ) from exc
+
     async def _execute_direct_url_extraction(
         self,
         run: SubjectProductionRun,
@@ -1447,6 +1581,7 @@ class ProductionWorkflowOrchestrator:
         failed: list[str] = []
         failed_attempts: list[str] = []
         failures: dict[str, dict[str, Any]] = {}
+        source_evidence_rejections: list[dict[str, Any]] = []
         plans_by_url = {plan.canonical_url: plan for plan in source_plans}
         full_calls = 0
         light_calls = 0
@@ -1542,6 +1677,57 @@ class ProductionWorkflowOrchestrator:
             progress["active_source_title"] = None
             progress["active_profile"] = None
 
+        async def gate_source_output(
+            work: _Q2SourceWork,
+            output: Q2SourceOutput,
+            *,
+            model_run_id: UUID,
+            batch_id: str | None = None,
+        ) -> Q2SourceOutput:
+            """Validate one source output against only that source's archive."""
+            archived = archived_sources.get(work.source.canonical_url)
+            archived_text = await self._load_archived_source_text(archived)
+            evidence = _gate_archived_q2_output(
+                output,
+                source_text=archived_text,
+                profile=work.plan.profile,
+            )
+            warnings.extend(evidence.warnings)
+            for rejection in evidence.rejections:
+                source_evidence_rejections.append(
+                    {
+                        "source_id": work.source.local_id,
+                        "source_url": work.source.canonical_url,
+                        "batch_id": batch_id,
+                        "model_run_id": str(model_run_id),
+                        "proposal_index": rejection.proposal_index,
+                        "proposal_kind": rejection.proposal_kind,
+                        "artifact_type": rejection.artifact_type,
+                        "reason_code": rejection.reason_code,
+                        "value_hash": hashlib.sha256(rejection.value.encode()).hexdigest(),
+                    }
+                )
+                warning_prefix = f"q2_batch:{batch_id}" if batch_id else "q2_source"
+                warnings.append(f"{warning_prefix}:{work.source.local_id}:{rejection.reason_code}")
+                self._diagnostics.record(
+                    event="q2.source.evidence_rejected",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    source_id=work.source.local_id,
+                    source_url=work.source.canonical_url,
+                    source_content_sha256=work.source_content_sha256,
+                    model_run_id=str(model_run_id),
+                    batch_id=batch_id,
+                    profile=work.plan.profile.value,
+                    proposal_index=rejection.proposal_index,
+                    proposal_kind=rejection.proposal_kind,
+                    artifact_type=rejection.artifact_type,
+                    reason_code=rejection.reason_code,
+                )
+            return evidence.filtered_output
+
         async def load_reusable_source(
             work: _Q2SourceWork,
             *,
@@ -1619,14 +1805,62 @@ class ProductionWorkflowOrchestrator:
                 if commit is not None:
                     await commit()
 
+        async def remove_q2_checkpoint_keys(model_run_id: UUID, keys: Sequence[str]) -> None:
+            """Remove source keys that failed local archive validation."""
+            if not keys:
+                return
+            async with self._uow_factory() as uow:
+                model_runs = getattr(uow, "model_runs", None)
+                get_for_update = getattr(model_runs, "get_for_update", None)
+                save = getattr(model_runs, "save", None)
+                if get_for_update is None or save is None:
+                    return
+                model_run = await get_for_update(model_run_id)
+                if model_run is None or model_run.status is not ModelRunStatus.SUCCEEDED:
+                    return
+                parameters = dict(getattr(model_run, "parameters", {}) or {})
+                current_keys = parameters.get("q2_checkpoint_keys", [])
+                if not isinstance(current_keys, list):
+                    return
+                parameters["q2_checkpoint_keys"] = [
+                    key for key in current_keys if key not in set(keys)
+                ]
+                model_run.parameters = parameters
+                await save(model_run)
+                commit = getattr(uow, "commit", None)
+                if commit is not None:
+                    await commit()
+
         async def record_reused_source(
             work: _Q2SourceWork,
             reusable: _Q2ReusableSource,
         ) -> None:
             nonlocal cache_hits, model_calls_avoided
-            filtered_output, profile_warnings = _enforce_q2_profile(
-                reusable.output, work.plan.profile
-            )
+            try:
+                profiled_output, profile_warnings = _enforce_q2_profile(
+                    reusable.output, work.plan.profile
+                )
+                filtered_output = await gate_source_output(
+                    work,
+                    profiled_output,
+                    model_run_id=reusable.model_run_id,
+                )
+            except _Q2SourceEvidenceUnavailable as exc:
+                await remove_q2_checkpoint_keys(
+                    reusable.model_run_id,
+                    (
+                        checkpoint_key(work, batched=False),
+                        checkpoint_key(work, batched=True),
+                    ),
+                )
+                await record_source_failure(
+                    work.source,
+                    error_code=exc.code,
+                    model_run_id=reusable.model_run_id,
+                    details=exc.details,
+                    profile=work.plan.profile,
+                )
+                return
             warnings.extend((*reusable.warnings, *profile_warnings))
             submissions.append(
                 Q2ProposalSubmission(
@@ -1686,14 +1920,15 @@ class ProductionWorkflowOrchestrator:
                     progress["light_batches"] = light_batches
                     progress["light_sources_batched"] = light_sources_batched
 
-        async def record_batch_source_failure(
-            item: Q2BatchSource,
+        async def record_source_failure(
+            source: ParsedSource,
             *,
             error_code: str,
             model_run_id: UUID,
             details: dict[str, Any] | None = None,
+            profile: ExtractionProfile,
+            batch_id: str | None = None,
         ) -> None:
-            source = item.source
             _mark_extraction_source_failed(progress, source.local_id, "failed")
             await self._persist_extraction_progress(run.id, progress)
             failed_attempts.append(source.local_id)
@@ -1701,7 +1936,7 @@ class ProductionWorkflowOrchestrator:
             failure_details = details or {}
             failures[source.local_id] = {
                 "model_run_id": str(model_run_id),
-                "batch_id": item.batch_id,
+                "batch_id": batch_id,
                 "source_url": source.canonical_url,
                 "error_code": error_code,
                 "error": error_code,
@@ -1722,8 +1957,8 @@ class ProductionWorkflowOrchestrator:
                 source_id=source.local_id,
                 source_url=source.canonical_url,
                 model_run_id=str(model_run_id),
-                batch_id=item.batch_id,
-                profile=ExtractionProfile.IOC_RULES.value,
+                batch_id=batch_id,
+                profile=profile.value,
                 error_code=error_code,
                 error=error_code,
                 retryable=False,
@@ -1731,6 +1966,22 @@ class ProductionWorkflowOrchestrator:
                 submission_state="post_submission",
                 failure_class=_Q2FailureClass.SOURCE_CONTENT_FAILURE.value,
                 duration_ms=0,
+            )
+
+        async def record_batch_source_failure(
+            item: Q2BatchSource,
+            *,
+            error_code: str,
+            model_run_id: UUID,
+            details: dict[str, Any] | None = None,
+        ) -> None:
+            await record_source_failure(
+                item.source,
+                error_code=error_code,
+                model_run_id=model_run_id,
+                details=details,
+                profile=ExtractionProfile.IOC_RULES,
+                batch_id=item.batch_id,
             )
 
         async def execute_individual(work: _Q2SourceWork) -> dict[str, Any] | None:
@@ -1805,7 +2056,6 @@ class ProductionWorkflowOrchestrator:
                             "verifier_version": ARTIFACT_VERIFIER_VERSION,
                         },
                         parameters={
-                            "q2_checkpoint_keys": [checkpoint_key(work, batched=False)],
                             "q2_execution_kind": "individual",
                         },
                     ),
@@ -1839,10 +2089,12 @@ class ProductionWorkflowOrchestrator:
                 self._log_parse(run, "extraction", parsed)
                 if not parsed.usable or parsed.value is None:
                     raise _Q2SourceContentFailure("; ".join(parsed.errors) or "source_unavailable")
-                # The local archive is not a complete representation of the
-                # rendered publication (images and screenshots carry
-                # indicators too), so it never gates this output.
                 filtered_output, profile_warnings = _enforce_q2_profile(parsed.value, plan.profile)
+                filtered_output = await gate_source_output(
+                    work,
+                    filtered_output,
+                    model_run_id=execution.run.id,
+                )
                 warnings.extend(profile_warnings)
                 submissions.append(
                     Q2ProposalSubmission(
@@ -2057,10 +2309,6 @@ class ProductionWorkflowOrchestrator:
                             "q2_batch_parser_version": Q2_BATCH_PARSER_VERSION,
                         },
                         parameters={
-                            "q2_checkpoint_keys": [
-                                checkpoint_key(pending[item.source.local_id], batched=True)
-                                for item in batch_sources
-                            ],
                             "q2_execution_kind": "batch",
                             "q2_batch_sources": [
                                 {
@@ -2132,10 +2380,26 @@ class ProductionWorkflowOrchestrator:
                             details={"errors": list(source_result.errors)},
                         )
                         continue
-                    # Provenance stays local: the model only ever saw B#.
+                    # Provenance stays local: the model only ever saw B# and
+                    # this block is checked against only its own archive.
                     filtered_output, profile_warnings = _enforce_q2_profile(
                         source_result.output, ExtractionProfile.IOC_RULES
                     )
+                    try:
+                        filtered_output = await gate_source_output(
+                            pending[item.source.local_id],
+                            filtered_output,
+                            model_run_id=execution.run.id,
+                            batch_id=item.batch_id,
+                        )
+                    except _Q2SourceEvidenceUnavailable as exc:
+                        await record_batch_source_failure(
+                            item,
+                            error_code=exc.code,
+                            model_run_id=execution.run.id,
+                            details=exc.details,
+                        )
+                        continue
                     warnings.extend(profile_warnings)
                     submissions.append(
                         Q2ProposalSubmission(
@@ -2424,6 +2688,7 @@ class ProductionWorkflowOrchestrator:
             ],
             verification_diagnostics={
                 "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
+                "source_evidence_version": SOURCE_EVIDENCE_VERSION,
                 "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
                 "extraction_profiles": {
                     plan.canonical_url: plan.profile.value for plan in source_plans
@@ -2448,6 +2713,7 @@ class ProductionWorkflowOrchestrator:
                     }
                     for item in verification.diagnostics
                 ],
+                "q2_source_evidence_rejections": source_evidence_rejections,
             },
         )
         await self._persist_extraction_progress(run.id, progress)
@@ -2979,6 +3245,7 @@ def _extraction_input_hash(
             "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
             "q2_batch_parser_version": Q2_BATCH_PARSER_VERSION,
             "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
+            "source_evidence_version": SOURCE_EVIDENCE_VERSION,
             "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
             "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
         }
