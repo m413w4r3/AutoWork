@@ -52,6 +52,7 @@ def test_full_prompt_requires_compact_facts_iocs_and_rules() -> None:
     assert "# RULES" not in prompt
     assert "indicator-status" not in prompt
     assert "<literal body>\n```\n\nUNCERTAINTIES" in prompt
+    assert prompt.count("Perform an exhaustive IOC pass:") == 1
     assert EXTRACTION_PROMPT_VERSION == "13"
     assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v5"
 
@@ -73,6 +74,7 @@ def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
     assert "do not extract FACTS" in prompt
     assert "narrative" in prompt
     assert "<literal body>\n```\n\nUNCERTAINTIES" in prompt
+    assert prompt.count("Perform an exhaustive IOC pass:") == 1
     assert IOC_RULES_PROMPT_VERSION == "6"
 
 
@@ -99,6 +101,44 @@ IOC contextual domain
     assert output.artifacts[0].context == "C2"
     assert output.artifacts[1].indicator_status == "contextual"
     assert output.artifacts[1].context == ""
+
+
+def test_blank_lines_after_headers_between_bullets_and_groups_are_neutral() -> None:
+    compact = _parse(
+        "IOC confirmed domain\n- evil.example\n- second.example\nFACT malware\n- ExampleRAT\n"
+    )
+    spaced = parse_q2_proposals_markdown(
+        "IOC confirmed domain\n\n- evil.example\n\n- second.example\n\n"
+        "FACT malware\n\n- ExampleRAT\n"
+    )
+
+    assert spaced.usable, spaced.errors
+    assert spaced.value == compact
+    assert spaced.warnings == []
+
+
+def test_structural_tokens_are_case_insensitive_but_payload_is_literal() -> None:
+    output = _parse(
+        "ioc Confirmed DOMAIN\n"
+        "- Evil.Example :: MiXeD Context\n\n"
+        "fact Malware\n"
+        "- CamelCase Fact\n\n"
+        "RULE YARA: MiXeD Rule\n"
+        "```YARA\n"
+        "rule MiXeD {\n  condition: true\n}\n"
+        "```\n\n"
+        "uNcErTaInTiEs\n"
+        "- Model Supplied Case\n"
+    )
+
+    assert [(item.artifact_type, item.value, item.context) for item in output.artifacts] == [
+        ("domain", "Evil.Example", "MiXeD Context")
+    ]
+    assert [(fact.category, fact.value) for fact in output.facts] == [("malware", "CamelCase Fact")]
+    assert output.rules[0].rule_type is DetectionRuleType.YARA
+    assert output.rules[0].name == "MiXeD Rule"
+    assert output.rules[0].body == "rule MiXeD {\n  condition: true\n}"
+    assert output.uncertainties == ["Model Supplied Case"]
 
 
 def test_fact_groups_are_self_contained_without_required_evidence() -> None:
@@ -162,8 +202,7 @@ def test_all_ioc_types_are_exact_and_hash_types_map_to_internal_hash() -> None:
     }
     output = _parse(
         "\n\n".join(
-            f"IOC confirmed {type_token}\n- {value}"
-            for type_token, value in values.items()
+            f"IOC confirmed {type_token}\n- {value}" for type_token, value in values.items()
         )
     )
 
@@ -259,6 +298,30 @@ IOC confirmed domain
     assert "rule_without_body_fence" in result.warnings
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "IOC confirmed domain",
+        "FACT malware\n\nIOC confirmed ip",
+        "UNCERTAINTIES",
+    ],
+)
+def test_headers_without_accepted_payload_are_not_usable(text: str) -> None:
+    result = parse_q2_proposals_markdown(text)
+
+    assert not result.usable
+    assert result.value is None
+    assert result.errors == ["q2_no_payload"]
+
+
+def test_model_supplied_uncertainty_is_accepted_payload() -> None:
+    result = parse_q2_proposals_markdown("UNCERTAINTIES\n- The source only partially loaded\n")
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert result.value.uncertainties == ["The source only partially loaded"]
+
+
 def test_empty_is_a_usable_empty_source_output() -> None:
     result = parse_q2_proposals_markdown("  EMPTY\n")
 
@@ -272,6 +335,19 @@ def test_unavailable_is_non_usable_with_a_specific_error() -> None:
     assert not result.usable
     assert result.value is None
     assert result.errors == ["q2_source_unavailable"]
+
+
+@pytest.mark.parametrize(
+    ("text", "usable", "error"),
+    [("eMpTy", True, None), ("uNaVaIlAbLe", False, "q2_source_unavailable")],
+)
+def test_terminal_responses_are_case_insensitive(
+    text: str, usable: bool, error: str | None
+) -> None:
+    result = parse_q2_proposals_markdown(text)
+
+    assert result.usable is usable
+    assert result.errors == ([] if error is None else [error])
 
 
 @pytest.mark.parametrize("marker", ["EMPTY", "UNAVAILABLE"])
@@ -463,7 +539,7 @@ def test_flattened_yara_stays_flattened_and_defanged_rule_text_stays_visible() -
     assert "\n" not in output.rules[0].body
 
 
-def test_incomplete_rule_goes_to_uncertainties_not_rules() -> None:
+def test_malformed_rule_alone_is_not_usable() -> None:
     result = parse_q2_proposals_markdown(
         """RULE yara: Broken
 ```yara
@@ -473,10 +549,30 @@ rule Broken {
 """
     )
 
+    assert not result.usable
+    assert result.value is None
+    assert result.errors == ["q2_no_payload"]
+    assert "rule_truncated_not_promoted" in result.warnings
+
+
+def test_valid_ioc_keeps_a_malformed_rule_local() -> None:
+    result = parse_q2_proposals_markdown(
+        """IOC confirmed domain
+- evil.example
+
+RULE yara: Broken
+```yara
+rule Broken {
+  condition: true
+```
+"""
+    )
+
     assert result.usable, result.errors
     assert result.value is not None
+    assert [artifact.value for artifact in result.value.artifacts] == ["evil.example"]
     assert result.value.rules == []
-    assert "rule_truncated_not_promoted" in result.value.uncertainties
+    assert "rule_truncated_not_promoted" in result.warnings
 
 
 def test_cached_full_projection_keeps_rules_for_ioc_rules() -> None:

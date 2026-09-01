@@ -15,7 +15,7 @@ REFERENCES_PROMPT_VERSION = "5"
 # live-URL-only prompt are never reused under the same identity.
 EXTRACTION_PROMPT_VERSION = "13"
 IOC_RULES_PROMPT_VERSION = "6"
-IOC_RULES_BATCH_PROMPT_VERSION = "1"
+IOC_RULES_BATCH_PROMPT_VERSION = "2"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -70,6 +70,7 @@ IOC <confirmed|contextual> <type>
 RULE <yara|sigma|suricata|snort>[: <visible name>]
 ```<language>
 <literal body>
+```
 
 SOURCE B2
 EMPTY
@@ -162,21 +163,6 @@ Rules:
 
 {source_access}
 
-Perform an exhaustive IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/
-SHA512 and email addresses, including tables, appendices, images and code.
-Also extract useful malware, tools, files, CVEs, detection rules, TTPs, infrastructure,
-victims and campaign context. Omit irrelevant, example-only, placeholder,
-masked, truncated, REDACTED or FUZZ values; never reconstruct hidden values.
-
-Extract the complete literal detection rule when it is visibly published by this
-source. For every YARA, Sigma, Suricata or Snort rule:
-- preserve the complete literal body, syntax and visible line breaks;
-- do not reconstruct truncated content, invent missing variables, or repair braces;
-- never merge two rules or transform one rule language into another;
-- preserve the visible rule name;
-- report partial/truncated rules in UNCERTAINTIES instead of promoting them as complete;
-- a flattened one-line YARA rule stays one line, and `hxxps\\://...` stays exactly visible.
-
 **Output format** — plain Markdown, no outer code fence, no JSON. Use only this
 wire format:
 
@@ -187,13 +173,14 @@ wire format:
 Rules:
 - The response is bound to this one source. Never repeat its URL, source id,
   provenance, evidence quote, model run id, or other internal identifier.
-- Emit only non-empty FACT, IOC and RULE groups. FACT categories are exactly:
-  actors, campaigns, malware, tools, infection_chain, ttps, victimology,
-  protocols, infrastructure, files, commands, persistence, detections,
-  other_technical.
+- Emit source-supported facts about malware, tools, files, TTPs, infrastructure,
+  victims and campaign context only in non-empty FACT groups. FACT categories
+  are exactly: actors, campaigns, malware, tools, infection_chain, ttps,
+  victimology, protocols, infrastructure, files, commands, persistence,
+  detections, other_technical.
 - IOC types are exactly: domain, ip, url, email, md5, sha1, sha256, sha512,
   filename, filepath, cve. `confirmed` means confirmed IOC and `contextual`
-  means contextual IOC. IOC_RULES output must contain no FACT group.
+  means contextual IOC.
 - The complete header is authoritative and self-contained. Do not rely on a
   previous header and do not repeat category, status or type on value lines.
 - Emit no source id, URL, provenance, evidence quote or model id. Emit only
@@ -204,12 +191,14 @@ Rules:
   SHA512 and email addresses, including tables, appendices, images and code.
   Omit irrelevant, example-only, placeholder, masked, truncated, REDACTED or
   FUZZ values; never reconstruct hidden values.
-- Put complete literal detection rules only in RULE. The fence is mandatory.
+- Put complete literal detection rules visible in this source only in RULE. The
+  fence is mandatory.
   Preserve the complete literal body, syntax, visible line breaks and visible
-  rule name. Never refang, reformat, flatten, unflatten, repair, reconstruct,
-  merge or transform a rule. Report partial/truncated rules in UNCERTAINTIES,
-  never as complete rules. A flattened one-line YARA rule stays one line, and
-  `hxxps\\://...` stays exactly visible.
+  rule name. Never reconstruct truncated content, invent missing variables,
+  repair braces, refang, reformat, flatten, unflatten, merge or transform a
+  rule. Report partial/truncated rules in UNCERTAINTIES, never as complete
+  rules. A flattened one-line YARA rule stays one line, and `hxxps\\://...`
+  stays exactly visible.
 - EMPTY means the source was actually analysed and contained nothing relevant.
   UNAVAILABLE means the source could not actually be analysed. Either terminal
   response must be alone except for surrounding whitespace.
@@ -223,25 +212,12 @@ Rules:
 
 {source_access}
 
-Never sacrifice IOC coverage to reduce cost. This profile emits no narrative
-facts: do not extract FACTS, TTP narrative, victimology, chronology, campaign
-context, tooling narrative, infection chains, or general historical context.
-
-Extract the complete literal detection rule when it is visibly published by this
-source. For every YARA, Sigma, Suricata or Snort rule:
-- preserve the complete literal body, syntax and visible line breaks;
-- do not reconstruct truncated content, invent missing variables, or repair braces;
-- never merge two rules or transform one rule language into another;
-- preserve the visible rule name;
-- report partial/truncated rules in UNCERTAINTIES instead of promoting them as complete;
-- a flattened one-line YARA rule stays one line, and `hxxps\\://...` stays exactly visible.
-
-Extract only every source-supported IOC, indicator file, relevant CVE,
-complete detection rule, and meaningful uncertainty. Omit irrelevant,
-example-only, placeholder, masked, truncated, REDACTED or FUZZ values.
+This profile emits no FACT group or narrative facts: do not extract FACTS, TTP
+narrative, victimology, chronology, campaign context, tooling narrative,
+infection chains, or general historical context.
 
 **Output format** — plain Markdown, no outer code fence, no JSON. Use this
-wire format, but never emit a FACT group:
+wire format:
 
 """
         + _Q2_IOC_RULES_WIRE_FORMAT
@@ -257,17 +233,22 @@ Rules:
   previous header and do not repeat status or type on value lines.
 - Emit no source id, URL, provenance, evidence quote or model id. Emit only
   values literally visible in this source.
-- Perform an exhaustive IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/
-  SHA512 and email addresses, including tables, appendices, images and code.
+- Never sacrifice IOC coverage to reduce cost. Perform an exhaustive IOC pass:
+  IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/SHA512 and email addresses,
+  including tables, appendices, images and code.
   Omit irrelevant, example-only, placeholder, masked, truncated, REDACTED or
-  FUZZ values; never reconstruct hidden values.
+  FUZZ values; never reconstruct hidden values. Emit only source-supported
+  indicators and meaningful uncertainties.
 - Use `:: short context` only when useful, with whitespace on both sides of
   `::`. Keep every IPv6 literal intact.
-- Put complete literal detection rules only in RULE. The fence is mandatory.
+- Put complete literal detection rules visible in this source only in RULE. The
+  fence is mandatory.
   Preserve the complete literal body, syntax, visible line breaks and visible
-  rule name. Never refang, reformat, flatten, unflatten, repair, reconstruct,
-  merge or transform a rule. Report partial/truncated rules in UNCERTAINTIES,
-  never as complete rules.
+  rule name. Never reconstruct truncated content, invent missing variables,
+  repair braces, refang, reformat, flatten, unflatten, merge or transform a
+  rule. Report partial/truncated rules in UNCERTAINTIES, never as complete
+  rules. A flattened one-line YARA rule stays one line, and `hxxps\\://...`
+  stays exactly visible.
 - EMPTY means the source was actually analysed and contained nothing relevant.
   UNAVAILABLE means the source could not actually be analysed. Either terminal
   response must be alone except for surrounding whitespace.

@@ -25,7 +25,10 @@ from cti_app.application.production_parsers import (
     ReferenceReport,
     q2_source_output_to_json,
 )
-from cti_app.application.production_prompts import ProductionPromptTemplates
+from cti_app.application.production_prompts import (
+    IOC_RULES_BATCH_PROMPT_VERSION,
+    ProductionPromptTemplates,
+)
 from cti_app.application.production_source_evidence import (
     verify_ioc_rules_output_against_source,
 )
@@ -173,6 +176,8 @@ def test_batch_prompt_is_archive_only_and_uses_only_batch_ids() -> None:
     assert "S1" not in prompt
     assert " :: " not in prompt
     assert "independently" in prompt
+    assert "<literal body>\n```\n\nSOURCE B2" in prompt
+    assert IOC_RULES_BATCH_PROMPT_VERSION == "2"
 
 
 def test_batch_model_run_id_is_content_order_and_version_addressed(

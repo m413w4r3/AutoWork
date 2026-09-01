@@ -808,11 +808,22 @@ MAX_TOTAL_RULE_CONTENT_BYTES_PER_SOURCE = 2 * 1024 * 1024
 _ATTACK_ID = re.compile(r"T\d{4}(?:\.\d{3})?")
 
 _Q2_HEADER_TEXT = re.compile(r"^\s*(?:#{1,6}\s+)?(?P<text>.+?)\s*#*\s*$")
-_Q2_FACT_HEADER = re.compile(r"^FACT(?:\s+(?P<category>.+))?$")
-_Q2_RULE_HEADER = re.compile(r"^RULE(?:\s+(?P<spec>.+))?$")
+_Q2_FACT_HEADER = re.compile(r"^FACT(?:\s+(?P<category>.+))?$", re.IGNORECASE)
+_Q2_RULE_HEADER = re.compile(r"^RULE(?:\s+(?P<spec>.+))?$", re.IGNORECASE)
 _Q2_FENCE_OPEN = re.compile(r"^\s*```[^\n]*$")
 _Q2_RULE_FENCE_OPEN = re.compile(r"^\s*```(?P<language>[A-Za-z0-9_-]+)\s*$")
-_Q2_TERMINAL_MARKERS = frozenset({"EMPTY", "UNAVAILABLE"})
+_Q2_TERMINAL_MARKERS = frozenset({"empty", "unavailable"})
+
+_Q2_FACT_CATEGORIES_BY_CASEFOLD = {
+    category.casefold(): category for category in _Q2_FACT_CATEGORIES
+}
+_Q2_IOC_TYPES_BY_CASEFOLD = {
+    type_token.casefold(): artifact_type
+    for type_token, artifact_type in _Q2_IOC_TYPE_TO_ARTIFACT_TYPE.items()
+}
+_Q2_RULE_TYPES_BY_CASEFOLD = {
+    type_token.casefold(): rule_type for type_token, rule_type in _Q2_RULE_TYPES.items()
+}
 
 
 def _rule_issue(result: ParseResult[Q2SourceOutput], code: str) -> None:
@@ -852,30 +863,33 @@ def _parse_q2_header(line: str) -> _Q2Header | None:
     if candidate is None:
         return None
 
-    if candidate == "UNCERTAINTIES":
+    if candidate.casefold() == "uncertainties":
         return _Q2Header(kind="uncertainties")
 
     fact_match = _Q2_FACT_HEADER.fullmatch(candidate)
     if fact_match is not None:
         category = fact_match.group("category")
-        if category in _Q2_FACT_CATEGORIES:
-            return _Q2Header(kind="fact", category=category)
+        canonical_category = (
+            _Q2_FACT_CATEGORIES_BY_CASEFOLD.get(category.casefold())
+            if category is not None
+            else None
+        )
+        if canonical_category is not None:
+            return _Q2Header(kind="fact", category=canonical_category)
         return _Q2Header(kind="invalid", error_code="q2_unknown_fact_category")
 
     parts = candidate.split()
-    if parts and parts[0] == "IOC":
-        status = parts[1] if len(parts) > 1 else ""
-        type_token = parts[2] if len(parts) > 2 else ""
+    if parts and parts[0].casefold() == "ioc":
+        status = parts[1].casefold() if len(parts) > 1 else ""
+        type_token = parts[2].casefold() if len(parts) > 2 else ""
         if status not in {"confirmed", "contextual"}:
             return _Q2Header(kind="invalid", error_code="q2_unknown_ioc_status")
-        artifact_type = _Q2_IOC_TYPE_TO_ARTIFACT_TYPE.get(type_token)
+        artifact_type = _Q2_IOC_TYPES_BY_CASEFOLD.get(type_token)
         if artifact_type is None or len(parts) != 3:
             return _Q2Header(kind="invalid", error_code="q2_unknown_ioc_type")
         return _Q2Header(
             kind="ioc",
-            indicator_status=(
-                "confirmed_ioc" if status == "confirmed" else "contextual"
-            ),
+            indicator_status=("confirmed_ioc" if status == "confirmed" else "contextual"),
             artifact_type=artifact_type,
         )
 
@@ -885,7 +899,7 @@ def _parse_q2_header(line: str) -> _Q2Header | None:
         if not specification:
             return _Q2Header(kind="invalid", error_code="q2_unknown_rule_type")
         raw_type, separator, raw_name = specification.partition(":")
-        rule_type = _Q2_RULE_TYPES.get(raw_type.strip())
+        rule_type = _Q2_RULE_TYPES_BY_CASEFOLD.get(raw_type.strip().casefold())
         if rule_type is None:
             return _Q2Header(kind="invalid", error_code="q2_unknown_rule_type")
         if separator and not raw_name.strip():
@@ -914,7 +928,7 @@ def _q2_terminal_markers_outside_fences(lines: list[str]) -> tuple[str, ...]:
         if _Q2_FENCE_OPEN.fullmatch(line) and not _FENCE_CLOSE.fullmatch(line):
             in_fence = True
             continue
-        marker = line.strip()
+        marker = line.strip().casefold()
         if marker in _Q2_TERMINAL_MARKERS:
             markers.append(marker)
     return tuple(markers)
@@ -947,10 +961,10 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
         result.errors.append("empty_response")
         return result
 
-    if body == "EMPTY":
+    if body.casefold() == "empty":
         result.value = Q2SourceOutput()
         return result
-    if body == "UNAVAILABLE":
+    if body.casefold() == "unavailable":
         result.errors.append("q2_source_unavailable")
         return result
 
@@ -1034,16 +1048,11 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
                 _rule_issue(result, "rule_body_empty")
             elif body_bytes > MAX_SINGLE_RULE_BODY_BYTES:
                 _rule_issue(result, "rule_limit_single_body")
-            elif rule_type is DetectionRuleType.YARA and not _yara_body_is_balanced(
-                body_value
-            ):
+            elif rule_type is DetectionRuleType.YARA and not _yara_body_is_balanced(body_value):
                 _rule_issue(result, "rule_truncated_not_promoted")
             elif len(rules) >= MAX_RULES_PER_SOURCE:
                 _rule_issue(result, "rule_limit_max_rules_per_source")
-            elif (
-                total_rule_content_bytes + body_bytes
-                > MAX_TOTAL_RULE_CONTENT_BYTES_PER_SOURCE
-            ):
+            elif total_rule_content_bytes + body_bytes > MAX_TOTAL_RULE_CONTENT_BYTES_PER_SOURCE:
                 _rule_issue(result, "rule_limit_total_content_per_source")
             else:
                 try:
@@ -1125,6 +1134,10 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
 
     if not recognized_groups:
         result.errors.append("q2_compact_sections_missing")
+        return result
+
+    if not (facts or artifacts or rules or uncertainties):
+        result.errors.append("q2_no_payload")
         return result
 
     result.value = Q2SourceOutput(
