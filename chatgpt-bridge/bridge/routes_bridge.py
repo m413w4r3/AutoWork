@@ -21,9 +21,18 @@ from bridge.contracts import (
     ResponseRequest,
     RunControls,
 )
-from bridge.generation import NeedsReviewError, _BackgroundRequest, generation_progress
+from bridge.generation import (
+    NeedsReviewError,
+    _BackgroundRequest,
+    _visible_citations,
+    generation_progress,
+)
 from bridge.registry import RunRegistry
-from bridge.routes_openai import OpenAIRoutes
+from bridge.routes_openai import (
+    OpenAIRoutes,
+    _browser_target_for_run,
+    _release_browser_target,
+)
 from bridge.transport import Bridge
 from bridge.ui import (
     UiUnavailable,
@@ -36,8 +45,72 @@ from bridge.ui import (
 logger = logging.getLogger("chatgpt_bridge")
 
 
+def _record_submission_state(record: dict[str, Any]) -> str | None:
+    if record.get("state") == "needs_review":
+        return "post_submission"
+    raw = record.get("error_json")
+    if not isinstance(raw, str):
+        return None
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return None
+    state = error.get("submission_state")
+    return state if state in {"submission_attempted", "post_submission"} else None
+
+
+def _recovery_assistant_turn_id(record: dict[str, Any]) -> str | None:
+    raw = record.get("error_json")
+    if not isinstance(raw, str):
+        return None
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    details = error.get("details") if isinstance(error, dict) else None
+    metadata = body.get("metadata")
+    for source in (details, metadata):
+        if not isinstance(source, dict):
+            continue
+        for key in ("initial_turn_id", "assistant_turn_id"):
+            value = source.get(key)
+            if isinstance(value, str) and 0 < len(value) <= 512:
+                return value
+    return None
+
+
+def _bounded_recovery_metadata(packet: dict[str, Any]) -> dict[str, Any]:
+    raw = packet.get("metadata")
+    if not isinstance(raw, dict):
+        return {}
+    metadata: dict[str, Any] = {}
+    citations = raw.get("visible_citations")
+    if isinstance(citations, list):
+        metadata["visible_citations"] = _visible_citations(citations[:50])
+    for key, limit in (
+        ("serializer_version", 64),
+        ("completion_signal", 32),
+        ("completion_confidence", 16),
+        ("content_script_version", 64),
+        ("capture_confidence", 32),
+    ):
+        value = raw.get(key)
+        if isinstance(value, str):
+            metadata[key] = value[:limit]
+    output_chars = raw.get("output_chars")
+    if isinstance(output_chars, int) and 0 <= output_chars <= 10_000_000:
+        metadata["output_chars"] = output_chars
+    return metadata
+
+
 class BridgeRoutes:
-    """Propriétaire des sept endpoints natifs du bridge (runs, recovery, UI).
+    """Propriétaire des huit endpoints natifs du bridge (runs, recovery, UI).
 
     Dépend de `OpenAIRoutes` (pour déléguer la génération synchrone à
     `create_response_internal`), jamais l'inverse. `bridge` et `registry` sont
@@ -81,6 +154,11 @@ class BridgeRoutes:
         self.router.add_api_route(
             "/v1/bridge/runs/{response_id}/recovery/visible",
             self.preview_visible_recovery,
+            methods=["POST"],
+        )
+        self.router.add_api_route(
+            "/v1/bridge/runs/{response_id}/recovery/release",
+            self.release_visible_recovery,
             methods=["POST"],
         )
         self.router.add_api_route(
@@ -346,6 +424,58 @@ class BridgeRoutes:
         record = self.registry.get_by_run_id(response_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Run bridge inconnu")
+        if not record.get("conversation_json"):
+            target = _browser_target_for_run(response_id, None)
+            if (
+                target is None
+                or record["state"] not in {"needs_review", "failed"}
+                or _record_submission_state(record) is None
+            ):
+                raise HTTPException(status_code=409, detail="Run stateless non récupérable")
+            packet = await self.bridge.request(
+                {
+                    "type": "recovery_capture",
+                    "bridge_run_id": response_id,
+                    "browser_target": target.model_dump(mode="json"),
+                    "assistant_turn_id": _recovery_assistant_turn_id(record),
+                },
+                timeout=UI_TIMEOUT,
+            )
+            if packet.get("error") or packet.get("code"):
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": packet.get("code") or "recovery_answer_unavailable",
+                        "message": str(packet.get("error") or packet.get("code")),
+                    },
+                )
+            if (
+                packet.get("target_id") != target.id
+                or packet.get("bridge_run_id") != response_id
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cible ou run de recovery incohérent",
+                )
+            turn_id = packet.get("turn_id")
+            if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 512:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Identifiant externe du tour de recovery absent ou invalide",
+                )
+            text = packet.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise HTTPException(status_code=404, detail="Aucune réponse finale récupérable")
+            preview = {
+                "bridge_run_id": response_id,
+                "target_id": target.id,
+                "turn_id": turn_id,
+                "text": text,
+                "metadata": _bounded_recovery_metadata(packet),
+            }
+            self.registry.store_preview(response_id, preview)
+            return preview
+
         if (
             record["state"] not in {
                 "running",
@@ -391,6 +521,25 @@ class BridgeRoutes:
         }
         self.registry.store_preview(response_id, preview)
         return preview
+
+    async def release_visible_recovery(self, response_id: str):
+        """Explicitement abandonner une target stateless conservée."""
+        record = self.registry.get_by_run_id(response_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Run bridge inconnu")
+        target = (
+            _browser_target_for_run(response_id, None)
+            if not record.get("conversation_json")
+            else None
+        )
+        if target is None:
+            raise HTTPException(status_code=409, detail="Ce run ne possède pas de target stateless")
+        await _release_browser_target(self.bridge, target, response_id)
+        return {
+            "bridge_run_id": response_id,
+            "target_id": target.id,
+            "released": True,
+        }
 
     async def bridge_ui_state(self, probe: bool = False, fresh: bool = False):
         """État pilotable de l'onglet ChatGPT, tel que le content script le relit.

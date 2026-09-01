@@ -584,7 +584,11 @@ async def run_generation(
                 initial_turn_id = (
                     metadata.get("initial_turn_id") if isinstance(metadata, dict) else None
                 )
-                if conversation_result is not None and initial_turn_id:
+                if (
+                    conversation is not None
+                    and conversation_result is not None
+                    and initial_turn_id
+                ):
                     conversation_result["initial_assistant_turn_id"] = initial_turn_id
                     registry.bind_conversation(request_id, conversation_result)
                 details = {

@@ -419,6 +419,140 @@ async function main() {
     assert.equal(await run('browserTargetRegistry.has("target-A")'), false);
   }
 
+  // 12a. A stateless post-submission error keeps the exact target, clears the
+  // busy/inflight state, and persists an explicit recoverable binding.
+  {
+    const mock = makeChromeMock();
+    mock.chrome.tabs.sendMessage = async () => ({});
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-error" };
+    await run(`handlePrompt(${JSON.stringify({
+      type: "prompt",
+      id: "run-error",
+      prompt: "bonjour",
+      new_chat: true,
+      browser_target: target,
+    })})`);
+    const tab = [...mock.tabsById.values()][0];
+    mock.messageListeners[0](
+      {
+        type: "error",
+        id: "run-error",
+        code: "bridge_ui_timeout",
+        submission_state: "post_submission",
+      },
+      { tab: { id: tab.id, windowId: tab.windowId } },
+      () => {},
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(mock.tabsById.has(tab.id), true);
+    assert.equal(await run('inflight.has("run-error")'), false);
+    assert.equal(await run(`busyTabs.has(${tab.id})`), false);
+    assert.equal(await run('browserTargetRegistry.get("target-error").state'), "recoverable");
+    assert.equal(await run('browserTargetRegistry.get("target-error").recoverable'), true);
+    assert.equal(await run('browserTargetRegistry.get("target-error").bridge_run_id'), "run-error");
+    assert.equal(mock.sessionStore.bridgeBrowserTargetRegistry["target-error"].tab_id, tab.id);
+  }
+
+  // 12b. An incomplete post-submit result has the same retention semantics,
+  // including when submission_state exists only in its metadata.
+  {
+    const mock = makeChromeMock();
+    mock.chrome.tabs.sendMessage = async () => ({});
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-incomplete" };
+    await run(`handlePrompt(${JSON.stringify({
+      type: "prompt",
+      id: "run-incomplete",
+      prompt: "bonjour",
+      new_chat: true,
+      browser_target: target,
+    })})`);
+    const tab = [...mock.tabsById.values()][0];
+    mock.messageListeners[0](
+      {
+        type: "incomplete",
+        id: "run-incomplete",
+        metadata: { submission_state: "post_submission" },
+      },
+      { tab: { id: tab.id, windowId: tab.windowId } },
+      () => {},
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(mock.tabsById.has(tab.id), true);
+    assert.equal(await run('browserTargetRegistry.get("target-incomplete").state'), "recoverable");
+    assert.equal(await run('browserTargetRegistry.get("target-incomplete").bridge_run_id'), "run-incomplete");
+  }
+
+  // 12c. Recovery only resolves an already-preserved binding: a missing
+  // binding never reserves a replacement Temporary Chat.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-missing" };
+    await assert.rejects(
+      run(`resolveRecoverableBrowserTarget(${JSON.stringify(target)}, "run-missing")`),
+      (err) => err.code === "recovery_unavailable",
+    );
+    assert.equal(mock.tabsById.size, 0);
+  }
+
+  // 12d. Recovery routes to the exact preserved target/run and rejects an
+  // unrelated run without touching either tab.
+  {
+    const mock = makeChromeMock();
+    const calls = [];
+    mock.chrome.tabs.sendMessage = async (tabId, msg) => {
+      calls.push({ tabId, msg });
+      return {
+        text: "réponse finale",
+        turn_id: "assistant-final",
+        metadata: {},
+      };
+    };
+    const { run } = loadBackground(mock.chrome);
+    const targetA = { kind: "temporary_chat_run", id: "target-recovery-A" };
+    const targetB = { kind: "temporary_chat_run", id: "target-recovery-B" };
+    const tabA = await run(`resolveBrowserTarget(${JSON.stringify(targetA)})`);
+    const tabB = await run(`resolveBrowserTarget(${JSON.stringify(targetB)})`);
+    await run(`browserTargetRegistry.set("${targetA.id}", { target_id: "${targetA.id}", tab_id: ${tabA.id}, state: "recoverable", recoverable: true, bridge_run_id: "run-A" })`);
+    await run(`browserTargetRegistry.set("${targetB.id}", { target_id: "${targetB.id}", tab_id: ${tabB.id}, state: "recoverable", recoverable: true, bridge_run_id: "run-B" })`);
+
+    await run(`handleRecoveryCapture({ id: "recovery-A", bridge_run_id: "run-A", browser_target: ${JSON.stringify(targetA)} })`);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].tabId, tabA.id);
+    assert.equal(calls[0].msg.bridge_run_id, "run-A");
+    assert.equal(calls[0].msg.browser_target.id, targetA.id);
+
+    await run(`handleRecoveryCapture({ id: "recovery-wrong", bridge_run_id: "run-B", browser_target: ${JSON.stringify(targetA)} })`);
+    assert.equal(calls.length, 1, "un run différent ne doit pas atteindre l'onglet");
+    assert.equal(mock.tabsById.size, 2);
+  }
+
+  // 12e. Explicit release is exact and idempotent: it cannot close another
+  // preserved target, and repeating it is harmless.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const targetA = { kind: "temporary_chat_run", id: "target-release-A" };
+    const targetB = { kind: "temporary_chat_run", id: "target-release-B" };
+    const tabA = await run(`resolveBrowserTarget(${JSON.stringify(targetA)})`);
+    const tabB = await run(`resolveBrowserTarget(${JSON.stringify(targetB)})`);
+    await run(`browserTargetRegistry.set("${targetA.id}", { target_id: "${targetA.id}", tab_id: ${tabA.id}, state: "recoverable", recoverable: true, bridge_run_id: "run-A" })`);
+    await run(`browserTargetRegistry.set("${targetB.id}", { target_id: "${targetB.id}", tab_id: ${tabB.id}, state: "recoverable", recoverable: true, bridge_run_id: "run-B" })`);
+
+    await run(`handleBrowserTargetRelease({ id: "release-wrong", run_id: "run-wrong", browser_target: ${JSON.stringify(targetA)} })`);
+    assert.equal(mock.tabsById.has(tabA.id), true, "un autre run ne doit pas libérer cette target");
+    await run(`handleBrowserTargetRelease({ id: "release-A", run_id: "run-A", browser_target: ${JSON.stringify(targetA)} })`);
+    await run(`handleBrowserTargetRelease({ id: "release-A-retry", run_id: "run-A", browser_target: ${JSON.stringify(targetA)} })`);
+    assert.equal(mock.tabsById.has(tabA.id), false);
+    assert.equal(mock.tabsById.has(tabB.id), true);
+    assert.equal(await run(`browserTargetRegistry.has("${targetA.id}")`), false);
+    assert.equal(await run(`browserTargetRegistry.has("${targetB.id}")`), true);
+  }
+
   // 13. Un onglet normal préexistant reste intact : le run stateless ouvre sa
   // propre target et ne lui envoie ni contrôle ni prompt.
   {

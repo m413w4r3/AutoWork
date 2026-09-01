@@ -842,6 +842,57 @@ function useVirtualClock(window) {
     assert.equal(run(`findAssistantTurnByExternalId("conversation-turn-9")`), null);
   }
 
+  // Recovery stateless is a read-only exact-target capture: only an explicitly
+  // final answer with a stable external message id is returned, and no Send or
+  // requestSubmit path is touched.
+  {
+    const body = `<form id="composer-form"><textarea data-id="prompt">draft intact</textarea>
+      <button aria-disabled="false" data-testid="send-button">Send</button></form>
+      <article data-testid="conversation-turn-9">
+        <div data-message-author-role="assistant" data-message-id="stable-final">
+          <div class="markdown"><p>réponse finale récupérable</p></div>
+        </div>${copyButton}
+      </article>`;
+    const { window, run } = loadExtension(body);
+    let clicks = 0;
+    let submits = 0;
+    window.document.querySelector("button[data-testid='send-button']").addEventListener("click", () => {
+      clicks += 1;
+    });
+    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submits += 1;
+      event.preventDefault();
+    });
+    const preview = await run(`captureLaterResponse(${JSON.stringify({
+      id: "recovery-1",
+      bridge_run_id: "run-1",
+      browser_target: { kind: "temporary_chat_run", id: "target-1" },
+    })})`);
+    assert.equal(preview.target_id, "target-1");
+    assert.equal(preview.bridge_run_id, "run-1");
+    assert.equal(preview.turn_id, "stable-final");
+    assert.equal(preview.text, "réponse finale récupérable");
+    assert.equal(clicks, 0);
+    assert.equal(submits, 0);
+    assert.equal(window.document.querySelector("textarea[data-id='prompt']").value, "draft intact");
+  }
+
+  // A local container/testid without data-message-id is never accepted as a
+  // recovery identity.
+  {
+    const { run } = loadExtension(`
+      <article data-testid="conversation-turn-10">
+        <div data-message-author-role="assistant"><div class="markdown"><p>final</p></div></div>
+        ${copyButton}
+      </article>`);
+    const preview = await run(`captureLaterResponse(${JSON.stringify({
+      id: "recovery-no-id",
+      bridge_run_id: "run-no-id",
+      browser_target: { kind: "temporary_chat_run", id: "target-no-id" },
+    })})`);
+    assert.equal(preview.error, "aucune réponse finale postérieure au tour initial");
+  }
+
   // 7. Aucune attente de 15s sur un locator de conversation ne subsiste.
   {
     const source = fs.readFileSync(path.join(EXTENSION, "content.js"), "utf8");

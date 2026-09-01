@@ -76,6 +76,49 @@ async def _release_browser_target(
         )
 
 
+async def _retain_browser_target(
+    bridge: Bridge, target: BridgeBrowserTarget | None, run_id: str
+) -> None:
+    """Tell the extension to retain an exact target for explicit recovery."""
+    if target is None:
+        return
+    try:
+        await bridge.send(
+            {
+                "type": "browser_target_retain",
+                "id": f"{run_id}:retain",
+                "browser_target": target.model_dump(mode="json"),
+                "run_id": run_id,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - the original failure is authoritative
+        logger.warning(
+            "bridge_browser_target_retain_failed bridge_run_id=%s target_id=%s error=%s",
+            run_id,
+            target.id,
+            type(exc).__name__,
+        )
+
+
+def _is_ambiguous_submission(exc: BaseException) -> bool:
+    return getattr(exc, "submission_state", None) in {
+        "submission_attempted",
+        "post_submission",
+    }
+
+
+async def _release_browser_target_if_safe(
+    bridge: Bridge,
+    target: BridgeBrowserTarget | None,
+    run_id: str,
+    exc: BaseException,
+) -> None:
+    if _is_ambiguous_submission(exc):
+        await _retain_browser_target(bridge, target, run_id)
+    else:
+        await _release_browser_target(bridge, target, run_id)
+
+
 def _upstream_error_detail(exc: UpstreamError) -> dict[str, Any]:
     detail: dict[str, Any] = {
         "code": exc.code,
@@ -191,7 +234,7 @@ class OpenAIRoutes:
                 extension_metadata=extension_metadata or None,
             )
         except NeedsReviewError as exc:
-            await _release_browser_target(self.bridge, browser_target, response_id)
+            await _retain_browser_target(self.bridge, browser_target, response_id)
             response = _response_body(
                 response_id,
                 req,
@@ -220,7 +263,7 @@ class OpenAIRoutes:
             )
             print(f"⚠️  Réponse de fond {response_id} refusée : {exc.detail}")
         except Exception as exc:  # noqa: BLE001 - erreur publique nettoyée ci-dessous
-            await _release_browser_target(self.bridge, browser_target, response_id)
+            await _release_browser_target_if_safe(self.bridge, browser_target, response_id, exc)
             self.background_responses[response_id] = _response_body(
                 response_id,
                 req,
@@ -320,14 +363,21 @@ class OpenAIRoutes:
                     )
                 ]
             except NeedsReviewError:
-                await _release_browser_target(self.bridge, browser_target, response_id)
+                await _retain_browser_target(self.bridge, browser_target, response_id)
                 raise
             except UpstreamError as exc:
-                await _release_browser_target(self.bridge, browser_target, response_id)
+                await _release_browser_target_if_safe(
+                    self.bridge, browser_target, response_id, exc
+                )
                 raise HTTPException(
                     status_code=502,
                     detail=_upstream_error_detail(exc),
                 ) from exc
+            except Exception as exc:  # noqa: BLE001 - cleanup before propagating
+                await _release_browser_target_if_safe(
+                    self.bridge, browser_target, response_id, exc
+                )
+                raise
         return _response_body(
             response_id,
             req,
@@ -395,7 +445,9 @@ class OpenAIRoutes:
                         ):
                             yield sse_chunk(cid, req.model, created, {"content": text}, None)
                     except UpstreamError as exc:
-                        await _release_browser_target(self.bridge, browser_target, cid)
+                        await _release_browser_target_if_safe(
+                            self.bridge, browser_target, cid, exc
+                        )
                         err = {
                             "error": {
                                 **_upstream_error_detail(exc),
@@ -405,6 +457,27 @@ class OpenAIRoutes:
                         yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
+                    except NeedsReviewError as exc:
+                        await _retain_browser_target(self.bridge, browser_target, cid)
+                        err = {
+                            "error": {
+                                "code": exc.reason,
+                                "message": "ChatGPT s'est arrêté sans réponse finale.",
+                                "retryable": False,
+                                "phase": "generation",
+                                "submission_state": "post_submission",
+                                "details": exc.details,
+                                "type": "bridge_error",
+                            }
+                        }
+                        yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    except Exception as exc:  # noqa: BLE001 - cleanup before propagating
+                        await _release_browser_target_if_safe(
+                            self.bridge, browser_target, cid, exc
+                        )
+                        raise
                     yield sse_chunk(cid, req.model, created, {}, "stop")
                     yield "data: [DONE]\n\n"
 
@@ -428,10 +501,18 @@ class OpenAIRoutes:
                     )
                 ]
             except UpstreamError as exc:
-                await _release_browser_target(self.bridge, browser_target, cid)
+                await _release_browser_target_if_safe(
+                    self.bridge, browser_target, cid, exc
+                )
                 raise HTTPException(
                     status_code=502, detail=_upstream_error_detail(exc)
                 ) from exc
+            except NeedsReviewError:
+                await _retain_browser_target(self.bridge, browser_target, cid)
+                raise
+            except Exception as exc:  # noqa: BLE001 - cleanup before propagating
+                await _release_browser_target_if_safe(self.bridge, browser_target, cid, exc)
+                raise
 
         return completion_body(cid, req.model, created, "".join(parts), prompt_tokens)
 

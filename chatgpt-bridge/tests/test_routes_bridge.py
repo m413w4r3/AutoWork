@@ -421,6 +421,124 @@ async def test_conversation_binding_precedes_incomplete_and_survives_restart(
     assert extension.prompt_count == 1
 
 
+async def test_stateless_incomplete_recovery_uses_canonical_target_and_release(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+
+    class StatelessRecoveryExtension:
+        def __init__(self) -> None:
+            self.runtime = runtime
+            self.prompt_count = 0
+            self.recovery_payloads: list[dict[str, Any]] = []
+            self.release_payloads: list[dict[str, Any]] = []
+            self.mismatch: str | None = None
+
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            if payload["type"] in {"ui_state", "ui_control"}:
+                self.runtime.bridge.dispatch(
+                    {
+                        "type": payload["type"],
+                        "id": payload["id"],
+                        "state": {},
+                        "applied": {},
+                        "target_id": payload["browser_target"]["id"],
+                        "tab_id": 1,
+                    }
+                )
+            elif payload["type"] == "prompt":
+                self.prompt_count += 1
+                target_id = payload["browser_target"]["id"]
+                self.runtime.bridge.dispatch(
+                    {
+                        "type": "incomplete",
+                        "id": payload["id"],
+                        "event_id": "incomplete-1",
+                        "reason": "no_final_answer",
+                        "metadata": {
+                            "submission_state": "post_submission",
+                            "initial_turn_id": "assistant-pending",
+                        },
+                        "target_id": target_id,
+                        "tab_id": 1,
+                    }
+                )
+            elif payload["type"] == "recovery_capture":
+                self.recovery_payloads.append(payload)
+                target = payload["browser_target"]
+                target_id = target["id"]
+                bridge_run_id = payload["bridge_run_id"]
+                if self.mismatch == "target":
+                    target_id = "wrong-target"
+                elif self.mismatch == "run":
+                    bridge_run_id = "wrong-run"
+                self.runtime.bridge.dispatch(
+                    {
+                        "type": "recovery_preview",
+                        "id": payload["id"],
+                        "target_id": target_id,
+                        "bridge_run_id": bridge_run_id,
+                        "turn_id": "assistant-final",
+                        "text": "réponse finale tardive",
+                        "metadata": {
+                            "completion_signal": "assistant_actions",
+                            "completion_confidence": "high",
+                        },
+                    }
+                )
+            elif payload["type"] == "browser_target_release":
+                self.release_payloads.append(payload)
+
+        async def close(self, code: int, reason: str) -> None:
+            del code, reason
+
+    extension = StatelessRecoveryExtension()
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="mission"), request_with_key("stateless-recovery")
+    )
+    assert result["status"] == "needs_review"
+    run_id = result["id"]
+
+    preview = await runtime.bridge_routes.preview_visible_recovery(run_id)
+    assert preview["bridge_run_id"] == run_id
+    assert preview["target_id"] == f"bridge-run-{run_id}"
+    assert preview["turn_id"] == "assistant-final"
+    assert preview["text"] == "réponse finale tardive"
+    assert extension.prompt_count == 1
+    assert extension.recovery_payloads[0]["browser_target"] == {
+        "kind": "temporary_chat_run",
+        "id": f"bridge-run-{run_id}",
+    }
+    assert extension.recovery_payloads[0]["bridge_run_id"] == run_id
+    assert extension.release_payloads == []
+
+    extension.mismatch = "target"
+    with pytest.raises(HTTPException) as wrong_target:
+        await runtime.bridge_routes.preview_visible_recovery(run_id)
+    assert wrong_target.value.status_code == 409
+
+    extension.mismatch = "run"
+    with pytest.raises(HTTPException) as wrong_run:
+        await runtime.bridge_routes.preview_visible_recovery(run_id)
+    assert wrong_run.value.status_code == 409
+
+    released = await runtime.bridge_routes.release_visible_recovery(run_id)
+    retried = await runtime.bridge_routes.release_visible_recovery(run_id)
+    assert released == retried == {
+        "bridge_run_id": run_id,
+        "target_id": f"bridge-run-{run_id}",
+        "released": True,
+    }
+    assert len(extension.release_payloads) == 2
+    assert all(
+        payload["browser_target"]["id"] == f"bridge-run-{run_id}"
+        and payload["run_id"] == run_id
+        for payload in extension.release_payloads
+    )
+
+
 async def test_done_rejects_incoherent_output_chars(
     runtime: BridgeApplication, tmp_path: Path
 ) -> None:

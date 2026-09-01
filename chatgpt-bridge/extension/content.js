@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "24";
+const VERSION = "25";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -1788,6 +1788,7 @@ async function handlePrompt({
         id,
         reason: serialized.incomplete_reason,
         text: serialized.text,
+        submission_state: "post_submission",
         metadata: {
           visible_citations: serialized.visible_citations,
           serializer_version: serialized.serializer_version,
@@ -1834,51 +1835,107 @@ async function handlePrompt({
   }
 }
 
+function boundedRecoveryCitations(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 50).flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const citation = {};
+    for (const key of ["label", "url", "canonical_url"]) {
+      if (typeof item[key] === "string") citation[key] = item[key].slice(0, 2048);
+    }
+    if (Number.isInteger(item.position) && item.position >= 0 && item.position <= 500) {
+      citation.position = item.position;
+    }
+    return Object.keys(citation).length ? [citation] : [];
+  });
+}
+
 async function captureLaterResponse(msg) {
-  const expected = Number(msg.conversation?.assistant_turns_before || 0);
-  const turns = [...document.querySelectorAll(SELECTORS.assistant)];
-  const later = turns.slice(expected);
-  for (let index = later.length - 1; index >= 0; index -= 1) {
-    const turn = later[index];
-    const completion = completionState(turn);
-
-    // On refuse seulement une réponse explicitement encore active.
-    // Un état DOM "unknown" est acceptable pour une PREVIEW humaine.
-    if (completion.finished === false) continue;
-
-    const root = answerRoot(turn, true);
-    const serialized = root ? readAnswer(root, false) : null;
-    if (!serialized?.text?.trim()) continue;
-    const container = closestOf(turn, SELECTORS.turnContainer);
+  const stateless = Boolean(msg.browser_target);
+  if (
+    stateless &&
+    (!isBrowserTarget(msg.browser_target) ||
+      typeof msg.bridge_run_id !== "string" ||
+      !msg.bridge_run_id)
+  ) {
     return {
       type: "recovery_preview",
       id: msg.id,
-      text: serialized.text,
-      conversation_id: msg.conversation.id,
+      error: "binding de recovery invalide",
+    };
+  }
+
+  const turns = [...document.querySelectorAll(SELECTORS.assistant)];
+  const expectedTurnId = msg.assistant_turn_id;
+  const candidates =
+    typeof expectedTurnId === "string" && expectedTurnId
+      ? turns.filter((turn) => turnExternalId(turn) === expectedTurnId)
+      : Number.isInteger(Number(msg.conversation?.assistant_turns_before))
+        ? turns.slice(Number(msg.conversation.assistant_turns_before))
+        : turns;
+
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const turn = candidates[index];
+    const completion = completionState(turn);
+
+    // Stateless recovery is strict: a visible answer must be explicitly final.
+    // Conversation-backed recovery keeps its existing human-preview tolerance
+    // for an unknown completion signal.
+    if (stateless ? completion.finished !== true : completion.finished === false) continue;
+
+    const turnId = turnExternalId(turn);
+    if (!turnId) continue;
+    const root = answerRoot(turn, true);
+    const serialized = root ? readAnswer(root, false) : null;
+    if (!serialized?.text?.trim()) continue;
+
+    // React may replace the turn between the two reads. Re-read the same
+    // external message id and accept only unchanged text and completion state;
+    // this remains entirely read-only (no click, input, or requestSubmit).
+    const verificationTurn = findAssistantTurnByExternalId(turnId);
+    if (!verificationTurn) continue;
+    const verificationCompletion = completionState(verificationTurn);
+    if (stateless && verificationCompletion.finished !== true) continue;
+    if (!stateless && verificationCompletion.finished === false) continue;
+    const verificationRoot = answerRoot(verificationTurn, true);
+    const verification = verificationRoot
+      ? readAnswer(verificationRoot, false)
+      : null;
+    if (!verification?.text?.trim() || verification.text !== serialized.text) continue;
+
+    return {
+      type: "recovery_preview",
+      id: msg.id,
+      target_id: stateless ? msg.browser_target.id : null,
+      bridge_run_id: stateless ? msg.bridge_run_id : null,
+      text: verification.text,
+      conversation_id: msg.conversation?.id || null,
       external_locator: diagnosticLocator(),
-      turn_id:
-        container?.getAttribute("data-testid") ||
-        turn.getAttribute("data-message-id") ||
-        null,
+      turn_id: turnId,
       metadata: {
-        visible_citations: serialized.visible_citations,
-        serializer_version: serialized.serializer_version,
+        visible_citations: boundedRecoveryCitations(verification.visible_citations),
+        serializer_version:
+          typeof verification.serializer_version === "string"
+            ? verification.serializer_version.slice(0, 64)
+            : null,
         output_chars: globalThis.ChatGPTBridgeFinalOutput.outputChars(
-          serialized.text,
+          verification.text,
         ),
-        completion_signal: completion.signal,
-        completion_confidence: completion.confidence,
+        completion_signal: verificationCompletion.signal,
+        completion_confidence: verificationCompletion.confidence,
         content_script_version: VERSION,
         capture_confidence:
-          completion.finished === true
-          ? "verified_final"
-          : "visible_unknown",
+          verificationCompletion.finished === true
+            ? "verified_final"
+            : "visible_unknown",
       },
     };
   }
   return {
     type: "recovery_preview",
     id: msg.id,
+    target_id: stateless ? msg.browser_target.id : null,
+    bridge_run_id: stateless ? msg.bridge_run_id : null,
     error: "aucune réponse finale postérieure au tour initial",
   };
 }

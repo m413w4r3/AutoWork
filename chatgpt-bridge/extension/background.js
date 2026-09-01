@@ -202,6 +202,8 @@ async function connect() {
       handleConversationArchive(msg);
     } else if (msg.type === "recovery_capture") {
       handleRecoveryCapture(msg);
+    } else if (msg.type === "browser_target_retain") {
+      handleBrowserTargetRetain(msg);
     } else if (msg.type === "browser_target_release") {
       handleBrowserTargetRelease(msg);
     } else if (msg.type === "abort") {
@@ -227,6 +229,42 @@ async function connect() {
 }
 
 async function handleRecoveryCapture(msg) {
+  if (msg.browser_target) {
+    let tab;
+    try {
+      tab = await resolveRecoverableBrowserTarget(msg.browser_target, msg.bridge_run_id);
+    } catch (err) {
+      send({
+        type: "recovery_preview",
+        id: msg.id,
+        code: err.code || "recovery_unavailable",
+        error: err.message,
+      });
+      return;
+    }
+    try {
+      const result = await sendToTab(tab.id, msg);
+      send({
+        ...result,
+        type: "recovery_preview",
+        id: msg.id,
+        target_id: msg.browser_target.id,
+        bridge_run_id: msg.bridge_run_id,
+        tab_id: tab.id,
+      });
+    } catch (err) {
+      send({
+        type: "recovery_preview",
+        id: msg.id,
+        code: "recovery_unavailable",
+        error: err.message,
+        target_id: msg.browser_target.id,
+        bridge_run_id: msg.bridge_run_id,
+        tab_id: tab.id,
+      });
+    }
+    return;
+  }
   await conversationRegistryReady;
   const known = conversationRegistry.get(msg.conversation.id);
   if (!known) {
@@ -392,6 +430,12 @@ async function resolveBrowserTarget(browserTarget) {
   const targetId = browserTarget.id;
   const known = browserTargetRegistry.get(targetId);
   if (known) {
+    if (known.state === "recoverable" || known.recoverable === true) {
+      throw new BridgeRoutingError(
+        "recovery_unavailable",
+        "la browser_target est conservée pour un recovery explicite",
+      );
+    }
     try {
       const tab = await chrome.tabs.get(known.tab_id);
       if (!isAllowedChatOrigin(tab.url)) throw new Error("origine invalide");
@@ -415,6 +459,45 @@ async function resolveBrowserTarget(browserTarget) {
     return await reservation;
   } finally {
     browserTargetReservations.delete(targetId);
+  }
+}
+
+/**
+ * Résout uniquement une target déjà conservée après une fin ambiguë.
+ * Cette fonction ne partage volontairement pas le chemin de réservation : un
+ * recovery ne peut jamais créer un nouvel onglet ou réanimer une identité.
+ */
+async function resolveRecoverableBrowserTarget(browserTarget, bridgeRunId) {
+  if (!isBrowserTarget(browserTarget) || typeof bridgeRunId !== "string" || !bridgeRunId) {
+    throw new BridgeRoutingError("recovery_unavailable", "binding de recovery invalide");
+  }
+  await browserTargetRegistryReady;
+  const targetId = browserTarget.id;
+  const known = browserTargetRegistry.get(targetId);
+  if (
+    !known ||
+    known.target_id !== targetId ||
+    known.bridge_run_id !== bridgeRunId ||
+    (known.state !== "recoverable" && known.recoverable !== true)
+  ) {
+    throw new BridgeRoutingError(
+      "recovery_unavailable",
+      "aucun binding exact de recovery n'est disponible",
+    );
+  }
+  try {
+    const tab = await chrome.tabs.get(known.tab_id);
+    if (!isAllowedChatOrigin(tab.url)) throw new Error("origine invalide");
+    return tab;
+  } catch {
+    // La disparition de l'onglet est une perte de session, jamais une raison
+    // de créer une autre target sous le même identifiant.
+    browserTargetRegistry.delete(targetId);
+    persistBrowserTargetRegistry();
+    throw new BridgeRoutingError(
+      "recovery_unavailable",
+      "l'onglet exact de recovery n'existe plus",
+    );
   }
 }
 
@@ -549,6 +632,66 @@ async function cleanupBrowserTargetForRequest(requestId, route = requestRoutes.g
     phase: "browser_target_released",
     target_id: targetId,
     tab_id: binding.tab_id,
+  });
+}
+
+async function retainBrowserTargetForRecovery(requestId, route = requestRoutes.get(requestId)) {
+  const targetId = route?.target_id;
+  if (!targetId) return;
+  await browserTargetRegistryReady;
+  const binding = browserTargetRegistry.get(targetId);
+  if (!binding || binding.bridge_run_id !== requestId) return;
+  browserTargetRegistry.set(targetId, {
+    ...binding,
+    target_id: targetId,
+    state: "recoverable",
+    recoverable: true,
+    bridge_run_id: requestId,
+    last_verified_at: Date.now(),
+  });
+  persistBrowserTargetRegistry();
+  console.log("bridge_run_phase", {
+    phase: "browser_target_recoverable",
+    target_id: targetId,
+    bridge_run_id: requestId,
+    tab_id: binding.tab_id,
+  });
+}
+
+function resultSubmissionState(msg) {
+  const reported = msg.submission_state || msg.metadata?.submission_state;
+  if (
+    reported === "pre_submission" ||
+    reported === "submission_attempted" ||
+    reported === "post_submission"
+  ) {
+    return reported;
+  }
+  // An incomplete snapshot is emitted only after the confirmed send path.
+  return msg.type === "incomplete" ? "post_submission" : null;
+}
+
+function isAmbiguousTargetOutcome(msg) {
+  return (
+    (msg.type === "incomplete" || msg.type === "error") &&
+    ["submission_attempted", "post_submission"].includes(resultSubmissionState(msg))
+  );
+}
+
+async function settleBrowserTargetForResult(requestId, route, msg) {
+  if (isAmbiguousTargetOutcome(msg)) {
+    await retainBrowserTargetForRecovery(requestId, route);
+  } else {
+    await cleanupBrowserTargetForRequest(requestId, route);
+  }
+}
+
+async function handleBrowserTargetRetain(msg) {
+  if (!isBrowserTarget(msg.browser_target) || typeof msg.run_id !== "string" || !msg.run_id) {
+    return;
+  }
+  await retainBrowserTargetForRecovery(msg.run_id, {
+    target_id: msg.browser_target.id,
   });
 }
 
@@ -808,9 +951,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         target_id: route.target_id,
         tab_id: senderTabId,
       };
+      const inflightTabId = inflight.get(msg.id);
+      inflight.delete(msg.id);
+      if (inflightTabId !== undefined) busyTabs.delete(inflightTabId);
       requestStates.set(msg.id, "failed");
       persistRequestStates();
-      void cleanupBrowserTargetForRequest(msg.id, route);
+      void settleBrowserTargetForResult(msg.id, route, mismatch);
       requestRoutes.delete(msg.id);
       send(mismatch);
       sendResponse({ ok: true });
@@ -901,7 +1047,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       const targetRoute = route;
       persistRequestStates();
-      if (targetRoute?.target_id) void cleanupBrowserTargetForRequest(msg.id, targetRoute);
+      if (targetRoute?.target_id) {
+        void settleBrowserTargetForResult(msg.id, targetRoute, msg);
+      }
       requestRoutes.delete(msg.id);
     }
     send({
