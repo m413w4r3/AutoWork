@@ -53,6 +53,7 @@ from cti_app.application.production_parsers import (
     ParsedEvent,
     ParsedSource,
     ParseResult,
+    Q2SourceOutput,
     ReferenceReport,
     parse_q2_proposals_markdown,
     parse_reference_report,
@@ -66,6 +67,7 @@ from cti_app.application.production_prompts import (
     EXTRACTION_PROMPT_VERSION,
     EXTRACTION_PROMPT_VERSION_BY_PROFILE,
     IOC_RULES_BATCH_PROMPT_VERSION,
+    IOC_RULES_PROMPT_VERSION,
     REFERENCES_FORMAT_REPAIR_VERSION,
     REFERENCES_PROMPT_VERSION,
     SYNTHESIS_FORMAT_REPAIR_VERSION,
@@ -473,6 +475,28 @@ def _new_extraction_progress(
         "active_profile": None,
         "sources": sources,
     }
+
+
+def _enforce_q2_profile(
+    output: Q2SourceOutput,
+    profile: ExtractionProfile,
+) -> tuple[Q2SourceOutput, tuple[str, ...]]:
+    """Apply the planner's output contract before canonical verification."""
+    if profile is ExtractionProfile.FULL:
+        return output, ()
+    if profile is not ExtractionProfile.IOC_RULES:
+        raise ValueError(f"Unsupported extraction profile: {profile}")
+    if not output.facts:
+        return output, ()
+    return (
+        Q2SourceOutput(
+            facts=[],
+            artifacts=list(output.artifacts),
+            rules=list(output.rules),
+            uncertainties=list(output.uncertainties),
+        ),
+        ("q2_ioc_rules_fact_dropped",),
+    )
 
 
 def _canonical_extraction_progress_counts(extraction: Any) -> dict[str, int]:
@@ -1615,7 +1639,8 @@ class ProductionWorkflowOrchestrator:
                 # The local archive is not a complete representation of the
                 # rendered publication (images and screenshots carry
                 # indicators too), so it never gates this output.
-                filtered_output = parsed.value
+                filtered_output, profile_warnings = _enforce_q2_profile(parsed.value, plan.profile)
+                warnings.extend(profile_warnings)
                 submissions.append(
                     Q2ProposalSubmission(
                         output=filtered_output,
@@ -1870,7 +1895,10 @@ class ProductionWorkflowOrchestrator:
                         )
                         continue
                     # Provenance stays local: the model only ever saw B#.
-                    filtered_output = source_result.output
+                    filtered_output, profile_warnings = _enforce_q2_profile(
+                        source_result.output, ExtractionProfile.IOC_RULES
+                    )
+                    warnings.extend(profile_warnings)
                     submissions.append(
                         Q2ProposalSubmission(
                             output=filtered_output,
@@ -2636,8 +2664,11 @@ def _extraction_input_hash(
             "references_hash": references_hash,
             "references_payload_hash": references_payload_hash or references_hash,
             "source_urls": sorted(source_urls),
-            "prompt_version": EXTRACTION_PROMPT_VERSION,
-            "parser_version": Q2_MARKDOWN_PARSER_VERSION,
+            "full_prompt_version": EXTRACTION_PROMPT_VERSION,
+            "ioc_rules_prompt_version": IOC_RULES_PROMPT_VERSION,
+            "ioc_rules_batch_prompt_version": IOC_RULES_BATCH_PROMPT_VERSION,
+            "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
+            "q2_batch_parser_version": Q2_BATCH_PARSER_VERSION,
             "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
             "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
             "routing_policy_version": Q2_ROUTING_POLICY_VERSION,

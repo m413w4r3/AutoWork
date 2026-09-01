@@ -14,10 +14,10 @@ REFERENCES_PROMPT_VERSION = "5"
 # collection provenance and is never inlined in the prompt.
 EXTRACTION_PROMPT_VERSION = "14"
 IOC_RULES_PROMPT_VERSION = "7"
-# "5": the batch input is the compact list of exact source URLs. Only the
+# "6": the batch input is the compact list of exact source URLs. Only the
 # output stays marker-framed: a marker starts the next block; EOF closes the
 # final block.
-IOC_RULES_BATCH_PROMPT_VERSION = "5"
+IOC_RULES_BATCH_PROMPT_VERSION = "6"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -280,8 +280,11 @@ marker.
 Never use one publication to interpret or classify another. Never move an IOC or
 rule between publications. Emit no FACT and no narrative context. Produce a
 compact response. The only provenance labels you may emit are the local B#
-labels carried by the output markers. Do not emit URLs, hashes, model ids or
-other internal identifiers.
+labels carried by the output markers. Do not repeat an input source URL as
+provenance. Do not emit model ids, internal ids or internal content hashes.
+
+This restriction does not apply to IOC values: extract URL, MD5, SHA1, SHA256
+and SHA512 indicators normally when they are actually published by that source.
 
 Use EMPTY only after analysing that publication and finding no IOC or rule. Use
 UNAVAILABLE only when that publication could not be analysed. Do not let one

@@ -283,9 +283,19 @@ def test_batch_prompt_lists_exact_urls_and_frames_only_the_output() -> None:
     assert "Open every exact source URL" in prompt
     assert "images/screenshots" in prompt
     assert "independently" in prompt
+    prompt_on_one_line = " ".join(prompt.split())
+    assert "Do not emit URLs, hashes" not in prompt_on_one_line
+    assert "Do not repeat an input source URL as provenance." in prompt_on_one_line
+    assert "Do not emit model ids, internal ids or internal content hashes." in prompt_on_one_line
+    assert (
+        "This restriction does not apply to IOC values: extract URL, MD5, SHA1, SHA256 and"
+        " SHA512 indicators normally"
+    ) in prompt_on_one_line
+    for ioc_type in ("url", "md5", "sha1", "sha256", "sha512"):
+        assert ioc_type in prompt
     assert " :: " not in prompt
     assert "S1" not in prompt
-    assert IOC_RULES_BATCH_PROMPT_VERSION == "5"
+    assert IOC_RULES_BATCH_PROMPT_VERSION == "6"
     assert production_q2_batch.Q2_BATCH_PARSER_VERSION == "q2-batch-v3"
 
 
@@ -588,10 +598,38 @@ async def test_batch_ioc_absent_from_the_local_archive_is_kept(
 
 
 @pytest.mark.asyncio
+async def test_batch_ioc_rules_drops_fact_from_one_source_without_affecting_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _batch_response(
+        "FACT actors\n- Should not survive\nIOC confirmed domain\n- evil.security-lab.io",
+        "IOC confirmed domain\n- sibling.security-lab.io",
+    )
+    orchestrator, run, _state, sink, gateway = _batch_workflow(monkeypatch, 2, response)
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", date(2026, 7, 10)),)),
+    )
+
+    assert result["status"] == "success", result
+    assert len(gateway.calls) == 1
+    canonical = sink.calls[-1]["canonical_json"]
+    assert [item["value"] for item in canonical["items"]] == [
+        "evil.security-lab.io",
+        "sibling.security-lab.io",
+    ]
+    assert all(item["category"] != "actors" for item in canonical["items"])
+    warnings = sink.calls[-1]["warnings"]
+    assert isinstance(warnings, list)
+    assert warnings.count("q2_ioc_rules_fact_dropped") == 1
+
+
+@pytest.mark.asyncio
 async def test_full_sources_are_never_batched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    orchestrator, run, state, _, gateway = _batch_workflow(
+    orchestrator, run, state, sink, gateway = _batch_workflow(
         monkeypatch,
         1,
         "FACT malware\n- ExampleRAT",
@@ -605,6 +643,8 @@ async def test_full_sources_are_never_batched(
     assert result["light_batches"] == 0
     assert gateway.calls[0].prompt_template_id == "production-q2-url"
     assert state.extractions.rows == {}
+    canonical = sink.calls[-1]["canonical_json"]
+    assert [item["value"] for item in canonical["items"]] == ["ExampleRAT"]
 
 
 @pytest.mark.asyncio

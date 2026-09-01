@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application import production_workflow
 from cti_app.application.production_artifact_reuse import (
     ProductionArtifactReuseService,
     cross_run_reuse_allowed,
@@ -521,7 +522,9 @@ def test_references_hash_tracks_functional_snapshot_and_ignores_run_identity() -
         )
 
 
-def test_extraction_hash_tracks_payload_urls_and_functional_versions() -> None:
+def test_extraction_hash_tracks_payload_urls_and_functional_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     kwargs = {
         "subject_id": uuid4(),
         "references_hash": "b" * 64,
@@ -536,6 +539,19 @@ def test_extraction_hash_tracks_payload_urls_and_functional_versions() -> None:
     assert base != _extraction_input_hash(
         **{**kwargs, "source_urls": ["https://example.test/other"]}, pipeline_generation=0
     )
+    for version_name in (
+        "EXTRACTION_PROMPT_VERSION",
+        "IOC_RULES_PROMPT_VERSION",
+        "IOC_RULES_BATCH_PROMPT_VERSION",
+        "Q2_MARKDOWN_PARSER_VERSION",
+        "Q2_BATCH_PARSER_VERSION",
+        "ARTIFACT_VERIFIER_VERSION",
+        "IANA_TLD_SNAPSHOT_VERSION",
+        "Q2_ROUTING_POLICY_VERSION",
+    ):
+        monkeypatch.setattr(production_workflow, version_name, "next")
+        assert _extraction_input_hash(**kwargs, pipeline_generation=0) != base, version_name
+        monkeypatch.undo()
 
 
 def test_synthesis_hash_tracks_content_evidence_and_routing_identity() -> None:

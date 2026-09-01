@@ -19,6 +19,7 @@ from cti_app.application.production_parsers import (
     project_q2_source_output,
 )
 from cti_app.application.production_workflow import (
+    _enforce_q2_profile,
     plan_q2_extraction_profiles,
 )
 from cti_app.domain.classification import TLP
@@ -216,6 +217,38 @@ def test_full_output_projection_for_ioc_rules_drops_narrative_facts() -> None:
 
     assert [fact.category for fact in projected.facts] == ["files"]
     assert len(projected.artifacts) == 1
+
+
+def test_enforce_q2_profile_drops_all_ioc_rules_facts_and_preserves_full() -> None:
+    output = Q2SourceOutput(
+        facts=[
+            Q2FactProposal(
+                category="actors",
+                value="Should not survive",
+                context="narrative",
+                evidence_quote="Should not survive",
+            )
+        ],
+        artifacts=[
+            Q2ArtifactProposal(
+                artifact_type="domain",
+                value="evil.example",
+                indicator_status="confirmed_ioc",
+            )
+        ],
+        uncertainties=["uncertain"],
+    )
+
+    enforced, warnings = _enforce_q2_profile(output, ExtractionProfile.IOC_RULES)
+    assert enforced.facts == []
+    assert enforced.artifacts == output.artifacts
+    assert enforced.rules == output.rules
+    assert enforced.uncertainties == output.uncertainties
+    assert warnings == ("q2_ioc_rules_fact_dropped",)
+
+    full, full_warnings = _enforce_q2_profile(output, ExtractionProfile.FULL)
+    assert full is output
+    assert full_warnings == ()
 
 
 class _CacheRepository:
@@ -574,6 +607,35 @@ async def test_ioc_visible_only_in_an_image_is_not_dropped_by_the_archived_text(
     assert result["status"] == "success", result
     canonical = sink.calls[-1]["canonical_json"]
     assert [item["value"] for item in canonical["items"]] == ["visual-ioc.security-lab.io"]
+
+
+@pytest.mark.asyncio
+async def test_individual_ioc_rules_drops_facts_before_canonical_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://example.test/ioc-rules"
+    gateway = _CacheGateway(
+        "FACT actors\n- Should not survive\nIOC confirmed domain\n- evil.security-lab.io\n"
+    )
+    orchestrator, run, _state, sink = _individual_setup(
+        monkeypatch,
+        url=url,
+        archived_text=b"ARCHIVED BODY",
+        gateway=gateway,
+        published_at=date(2025, 1, 1),
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/other", date(2026, 7, 10)),)),
+    )
+
+    assert result["status"] == "success", result
+    canonical = sink.calls[-1]["canonical_json"]
+    assert [item["value"] for item in canonical["items"]] == ["evil.security-lab.io"]
+    warnings = sink.calls[-1]["warnings"]
+    assert isinstance(warnings, list)
+    assert warnings.count("q2_ioc_rules_fact_dropped") == 1
 
 
 @pytest.mark.asyncio
