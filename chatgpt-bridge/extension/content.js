@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "23";
+const VERSION = "24";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -107,7 +107,6 @@ const MOTS_RECHERCHE =
 const MOTS_PLUS_MODELES = /plus de mod|autres mod|more models|legacy models/;
 
 const POLL_MS = 120;
-const APPEAR_TIMEOUT_MS = 30000; // délai d'apparition de la bulle de réponse
 // La première fenêtre reste courte pour rendre rapidement un diagnostic, mais
 // elle n'est plus la borne de la soumission. Après celle-ci, on conserve le
 // même job et le même onglet dans une phase ambiguë jusqu'à cette borne finale.
@@ -254,21 +253,47 @@ function activeReasoningSignal(element) {
   return submissionSignalVisible(element);
 }
 
-function captureSubmissionSnapshot(composer, sendBtn) {
+function currentSubmissionGenerationSignals() {
   const stopSignals = activeSubmissionSignals(SELECTORS.stop);
   const reasoningSignals = activeSubmissionSignals(
     SELECTORS.reasoning,
     activeReasoningSignal,
   );
-  const generationSignals = [
+  const streamingSignals = activeSubmissionSignals([
+    ".streaming-animation",
+    ".result-streaming",
+    "[data-is-streaming='true']",
+  ]);
+  const elements = [
     ...stopSignals,
     ...reasoningSignals,
-    ...activeSubmissionSignals([
-      ".streaming-animation",
-      ".result-streaming",
-      "[data-is-streaming='true']",
-    ]),
+    ...streamingSignals,
   ];
+  const signatures = new Map(
+    elements.map((element) => [
+      element,
+      [
+        element.getAttribute("aria-hidden"),
+        element.getAttribute("data-state"),
+        element.getAttribute("data-is-streaming"),
+        element.getAttribute("class"),
+        element.getAttribute("style"),
+        element.open,
+      ].join("|"),
+    ]),
+  );
+  return {
+    stop: stopSignals.length > 0,
+    reasoning: reasoningSignals.length > 0,
+    streaming: streamingSignals.length > 0,
+    present: elements.length > 0,
+    elements: new Set(elements),
+    signatures,
+  };
+}
+
+function captureSubmissionSnapshot(composer, sendBtn) {
+  const generation = currentSubmissionGenerationSignals();
   return {
     userTurns: document.querySelectorAll(SELECTORS.user).length,
     assistantTurns: document.querySelectorAll(SELECTORS.assistant).length,
@@ -278,26 +303,19 @@ function captureSubmissionSnapshot(composer, sendBtn) {
       ariaDisabled: sendBtn?.getAttribute("aria-disabled") ?? null,
       ready: isSendButtonReady(sendBtn),
     },
-    generation: {
-      stop: stopSignals.length > 0,
-      reasoning: reasoningSignals.length > 0,
-      present: generationSignals.length > 0,
-      elements: new Set(generationSignals),
-    },
+    generation,
   };
 }
 
 function newSubmissionGenerationSignal(before) {
-  const current = [
-    ...activeSubmissionSignals(SELECTORS.stop),
-    ...activeSubmissionSignals(SELECTORS.reasoning, activeReasoningSignal),
-    ...activeSubmissionSignals([
-      ".streaming-animation",
-      ".result-streaming",
-      "[data-is-streaming='true']",
-    ]),
-  ];
-  return current.some((element) => !before.generation.elements.has(element));
+  const current = currentSubmissionGenerationSignals();
+  return [...current.elements].some((element) => {
+    if (!before.generation.elements.has(element)) return true;
+    return (
+      before.generation.signatures?.get(element) !==
+      current.signatures.get(element)
+    );
+  });
 }
 
 function submissionDiagnostics(snapshot, method, after) {
@@ -364,6 +382,90 @@ async function waitForSubmissionConfirmation(composer, sendBtn, snapshot, method
   );
   error.diagnostics = diagnostics;
   throw error;
+}
+
+function firstAssistantWaitDiagnostics(
+  composer,
+  sendBtn,
+  snapshot,
+  before,
+  startedAt,
+) {
+  const after = captureSubmissionSnapshot(composer, sendBtn);
+  return {
+    content_script_version: VERSION,
+    elapsed_ms: Math.max(0, Date.now() - startedAt),
+    assistant_turns_before: before,
+    assistant_turns_after: after.assistantTurns,
+    user_turns_before: snapshot.userTurns,
+    user_turns_after: after.userTurns,
+    composer_has_text: Boolean(after.composerText.trim()),
+    send_enabled: after.sendState.ready,
+    send_disabled: !after.sendState.ready,
+    stop_visible: after.generation.stop,
+    reasoning_visible: after.generation.reasoning,
+    streaming_generation_signal_visible: after.generation.present,
+  };
+}
+
+/**
+ * Waits for the first assistant turn created by the already-confirmed send.
+ *
+ * This is deliberately not a wall-clock appearance timeout. ChatGPT can spend
+ * several minutes in web research or reasoning before it creates the visible
+ * assistant turn. Only a generation signal whose DOM element was not present
+ * at submission time counts as activity; stale pre-submit controls and
+ * indicators therefore cannot keep this wait alive.
+ */
+async function waitForFirstAssistantTurn(
+  job,
+  composer,
+  sendBtn,
+  submissionSnapshot,
+  assistantTurnsBefore,
+) {
+  const startedAt = Date.now();
+  let lastActivityAt = startedAt;
+  let lastHeartbeatAt = startedAt;
+  const progress = {
+    phase: "waiting_answer",
+    output_chars: 0,
+    stable_for_ms: 0,
+    completion_signal: "unknown",
+    completion_confidence: "low",
+  };
+
+  while (!job.aborted) {
+    await sleep(POLL_MS);
+    const now = Date.now();
+
+    if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+      reply({ type: "heartbeat", id: job.id, progress });
+      lastHeartbeatAt = now;
+    }
+
+    const turns = document.querySelectorAll(SELECTORS.assistant);
+    if (turns.length > assistantTurnsBefore) return turns[turns.length - 1];
+
+    if (newSubmissionGenerationSignal(submissionSnapshot)) {
+      lastActivityAt = now;
+    }
+    if (now - lastActivityAt >= ACTIVE_SIGNAL_STALL_MS) {
+      const error = new BridgeError(
+        "bridge_ui_timeout",
+        "aucun tour assistant après la soumission du prompt",
+      );
+      error.diagnostics = firstAssistantWaitDiagnostics(
+        composer,
+        sendBtn,
+        submissionSnapshot,
+        assistantTurnsBefore,
+        startedAt,
+      );
+      throw error;
+    }
+  }
+  return null;
 }
 
 /**
@@ -1660,15 +1762,16 @@ async function handlePrompt({
       });
     }
 
-    // Attendre la bulle de réponse *nouvelle* (pas la précédente).
-    const premier = await waitFor(
-      () => {
-        const turns = document.querySelectorAll(SELECTORS.assistant);
-        return turns.length > before ? turns[turns.length - 1] : null;
-      },
-      APPEAR_TIMEOUT_MS,
-      "pas de réponse de ChatGPT",
+    // Attendre le premier tour assistant *nouveau* (pas le précédent), sans
+    // imposer une courte borne murale à une recherche web ou réflexion longue.
+    const premier = await waitForFirstAssistantTurn(
+      job,
+      composer,
+      sendBtn,
+      submissionBaseline,
+      before,
     );
+    if (!premier) return;
     const serialized = await streamAnswer(job, turnLocator(premier), before);
 
     if (!job.aborted) {

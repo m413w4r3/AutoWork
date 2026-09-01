@@ -676,7 +676,124 @@ function useVirtualClock(window) {
     });
     await run(`handlePrompt({ id: "req-post", prompt: "bonjour", conversation: { id: "conv-A", mode: "fresh" } })`);
     assert.equal(submitEvents, 1);
-    assert.equal(sent.find((message) => message.type === "error")?.submission_state, "post_submission");
+    const error = sent.find((message) => message.type === "error");
+    assert.equal(error?.code, "bridge_ui_timeout");
+    assert.equal(error?.phase, "generation");
+    assert.equal(error?.submission_state, "post_submission");
+    assert.equal(error?.diagnostics?.composer_has_text, false);
+    assert.equal(error?.diagnostics?.streaming_generation_signal_visible, false);
+    assert.equal(error?.diagnostics?.assistant_turns_before, 0);
+    assert.equal(error?.diagnostics?.assistant_turns_after, 0);
+    assert.equal(
+      JSON.stringify(error).includes("bonjour"),
+      false,
+      "les diagnostics de stall ne doivent pas contenir le prompt",
+    );
+  }
+
+  // 10e. Le premier tour peut apparaître après plus de 30 s : une activité de
+  // génération post-soumission garde l'attente en vie, les heartbeats restent
+  // sans contenu, puis le même envoi aboutit sans second trigger.
+  {
+    const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
+      <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    let clock = 0;
+    let assistantAdded = false;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      if (!assistantAdded && clock >= 30_500) {
+        assistantAdded = true;
+        window.document.body.insertAdjacentHTML(
+          "beforeend",
+          `<article data-testid="conversation-turn-long">
+            <div data-message-author-role="assistant" data-message-id="msg-long">
+              <div class="markdown"><p>réponse après longue attente</p></div>
+            </div>${copyButton}
+          </article>`,
+        );
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+    let submitEvents = 0;
+    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      window.document.querySelector("textarea[data-id='prompt']").value = "";
+      window.document.querySelector("#composer-form").insertAdjacentHTML(
+        "beforeend",
+        `<div class="result-streaming"></div>`,
+      );
+    });
+
+    await run(`handlePrompt({ id: "req-long-first-turn", prompt: "recherche longue", conversation: { id: "conv-long", mode: "fresh" } })`);
+
+    assert.ok(clock > 30_000, "le tour doit être attendu au-delà de l'ancienne borne de 30 s");
+    assert.equal(submitEvents, 1, "le formulaire ne doit être soumis qu'une fois");
+    assert.equal(sent.filter((message) => message.type === "error").length, 0);
+    assert.equal(sent.find((message) => message.type === "done")?.text, "réponse après longue attente");
+    const heartbeats = sent.filter((message) => message.type === "heartbeat");
+    assert.ok(heartbeats.length >= 5, "les heartbeats doivent continuer avant le premier tour");
+    assert.ok(
+      heartbeats.every(
+        (message) =>
+          message.progress?.phase === "waiting_answer" &&
+          message.progress?.output_chars === 0,
+      ),
+      "l'attente du premier tour ne doit publier que de la liveness sans contenu",
+    );
+    assert.equal(
+      heartbeats.some((message) => JSON.stringify(message).includes("recherche longue")),
+      false,
+      "un heartbeat ne doit jamais contenir le prompt",
+    );
+    assert.equal(
+      heartbeats.some((message) => JSON.stringify(message).includes("réponse après longue attente")),
+      false,
+      "un heartbeat ne doit jamais contenir la réponse",
+    );
+  }
+
+  // 10f. Les signaux Stop/reasoning/streaming déjà présents avant l'envoi ne
+  // prolongent pas artificiellement l'attente d'un nouveau tour assistant.
+  {
+    const body = `<article data-testid="conversation-turn-stale">
+        <div data-message-author-role="assistant" data-message-id="msg-stale">
+          <div class="markdown"><p>ancienne réponse</p></div>
+          <div class="result-streaming"></div>
+        </div>
+      </article>
+      <details data-testid="reasoning" open><summary>Reasoning</summary></details>
+      <form id="composer-form"><textarea data-id="prompt"></textarea>
+        <button data-testid="stop-button" aria-label="Stop streaming">Stop</button>
+        <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    useVirtualClock(window);
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    let submitEvents = 0;
+    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      window.document.querySelector("textarea[data-id='prompt']").value = "";
+    });
+
+    await run(`handlePrompt({ id: "req-stale-signals", prompt: "recherche", conversation: { id: "conv-stale", mode: "fresh" } })`);
+
+    const error = sent.find((message) => message.type === "error");
+    assert.equal(submitEvents, 1, "un signal DOM périmé ne doit jamais provoquer un second envoi");
+    assert.equal(error?.code, "bridge_ui_timeout");
+    assert.equal(error?.phase, "generation");
+    assert.equal(error?.submission_state, "post_submission");
+    assert.equal(error?.diagnostics?.assistant_turns_before, 1);
+    assert.equal(error?.diagnostics?.assistant_turns_after, 1);
+    assert.equal(error?.diagnostics?.stop_visible, true);
+    assert.equal(error?.diagnostics?.reasoning_visible, true);
+    assert.equal(error?.diagnostics?.streaming_generation_signal_visible, true);
   }
 
   // 11. CONTINUE sur une navigation /c/... : refus avant toute saisie/envoi.
