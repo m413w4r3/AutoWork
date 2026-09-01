@@ -7,6 +7,7 @@ import pytest
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.model_conversations import (
+    ConversationPolicyError,
     ModelConversationError,
     ModelConversationService,
 )
@@ -23,6 +24,7 @@ from cti_app.application.model_gateway import (
     SafeModelRequest,
     sanitize_model_request,
 )
+from cti_app.application.production_reconciliation import _verified_external_turn_id
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
@@ -555,3 +557,261 @@ async def test_repeat_archive_is_safe_and_retries_closing(tmp_path: Path) -> Non
     assert second.status is ConversationStatus.ARCHIVED
     # Both calls retry closing the exact external tab.
     assert closer.calls == [conversation.id, conversation.id]
+
+
+# --------------------------------------------------------------------------- #
+# Recovery identity: only a verified external assistant turn id may become
+# `ModelConversationTurn.external_turn_id`. It is never derived from the bridge
+# run id, `ModelRun.response_id`, the ModelRun id or a browser target id.
+# --------------------------------------------------------------------------- #
+_AMBIGUOUS_BRIDGE_RUN_ID = "bridge-response-DIFFERENT"
+
+
+class _AmbiguousThenAnsweringAdapter(_ScriptedBridgeAdapter):
+    """Fails the first submission ambiguously, then answers normally."""
+
+    def __init__(self, answer: str, *, turn_id: str = "dom-turn-continue") -> None:
+        super().__init__(answer, turn_id=turn_id)
+        self.fail_next = True
+
+    async def invoke(
+        self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        if self.fail_next:
+            self.fail_next = False
+            self.calls.append(request)
+            raise BridgeTransportError(
+                "bridge_ui_timeout",
+                "La confirmation du bridge est ambiguë.",
+                retryable=True,
+                phase="submission_confirmation",
+                bridge_run_id=_AMBIGUOUS_BRIDGE_RUN_ID,
+                submission_state="submission_attempted",
+            )
+        return await super().invoke(request, role=role, output_schema=output_schema)
+
+
+async def _ambiguous_first_turn(
+    service: ModelConversationService,
+    conversation: ModelConversation,
+) -> None:
+    with pytest.raises(ModelGatewayError):
+        await service.add_turn(
+            conversation.id,
+            message="Question récupérable",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            idempotency_key="identity-recovery-key",
+            correlation_id="corr-identity",
+        )
+
+
+async def test_visible_recovery_persists_the_real_external_turn_id(tmp_path: Path) -> None:
+    """J + L: the DOM turn id survives adoption; response_id never stands in."""
+    adapter = _AmbiguousThenAnsweringAdapter("Suite", turn_id="dom-turn-2")
+    service, state = _build_service(adapter, tmp_path)
+    conversation = await _fresh_conversation(service)
+    await _ambiguous_first_turn(service, conversation)
+
+    turn = next(iter(state.turns.values()))
+    model_run = state.model_runs[turn.model_run_id]
+    # The bridge response id is deliberately different from the DOM turn id.
+    assert model_run.response_id == _AMBIGUOUS_BRIDGE_RUN_ID
+
+    await service._gateway.adopt_recovery_output(  # type: ignore[attr-defined]
+        model_run.id,
+        b"Reponse recuperee",
+        provenance="visible_recovery",
+        actor_id="reviewer",
+        external_turn_id="dom-turn-1",
+    )
+
+    adopted = state.turns[turn.id]
+    assert adopted.status is ConversationTurnStatus.SUCCEEDED
+    assert adopted.external_turn_id == "dom-turn-1"
+    assert adopted.external_turn_id != model_run.response_id
+    assert adopted.external_turn_id != str(model_run.id)
+    assert adopted.external_turn_id != str(conversation.id)
+
+
+async def test_continue_after_visible_recovery_routes_on_the_real_turn_id(
+    tmp_path: Path,
+) -> None:
+    """K: the next CONTINUE carries the captured DOM turn id, not response_id."""
+    adapter = _AmbiguousThenAnsweringAdapter("Suite", turn_id="dom-turn-2")
+    service, state = _build_service(adapter, tmp_path)
+    conversation = await _fresh_conversation(service)
+    await _ambiguous_first_turn(service, conversation)
+
+    turn = next(iter(state.turns.values()))
+    await service._gateway.adopt_recovery_output(  # type: ignore[attr-defined]
+        state.model_runs[turn.model_run_id].id,
+        b"Reponse recuperee",
+        provenance="visible_recovery",
+        actor_id="reviewer",
+        external_turn_id="dom-turn-1",
+    )
+
+    second = await service.add_turn(
+        conversation.id,
+        message="Et ensuite ?",
+        mode=ConversationMode.CONTINUE,
+        external_llm_allowed=True,
+        idempotency_key="continue-after-recovery",
+        correlation_id="corr-continue-recovery",
+    )
+
+    assert second.status is ConversationTurnStatus.SUCCEEDED
+    context = adapter.calls[-1].conversation
+    assert context is not None
+    assert context.expected_turn_id == "dom-turn-1"
+    assert context.expected_turn_id != _AMBIGUOUS_BRIDGE_RUN_ID
+
+
+async def test_manual_import_invents_no_external_turn_id_and_blocks_continue(
+    tmp_path: Path,
+) -> None:
+    """M: a Markdown import has no verified external identity, and says so."""
+    adapter = _AmbiguousThenAnsweringAdapter("Suite")
+    service, state = _build_service(adapter, tmp_path)
+    conversation = await _fresh_conversation(service)
+    await _ambiguous_first_turn(service, conversation)
+
+    turn = next(iter(state.turns.values()))
+    model_run = state.model_runs[turn.model_run_id]
+    await service._gateway.adopt_recovery_output(  # type: ignore[attr-defined]
+        model_run.id,
+        b"Contenu colle a la main",
+        provenance="manual_import",
+        actor_id="analyst",
+    )
+
+    adopted = state.turns[turn.id]
+    assert adopted.status is ConversationTurnStatus.SUCCEEDED
+    assert adopted.external_turn_id is None
+
+    with pytest.raises(ConversationPolicyError, match="tour externe vérifié"):
+        await service.add_turn(
+            conversation.id,
+            message="Et ensuite ?",
+            mode=ConversationMode.CONTINUE,
+            external_llm_allowed=True,
+            idempotency_key="continue-after-manual-import",
+            correlation_id="corr-continue-manual",
+        )
+    # The refusal happened before any submission: the adapter was called once.
+    assert len(adapter.calls) == 1
+
+
+async def test_blank_external_turn_id_is_not_replaced_by_a_look_alike(
+    tmp_path: Path,
+) -> None:
+    """O: an unusable capture identity degrades to `None`, never to a fallback."""
+    adapter = _AmbiguousThenAnsweringAdapter("Suite")
+    service, state = _build_service(adapter, tmp_path)
+    conversation = await _fresh_conversation(service)
+    await _ambiguous_first_turn(service, conversation)
+
+    turn = next(iter(state.turns.values()))
+    await service._gateway.adopt_recovery_output(  # type: ignore[attr-defined]
+        state.model_runs[turn.model_run_id].id,
+        b"Reponse recuperee",
+        provenance="visible_recovery",
+        actor_id="reviewer",
+        external_turn_id=_verified_external_turn_id("   "),
+    )
+
+    assert state.turns[turn.id].external_turn_id is None
+
+
+async def test_double_adoption_creates_no_second_run_or_turn(tmp_path: Path) -> None:
+    """P: replaying the exact same adoption is a join, never a new identity."""
+    adapter = _AmbiguousThenAnsweringAdapter("Suite")
+    service, state = _build_service(adapter, tmp_path)
+    conversation = await _fresh_conversation(service)
+    await _ambiguous_first_turn(service, conversation)
+
+    turn = next(iter(state.turns.values()))
+    model_run_id = state.model_runs[turn.model_run_id].id
+    first = await service._gateway.adopt_recovery_output(  # type: ignore[attr-defined]
+        model_run_id,
+        b"Reponse recuperee",
+        provenance="visible_recovery",
+        actor_id="reviewer",
+        external_turn_id="dom-turn-1",
+    )
+    second = await service._gateway.adopt_recovery_output(  # type: ignore[attr-defined]
+        model_run_id,
+        b"Reponse recuperee",
+        provenance="visible_recovery",
+        actor_id="reviewer",
+        external_turn_id="dom-turn-1",
+    )
+
+    assert first.id == second.id == model_run_id
+    assert len(state.model_runs) == 1
+    assert len(state.turns) == 1
+    assert len(state.conversations) == 1
+    assert state.turns[turn.id].external_turn_id == "dom-turn-1"
+
+
+class _AlwaysAmbiguousStatelessAdapter:
+    """Stateless bridge run: no ConversationContext is ever attached."""
+
+    provider = ModelProvider.OPENAI
+    requested_model = "chatgpt-web"
+    is_external = True
+
+    async def invoke(
+        self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del role, output_schema
+        assert request.conversation is None
+        raise BridgeTransportError(
+            "bridge_ui_timeout",
+            "La confirmation du bridge est ambiguë.",
+            retryable=True,
+            phase="submission_confirmation",
+            bridge_run_id="bridge-response-STATELESS",
+            submission_state="submission_attempted",
+        )
+
+    async def resume(
+        self, response_id: str, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        raise ModelGatewayError("stateless adapter does not resume")
+
+
+async def test_stateless_recovery_creates_no_conversational_identity(
+    tmp_path: Path,
+) -> None:
+    """N: adopting a stateless run never fabricates a conversation or a turn."""
+    adapter = _AlwaysAmbiguousStatelessAdapter()
+    service, state = _build_service(adapter, tmp_path)  # type: ignore[arg-type]
+    gateway = service._gateway  # type: ignore[attr-defined]
+    run_id = uuid4()
+
+    with pytest.raises(ModelGatewayError):
+        await gateway.research(
+            ModelRequest(
+                text="Recherche sans conversation",
+                prompt_template_id="analyst-conversation",
+                prompt_template_version="1",
+                evidence_pack_hash="a" * 64,
+                external_llm_allowed=True,
+                routing_hint=ModelRoutingHint.WEB_RESEARCH,
+                run_id=run_id,
+            )
+        )
+
+    await gateway.adopt_recovery_output(
+        run_id,
+        b"Reponse recuperee sans conversation",
+        provenance="visible_recovery",
+        actor_id="reviewer",
+        external_turn_id="dom-turn-stateless",
+    )
+
+    assert state.turns == {}
+    assert state.conversations == {}
+    assert state.model_runs[run_id].status.value == "succeeded"

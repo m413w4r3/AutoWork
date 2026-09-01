@@ -404,7 +404,17 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         provenance: str,
         actor_id: str,
         source_model_run_id: UUID | None = None,
+        external_turn_id: str | None = None,
     ) -> ModelRun:
+        """Adopt an out-of-band output for an exact ModelRun.
+
+        `external_turn_id` is the verified external assistant turn id captured
+        from the exact ChatGPT target.  It is the only value allowed to become
+        `ModelConversationTurn.external_turn_id`: a manual import passes `None`
+        rather than inventing an identity, and it is never substituted by
+        `run.response_id`, the bridge run id or a browser target id -- none of
+        those can route a later CONTINUE.
+        """
         digest = hashlib.sha256(content).hexdigest()
         async with self._uow_factory() as uow:
             existing = await uow.model_runs.get(run_id)
@@ -472,7 +482,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         turn.adopt_recovery_output(
                             output_blob_reference=reference,
                             output_sha256=digest,
-                            external_turn_id=run.response_id,
+                            external_turn_id=external_turn_id,
                         )
                         conversation.finish_turn(
                             turn.id,

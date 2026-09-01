@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "25";
+const VERSION = "26";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -307,15 +307,37 @@ function captureSubmissionSnapshot(composer, sendBtn) {
   };
 }
 
+/**
+ * Compares two generation-signal states and names the transition between them.
+ *
+ * Returns `null` when the signals are strictly unchanged — same elements, same
+ * signatures. Persistence is not activity: a Stop/reasoning/streaming node that
+ * appeared once and then froze must stop refreshing any liveness deadline.
+ */
+function generationSignalTransition(previous, current) {
+  for (const element of current.elements) {
+    if (!previous.elements.has(element)) return "appeared";
+    if (previous.signatures?.get(element) !== current.signatures.get(element)) {
+      return "changed";
+    }
+  }
+  for (const element of previous.elements) {
+    if (!current.elements.has(element)) return "disappeared";
+  }
+  return null;
+}
+
+/**
+ * Submission proof only: a signal that appeared or mutated since the
+ * pre-submission snapshot. A signal *disappearing* proves nothing about the
+ * send having been accepted, so it is deliberately not counted here.
+ */
 function newSubmissionGenerationSignal(before) {
-  const current = currentSubmissionGenerationSignals();
-  return [...current.elements].some((element) => {
-    if (!before.generation.elements.has(element)) return true;
-    return (
-      before.generation.signatures?.get(element) !==
-      current.signatures.get(element)
-    );
-  });
+  const transition = generationSignalTransition(
+    before.generation,
+    currentSubmissionGenerationSignals(),
+  );
+  return transition === "appeared" || transition === "changed";
 }
 
 function submissionDiagnostics(snapshot, method, after) {
@@ -413,9 +435,17 @@ function firstAssistantWaitDiagnostics(
  *
  * This is deliberately not a wall-clock appearance timeout. ChatGPT can spend
  * several minutes in web research or reasoning before it creates the visible
- * assistant turn. Only a generation signal whose DOM element was not present
- * at submission time counts as activity; stale pre-submit controls and
- * indicators therefore cannot keep this wait alive.
+ * assistant turn.
+ *
+ * Activity is a *transition* from the last observed signal state, never a
+ * repeated comparison against the pre-submission snapshot. That distinction
+ * matters for two symmetric failures:
+ *   - a signal already visible before Send never counts (it never transitions);
+ *   - a signal that appears after Send and then freezes counts exactly once,
+ *     so a stuck UI still reaches ACTIVE_SIGNAL_STALL_MS instead of being kept
+ *     alive forever by its own persistence.
+ * Real activity — appearance, disappearance, signature/state change, a new
+ * element — keeps refreshing the deadline for as long as the UI truly moves.
  */
 async function waitForFirstAssistantTurn(
   job,
@@ -427,6 +457,9 @@ async function waitForFirstAssistantTurn(
   const startedAt = Date.now();
   let lastActivityAt = startedAt;
   let lastHeartbeatAt = startedAt;
+  // Baseline = the state observed at submission time, so a pre-existing signal
+  // is already "seen" and cannot register as an appearance.
+  let observedSignals = submissionSnapshot.generation;
   const progress = {
     phase: "waiting_answer",
     output_chars: 0,
@@ -447,9 +480,11 @@ async function waitForFirstAssistantTurn(
     const turns = document.querySelectorAll(SELECTORS.assistant);
     if (turns.length > assistantTurnsBefore) return turns[turns.length - 1];
 
-    if (newSubmissionGenerationSignal(submissionSnapshot)) {
+    const currentSignals = currentSubmissionGenerationSignals();
+    if (generationSignalTransition(observedSignals, currentSignals)) {
       lastActivityAt = now;
     }
+    observedSignals = currentSignals;
     if (now - lastActivityAt >= ACTIVE_SIGNAL_STALL_MS) {
       const error = new BridgeError(
         "bridge_ui_timeout",

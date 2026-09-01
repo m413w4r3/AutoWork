@@ -577,6 +577,41 @@ async function main() {
     assert.equal(await run(`browserTargetRegistry.has("${targetB.id}")`), true);
   }
 
+  // 12f. Redémarrage du navigateur / rechargement de l'extension :
+  // chrome.storage.session est entièrement perdu. Une target stateless connue
+  // avant le redémarrage doit échouer fermé — jamais de nouvel onglet, jamais
+  // de repli sur un onglet ChatGPT existant, jamais de resoumission.
+  {
+    const mock = makeChromeMock();
+    const survivor = await mock.chrome.tabs.create({
+      url: "https://chatgpt.com/?temporary-chat=true",
+      active: true,
+    });
+    const sent = [];
+    mock.chrome.tabs.sendMessage = async (tabId, msg) => {
+      sent.push({ tabId, msg });
+      return {};
+    };
+    // storage.session est vide : rien n'a survécu au redémarrage.
+    assert.deepEqual(mock.sessionStore, {});
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-lost-after-restart" };
+
+    await assert.rejects(
+      run(`resolveRecoverableBrowserTarget(${JSON.stringify(target)}, "run-lost")`),
+      (err) => typeof err.code === "string" && err.code.length > 0,
+      "une target inconnue doit échouer avec un code typé",
+    );
+
+    await run(`handleRecoveryCapture({ id: "recovery-lost", bridge_run_id: "run-lost", browser_target: ${JSON.stringify(target)} })`);
+    await run(`handleBrowserTargetRelease({ id: "release-lost", run_id: "run-lost", browser_target: ${JSON.stringify(target)} })`);
+
+    assert.equal(mock.tabsById.size, 1, "aucun onglet ne doit être créé ni fermé");
+    assert.equal(mock.tabsById.has(survivor.id), true);
+    assert.equal(sent.length, 0, "aucun message ne doit atteindre un onglet ChatGPT arbitraire");
+    assert.equal(await run(`browserTargetRegistry.has("${target.id}")`), false);
+  }
+
   // 13. Un onglet normal préexistant reste intact : le run stateless ouvre sa
   // propre target et ne lui envoie ni contrôle ni prompt.
   {

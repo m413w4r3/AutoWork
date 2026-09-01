@@ -796,6 +796,184 @@ function useVirtualClock(window) {
     assert.equal(error?.diagnostics?.streaming_generation_signal_visible, true);
   }
 
+  // 10g. `generationSignalTransition` distingue les six cas observables. Une
+  // persistance stricte n'est jamais de l'activité.
+  {
+    const { window, run } = loadExtension(
+      `<div id="host"><div class="result-streaming" id="s1"></div></div>`,
+    );
+    const host = window.document.querySelector("#host");
+    const capture = (name) =>
+      run(`globalThis.${name} = currentSubmissionGenerationSignals(); null`);
+
+    // signal déjà présent, strictement inchangé -> aucune transition
+    capture("__a");
+    capture("__b");
+    assert.equal(run(`generationSignalTransition(__a, __b)`), null);
+
+    // changement de signature/state sur le même élément
+    window.document
+      .querySelector("#s1")
+      .setAttribute("class", "result-streaming busy");
+    capture("__c");
+    assert.equal(run(`generationSignalTransition(__b, __c)`), "changed");
+
+    // nouvel élément apparu
+    host.insertAdjacentHTML(
+      "beforeend",
+      `<button data-testid="stop-button" aria-label="Stop streaming"></button>`,
+    );
+    capture("__d");
+    assert.equal(run(`generationSignalTransition(__c, __d)`), "appeared");
+
+    // aucune mutation entre deux polls -> toujours aucune activité
+    capture("__e");
+    assert.equal(run(`generationSignalTransition(__d, __e)`), null);
+
+    // disparition
+    window.document.querySelector("#s1").remove();
+    capture("__f");
+    assert.equal(run(`generationSignalTransition(__e, __f)`), "disappeared");
+
+    // plus aucun signal, deux fois de suite -> aucune activité
+    window.document.querySelector("[data-testid='stop-button']").remove();
+    capture("__g");
+    capture("__h");
+    assert.equal(run(`generationSignalTransition(__g, __h)`), null);
+  }
+
+  // 10h. Un signal de génération qui apparaît APRÈS Send puis reste
+  // parfaitement figé ne doit pas rafraîchir l'activité à chaque poll :
+  // l'attente doit finir en bridge_ui_timeout borné.
+  {
+    const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
+      <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    let clock = 0;
+    let polls = 0;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      polls += 1;
+      if (polls > 20_000) {
+        throw new Error(
+          "le watchdog n'a jamais conclu : un signal figé maintient l'attente en vie",
+        );
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+    let submitEvents = 0;
+    let sendClicks = 0;
+    window.document.querySelector("button[data-testid='send-button']").addEventListener("click", () => { sendClicks += 1; });
+    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      window.document.querySelector("textarea[data-id='prompt']").value = "";
+      // Apparaît une fois, puis plus jamais aucune mutation.
+      window.document.body.insertAdjacentHTML(
+        "beforeend",
+        `<div class="result-streaming" data-frozen="true"></div>`,
+      );
+    });
+
+    await run(`handlePrompt({ id: "req-frozen-signal", prompt: "recherche figée", conversation: { id: "conv-frozen", mode: "fresh" } })`);
+
+    const error = sent.find((message) => message.type === "error");
+    assert.equal(error?.code, "bridge_ui_timeout");
+    assert.equal(error?.phase, "generation");
+    assert.equal(error?.submission_state, "post_submission");
+    assert.equal(error?.diagnostics?.streaming_generation_signal_visible, true);
+    assert.equal(error?.diagnostics?.assistant_turns_after, 0);
+    assert.equal(submitEvents, 1, "aucune resoumission après un stall figé");
+    assert.equal(sendClicks, 0);
+    assert.ok(
+      clock >= 300_000,
+      `le stall ne doit pas être prématuré (clock=${clock})`,
+    );
+    assert.ok(
+      clock < 400_000,
+      `le stall doit rester borné par ACTIVE_SIGNAL_STALL_MS (clock=${clock})`,
+    );
+    assert.equal(
+      JSON.stringify(sent).includes("recherche figée"),
+      false,
+      "ni heartbeat ni diagnostics ne doivent contenir le prompt",
+    );
+  }
+
+  // 10i. Une vraie activité prolongée (signature qui change réellement) garde
+  // le watchdog vivant bien au-delà de ACTIVE_SIGNAL_STALL_MS, puis le tour
+  // assistant arrive et la finalisation se poursuit normalement.
+  {
+    const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
+      <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
+    const { window, run } = loadExtension(body, "https://chatgpt.com/?temporary-chat=true");
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    let clock = 0;
+    let polls = 0;
+    let assistantAdded = false;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      polls += 1;
+      if (polls > 40_000) throw new Error("boucle non bornée");
+      const signal = window.document.querySelector(".result-streaming");
+      if (signal && clock < 600_000) {
+        signal.setAttribute("class", `result-streaming step-${polls}`);
+      }
+      if (!assistantAdded && clock >= 600_000) {
+        assistantAdded = true;
+        signal?.remove();
+        window.document.body.insertAdjacentHTML(
+          "beforeend",
+          `<article data-testid="conversation-turn-slow">
+            <div data-message-author-role="assistant" data-message-id="msg-slow">
+              <div class="markdown"><p>réponse après recherche approfondie</p></div>
+            </div>${copyButton}
+          </article>`,
+        );
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+    let submitEvents = 0;
+    window.document.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      window.document.querySelector("textarea[data-id='prompt']").value = "";
+      window.document.body.insertAdjacentHTML(
+        "beforeend",
+        `<div class="result-streaming"></div>`,
+      );
+    });
+
+    await run(`handlePrompt({ id: "req-long-activity", prompt: "recherche approfondie", conversation: { id: "conv-long-activity", mode: "fresh" } })`);
+
+    assert.ok(clock > 600_000, "l'attente doit dépasser largement 30 s et 300 s");
+    assert.equal(sent.filter((message) => message.type === "error").length, 0);
+    assert.equal(
+      sent.find((message) => message.type === "done")?.text,
+      "réponse après recherche approfondie",
+    );
+    assert.equal(submitEvents, 1, "exactement une soumission");
+    const heartbeats = sent.filter((message) => message.type === "heartbeat");
+    assert.ok(heartbeats.length >= 5, "le heartbeat doit continuer pendant l'attente");
+    assert.equal(
+      JSON.stringify(heartbeats).includes("recherche approfondie"),
+      false,
+      "aucun contenu de prompt dans les heartbeats",
+    );
+    assert.equal(
+      JSON.stringify(heartbeats).includes("réponse après recherche approfondie"),
+      false,
+      "aucun contenu de réponse dans les heartbeats",
+    );
+  }
+
   // 11. CONTINUE sur une navigation /c/... : refus avant toute saisie/envoi.
   {
     const body = `${temporaryComposer}<button data-testid="send-button">Send</button>

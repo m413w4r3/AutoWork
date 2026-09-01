@@ -37,14 +37,40 @@ extérieur au port 8001.
 | `BRIDGE_RUN_DB` | SQLite durable, `/data/bridge-runs.sqlite3` dans Compose |
 | `BRIDGE_RUN_RETENTION_SECONDS` | rétention des runs terminaux, 7 jours par défaut |
 | `BRIDGE_RUN_CLEANUP_LIMIT` | nombre maximal de lignes supprimées par nettoyage |
-| `BRIDGE_IDLE_TIMEOUT` | silence maximal de l’extension |
-| `BRIDGE_TOTAL_TIMEOUT` | recherche complète, 900 secondes par défaut |
-| `BRIDGE_UI_TIMEOUT` | probe ou contrôle actif de l’UI |
+| `BRIDGE_IDLE_TIMEOUT` | silence maximal de l’extension, 300 secondes par défaut |
+| `BRIDGE_TOTAL_TIMEOUT` | génération complète, 3600 secondes par défaut |
+| `BRIDGE_UI_TIMEOUT` | probe ou contrôle actif de l’UI, 30 secondes par défaut |
 | `BRIDGE_UI_SNAPSHOT_STALE` | âge après lequel le dernier snapshot est périmé |
 | `BRIDGE_SHUTDOWN_GRACE_SECONDS` | délai de drainage des runs, 20 secondes par défaut |
 | `OPENAI_BRIDGE_CONNECT_TIMEOUT_SECONDS` | connexion applicative, 3 secondes |
 | `OPENAI_BRIDGE_CAPABILITIES_TIMEOUT_SECONDS` | capabilities, au plus 2 secondes |
 | `OPENAI_BRIDGE_MAX_ATTEMPTS` | tentatives réseau bornées avec clé stable |
+
+### Trois bornes indépendantes
+
+Elles ne se remplacent pas et ne doivent jamais être confondues.
+
+1. **Idle timeout réseau/extension** — `BRIDGE_IDLE_TIMEOUT` (300 s). Silence
+   total de l’extension côté serveur : plus aucun paquet, heartbeat compris. Un
+   heartbeat le réarme, parce qu’il prouve que l’extension et l’onglet vivent.
+2. **UI/activity stall watchdog** — dans le content script :
+   `ACTIVE_SIGNAL_STALL_MS` (300 s) pendant l’attente du premier tour assistant,
+   `FINALIZATION_STALL_MS` (45 s) pendant la finalisation. Il mesure l’activité
+   *observable du DOM* : apparition, disparition, changement de signature ou
+   d’état d’un signal Stop/reasoning/streaming. Un signal apparu puis
+   strictement figé n’est **pas** de l’activité et n’en repousse pas l’échéance.
+   Un heartbeat ne peut donc jamais masquer indéfiniment une UI bloquée : le
+   heartbeat réarme la borne 1, jamais celle-ci.
+3. **Total generation timeout** — `BRIDGE_TOTAL_TIMEOUT` (3600 s). Plafond
+   absolu d’une génération, quelle que soit l’activité observée. Une recherche
+   approfondie ChatGPT dépasse couramment le quart d’heure : cette borne protège
+   d’une génération réellement bloquée, elle n’arbitre pas la durée normale
+   d’une recherche. `JOB_ACTOR_TIME_LIMIT_SECONDS` (4500 s) doit rester
+   au-dessus pour laisser au worker le temps de parser et persister.
+
+Aucune de ces bornes ne resoumet le prompt : elles terminent le run
+(`bridge_timeout` ou `bridge_ui_timeout`) et laissent la réconciliation
+explicite décider.
 
 Dans Chrome : charger `chatgpt-bridge/extension`, ouvrir le popup, saisir
 `ws://127.0.0.1:8001/ws` et `BRIDGE_WS_TOKEN`, puis reconnecter. Le jeton est

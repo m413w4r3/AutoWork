@@ -11,6 +11,7 @@ from cti_app.application.jobs import DuplicateJobError
 from cti_app.application.production_reconciliation import (
     ProductionReconciliationError,
     ProductionReconciliationService,
+    _verified_external_turn_id,
 )
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.jobs import Job
@@ -155,9 +156,11 @@ class _Gateway:
         self.model = model
         self.adapter_calls = 0
         self.outputs: dict[str, bytes] = {}
+        self.adoptions: list[dict[str, object]] = []
 
     async def adopt_recovery_output(self, run_id: UUID, content: bytes, **kwargs: object):
         assert run_id == self.model.id
+        self.adoptions.append(dict(kwargs))
         self.model.adopt_recovery(
             output_reference=f"output:{run_id}",
             output_sha256=hashlib.sha256(content).hexdigest(),
@@ -183,8 +186,11 @@ class _Bridge:
         self.previews += 1
         return {
             "bridge_run_id": bridge_run_id,
+            # The verified external assistant turn id: deliberately unrelated to
+            # the bridge run id and to ModelRun.response_id.
+            "turn_id": "dom-turn-77",
             "text": self.text,
-            "metadata": {"turn_id": "turn-1", "target_id": "target-1"},
+            "metadata": {"turn_id": "dom-turn-77", "target_id": "target-1"},
         }
 
     async def release_visible_recovery(self, bridge_run_id: str):
@@ -521,3 +527,72 @@ async def test_terminal_batch_recovery_keeps_every_publication_fence(
     )
     assert gateway.model.status is ModelRunStatus.NEEDS_REVIEW
     assert jobs.submissions == 0
+
+
+@pytest.mark.asyncio
+async def test_visible_adoption_forwards_the_verified_external_turn_id(
+    fixture: ReconciliationFixture,
+) -> None:
+    """The DOM turn id captured by the bridge is what reaches the gateway."""
+    service, uow, gateway, _bridge, _jobs = fixture
+    run = next(iter(uow.subject_production_runs.runs.values()))
+    preview = await service.preview_visible(run.id)
+
+    assert preview.external_turn_id == "dom-turn-77"
+    # It is never exposed as operator-facing preview data.
+    assert "external_turn_id" not in preview.as_dict()
+
+    await service.adopt_visible(run.id, preview.sha256, actor_id="analyst")
+
+    assert gateway.adoptions == [
+        {
+            "provenance": "visible_recovery",
+            "actor_id": "analyst",
+            "external_turn_id": "dom-turn-77",
+        }
+    ]
+    assert gateway.adoptions[0]["external_turn_id"] != gateway.model.response_id
+    assert gateway.adoptions[0]["external_turn_id"] != preview.bridge_response_id
+
+
+@pytest.mark.asyncio
+async def test_review_adoption_uses_the_same_identity_contract(
+    review_fixture: ReconciliationFixture,
+) -> None:
+    """Review and Production adopt through one contract; identity must match."""
+    service, uow, gateway, _bridge, _jobs = review_fixture
+    run = next(iter(uow.subject_production_runs.runs.values()))
+    preview = await service.preview_visible(run.id)
+    await service.adopt_visible(run.id, preview.sha256, actor_id="reviewer")
+
+    assert gateway.adoptions[0]["external_turn_id"] == "dom-turn-77"
+
+
+@pytest.mark.asyncio
+async def test_manual_adoption_never_invents_an_external_turn_id(
+    fixture: ReconciliationFixture,
+) -> None:
+    service, uow, gateway, bridge, _jobs = fixture
+    run = next(iter(uow.subject_production_runs.runs.values()))
+    markdown = "# import manuel\n\ncontenu"
+    preview = await service.preview_manual(run.id, markdown)
+
+    assert preview.external_turn_id is None
+
+    await service.adopt_manual(run.id, markdown, preview.sha256, actor_id="analyst")
+
+    assert gateway.adoptions == [{"provenance": "manual_import", "actor_id": "analyst"}]
+    assert bridge.previews == 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "   ", 42, "x" * 513],
+)
+def test_unverified_turn_ids_degrade_to_none(value: object) -> None:
+    """No look-alike substitute is ever produced for an unusable capture id."""
+    assert _verified_external_turn_id(value) is None
+
+
+def test_verified_turn_id_is_kept_verbatim() -> None:
+    assert _verified_external_turn_id(" dom-turn-77 ") == "dom-turn-77"

@@ -472,7 +472,10 @@ class ModelConversationService:
                 persisted_turn.succeed(
                     output_blob_reference=output_reference,
                     output_sha256=output_sha256,
-                    external_turn_id=metadata.turn_id if metadata else execution.run.response_id,
+                    # No verified bridge metadata means no verified external
+                    # identity: leave it unset rather than passing off the
+                    # ModelRun response id as a continuation handle.
+                    external_turn_id=metadata.turn_id if metadata else None,
                 )
                 persisted_conversation.finish_turn(
                     persisted_turn.id,

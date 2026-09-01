@@ -85,6 +85,11 @@ class ProductionRecoveryPreview:
     chars: int
     metadata: dict[str, Any]
     visible_available: bool
+    # Verified external assistant turn id captured from the exact ChatGPT DOM
+    # target.  Never derived from bridge_response_id, ModelRun.response_id or a
+    # browser target id: only a real, stable turn id can route a later
+    # CONTINUE.  `None` means "no verified external identity" (manual import).
+    external_turn_id: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -167,6 +172,7 @@ class ProductionReconciliationService:
             text,
             visible_available=True,
             metadata=_bounded_metadata(payload.get("metadata")),
+            external_turn_id=_verified_external_turn_id(payload.get("turn_id")),
         )
 
     async def preview_manual(self, run_id: UUID, markdown: str) -> ProductionRecoveryPreview:
@@ -200,6 +206,7 @@ class ProductionReconciliationService:
                     text.encode("utf-8"),
                     provenance="visible_recovery",
                     actor_id=actor_id,
+                    external_turn_id=preview.external_turn_id,
                 )
             except ModelGatewayError as exc:
                 raise ProductionReconciliationError(
@@ -611,6 +618,7 @@ class ProductionReconciliationService:
         *,
         visible_available: bool,
         metadata: dict[str, Any],
+        external_turn_id: str | None = None,
     ) -> ProductionRecoveryPreview:
         return ProductionRecoveryPreview(
             production_run_id=run.id,
@@ -625,7 +633,24 @@ class ProductionReconciliationService:
             chars=len(text),
             metadata=metadata,
             visible_available=visible_available,
+            external_turn_id=external_turn_id,
         )
+
+
+def _verified_external_turn_id(value: object) -> str | None:
+    """Accept only a non-empty external turn id reported by the capture.
+
+    The bridge sends the assistant turn's stable external message id.  Anything
+    else -- absent, blank, oversized, or not a string -- is treated as "no
+    verified identity" rather than being replaced by a look-alike such as the
+    ModelRun response id.
+    """
+    if not isinstance(value, str):
+        return None
+    turn_id = value.strip()
+    if not turn_id or len(turn_id) > 512:
+        return None
+    return turn_id
 
 
 def _sha256(text: str) -> str:
