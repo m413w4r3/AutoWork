@@ -24,6 +24,7 @@ from cti_app.domain.production import (
     ProductionBatchStatus,
     ProductionInputSnapshot,
     ProductionInputSource,
+    ProductionReconciliationRequiredError,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -415,6 +416,12 @@ class SubjectProductionService:
                     SubjectProductionStatus.RUNNING,
                 ):
                     raise ValueError("retry_not_allowed_while_running")
+                # An unresolved provider submission owns its own recovery use
+                # case.  Refuse before the batch is touched so a rejected retry
+                # never reopens a finished batch as a side effect; the domain
+                # repeats the fence under the run lock.
+                if initial_run.requires_reconciliation:
+                    raise ProductionReconciliationRequiredError
 
                 # A manifest is immutable evidence of a freeze.  Keep this
                 # check under the Edition lock so a retry cannot race with the
@@ -430,16 +437,11 @@ class SubjectProductionService:
                 # targets a batch that already finished with issues, and the
                 # dispatch fences only ever let a dispatchable batch move a
                 # subject forward.  This reopens exactly that batch, and
-                # refuses cancelled, superseded or busy ones.
-                await prepare_batch_for_recovery(
-                    uow,
-                    initial_run,
-                    reopen=True,
-                    # A batch still running its initial pass keeps its existing
-                    # retry semantics: a manual retry there has always been
-                    # allowed to sit alongside the subject in flight.
-                    require_idle_siblings=False,
-                )
+                # refuses cancelled, superseded or busy ones.  A batch still
+                # running its initial pass is no exception: one subject at a
+                # time is the batch's serialization invariant, and a manual
+                # retry must not be the one gesture that breaks it.
+                await prepare_batch_for_recovery(uow, initial_run, reopen=True)
 
                 result = await self._retry_from_stage_in_uow(
                     uow,

@@ -40,7 +40,9 @@ from cti_app.domain.editorial import (
     GroupingConfidence,
     GroupingOutcome,
 )
+from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
+    PRODUCTION_RECONCILIATION_ERROR_CODE,
     AnalystInputPack,
     AnalystInvestigation,
     EditionProductionBatch,
@@ -51,6 +53,7 @@ from cti_app.domain.production import (
     ProductionBatchPhase,
     ProductionBatchStatus,
     ProductionReuseInvalidation,
+    ProductionSubmissionReconciliation,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -1963,3 +1966,205 @@ async def test_exact_run_cancel_rejects_inactive_terminal_run(
 
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "production_run_not_cancellable"
+
+
+def _reconciliation_run(
+    edition_id: UUID,
+    subject_id: UUID,
+    *,
+    stage: SubjectProductionStage = SubjectProductionStage.EXTRACTION,
+) -> SubjectProductionRun:
+    """A run stopped by an ambiguous provider submission, as production leaves it."""
+    run = SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
+    run.start_running()
+    run.current_stage = stage
+    run.mark_needs_review(
+        code=PRODUCTION_RECONCILIATION_ERROR_CODE,
+        message="Submission state unknown",
+        reconciliation=ProductionSubmissionReconciliation(
+            production_run_id=run.id,
+            model_run_id=uuid4(),
+            stage=stage,
+            bridge_response_id="bridge-1",
+            submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+            phase="reconciliation",
+        ),
+    )
+    return run
+
+
+@pytest.mark.parametrize("stage", ("extraction", "references"))
+async def test_retry_by_subject_is_refused_while_reconciliation_is_pending(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+    stage: str,
+) -> None:
+    """The current stage and every earlier one are equally refused."""
+    edition_id, subject_id = uuid4(), uuid4()
+    run = _reconciliation_run(edition_id, subject_id)
+    await uow.subject_production_runs.add(run)
+    (await uow.editions.get(edition_id)).status = EditionStatus.REVIEW
+    for artifact_stage in ProductionArtifactStage:
+        await uow.production_artifacts.append(_artifact(run, artifact_stage))
+    jobs = production_app.state.job_service
+    dispatcher = production_app.state.job_dispatcher
+    jobs.submitted.clear()
+    dispatcher.dispatched.clear()
+
+    response = await api.post(f"/api/subjects/{subject_id}/production/retry", json={"stage": stage})
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "production_reconciliation_required"
+    persisted = uow.subject_production_runs.items[run.id]
+    assert persisted.pipeline_generation == 0
+    assert persisted.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert persisted.reconciliation is not None
+    # Nothing was scheduled, so no stage worker and no provider submission.
+    assert jobs.submitted == []
+    assert dispatcher.dispatched == []
+    assert all(
+        artifact.status is ProductionArtifactStatus.VERIFIED
+        for artifact in uow.production_artifacts.items
+    )
+
+
+async def test_retry_by_run_is_refused_while_reconciliation_is_pending(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    run = _reconciliation_run(edition_id, subject_id)
+    await uow.subject_production_runs.add(run)
+    (await uow.editions.get(edition_id)).status = EditionStatus.REVIEW
+    for artifact_stage in ProductionArtifactStage:
+        await uow.production_artifacts.append(_artifact(run, artifact_stage))
+    jobs = production_app.state.job_service
+    dispatcher = production_app.state.job_dispatcher
+    jobs.submitted.clear()
+    dispatcher.dispatched.clear()
+
+    response = await api.post(f"/api/production/runs/{run.id}/retry", json={"stage": "extraction"})
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "production_reconciliation_required"
+    assert uow.subject_production_runs.items[run.id].pipeline_generation == 0
+    assert jobs.submitted == []
+    assert dispatcher.dispatched == []
+
+
+async def test_reconciliation_barrier_does_not_change_the_ordinary_retry_contract(
+    api: AsyncClient,
+    uow: _Uow,
+) -> None:
+    """A NEEDS_REVIEW run without a reconciliation identity still retries."""
+    edition_id, subject_id = uuid4(), uuid4()
+    run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
+    run.current_stage = SubjectProductionStage.EXTRACTION
+    await uow.subject_production_runs.add(run)
+    (await uow.editions.get(edition_id)).status = EditionStatus.REVIEW
+    for artifact_stage in ProductionArtifactStage:
+        await uow.production_artifacts.append(_artifact(run, artifact_stage))
+
+    response = await api.post(
+        f"/api/subjects/{subject_id}/production/retry", json={"stage": "extraction"}
+    )
+
+    assert response.status_code == 200, response.text
+    assert uow.subject_production_runs.items[run.id].pipeline_generation == 1
+
+
+async def test_subject_production_status_exposes_the_owning_batch(
+    api: AsyncClient,
+    uow: _Uow,
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-900", subject_id))
+    run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.FAILED)
+    await uow.subject_production_runs.add(run)
+    await uow.production_input_snapshots.add(
+        SimpleNamespace(
+            production_run_id=run.id,
+            subject_title="TAG-900",
+            research_date=None,
+        )
+    )
+    batch = EditionProductionBatch(
+        edition_id=edition_id,
+        status=ProductionBatchStatus.COMPLETED_WITH_ISSUES,
+        phase=ProductionBatchPhase.REVIEW,
+    )
+    await uow.edition_production_batches.add(batch)
+    await uow.edition_production_batch_items.append_many(
+        [
+            EditionProductionBatchItem(
+                batch_id=batch.id,
+                subject_id=subject_id,
+                production_run_id=run.id,
+                position=1,
+            )
+        ]
+    )
+
+    response = await api.get(f"/api/subjects/{subject_id}/production")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["batch_id"] == str(batch.id)
+
+
+async def test_a_cancelled_batch_article_is_not_restarted_as_a_standalone_run(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    """A new standalone run would never repair the batch item it seems to replace."""
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-901", subject_id))
+    run = SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
+    run.start_running()
+    run.mark_cancelled()
+    await uow.subject_production_runs.add(run)
+    batch = EditionProductionBatch(
+        edition_id=edition_id,
+        status=ProductionBatchStatus.COMPLETED_WITH_ISSUES,
+        phase=ProductionBatchPhase.REVIEW,
+    )
+    await uow.edition_production_batches.add(batch)
+    await uow.edition_production_batch_items.append_many(
+        [
+            EditionProductionBatchItem(
+                batch_id=batch.id,
+                subject_id=subject_id,
+                production_run_id=run.id,
+                position=1,
+            )
+        ]
+    )
+    jobs = production_app.state.job_service
+    jobs.submitted.clear()
+
+    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "production_run_batch_owned"
+    assert len(uow.subject_production_runs.items) == 1
+    assert uow.subject_production_runs.items[run.id].status is SubjectProductionStatus.CANCELLED
+    assert jobs.submitted == []
+
+
+async def test_a_subject_outside_any_batch_can_still_be_restarted(
+    api: AsyncClient,
+    uow: _Uow,
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-902", subject_id))
+    run = SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
+    run.start_running()
+    run.mark_cancelled()
+    await uow.subject_production_runs.add(run)
+
+    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["run_id"] != str(run.id)

@@ -86,6 +86,11 @@ export interface ProductionStatus {
   error_details: Record<string, unknown> | null;
   extraction_progress?: ExtractionProgress | null;
   reconciliation?: ProductionReconciliation | null;
+  /**
+   * Set when the run belongs to an edition production batch. Such a run is
+   * only ever resumed through its batch, never restarted as a standalone one.
+   */
+  batch_id?: string | null;
   /** Parser recoveries worth showing, never blocking. */
   warnings: string[];
   stages: Record<string, StageStatus>;

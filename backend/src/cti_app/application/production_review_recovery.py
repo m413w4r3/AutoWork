@@ -43,7 +43,6 @@ async def prepare_batch_for_recovery(
     run: SubjectProductionRun,
     *,
     reopen: bool,
-    require_idle_siblings: bool = True,
 ) -> EditionProductionBatch | None:
     """Validate — and optionally perform — the batch side of a resume.
 
@@ -80,8 +79,9 @@ async def prepare_batch_for_recovery(
         # never resurrect an old batch behind a newer production.
         await _ensure_not_superseded(batches, batch)
 
-    if require_idle_siblings or needs_reopening:
-        await _ensure_no_active_sibling(uow, items, batch.id, run.id)
+    # One subject of a batch runs at a time, whatever gesture asks for the
+    # resume: a running sibling must reach a terminal state first.
+    await _ensure_no_active_sibling(uow, items, batch.id, run.id)
 
     if reopen and needs_reopening:
         batch.open_review_recovery()
@@ -107,11 +107,25 @@ async def _get_batch(
 
 
 async def _ensure_not_superseded(batches: Any, batch: EditionProductionBatch) -> None:
+    """Only the edition's newest batch may be reopened.
+
+    Activity is not the criterion: a newer batch that already finished — as
+    ``completed`` or ``completed_with_issues`` — is just as much the edition's
+    current production, and resurrecting the batch behind it would reopen a
+    superseded Review.  ``get_latest_for_edition`` is the authority; the
+    active-batch check stays as the cheaper, narrower fence.
+    """
     get_active = getattr(batches, "get_active_for_edition", None)
-    if get_active is None:
+    if get_active is not None:
+        active = await get_active(batch.edition_id)
+        if active is not None and active.id != batch.id:
+            raise ReviewRecoveryConflictError(BATCH_SUPERSEDED)
+
+    get_latest = getattr(batches, "get_latest_for_edition", None)
+    if get_latest is None:
         return
-    active = await get_active(batch.edition_id)
-    if active is not None and active.id != batch.id:
+    latest = await get_latest(batch.edition_id)
+    if latest is not None and latest.id != batch.id:
         raise ReviewRecoveryConflictError(BATCH_SUPERSEDED)
 
 

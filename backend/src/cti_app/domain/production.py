@@ -59,6 +59,34 @@ class ProductionSubmissionReconciliation:
             raise ValueError("output_sha256 must be lowercase SHA-256")
 
 
+class ProductionReconciliationRequiredError(ValueError):
+    """A run whose provider submission is unresolved refuses an ordinary retry.
+
+    The exact ChatGPT answer may already exist on the provider side.  Replaying
+    the stage would either duplicate that work or silently discard it, so the
+    run owns exactly one recovery use case — adopt the exact answer — until the
+    ambiguity is resolved.
+    """
+
+    code = "production_reconciliation_required"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+def requires_submission_reconciliation(
+    status: SubjectProductionStatus,
+    error_code: str | None,
+    reconciliation: ProductionSubmissionReconciliation | None,
+) -> bool:
+    """The single definition of "this run waits for a provider reconciliation"."""
+    return (
+        status is SubjectProductionStatus.NEEDS_REVIEW
+        and error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
+        and reconciliation is not None
+    )
+
+
 class ProductionBatchPhase(StrEnum):
     INITIAL = "initial"
     RECOVERY = "recovery"
@@ -544,6 +572,11 @@ class SubjectProductionRun:
         self.updated_at = self.finished_at
         self.version += 1
 
+    @property
+    def requires_reconciliation(self) -> bool:
+        """This run waits for the exact provider answer to be adopted."""
+        return requires_submission_reconciliation(self.status, self.error_code, self.reconciliation)
+
     def retry_from_stage(
         self,
         stage: SubjectProductionStage,
@@ -558,6 +591,11 @@ class SubjectProductionRun:
         """
         if self.status is SubjectProductionStatus.CANCELLED:
             raise ValueError("production_run_cancelled")
+        # The last fence under the run lock: no retry — of this stage or of an
+        # earlier one — may open a new generation while the provider
+        # submission of this generation is still unresolved.
+        if self.requires_reconciliation:
+            raise ProductionReconciliationRequiredError
         if self.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
             raise ValueError("Cannot retry a queued or running production")
         self.status = SubjectProductionStatus.RUNNING

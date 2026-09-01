@@ -170,6 +170,49 @@ describe("SubjectProduction retry from stage", () => {
     expect(
       screen.queryByRole("button", { name: "Relancer cette étape" }),
     ).toBeNull();
+    // No generic retry survives: the earlier-stage escape hatch included.
+    expect(
+      screen.queryByText("Relancer depuis une étape précédente"),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /^Relancer depuis / }),
+    ).toBeNull();
+    expect(screen.queryByRole("combobox")).toBeNull();
+  });
+
+  it("un run annulé appartenant à un lot n’offre pas de production isolée", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("failed"),
+          status: "cancelled",
+          batch_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        }),
+      ),
+    );
+    renderProduction();
+    expect(
+      await screen.findByText(/appartient à une production d’édition/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Relancer la production" }),
+    ).toBeNull();
+  });
+
+  it("un run annulé hors lot garde la relance standalone", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          Response.json({ ...status("failed"), status: "cancelled" }),
+        ),
+    );
+    renderProduction();
+    expect(
+      await screen.findByRole("button", { name: "Relancer la production" }),
+    ).toBeInTheDocument();
   });
 
   it("READY affiche un menu avec les cinq étapes", async () => {

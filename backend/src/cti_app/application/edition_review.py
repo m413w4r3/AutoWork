@@ -11,11 +11,11 @@ from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
-    PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionArtifactStatus,
     ProductionSubmissionReconciliation,
     SubjectProductionStage,
     SubjectProductionStatus,
+    requires_submission_reconciliation,
 )
 from cti_app.domain.publication_review import (
     PublicationDecision,
@@ -59,12 +59,12 @@ def requires_reconciliation(
     The exact ChatGPT answer may already exist on the provider side.  Replaying
     the stage would either duplicate that work or silently drop it, so the run
     is not retryable until the operator adopts or abandons the exact answer.
+
+    The rule itself lives in the domain, next to the fence that refuses
+    ``SubjectProductionRun.retry_from_stage``: the read model and the write
+    barrier must never diverge.
     """
-    return (
-        run_status is SubjectProductionStatus.NEEDS_REVIEW
-        and error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
-        and reconciliation is not None
-    )
+    return requires_submission_reconciliation(run_status, error_code, reconciliation)
 
 
 def review_item_can_retry(

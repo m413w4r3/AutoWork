@@ -133,6 +133,9 @@ class ProductionStatus(BaseModel):
     error_details: dict[str, Any] | None = None
     extraction_progress: dict[str, Any] | None = None
     reconciliation: ProductionReconciliationView | None = None
+    # Set when this run belongs to an edition production batch: such a run is
+    # only ever resumed through the batch, never restarted standalone.
+    batch_id: str | None = None
     # Parser recoveries worth showing to an analyst, never blocking.
     warnings: list[str] = []
     stages: dict[str, StageStatus]
@@ -695,6 +698,23 @@ async def start_subject_production(
             )
         edition_id = group.edition_id
 
+        # A subject produced inside an edition batch is repaired through that
+        # batch, never by a standalone run: once the current run is terminal,
+        # starting again would create a run the batch does not own — invisible
+        # to Review and unable to repair the batch item it appears to replace.
+        current = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if current is not None and current.status not in {
+            SubjectProductionStatus.QUEUED,
+            SubjectProductionStatus.RUNNING,
+        }:
+            get_by_run = getattr(uow.edition_production_batch_items, "get_by_run", None)
+            item = await get_by_run(current.id) if get_by_run is not None else None
+            if item is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"code": "production_run_batch_owned"},
+                )
+
     try:
         run, job_id = await _create_and_start_run(
             uow_factory,
@@ -761,6 +781,8 @@ async def get_subject_production(
             )
 
         group = await uow.editorial_groups.get_by_subject(subject_id)
+        get_by_run = getattr(uow.edition_production_batch_items, "get_by_run", None)
+        batch_item = await get_by_run(run.id) if get_by_run is not None else None
         snapshot = await uow.production_input_snapshots.get_by_run(run.id)
         if snapshot is None:
             raise HTTPException(
@@ -820,6 +842,7 @@ async def get_subject_production(
                     pipeline_generation=run.pipeline_generation,
                 )
             ),
+            batch_id=str(batch_item.batch_id) if batch_item is not None else None,
             warnings=_collect_warnings(artifacts),
             stages={name: StageStatus(**stage) for name, stage in stages.items()},
         )

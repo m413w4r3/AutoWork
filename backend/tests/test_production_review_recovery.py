@@ -636,3 +636,185 @@ async def test_reconciliation_resume_job_chains_to_assembly_on_a_reopened_batch(
     assert world.run.pipeline_generation == 1
     assert world.run.status is SubjectProductionStatus.READY
     assert jobs.cancelled == []
+
+
+def _reconciliation_identity(
+    run: SubjectProductionRun, stage: SubjectProductionStage
+) -> ProductionSubmissionReconciliation:
+    return ProductionSubmissionReconciliation(
+        production_run_id=run.id,
+        model_run_id=uuid4(),
+        stage=stage,
+        bridge_response_id="bridge-1",
+        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        phase="reconciliation",
+    )
+
+
+@pytest.mark.parametrize(
+    "stage",
+    (SubjectProductionStage.EXTRACTION, SubjectProductionStage.REFERENCES),
+)
+async def test_an_unresolved_reconciliation_forbids_every_retry(
+    monkeypatch: pytest.MonkeyPatch, stage: SubjectProductionStage
+) -> None:
+    """The current stage and any earlier one are refused identically."""
+    world = _World()
+    _register(world, monkeypatch)
+    world.run.error_code = PRODUCTION_RECONCILIATION_ERROR_CODE
+    world.run.reconciliation = _reconciliation_identity(
+        world.run, SubjectProductionStage.EXTRACTION
+    )
+
+    with pytest.raises(ValueError) as error:
+        await _retry(world, stage)
+
+    assert str(error.value) == "production_reconciliation_required"
+    assert world.run.pipeline_generation == 1
+    assert world.run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert world.run.reconciliation is not None
+    # The refusal happens before the batch is touched: no reopening side effect.
+    assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
+    assert world.batch.phase is ProductionBatchPhase.REVIEW
+    assert world.uow.production_artifacts.staled == []
+
+
+async def test_the_domain_itself_refuses_a_retry_awaiting_reconciliation() -> None:
+    run = SubjectProductionRun(subject_id=uuid4(), edition_id=uuid4())
+    run.start_running()
+    run.current_stage = SubjectProductionStage.EXTRACTION
+    run.mark_needs_review(
+        code=PRODUCTION_RECONCILIATION_ERROR_CODE,
+        message="unknown submission",
+        reconciliation=_reconciliation_identity(run, SubjectProductionStage.EXTRACTION),
+    )
+
+    with pytest.raises(ValueError, match="production_reconciliation_required"):
+        run.retry_from_stage(SubjectProductionStage.REFERENCES)
+
+    assert run.pipeline_generation == 0
+    assert run.status is SubjectProductionStatus.NEEDS_REVIEW
+
+
+@pytest.mark.parametrize(
+    "newer_status",
+    (
+        ProductionBatchStatus.RUNNING,
+        ProductionBatchStatus.COMPLETED,
+        ProductionBatchStatus.COMPLETED_WITH_ISSUES,
+    ),
+)
+async def test_only_the_latest_batch_of_an_edition_may_be_reopened(
+    monkeypatch: pytest.MonkeyPatch, newer_status: ProductionBatchStatus
+) -> None:
+    """A finished newer batch supersedes just as much as a running one."""
+    world = _World()
+    _register(world, monkeypatch)
+    newer = world.uow.edition_production_batches.add(
+        EditionProductionBatch(
+            edition_id=world.edition.id,
+            status=newer_status,
+            phase=ProductionBatchPhase.INITIAL,
+        )
+    )
+    newer_version = newer.version
+
+    with pytest.raises(ValueError) as error:
+        await _retry(world, SubjectProductionStage.EXTRACTION)
+
+    assert str(error.value) == "production_batch_superseded"
+    # Neither batch is mutated by the refusal.
+    assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
+    assert world.batch.phase is ProductionBatchPhase.REVIEW
+    assert newer.status is newer_status
+    assert newer.phase is ProductionBatchPhase.INITIAL
+    assert newer.version == newer_version
+    assert world.run.pipeline_generation == 1
+    assert world.run.status is SubjectProductionStatus.NEEDS_REVIEW
+
+
+async def test_the_exact_latest_terminal_batch_still_reopens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _World()
+    _register(world, monkeypatch)
+
+    result = await _retry(world, SubjectProductionStage.EXTRACTION)
+
+    assert world.batch.status is ProductionBatchStatus.RUNNING
+    assert world.batch.phase is ProductionBatchPhase.REVIEW
+    assert result.run.pipeline_generation == 2
+
+
+async def test_a_running_sibling_blocks_a_retry_inside_a_running_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One subject at a time, including during the batch's initial pass."""
+    world = _World(
+        edition_status=EditionStatus.PRODUCTION,
+        batch_status=ProductionBatchStatus.RUNNING,
+        batch_phase=ProductionBatchPhase.INITIAL,
+    )
+    _, jobs, _ = _register(world, monkeypatch)
+    world.sibling.status = SubjectProductionStatus.RUNNING
+
+    with pytest.raises(ValueError) as error:
+        await _retry(world, SubjectProductionStage.EXTRACTION)
+
+    assert str(error.value) == "production_active_sibling"
+    assert world.run.pipeline_generation == 1
+    assert world.run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert jobs.submitted == []
+    assert world.batch.status is ProductionBatchStatus.RUNNING
+    assert world.batch.phase is ProductionBatchPhase.INITIAL
+
+
+async def test_the_same_retry_succeeds_once_the_sibling_is_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _World(
+        edition_status=EditionStatus.PRODUCTION,
+        batch_status=ProductionBatchStatus.RUNNING,
+        batch_phase=ProductionBatchPhase.INITIAL,
+    )
+    _register(world, monkeypatch)
+    world.sibling.status = SubjectProductionStatus.RUNNING
+
+    with pytest.raises(ValueError):
+        await _retry(world, SubjectProductionStage.EXTRACTION)
+
+    world.sibling.status = SubjectProductionStatus.READY
+    result = await _retry(world, SubjectProductionStage.EXTRACTION)
+
+    assert result.run.pipeline_generation == 2
+    assert result.run.status is SubjectProductionStatus.RUNNING
+
+
+async def test_a_queued_sibling_never_blocks_a_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    world = _World(
+        edition_status=EditionStatus.PRODUCTION,
+        batch_status=ProductionBatchStatus.RUNNING,
+        batch_phase=ProductionBatchPhase.INITIAL,
+    )
+    _register(world, monkeypatch)
+    world.sibling.status = SubjectProductionStatus.QUEUED
+
+    result = await _retry(world, SubjectProductionStage.EXTRACTION)
+
+    assert result.run.pipeline_generation == 2
+
+
+async def test_reconciliation_keeps_the_same_running_sibling_fence() -> None:
+    world = _World()
+    world.sibling.status = SubjectProductionStatus.RUNNING
+    world.run.error_code = PRODUCTION_RECONCILIATION_ERROR_CODE
+    world.run.reconciliation = _reconciliation_identity(
+        world.run, SubjectProductionStage.EXTRACTION
+    )
+
+    async with world.uow as uow:
+        with pytest.raises(ReviewRecoveryConflictError) as error:
+            await prepare_batch_for_recovery(cast(Any, uow), world.run, reopen=True)
+
+    assert error.value.reason == "active_sibling"
+    assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES

@@ -1,19 +1,13 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { useState } from "react";
 import {
   getSubjectProduction,
   retryProductionStage,
   startSubjectProduction,
   shouldPollProduction,
-  previewProductionReconciliationVisible,
-  adoptProductionReconciliationVisible,
-  previewProductionReconciliationManual,
-  adoptProductionReconciliationManual,
-  type ProductionRecoveryPreview,
-  type ProductionStatus,
 } from "../api/production";
 import { cancelProductionRun } from "../api/publication";
 import type { StageStatus } from "../api/production";
+import { ReconciliationPanel } from "../features/edition-workflow/ReconciliationPanel";
 import { ExtractionProgressView } from "./ExtractionProgress";
 import { ProductionStageCard } from "./ProductionStageCard";
 import { ProductionStateTransfer } from "./ProductionStateTransfer";
@@ -110,128 +104,6 @@ function issueCopy(status: string, errorCode: string | null): string {
     : "Échec de l’étape — consultez ses détails.";
 }
 
-function SubjectReconciliationFlow({
-  status,
-  onRecovered,
-}: {
-  status: ProductionStatus;
-  onRecovered: () => void;
-}) {
-  const [preview, setPreview] = useState<ProductionRecoveryPreview | null>(
-    null,
-  );
-  const [markdown, setMarkdown] = useState("");
-  const [manualMode, setManualMode] = useState(false);
-  const visiblePreview = useMutation({
-    mutationFn: () => previewProductionReconciliationVisible(status.run_id),
-    onSuccess: setPreview,
-    onError: () => setManualMode(true),
-  });
-  const visibleAdopt = useMutation({
-    mutationFn: (sha256: string) =>
-      adoptProductionReconciliationVisible(status.run_id, sha256),
-    onSuccess: onRecovered,
-  });
-  const manualPreview = useMutation({
-    mutationFn: () =>
-      previewProductionReconciliationManual(status.run_id, markdown),
-    onSuccess: setPreview,
-  });
-  const manualAdopt = useMutation({
-    mutationFn: (sha256: string) =>
-      adoptProductionReconciliationManual(status.run_id, markdown, sha256),
-    onSuccess: onRecovered,
-  });
-  const error =
-    visiblePreview.error ||
-    visibleAdopt.error ||
-    manualPreview.error ||
-    manualAdopt.error;
-  const manualPreviewShown = preview?.metadata.source === "manual_import";
-  return (
-    <div
-      className="production-reconciliation"
-      aria-label="Récupération ChatGPT"
-    >
-      <h3>Récupérer la réponse ChatGPT</h3>
-      <p>
-        ModelRun : <code>{status.reconciliation?.model_run_id}</code> · étape :{" "}
-        {STAGE_LABELS[status.reconciliation?.stage ?? status.current_stage]}
-      </p>
-      <p>
-        Soumission : {status.reconciliation?.submission_state} · génération :{" "}
-        {status.reconciliation?.pipeline_generation}
-      </p>
-      <button
-        className="button"
-        type="button"
-        disabled={visiblePreview.isPending}
-        onClick={() => visiblePreview.mutate()}
-      >
-        {visiblePreview.isPending
-          ? "Lecture de la réponse…"
-          : "Récupérer la réponse ChatGPT"}
-      </button>
-      {preview ? (
-        <div className="production-reconciliation__preview">
-          <p>
-            SHA-256 : <code>{preview.sha256}</code> · {preview.chars} caractères
-          </p>
-          <pre>{preview.text}</pre>
-          <button
-            className="button button--primary"
-            type="button"
-            disabled={visibleAdopt.isPending || manualAdopt.isPending}
-            onClick={() =>
-              manualPreviewShown
-                ? manualAdopt.mutate(preview.sha256)
-                : visibleAdopt.mutate(preview.sha256)
-            }
-          >
-            Confirmer et reprendre la production
-          </button>
-        </div>
-      ) : null}
-      <button
-        className="button button--secondary"
-        type="button"
-        onClick={() => setManualMode((current) => !current)}
-      >
-        {manualMode
-          ? "Masquer l’import Markdown"
-          : "Réponse ChatGPT indisponible ? Coller le Markdown"}
-      </button>
-      {manualMode ? (
-        <div className="production-reconciliation__manual">
-          <label>
-            Réponse Markdown
-            <textarea
-              value={markdown}
-              onChange={(event) => setMarkdown(event.target.value)}
-              rows={8}
-            />
-          </label>
-          <button
-            className="button"
-            type="button"
-            disabled={!markdown.trim() || manualPreview.isPending}
-            onClick={() => manualPreview.mutate()}
-          >
-            Prévisualiser l’import
-          </button>
-        </div>
-      ) : null}
-      {error ? (
-        <p className="error-message" role="alert">
-          {error instanceof Error
-            ? error.message
-            : "La récupération n’a pas abouti."}
-        </p>
-      ) : null}
-    </div>
-  );
-}
-
 export function SubjectProduction({
   subjectId,
   onClose,
@@ -280,6 +152,10 @@ export function SubjectProduction({
 
   // A failed run remains visible: its failed stage and recovery path matter.
   const restartable = !status || status.status === "cancelled";
+  // A run owned by an edition batch is repaired through that batch. Starting a
+  // standalone run here would create an article the batch never sees, so the
+  // backend refuses it and the page must not offer it either.
+  const batchOwned = Boolean(status?.batch_id);
 
   if (restartable) {
     return (
@@ -301,17 +177,25 @@ export function SubjectProduction({
             {String(startMutation.error)}
           </p>
         ) : null}
-        <button
-          className="button"
-          disabled={startMutation.isPending}
-          onClick={() => startMutation.mutate()}
-        >
-          {startMutation.isPending
-            ? "Démarrage…"
-            : status
-              ? "Relancer la production"
-              : "Produire cet article"}
-        </button>
+        {batchOwned ? (
+          <p role="note">
+            Cet article appartient à une production d’édition. Une nouvelle
+            production isolée ne réparerait pas l’article annulé du lot :
+            reprenez-le depuis la revue de l’édition.
+          </p>
+        ) : (
+          <button
+            className="button"
+            disabled={startMutation.isPending}
+            onClick={() => startMutation.mutate()}
+          >
+            {startMutation.isPending
+              ? "Démarrage…"
+              : status
+                ? "Relancer la production"
+                : "Produire cet article"}
+          </button>
+        )}
         <ProductionStateTransfer
           subjectId={subjectId}
           productionStatus={status ?? null}
@@ -336,18 +220,22 @@ export function SubjectProduction({
     (stage) => stages[stage]?.status === "succeeded",
   ).length;
   const issueStageIndex = RETRY_STAGES.indexOf(status.current_stage);
-  const retryStages: readonly RetryStage[] =
-    status.status === "ready"
-      ? RETRY_STAGES
-      : showIssue && issueStageIndex >= 0
-        ? RETRY_STAGES.slice(0, issueStageIndex + 1)
-        : [];
-  const issueRetryStage = showIssue ? status.current_stage : null;
   const reconciliationRequired =
     status.status === "needs_review" &&
     status.error_code === "model_submission_reconciliation_required" &&
     status.reconciliation !== null &&
     status.reconciliation !== undefined;
+  // An unresolved provider submission owns the only recovery gesture: the
+  // backend refuses every retry until the exact answer is adopted, so no
+  // generic retry control — current stage or earlier — is offered here.
+  const retryStages: readonly RetryStage[] = reconciliationRequired
+    ? []
+    : status.status === "ready"
+      ? RETRY_STAGES
+      : showIssue && issueStageIndex >= 0
+        ? RETRY_STAGES.slice(0, issueStageIndex + 1)
+        : [];
+  const issueRetryStage = showIssue ? status.current_stage : null;
 
   return (
     <section className="production-panel">
@@ -447,9 +335,10 @@ export function SubjectProduction({
         </div>
       )}
 
-      {reconciliationRequired ? (
-        <SubjectReconciliationFlow
-          status={status}
+      {reconciliationRequired && status.reconciliation ? (
+        <ReconciliationPanel
+          runId={status.run_id}
+          reconciliation={status.reconciliation}
           onRecovered={() => void refetch()}
         />
       ) : null}
@@ -483,7 +372,7 @@ export function SubjectProduction({
       ) : null}
 
       <div className="production-actions">
-        {status.status === "ready" && (
+        {!reconciliationRequired && status.status === "ready" && (
           <label>
             Relancer depuis…
             <select
@@ -504,7 +393,7 @@ export function SubjectProduction({
             </select>
           </label>
         )}
-        {showIssue && retryStages.length > 1 && (
+        {!reconciliationRequired && showIssue && retryStages.length > 1 && (
           <details>
             <summary>Relancer depuis une étape précédente</summary>
             <div>
