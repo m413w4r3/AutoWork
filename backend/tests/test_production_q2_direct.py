@@ -22,6 +22,7 @@ from cti_app.application.production_parsers import (
     ReferenceReport,
     parse_q2_proposals_markdown,
 )
+from cti_app.application.production_q2_batch import q2_batch_output_marker
 from cti_app.application.production_workflow import _extraction_input_hash, _q2_source_model_run_id
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
@@ -37,6 +38,7 @@ from cti_app.domain.production import (
     ProductionInputSource,
     SubjectProductionRun,
     SubjectProductionStage,
+    SubjectProductionStatus,
 )
 from cti_app.integrations.models import (
     BridgeTransportError,
@@ -44,7 +46,7 @@ from cti_app.integrations.models import (
     InMemoryModelOutputStore,
     _bridge_http_error,
 )
-from tests.model_support import InMemoryModelRunUnitOfWorkFactory
+from tests.model_support import InMemoryModelRunRepository, InMemoryModelRunUnitOfWorkFactory
 
 
 def test_q2_source_model_run_id_is_stable_per_generation_and_source() -> None:
@@ -261,10 +263,13 @@ class _Q2Snapshots:
 
 
 class _Q2UnitOfWork:
-    def __init__(self) -> None:
+    def __init__(self, model_run_state: dict[Any, Any] | None = None) -> None:
         self.production_artifacts = _Q2Artifacts()
         self.subject_production_runs = _Q2Runs()
         self.production_input_snapshots = _Q2Snapshots()
+        self.model_runs = InMemoryModelRunRepository(
+            model_run_state if model_run_state is not None else {}
+        )
 
     async def __aenter__(self) -> "_Q2UnitOfWork":
         return self
@@ -417,10 +422,12 @@ def _q2_orchestrator(
     monkeypatch: pytest.MonkeyPatch,
     gateway: Any,
     report: ReferenceReport,
+    *,
+    model_run_state: dict[Any, Any] | None = None,
 ) -> tuple[
     production_workflow.ProductionWorkflowOrchestrator, SubjectProductionRun, _Q2Diagnostics
 ]:
-    uow = _Q2UnitOfWork()
+    uow = _Q2UnitOfWork(model_run_state)
     diagnostics = _Q2Diagnostics()
     orchestrator = production_workflow.ProductionWorkflowOrchestrator.__new__(
         production_workflow.ProductionWorkflowOrchestrator
@@ -640,6 +647,94 @@ async def test_q2_pre_submission_retry_reuses_model_run_across_job_attempts(
     assert model_uow.state[s1_model_run_id].status is ModelRunStatus.SUCCEEDED
     assert model_uow.state[s1_model_run_id].submission_attempt == 2
     assert "Failed ModelRun is not safe to resubmit" not in str(second)
+
+
+@pytest.mark.asyncio
+async def test_manual_extraction_retry_reuses_successful_batch_members_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = "\n\n".join(
+        f"{q2_batch_output_marker(f'B{index}')}\n"
+        + (f"IOC confirmed domain\n- retry-{index}.example" if index < 5 else "UNAVAILABLE")
+        for index in range(1, 6)
+    )
+    adapter = FakeModelAdapter(research_text=response)
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    output_store = InMemoryModelOutputStore()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=adapter,
+            openai_structured=adapter,
+            qwen=adapter,
+            fake=adapter,
+        ),
+        model_uow,
+        output_store,
+    )
+    orchestrator, run, _ = _q2_orchestrator(
+        monkeypatch,
+        gateway,
+        _q2_report(5),
+        model_run_state=model_uow.state,
+    )
+    snapshot = replace(_q2_snapshot(), core_sources=(), reuse_basis_hash="", input_hash="")
+
+    first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
+
+    assert first["status"] == "needs_review"
+    assert first["completed_source_ids"] == ["S1", "S2", "S3", "S4"]
+    assert len(adapter.calls) == 1
+
+    adapter._research_text = "EMPTY"
+    run.status = SubjectProductionStatus.NEEDS_REVIEW
+    run.retry_from_stage(SubjectProductionStage.EXTRACTION)
+
+    second = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
+
+    assert second["status"] == "success", second
+    assert second["cache_hits"] == 4
+    assert second["model_calls"] == 1
+    assert second["light_batches"] == 0
+    assert len(adapter.calls) == 2
+    assert adapter.calls[-1].metadata["source_id"] == "S5"
+
+
+@pytest.mark.asyncio
+async def test_manual_extraction_retry_reuses_successful_full_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeModelAdapter(research_text="FACT malware\n- ExampleRAT\n")
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=adapter,
+            openai_structured=adapter,
+            qwen=adapter,
+            fake=adapter,
+        ),
+        model_uow,
+        InMemoryModelOutputStore(),
+    )
+    orchestrator, run, _ = _q2_orchestrator(
+        monkeypatch,
+        gateway,
+        _q2_report(1),
+        model_run_state=model_uow.state,
+    )
+    snapshot = _q2_snapshot()
+
+    first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
+
+    assert first["status"] == "success"
+    run.status = SubjectProductionStatus.NEEDS_REVIEW
+    run.retry_from_stage(SubjectProductionStage.EXTRACTION)
+
+    second = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
+
+    assert second["status"] == "success", second
+    assert second["cache_hits"] == 1
+    assert second["model_calls"] == 0
+    assert len(adapter.calls) == 1
 
 
 @pytest.mark.asyncio

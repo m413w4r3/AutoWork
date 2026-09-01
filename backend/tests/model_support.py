@@ -5,7 +5,7 @@ from types import TracebackType
 from uuid import UUID
 
 from cti_app.application.model_gateway import ModelRunRepository, ModelRunUnitOfWork
-from cti_app.domain.model_runs import ModelOutputRejection, ModelRun
+from cti_app.domain.model_runs import ModelOutputRejection, ModelRun, ModelRunStatus
 
 
 class InMemoryModelRunRepository:
@@ -23,6 +23,17 @@ class InMemoryModelRunRepository:
 
     async def get_for_update(self, run_id: UUID) -> ModelRun | None:
         return await self.get(run_id)
+
+    async def find_successful_q2_checkpoint(self, checkpoint_key: str) -> ModelRun | None:
+        matches = [
+            run
+            for run in self._state.values()
+            if run.status is ModelRunStatus.SUCCEEDED
+            and checkpoint_key in run.parameters.get("q2_checkpoint_keys", [])
+        ]
+        if not matches:
+            return None
+        return deepcopy(max(matches, key=lambda run: (run.updated_at, str(run.id))))
 
     async def save(self, run: ModelRun) -> None:
         if run.id not in self._state:

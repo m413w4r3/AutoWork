@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -485,6 +486,82 @@ async def test_five_light_sources_use_one_web_batch_of_urls(
     assert state.extractions.lookups == 0
     assert run.extraction_progress["model_calls"] == 1  # type: ignore[index]
     assert len(sink.calls[-1]["canonical_json"]["items"]) == 5  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_batch_progress_marks_only_current_sources_running_before_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _batch_response(
+        *(f"IOC confirmed domain\n- domain-{index}.security-lab.io" for index in range(1, 6))
+    )
+    orchestrator, run, _state, _sink, gateway = _batch_workflow(monkeypatch, 5, response)
+    snapshots: list[dict[str, object]] = []
+
+    async def persist(run_id: UUID, progress: dict[str, object]) -> None:
+        del run_id
+        snapshots.append(deepcopy(progress))
+        run.extraction_progress = deepcopy(progress)
+
+    orchestrator._persist_extraction_progress = persist  # type: ignore[method-assign]
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", date(2026, 7, 10)),)),
+    )
+
+    assert result["status"] == "success"
+    assert len(gateway.calls) == 1
+    assert all(item["status"] == "pending" for item in snapshots[0]["sources"])
+    assert snapshots[0]["active_source_id"] is None
+    before_call = snapshots[1]
+    assert [item["status"] for item in before_call["sources"]] == [
+        "running",
+        "running",
+        "running",
+        "running",
+        "running",
+    ]
+    assert before_call["active_source_id"] in {f"S{index}" for index in range(1, 6)}
+
+
+@pytest.mark.asyncio
+async def test_later_batch_remains_pending_until_its_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_response = _batch_response(
+        *(f"IOC confirmed domain\n- domain-{index}.security-lab.io" for index in range(1, 9))
+    )
+    second_response = _batch_response(
+        *(f"IOC confirmed domain\n- domain-{index}.security-lab.io" for index in range(9, 11))
+    )
+    orchestrator, run, _state, _sink, gateway = _batch_workflow(monkeypatch, 10, first_response)
+    gateway.responses.append(second_response)
+    snapshots: list[dict[str, object]] = []
+
+    async def persist(run_id: UUID, progress: dict[str, object]) -> None:
+        del run_id
+        snapshots.append(deepcopy(progress))
+        run.extraction_progress = deepcopy(progress)
+
+    orchestrator._persist_extraction_progress = persist  # type: ignore[method-assign]
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", date(2026, 7, 10)),)),
+    )
+
+    assert result["status"] == "success"
+    assert len(gateway.calls) == 2
+    second_call = next(
+        snapshot
+        for snapshot in snapshots
+        if {item["source_id"]: item["status"] for item in snapshot["sources"]}["S9"] == "running"
+    )
+    statuses = {item["source_id"]: item["status"] for item in second_call["sources"]}
+    assert all(statuses[f"S{index}"] == "succeeded" for index in range(1, 9))
+    assert statuses["S9"] == "running"
+    assert statuses["S10"] == "running"
 
 
 @pytest.mark.asyncio

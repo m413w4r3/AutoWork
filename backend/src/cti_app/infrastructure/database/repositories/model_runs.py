@@ -36,6 +36,18 @@ class SqlAlchemyModelRunRepository:
         )
         return _model_run_from_row(row) if row else None
 
+    async def find_successful_q2_checkpoint(self, checkpoint_key: str) -> ModelRun | None:
+        row = await self._session.scalar(
+            select(ModelRunRow)
+            .where(
+                ModelRunRow.status == ModelRunStatus.SUCCEEDED.value,
+                ModelRunRow.parameters.contains({"q2_checkpoint_keys": [checkpoint_key]}),
+            )
+            .order_by(ModelRunRow.updated_at.desc(), ModelRunRow.id.desc())
+            .limit(1)
+        )
+        return _model_run_from_row(row) if row else None
+
     async def save(self, run: ModelRun) -> None:
         row = await self._session.get(ModelRunRow, run.id)
         if row is None:

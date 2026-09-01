@@ -123,6 +123,11 @@ _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 # deterministic ModelRun identities include this routing policy, so changing it
 # creates fresh executions without conversations or repair turns.
 Q2_ROUTING_POLICY_VERSION = "4"
+# The provider/model selection is part of the run-local checkpoint contract.
+# Keep this separate from the routing policy so a model-policy change can
+# invalidate Q2 reuse without changing the live-web request format.
+Q2_MODEL_POLICY_VERSION = "openai-web-research-v1"
+Q2_SUCCESSFUL_CHECKPOINT_VERSION = "q2-run-local-v1"
 REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
 
 # Bridge and network hiccups are worth retrying; anything else is a dead end
@@ -616,6 +621,16 @@ class _Q2SourceWork:
     source: ParsedSource
     plan: Q2SourcePlan
     source_content_sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _Q2ReusableSource:
+    """A source-local view of a successful run-local Q2 response."""
+
+    output: Q2SourceOutput
+    raw: str
+    model_run_id: UUID
+    warnings: tuple[str, ...] = ()
 
 
 async def _archived_sources_by_url(
@@ -1437,9 +1452,6 @@ class ProductionWorkflowOrchestrator:
         light_calls = 0
         light_batches = 0
         light_sources_batched = 0
-        # Q2 reads the live web, so no result is ever served from a
-        # content-addressed checkpoint. The counters stay in the progress and
-        # result payloads consumed downstream.
         cache_hits = 0
         model_calls_avoided = 0
         # Each entry carries the batch and its ModelRun identity, all decided
@@ -1448,6 +1460,16 @@ class ProductionWorkflowOrchestrator:
         individual_source_ids: set[str] = set()
         batch_candidates: list[Q2BatchCandidate] = []
         pending: dict[str, _Q2SourceWork] = {}
+
+        requested_model = "unknown"
+        router = getattr(model_gateway, "_router", None)
+        if router is not None:
+            try:
+                requested_model = str(
+                    router.by_provider(ModelProvider.OPENAI, ModelRole.RESEARCH).requested_model
+                )
+            except (AttributeError, KeyError):
+                pass
 
         def metrics() -> dict[str, int]:
             return {
@@ -1459,6 +1481,184 @@ class ProductionWorkflowOrchestrator:
                 "cache_hits": cache_hits,
                 "model_calls_avoided": model_calls_avoided,
             }
+
+        async def find_q2_checkpoint(checkpoint_key: str) -> Any | None:
+            async with self._uow_factory() as uow:
+                model_runs = getattr(uow, "model_runs", None)
+                finder = getattr(model_runs, "find_successful_q2_checkpoint", None)
+                if finder is None:
+                    return None
+                checkpoint = await finder(checkpoint_key)
+                if checkpoint is None or checkpoint.status is not ModelRunStatus.SUCCEEDED:
+                    return None
+                return checkpoint
+
+        async def read_q2_checkpoint(checkpoint: Any) -> str | None:
+            reference = getattr(checkpoint, "raw_output_reference", None) or (
+                checkpoint.output_references[0]
+                if getattr(checkpoint, "output_references", ())
+                else None
+            )
+            reader = getattr(model_gateway, "read_output", None)
+            if reference is None or not callable(reader):
+                return None
+            try:
+                content = await reader(reference)
+            except Exception as exc:
+                self._diagnostics.record(
+                    event="q2.checkpoint.read_failed",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    model_run_id=str(checkpoint.id),
+                    error_code="q2_checkpoint_read_failed",
+                    error=str(exc),
+                )
+                return None
+            if not isinstance(content, bytes):
+                return None
+            return content.decode("utf-8", errors="replace")
+
+        def checkpoint_key(work: _Q2SourceWork, *, batched: bool) -> str:
+            if batched:
+                prompt_version = IOC_RULES_BATCH_PROMPT_VERSION
+                batch_parser_version: str | None = Q2_BATCH_PARSER_VERSION
+            else:
+                prompt_version = EXTRACTION_PROMPT_VERSION_BY_PROFILE[work.plan.profile]
+                batch_parser_version = None
+            return _q2_checkpoint_key(
+                production_run_id=run.id,
+                canonical_url=work.source.canonical_url,
+                profile=work.plan.profile,
+                prompt_version=prompt_version,
+                batch_parser_version=batch_parser_version,
+                provider=ModelProvider.OPENAI,
+                requested_model=requested_model,
+            )
+
+        def clear_active_source() -> None:
+            progress["active_source_id"] = None
+            progress["active_source_title"] = None
+            progress["active_profile"] = None
+
+        async def load_reusable_source(
+            work: _Q2SourceWork,
+            *,
+            batched: bool,
+        ) -> _Q2ReusableSource | None:
+            key = checkpoint_key(work, batched=batched)
+            checkpoint = await find_q2_checkpoint(key)
+            if checkpoint is None:
+                return None
+            raw = await read_q2_checkpoint(checkpoint)
+            if raw is None or not raw.strip():
+                return None
+
+            parameters = getattr(checkpoint, "parameters", {})
+            kind = parameters.get("q2_execution_kind") if isinstance(parameters, dict) else None
+            if kind == "batch":
+                batch_sources = parameters.get("q2_batch_sources", [])
+                target = next(
+                    (
+                        item
+                        for item in batch_sources
+                        if isinstance(item, dict)
+                        and item.get("canonical_url") == work.source.canonical_url
+                    ),
+                    None,
+                )
+                if not isinstance(target, dict) or not isinstance(target.get("batch_id"), str):
+                    return None
+                parsed_batch = parse_q2_batch_response(
+                    raw,
+                    {target["batch_id"]: work.source},
+                )
+                if (
+                    not parsed_batch.usable
+                    or not parsed_batch.sources
+                    or not parsed_batch.sources[0].usable
+                ):
+                    return None
+                source_result = parsed_batch.sources[0]
+                assert source_result.output is not None
+                return _Q2ReusableSource(
+                    output=source_result.output,
+                    raw=source_result.raw_block,
+                    model_run_id=checkpoint.id,
+                    warnings=(*parsed_batch.warnings, *source_result.warnings),
+                )
+            if kind == "individual":
+                parsed_individual = parse_q2_proposals_markdown(raw)
+                if not parsed_individual.usable or parsed_individual.value is None:
+                    return None
+                return _Q2ReusableSource(
+                    output=parsed_individual.value,
+                    raw=raw,
+                    model_run_id=checkpoint.id,
+                    warnings=tuple(parsed_individual.warnings),
+                )
+            return None
+
+        async def persist_q2_checkpoint_keys(model_run_id: UUID, keys: Sequence[str]) -> None:
+            """Record only source results that passed the Q2 source parser."""
+            async with self._uow_factory() as uow:
+                model_runs = getattr(uow, "model_runs", None)
+                get_for_update = getattr(model_runs, "get_for_update", None)
+                save = getattr(model_runs, "save", None)
+                if get_for_update is None or save is None:
+                    return
+                model_run = await get_for_update(model_run_id)
+                if model_run is None or model_run.status is not ModelRunStatus.SUCCEEDED:
+                    return
+                parameters = dict(getattr(model_run, "parameters", {}) or {})
+                parameters["q2_checkpoint_keys"] = list(dict.fromkeys(keys))
+                model_run.parameters = parameters
+                await save(model_run)
+                commit = getattr(uow, "commit", None)
+                if commit is not None:
+                    await commit()
+
+        async def record_reused_source(
+            work: _Q2SourceWork,
+            reusable: _Q2ReusableSource,
+        ) -> None:
+            nonlocal cache_hits, model_calls_avoided
+            filtered_output, profile_warnings = _enforce_q2_profile(
+                reusable.output, work.plan.profile
+            )
+            warnings.extend((*reusable.warnings, *profile_warnings))
+            submissions.append(
+                Q2ProposalSubmission(
+                    output=filtered_output,
+                    source_ids=(work.source.local_id,),
+                    model_run_id=str(reusable.model_run_id),
+                )
+            )
+            completed.append(work.source.local_id)
+            _mark_extraction_source_complete(
+                progress,
+                work.source,
+                status="cached",
+                counts=_source_progress_counts(filtered_output, work.source.local_id),
+                cache_hit=True,
+            )
+            cache_hits += 1
+            model_calls_avoided += 1
+            await self._persist_extraction_progress(run.id, progress)
+            url_raw_parts.append(reusable.raw)
+            self._diagnostics.record(
+                event="q2.source.reused",
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage="extraction",
+                correlation_id=self._correlation_id,
+                source_id=work.source.local_id,
+                source_url=work.source.canonical_url,
+                model_run_id=str(reusable.model_run_id),
+                profile=work.plan.profile.value,
+                checkpoint_version=Q2_SUCCESSFUL_CHECKPOINT_VERSION,
+            )
 
         async def pace_before_model_call() -> None:
             if progress["model_calls"]:
@@ -1538,11 +1738,6 @@ class ProductionWorkflowOrchestrator:
             source = work.source
             plan = work.plan
             source_content_sha256 = work.source_content_sha256
-            _mark_extraction_source_running(progress, source, plan)
-            await self._persist_extraction_progress(run.id, progress)
-            # A web reading is not a function of any content we hold: the
-            # identity is run-local, so a retry of this exact run reuses its
-            # ModelRun while a new production reads the source again.
             model_run_id = _q2_source_model_run_id(
                 production_run_id=run.id,
                 pipeline_generation=run.pipeline_generation,
@@ -1563,6 +1758,9 @@ class ProductionWorkflowOrchestrator:
             else:
                 light_calls += 1
             await pace_before_model_call()
+            # The progress snapshot immediately before submission is the first
+            # state that may claim this source is running.
+            _mark_extraction_source_running(progress, source, plan)
             progress["model_calls"] += 1
             await self._persist_extraction_progress(run.id, progress)
             self._diagnostics.record(
@@ -1581,6 +1779,7 @@ class ProductionWorkflowOrchestrator:
             )
             started_at = time.monotonic()
             raw = ""
+            execution: Any | None = None
             try:
                 execution = await model_gateway.execute(
                     ModelRequest(
@@ -1604,6 +1803,10 @@ class ProductionWorkflowOrchestrator:
                             "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
                             "parser_version": Q2_MARKDOWN_PARSER_VERSION,
                             "verifier_version": ARTIFACT_VERIFIER_VERSION,
+                        },
+                        parameters={
+                            "q2_checkpoint_keys": [checkpoint_key(work, batched=False)],
+                            "q2_execution_kind": "individual",
                         },
                     ),
                     ModelRole.RESEARCH,
@@ -1655,6 +1858,11 @@ class ProductionWorkflowOrchestrator:
                     status="succeeded",
                     counts=_source_progress_counts(filtered_output, source.local_id),
                 )
+                await persist_q2_checkpoint_keys(
+                    execution.run.id,
+                    [checkpoint_key(work, batched=False)],
+                )
+                clear_active_source()
                 await self._persist_extraction_progress(run.id, progress)
                 url_raw_parts.append(raw)
                 warnings.extend(parsed.warnings)
@@ -1679,6 +1887,12 @@ class ProductionWorkflowOrchestrator:
                 raise
             except Exception as exc:
                 await self._check_cancellation(run.id, context)
+                if (
+                    execution is not None
+                    and getattr(execution, "run", None) is not None
+                    and execution.run.status is ModelRunStatus.SUCCEEDED
+                ):
+                    await persist_q2_checkpoint_keys(execution.run.id, [])
                 classification = _classify_q2_failure(
                     exc,
                     provider_response_produced=bool(raw),
@@ -1688,6 +1902,7 @@ class ProductionWorkflowOrchestrator:
                     source.local_id,
                     "needs_review" if classification.status == "needs_review" else "failed",
                 )
+                clear_active_source()
                 await self._persist_extraction_progress(run.id, progress)
                 error = str(exc)[:1000]
                 duration_ms = int((time.monotonic() - started_at) * 1000)
@@ -1789,6 +2004,14 @@ class ProductionWorkflowOrchestrator:
             light_batches += 1
             light_sources_batched += len(batch_sources)
             await pace_before_model_call()
+            # Only this batch is in flight. Future batches remain pending until
+            # their own provider submission is about to start.
+            for item in batch_sources:
+                _mark_extraction_source_running(
+                    progress,
+                    item.source,
+                    pending[item.source.local_id].plan,
+                )
             progress["model_calls"] += 1
             progress["light_batches"] = light_batches
             progress["light_sources_batched"] = light_sources_batched
@@ -1806,6 +2029,7 @@ class ProductionWorkflowOrchestrator:
             )
             started_at = time.monotonic()
             raw = ""
+            execution: Any | None = None
             try:
                 execution = await model_gateway.execute(
                     ModelRequest(
@@ -1831,6 +2055,20 @@ class ProductionWorkflowOrchestrator:
                             "ioc_rules_batch_prompt_version": IOC_RULES_BATCH_PROMPT_VERSION,
                             "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
                             "q2_batch_parser_version": Q2_BATCH_PARSER_VERSION,
+                        },
+                        parameters={
+                            "q2_checkpoint_keys": [
+                                checkpoint_key(pending[item.source.local_id], batched=True)
+                                for item in batch_sources
+                            ],
+                            "q2_execution_kind": "batch",
+                            "q2_batch_sources": [
+                                {
+                                    "batch_id": item.batch_id,
+                                    "canonical_url": item.canonical_url,
+                                }
+                                for item in batch_sources
+                            ],
                         },
                     ),
                     ModelRole.RESEARCH,
@@ -1932,11 +2170,27 @@ class ProductionWorkflowOrchestrator:
                         rules_count=len(filtered_output.rules),
                         duration_ms=int((time.monotonic() - started_at) * 1000),
                     )
+                await persist_q2_checkpoint_keys(
+                    execution.run.id,
+                    [
+                        checkpoint_key(pending[item.source.local_id], batched=True)
+                        for item in batch_sources
+                        if item.source.local_id in completed
+                    ],
+                )
+                clear_active_source()
+                await self._persist_extraction_progress(run.id, progress)
                 return None
             except JobCancelledError:
                 raise
             except Exception as exc:
                 await self._check_cancellation(run.id, context)
+                if (
+                    execution is not None
+                    and getattr(execution, "run", None) is not None
+                    and execution.run.status is ModelRunStatus.SUCCEEDED
+                ):
+                    await persist_q2_checkpoint_keys(execution.run.id, [])
                 classification = _classify_q2_failure(exc, provider_response_produced=False)
                 error = str(exc)[:1000]
                 duration_ms = int((time.monotonic() - started_at) * 1000)
@@ -1965,6 +2219,7 @@ class ProductionWorkflowOrchestrator:
                             item.source.local_id,
                             "needs_review",
                         )
+                clear_active_source()
                 await self._persist_extraction_progress(run.id, progress)
                 self._diagnostics.record(
                     event="q2.batch.failed",
@@ -2019,14 +2274,12 @@ class ProductionWorkflowOrchestrator:
                 **metrics(),
             }
 
-        # First pass: plan every source. Q2 reads the live publication, so
-        # there is no content-addressed checkpoint to consult here; the archive
-        # only supplies the collection provenance recorded in diagnostics.
+        # First pass: plan every source. Planning must not claim work is in
+        # flight: all sources were persisted as pending above, and only the
+        # request immediately before a provider call changes that state.
         for source in report.sources:
             plan = plans_by_url[source.canonical_url]
             await self._check_cancellation(run.id, context)
-            _mark_extraction_source_running(progress, source, plan)
-            await self._persist_extraction_progress(run.id, progress)
             archived = archived_sources.get(source.canonical_url)
             source_content_sha256 = archived.content_sha256 if archived is not None else None
             self._diagnostics.record(
@@ -2054,13 +2307,33 @@ class ProductionWorkflowOrchestrator:
             if candidate is not None:
                 batch_candidates.append(candidate)
             else:
-                individual_source_ids.add(source.local_id)
+                reusable = await load_reusable_source(pending[source.local_id], batched=False)
+                if reusable is not None:
+                    await record_reused_source(pending[source.local_id], reusable)
+                else:
+                    individual_source_ids.add(source.local_id)
 
         for candidate_group in partition_q2_batch_candidates(batch_candidates):
-            if len(candidate_group) < 2:
-                individual_source_ids.add(candidate_group[0].source.local_id)
+            remaining: list[Q2BatchCandidate] = []
+            for candidate in candidate_group:
+                work = pending[candidate.source.local_id]
+                reusable = await load_reusable_source(work, batched=True)
+                if reusable is None:
+                    # An earlier individual IOC_RULES response is also a valid
+                    # source checkpoint; it is parsed without batch framing.
+                    reusable = await load_reusable_source(work, batched=False)
+                if reusable is not None:
+                    await record_reused_source(work, reusable)
+                else:
+                    remaining.append(candidate)
+
+            if len(remaining) == 1:
+                # A one-source retry is always the individual IOC_RULES path.
+                individual_source_ids.add(remaining[0].source.local_id)
                 continue
-            local_batch = make_q2_batch(candidate_group)
+            if len(remaining) < 2:
+                continue
+            local_batch = make_q2_batch(remaining)
             batch_run_id = _q2_batch_model_run_id(
                 production_run_id=run.id,
                 pipeline_generation=run.pipeline_generation,
@@ -2561,6 +2834,42 @@ class ProductionWorkflowOrchestrator:
                     "run_status": SubjectProductionStatus.NEEDS_REVIEW.value,
                     "qa": qa_result,
                 }
+
+
+def _q2_checkpoint_key(
+    *,
+    production_run_id: UUID,
+    canonical_url: str,
+    profile: ExtractionProfile,
+    prompt_version: str,
+    batch_parser_version: str | None,
+    provider: ModelProvider,
+    requested_model: str,
+) -> str:
+    """Return the identity of a reusable successful Q2 source response.
+
+    This is deliberately run-local and contains no archived-content hash. A
+    batch response carries one key for every source it was asked to process;
+    the parser decides which of those source results actually succeeded.
+    """
+    identity = {
+        "checkpoint_version": Q2_SUCCESSFUL_CHECKPOINT_VERSION,
+        "production_run_id": str(production_run_id),
+        "canonical_url": canonical_url,
+        "profile": profile.value,
+        "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+        "verifier_version": ARTIFACT_VERIFIER_VERSION,
+        "prompt_version": prompt_version,
+        "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
+        "q2_batch_parser_version": batch_parser_version,
+        "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+        "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
+        "provider": provider.value,
+        "requested_model": requested_model,
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def _q2_source_model_run_id(

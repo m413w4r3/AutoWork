@@ -12,7 +12,7 @@ const PROFILE_LABELS: Record<ExtractionProgressProfile, string> = {
 const SOURCE_STATUS_LABELS: Record<ExtractionProgressSourceStatus, string> = {
   pending: "En attente",
   running: "En cours",
-  cached: "Cache",
+  cached: "Réutilisé",
   succeeded: "Terminé",
   needs_review: "À vérifier",
   failed: "Échec",
@@ -80,7 +80,8 @@ export function ExtractionProgressView({
           {progress.snort_rules}
         </span>
         <span>
-          Cache : {progress.cache_hits} · Appels modèle : {progress.model_calls}
+          Réutilisés : {progress.cache_hits} · Appels modèle :{" "}
+          {progress.model_calls}
         </span>
       </div>
 
