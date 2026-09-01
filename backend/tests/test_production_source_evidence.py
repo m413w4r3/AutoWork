@@ -29,7 +29,7 @@ def test_version_and_ioc_from_same_source_are_kept_with_value_only() -> None:
 
     result = verify_ioc_rules_output_against_source(output, "The domain is evil.com.")
 
-    assert SOURCE_EVIDENCE_VERSION == "1"
+    assert SOURCE_EVIDENCE_VERSION == "2"
     assert result.output.artifacts[0].value == "evil[.]com"
     assert result.output.artifacts[0].context == ""
     assert result.output.artifacts[0].evidence_quote == ""
@@ -61,6 +61,60 @@ def test_explicit_defanging_and_transport_escaping_are_equivalent() -> None:
 
     assert len(result.output.artifacts) == 2
     assert result.rejections == ()
+
+
+def test_defanged_url_in_the_middle_of_a_sentence_is_proven() -> None:
+    value = "https://evil.com/a"
+
+    result = verify_ioc_rules_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact(value, "url")]),
+        "Observed hxxps://evil[.]com/a in the report.",
+    )
+
+    assert result.output.artifacts[0].value == value
+    assert result.rejections == ()
+
+
+def test_defanged_http_url_in_the_middle_of_a_sentence_is_proven() -> None:
+    result = verify_ioc_rules_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact("http://evil.com/a", "url")]),
+        "Observed hxxp://evil[.]com/a in the report.",
+    )
+
+    assert len(result.output.artifacts) == 1
+    assert result.rejections == ()
+
+
+def test_escaped_defanged_url_in_the_middle_of_a_sentence_is_proven() -> None:
+    result = verify_ioc_rules_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact("https://evil.com/a", "url")]),
+        r"See hxxps\://evil[.]com/a in the report.",
+    )
+
+    assert len(result.output.artifacts) == 1
+    assert result.rejections == ()
+
+
+def test_defanged_candidate_and_defanged_source_are_equivalent() -> None:
+    value = r"hxxps\://evil[.]com/a"
+
+    result = verify_ioc_rules_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact(value, "url")]),
+        "Observed hxxps://evil[.]com/a in the report.",
+    )
+
+    assert result.output.artifacts[0].value == value
+    assert result.rejections == ()
+
+
+def test_defanged_scheme_glued_to_alphanumeric_token_is_not_transformed() -> None:
+    result = verify_ioc_rules_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact("https://evil.example", "url")]),
+        "The value foohxxps://evil.example is not a URL token.",
+    )
+
+    assert result.output.artifacts == []
+    assert result.rejections[0].reason_code == "source_evidence_missing"
 
 
 def test_nbsp_and_narrow_nbsp_are_spaces_only_in_the_comparison_view() -> None:

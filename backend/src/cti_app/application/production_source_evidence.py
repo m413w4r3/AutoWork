@@ -16,13 +16,14 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.domain.publication import ArtifactType
 
-SOURCE_EVIDENCE_VERSION = "1"
+SOURCE_EVIDENCE_VERSION = "2"
 
 _NBSP = "\u00a0"
 _NARROW_NBSP = "\u202f"
 _DOT = re.compile(r"\[\.\]|\(\.\)|\{\.\}", re.IGNORECASE)
 _COLON = re.compile(r"\[:\]", re.IGNORECASE)
 _AT = re.compile(r"\[(?:at|@)\]|\((?:at|@)\)", re.IGNORECASE)
+_DEFANGED_SCHEME = re.compile(r"(?<!\w)hxxp(?P<secure>s?)://", re.IGNORECASE)
 
 # These are continuation characters of an indicator token.  Punctuation not
 # listed here remains a delimiter; no punctuation is removed from the value.
@@ -142,10 +143,10 @@ def _artifact_comparison_view(value: str) -> str:
     view = _DOT.sub(".", view)
     view = _COLON.sub(":", view)
     view = _AT.sub("@", view)
-    if view[:8].casefold() == "hxxps://":
-        view = "https://" + view[8:]
-    elif view[:7].casefold() == "hxxp://":
-        view = "http://" + view[7:]
+    view = _DEFANGED_SCHEME.sub(
+        lambda match: "https://" if match.group("secure") else "http://",
+        view,
+    )
     return view
 
 
