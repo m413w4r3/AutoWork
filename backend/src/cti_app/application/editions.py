@@ -39,6 +39,17 @@ class EditionTransitionRequiresUseCaseError(ValueError):
         )
 
 
+class ActiveProductionEditionError(ValueError):
+    """An active production must be stopped through its compensation use case."""
+
+    code = "active_production_requires_cancellation"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Active production must be stopped before the edition can be archived"
+        )
+
+
 _USE_CASE_OWNED_TRANSITIONS = {
     (EditionStatus.SELECTION, EditionStatus.PRODUCTION),
     (EditionStatus.PRODUCTION, EditionStatus.REVIEW),
@@ -202,6 +213,8 @@ class EditionService:
                 raise EditionNotFoundError(str(edition_id))
             if edition.version != expected_version:
                 raise EditionConcurrencyError("Edition was modified by another request")
+            if edition.status is EditionStatus.PRODUCTION and target is EditionStatus.ARCHIVED:
+                raise ActiveProductionEditionError()
             if (edition.status, target) in _USE_CASE_OWNED_TRANSITIONS:
                 raise EditionTransitionRequiresUseCaseError(edition.status, target)
             before = edition.snapshot()

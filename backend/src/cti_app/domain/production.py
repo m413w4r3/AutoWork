@@ -815,6 +815,16 @@ class ProductionBatchStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ProductionBatchCancellationConflictError(ValueError):
+    """Raised when a terminal production batch cannot be cancelled."""
+
+    code = "production_batch_not_cancellable"
+
+    def __init__(self, status: ProductionBatchStatus) -> None:
+        self.status = status
+        super().__init__(f"Production batch in {status.value} status cannot be cancelled")
+
+
 @dataclass(slots=True, kw_only=True)
 class EditionProductionBatch:
     edition_id: UUID
@@ -851,13 +861,24 @@ class EditionProductionBatch:
         self.finished_at = now or datetime.now(UTC)
         self.version += 1
 
-    def cancel(self, *, now: datetime | None = None) -> None:
+    def cancel(self, *, now: datetime | None = None) -> bool:
         if self.status is ProductionBatchStatus.CANCELLED:
-            return
+            return False
+        if self.status in {
+            ProductionBatchStatus.COMPLETED,
+            ProductionBatchStatus.COMPLETED_WITH_ISSUES,
+        }:
+            raise ProductionBatchCancellationConflictError(self.status)
+        if self.status not in {
+            ProductionBatchStatus.QUEUED,
+            ProductionBatchStatus.RUNNING,
+        }:
+            raise ProductionBatchCancellationConflictError(self.status)
         self.status = ProductionBatchStatus.CANCELLED
         self.next_dispatch_at = None
         self.finished_at = now or datetime.now(UTC)
         self.version += 1
+        return True
 
     def schedule_next_dispatch(self, dispatch_at: datetime) -> None:
         if dispatch_at.tzinfo is None or dispatch_at.utcoffset() is None:

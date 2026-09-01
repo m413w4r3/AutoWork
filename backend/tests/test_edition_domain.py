@@ -9,6 +9,11 @@ from cti_app.domain.editions import (
     EditionStatus,
     InvalidEditionTransitionError,
 )
+from cti_app.domain.production import (
+    EditionProductionBatch,
+    ProductionBatchCancellationConflictError,
+    ProductionBatchStatus,
+)
 
 
 def make_edition(target_articles: int = 8) -> Edition:
@@ -75,6 +80,33 @@ def test_assembling_cannot_be_archived_but_published_can() -> None:
     edition.transition(EditionStatus.ARCHIVED)
 
     assert edition.status is EditionStatus.ARCHIVED
+
+
+def test_production_returns_to_selection_only_through_compensation() -> None:
+    edition = make_edition()
+    edition.status = EditionStatus.PRODUCTION
+
+    assert edition.allowed_transitions == (EditionStatus.REVIEW,)
+    with pytest.raises(InvalidEditionTransitionError):
+        edition.transition(EditionStatus.SELECTION)
+
+    edition.return_to_selection_after_production_cancellation()
+
+    assert edition.status is EditionStatus.SELECTION
+
+
+def test_completed_production_batch_cannot_be_cancelled() -> None:
+    batch = EditionProductionBatch(
+        edition_id=make_edition().id,
+        status=ProductionBatchStatus.QUEUED,
+    )
+    batch.start()
+    batch.finish()
+
+    with pytest.raises(ProductionBatchCancellationConflictError):
+        batch.cancel()
+
+    assert batch.status is ProductionBatchStatus.COMPLETED
 
 
 @pytest.mark.parametrize(

@@ -685,7 +685,10 @@ class SqlAlchemyEditionProductionBatchRepository:
         query = (
             select(EditionProductionBatchRow)
             .where(EditionProductionBatchRow.edition_id == edition_id)
-            .order_by(EditionProductionBatchRow.created_at.desc())
+            .order_by(
+                EditionProductionBatchRow.created_at.desc(),
+                EditionProductionBatchRow.id.desc(),
+            )
             .limit(1)
         )
         result = await self._session.execute(query)
@@ -718,7 +721,10 @@ class SqlAlchemyEditionProductionBatchRepository:
                     )
                 )
             )
-            .order_by(EditionProductionBatchRow.created_at.desc())
+            .order_by(
+                EditionProductionBatchRow.created_at.desc(),
+                EditionProductionBatchRow.id.desc(),
+            )
             .limit(1)
         )
         result = await self._session.execute(query)

@@ -10,6 +10,7 @@ import {
   type SubjectProductionStage,
   type SubjectProductionStatus,
 } from "../../api/production";
+import type { Edition } from "../../api/editions";
 import { ExtractionProgressView } from "../../components/ExtractionProgress";
 import { Link } from "../../routing";
 import { productionBatchPollingInterval } from "./productionPolling";
@@ -68,7 +69,9 @@ function useDispatchCountdown(nextDispatchAt: string | null): number | null {
 }
 
 function processedCount(batch: BatchStatus): number {
-  return batch.completed + batch.needs_review + batch.failed + batch.cancelled;
+  // Cancellation is a separate outcome, not produced work.  It must not
+  // make a stopped batch look fully processed.
+  return batch.completed + batch.needs_review + batch.failed;
 }
 
 function BatchCounters({ batch }: { batch: BatchStatus }) {
@@ -175,11 +178,27 @@ export function ProductionConsole({ editionId }: { editionId: string }) {
         ? cancelProductionBatch(editionId, batch.data.batch_id)
         : Promise.reject(new Error("Aucun lot de production actif.")),
     retry: false,
-    onSuccess: () => {
+    onSuccess: (result) => {
+      const currentEdition = queryClient.getQueryData<Edition>([
+        "edition",
+        editionId,
+      ]);
+      if (currentEdition && result.edition_status === "selection") {
+        queryClient.setQueryData<Edition>(["edition", editionId], {
+          ...currentEdition,
+          status: "selection",
+          version: result.edition_version,
+          progress_percent: 30,
+          allowed_transitions: ["production", "archived"],
+        });
+      }
       void queryClient.invalidateQueries({ queryKey: ["batch", editionId] });
       void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
       void queryClient.invalidateQueries({
         queryKey: ["edition-review", editionId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["editorial-board", editionId],
       });
     },
   });
@@ -244,7 +263,7 @@ export function ProductionConsole({ editionId }: { editionId: string }) {
             disabled={cancel.isPending}
             onClick={() => cancel.mutate()}
           >
-            {cancel.isPending ? "Arrêt…" : "Arrêter le lot"}
+            {cancel.isPending ? "Arrêt…" : "Arrêter et revenir à la sélection"}
           </button>
         ) : null}
       </div>

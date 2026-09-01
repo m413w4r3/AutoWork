@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.editions import (
+    ActiveProductionEditionError,
     DuplicateEditionError,
     EditionConcurrencyError,
     EditionNotFoundError,
@@ -287,6 +288,11 @@ def _raise_api_error(exc: Exception) -> NoReturn:
             },
         ) from exc
     if isinstance(exc, EditionTransitionRequiresUseCaseError):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    if isinstance(exc, ActiveProductionEditionError):
         raise HTTPException(
             status_code=409,
             detail={"code": exc.code, "message": str(exc)},

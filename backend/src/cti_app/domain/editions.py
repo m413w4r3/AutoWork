@@ -30,7 +30,10 @@ EDITION_TRANSITIONS: dict[EditionStatus, tuple[EditionStatus, ...]] = {
     EditionStatus.DRAFT: (EditionStatus.DISCOVERY, EditionStatus.ARCHIVED),
     EditionStatus.DISCOVERY: (EditionStatus.SELECTION, EditionStatus.ARCHIVED),
     EditionStatus.SELECTION: (EditionStatus.PRODUCTION, EditionStatus.ARCHIVED),
-    EditionStatus.PRODUCTION: (EditionStatus.REVIEW, EditionStatus.ARCHIVED),
+    # Production can only leave through its production workflow.  In
+    # particular, archiving an active production would bypass batch cleanup;
+    # cancellation has its own explicit compensation operation below.
+    EditionStatus.PRODUCTION: (EditionStatus.REVIEW,),
     EditionStatus.REVIEW: (
         EditionStatus.PRODUCTION,
         EditionStatus.ASSEMBLING,
@@ -137,6 +140,17 @@ class Edition:
                 f"Transition from {self.status.value} to {target.value} is not allowed"
             )
         self.status = target
+        self._bump(now)
+
+    def return_to_selection_after_production_cancellation(
+        self, *, now: datetime | None = None
+    ) -> None:
+        """Compensate a cancelled production without exposing a generic edge."""
+        if self.status is not EditionStatus.PRODUCTION:
+            raise InvalidEditionTransitionError(
+                "Only a production edition can return to selection after cancellation"
+            )
+        self.status = EditionStatus.SELECTION
         self._bump(now)
 
     def snapshot(self) -> dict[str, Any]:

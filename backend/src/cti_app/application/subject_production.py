@@ -15,7 +15,7 @@ from cti_app.application.persistence import (
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
-from cti_app.domain.editions import EditionAuditEvent, EditionStatus
+from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
@@ -61,6 +61,26 @@ class SubjectProductionRetryResult:
 class SubjectProductionCancellationResult:
     run: SubjectProductionRun
     batch_id: UUID | None
+    changed: bool
+
+
+class EditionProductionBatchNotFoundError(LookupError):
+    pass
+
+
+class EditionProductionBatchOwnershipError(ValueError):
+    pass
+
+
+class StaleEditionProductionBatchError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class EditionProductionCancellationResult:
+    edition: Edition
+    batch: EditionProductionBatch
+    cancelled_runs: tuple[tuple[UUID, UUID], ...]
     changed: bool
 
 
@@ -597,6 +617,130 @@ class EditionProductionService:
             await uow.commit()
             return batch
 
+    async def cancel_batch_with_result(
+        self,
+        edition_id: UUID,
+        batch_id: UUID,
+        *,
+        actor_id: str = "system",
+        correlation_id: str = "-",
+    ) -> EditionProductionCancellationResult:
+        """Compensate one active batch and return its exact affected runs.
+
+        The owning Edition is the serialization point for production start,
+        handoff, and cancellation.  The exact batch is then re-read under
+        lock, so an old batch ID cannot cancel a newer active batch.
+        """
+        async with self._uow_factory() as uow:
+            editions = getattr(uow, "editions", None)
+            if editions is None:
+                raise ValueError("edition_repository_missing")
+
+            edition = await editions.get_for_update(edition_id)
+            if edition is None:
+                raise EditionProductionBatchNotFoundError(str(edition_id))
+
+            batch = await uow.edition_production_batches.get_for_update(batch_id)
+            if batch is None:
+                raise EditionProductionBatchNotFoundError(str(batch_id))
+            if batch.edition_id != edition_id:
+                raise EditionProductionBatchOwnershipError(
+                    "Production batch does not belong to this edition"
+                )
+
+            active = await uow.edition_production_batches.get_active_for_edition(edition_id)
+            if active is not None and active.id != batch.id:
+                raise StaleEditionProductionBatchError(
+                    "A newer production batch is active for this edition"
+                )
+
+            # A repeated request for the same current cancelled batch is an
+            # idempotent success.  It must not repair or mutate anything else,
+            # especially not a later batch.
+            if batch.status is ProductionBatchStatus.CANCELLED:
+                await uow.commit()
+                return EditionProductionCancellationResult(
+                    edition=edition,
+                    batch=batch,
+                    cancelled_runs=(),
+                    changed=False,
+                )
+
+            # Check terminal status before the Edition status so a completed
+            # batch always returns its typed business conflict, even if an
+            # older inconsistent record still says production.
+            if batch.status in {
+                ProductionBatchStatus.COMPLETED,
+                ProductionBatchStatus.COMPLETED_WITH_ISSUES,
+            }:
+                batch.cancel()
+
+            if edition.status is not EditionStatus.PRODUCTION:
+                raise ValueError("edition_not_in_production")
+
+            # The domain operation rejects completed terminal batches and is
+            # deliberately not represented by Edition.transition.
+            now = datetime.now(UTC)
+            batch.cancel(now=now)
+            await uow.edition_production_batches.save(batch)
+
+            cancelled_runs: list[tuple[UUID, UUID]] = []
+            items = await uow.edition_production_batch_items.list_for_batch(batch.id)
+            for item in items:
+                run = await uow.subject_production_runs.get_for_update(item.production_run_id)
+                if run is None:
+                    raise ValueError("production_batch_run_missing")
+                if run.edition_id != edition_id or run.subject_id != item.subject_id:
+                    raise EditionProductionBatchOwnershipError(
+                        "Production run does not belong to this batch"
+                    )
+                if run.status in {
+                    SubjectProductionStatus.QUEUED,
+                    SubjectProductionStatus.RUNNING,
+                }:
+                    run.mark_cancelled(now=now)
+                    await uow.subject_production_runs.save(run)
+                    cancelled_runs.append((run.id, run.subject_id))
+
+            before = edition.snapshot()
+            edition.return_to_selection_after_production_cancellation(now=now)
+            if not await editions.update(edition, edition.version - 1):
+                raise ValueError("edition_concurrent_update")
+            await uow.edition_audit.append(
+                EditionAuditEvent(
+                    edition_id=edition.id,
+                    actor_id=actor_id,
+                    action="edition.production_cancelled",
+                    before=before,
+                    after=edition.snapshot(),
+                    correlation_id=correlation_id,
+                    occurred_at=now,
+                )
+            )
+            await uow.commit()
+            return EditionProductionCancellationResult(
+                edition=edition,
+                batch=batch,
+                cancelled_runs=tuple(cancelled_runs),
+                changed=True,
+            )
+
+    async def cancel_batch(
+        self,
+        edition_id: UUID,
+        batch_id: UUID,
+        *,
+        actor_id: str = "system",
+        correlation_id: str = "-",
+    ) -> EditionProductionCancellationResult:
+        """Alias for the explicit production cancellation use case."""
+        return await self.cancel_batch_with_result(
+            edition_id,
+            batch_id,
+            actor_id=actor_id,
+            correlation_id=correlation_id,
+        )
+
     async def get_batch(self, batch_id_or_edition_id: UUID) -> EditionProductionBatch | None:
         """Get a production batch by ID or get active batch for edition."""
         async with self._uow_factory() as uow:
@@ -614,6 +758,27 @@ class EditionProductionService:
             return await uow.edition_production_batches.get_latest_for_edition(
                 batch_id_or_edition_id
             )
+
+    async def _get_batch_for_update_in_lock_order(
+        self,
+        uow: ProductionUnitOfWork,
+        batch_id: UUID,
+    ) -> EditionProductionBatch:
+        """Acquire Edition then batch, matching production cancellation."""
+        probe = await uow.edition_production_batches.get(batch_id)
+        if probe is None:
+            raise ValueError(f"Batch {batch_id} not found")
+
+        editions = getattr(uow, "editions", None)
+        if editions is not None:
+            edition = await editions.get_for_update(probe.edition_id)
+            if edition is None:
+                raise ValueError("edition_not_found")
+
+        batch = await uow.edition_production_batches.get_for_update(batch_id)
+        if batch is None:
+            raise ValueError(f"Batch {batch_id} not found")
+        return batch
 
     async def _start_next_in_uow(
         self,
@@ -659,9 +824,7 @@ class EditionProductionService:
 
     async def start_next(self, batch_id: UUID) -> SubjectProductionRun | None:
         async with self._uow_factory() as uow:
-            batch = await uow.edition_production_batches.get_for_update(batch_id)
-            if not batch:
-                raise ValueError(f"Batch {batch_id} not found")
+            batch = await self._get_batch_for_update_in_lock_order(uow, batch_id)
             run = await self._start_next_in_uow(uow, batch)
             await uow.commit()
             return run
@@ -680,9 +843,12 @@ class EditionProductionService:
         The caller dispatches the job outside this transaction.
         """
         async with self._uow_factory() as uow:
-            batch = await uow.edition_production_batches.get_for_update(batch_id)
-            if not batch:
-                raise ValueError(f"Batch {batch_id} not found")
+            batch = await self._get_batch_for_update_in_lock_order(uow, batch_id)
+
+            item_for_run = await uow.edition_production_batch_items.get_by_run(run_id)
+            if item_for_run is None or item_for_run.batch_id != batch.id:
+                await uow.commit()
+                return None
 
             started = await self._start_next_in_uow(uow, batch, pace_subject=True)
             if started is not None:
@@ -815,9 +981,7 @@ class EditionProductionService:
             item = await uow.edition_production_batch_items.get_by_run(run_id)
             if item is None:
                 return
-            batch = await uow.edition_production_batches.get_for_update(item.batch_id)
-            if batch is None:
-                return
+            batch = await self._get_batch_for_update_in_lock_order(uow, item.batch_id)
             batch.clear_next_dispatch()
             await uow.edition_production_batches.save(batch)
             await uow.commit()

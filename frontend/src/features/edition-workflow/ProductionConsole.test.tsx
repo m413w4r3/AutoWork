@@ -3,19 +3,52 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { BatchStatus } from "../../api/production";
+import type { Edition } from "../../api/editions";
+import type {
+  BatchStatus,
+  CancelProductionBatchResponse,
+} from "../../api/production";
 import { ProductionConsole } from "./ProductionConsole";
 import { productionBatchPollingInterval } from "./productionPolling";
 
 const EDITION_ID = "edition-1";
 
-function renderConsole(batch: BatchStatus | null) {
+function renderConsole(
+  batch: BatchStatus | null,
+  cancellation: CancelProductionBatchResponse = {
+    action: "cancel",
+    batch_id: batch?.batch_id ?? "batch-none",
+    status: "cancelled",
+    edition_status: "selection",
+    edition_version: 4,
+  },
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  const cachedEdition: Edition = {
+    id: EDITION_ID,
+    country: "France",
+    country_code: "FR",
+    period_start: "2026-08-01",
+    period_end: "2026-08-31",
+    tlp: "GREEN",
+    languages: ["fr"],
+    target_articles: 1,
+    previous_edition_id: null,
+    source_profile: "default",
+    status: "production",
+    version: 3,
+    progress_percent: 55,
+    allowed_transitions: ["review"],
+    created_at: "2026-08-29T10:00:00Z",
+    updated_at: "2026-08-29T10:00:00Z",
+  };
+  client.setQueryData(["edition", EDITION_ID], cachedEdition);
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     void input;
-    void init;
+    if (init?.method === "POST")
+      return Promise.resolve(Response.json(cancellation));
     return Promise.resolve(
       batch ? Response.json(batch) : new Response(null, { status: 404 }),
     );
@@ -200,7 +233,7 @@ describe("ProductionConsole", () => {
     renderConsole(batch);
 
     expect(
-      await screen.findByRole("heading", { name: "4 / 4 articles traités" }),
+      await screen.findByRole("heading", { name: "3 / 4 articles traités" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Récupération automatique")).toBeInTheDocument();
     expect(screen.getByLabelText("Compteurs de production")).toHaveTextContent(
@@ -232,8 +265,39 @@ describe("ProductionConsole", () => {
       screen.getByText(/Démarrage du prochain article dans 00:4[12]/),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Arrêter le lot" }),
+      screen.getByRole("button", {
+        name: "Arrêter et revenir à la sélection",
+      }),
     ).toBeInTheDocument();
+  });
+
+  it("ne compte pas les annulations comme du travail produit", async () => {
+    const batch: BatchStatus = {
+      batch_id: "batch-cancelled",
+      edition_id: EDITION_ID,
+      status: "cancelled",
+      phase: "initial",
+      next_dispatch_at: null,
+      items: 2,
+      completed: 0,
+      needs_review: 0,
+      failed: 0,
+      cancelled: 2,
+      item_details: [],
+      created_at: "2026-08-29T10:00:00Z",
+      started_at: "2026-08-29T10:00:00Z",
+      finished_at: "2026-08-29T10:01:00Z",
+    };
+
+    renderConsole(batch);
+
+    expect(
+      await screen.findByRole("heading", { name: "0 / 2 articles traités" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Compteurs de production")).toHaveTextContent(
+      "2 annulés",
+    );
+    expect(screen.getByRole("progressbar")).toHaveValue(0);
   });
 
   it("ne présente pas une étape active pendant le délai avant le prochain article", async () => {
@@ -308,7 +372,9 @@ describe("ProductionConsole", () => {
 
     await screen.findByRole("heading", { name: "0 / 0 articles traités" });
     expect(
-      screen.queryByRole("button", { name: "Arrêter le lot" }),
+      screen.queryByRole("button", {
+        name: "Arrêter et revenir à la sélection",
+      }),
     ).not.toBeInTheDocument();
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({
@@ -347,7 +413,9 @@ describe("ProductionConsole", () => {
     const user = userEvent.setup();
 
     await user.click(
-      await screen.findByRole("button", { name: "Arrêter le lot" }),
+      await screen.findByRole("button", {
+        name: "Arrêter et revenir à la sélection",
+      }),
     );
 
     await waitFor(() =>
@@ -371,6 +439,12 @@ describe("ProductionConsole", () => {
       expect(invalidate).toHaveBeenCalledWith({
         queryKey: ["edition-review", EDITION_ID],
       });
+      expect(invalidate).toHaveBeenCalledWith({
+        queryKey: ["editorial-board", EDITION_ID],
+      });
+      expect(
+        client.getQueryData<Edition>(["edition", EDITION_ID])?.status,
+      ).toBe("selection");
     });
   });
 

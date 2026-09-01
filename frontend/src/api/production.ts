@@ -127,6 +127,14 @@ export interface BatchStatus {
   finished_at: string | null;
 }
 
+export interface CancelProductionBatchResponse {
+  action: string;
+  batch_id: string;
+  status: "cancelled";
+  edition_status: "selection";
+  edition_version: number;
+}
+
 export interface ArtifactResponse {
   artifact_id: string;
   stage: string;
@@ -350,7 +358,7 @@ export async function invalidateProductionReuse(
 export async function cancelProductionBatch(
   editionId: string,
   batchId: string,
-): Promise<{ action: string; batch_id: string; status: "cancelled" }> {
+): Promise<CancelProductionBatchResponse> {
   return request(`/api/editions/${editionId}/production/${batchId}/cancel`, {
     method: "POST",
   });

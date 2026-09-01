@@ -37,13 +37,17 @@ from cti_app.application.production_state import (
     ProductionStateSnapshotV2,
 )
 from cti_app.application.subject_production import (
+    EditionProductionBatchNotFoundError,
+    EditionProductionBatchOwnershipError,
     EditionProductionService,
     ProductionRunNotFoundError,
+    StaleEditionProductionBatchError,
     SubjectProductionService,
 )
 from cti_app.domain.editorial import EditorialGroup, EditorialGroupStatus
 from cti_app.domain.production import (
     ProductionArtifactStage,
+    ProductionBatchCancellationConflictError,
     ProductionBatchStatus,
     ProductionReuseInvalidation,
     SubjectProductionRun,
@@ -953,6 +957,11 @@ async def start_edition_production(
 ) -> BatchStatus:
     # Idempotent: returns the existing active batch if one exists.
     payload = body or StartEditionProductionRequest()
+    if payload.subject_ids is not None and not payload.subject_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one subject must be selected for production",
+        )
     uow_factory, jobs, dispatcher = _runtime(request)
     service = EditionProductionService(uow_factory, _production_pacing(request))
 
@@ -970,7 +979,7 @@ async def start_edition_production(
             detail="No selected articles found for edition",
         )
 
-    if payload.subject_ids:
+    if payload.subject_ids is not None:
         requested = set(payload.subject_ids)
         unknown = requested - set(eligible_order)
         if unknown:
@@ -1059,47 +1068,59 @@ async def cancel_edition_batch(
     request: Request,
 ) -> dict[str, Any]:
     uow_factory, jobs, _ = _runtime(request)
-    runs_to_cancel: list[tuple[UUID, UUID]] = []
     actor_id = await _actor_id(request)
 
-    async with uow_factory() as uow:
-        batch = await uow.edition_production_batches.get_for_update(batch_id)
-        if not batch:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Batch {batch_id} not found",
-            )
-
-        if batch.edition_id != edition_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Batch does not belong to this edition",
-            )
-
-        batch.cancel(now=datetime.now(UTC))
-        await uow.edition_production_batches.save(batch)
-        items = await uow.edition_production_batch_items.list_for_batch(batch.id)
-        for item in items:
-            run = await uow.subject_production_runs.get_for_update(item.production_run_id)
-            if run is None:
-                continue
-            runs_to_cancel.append((run.id, run.subject_id))
-            if run.status is SubjectProductionStatus.QUEUED:
-                run.mark_cancelled(now=datetime.now(UTC))
-                await uow.subject_production_runs.save(run)
-            elif run.status is SubjectProductionStatus.RUNNING:
-                run.mark_cancelled(now=datetime.now(UTC))
-                await uow.subject_production_runs.save(run)
-        await uow.commit()
+    service = EditionProductionService(uow_factory, _production_pacing(request))
+    try:
+        cancellation = await service.cancel_batch_with_result(
+            edition_id,
+            batch_id,
+            actor_id=actor_id,
+            correlation_id=get_correlation_id(),
+        )
+    except EditionProductionBatchNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Batch {batch_id} not found",
+        ) from exc
+    except EditionProductionBatchOwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except StaleEditionProductionBatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "stale_production_batch",
+                "message": str(exc),
+            },
+        ) from exc
+    except ProductionBatchCancellationConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": exc.code,
+                "message": str(exc),
+                "status": exc.status.value,
+            },
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": str(exc)},
+        ) from exc
 
     await _cancel_non_terminal_run_jobs(
         jobs,
-        runs_to_cancel,
+        cancellation.cancelled_runs,
         actor_id=actor_id,
     )
 
     return {
         "action": "cancel",
-        "batch_id": str(batch.id),
-        "status": batch.status.value,
+        "batch_id": str(cancellation.batch.id),
+        "status": cancellation.batch.status.value,
+        "edition_status": cancellation.edition.status.value,
+        "edition_version": cancellation.edition.version,
     }

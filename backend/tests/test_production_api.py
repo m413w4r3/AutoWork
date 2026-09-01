@@ -115,6 +115,14 @@ class _Edition:
         self.status = status
         self.version += 1
 
+    def return_to_selection_after_production_cancellation(
+        self, *, now: datetime
+    ) -> None:
+        del now
+        assert self.status is EditionStatus.PRODUCTION
+        self.status = EditionStatus.SELECTION
+        self.version += 1
+
 
 class _Editions:
     def __init__(self) -> None:
@@ -134,8 +142,11 @@ class _Editions:
 
 
 class _Audit:
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
     async def append(self, event: Any) -> None:
-        del event
+        self.events.append(event)
 
 
 class _DiscoveryBatches:
@@ -748,6 +759,7 @@ async def test_start_edition_produces_every_selected_article(api: AsyncClient, u
 
     assert response.status_code == 200, response.text
     assert response.json()["items"] == 3
+    assert (await uow.editions.get(edition_id)).status is EditionStatus.PRODUCTION
 
 
 async def test_start_edition_honours_subject_selection(api: AsyncClient, uow: _Uow) -> None:
@@ -766,6 +778,23 @@ async def test_start_edition_honours_subject_selection(api: AsyncClient, uow: _U
 
     produced = {item.subject_id for item in uow.edition_production_batch_items.items}
     assert produced == {subjects[0], subjects[2]}
+
+
+async def test_start_edition_rejects_explicit_empty_subject_selection(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+
+    response = await api.post(
+        f"/api/editions/{edition_id}/production",
+        json={"subject_ids": []},
+    )
+
+    assert response.status_code == 400
+    assert not uow.edition_production_batches.items
+    assert (await uow.editions.get(edition_id)).status is EditionStatus.SELECTION
 
 
 async def test_start_edition_with_more_eligible_than_selected_runs_only_the_chosen_subset(
@@ -1565,6 +1594,11 @@ async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
     assert response.status_code == 200, response.text
     assert repeated.status_code == 200, repeated.text
     assert batch.status == "cancelled"
+    assert (await uow.editions.get(edition_id)).status is EditionStatus.SELECTION
+    assert [event.action for event in uow.edition_audit.events] == [
+        "edition.transitioned",
+        "edition.production_cancelled",
+    ]
     assert all(
         run.status is SubjectProductionStatus.CANCELLED
         for run in uow.subject_production_runs.items.values()
@@ -1573,6 +1607,98 @@ async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
     assert str(first_run.id) == exact_job.input_parameters["run_id"]
     assert exact_job.id in jobs.cancelled
     assert unrelated.id not in jobs.cancelled
+
+
+async def test_batch_cancel_preserves_terminal_runs(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subjects = [uuid4(), uuid4(), uuid4()]
+    for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
+        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+    jobs = _CancelableJobs()
+    production_app.state.job_service = jobs
+
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert started.status_code == 200, started.text
+    items = sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
+    terminal = uow.subject_production_runs.items[items[1].production_run_id]
+    terminal.mark_ready()
+
+    response = await api.post(
+        f"/api/editions/{edition_id}/production/{started.json()['batch_id']}/cancel"
+    )
+
+    assert response.status_code == 200, response.text
+    assert terminal.status is SubjectProductionStatus.READY
+    assert uow.subject_production_runs.items[items[0].production_run_id].status is (
+        SubjectProductionStatus.CANCELLED
+    )
+    assert uow.subject_production_runs.items[items[2].production_run_id].status is (
+        SubjectProductionStatus.CANCELLED
+    )
+    assert response.json()["edition_status"] == "selection"
+
+
+async def test_repeated_old_batch_cancel_cannot_affect_newer_batch(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    jobs = _CancelableJobs()
+    production_app.state.job_service = jobs
+
+    first = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert first.status_code == 200, first.text
+    old_batch_id = first.json()["batch_id"]
+    stopped = await api.post(f"/api/editions/{edition_id}/production/{old_batch_id}/cancel")
+    assert stopped.status_code == 200, stopped.text
+
+    second = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert second.status_code == 200, second.text
+    new_batch_id = second.json()["batch_id"]
+    assert new_batch_id != old_batch_id
+    new_run = next(
+        run
+        for run in uow.subject_production_runs.items.values()
+        if run.id
+        == next(
+            item.production_run_id
+            for item in uow.edition_production_batch_items.items
+            if str(item.batch_id) == new_batch_id
+        )
+    )
+    audit_count = len(uow.edition_audit.events)
+
+    stale = await api.post(f"/api/editions/{edition_id}/production/{old_batch_id}/cancel")
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "stale_production_batch"
+    assert uow.subject_production_runs.items[new_run.id].status is SubjectProductionStatus.RUNNING
+    assert len(uow.edition_audit.events) == audit_count
+
+
+async def test_completed_batch_cannot_be_cancelled(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert started.status_code == 200, started.text
+    batch = next(iter(uow.edition_production_batches.items.values()))
+    batch.finish()
+
+    response = await api.post(f"/api/editions/{edition_id}/production/{batch.id}/cancel")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "production_batch_not_cancellable"
+    assert batch.status is ProductionBatchStatus.COMPLETED
 
 
 async def test_exact_run_cancel_hands_off_to_the_next_batch_subject(

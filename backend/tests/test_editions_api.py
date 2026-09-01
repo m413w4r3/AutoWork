@@ -128,6 +128,38 @@ async def test_generic_transition_can_archive_published_edition() -> None:
     assert factory.state[edition.id].status is EditionStatus.ARCHIVED
 
 
+async def test_generic_transition_cannot_archive_active_production() -> None:
+    factory = InMemoryEditionUnitOfWorkFactory()
+    edition = Edition(
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        tlp=TLP.GREEN,
+        languages=("fr",),
+        target_articles=1,
+        source_profile="default",
+        status=EditionStatus.PRODUCTION,
+    )
+    factory.state[edition.id] = edition
+    application = FastAPI()
+    application.include_router(router)
+    application.state.edition_service = EditionService(factory)
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/api/editions/{edition.id}/transitions",
+            json={"target_status": "archived", "version": edition.version},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "active_production_requires_cancellation"
+    assert factory.state[edition.id].status is EditionStatus.PRODUCTION
+
+
 async def test_generic_transition_allows_normal_transition() -> None:
     factory = InMemoryEditionUnitOfWorkFactory()
     edition = Edition(

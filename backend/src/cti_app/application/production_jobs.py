@@ -29,6 +29,7 @@ from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import EditionProductionService
 from cti_app.domain.production import (
+    ProductionBatchStatus,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -158,11 +159,20 @@ def register_production_jobs(
     production_pacing = pacing or stage_chain.pacing
 
     async def can_dispatch(run_id: UUID, context: JobExecutionContext) -> bool:
-        """Re-read the exact run immediately before creating/dispatching a job."""
+        """Re-read the run and its batch immediately before dispatch."""
         await context.check_cancelled()
         async with uow_factory() as uow:
             run = await uow.subject_production_runs.get(run_id)
-        return run is not None and run.status is SubjectProductionStatus.RUNNING
+            if run is None or run.status is not SubjectProductionStatus.RUNNING:
+                return False
+            item = await uow.edition_production_batch_items.get_by_run(run_id)
+            if item is None:
+                return True
+            batch = await uow.edition_production_batches.get(item.batch_id)
+            return batch is not None and batch.status in {
+                ProductionBatchStatus.QUEUED,
+                ProductionBatchStatus.RUNNING,
+            }
 
     async def advance_batch(
         run_id: UUID,
@@ -224,10 +234,11 @@ def register_production_jobs(
                 delay_ms=subject_delay_ms,
                 before_dispatch=lambda: can_dispatch(started.id, context),
             )
-        except DuplicateJobError:
+        except (DuplicateJobError, JobCancelledError):
             # A recovered worker may reach this hand-off after the original
             # dispatch already committed. The idempotency key is the proof
-            # that the existing job is the exact same stage attempt.
+            # that the existing job is the exact same stage attempt.  A
+            # cancellation can also win the final dispatch fence.
             return
 
     async def handle_stage(
