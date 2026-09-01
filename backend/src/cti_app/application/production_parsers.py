@@ -256,7 +256,7 @@ Q2_EXTRACTION_CONTRACT_VERSION = "q2-source-extraction-v3"
 
 # Bump whenever the Q2 Markdown dialect or its lexing rules change. Participates
 # in the Q2 checkpoint identity so a parser change forces a fresh model call.
-Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v4"
+Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v5"
 
 
 def q2_source_output_to_json(output: Q2SourceOutput) -> dict[str, Any]:
@@ -810,6 +810,7 @@ _ATTACK_ID = re.compile(r"T\d{4}(?:\.\d{3})?")
 _Q2_HEADER_TEXT = re.compile(r"^\s*(?:#{1,6}\s+)?(?P<text>.+?)\s*#*\s*$")
 _Q2_FACT_HEADER = re.compile(r"^FACT(?:\s+(?P<category>.+))?$")
 _Q2_RULE_HEADER = re.compile(r"^RULE(?:\s+(?P<spec>.+))?$")
+_Q2_FENCE_OPEN = re.compile(r"^\s*```[^\n]*$")
 _Q2_RULE_FENCE_OPEN = re.compile(r"^\s*```(?P<language>[A-Za-z0-9_-]+)\s*$")
 _Q2_TERMINAL_MARKERS = frozenset({"EMPTY", "UNAVAILABLE"})
 
@@ -910,7 +911,7 @@ def _q2_terminal_markers_outside_fences(lines: list[str]) -> tuple[str, ...]:
             if _FENCE_CLOSE.fullmatch(line):
                 in_fence = False
             continue
-        if _Q2_RULE_FENCE_OPEN.fullmatch(line):
+        if _Q2_FENCE_OPEN.fullmatch(line) and not _FENCE_CLOSE.fullmatch(line):
             in_fence = True
             continue
         marker = line.strip()
@@ -967,7 +968,7 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
     total_rule_content_bytes = 0
     i = 0
     while i < len(lines):
-        if _FENCE_OPEN.fullmatch(lines[i]) and not _FENCE_CLOSE.fullmatch(lines[i]):
+        if _Q2_FENCE_OPEN.fullmatch(lines[i]) and not _FENCE_CLOSE.fullmatch(lines[i]):
             if current is not None:
                 result.warnings.append("q2_unexpected_structure")
                 result.dropped_blocks.append(lines[i].strip())

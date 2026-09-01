@@ -51,8 +51,9 @@ def test_full_prompt_requires_compact_facts_iocs_and_rules() -> None:
     assert "# IOCS" not in prompt
     assert "# RULES" not in prompt
     assert "indicator-status" not in prompt
-    assert EXTRACTION_PROMPT_VERSION == "12"
-    assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v4"
+    assert "<literal body>\n```\n\nUNCERTAINTIES" in prompt
+    assert EXTRACTION_PROMPT_VERSION == "13"
+    assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v5"
 
 
 def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
@@ -71,7 +72,8 @@ def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
     assert "# RULES" not in prompt
     assert "do not extract FACTS" in prompt
     assert "narrative" in prompt
-    assert IOC_RULES_PROMPT_VERSION == "5"
+    assert "<literal body>\n```\n\nUNCERTAINTIES" in prompt
+    assert IOC_RULES_PROMPT_VERSION == "6"
 
 
 def test_ioc_group_parses_100_confirmed_iocs() -> None:
@@ -297,6 +299,21 @@ title: EMPTY
     assert result.usable, result.errors
     assert result.value is not None
     assert result.value.rules[0].body == "title: EMPTY"
+
+
+def test_terminal_marker_inside_an_unrelated_fence_is_not_mixed() -> None:
+    result = parse_q2_proposals_markdown(
+        """IOC confirmed domain
+- kept.example
+```text example
+EMPTY
+```
+"""
+    )
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert [artifact.value for artifact in result.value.artifacts] == ["kept.example"]
 
 
 def test_headers_inside_an_unrelated_fence_are_not_parsed() -> None:

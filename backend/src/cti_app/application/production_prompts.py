@@ -9,12 +9,12 @@ from cti_app.domain.production import ExtractionProfile
 REFERENCES_PROMPT_VERSION = "5"
 # Q2 uses free-text GPT plus a stateless Markdown wire-format parser. The bridge does
 # not guarantee response_format / JSON Schema.
-# "12" / "5": Q2 analyses the archived capture inlined in the prompt whenever
+# "13" / "6": Q2 analyses the archived capture inlined in the prompt whenever
 # one is available, so a result cached under a content hash is really produced
 # from that content. Versions bumped so checkpoints written by the previous,
 # live-URL-only prompt are never reused under the same identity.
-EXTRACTION_PROMPT_VERSION = "12"
-IOC_RULES_PROMPT_VERSION = "5"
+EXTRACTION_PROMPT_VERSION = "13"
+IOC_RULES_PROMPT_VERSION = "6"
 IOC_RULES_BATCH_PROMPT_VERSION = "1"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
@@ -36,6 +36,7 @@ IOC <confirmed|contextual> <type>
 RULE <yara|sigma|suricata|snort>[: <visible name>]
 ```<language>
 <literal body>
+```
 
 UNCERTAINTIES
 - <uncertainty>
@@ -52,6 +53,7 @@ _Q2_IOC_RULES_WIRE_FORMAT = """IOC <confirmed|contextual> <type>
 RULE <yara|sigma|suricata|snort>[: <visible name>]
 ```<language>
 <literal body>
+```
 
 UNCERTAINTIES
 - <uncertainty>
@@ -166,9 +168,8 @@ Also extract useful malware, tools, files, CVEs, detection rules, TTPs, infrastr
 victims and campaign context. Omit irrelevant, example-only, placeholder,
 masked, truncated, REDACTED or FUZZ values; never reconstruct hidden values.
 
-Extract the complete literal detection rule when it is visibly published by the
-exact source or its explicitly linked technical annex/repository already admitted
-to the source corpus. For every YARA, Sigma, Suricata or Snort rule:
+Extract the complete literal detection rule when it is visibly published by this
+source. For every YARA, Sigma, Suricata or Snort rule:
 - preserve the complete literal body, syntax and visible line breaks;
 - do not reconstruct truncated content, invent missing variables, or repair braces;
 - never merge two rules or transform one rule language into another;
@@ -196,7 +197,7 @@ Rules:
 - The complete header is authoritative and self-contained. Do not rely on a
   previous header and do not repeat category, status or type on value lines.
 - Emit no source id, URL, provenance, evidence quote or model id. Emit only
-  values literally visible in this source or its admitted technical annex.
+  values literally visible in this source.
 - Use `:: short context` only when useful, with whitespace on both sides of
   `::`. Keep every IPv6 literal intact.
 - Perform an exhaustive IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/
@@ -226,9 +227,8 @@ Never sacrifice IOC coverage to reduce cost. This profile emits no narrative
 facts: do not extract FACTS, TTP narrative, victimology, chronology, campaign
 context, tooling narrative, infection chains, or general historical context.
 
-Extract the complete literal detection rule when it is visibly published by the
-exact source or its explicitly linked technical annex/repository already admitted
-to the source corpus. For every YARA, Sigma, Suricata or Snort rule:
+Extract the complete literal detection rule when it is visibly published by this
+source. For every YARA, Sigma, Suricata or Snort rule:
 - preserve the complete literal body, syntax and visible line breaks;
 - do not reconstruct truncated content, invent missing variables, or repair braces;
 - never merge two rules or transform one rule language into another;
@@ -256,7 +256,7 @@ Rules:
 - The complete header is authoritative and self-contained. Do not rely on a
   previous header and do not repeat status or type on value lines.
 - Emit no source id, URL, provenance, evidence quote or model id. Emit only
-  values literally visible in this source or its admitted technical annex.
+  values literally visible in this source.
 - Perform an exhaustive IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/
   SHA512 and email addresses, including tables, appendices, images and code.
   Omit irrelevant, example-only, placeholder, masked, truncated, REDACTED or
