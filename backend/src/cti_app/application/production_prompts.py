@@ -9,15 +9,15 @@ from cti_app.domain.production import ExtractionProfile
 REFERENCES_PROMPT_VERSION = "5"
 # Q2 uses free-text GPT plus a stateless Markdown wire-format parser. The bridge does
 # not guarantee response_format / JSON Schema.
-# "14" / "7": Q2 analyses the live publication behind the exact canonical URL,
+# "15" / "8": Q2 analyses the live publication behind the exact canonical URL,
 # including its rendered tables, code and visible images. The local archive is
 # collection provenance and is never inlined in the prompt.
-EXTRACTION_PROMPT_VERSION = "14"
-IOC_RULES_PROMPT_VERSION = "7"
-# "6": the batch input is the compact list of exact source URLs. Only the
+EXTRACTION_PROMPT_VERSION = "15"
+IOC_RULES_PROMPT_VERSION = "8"
+# "7": the batch input is the compact list of exact source URLs. Only the
 # output stays marker-framed: a marker starts the next block; EOF closes the
 # final block.
-IOC_RULES_BATCH_PROMPT_VERSION = "6"
+IOC_RULES_BATCH_PROMPT_VERSION = "7"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -174,8 +174,9 @@ wire format:
         + """
 
 Rules:
-- The response is bound to this one source. Never repeat its URL, source id,
-  provenance, evidence quote, model run id, or other internal identifier.
+- The response is bound to this one source. Do not emit source ids, provenance,
+  evidence quotes, model run ids or other internal identifiers. Do not repeat
+  the input source URL merely as provenance.
 - Emit source-supported facts about malware, tools, files, TTPs, infrastructure,
   victims and campaign context only in non-empty FACT groups. FACT categories
   are exactly: actors, campaigns, malware, tools, infection_chain, ttps,
@@ -186,8 +187,9 @@ Rules:
   means contextual IOC.
 - The complete header is authoritative and self-contained. Do not rely on a
   previous header and do not repeat category, status or type on value lines.
-- Emit no source id, URL, provenance, evidence quote or model id. Emit only
-  values literally visible in this source.
+- Emit only values literally visible in this source. This restriction does not
+  apply to IOC values: extract URL indicators normally when they are actually
+  published by this source.
 - Use `:: short context` on FACT values only when useful, with whitespace on
   both sides of `::`. IOC value lines carry no annotation. Keep every IPv6
   literal intact.
@@ -228,15 +230,17 @@ wire format:
         + """
 
 Rules:
-- The response is bound to this one source. Never repeat its URL, source id,
-  provenance, evidence quote, model run id, or other internal identifier.
+- The response is bound to this one source. Do not emit source ids, provenance,
+  evidence quotes, model run ids or other internal identifiers. Do not repeat
+  the input source URL merely as provenance.
 - Emit only non-empty IOC and RULE groups. IOC types are exactly: domain, ip,
   url, email, md5, sha1, sha256, sha512, filename, filepath, cve. `confirmed`
   means confirmed IOC and `contextual` means contextual IOC.
 - The complete header is authoritative and self-contained. Do not rely on a
   previous header and do not repeat status or type on value lines.
-- Emit no source id, URL, provenance, evidence quote or model id. Emit only
-  values literally visible in this source.
+- Emit only values literally visible in this source. This restriction does not
+  apply to IOC values: extract URL indicators normally when they are actually
+  published by this source.
 - Never sacrifice IOC coverage to reduce cost. Perform an exhaustive IOC pass:
   IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/SHA512 and email addresses,
   including tables, appendices, images and code.
@@ -264,7 +268,8 @@ Rules:
 Open every exact source URL listed below.
 
 Analyse each publication itself. Inspect the complete accessible rendered
-source, including technical tables, code blocks, indicator lists and visible
+source, including technical tables, code blocks, indicator lists,
+appendices/annexes reachable from the publication and visible
 images/screenshots when available.
 
 Do not replace a source with unrelated search results and do not use another

@@ -55,7 +55,16 @@ def test_full_prompt_requires_compact_facts_iocs_and_rules() -> None:
     assert "https://source.example/report" in prompt
     assert "<ARCHIVED_SOURCE>" not in prompt
     assert "images/screenshots" in prompt
-    assert EXTRACTION_PROMPT_VERSION == "14"
+    one_line = " ".join(prompt.split())
+    assert "Do not repeat the input source URL merely as provenance." in one_line
+    assert (
+        "This restriction does not apply to IOC values: extract URL indicators normally "
+        "when they are actually published by this source."
+    ) in one_line
+    assert "Emit no source id, URL, provenance" not in one_line
+    assert "Never repeat its URL" not in one_line
+    assert "url, email, md5, sha1, sha256, sha512" in one_line
+    assert EXTRACTION_PROMPT_VERSION == "15"
     assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v5"
 
 
@@ -79,7 +88,16 @@ def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
     assert "https://source.example/report" in prompt
     assert "<ARCHIVED_SOURCE>" not in prompt
     assert "images/screenshots" in prompt
-    assert IOC_RULES_PROMPT_VERSION == "7"
+    one_line = " ".join(prompt.split())
+    assert "Do not repeat the input source URL merely as provenance." in one_line
+    assert (
+        "This restriction does not apply to IOC values: extract URL indicators normally "
+        "when they are actually published by this source."
+    ) in one_line
+    assert "Emit no source id, URL, provenance" not in one_line
+    assert "Never repeat its URL" not in one_line
+    assert "url, email, md5, sha1, sha256, sha512" in one_line
+    assert IOC_RULES_PROMPT_VERSION == "8"
 
 
 def test_ioc_group_parses_100_confirmed_iocs() -> None:

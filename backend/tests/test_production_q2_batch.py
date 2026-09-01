@@ -282,6 +282,7 @@ def test_batch_prompt_lists_exact_urls_and_frames_only_the_output() -> None:
     assert "@@Q2IN" not in prompt
     assert "Open every exact source URL" in prompt
     assert "images/screenshots" in prompt
+    assert "appendices/annexes reachable from the publication" in prompt
     assert "independently" in prompt
     prompt_on_one_line = " ".join(prompt.split())
     assert "Do not emit URLs, hashes" not in prompt_on_one_line
@@ -295,7 +296,7 @@ def test_batch_prompt_lists_exact_urls_and_frames_only_the_output() -> None:
         assert ioc_type in prompt
     assert " :: " not in prompt
     assert "S1" not in prompt
-    assert IOC_RULES_BATCH_PROMPT_VERSION == "6"
+    assert IOC_RULES_BATCH_PROMPT_VERSION == "7"
     assert production_q2_batch.Q2_BATCH_PARSER_VERSION == "q2-batch-v3"
 
 
