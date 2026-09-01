@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import date
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -16,6 +17,7 @@ from cti_app.application.model_gateway import (
     ModelGateway,
     ModelRequest,
     ModelRouter,
+    ModelRoutingHint,
     ModelSubmissionReconciliationRequiredError,
 )
 from cti_app.application.production_artifact_verification import (
@@ -35,6 +37,7 @@ from cti_app.application.production_prompts import (
     ProductionPromptTemplates,
 )
 from cti_app.application.production_source_evidence import (
+    SOURCE_EVIDENCE_VERSION,
     verify_ioc_rules_output_against_source,
 )
 from cti_app.application.production_workflow import (
@@ -43,7 +46,7 @@ from cti_app.application.production_workflow import (
     _source_extraction_verifier_identity,
 )
 from cti_app.domain.discovery import SourceRole
-from cti_app.domain.model_runs import ModelRole, ModelRunStatus
+from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
 from cti_app.domain.production import (
     ExtractionProfile,
     SourceExtraction,
@@ -852,6 +855,124 @@ async def test_cached_full_projection_is_gated_against_current_archived_source(
     assert result["status"] == "success", result
     assert gateway.calls == []
     assert sink.calls[-1]["canonical_json"]["items"] == []  # type: ignore[index]
+    assert "q2_source:S1:source_evidence_missing" in sink.calls[-1]["warnings"]  # type: ignore[operator]
+
+
+@pytest.mark.asyncio
+async def test_source_checkpoint_rebuilds_from_succeeded_model_run_under_current_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verifier bump reparses the durable ModelRun without a provider call."""
+    profile = ExtractionProfile.IOC_RULES
+    source_url = "https://example.test/source-1"
+    archived_text = "The exact archive contains present.security-lab.io only."
+    raw_response = (
+        "IOC confirmed domain\n"
+        "- present.security-lab.io\n"
+        "IOC confirmed domain\n"
+        "- absent.security-lab.io\n"
+    )
+    adapter = FakeModelAdapter(research_text=raw_response)
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    model_output_store = InMemoryModelOutputStore()
+    model_gateway = ModelGateway(
+        ModelRouter(
+            openai_research=adapter,
+            openai_structured=adapter,
+            qwen=adapter,
+            fake=adapter,
+        ),
+        model_uow,
+        model_output_store,
+    )
+    orchestrator, run, state, sink, _ = _batch_workflow(
+        monkeypatch,
+        1,
+        "",
+        gateway=model_gateway,  # type: ignore[arg-type]
+        archived_texts=[archived_text],
+    )
+
+    source = _source(1)
+    assert source.canonical_url == source_url
+    document = next(
+        document for document in state._docs_by_id.values() if document.final_url == source_url
+    )
+    source_content_sha256 = document.decoded_sha256
+    model_run_id = _source_extraction_model_run_id(
+        source_content_sha256=source_content_sha256,
+        profile=profile,
+    )
+    prompt = ProductionPromptTemplates.get_extraction_prompt(
+        "Subject",
+        source.local_id,
+        source.title,
+        source.canonical_url,
+        profile=profile,
+        archived_source_content=archived_text,
+    )
+    seeded = await model_gateway.execute(
+        ModelRequest(
+            text=prompt,
+            prompt_template_id="production-q2-url",
+            prompt_template_version=production_workflow.EXTRACTION_PROMPT_VERSION_BY_PROFILE[
+                profile
+            ],
+            evidence_pack_hash=hashlib.sha256(prompt.encode()).hexdigest(),
+            external_llm_allowed=True,
+            routing_hint=ModelRoutingHint.WEB_RESEARCH,
+            provider=ModelProvider.OPENAI,
+            web_search=True,
+            run_id=model_run_id,
+            allow_failed_resubmit=True,
+            metadata={
+                "source_id": source.local_id,
+                "source_url": source.canonical_url,
+                "profile": profile.value,
+                "source_content_sha256": source_content_sha256,
+                "extraction_contract_version": production_workflow.Q2_EXTRACTION_CONTRACT_VERSION,
+                "parser_version": production_workflow.Q2_MARKDOWN_PARSER_VERSION,
+                "verifier_version": production_workflow.ARTIFACT_VERIFIER_VERSION,
+            },
+        ),
+        ModelRole.RESEARCH,
+    )
+    assert seeded.run.id == model_run_id
+    assert seeded.run.status is ModelRunStatus.SUCCEEDED
+    assert state.extractions.rows == {}
+    adapter.calls.clear()
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", date(2026, 7, 10)),)),
+    )
+
+    assert result["status"] == "success", result
+    assert result["model_calls"] == 0
+    assert result["cache_hits"] == 0
+    assert adapter.calls == []
+
+    checkpoints = list(state.extractions.rows.values())
+    assert len(checkpoints) == 1
+    checkpoint = checkpoints[0]
+    assert checkpoint.status is SourceExtractionStatus.VERIFIED
+    assert checkpoint.source_content_sha256 == source_content_sha256
+    assert checkpoint.profile is profile
+    assert checkpoint.model_run_id == model_run_id
+    identity = orchestrator._source_extraction_identity(
+        source_content_sha256=source_content_sha256,
+        profile=profile,
+    )
+    assert checkpoint.verifier_version == identity["verifier_version"]
+    assert checkpoint.verifier_version == _source_extraction_verifier_identity(profile)
+    assert f"source-evidence-{SOURCE_EVIDENCE_VERSION}" in checkpoint.verifier_version
+
+    assert checkpoint.canonical_blob_id is not None
+    canonical_payload = orchestrator._artifact_store.payloads[  # type: ignore[union-attr]
+        checkpoint.canonical_blob_id
+    ]
+    assert [item["value"] for item in canonical_payload["artifacts"]] == ["present.security-lab.io"]
+    assert sink.calls[-1]["canonical_json"]["items"]  # type: ignore[index]
     assert "q2_source:S1:source_evidence_missing" in sink.calls[-1]["warnings"]  # type: ignore[operator]
 
 
