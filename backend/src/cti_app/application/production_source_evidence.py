@@ -16,7 +16,7 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.domain.publication import ArtifactType
 
-SOURCE_EVIDENCE_VERSION = "2"
+SOURCE_EVIDENCE_VERSION = "3"
 
 _NBSP = "\u00a0"
 _NARROW_NBSP = "\u202f"
@@ -80,6 +80,30 @@ def verify_ioc_rules_output_against_source(
     surviving proposal has its narrative fields cleared; the model's value or
     rule body is otherwise left untouched.
     """
+    return _verify_output_against_source(output, source_text, preserve_facts=False)
+
+
+def verify_q2_output_against_source(
+    output: Q2SourceOutput,
+    source_text: str,
+) -> SourceEvidenceResult:
+    """Gate archived Q2 output while preserving the FULL facts channel.
+
+    Facts are intentionally not source-gated: the archived source is the
+    model's input, but this deterministic gate only constrains artifacts and
+    detection rules.  Surviving artifacts and rules retain their exact value
+    or body while their model-supplied narrative fields are removed.
+    """
+    return _verify_output_against_source(output, source_text, preserve_facts=True)
+
+
+def _verify_output_against_source(
+    output: Q2SourceOutput,
+    source_text: str,
+    *,
+    preserve_facts: bool,
+) -> SourceEvidenceResult:
+    """Apply the shared artifact/rule source-local gate."""
     source_view = _artifact_comparison_view(source_text)
     rule_source_view = _rule_comparison_view(source_text)
     artifacts: list[Q2ArtifactProposal] = []
@@ -87,7 +111,7 @@ def verify_ioc_rules_output_against_source(
     warnings: list[str] = []
     rejections: list[SourceEvidenceRejection] = []
 
-    if output.facts:
+    if output.facts and not preserve_facts:
         warnings.append("fact_not_allowed")
 
     proposal_index = len(output.facts)
@@ -123,7 +147,7 @@ def verify_ioc_rules_output_against_source(
             )
 
     filtered = Q2SourceOutput(
-        facts=[],
+        facts=list(output.facts) if preserve_facts else [],
         artifacts=artifacts,
         rules=rules,
         uncertainties=list(output.uncertainties),

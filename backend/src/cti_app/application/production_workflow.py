@@ -90,7 +90,9 @@ from cti_app.application.production_q2_batch import (
 )
 from cti_app.application.production_source_evidence import (
     SOURCE_EVIDENCE_VERSION,
+    SourceEvidenceResult,
     verify_ioc_rules_output_against_source,
+    verify_q2_output_against_source,
 )
 from cti_app.application.production_stages import (
     ExtractionService,
@@ -171,6 +173,27 @@ _REVIEW_CODES = {
 
 _MODEL_SUBMISSION_RECONCILIATION_CODE = "model_submission_reconciliation_required"
 _SOURCE_CONTENT_CODES = frozenset({"source_content_invalid"})
+
+
+def _source_extraction_verifier_identity(profile: ExtractionProfile) -> str:
+    """Identify the deterministic verifier used by archived Q2 checkpoints."""
+    if profile in {ExtractionProfile.FULL, ExtractionProfile.IOC_RULES}:
+        return f"{ARTIFACT_VERIFIER_VERSION}+source-evidence-{SOURCE_EVIDENCE_VERSION}"
+    return ARTIFACT_VERIFIER_VERSION
+
+
+def _gate_archived_q2_output(
+    output: Any,
+    *,
+    source_text: str,
+    profile: ExtractionProfile,
+) -> SourceEvidenceResult:
+    """Apply the profile-specific source-local gate to archived output."""
+    if profile is ExtractionProfile.FULL:
+        return verify_q2_output_against_source(output, source_text)
+    if profile is ExtractionProfile.IOC_RULES:
+        return verify_ioc_rules_output_against_source(output, source_text)
+    raise ValueError(f"Unsupported extraction profile: {profile}")
 
 
 class _Q2FailureClass(StrEnum):
@@ -1402,7 +1425,7 @@ class ProductionWorkflowOrchestrator:
             "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
             "prompt_version": EXTRACTION_PROMPT_VERSION_BY_PROFILE[profile],
             "parser_version": Q2_MARKDOWN_PARSER_VERSION,
-            "verifier_version": ARTIFACT_VERIFIER_VERSION,
+            "verifier_version": _source_extraction_verifier_identity(profile),
         }
 
     async def _read_source_extraction_cache(
@@ -1410,12 +1433,13 @@ class ProductionWorkflowOrchestrator:
         *,
         plan: Q2SourcePlan,
         source_content_sha256: str | None,
+        archived_text: str | None = None,
         wait_for_running: bool = True,
-    ) -> tuple[Any | None, SourceExtraction | None, str]:
+    ) -> tuple[Any | None, SourceExtraction | None, str, tuple[str, ...]]:
         """Read a verified source checkpoint, including FULL -> IOC_RULES."""
         repository = getattr(self, "_uow_factory", None)
         if source_content_sha256 is None or self._artifact_store is None or repository is None:
-            return None, None, "unavailable"
+            return None, None, "unavailable", ()
 
         source_repository = None
         profiles = [plan.profile]
@@ -1434,7 +1458,7 @@ class ProductionWorkflowOrchestrator:
                 continue
             if row.status is SourceExtractionStatus.RUNNING:
                 if not wait_for_running:
-                    return None, row, "in_progress"
+                    return None, row, "in_progress", ()
                 for _ in range(150):
                     await asyncio.sleep(0.2)
                     async with self._uow_factory() as uow:
@@ -1448,7 +1472,7 @@ class ProductionWorkflowOrchestrator:
                     if row is None or row.status is not SourceExtractionStatus.RUNNING:
                         break
                 if row is not None and row.status is SourceExtractionStatus.RUNNING:
-                    return None, row, "in_progress"
+                    return None, row, "in_progress", ()
             if row is None or row.status is not SourceExtractionStatus.VERIFIED:
                 continue
             if row.canonical_blob_id is None:
@@ -1459,13 +1483,26 @@ class ProductionWorkflowOrchestrator:
                 )
             except Exception:
                 continue
+            cache_warnings: tuple[str, ...] = ()
+            if archived_text is not None:
+                evidence = _gate_archived_q2_output(
+                    output,
+                    source_text=archived_text,
+                    profile=plan.profile,
+                )
+                cache_warnings = (
+                    *evidence.warnings,
+                    *(rejection.reason_code for rejection in evidence.rejections),
+                )
+                output = evidence.output
             return (
                 project_q2_source_output(output, plan.profile),
                 row,
                 ("cached_full" if profile is ExtractionProfile.FULL else "cached_light"),
+                cache_warnings,
             )
 
-        return None, None, "miss"
+        return None, None, "miss", ()
 
     async def _claim_source_extraction(
         self,
@@ -1626,9 +1663,7 @@ class ProductionWorkflowOrchestrator:
         model_calls_avoided = 0
         # Each entry carries the batch, its ModelRun identity and the boundary
         # token derived from that identity, all decided before any prompt exists.
-        light_batches_by_first_source: dict[
-            str, tuple[tuple[Q2BatchSource, ...], UUID, str]
-        ] = {}
+        light_batches_by_first_source: dict[str, tuple[tuple[Q2BatchSource, ...], UUID, str]] = {}
         individual_source_ids: set[str] = set()
         batch_candidates: list[Q2BatchCandidate] = []
         pending: dict[str, _Q2SourceWork] = {}
@@ -1743,11 +1778,16 @@ class ProductionWorkflowOrchestrator:
                         cached_output,
                         cache_checkpoint,
                         cache_status,
+                        cache_warnings,
                     ) = await self._read_source_extraction_cache(
                         plan=plan,
                         source_content_sha256=source_content_sha256,
+                        archived_text=archived_text,
                     )
                     if cached_output is not None and cache_checkpoint is not None:
+                        warnings.extend(
+                            f"q2_source:{source.local_id}:{warning}" for warning in cache_warnings
+                        )
                         cache_hits += 1
                         model_calls_avoided += 1
                         submissions.append(
@@ -1891,15 +1931,42 @@ class ProductionWorkflowOrchestrator:
                 self._log_parse(run, "extraction", parsed)
                 if not parsed.usable or parsed.value is None:
                     raise _Q2SourceContentFailure("; ".join(parsed.errors) or "source_unavailable")
+                filtered_output = parsed.value
+                if archived_text is not None:
+                    evidence = _gate_archived_q2_output(
+                        parsed.value,
+                        source_text=archived_text,
+                        profile=plan.profile,
+                    )
+                    filtered_output = evidence.filtered_output
+                    warnings.extend(evidence.warnings)
+                    warnings.extend(
+                        f"q2_source:{source.local_id}:{rejection.reason_code}"
+                        for rejection in evidence.rejections
+                    )
+                    for rejection in evidence.rejections:
+                        self._diagnostics.record(
+                            event="q2.source.evidence_rejected",
+                            run_id=run.id,
+                            subject_id=run.subject_id,
+                            stage="extraction",
+                            correlation_id=self._correlation_id,
+                            source_id=source.local_id,
+                            source_content_sha256=source_content_sha256,
+                            profile=plan.profile.value,
+                            proposal_kind=rejection.proposal_kind,
+                            artifact_type=rejection.artifact_type,
+                            reason_code=rejection.reason_code,
+                        )
                 if cache_checkpoint is not None:
                     await self._complete_source_extraction(
                         cache_checkpoint,
                         raw=raw,
-                        output=parsed.value,
+                        output=filtered_output,
                     )
                 submissions.append(
                     Q2ProposalSubmission(
-                        output=parsed.value,
+                        output=filtered_output,
                         source_ids=(source.local_id,),
                         model_run_id=str(execution.run.id),
                     )
@@ -1909,7 +1976,7 @@ class ProductionWorkflowOrchestrator:
                     progress,
                     source,
                     status="succeeded",
-                    counts=_source_progress_counts(parsed.value, source.local_id),
+                    counts=_source_progress_counts(filtered_output, source.local_id),
                 )
                 await self._persist_extraction_progress(run.id, progress)
                 url_raw_parts.append(raw)
@@ -1925,9 +1992,9 @@ class ProductionWorkflowOrchestrator:
                     model_run_id=str(model_run_id),
                     profile=plan.profile.value,
                     answer_chars=len(raw),
-                    facts_count=len(parsed.value.facts),
-                    artifacts_count=len(parsed.value.artifacts),
-                    rules_count=len(parsed.value.rules),
+                    facts_count=len(filtered_output.facts),
+                    artifacts_count=len(filtered_output.artifacts),
+                    rules_count=len(filtered_output.rules),
                     duration_ms=int((time.monotonic() - started_at) * 1000),
                 )
                 return None
@@ -2315,9 +2382,11 @@ class ProductionWorkflowOrchestrator:
                 cached_output,
                 cache_checkpoint,
                 cache_status,
+                cache_warnings,
             ) = await self._read_source_extraction_cache(
                 plan=plan,
                 source_content_sha256=source_content_sha256,
+                archived_text=archived_text,
             )
             self._diagnostics.record(
                 event="q2.source.plan",
@@ -2334,6 +2403,9 @@ class ProductionWorkflowOrchestrator:
                 cache_status=cache_status,
             )
             if cache_status.startswith("cached_") and cached_output is not None:
+                warnings.extend(
+                    f"q2_source:{source.local_id}:{warning}" for warning in cache_warnings
+                )
                 cache_hits += 1
                 model_calls_avoided += 1
                 submissions.append(

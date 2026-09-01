@@ -40,6 +40,7 @@ from cti_app.application.production_source_evidence import (
 from cti_app.application.production_workflow import (
     _q2_batch_model_run_id,
     _source_extraction_model_run_id,
+    _source_extraction_verifier_identity,
 )
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import ModelRole, ModelRunStatus
@@ -323,6 +324,41 @@ def test_batch_identity_ignores_q1_parser_and_individual_ioc_rules_prompt(
     assert _q2_batch_model_run_id(source_content_sha256=hashes) == first
 
 
+def test_source_evidence_version_only_changes_source_checkpoint_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _source_extraction_verifier_identity(ExtractionProfile.FULL)
+    source_hash = "a" * 64
+    source_identity = (
+        production_workflow.ProductionWorkflowOrchestrator._source_extraction_identity(
+            source_content_sha256=source_hash,
+            profile=ExtractionProfile.FULL,
+        )
+    )
+    model_run_id = _source_extraction_model_run_id(
+        source_content_sha256=source_hash,
+        profile=ExtractionProfile.FULL,
+    )
+
+    monkeypatch.setattr(production_workflow, "SOURCE_EVIDENCE_VERSION", "next")
+
+    assert _source_extraction_verifier_identity(ExtractionProfile.FULL) != first
+    assert (
+        production_workflow.ProductionWorkflowOrchestrator._source_extraction_identity(
+            source_content_sha256=source_hash,
+            profile=ExtractionProfile.FULL,
+        )["verifier_version"]
+        != source_identity["verifier_version"]
+    )
+    assert (
+        _source_extraction_model_run_id(
+            source_content_sha256=source_hash,
+            profile=ExtractionProfile.FULL,
+        )
+        == model_run_id
+    )
+
+
 def test_batch_local_evidence_gate_rejects_cross_source_iocs_and_rules() -> None:
     output = Q2SourceOutput(
         artifacts=[
@@ -560,6 +596,64 @@ async def test_single_light_candidate_uses_individual_checkpoint_and_never_batch
 
 
 @pytest.mark.asyncio
+async def test_individual_archived_ioc_is_source_gated_before_checkpoint_and_canonical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator, run, _state, sink, gateway = _batch_workflow(
+        monkeypatch,
+        1,
+        "IOC confirmed domain\n- absent.example",
+        archived_texts=["The archive contains present.example only."],
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", date(2026, 7, 10)),)),
+    )
+
+    assert result["status"] == "success", result
+    assert len(gateway.calls) == 1
+    assert sink.calls[-1]["canonical_json"]["items"] == []  # type: ignore[index]
+    canonical_payload = next(
+        payload
+        for payload in orchestrator._artifact_store.payloads.values()  # type: ignore[union-attr]
+        if "artifacts" in payload
+    )
+    assert canonical_payload["artifacts"] == []
+    assert "q2_source:S1:source_evidence_missing" in sink.calls[-1]["warnings"]  # type: ignore[operator]
+
+
+@pytest.mark.asyncio
+async def test_individual_archived_full_preserves_facts_and_gates_iocs_and_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = (
+        "FACT malware\n- ExampleRAT\n"
+        "IOC confirmed domain\n- absent.example\n"
+        "RULE sigma: kept\n```sigma\n"
+        "title: Kept\nlogsource:\n  product: windows\n```\n"
+    )
+    orchestrator, run, _state, sink, gateway = _batch_workflow(
+        monkeypatch,
+        1,
+        response,
+        archived_texts=["ExampleRAT\ntitle: Kept\nlogsource:\n  product: windows"],
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/source-1", date(2026, 7, 10)),)),
+    )
+
+    assert result["status"] == "success", result
+    assert len(gateway.calls) == 1
+    canonical = sink.calls[-1]["canonical_json"]  # type: ignore[index]
+    assert [item["value"] for item in canonical["items"]] == ["ExampleRAT"]
+    assert len(canonical["rules"]) == 1
+    assert "q2_source:S1:source_evidence_missing" in sink.calls[-1]["warnings"]  # type: ignore[operator]
+
+
+@pytest.mark.asyncio
 async def test_light_source_over_batch_budget_uses_exact_archive_individually(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -666,6 +760,63 @@ async def test_cache_hit_is_removed_before_batch_partition(monkeypatch: pytest.M
     assert result["light_sources_batched"] == 2
     assert len(gateway.calls) == 1
     assert len(state.extractions.rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_cached_full_projection_is_gated_against_current_archived_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator, run, state, sink, gateway = _batch_workflow(
+        monkeypatch,
+        1,
+        "",
+        archived_texts=["present.example"],
+    )
+    source = _source(1)
+    document = next(
+        document for document in state._docs_by_id.values() if document.final_url == source.url
+    )
+    source_hash = document.decoded_sha256
+    identity = orchestrator._source_extraction_identity(
+        source_content_sha256=source_hash,
+        profile=ExtractionProfile.FULL,
+    )
+    canonical_blob_id = uuid4()
+    await state.extractions.save(
+        SourceExtraction(
+            canonical_url=source.canonical_url,
+            source_content_sha256=source_hash,
+            profile=ExtractionProfile.FULL,
+            contract_version=identity["contract_version"],
+            prompt_version=identity["prompt_version"],
+            parser_version=identity["parser_version"],
+            verifier_version=identity["verifier_version"],
+            status=SourceExtractionStatus.VERIFIED,
+            canonical_blob_id=canonical_blob_id,
+            model_run_id=uuid4(),
+        )
+    )
+    orchestrator._artifact_store.payloads[canonical_blob_id] = q2_source_output_to_json(
+        Q2SourceOutput(
+            artifacts=[
+                Q2ArtifactProposal(
+                    value="absent.example",
+                    artifact_type="domain",
+                    indicator_status="confirmed_ioc",
+                )
+            ]
+        )
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", date(2026, 7, 10)),)),
+    )
+
+    assert result["status"] == "success", result
+    assert gateway.calls == []
+    assert sink.calls[-1]["canonical_json"]["items"] == []  # type: ignore[index]
+    assert "q2_source:S1:source_evidence_missing" in sink.calls[-1]["warnings"]  # type: ignore[operator]
 
 
 @pytest.mark.asyncio

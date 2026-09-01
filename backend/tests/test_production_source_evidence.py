@@ -9,6 +9,7 @@ from cti_app.application.production_parsers import (
 from cti_app.application.production_source_evidence import (
     SOURCE_EVIDENCE_VERSION,
     verify_ioc_rules_output_against_source,
+    verify_q2_output_against_source,
 )
 
 
@@ -29,11 +30,36 @@ def test_version_and_ioc_from_same_source_are_kept_with_value_only() -> None:
 
     result = verify_ioc_rules_output_against_source(output, "The domain is evil.com.")
 
-    assert SOURCE_EVIDENCE_VERSION == "2"
+    assert SOURCE_EVIDENCE_VERSION == "3"
     assert result.output.artifacts[0].value == "evil[.]com"
     assert result.output.artifacts[0].context == ""
     assert result.output.artifacts[0].evidence_quote == ""
     assert result.rejections == ()
+
+
+def test_full_gate_preserves_facts_but_filters_artifacts_and_rules() -> None:
+    fact = Q2FactProposal(category="malware", value="ExampleRAT", context="context")
+    output = Q2SourceOutput(
+        facts=[fact],
+        artifacts=[_artifact("missing.example", "domain")],
+        rules=[
+            Q2RuleProposal(
+                rule_type="sigma",
+                name="kept",
+                body="title: Kept\nlogsource:\n  product: windows",
+            )
+        ],
+    )
+
+    result = verify_q2_output_against_source(
+        output,
+        "ExampleRAT\ntitle: Kept\nlogsource:\n  product: windows",
+    )
+
+    assert result.output.facts == [fact]
+    assert result.output.artifacts == []
+    assert len(result.output.rules) == 1
+    assert result.rejections[0].reason_code == "source_evidence_missing"
 
 
 def test_ioc_present_only_in_another_source_is_rejected() -> None:

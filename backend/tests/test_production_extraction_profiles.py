@@ -410,8 +410,7 @@ class _CacheGateway:
         self.source_ids.append(str(source_id))
         return SimpleNamespace(
             output_text=(
-                "# FACTS\n\n## malware\n- ExampleRAT :: observed\n"
-                "# IOCS\n\n## confirmed\ndomain:\n- c2.example.org\n"
+                "FACT malware\n- ExampleRAT :: observed\nIOC confirmed domain\n- c2.example.org\n"
             ),
             run=SimpleNamespace(
                 id=run_id,
@@ -664,7 +663,7 @@ async def test_retry_uses_source_cache_for_s1_to_s10_and_calls_only_s11(
         return report
 
     orchestrator._load_reference_report = load_report
-    snapshot = _snapshot((_input_source(urls[0], date(2026, 7, 10)),))
+    snapshot = _snapshot(tuple(_input_source(url, date(2026, 7, 10)) for url in urls))
     first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
     missing_document_id = next(
         document_id for document_id, document in docs.items() if document.final_url == urls[-1]

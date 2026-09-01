@@ -61,27 +61,25 @@ def test_q2_rule_parser_preserves_multiline_bodies_and_rule_type_authority() -> 
         "title: Sigma: {quoted}\nlogsource:\n  product: windows\n"
         'detection:\n  selection:\n    CommandLine|contains: "x:y"\n  condition: selection'
     )
-    text = f"""# RULES
-
-## yara: ExampleRule
+    text = f"""RULE yara: ExampleRule
 
 ```text
 {yara_body}
 ```
 
-## sigma: SigmaExample
+RULE sigma: SigmaExample
 
 ```yaml
 {sigma_body}
 ```
 
-## suricata: alert-example
+RULE suricata: alert-example
 
 ```suricata
 alert http any any -> any any (msg:"x:y {{q}}"; content:"abc"; sid:1;)
 ```
 
-## snort: alert-snort
+RULE snort: alert-snort
 
 ```snort
 alert tcp any any -> any 443 (msg:"snort: {{quoted}}"; sid:2;)
@@ -103,9 +101,7 @@ alert tcp any any -> any 443 (msg:"snort: {{quoted}}"; sid:2;)
 
 def test_q2_truncated_rule_is_warned_and_not_promoted() -> None:
     result = parse_q2_proposals_markdown(
-        """# RULES
-
-## yara: Truncated
+        """RULE yara: Truncated
 
 ```yara
 rule Truncated {
@@ -114,9 +110,9 @@ rule Truncated {
 """
     )
 
-    assert result.usable, result.errors
-    assert result.value is not None
-    assert result.value.rules == []
+    assert not result.usable
+    assert result.errors == ["q2_no_payload"]
+    assert result.value is None
     assert "rule_truncated_not_promoted" in result.warnings
 
 
