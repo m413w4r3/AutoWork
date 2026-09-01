@@ -84,8 +84,7 @@ from cti_app.application.production_q2_batch import (
     make_q2_batch,
     parse_q2_batch_response,
     partition_q2_batch_candidates,
-    q2_batch_boundary_collides,
-    q2_batch_boundary_token,
+    q2_batch_framing_collides,
     q2_batch_model_run_id,
 )
 from cti_app.application.production_source_evidence import (
@@ -1661,9 +1660,9 @@ class ProductionWorkflowOrchestrator:
         light_sources_batched = 0
         cache_hits = 0
         model_calls_avoided = 0
-        # Each entry carries the batch, its ModelRun identity and the boundary
-        # token derived from that identity, all decided before any prompt exists.
-        light_batches_by_first_source: dict[str, tuple[tuple[Q2BatchSource, ...], UUID, str]] = {}
+        # Each entry carries the batch and its ModelRun identity, all decided
+        # before any prompt exists.
+        light_batches_by_first_source: dict[str, tuple[tuple[Q2BatchSource, ...], UUID]] = {}
         individual_source_ids: set[str] = set()
         batch_candidates: list[Q2BatchCandidate] = []
         pending: dict[str, _Q2SourceWork] = {}
@@ -2097,7 +2096,6 @@ class ProductionWorkflowOrchestrator:
             batch_sources: tuple[Q2BatchSource, ...],
             *,
             model_run_id: UUID,
-            boundary_token: str,
         ) -> dict[str, Any] | None:
             nonlocal light_calls, light_batches, light_sources_batched
             batch = make_q2_batch(tuple(item.candidate for item in batch_sources))
@@ -2108,12 +2106,8 @@ class ProductionWorkflowOrchestrator:
                 item.batch_id for item in batch_sources
             ):
                 raise _Q2ControlFailure("Batch source mapping is not deterministic")
-            # The identity and its boundary token are decided before the prompt
-            # exists: the prompt embeds the token, so the reverse order would
-            # make the ModelRun id depend on itself.
             prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
                 [(item.batch_id, item.archived_text) for item in batch_sources],
-                boundary_token=boundary_token,
             )
             light_calls += 1
             light_batches += 1
@@ -2203,9 +2197,7 @@ class ProductionWorkflowOrchestrator:
                 if not raw.strip():
                     raise _Q2ControlFailure("Provider returned no Q2 response")
                 url_raw_parts.append(raw)
-                parsed = parse_q2_batch_response(
-                    raw, batch.source_mapping, boundary_token=boundary_token
-                )
+                parsed = parse_q2_batch_response(raw, batch.source_mapping)
                 self._diagnostics.record(
                     event="q2.batch.parsed",
                     run_id=run.id,
@@ -2505,15 +2497,14 @@ class ProductionWorkflowOrchestrator:
                     item.source_content_sha256 for item in local_batch.sources
                 )
             )
-            boundary_token = q2_batch_boundary_token(batch_run_id)
-            if q2_batch_boundary_collides(
-                boundary_token,
+            if q2_batch_framing_collides(
+                tuple(item.batch_id for item in local_batch.sources),
                 tuple(item.archived_text for item in local_batch.sources),
             ):
                 # An archive is never rewritten and an ambiguous framing is never
                 # chosen: these sources go back to the individual path instead.
                 self._diagnostics.record(
-                    event="q2.batch.boundary_collision",
+                    event="q2.batch.framing_collision",
                     run_id=run.id,
                     subject_id=run.subject_id,
                     stage="extraction",
@@ -2521,14 +2512,13 @@ class ProductionWorkflowOrchestrator:
                     batch_model_run_id=str(batch_run_id),
                     source_ids=[item.source.local_id for item in local_batch.sources],
                 )
-                warnings.append("q2_batch_boundary_collision")
+                warnings.append("q2_batch_framing_collision")
                 for item in local_batch.sources:
                     individual_source_ids.add(item.source.local_id)
                 continue
             light_batches_by_first_source[local_batch.sources[0].source.local_id] = (
                 local_batch.sources,
                 batch_run_id,
-                boundary_token,
             )
 
         handled_source_ids = set(completed)
@@ -2537,11 +2527,10 @@ class ProductionWorkflowOrchestrator:
                 continue
             prepared_batch = light_batches_by_first_source.get(source.local_id)
             if prepared_batch is not None:
-                batch_sources, batch_run_id, boundary_token = prepared_batch
+                batch_sources, batch_run_id = prepared_batch
                 early_result = await execute_batch(
                     batch_sources,
                     model_run_id=batch_run_id,
-                    boundary_token=boundary_token,
                 )
                 if early_result is not None:
                     return early_result

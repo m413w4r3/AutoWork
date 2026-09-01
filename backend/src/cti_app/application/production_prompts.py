@@ -15,10 +15,9 @@ REFERENCES_PROMPT_VERSION = "5"
 # live-URL-only prompt are never reused under the same identity.
 EXTRACTION_PROMPT_VERSION = "13"
 IOC_RULES_PROMPT_VERSION = "6"
-# "3": the batch wire format frames every input and every output section with
-# deterministic per-batch boundary markers instead of ``SOURCE B#`` headers, so
-# block boundaries no longer depend on Markdown fence state.
-IOC_RULES_BATCH_PROMPT_VERSION = "3"
+# "4": the batch wire format uses minimal deterministic Q2/Q2IN markers. A
+# marker starts the next block; EOF closes the final block.
+IOC_RULES_BATCH_PROMPT_VERSION = "4"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -66,30 +65,23 @@ EMPTY
 
 UNAVAILABLE"""
 
-# Batch boundary markers. The token is derived per batch from its ModelRun
-# identity and is checked to be absent from every archived input, so these
-# markers can never be confused with document or rule content. Both templates
-# are the single source of truth shared with the batch parser.
-Q2_BATCH_OUTPUT_MARKER = "@@Q2:{token}:{batch_id}:{kind}@@"
-Q2_BATCH_INPUT_MARKER = "@@Q2IN:{token}:{batch_id}:{kind}@@"
+# Batch framing markers. The exact markers for a batch are rendered from the
+# actual source list below; there is no static B1/B2/B3 example to extrapolate.
+Q2_BATCH_OUTPUT_MARKER = "@@Q2:{batch_id}@@"
+Q2_BATCH_INPUT_MARKER = "@@Q2IN:{batch_id}@@"
 
-_Q2_IOC_RULES_BATCH_WIRE_FORMAT = """@@Q2:{boundary_token}:B1:BEGIN@@
-IOC <confirmed|contextual> <type>
+_Q2_IOC_RULES_BATCH_BODY_FORMAT = """IOC <confirmed|contextual> <type>
 - <value>
 
 RULE <yara|sigma|suricata|snort>[: <visible name>]
 ```<language>
 <literal body>
 ```
-@@Q2:{boundary_token}:B1:END@@
 
-@@Q2:{boundary_token}:B2:BEGIN@@
+Or, when applicable, return exactly one of these terminal responses:
 EMPTY
-@@Q2:{boundary_token}:B2:END@@
 
-@@Q2:{boundary_token}:B3:BEGIN@@
-UNAVAILABLE
-@@Q2:{boundary_token}:B3:END@@"""
+UNAVAILABLE"""
 
 
 class ProductionPromptTemplates:
@@ -271,19 +263,20 @@ Rules:
     IOC_RULES_BATCH_EXTRACTION_MARKDOWN_V1 = (
         """You are performing an IOC and detection-rule extraction over several independent CTI documents.
 
-Each input framed by its own @@Q2IN:...:BEGIN@@ and @@Q2IN:...:END@@ markers is
-a separate document. Treat every document independently and process all
-documents.
+Each input starts on its own line with a marker matching @@Q2IN:B<number>@@.
+The next input marker terminates the previous input, and EOF terminates the
+last input. Treat every document independently and process all documents.
 
-Never use B2 to interpret or classify B1. Never move an IOC or rule between
-documents. Emit no FACT and no narrative context. Produce a compact response.
+Never use one document to interpret or classify another. Never move an IOC or
+rule between documents. Emit no FACT and no narrative context. Produce a compact response.
 The only provenance labels you may emit are the local B# labels carried by the
 markers shown in the output format. Do not emit Q1 ids, URLs, hashes, model ids
 or other internal identifiers.
 
-For every document, emit exactly one section framed by its own
-@@Q2:...:B#:BEGIN@@ and @@Q2:...:B#:END@@ markers, copied exactly, each alone on
-its line. Always close a section you opened, even when its extraction failed.
+For every document listed in Inputs, emit exactly one output section. Start each
+section with its exact marker from the output structure below, alone on its line.
+The next output marker terminates the previous section and EOF terminates the
+last section. Do not emit a terminating marker.
 Use EMPTY only after analysing that document and finding no IOC or rule. Use
 UNAVAILABLE only when that document was not analysed. Do not let one document's
 failure suppress the other documents.
@@ -293,17 +286,20 @@ Sigma, Suricata or Snort rule. Preserve rule syntax, visible line breaks and
 visible names. Never invent, repair, refang, reformat, flatten, merge or
 transform a rule. Put partial rules in no RULE block.
 
-Output format, with one independent section per input:
+Output body grammar, shared by every section:
 
 """
-        + _Q2_IOC_RULES_BATCH_WIRE_FORMAT
+        + _Q2_IOC_RULES_BATCH_BODY_FORMAT
         + """
 
 IOC types are exactly domain, ip, url, email, md5, sha1, sha256, sha512,
 filename, filepath and cve. Mark each IOC confirmed or contextual. Do not add
-annotations to value lines. The rule fence is mandatory. Never place a boundary
-marker inside a rule fence, and never emit a boundary marker that is not one of
-the section markers listed above.
+annotations to value lines. The rule fence is mandatory. The framing is
+structural and takes precedence over Markdown fences. Never emit a Q2 output
+marker that is not one of the section markers listed below.
+
+Output structure for this batch, with one independent section per input:
+{batch_output_structure}
 
 Inputs:
 {batch_sources}
@@ -467,33 +463,22 @@ Archived source content:
     def get_ioc_rules_batch_prompt(
         cls,
         batch_sources: Sequence[tuple[str, str]],
-        *,
-        boundary_token: str,
     ) -> str:
-        """Render an archive-only IOC_RULES batch using local B# labels.
-
-        ``boundary_token`` is the caller's per-batch token, already checked to be
-        absent from every archived capture inlined here.
-        """
-        if not boundary_token:
-            raise ValueError("A Q2 batch prompt requires a boundary token")
+        """Render an archive-only IOC_RULES batch using local B# labels."""
         blocks = "\n\n".join(
-            "{begin}\n{text}\n{end}".format(
-                begin=Q2_BATCH_INPUT_MARKER.format(
-                    token=boundary_token, batch_id=batch_id, kind="BEGIN"
-                ),
-                text=archived_text,
-                end=Q2_BATCH_INPUT_MARKER.format(
-                    token=boundary_token, batch_id=batch_id, kind="END"
-                ),
-            )
+            f"{Q2_BATCH_INPUT_MARKER.format(batch_id=batch_id)}\n{archived_text}"
             for batch_id, archived_text in batch_sources
         )
         if not blocks.strip():
             raise ValueError("A Q2 batch prompt requires at least one source")
+        output_structure = "\n\n".join(
+            f"{Q2_BATCH_OUTPUT_MARKER.format(batch_id=batch_id)}\n"
+            "<source-local IOC/rule output, EMPTY or UNAVAILABLE>"
+            for batch_id, _ in batch_sources
+        )
         return cls.IOC_RULES_BATCH_EXTRACTION_MARKDOWN_V1.format(
             batch_sources=blocks,
-            boundary_token=boundary_token,
+            batch_output_structure=output_structure,
         )
 
     _REFERENCES_STRUCTURE = """# REFERENCES

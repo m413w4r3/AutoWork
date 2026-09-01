@@ -87,18 +87,14 @@ def _candidate(index: int, text: str = "archived") -> production_q2_batch.Q2Batc
     )
 
 
-_TOKEN = "0123456789abcdef" * 2
+def _block(batch_id: str, body: str) -> str:
+    marker = production_q2_batch.q2_batch_output_marker(batch_id)
+    return f"{marker}\n{body}"
 
 
-def _block(batch_id: str, body: str, *, token: str = _TOKEN) -> str:
-    begin, end = production_q2_batch.q2_batch_output_markers(token, batch_id)
-    return f"{begin}\n{body}\n{end}"
-
-
-def _batch_response(*source_outputs: str, token: str = _TOKEN) -> str:
+def _batch_response(*source_outputs: str) -> str:
     return "\n\n".join(
-        _block(f"B{index}", output, token=token)
-        for index, output in enumerate(source_outputs, start=1)
+        _block(f"B{index}", output) for index, output in enumerate(source_outputs, start=1)
     )
 
 
@@ -131,7 +127,6 @@ def test_batch_parser_reads_expected_markers_and_terminal_states() -> None:
             "UNAVAILABLE",
         ),
         batch.sources,
-        boundary_token=_TOKEN,
     )
     assert parsed.usable
     assert parsed.warnings == ()
@@ -140,6 +135,30 @@ def test_batch_parser_reads_expected_markers_and_terminal_states() -> None:
     assert parsed.sources[0].output.artifacts[0].value == "evil.example"
     assert parsed.sources[1].output == Q2SourceOutput()
     assert parsed.sources[2].error_code == "batch_source_unavailable"
+
+
+def test_batch_parser_accepts_lowercase_markers_and_terminal_states_case_insensitively() -> None:
+    batch = production_q2_batch.make_q2_batch(tuple(_candidate(index) for index in (1, 2)))
+    parsed = production_q2_batch.parse_q2_batch_response(
+        "  @@q2:b01@@  \n eMpTy \n\t@@Q2:B2@@\n UnAvAiLaBlE \n",
+        batch.sources,
+    )
+
+    assert parsed.usable
+    assert [item.batch_id for item in parsed.sources] == ["B1", "B2"]
+    assert parsed.sources[0].output == Q2SourceOutput()
+    assert parsed.sources[1].error_code == "batch_source_unavailable"
+
+
+def test_empty_expected_block_is_invalid() -> None:
+    batch = production_q2_batch.make_q2_batch(tuple(_candidate(index) for index in (1, 2)))
+    parsed = production_q2_batch.parse_q2_batch_response(
+        "@@Q2:B1@@\n\n@@Q2:B2@@\nEMPTY", batch.sources
+    )
+
+    assert parsed.usable
+    assert parsed.sources[0].error_code == "batch_source_invalid"
+    assert parsed.sources[1].output == Q2SourceOutput()
 
 
 def test_batch_parser_reports_missing_duplicate_and_unknown_sources() -> None:
@@ -151,9 +170,7 @@ def test_batch_parser_reports_missing_duplicate_and_unknown_sources() -> None:
             _block("B9", "EMPTY"),
         )
     )
-    parsed = production_q2_batch.parse_q2_batch_response(
-        response, batch.sources, boundary_token=_TOKEN
-    )
+    parsed = production_q2_batch.parse_q2_batch_response(response, batch.sources)
 
     assert parsed.usable
     assert parsed.warnings.count("batch_source_unknown") == 1
@@ -164,9 +181,22 @@ def test_batch_parser_reports_missing_duplicate_and_unknown_sources() -> None:
     assert by_id["B3"].error_code == "batch_source_missing"
 
 
-def test_batch_parser_keeps_a_missing_end_marker_source_local() -> None:
+def test_unknown_marker_content_is_not_attributed_to_an_expected_source() -> None:
     batch = production_q2_batch.make_q2_batch(tuple(_candidate(index) for index in (1, 2)))
-    begin, _ = production_q2_batch.q2_batch_output_markers(_TOKEN, "B1")
+    parsed = production_q2_batch.parse_q2_batch_response(
+        "@@Q2:B9@@\nIOC confirmed domain\n- unknown.example\n@@Q2:B2@@\nEMPTY",
+        batch.sources,
+    )
+
+    assert parsed.usable
+    assert parsed.warnings.count("batch_source_unknown") == 1
+    assert parsed.sources[0].error_code == "batch_source_missing"
+    assert parsed.sources[1].output == Q2SourceOutput()
+
+
+def test_next_marker_closes_previous_source_and_eof_closes_last_source() -> None:
+    batch = production_q2_batch.make_q2_batch(tuple(_candidate(index) for index in (1, 2)))
+    begin = production_q2_batch.q2_batch_output_marker("B1")
     response = "\n".join(
         (
             begin,
@@ -174,13 +204,12 @@ def test_batch_parser_keeps_a_missing_end_marker_source_local() -> None:
             _block("B2", "IOC confirmed domain\n- b2.example"),
         )
     )
-    parsed = production_q2_batch.parse_q2_batch_response(
-        response, batch.sources, boundary_token=_TOKEN
-    )
+    parsed = production_q2_batch.parse_q2_batch_response(response, batch.sources)
 
     assert parsed.usable
-    assert parsed.sources[0].error_code == "batch_source_unterminated"
-    assert parsed.sources[0].output is None
+    assert parsed.sources[0].status == "succeeded"
+    assert parsed.sources[0].output is not None
+    assert parsed.sources[0].output.artifacts[0].value == "b1.example"
     assert parsed.sources[1].status == "succeeded"
     assert parsed.sources[1].output is not None
     assert parsed.sources[1].output.artifacts[0].value == "b2.example"
@@ -188,7 +217,7 @@ def test_batch_parser_keeps_a_missing_end_marker_source_local() -> None:
 
 def test_unclosed_rule_fence_in_first_block_still_recovers_the_next_block() -> None:
     batch = production_q2_batch.make_q2_batch(tuple(_candidate(index) for index in (1, 2)))
-    begin, _ = production_q2_batch.q2_batch_output_markers(_TOKEN, "B1")
+    begin = production_q2_batch.q2_batch_output_marker("B1")
     response = "\n".join(
         (
             begin,
@@ -200,13 +229,11 @@ def test_unclosed_rule_fence_in_first_block_still_recovers_the_next_block() -> N
             _block("B2", "IOC confirmed domain\n- b2.example"),
         )
     )
-    parsed = production_q2_batch.parse_q2_batch_response(
-        response, batch.sources, boundary_token=_TOKEN
-    )
+    parsed = production_q2_batch.parse_q2_batch_response(response, batch.sources)
 
     assert parsed.usable
     assert parsed.sources[0].status == "failed"
-    assert parsed.sources[0].error_code == "batch_source_unterminated"
+    assert parsed.sources[0].error_code == "batch_source_invalid"
     assert parsed.sources[1].status == "succeeded"
     assert parsed.sources[1].output is not None
     assert parsed.sources[1].output.artifacts[0].value == "b2.example"
@@ -228,7 +255,6 @@ rule embedded {
             "IOC confirmed domain\n- b2.example",
         ),
         batch.sources,
-        boundary_token=_TOKEN,
     )
     assert parsed.usable
     assert len(parsed.sources[0].output.rules) == 1  # type: ignore[union-attr]
@@ -245,7 +271,6 @@ def test_source_header_text_inside_a_rule_has_no_structural_meaning() -> None:
             "EMPTY",
         ),
         batch.sources,
-        boundary_token=_TOKEN,
     )
     assert parsed.usable
     first = parsed.sources[0].output
@@ -255,40 +280,54 @@ def test_source_header_text_inside_a_rule_has_no_structural_meaning() -> None:
     assert parsed.sources[1].output == Q2SourceOutput()
 
 
-def test_boundary_token_is_deterministic_and_collision_is_detected() -> None:
-    hashes = ("a" * 64, "b" * 64)
-    run_id = _q2_batch_model_run_id(source_content_sha256=hashes)
-    token = production_q2_batch.q2_batch_boundary_token(run_id)
-    assert token == production_q2_batch.q2_batch_boundary_token(run_id)
-    assert len(token) == production_q2_batch.Q2_BATCH_BOUNDARY_TOKEN_CHARS
-    assert token != production_q2_batch.q2_batch_boundary_token(
-        _q2_batch_model_run_id(source_content_sha256=hashes[::-1])
+def test_batch_framing_markers_are_exact_and_collisions_use_whole_markers() -> None:
+    batch_ids = ("B1", "B2")
+    assert production_q2_batch.q2_batch_framing_markers(batch_ids) == (
+        "@@Q2:B1@@",
+        "@@Q2:B2@@",
+        "@@Q2IN:B1@@",
+        "@@Q2IN:B2@@",
     )
-    assert not production_q2_batch.q2_batch_boundary_collides(token, ("archived text",))
-    assert production_q2_batch.q2_batch_boundary_collides(
-        token, ("archived text", f"leaked {token} marker")
+    assert not production_q2_batch.q2_batch_framing_collides(
+        batch_ids, ("archive mentions B1 and Q2",)
+    )
+    assert production_q2_batch.q2_batch_framing_collides(
+        batch_ids, ("archive contains @@Q2IN:B2@@ exactly",)
     )
 
 
-def test_batch_prompt_is_archive_only_and_frames_inputs_with_boundary_markers() -> None:
+def test_batch_prompt_is_archive_only_and_frames_inputs_with_minimal_markers() -> None:
     prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
-        [("B1", "exact archive one"), ("B2", "exact archive two")],
-        boundary_token=_TOKEN,
+        [("B1", "exact archive one"), ("B2", "exact archive two")]
     )
     for batch_id, text in (("B1", "exact archive one"), ("B2", "exact archive two")):
-        begin, end = production_q2_batch.q2_batch_input_markers(_TOKEN, batch_id)
-        assert f"{begin}\n{text}\n{end}" in prompt
-    for batch_id in ("B1", "B2", "B3"):
-        begin, end = production_q2_batch.q2_batch_output_markers(_TOKEN, batch_id)
-        assert begin in prompt
-        assert end in prompt
+        marker = production_q2_batch.q2_batch_input_marker(batch_id)
+        assert f"{marker}\n{text}" in prompt
+        assert f"{marker}\n{text}\n@@" not in prompt
+        output_marker = production_q2_batch.q2_batch_output_marker(batch_id)
+        assert prompt.count(output_marker) == 1
+    assert "@@Q2:B3@@" not in prompt
+    assert "0123456789abcdef" not in prompt
     assert "SOURCE B" not in prompt
     assert "Q2_SOURCE" not in prompt
     assert "S1" not in prompt
     assert " :: " not in prompt
     assert "independently" in prompt
-    assert IOC_RULES_BATCH_PROMPT_VERSION == "3"
-    assert production_q2_batch.Q2_BATCH_PARSER_VERSION == "q2-batch-v2"
+    assert IOC_RULES_BATCH_PROMPT_VERSION == "4"
+    assert production_q2_batch.Q2_BATCH_PARSER_VERSION == "q2-batch-v3"
+
+
+def test_batch_prompt_renders_exactly_the_real_eight_source_output_structure() -> None:
+    prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
+        [(f"B{index}", f"exact archive {index}") for index in range(1, 9)]
+    )
+
+    for index in range(1, 9):
+        assert prompt.count(f"@@Q2:B{index}@@") == 1
+        assert prompt.count(f"@@Q2IN:B{index}@@") == 1
+    assert "@@Q2:B9@@" not in prompt
+    assert "BEGIN" not in prompt
+    assert ":END@@" not in prompt
 
 
 def test_batch_model_run_id_is_content_order_and_version_addressed(
@@ -439,9 +478,6 @@ def _batch_workflow(
     gateway: _BatchGateway | None = None,
     archived_texts: list[str] | None = None,
 ) -> tuple[object, SubjectProductionRun, _CacheState, _ExtractionSink, _BatchGateway]:
-    # The real token is derived from the batch identity; pinning it lets a test
-    # write the response the model is asked for without recomputing the digest.
-    monkeypatch.setattr(production_workflow, "q2_batch_boundary_token", lambda _run_id: _TOKEN)
     subject = uuid4()
     blobs = _ArchivedBlobs()
     documents: dict[UUID, SimpleNamespace] = {}
@@ -543,7 +579,7 @@ async def test_batch_partial_source_failure_keeps_safe_sources_and_marks_coverag
 
 
 @pytest.mark.asyncio
-async def test_boundary_token_colliding_with_an_archive_falls_back_to_individual_path(
+async def test_batch_marker_colliding_with_an_archive_falls_back_to_individual_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway = _BatchGateway(
@@ -558,7 +594,7 @@ async def test_boundary_token_colliding_with_an_archive_falls_back_to_individual
         "",
         gateway=gateway,
         archived_texts=[
-            f"domain-1.security-lab.io leaked marker {_TOKEN}",
+            "domain-1.security-lab.io leaked marker @@Q2:B1@@",
             "domain-2.security-lab.io",
         ],
     )
