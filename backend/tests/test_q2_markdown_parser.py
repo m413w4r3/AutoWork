@@ -41,7 +41,6 @@ def test_full_prompt_requires_compact_facts_iocs_and_rules() -> None:
         source_title="Source",
         source_url="https://source.example/report",
         profile=ExtractionProfile.FULL,
-        archived_source_content="archived source",
     )
 
     assert "FACT <category>" in prompt
@@ -53,7 +52,10 @@ def test_full_prompt_requires_compact_facts_iocs_and_rules() -> None:
     assert "indicator-status" not in prompt
     assert "<literal body>\n```\n\nUNCERTAINTIES" in prompt
     assert prompt.count("Perform an exhaustive IOC pass:") == 1
-    assert EXTRACTION_PROMPT_VERSION == "13"
+    assert "https://source.example/report" in prompt
+    assert "<ARCHIVED_SOURCE>" not in prompt
+    assert "images/screenshots" in prompt
+    assert EXTRACTION_PROMPT_VERSION == "14"
     assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v5"
 
 
@@ -63,7 +65,6 @@ def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
         source_title="Source",
         source_url="https://source.example/report",
         profile=ExtractionProfile.IOC_RULES,
-        archived_source_content="archived source",
     )
 
     assert "IOC <confirmed|contextual> <type>" in prompt
@@ -75,7 +76,10 @@ def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
     assert "narrative" in prompt
     assert "<literal body>\n```\n\nUNCERTAINTIES" in prompt
     assert prompt.count("Perform an exhaustive IOC pass:") == 1
-    assert IOC_RULES_PROMPT_VERSION == "6"
+    assert "https://source.example/report" in prompt
+    assert "<ARCHIVED_SOURCE>" not in prompt
+    assert "images/screenshots" in prompt
+    assert IOC_RULES_PROMPT_VERSION == "7"
 
 
 def test_ioc_group_parses_100_confirmed_iocs() -> None:

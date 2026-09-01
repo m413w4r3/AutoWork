@@ -1,21 +1,19 @@
-"""Batching primitives for archived IOC_RULES Q2 extraction.
+"""Batching primitives for URL-only IOC_RULES Q2 extraction.
 
 The objects in this module deliberately carry the Q1 source only as local
-orchestration state.  The model-facing identifier is the per-batch ``B#``
-label; no Q1 source id is put in the batch wire format.
+orchestration state.  The model-facing identifiers are the exact canonical URL
+and the per-batch ``B#`` label; no Q1 source id is put in the batch wire format.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from cti_app.application.production_artifact_verification import ARTIFACT_VERIFIER_VERSION
 from cti_app.application.production_parsers import (
-    Q2_EXTRACTION_CONTRACT_VERSION,
     Q2_MARKDOWN_PARSER_VERSION,
     ParsedSource,
     Q2SourceOutput,
@@ -23,37 +21,38 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.application.production_prompts import (
     IOC_RULES_BATCH_PROMPT_VERSION,
-    Q2_BATCH_INPUT_MARKER,
     Q2_BATCH_OUTPUT_MARKER,
 )
-from cti_app.application.production_source_evidence import SOURCE_EVIDENCE_VERSION
 from cti_app.domain.model_runs import ModelProvider
 
-MAX_Q2_BATCH_ARCHIVED_CHARS = 70_000
 MAX_Q2_BATCH_SOURCES = 8
 # "q2-batch-v3": source blocks are delimited by minimal Q2 markers. The
 # framing scanner is intentionally independent from Markdown fence state, so a
 # malformed rule fence in one block can no longer swallow the next block.
 Q2_BATCH_PARSER_VERSION = "q2-batch-v3"
 
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_HTTP_URL = re.compile(r"^https?://\S+$", re.IGNORECASE)
 _BATCH_ID = re.compile(r"^B(?P<number>[0-9]+)$", re.IGNORECASE)
 _Q2_BATCH_MARKER = re.compile(r"^\s*@@Q2:B(?P<number>[0-9]+)@@\s*$", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
 class Q2BatchCandidate:
-    """One exact archived source eligible for IOC_RULES batching."""
+    """One Q1 source eligible for IOC_RULES batching.
+
+    Eligibility is decided by the source itself: the batch sends the exact
+    canonical URL, so an HTTP(S) URL is the only content requirement.
+    """
 
     source: ParsedSource
-    archived_text: str
-    source_content_sha256: str
 
     def __post_init__(self) -> None:
-        if not _SHA256.fullmatch(self.source_content_sha256):
-            raise ValueError("source_content_sha256 must be a lowercase SHA-256")
-        if not self.archived_text:
-            raise ValueError("archived_text must not be empty")
+        if not _HTTP_URL.fullmatch(self.source.canonical_url or ""):
+            raise ValueError("A batch candidate needs an HTTP(S) canonical URL")
+
+    @property
+    def canonical_url(self) -> str:
+        return self.source.canonical_url
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,12 +67,8 @@ class Q2BatchSource:
         return self.candidate.source
 
     @property
-    def archived_text(self) -> str:
-        return self.candidate.archived_text
-
-    @property
-    def source_content_sha256(self) -> str:
-        return self.candidate.source_content_sha256
+    def canonical_url(self) -> str:
+        return self.candidate.canonical_url
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,8 +82,8 @@ class Q2Batch:
         return {item.batch_id: item.source for item in self.sources}
 
     @property
-    def archived_chars(self) -> int:
-        return sum(len(item.archived_text) for item in self.sources)
+    def canonical_urls(self) -> tuple[str, ...]:
+        return tuple(item.canonical_url for item in self.sources)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,24 +119,15 @@ class Q2BatchParseResult:
 def partition_q2_batch_candidates(
     candidates: Sequence[Q2BatchCandidate],
 ) -> tuple[tuple[Q2BatchCandidate, ...], ...]:
-    """Greedily partition candidates without truncating any source."""
+    """Partition candidates in ReferenceReport order, never dropping one."""
 
     batches: list[tuple[Q2BatchCandidate, ...]] = []
     current: list[Q2BatchCandidate] = []
-    current_chars = 0
     for candidate in candidates:
-        candidate_chars = len(candidate.archived_text)
-        if candidate_chars > MAX_Q2_BATCH_ARCHIVED_CHARS:
-            raise ValueError("A batch candidate exceeds the batch character budget")
-        if current and (
-            len(current) >= MAX_Q2_BATCH_SOURCES
-            or current_chars + candidate_chars > MAX_Q2_BATCH_ARCHIVED_CHARS
-        ):
+        if len(current) >= MAX_Q2_BATCH_SOURCES:
             batches.append(tuple(current))
             current = []
-            current_chars = 0
         current.append(candidate)
-        current_chars += candidate_chars
     if current:
         batches.append(tuple(current))
     return tuple(batches)
@@ -152,8 +138,6 @@ def make_q2_batch(candidates: Sequence[Q2BatchCandidate]) -> Q2Batch:
 
     if not 2 <= len(candidates) <= MAX_Q2_BATCH_SOURCES:
         raise ValueError("A Q2 batch must contain between 2 and 8 sources")
-    if sum(len(candidate.archived_text) for candidate in candidates) > MAX_Q2_BATCH_ARCHIVED_CHARS:
-        raise ValueError("Q2 batch exceeds the archived character budget")
     return Q2Batch(
         sources=tuple(
             Q2BatchSource(batch_id=f"B{index}", candidate=candidate)
@@ -164,33 +148,33 @@ def make_q2_batch(candidates: Sequence[Q2BatchCandidate]) -> Q2Batch:
 
 def q2_batch_model_run_id(
     *,
-    source_content_sha256: Sequence[str],
+    production_run_id: UUID,
+    pipeline_generation: int,
+    canonical_urls: Sequence[str],
     routing_policy_version: str,
     provider: ModelProvider = ModelProvider.OPENAI,
-    extraction_contract_version: str | None = None,
     ioc_rules_batch_prompt_version: str | None = None,
     q2_markdown_parser_version: str | None = None,
     q2_batch_parser_version: str | None = None,
-    source_evidence_version: str | None = None,
-    artifact_verifier_version: str | None = None,
 ) -> UUID:
-    """Return a content/version-addressed identity for one exact Q2 batch.
+    """Return the identity of one exact batch of web readings, scoped to a run.
 
-    Only versions that can change what this batch actually does belong here.
-    The Q1 ``PARSER_VERSION`` and the single-source ``IOC_RULES_PROMPT_VERSION``
-    are deliberately excluded: neither changes the batch prompt, the batch wire
-    format or the batch parser, so neither may invalidate a reusable batch.
+    A Q2 batch reads live publications, so it is not a pure function of any
+    content we hold: the identity is scoped to the production run that decided
+    the work.  A retry of the same run reuses the same ModelRun; a new
+    production reads the web again.  Versions that cannot change what this
+    batch does — the Q1 parser, the single-source prompt, the archive-only
+    source-evidence and SourceExtraction versions — are deliberately excluded.
     """
 
-    hashes = tuple(source_content_sha256)
-    if not hashes or any(not _SHA256.fullmatch(value) for value in hashes):
-        raise ValueError("source_content_sha256 must contain lowercase SHA-256 values")
+    urls = tuple(canonical_urls)
+    if not urls or any(not _HTTP_URL.fullmatch(url or "") for url in urls):
+        raise ValueError("canonical_urls must contain HTTP(S) URLs")
     identity = json.dumps(
         {
-            "ordered_source_content_sha256": hashes,
-            "q2_extraction_contract_version": (
-                extraction_contract_version or Q2_EXTRACTION_CONTRACT_VERSION
-            ),
+            "production_run_id": str(production_run_id),
+            "pipeline_generation": pipeline_generation,
+            "ordered_canonical_urls": urls,
             "ioc_rules_batch_prompt_version": (
                 ioc_rules_batch_prompt_version or IOC_RULES_BATCH_PROMPT_VERSION
             ),
@@ -198,8 +182,6 @@ def q2_batch_model_run_id(
                 q2_markdown_parser_version or Q2_MARKDOWN_PARSER_VERSION
             ),
             "q2_batch_parser_version": q2_batch_parser_version or Q2_BATCH_PARSER_VERSION,
-            "source_evidence_version": source_evidence_version or SOURCE_EVIDENCE_VERSION,
-            "artifact_verifier_version": artifact_verifier_version or ARTIFACT_VERIFIER_VERSION,
             "q2_routing_policy_version": routing_policy_version,
             "provider": provider.value,
         },
@@ -220,28 +202,6 @@ def q2_batch_output_marker(batch_id: str) -> str:
     """Return the exact output marker for one normalized local batch id."""
 
     return Q2_BATCH_OUTPUT_MARKER.format(batch_id=_normalize_batch_id(batch_id))
-
-
-def q2_batch_input_marker(batch_id: str) -> str:
-    """Return the exact input marker for one normalized local batch id."""
-
-    return Q2_BATCH_INPUT_MARKER.format(batch_id=_normalize_batch_id(batch_id))
-
-
-def q2_batch_framing_markers(batch_ids: Iterable[str]) -> tuple[str, ...]:
-    """Return every exact Q2/Q2IN marker that structures a batch."""
-
-    normalized_ids = tuple(_normalize_batch_id(batch_id) for batch_id in batch_ids)
-    return tuple(q2_batch_output_marker(batch_id) for batch_id in normalized_ids) + tuple(
-        q2_batch_input_marker(batch_id) for batch_id in normalized_ids
-    )
-
-
-def q2_batch_framing_collides(batch_ids: Iterable[str], archived_texts: Iterable[str]) -> bool:
-    """Report whether an archive already contains an exact batch marker."""
-
-    markers = q2_batch_framing_markers(batch_ids)
-    return any(marker in text for text in archived_texts for marker in markers)
 
 
 def _split_batch_blocks(text: str) -> tuple[list[tuple[str, str]], list[str]]:
@@ -397,7 +357,6 @@ def parse_q2_batch_response(
 
 
 __all__ = [
-    "MAX_Q2_BATCH_ARCHIVED_CHARS",
     "MAX_Q2_BATCH_SOURCES",
     "Q2_BATCH_PARSER_VERSION",
     "Q2Batch",
@@ -408,9 +367,6 @@ __all__ = [
     "make_q2_batch",
     "parse_q2_batch_response",
     "partition_q2_batch_candidates",
-    "q2_batch_framing_collides",
-    "q2_batch_framing_markers",
-    "q2_batch_input_marker",
     "q2_batch_model_run_id",
     "q2_batch_output_marker",
 ]

@@ -9,15 +9,15 @@ from cti_app.domain.production import ExtractionProfile
 REFERENCES_PROMPT_VERSION = "5"
 # Q2 uses free-text GPT plus a stateless Markdown wire-format parser. The bridge does
 # not guarantee response_format / JSON Schema.
-# "13" / "6": Q2 analyses the archived capture inlined in the prompt whenever
-# one is available, so a result cached under a content hash is really produced
-# from that content. Versions bumped so checkpoints written by the previous,
-# live-URL-only prompt are never reused under the same identity.
-EXTRACTION_PROMPT_VERSION = "13"
-IOC_RULES_PROMPT_VERSION = "6"
-# "4": the batch wire format uses minimal deterministic Q2/Q2IN markers. A
-# marker starts the next block; EOF closes the final block.
-IOC_RULES_BATCH_PROMPT_VERSION = "4"
+# "14" / "7": Q2 analyses the live publication behind the exact canonical URL,
+# including its rendered tables, code and visible images. The local archive is
+# collection provenance and is never inlined in the prompt.
+EXTRACTION_PROMPT_VERSION = "14"
+IOC_RULES_PROMPT_VERSION = "7"
+# "5": the batch input is the compact list of exact source URLs. Only the
+# output stays marker-framed: a marker starts the next block; EOF closes the
+# final block.
+IOC_RULES_BATCH_PROMPT_VERSION = "5"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -33,7 +33,6 @@ _Q2_WIRE_FORMAT = """FACT <category>
 
 IOC <confirmed|contextual> <type>
 - <value>
-- <value> :: <short context>
 
 RULE <yara|sigma|suricata|snort>[: <visible name>]
 ```<language>
@@ -50,7 +49,6 @@ UNAVAILABLE"""
 
 _Q2_IOC_RULES_WIRE_FORMAT = """IOC <confirmed|contextual> <type>
 - <value>
-- <value> :: <short context>
 
 RULE <yara|sigma|suricata|snort>[: <visible name>]
 ```<language>
@@ -65,10 +63,10 @@ EMPTY
 
 UNAVAILABLE"""
 
-# Batch framing markers. The exact markers for a batch are rendered from the
-# actual source list below; there is no static B1/B2/B3 example to extrapolate.
+# Batch output framing marker. The exact markers for a batch are rendered from
+# the actual source list below; there is no static B1/B2/B3 example to
+# extrapolate. The input side needs no framing: it is a list of exact URLs.
 Q2_BATCH_OUTPUT_MARKER = "@@Q2:{batch_id}@@"
-Q2_BATCH_INPUT_MARKER = "@@Q2IN:{batch_id}@@"
 
 _Q2_IOC_RULES_BATCH_BODY_FORMAT = """IOC <confirmed|contextual> <type>
 - <value>
@@ -190,8 +188,9 @@ Rules:
   previous header and do not repeat category, status or type on value lines.
 - Emit no source id, URL, provenance, evidence quote or model id. Emit only
   values literally visible in this source.
-- Use `:: short context` only when useful, with whitespace on both sides of
-  `::`. Keep every IPv6 literal intact.
+- Use `:: short context` on FACT values only when useful, with whitespace on
+  both sides of `::`. IOC value lines carry no annotation. Keep every IPv6
+  literal intact.
 - Perform an exhaustive IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/
   SHA512 and email addresses, including tables, appendices, images and code.
   Omit irrelevant, example-only, placeholder, masked, truncated, REDACTED or
@@ -244,8 +243,7 @@ Rules:
   Omit irrelevant, example-only, placeholder, masked, truncated, REDACTED or
   FUZZ values; never reconstruct hidden values. Emit only source-supported
   indicators and meaningful uncertainties.
-- Use `:: short context` only when useful, with whitespace on both sides of
-  `::`. Keep every IPv6 literal intact.
+- IOC value lines carry no annotation. Keep every IPv6 literal intact.
 - Put complete literal detection rules visible in this source only in RULE. The
   fence is mandatory.
   Preserve the complete literal body, syntax, visible line breaks and visible
@@ -261,25 +259,33 @@ Rules:
     )
 
     IOC_RULES_BATCH_EXTRACTION_MARKDOWN_V1 = (
-        """You are performing an IOC and detection-rule extraction over several independent CTI documents.
+        """You are performing an IOC and detection-rule extraction over several independent CTI publications.
 
-Each input starts on its own line with a marker matching @@Q2IN:B<number>@@.
-The next input marker terminates the previous input, and EOF terminates the
-last input. Treat every document independently and process all documents.
+Open every exact source URL listed below.
 
-Never use one document to interpret or classify another. Never move an IOC or
-rule between documents. Emit no FACT and no narrative context. Produce a compact response.
-The only provenance labels you may emit are the local B# labels carried by the
-markers shown in the output format. Do not emit Q1 ids, URLs, hashes, model ids
-or other internal identifiers.
+Analyse each publication itself. Inspect the complete accessible rendered
+source, including technical tables, code blocks, indicator lists and visible
+images/screenshots when available.
 
-For every document listed in Inputs, emit exactly one output section. Start each
-section with its exact marker from the output structure below, alone on its line.
-The next output marker terminates the previous section and EOF terminates the
-last section. Do not emit a terminating marker.
-Use EMPTY only after analysing that document and finding no IOC or rule. Use
-UNAVAILABLE only when that document was not analysed. Do not let one document's
-failure suppress the other documents.
+Do not replace a source with unrelated search results and do not use another
+publication as evidence for that B#.
+
+Treat every B# independently.
+
+For every B#, emit exactly one output section beginning with its exact
+@@Q2:B#@@ marker, alone on its line. The next output marker terminates the
+previous section and EOF terminates the last section. Do not emit a terminating
+marker.
+
+Never use one publication to interpret or classify another. Never move an IOC or
+rule between publications. Emit no FACT and no narrative context. Produce a
+compact response. The only provenance labels you may emit are the local B#
+labels carried by the output markers. Do not emit URLs, hashes, model ids or
+other internal identifiers.
+
+Use EMPTY only after analysing that publication and finding no IOC or rule. Use
+UNAVAILABLE only when that publication could not be analysed. Do not let one
+failure suppress the other sources.
 
 Extract every source-supported literal IOC and every complete literal YARA,
 Sigma, Suricata or Snort rule. Preserve rule syntax, visible line breaks and
@@ -298,10 +304,10 @@ annotations to value lines. The rule fence is mandatory. The framing is
 structural and takes precedence over Markdown fences. Never emit a Q2 output
 marker that is not one of the section markers listed below.
 
-Output structure for this batch, with one independent section per input:
+Output structure for this batch, with one independent section per source:
 {batch_output_structure}
 
-Inputs:
+Sources:
 {batch_sources}
 """
     )
@@ -397,37 +403,17 @@ functional description. Return only French prose.
             supporting_sources=supporting_sources_text or "- None supplied.",
         )
 
-    # No archived capture is usable: the model has to open the live page, and
-    # the result stays subject-local (never content-addressed), because what it
-    # actually read cannot be tied to any content hash we hold.
+    # Q2 analyses the live publication behind the exact canonical URL. The local
+    # archive is a collection snapshot and is never inlined here: its derived
+    # text does not represent what the rendered publication actually shows.
     LIVE_SOURCE_ACCESS_V1 = """Open this exact source:
 {source_url}
 
 Analyse the source itself. Read the complete accessible page; inspect technical
-tables, code blocks and visible images/screenshots when available. Do not
-replace it with unrelated search results or use memory as evidence. If the
-exact source cannot be accessed, return `UNAVAILABLE` alone and do not invent
-an extraction."""
-
-    # The archived capture is the analysed document, so the extraction really is
-    # a function of the content hash it is cached under.
-    ARCHIVED_SOURCE_ACCESS_V1 = """Source URL (context and provenance only):
-{source_url}
-
-The archived capture of this exact source is reproduced below, between the
-`<ARCHIVED_SOURCE>` markers. That archived content is the document to analyse:
-read it completely, including technical tables, code blocks, appendices/annexes
-and indicator lists. Do not replace it with the current live page, unrelated
-search results, or memory. Web access may only help you interpret what the
-archived content already contains; never add a fact, indicator or rule that is
-absent from it. If the archived content is unusable, return `UNAVAILABLE` alone
-and do not invent an extraction.
-
-Archived source content:
-
-<ARCHIVED_SOURCE>
-{archived_source_content}
-</ARCHIVED_SOURCE>"""
+tables, code blocks, appendices/annexes reachable from the publication and
+visible images/screenshots when available. Do not replace it with unrelated
+search results or use memory as evidence. If the exact source cannot be
+accessed, return `UNAVAILABLE` alone and do not invent an extraction."""
 
     @classmethod
     def get_extraction_prompt(
@@ -437,7 +423,6 @@ Archived source content:
         source_title: str = "",
         source_url: str = "",
         profile: ExtractionProfile = ExtractionProfile.FULL,
-        archived_source_content: str | None = None,
     ) -> str:
         del subject_title, source_id
         template = (
@@ -445,18 +430,10 @@ Archived source content:
             if profile is ExtractionProfile.FULL
             else cls.IOC_RULES_EXTRACTION_MARKDOWN_V1
         )
-        source_access = (
-            cls.LIVE_SOURCE_ACCESS_V1.format(source_url=source_url)
-            if archived_source_content is None
-            else cls.ARCHIVED_SOURCE_ACCESS_V1.format(
-                source_url=source_url,
-                archived_source_content=archived_source_content,
-            )
-        )
         return template.format(
             source_title=source_title,
             source_url=source_url,
-            source_access=source_access,
+            source_access=cls.LIVE_SOURCE_ACCESS_V1.format(source_url=source_url),
         )
 
     @classmethod
@@ -464,11 +441,8 @@ Archived source content:
         cls,
         batch_sources: Sequence[tuple[str, str]],
     ) -> str:
-        """Render an archive-only IOC_RULES batch using local B# labels."""
-        blocks = "\n\n".join(
-            f"{Q2_BATCH_INPUT_MARKER.format(batch_id=batch_id)}\n{archived_text}"
-            for batch_id, archived_text in batch_sources
-        )
+        """Render a URL-only IOC_RULES batch using local B# labels."""
+        blocks = "\n".join(f"{batch_id} {source_url}" for batch_id, source_url in batch_sources)
         if not blocks.strip():
             raise ValueError("A Q2 batch prompt requires at least one source")
         output_structure = "\n\n".join(
