@@ -6,7 +6,12 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application import production_q2_batch, production_workflow
+from cti_app.application import (
+    production_parsers,
+    production_prompts,
+    production_q2_batch,
+    production_workflow,
+)
 from cti_app.application.model_gateway import (
     ModelGateway,
     ModelRequest,
@@ -81,9 +86,18 @@ def _candidate(index: int, text: str = "archived") -> production_q2_batch.Q2Batc
     )
 
 
-def _batch_response(*source_outputs: str) -> str:
+_TOKEN = "0123456789abcdef" * 2
+
+
+def _block(batch_id: str, body: str, *, token: str = _TOKEN) -> str:
+    begin, end = production_q2_batch.q2_batch_output_markers(token, batch_id)
+    return f"{begin}\n{body}\n{end}"
+
+
+def _batch_response(*source_outputs: str, token: str = _TOKEN) -> str:
     return "\n\n".join(
-        f"SOURCE B{index}\n{output}" for index, output in enumerate(source_outputs, start=1)
+        _block(f"B{index}", output, token=token)
+        for index, output in enumerate(source_outputs, start=1)
     )
 
 
@@ -107,45 +121,97 @@ def test_batch_candidate_over_budget_is_not_silently_truncated() -> None:
         production_q2_batch.partition_q2_batch_candidates((oversized,))
 
 
-def test_batch_parser_handles_terminal_states_missing_duplicates_unknowns_and_fences() -> None:
+def test_batch_parser_reads_expected_markers_and_terminal_states() -> None:
     batch = production_q2_batch.make_q2_batch(tuple(_candidate(index) for index in range(1, 4)))
-    response = """SOURCE B1
-RULE yara: embedded
-```yara
-rule embedded {
-  strings:
-    $x = "SOURCE B2"
-  condition:
-    $x
-}
-```
-SOURCE B1
-EMPTY
-SOURCE B9
-EMPTY
-"""
-    parsed = production_q2_batch.parse_q2_batch_response(response, batch.sources)
+    parsed = production_q2_batch.parse_q2_batch_response(
+        _batch_response(
+            "IOC confirmed domain\n- evil.example",
+            "EMPTY",
+            "UNAVAILABLE",
+        ),
+        batch.sources,
+        boundary_token=_TOKEN,
+    )
+    assert parsed.usable
+    assert parsed.warnings == ()
+    assert [item.status for item in parsed.sources] == ["succeeded", "succeeded", "failed"]
+    assert parsed.sources[0].output is not None
+    assert parsed.sources[0].output.artifacts[0].value == "evil.example"
+    assert parsed.sources[1].output == Q2SourceOutput()
+    assert parsed.sources[2].error_code == "batch_source_unavailable"
+
+
+def test_batch_parser_reports_missing_duplicate_and_unknown_sources() -> None:
+    batch = production_q2_batch.make_q2_batch(tuple(_candidate(index) for index in range(1, 4)))
+    response = "\n".join(
+        (
+            _block("B1", "EMPTY"),
+            _block("B1", "IOC confirmed domain\n- evil.example"),
+            _block("B9", "EMPTY"),
+        )
+    )
+    parsed = production_q2_batch.parse_q2_batch_response(
+        response, batch.sources, boundary_token=_TOKEN
+    )
 
     assert parsed.usable
     assert parsed.warnings.count("batch_source_unknown") == 1
     by_id = {item.batch_id: item for item in parsed.sources}
     assert by_id["B1"].error_code == "batch_source_duplicate"
+    assert by_id["B1"].output is None
     assert by_id["B2"].error_code == "batch_source_missing"
     assert by_id["B3"].error_code == "batch_source_missing"
 
-    terminals = production_q2_batch.parse_q2_batch_response(
-        "SOURCE B1\nEMPTY\nSOURCE B2\nUNAVAILABLE\nSOURCE B3\nEMPTY",
-        batch.sources,
+
+def test_batch_parser_keeps_a_missing_end_marker_source_local() -> None:
+    batch = production_q2_batch.make_q2_batch(tuple(_candidate(index) for index in (1, 2)))
+    begin, _ = production_q2_batch.q2_batch_output_markers(_TOKEN, "B1")
+    response = "\n".join(
+        (
+            begin,
+            "IOC confirmed domain\n- b1.example",
+            _block("B2", "IOC confirmed domain\n- b2.example"),
+        )
     )
-    assert [item.status for item in terminals.sources] == [
-        "succeeded",
-        "failed",
-        "succeeded",
-    ]
-    assert terminals.sources[1].error_code == "batch_source_unavailable"
+    parsed = production_q2_batch.parse_q2_batch_response(
+        response, batch.sources, boundary_token=_TOKEN
+    )
+
+    assert parsed.usable
+    assert parsed.sources[0].error_code == "batch_source_unterminated"
+    assert parsed.sources[0].output is None
+    assert parsed.sources[1].status == "succeeded"
+    assert parsed.sources[1].output is not None
+    assert parsed.sources[1].output.artifacts[0].value == "b2.example"
 
 
-def test_batch_parser_does_not_split_source_header_inside_rule_fence() -> None:
+def test_unclosed_rule_fence_in_first_block_still_recovers_the_next_block() -> None:
+    batch = production_q2_batch.make_q2_batch(tuple(_candidate(index) for index in (1, 2)))
+    begin, _ = production_q2_batch.q2_batch_output_markers(_TOKEN, "B1")
+    response = "\n".join(
+        (
+            begin,
+            "RULE yara: broken",
+            "```yara",
+            "rule broken {",
+            "  condition:",
+            "    true",
+            _block("B2", "IOC confirmed domain\n- b2.example"),
+        )
+    )
+    parsed = production_q2_batch.parse_q2_batch_response(
+        response, batch.sources, boundary_token=_TOKEN
+    )
+
+    assert parsed.usable
+    assert parsed.sources[0].status == "failed"
+    assert parsed.sources[0].error_code == "batch_source_unterminated"
+    assert parsed.sources[1].status == "succeeded"
+    assert parsed.sources[1].output is not None
+    assert parsed.sources[1].output.artifacts[0].value == "b2.example"
+
+
+def test_closed_rule_fence_is_parsed_and_next_block_is_independent() -> None:
     batch = production_q2_batch.make_q2_batch(tuple(_candidate(index) for index in (1, 2)))
     parsed = production_q2_batch.parse_q2_batch_response(
         _batch_response(
@@ -158,26 +224,70 @@ rule embedded {
     $x
 }
 ```""",
-            "EMPTY",
+            "IOC confirmed domain\n- b2.example",
         ),
         batch.sources,
+        boundary_token=_TOKEN,
     )
     assert parsed.usable
     assert len(parsed.sources[0].output.rules) == 1  # type: ignore[union-attr]
     assert parsed.sources[1].output is not None
+    assert parsed.sources[1].output.artifacts[0].value == "b2.example"
 
 
-def test_batch_prompt_is_archive_only_and_uses_only_batch_ids() -> None:
-    prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
-        [("B1", "exact archive one"), ("B2", "exact archive two")]
+def test_source_header_text_inside_a_rule_has_no_structural_meaning() -> None:
+    batch = production_q2_batch.make_q2_batch(tuple(_candidate(index) for index in (1, 2)))
+    parsed = production_q2_batch.parse_q2_batch_response(
+        _batch_response(
+            'RULE yara: embedded\n```yara\nrule embedded {\n  strings:\n    $x = "SOURCE B2"\n'
+            "  condition:\n    $x\n}\n```\nSOURCE B2\nIOC confirmed domain\n- still-b1.example",
+            "EMPTY",
+        ),
+        batch.sources,
+        boundary_token=_TOKEN,
     )
-    assert "<Q2_SOURCE B1>\nexact archive one\n</Q2_SOURCE>" in prompt
-    assert "<Q2_SOURCE B2>\nexact archive two\n</Q2_SOURCE>" in prompt
+    assert parsed.usable
+    first = parsed.sources[0].output
+    assert first is not None
+    # The bare header text stays inside B1: it split nothing.
+    assert [artifact.value for artifact in first.artifacts] == ["still-b1.example"]
+    assert parsed.sources[1].output == Q2SourceOutput()
+
+
+def test_boundary_token_is_deterministic_and_collision_is_detected() -> None:
+    hashes = ("a" * 64, "b" * 64)
+    run_id = _q2_batch_model_run_id(source_content_sha256=hashes)
+    token = production_q2_batch.q2_batch_boundary_token(run_id)
+    assert token == production_q2_batch.q2_batch_boundary_token(run_id)
+    assert len(token) == production_q2_batch.Q2_BATCH_BOUNDARY_TOKEN_CHARS
+    assert token != production_q2_batch.q2_batch_boundary_token(
+        _q2_batch_model_run_id(source_content_sha256=hashes[::-1])
+    )
+    assert not production_q2_batch.q2_batch_boundary_collides(token, ("archived text",))
+    assert production_q2_batch.q2_batch_boundary_collides(
+        token, ("archived text", f"leaked {token} marker")
+    )
+
+
+def test_batch_prompt_is_archive_only_and_frames_inputs_with_boundary_markers() -> None:
+    prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
+        [("B1", "exact archive one"), ("B2", "exact archive two")],
+        boundary_token=_TOKEN,
+    )
+    for batch_id, text in (("B1", "exact archive one"), ("B2", "exact archive two")):
+        begin, end = production_q2_batch.q2_batch_input_markers(_TOKEN, batch_id)
+        assert f"{begin}\n{text}\n{end}" in prompt
+    for batch_id in ("B1", "B2", "B3"):
+        begin, end = production_q2_batch.q2_batch_output_markers(_TOKEN, batch_id)
+        assert begin in prompt
+        assert end in prompt
+    assert "SOURCE B" not in prompt
+    assert "Q2_SOURCE" not in prompt
     assert "S1" not in prompt
     assert " :: " not in prompt
     assert "independently" in prompt
-    assert "<literal body>\n```\n\nSOURCE B2" in prompt
-    assert IOC_RULES_BATCH_PROMPT_VERSION == "2"
+    assert IOC_RULES_BATCH_PROMPT_VERSION == "3"
+    assert production_q2_batch.Q2_BATCH_PARSER_VERSION == "q2-batch-v2"
 
 
 def test_batch_model_run_id_is_content_order_and_version_addressed(
@@ -188,8 +298,29 @@ def test_batch_model_run_id_is_content_order_and_version_addressed(
     assert first == _q2_batch_model_run_id(source_content_sha256=hashes)
     assert first != _q2_batch_model_run_id(source_content_sha256=hashes[::-1])
     assert first != _q2_batch_model_run_id(source_content_sha256=("a" * 64, "c" * 64))
-    monkeypatch.setattr(production_workflow, "Q2_BATCH_PARSER_VERSION", "next")
-    assert first != _q2_batch_model_run_id(source_content_sha256=hashes)
+    for name in (
+        "Q2_EXTRACTION_CONTRACT_VERSION",
+        "IOC_RULES_BATCH_PROMPT_VERSION",
+        "Q2_MARKDOWN_PARSER_VERSION",
+        "Q2_BATCH_PARSER_VERSION",
+        "SOURCE_EVIDENCE_VERSION",
+        "ARTIFACT_VERIFIER_VERSION",
+        "Q2_ROUTING_POLICY_VERSION",
+    ):
+        with monkeypatch.context() as patched:
+            patched.setattr(production_workflow, name, "next")
+            assert first != _q2_batch_model_run_id(source_content_sha256=hashes), name
+
+
+def test_batch_identity_ignores_q1_parser_and_individual_ioc_rules_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hashes = ("a" * 64, "b" * 64)
+    first = _q2_batch_model_run_id(source_content_sha256=hashes)
+    monkeypatch.setattr(production_workflow, "PARSER_VERSION", "q1-next")
+    monkeypatch.setattr(production_parsers, "PARSER_VERSION", "q1-next")
+    monkeypatch.setattr(production_prompts, "IOC_RULES_PROMPT_VERSION", "999")
+    assert _q2_batch_model_run_id(source_content_sha256=hashes) == first
 
 
 def test_batch_local_evidence_gate_rejects_cross_source_iocs_and_rules() -> None:
@@ -272,6 +403,9 @@ def _batch_workflow(
     gateway: _BatchGateway | None = None,
     archived_texts: list[str] | None = None,
 ) -> tuple[object, SubjectProductionRun, _CacheState, _ExtractionSink, _BatchGateway]:
+    # The real token is derived from the batch identity; pinning it lets a test
+    # write the response the model is asked for without recomputing the digest.
+    monkeypatch.setattr(production_workflow, "q2_batch_boundary_token", lambda _run_id: _TOKEN)
     subject = uuid4()
     blobs = _ArchivedBlobs()
     documents: dict[UUID, SimpleNamespace] = {}
@@ -370,6 +504,41 @@ async def test_batch_partial_source_failure_keeps_safe_sources_and_marks_coverag
     assert state.extractions.rows == {}
     items = sink.calls  # No extraction artifact is stored on coverage failure.
     assert items == []
+
+
+@pytest.mark.asyncio
+async def test_boundary_token_colliding_with_an_archive_falls_back_to_individual_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _BatchGateway(
+        [
+            "IOC confirmed domain\n- domain-1.security-lab.io",
+            "IOC confirmed domain\n- domain-2.security-lab.io",
+        ]
+    )
+    orchestrator, run, state, _, _ = _batch_workflow(
+        monkeypatch,
+        2,
+        "",
+        gateway=gateway,
+        archived_texts=[
+            f"domain-1.security-lab.io leaked marker {_TOKEN}",
+            "domain-2.security-lab.io",
+        ],
+    )
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", date(2026, 7, 10)),)),
+    )
+
+    assert result["status"] == "success", result
+    assert result["light_batches"] == 0
+    assert result["light_sources_batched"] == 0
+    assert len(gateway.calls) == 2
+    assert {call.prompt_template_id for call in gateway.calls} == {"production-q2-url"}
+    # The colliding archive is never rewritten, and both sources keep their own
+    # individual checkpoint.
+    assert len(state.extractions.rows) == 2
 
 
 @pytest.mark.asyncio

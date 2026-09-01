@@ -70,7 +70,6 @@ from cti_app.application.production_prompts import (
     EXTRACTION_PROMPT_VERSION,
     EXTRACTION_PROMPT_VERSION_BY_PROFILE,
     IOC_RULES_BATCH_PROMPT_VERSION,
-    IOC_RULES_PROMPT_VERSION,
     REFERENCES_FORMAT_REPAIR_VERSION,
     REFERENCES_PROMPT_VERSION,
     SYNTHESIS_FORMAT_REPAIR_VERSION,
@@ -85,6 +84,8 @@ from cti_app.application.production_q2_batch import (
     make_q2_batch,
     parse_q2_batch_response,
     partition_q2_batch_candidates,
+    q2_batch_boundary_collides,
+    q2_batch_boundary_token,
     q2_batch_model_run_id,
 )
 from cti_app.application.production_source_evidence import (
@@ -1623,7 +1624,11 @@ class ProductionWorkflowOrchestrator:
         light_sources_batched = 0
         cache_hits = 0
         model_calls_avoided = 0
-        light_batches_by_first_source: dict[str, tuple[Q2BatchSource, ...]] = {}
+        # Each entry carries the batch, its ModelRun identity and the boundary
+        # token derived from that identity, all decided before any prompt exists.
+        light_batches_by_first_source: dict[
+            str, tuple[tuple[Q2BatchSource, ...], UUID, str]
+        ] = {}
         individual_source_ids: set[str] = set()
         batch_candidates: list[Q2BatchCandidate] = []
         pending: dict[str, _Q2SourceWork] = {}
@@ -2021,7 +2026,12 @@ class ProductionWorkflowOrchestrator:
                     }
                 return None
 
-        async def execute_batch(batch_sources: tuple[Q2BatchSource, ...]) -> dict[str, Any] | None:
+        async def execute_batch(
+            batch_sources: tuple[Q2BatchSource, ...],
+            *,
+            model_run_id: UUID,
+            boundary_token: str,
+        ) -> dict[str, Any] | None:
             nonlocal light_calls, light_batches, light_sources_batched
             batch = make_q2_batch(tuple(item.candidate for item in batch_sources))
             # ``batch_sources`` already carries B# labels; rebuild only guards
@@ -2031,11 +2041,12 @@ class ProductionWorkflowOrchestrator:
                 item.batch_id for item in batch_sources
             ):
                 raise _Q2ControlFailure("Batch source mapping is not deterministic")
+            # The identity and its boundary token are decided before the prompt
+            # exists: the prompt embeds the token, so the reverse order would
+            # make the ModelRun id depend on itself.
             prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
-                [(item.batch_id, item.archived_text) for item in batch_sources]
-            )
-            model_run_id = _q2_batch_model_run_id(
-                source_content_sha256=tuple(item.source_content_sha256 for item in batch_sources)
+                [(item.batch_id, item.archived_text) for item in batch_sources],
+                boundary_token=boundary_token,
             )
             light_calls += 1
             light_batches += 1
@@ -2083,7 +2094,10 @@ class ProductionWorkflowOrchestrator:
                             "source_content_sha256": [
                                 item.source_content_sha256 for item in batch_sources
                             ],
-                            "ioc_rules_prompt_version": IOC_RULES_PROMPT_VERSION,
+                            # Only versions that are part of the batch identity
+                            # belong here: the gateway hashes this metadata, so
+                            # an unrelated version would break ModelRun reuse.
+                            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
                             "ioc_rules_batch_prompt_version": IOC_RULES_BATCH_PROMPT_VERSION,
                             "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
                             "q2_batch_parser_version": Q2_BATCH_PARSER_VERSION,
@@ -2122,7 +2136,9 @@ class ProductionWorkflowOrchestrator:
                 if not raw.strip():
                     raise _Q2ControlFailure("Provider returned no Q2 response")
                 url_raw_parts.append(raw)
-                parsed = parse_q2_batch_response(raw, batch.source_mapping)
+                parsed = parse_q2_batch_response(
+                    raw, batch.source_mapping, boundary_token=boundary_token
+                )
                 self._diagnostics.record(
                     event="q2.batch.parsed",
                     run_id=run.id,
@@ -2412,17 +2428,49 @@ class ProductionWorkflowOrchestrator:
                 individual_source_ids.add(candidate_group[0].source.local_id)
                 continue
             local_batch = make_q2_batch(candidate_group)
+            batch_run_id = _q2_batch_model_run_id(
+                source_content_sha256=tuple(
+                    item.source_content_sha256 for item in local_batch.sources
+                )
+            )
+            boundary_token = q2_batch_boundary_token(batch_run_id)
+            if q2_batch_boundary_collides(
+                boundary_token,
+                tuple(item.archived_text for item in local_batch.sources),
+            ):
+                # An archive is never rewritten and an ambiguous framing is never
+                # chosen: these sources go back to the individual path instead.
+                self._diagnostics.record(
+                    event="q2.batch.boundary_collision",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    batch_model_run_id=str(batch_run_id),
+                    source_ids=[item.source.local_id for item in local_batch.sources],
+                )
+                warnings.append("q2_batch_boundary_collision")
+                for item in local_batch.sources:
+                    individual_source_ids.add(item.source.local_id)
+                continue
             light_batches_by_first_source[local_batch.sources[0].source.local_id] = (
-                local_batch.sources
+                local_batch.sources,
+                batch_run_id,
+                boundary_token,
             )
 
         handled_source_ids = set(completed)
         for source in report.sources:
             if source.local_id in handled_source_ids:
                 continue
-            batch_sources = light_batches_by_first_source.get(source.local_id)
-            if batch_sources is not None:
-                early_result = await execute_batch(batch_sources)
+            prepared_batch = light_batches_by_first_source.get(source.local_id)
+            if prepared_batch is not None:
+                batch_sources, batch_run_id, boundary_token = prepared_batch
+                early_result = await execute_batch(
+                    batch_sources,
+                    model_run_id=batch_run_id,
+                    boundary_token=boundary_token,
+                )
                 if early_result is not None:
                     return early_result
                 handled_source_ids.update(item.source.local_id for item in batch_sources)
@@ -2948,13 +2996,12 @@ def _q2_batch_model_run_id(
         source_content_sha256=source_content_sha256,
         routing_policy_version=Q2_ROUTING_POLICY_VERSION,
         provider=provider,
-        ioc_rules_prompt_version=IOC_RULES_PROMPT_VERSION,
+        extraction_contract_version=Q2_EXTRACTION_CONTRACT_VERSION,
         ioc_rules_batch_prompt_version=IOC_RULES_BATCH_PROMPT_VERSION,
         q2_markdown_parser_version=Q2_MARKDOWN_PARSER_VERSION,
         q2_batch_parser_version=Q2_BATCH_PARSER_VERSION,
         source_evidence_version=SOURCE_EVIDENCE_VERSION,
         artifact_verifier_version=ARTIFACT_VERIFIER_VERSION,
-        parser_version=PARSER_VERSION,
     )
 
 

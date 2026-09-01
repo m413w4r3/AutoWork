@@ -7,15 +7,16 @@ label; no Q1 source id is put in the batch wire format.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.production_artifact_verification import ARTIFACT_VERIFIER_VERSION
 from cti_app.application.production_parsers import (
-    PARSER_VERSION,
+    Q2_EXTRACTION_CONTRACT_VERSION,
     Q2_MARKDOWN_PARSER_VERSION,
     ParsedSource,
     Q2SourceOutput,
@@ -23,22 +24,25 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.application.production_prompts import (
     IOC_RULES_BATCH_PROMPT_VERSION,
-    IOC_RULES_PROMPT_VERSION,
+    Q2_BATCH_INPUT_MARKER,
+    Q2_BATCH_OUTPUT_MARKER,
 )
 from cti_app.application.production_source_evidence import SOURCE_EVIDENCE_VERSION
 from cti_app.domain.model_runs import ModelProvider
 
 MAX_Q2_BATCH_ARCHIVED_CHARS = 70_000
 MAX_Q2_BATCH_SOURCES = 8
-Q2_BATCH_PARSER_VERSION = "q2-batch-v1"
+# "q2-batch-v2": source blocks are delimited by deterministic per-batch
+# boundary markers instead of Markdown-fence-aware ``SOURCE B#`` headers, so a
+# malformed rule fence in one block can no longer swallow the next block.
+Q2_BATCH_PARSER_VERSION = "q2-batch-v2"
 
-_BATCH_SOURCE_HEADER = re.compile(
-    r"^\s*(?:#{1,6}\s+)?SOURCE\s+B(?P<number>\d+)\s*#*\s*$",
-    re.IGNORECASE,
-)
-_FENCE_OPEN = re.compile(r"^\s*```[^\n]*$")
-_FENCE_CLOSE = re.compile(r"^\s*```\s*$")
+# Length of the hex boundary token. Long enough that an archived capture is not
+# realistically going to contain one, short enough to stay readable in a prompt.
+Q2_BATCH_BOUNDARY_TOKEN_CHARS = 32
+
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_BOUNDARY_TOKEN = re.compile(r"^[0-9a-f]{16,}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +114,7 @@ class Q2BatchSourceResult:
 
 @dataclass(frozen=True, slots=True)
 class Q2BatchParseResult:
-    """Fence-aware batch parsing result."""
+    """Envelope-delimited batch parsing result."""
 
     sources: tuple[Q2BatchSourceResult, ...]
     warnings: tuple[str, ...] = ()
@@ -167,15 +171,20 @@ def q2_batch_model_run_id(
     source_content_sha256: Sequence[str],
     routing_policy_version: str,
     provider: ModelProvider = ModelProvider.OPENAI,
-    ioc_rules_prompt_version: str | None = None,
+    extraction_contract_version: str | None = None,
     ioc_rules_batch_prompt_version: str | None = None,
     q2_markdown_parser_version: str | None = None,
     q2_batch_parser_version: str | None = None,
     source_evidence_version: str | None = None,
     artifact_verifier_version: str | None = None,
-    parser_version: str | None = None,
 ) -> UUID:
-    """Return a content/version-addressed identity for one exact Q2 batch."""
+    """Return a content/version-addressed identity for one exact Q2 batch.
+
+    Only versions that can change what this batch actually does belong here.
+    The Q1 ``PARSER_VERSION`` and the single-source ``IOC_RULES_PROMPT_VERSION``
+    are deliberately excluded: neither changes the batch prompt, the batch wire
+    format or the batch parser, so neither may invalidate a reusable batch.
+    """
 
     hashes = tuple(source_content_sha256)
     if not hashes or any(not _SHA256.fullmatch(value) for value in hashes):
@@ -183,7 +192,9 @@ def q2_batch_model_run_id(
     identity = json.dumps(
         {
             "ordered_source_content_sha256": hashes,
-            "ioc_rules_prompt_version": (ioc_rules_prompt_version or IOC_RULES_PROMPT_VERSION),
+            "q2_extraction_contract_version": (
+                extraction_contract_version or Q2_EXTRACTION_CONTRACT_VERSION
+            ),
             "ioc_rules_batch_prompt_version": (
                 ioc_rules_batch_prompt_version or IOC_RULES_BATCH_PROMPT_VERSION
             ),
@@ -195,7 +206,6 @@ def q2_batch_model_run_id(
             "artifact_verifier_version": artifact_verifier_version or ARTIFACT_VERIFIER_VERSION,
             "q2_routing_policy_version": routing_policy_version,
             "provider": provider.value,
-            "parser_version": parser_version or PARSER_VERSION,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -203,78 +213,169 @@ def q2_batch_model_run_id(
     return uuid5(NAMESPACE_URL, f"production-q2-ioc-batch:{identity}")
 
 
-def _split_batch_blocks(text: str) -> tuple[list[tuple[str, str]], list[str]]:
-    """Split SOURCE B# blocks, ignoring headers inside any code fence."""
+def q2_batch_boundary_token(model_run_id: UUID) -> str:
+    """Derive the deterministic boundary token of one batch.
 
+    The token depends only on the batch identity, so the same exact batch always
+    frames its prompt and its response the same way and stays reusable.
+    """
+
+    digest = hashlib.sha256(f"q2-batch-boundary:{model_run_id!s}".encode()).hexdigest()
+    return digest[:Q2_BATCH_BOUNDARY_TOKEN_CHARS]
+
+
+def q2_batch_output_markers(boundary_token: str, batch_id: str) -> tuple[str, str]:
+    """Return the BEGIN/END response markers framing one source block."""
+
+    _validate_boundary_token(boundary_token)
+    return (
+        Q2_BATCH_OUTPUT_MARKER.format(token=boundary_token, batch_id=batch_id, kind="BEGIN"),
+        Q2_BATCH_OUTPUT_MARKER.format(token=boundary_token, batch_id=batch_id, kind="END"),
+    )
+
+
+def q2_batch_input_markers(boundary_token: str, batch_id: str) -> tuple[str, str]:
+    """Return the BEGIN/END markers framing one archived input document."""
+
+    _validate_boundary_token(boundary_token)
+    return (
+        Q2_BATCH_INPUT_MARKER.format(token=boundary_token, batch_id=batch_id, kind="BEGIN"),
+        Q2_BATCH_INPUT_MARKER.format(token=boundary_token, batch_id=batch_id, kind="END"),
+    )
+
+
+def q2_batch_boundary_collides(boundary_token: str, archived_texts: Iterable[str]) -> bool:
+    """Report whether framing this batch would be ambiguous.
+
+    An archive is never rewritten to make room for a marker. When the token
+    appears in any archived capture the caller must fall back to the individual
+    path for those sources instead of choosing an ambiguous framing.
+    """
+
+    _validate_boundary_token(boundary_token)
+    return any(boundary_token in text for text in archived_texts)
+
+
+def _validate_boundary_token(boundary_token: str) -> None:
+    if not _BOUNDARY_TOKEN.fullmatch(boundary_token):
+        raise ValueError("boundary_token must be a long lowercase hex token")
+
+
+def _split_batch_blocks(
+    text: str, boundary_token: str
+) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Split marker-delimited blocks without ever looking at Markdown fences.
+
+    Returns ``(batch_id, body, status)`` triples in response order plus response
+    level warnings. ``status`` is ``"closed"`` for a properly terminated block
+    and ``"unterminated"`` for one whose END marker never arrived.
+    """
+
+    marker = re.compile(
+        r"^\s*"
+        + Q2_BATCH_OUTPUT_MARKER.format(
+            token=re.escape(boundary_token),
+            batch_id=r"(?P<batch_id>B\d+)",
+            kind=r"(?P<kind>BEGIN|END)",
+        )
+        + r"\s*$"
+    )
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    blocks: list[tuple[str, str]] = []
+    blocks: list[tuple[str, str, str]] = []
     warnings: list[str] = []
     current_id: str | None = None
     current_lines: list[str] = []
-    in_fence = False
 
-    def finish() -> None:
+    def close(status: str) -> None:
+        nonlocal current_id, current_lines
         if current_id is not None:
-            blocks.append((current_id, "\n".join(current_lines).strip()))
+            blocks.append((current_id, "\n".join(current_lines).strip(), status))
+        current_id = None
+        current_lines = []
 
     for line in lines:
-        if in_fence:
-            current_lines.append(line)
-            if _FENCE_CLOSE.fullmatch(line):
-                in_fence = False
+        found = marker.fullmatch(line)
+        if found is not None:
+            batch_id = found.group("batch_id")
+            if found.group("kind") == "BEGIN":
+                if current_id is not None:
+                    # A BEGIN inside an open block only ends that block; it never
+                    # merges the two, and it never hides the block that follows.
+                    warnings.append("batch_marker_unterminated")
+                    close("unterminated")
+                current_id = batch_id
+                current_lines = []
+                continue
+            if current_id is None:
+                warnings.append("batch_marker_unexpected_end")
+                continue
+            if batch_id != current_id:
+                warnings.append("batch_marker_mismatched_end")
+                close("unterminated")
+                continue
+            close("closed")
             continue
-        header = _BATCH_SOURCE_HEADER.fullmatch(line)
-        if header is not None:
-            finish()
-            current_id = f"B{int(header.group('number'))}"
-            current_lines = []
-            continue
-        if _FENCE_OPEN.fullmatch(line):
-            in_fence = True
         if current_id is None:
             if line.strip():
                 warnings.append("batch_text_outside_source")
             continue
         current_lines.append(line)
-    finish()
+    if current_id is not None:
+        warnings.append("batch_marker_unterminated")
+        close("unterminated")
     return blocks, list(dict.fromkeys(warnings))
 
 
 def parse_q2_batch_response(
     text: str,
     expected_sources: Mapping[str, ParsedSource] | Sequence[Q2BatchSource],
+    *,
+    boundary_token: str,
 ) -> Q2BatchParseResult:
     """Parse source blocks while keeping malformed blocks source-local."""
 
+    _validate_boundary_token(boundary_token)
     expected = (
         {item.batch_id: item.source for item in expected_sources}
         if not isinstance(expected_sources, Mapping)
         else dict(expected_sources)
     )
-    blocks, warnings = _split_batch_blocks(text)
-    occurrences: dict[str, list[str]] = {}
-    for batch_id, body in blocks:
-        occurrences.setdefault(batch_id, []).append(body)
+    blocks, warnings = _split_batch_blocks(text, boundary_token)
+    occurrences: dict[str, list[tuple[str, str]]] = {}
+    for batch_id, body, status in blocks:
+        occurrences.setdefault(batch_id, []).append((body, status))
 
     results: list[Q2BatchSourceResult] = []
     recognized_expected = 0
-    for batch_id, bodies in occurrences.items():
+    for batch_id, entries in occurrences.items():
         if batch_id not in expected:
             warnings.append("batch_source_unknown")
             continue
         recognized_expected += 1
-        if len(bodies) > 1:
+        if len(entries) > 1:
             results.append(
                 Q2BatchSourceResult(
                     batch_id=batch_id,
                     output=None,
                     status="failed",
                     error_code="batch_source_duplicate",
-                    raw_block="\n\n---\n\n".join(bodies),
+                    raw_block="\n\n---\n\n".join(body for body, _ in entries),
                 )
             )
             continue
-        body = bodies[0].strip()
+        body, block_status = entries[0]
+        if block_status != "closed":
+            results.append(
+                Q2BatchSourceResult(
+                    batch_id=batch_id,
+                    output=None,
+                    status="failed",
+                    error_code="batch_source_unterminated",
+                    raw_block=body,
+                )
+            )
+            continue
+        body = body.strip()
         normalized = body.strip()
         if normalized == "EMPTY":
             results.append(
@@ -349,6 +450,7 @@ def parse_q2_batch_response(
 __all__ = [
     "MAX_Q2_BATCH_ARCHIVED_CHARS",
     "MAX_Q2_BATCH_SOURCES",
+    "Q2_BATCH_BOUNDARY_TOKEN_CHARS",
     "Q2_BATCH_PARSER_VERSION",
     "Q2Batch",
     "Q2BatchCandidate",
@@ -358,5 +460,9 @@ __all__ = [
     "make_q2_batch",
     "parse_q2_batch_response",
     "partition_q2_batch_candidates",
+    "q2_batch_boundary_collides",
+    "q2_batch_boundary_token",
+    "q2_batch_input_markers",
     "q2_batch_model_run_id",
+    "q2_batch_output_markers",
 ]
