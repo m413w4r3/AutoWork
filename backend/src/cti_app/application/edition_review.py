@@ -11,7 +11,9 @@ from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
+    PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionArtifactStatus,
+    ProductionSubmissionReconciliation,
     SubjectProductionStage,
     SubjectProductionStatus,
 )
@@ -40,10 +42,50 @@ class EditionReviewReadItem:
     effective_decision: PublicationDecision | None
     effective_decision_id: UUID | None = None
     retry_stage: SubjectProductionStage | None = None
+    reconciliation: ProductionSubmissionReconciliation | None = None
 
 
 class EditionReviewReadRepository(Protocol):
     async def list_for_edition(self, edition_id: UUID) -> Sequence[EditionReviewReadItem]: ...
+
+
+def requires_reconciliation(
+    run_status: SubjectProductionStatus,
+    error_code: str | None,
+    reconciliation: ProductionSubmissionReconciliation | None,
+) -> bool:
+    """An ambiguous provider submission owns its own recovery use case.
+
+    The exact ChatGPT answer may already exist on the provider side.  Replaying
+    the stage would either duplicate that work or silently drop it, so the run
+    is not retryable until the operator adopts or abandons the exact answer.
+    """
+    return (
+        run_status is SubjectProductionStatus.NEEDS_REVIEW
+        and error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
+        and reconciliation is not None
+    )
+
+
+def review_item_can_retry(
+    run_status: SubjectProductionStatus,
+    *,
+    artifact_verified: bool,
+    reconciliation_required: bool,
+) -> bool:
+    """The single Review retry policy, shared by the read model and the API.
+
+    ``CANCELLED`` is deliberately absent: the domain refuses
+    ``SubjectProductionRun.retry_from_stage`` on a cancelled run, so offering a
+    retry would only produce a conflict.  A cancelled article is resolved by
+    excluding it from the edition.
+    """
+    if reconciliation_required:
+        return False
+    return run_status in {
+        SubjectProductionStatus.FAILED,
+        SubjectProductionStatus.NEEDS_REVIEW,
+    } or (run_status is SubjectProductionStatus.READY and not artifact_verified)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +107,8 @@ class EditionReviewItem:
     can_retry: bool
     effective_decision_id: UUID | None = None
     retry_stage: SubjectProductionStage | None = None
+    requires_reconciliation: bool = False
+    reconciliation: ProductionSubmissionReconciliation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,11 +297,14 @@ def _build_item(row: EditionReviewReadItem) -> EditionReviewItem:
         blocking = True
 
     included = decision is PublicationDecision.INCLUDE and artifact_verified
-    can_retry = row.run_status in {
-        SubjectProductionStatus.FAILED,
-        SubjectProductionStatus.NEEDS_REVIEW,
-        SubjectProductionStatus.CANCELLED,
-    } or (row.run_status is SubjectProductionStatus.READY and not artifact_verified)
+    reconciliation_required = requires_reconciliation(
+        row.run_status, row.error_code, row.reconciliation
+    )
+    can_retry = review_item_can_retry(
+        row.run_status,
+        artifact_verified=artifact_verified,
+        reconciliation_required=reconciliation_required,
+    )
     retry_stage = row.retry_stage if can_retry else None
     return EditionReviewItem(
         position=row.position,
@@ -277,6 +324,8 @@ def _build_item(row: EditionReviewReadItem) -> EditionReviewItem:
         can_retry=can_retry,
         effective_decision_id=row.effective_decision_id,
         retry_stage=retry_stage,
+        requires_reconciliation=reconciliation_required,
+        reconciliation=row.reconciliation if reconciliation_required else None,
     )
 
 
@@ -302,4 +351,6 @@ __all__ = [
     "InvalidReviewDocumentError",
     "InvalidReviewReasonError",
     "ReviewItemStaleError",
+    "requires_reconciliation",
+    "review_item_can_retry",
 ]

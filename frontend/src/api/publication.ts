@@ -1,4 +1,7 @@
 import { ApiError, type EditionStatus } from "./editions";
+import type { ProductionReconciliation } from "./production";
+
+export type { ProductionReconciliation };
 
 export type PublicationDecision = "include" | "exclude";
 
@@ -53,8 +56,15 @@ export interface ReviewItem {
   effective_decision: PublicationDecision | null;
   included: boolean;
   blocking: boolean;
+  /**
+   * The backend owns the Review action policy. `can_retry` and
+   * `requires_reconciliation` are mutually exclusive, so the UI never has to
+   * infer which action is legal from an error message.
+   */
   can_retry: boolean;
   retry_stage: ReviewRetryStage | null;
+  requires_reconciliation: boolean;
+  reconciliation: ProductionReconciliation | null;
   error_code: string | null;
   error_message: string | null;
 }

@@ -115,9 +115,7 @@ class _Edition:
         self.status = status
         self.version += 1
 
-    def return_to_selection_after_production_cancellation(
-        self, *, now: datetime
-    ) -> None:
+    def return_to_selection_after_production_cancellation(self, *, now: datetime) -> None:
         del now
         assert self.status is EditionStatus.PRODUCTION
         self.status = EditionStatus.SELECTION
@@ -1683,9 +1681,7 @@ async def test_repeated_old_batch_cancel_cannot_affect_newer_batch(
     assert len(uow.edition_audit.events) == audit_count
 
 
-async def test_completed_batch_cannot_be_cancelled(
-    api: AsyncClient, uow: _Uow
-) -> None:
+async def test_completed_batch_cannot_be_cancelled(api: AsyncClient, uow: _Uow) -> None:
     edition_id, subject_id = uuid4(), uuid4()
     uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
 

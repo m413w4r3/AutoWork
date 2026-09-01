@@ -10,6 +10,7 @@ import {
   type ReviewItem,
 } from "../../api/publication";
 import { Link } from "../../routing";
+import { ReconciliationPanel } from "./ReconciliationPanel";
 
 const STALE_MESSAGE =
   "Cet article a changé depuis son ouverture. La revue a été rechargée.";
@@ -30,6 +31,13 @@ function retryItem(item: ReviewItem) {
   if (!item.can_retry || item.retry_stage === null) {
     return Promise.reject(
       new Error("Cette tentative ne peut pas être relancée."),
+    );
+  }
+  if (item.requires_reconciliation) {
+    return Promise.reject(
+      new Error(
+        "La réponse ChatGPT doit d’abord être récupérée ou abandonnée.",
+      ),
     );
   }
   return retryProductionRun(item.run_id, item.retry_stage);
@@ -155,7 +163,14 @@ export function ReviewItemCard({
   const isReadyIncluded = item.run_status === "ready" && item.included;
   const canReinclude =
     isExcluded && item.run_status === "ready" && hasDocument(item);
-  const canRetry = item.can_retry === true && item.retry_stage !== null;
+  // An ambiguous ChatGPT submission has its own recovery use case: replaying
+  // the stage would duplicate or drop an answer the provider may already hold.
+  const needsReconciliation =
+    item.requires_reconciliation === true && item.reconciliation !== null;
+  const canRetry =
+    item.can_retry === true &&
+    item.retry_stage !== null &&
+    !needsReconciliation;
   const isProblem =
     item.run_status === "failed" ||
     item.run_status === "needs_review" ||
@@ -264,6 +279,16 @@ export function ReviewItemCard({
           </button>
         ) : null}
       </div>
+
+      {!isActive && needsReconciliation && item.reconciliation ? (
+        <ReconciliationPanel
+          runId={item.run_id}
+          reconciliation={item.reconciliation}
+          onRecovered={() =>
+            invalidateAfterRetry(queryClient, editionId, item.subject_id)
+          }
+        />
+      ) : null}
 
       {excludeOpen ? (
         <form className="review-item-card__exclude" onSubmit={confirmExclude}>

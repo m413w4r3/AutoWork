@@ -15,6 +15,7 @@ from cti_app.application.persistence import (
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
+from cti_app.application.production_review_recovery import prepare_batch_for_recovery
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.production import (
     EditionProductionBatch,
@@ -403,6 +404,18 @@ class SubjectProductionService:
                 if edition.status not in {EditionStatus.PRODUCTION, EditionStatus.REVIEW}:
                     raise ValueError("edition_frozen_for_publication")
 
+                # Reject a run that obviously cannot be retried before touching
+                # the batch: reopening a finished batch for a cancelled or
+                # already running article would be a pure side effect.  The
+                # authoritative check stays under the run lock below.
+                if initial_run.status is SubjectProductionStatus.CANCELLED:
+                    raise ValueError("production_run_cancelled")
+                if initial_run.status in (
+                    SubjectProductionStatus.QUEUED,
+                    SubjectProductionStatus.RUNNING,
+                ):
+                    raise ValueError("retry_not_allowed_while_running")
+
                 # A manifest is immutable evidence of a freeze.  Keep this
                 # check under the Edition lock so a retry cannot race with the
                 # transaction that creates the manifest.
@@ -412,6 +425,21 @@ class SubjectProductionService:
                     and await manifests.get_latest_for_edition(initial_run.edition_id) is not None
                 ):
                     raise ValueError("edition_frozen_for_publication")
+
+                # Edition, then batch, then run: a Review-time retry usually
+                # targets a batch that already finished with issues, and the
+                # dispatch fences only ever let a dispatchable batch move a
+                # subject forward.  This reopens exactly that batch, and
+                # refuses cancelled, superseded or busy ones.
+                await prepare_batch_for_recovery(
+                    uow,
+                    initial_run,
+                    reopen=True,
+                    # A batch still running its initial pass keeps its existing
+                    # retry semantics: a manual retry there has always been
+                    # allowed to sit alongside the subject in flight.
+                    require_idle_siblings=False,
+                )
 
                 result = await self._retry_from_stage_in_uow(
                     uow,

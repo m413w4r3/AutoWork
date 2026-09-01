@@ -17,17 +17,43 @@ from cti_app.application.production_jobs import (
     production_reconciliation_resume_idempotency_key,
     production_reconciliation_resume_job_kind,
 )
+from cti_app.application.production_review_recovery import (
+    ACTIVE_SIBLING,
+    BATCH_CANCELLED,
+    BATCH_MISSING,
+    BATCH_SUPERSEDED,
+    ReviewRecoveryConflictError,
+    prepare_batch_for_recovery,
+)
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
-    ProductionBatchStatus,
     ProductionSubmissionReconciliation,
     SubjectProductionRun,
     SubjectProductionStatus,
 )
 
 MAX_RECOVERY_BYTES = 10_000_000
+
+_RECOVERY_CONFLICTS = {
+    BATCH_MISSING: (
+        "production_reconciliation_batch_missing",
+        "Le lot de production est introuvable.",
+    ),
+    BATCH_CANCELLED: (
+        "production_reconciliation_batch_cancelled",
+        "Un lot de production annulé ne peut pas être repris.",
+    ),
+    BATCH_SUPERSEDED: (
+        "production_reconciliation_batch_superseded",
+        "Un lot de production plus récent est actif ; cette reprise est obsolète.",
+    ),
+    ACTIVE_SIBLING: (
+        "production_reconciliation_active_sibling",
+        "Un autre article du lot est actif ; la reprise est mise en attente.",
+    ),
+}
 
 
 class ProductionReconciliationError(ValueError):
@@ -112,9 +138,7 @@ class ProductionReconciliationService:
                 "Le bridge ChatGPT n'est pas disponible ; utilisez l'import Markdown.",
             )
         try:
-            payload = await self._bridge.preview_visible_recovery(
-                reconciliation.bridge_response_id
-            )
+            payload = await self._bridge.preview_visible_recovery(reconciliation.bridge_response_id)
         except Exception as exc:
             raise ProductionReconciliationError(
                 "production_reconciliation_visible_unavailable",
@@ -288,23 +312,29 @@ class ProductionReconciliationService:
                 raise ProductionReconciliationError(
                     "production_run_not_found", "Le run de production est introuvable."
                 )
-            # Lock in the same order as ordinary production retry/cancellation:
-            # edition first, then its run, so reconciliation cannot race a
-            # publication freeze or a cancellation.
+            # Lock in the same order as ordinary production retry/cancellation
+            # and as the batch hand-off: edition, then batch, then run, so
+            # reconciliation cannot race a publication freeze, a cancellation
+            # or a batch transition.
             edition = await uow.editions.get_for_update(probe.edition_id)
-            run = await uow.subject_production_runs.get_for_update(run_id)
-            if run is None:
-                raise ProductionReconciliationError(
-                    "production_run_not_found", "Le run de production est introuvable."
-                )
-            if edition is None or edition.id != run.edition_id:
+            if edition is None or edition.id != probe.edition_id:
                 raise ProductionReconciliationError(
                     "production_reconciliation_identity_mismatch",
                     "Le run de production n'est plus associé à la même édition.",
                 )
             self._ensure_edition_safety(edition.status)
             await self._ensure_no_publication_freeze(uow, edition.id)
-            await self._ensure_batch_safety(uow, run)
+            await self._ensure_batch_safety(uow, probe, reopen=True)
+            run = await uow.subject_production_runs.get_for_update(run_id)
+            if run is None:
+                raise ProductionReconciliationError(
+                    "production_run_not_found", "Le run de production est introuvable."
+                )
+            if edition.id != run.edition_id:
+                raise ProductionReconciliationError(
+                    "production_reconciliation_identity_mismatch",
+                    "Le run de production n'est plus associé à la même édition.",
+                )
             current = run.reconciliation
             if current is None or current.model_run_id != reconciliation.model_run_id:
                 raise ProductionReconciliationError(
@@ -356,7 +386,9 @@ class ProductionReconciliationService:
                 generation = run.pipeline_generation
                 if current.output_sha256 is None:
                     await uow.subject_production_runs.save(run)
-                    await uow.commit()
+                # A repeated adoption may still be the call that reopens the
+                # batch, so this path commits even when the run is unchanged.
+                await uow.commit()
             else:
                 return None, True
 
@@ -410,16 +442,14 @@ class ProductionReconciliationService:
                 and run.error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
             )
             if (
-                (not reviewable and (not allow_adopted or not adopted))
-                or run.reconciliation is None
-            ):
+                not reviewable and (not allow_adopted or not adopted)
+            ) or run.reconciliation is None:
                 raise ProductionReconciliationError(
                     "production_reconciliation_not_eligible",
                     "Ce run n'est pas dans l'état de réconciliation attendu.",
                 )
-            if (
-                run.reconciliation.production_run_id != run.id
-                or (reviewable and run.reconciliation.stage is not run.current_stage)
+            if run.reconciliation.production_run_id != run.id or (
+                reviewable and run.reconciliation.stage is not run.current_stage
             ):
                 raise ProductionReconciliationError(
                     "production_reconciliation_identity_mismatch",
@@ -441,29 +471,20 @@ class ProductionReconciliationService:
                 )
             return run, run.reconciliation, model
 
-    async def _ensure_batch_safety(self, uow: Any, run: SubjectProductionRun) -> None:
-        item = await uow.edition_production_batch_items.get_by_run(run.id)
-        if item is None:
-            return
-        batch = await uow.edition_production_batches.get_for_update(item.batch_id)
-        if batch is None:
-            raise ProductionReconciliationError(
-                "production_reconciliation_batch_missing", "Le lot de production est introuvable."
-            )
-        if batch.status is ProductionBatchStatus.CANCELLED:
-            raise ProductionReconciliationError(
-                "production_reconciliation_batch_cancelled",
-                "Un lot de production annulé ne peut pas être repris.",
-            )
-        for sibling in await uow.edition_production_batch_items.list_for_batch(batch.id):
-            if sibling.production_run_id == run.id:
-                continue
-            sibling_run = await uow.subject_production_runs.get(sibling.production_run_id)
-            if sibling_run is not None and sibling_run.status is SubjectProductionStatus.RUNNING:
-                raise ProductionReconciliationError(
-                    "production_reconciliation_active_sibling",
-                    "Un autre article du lot est actif ; la reprise est mise en attente.",
-                )
+    async def _ensure_batch_safety(
+        self, uow: Any, run: SubjectProductionRun, *, reopen: bool = False
+    ) -> None:
+        """Share the Review recovery rule with the ordinary business retry.
+
+        With ``reopen``, the batch that already finished with issues is put
+        back into an explicit review-recovery pass so the chained stages of
+        this article can be dispatched again.
+        """
+        try:
+            await prepare_batch_for_recovery(uow, run, reopen=reopen)
+        except ReviewRecoveryConflictError as exc:
+            code, message = _RECOVERY_CONFLICTS[exc.reason]
+            raise ProductionReconciliationError(code, message) from exc
 
     async def _ensure_resume_context(self, run: SubjectProductionRun) -> None:
         async with self._uow_factory() as uow:
@@ -558,9 +579,7 @@ class ProductionReconciliationService:
                 "La réponse adoptée n'a pas de contenu archivé.",
             )
         try:
-            content = await self._model_gateway.read_output(
-                reference, max_bytes=MAX_RECOVERY_BYTES
-            )
+            content = await self._model_gateway.read_output(reference, max_bytes=MAX_RECOVERY_BYTES)
         except Exception as exc:
             raise ProductionReconciliationError(
                 "production_reconciliation_output_missing",

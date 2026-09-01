@@ -18,10 +18,13 @@ from cti_app.application.edition_review import (
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition, EditionStatus
+from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
+    PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionSubmissionReconciliation,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -33,6 +36,7 @@ SUBJECT_ID = UUID("22222222-2222-4222-8222-222222222222")
 RUN_ID = UUID("33333333-3333-4333-8333-333333333333")
 ARTIFACT_ID = UUID("44444444-4444-4444-8444-444444444444")
 INPUT_HASH = "a" * 64
+MODEL_RUN_ID = UUID("55555555-5555-4555-8555-555555555555")
 
 
 class _DecisionArguments(TypedDict):
@@ -86,6 +90,8 @@ def _row(
     generation: int = 2,
     position: int = 1,
     retry_stage: SubjectProductionStage | None = None,
+    error_code: str | None = None,
+    reconciliation: ProductionSubmissionReconciliation | None = None,
 ) -> EditionReviewReadItem:
     return EditionReviewReadItem(
         position=position,
@@ -98,11 +104,23 @@ def _row(
         document_artifact_version=1 if artifact_status is not None else None,
         document_input_hash=INPUT_HASH if artifact_status is not None else None,
         document_artifact_status=artifact_status,
-        error_code="failed" if status is SubjectProductionStatus.FAILED else None,
+        error_code=error_code or ("failed" if status is SubjectProductionStatus.FAILED else None),
         error_message="Échec public" if status is SubjectProductionStatus.FAILED else None,
         effective_decision=decision,
         effective_decision_id=effective_decision_id,
         retry_stage=retry_stage,
+        reconciliation=reconciliation,
+    )
+
+
+def _reconciliation() -> ProductionSubmissionReconciliation:
+    return ProductionSubmissionReconciliation(
+        production_run_id=RUN_ID,
+        model_run_id=MODEL_RUN_ID,
+        stage=SubjectProductionStage.SYNTHESIS,
+        bridge_response_id="bridge-1",
+        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        phase="reconciliation",
     )
 
 
@@ -513,3 +531,56 @@ async def test_review_exposes_effective_decision_id_and_backend_retry_stage() ->
         SubjectProductionStatus.READY, retry_stage=SubjectProductionStage.SYNTHESIS
     )
     assert ready_item.retry_stage is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_review_item_is_never_offered_a_retry() -> None:
+    """The domain refuses retry_from_stage on a cancelled run.
+
+    Offering the action anyway would only produce a conflict, so the read model
+    and the domain now agree: a cancelled article is resolved by excluding it.
+    """
+    item, _ = await _review(
+        SubjectProductionStatus.CANCELLED,
+        artifact_status=None,
+        retry_stage=SubjectProductionStage.SYNTHESIS,
+    )
+
+    assert item.can_retry is False
+    assert item.retry_stage is None
+    assert item.requires_reconciliation is False
+    # It still blocks the edition until it is explicitly excluded.
+    assert item.blocking is True
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_item_asks_for_recovery_instead_of_a_retry() -> None:
+    item, _ = await _review(
+        SubjectProductionStatus.NEEDS_REVIEW,
+        artifact_status=None,
+        retry_stage=SubjectProductionStage.SYNTHESIS,
+        error_code=PRODUCTION_RECONCILIATION_ERROR_CODE,
+        reconciliation=_reconciliation(),
+    )
+
+    assert item.requires_reconciliation is True
+    assert item.can_retry is False
+    assert item.retry_stage is None
+    assert item.reconciliation is not None
+    # The frontend addresses the exact ModelRun, never a parsed message.
+    assert item.reconciliation.model_run_id == MODEL_RUN_ID
+    assert item.reconciliation.bridge_response_id == "bridge-1"
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_needs_review_item_stays_retryable() -> None:
+    item, _ = await _review(
+        SubjectProductionStatus.NEEDS_REVIEW,
+        artifact_status=None,
+        retry_stage=SubjectProductionStage.SYNTHESIS,
+        error_code="synthesis_error",
+    )
+
+    assert (item.can_retry, item.requires_reconciliation) == (True, False)
+    assert item.retry_stage is SubjectProductionStage.SYNTHESIS
+    assert item.reconciliation is None

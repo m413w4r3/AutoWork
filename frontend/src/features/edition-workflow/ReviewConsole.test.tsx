@@ -43,12 +43,45 @@ const baseItem: ReviewItem = {
   blocking: false,
   can_retry: false,
   retry_stage: null,
+  requires_reconciliation: false,
+  reconciliation: null,
   error_code: null,
   error_message: null,
 };
 
 function makeItem(overrides: Partial<ReviewItem> = {}): ReviewItem {
   return { ...baseItem, ...overrides };
+}
+
+function reconciliationItem(): ReviewItem {
+  return makeItem({
+    run_id: "run-reconcile",
+    run_status: "needs_review",
+    effective_decision: null,
+    included: false,
+    blocking: true,
+    can_retry: false,
+    retry_stage: null,
+    requires_reconciliation: true,
+    reconciliation: {
+      production_run_id: "run-reconcile",
+      model_run_id: "model-run-1",
+      bridge_response_id: "bridge-1",
+      submission_state: "submitted_or_unknown",
+      phase: "reconciliation",
+      stage: "synthesis",
+      pipeline_generation: 3,
+      output_sha256: null,
+      provenance: null,
+      visible_available: true,
+      batch_id: null,
+    },
+    document_artifact_id: null,
+    document_artifact_version: null,
+    document_input_hash: null,
+    error_code: "model_submission_reconciliation_required",
+    error_message: "Soumission ambiguë.",
+  });
 }
 
 function makeReview(
@@ -94,6 +127,12 @@ function renderReview(
     </QueryClientProvider>,
   );
   return { client, fetchMock };
+}
+
+function postCalls(fetchMock: FetchMock) {
+  return fetchMock.mock.calls
+    .filter(([, init]) => init?.method === "POST")
+    .map(([input, init]) => [urlOf(input), init as RequestInit] as const);
 }
 
 function postCall(fetchMock: FetchMock) {
@@ -534,5 +573,154 @@ describe("ReviewConsole", () => {
         ([input]) => !urlOf(input).includes("artifacts"),
       ),
     ).toBe(true);
+  });
+  it("propose la réconciliation ChatGPT au lieu d’un retry générique", async () => {
+    renderReview(makeReview([reconciliationItem()]));
+
+    await screen.findByText("Article de test");
+    expect(
+      screen.getByRole("button", { name: "Récupérer la réponse ChatGPT" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Réessayer" }),
+    ).not.toBeInTheDocument();
+    // L’identité exacte est affichée, jamais devinée depuis le message.
+    expect(screen.getByText("model-run-1")).toBeInTheDocument();
+    expect(screen.getByText("bridge-1")).toBeInTheDocument();
+  });
+
+  it("preview puis confirmation adoptent le SHA-256 affiché et rechargent la revue", async () => {
+    const item = reconciliationItem();
+    const preview = {
+      production_run_id: item.run_id,
+      model_run_id: "model-run-1",
+      stage: "synthesis",
+      pipeline_generation: 3,
+      bridge_response_id: "bridge-1",
+      submission_state: "submitted_or_unknown",
+      phase: "reconciliation",
+      text: "# réponse récupérée",
+      sha256: "c".repeat(64),
+      chars: 19,
+      metadata: {},
+      visible_available: true,
+    };
+    const { client, fetchMock } = renderReview(makeReview([item]), () =>
+      Response.json(preview),
+    );
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Récupérer la réponse ChatGPT",
+      }),
+    );
+    expect(await screen.findByText("c".repeat(64))).toBeInTheDocument();
+    expect(screen.getByText("# réponse récupérée")).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Confirmer et reprendre la production",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([, init]) => init?.method === "POST"),
+      ).toHaveLength(2),
+    );
+    const posts = postCalls(fetchMock);
+    expect(posts.map(([url]) => url)).toEqual([
+      "/api/production/runs/run-reconcile/reconciliation/visible/preview",
+      "/api/production/runs/run-reconcile/reconciliation/visible/adopt",
+    ]);
+    expect(JSON.parse(bodyOf(posts[1]![1]))).toEqual({
+      expected_sha256: "c".repeat(64),
+    });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["edition-review", EDITION_ID],
+    });
+  });
+
+  it("bascule sur l’import Markdown quand la cible visible est perdue", async () => {
+    const item = reconciliationItem();
+    const manualPreview = {
+      production_run_id: item.run_id,
+      model_run_id: "model-run-1",
+      stage: "synthesis",
+      pipeline_generation: 3,
+      bridge_response_id: null,
+      submission_state: "submitted_or_unknown",
+      phase: "reconciliation",
+      text: "# collé",
+      sha256: "d".repeat(64),
+      chars: 7,
+      metadata: { source: "manual_import" },
+      visible_available: false,
+    };
+    const { fetchMock } = renderReview(makeReview([item]), () =>
+      Response.json(manualPreview),
+    );
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Réponse ChatGPT indisponible ? Coller le Markdown",
+      }),
+    );
+    await user.type(screen.getByLabelText("Réponse Markdown"), "# collé");
+    await user.click(
+      screen.getByRole("button", { name: "Prévisualiser l’import" }),
+    );
+
+    expect(await screen.findByText("d".repeat(64))).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", {
+        name: "Confirmer et reprendre la production",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([, init]) => init?.method === "POST"),
+      ).toHaveLength(2),
+    );
+    const posts = postCalls(fetchMock);
+    expect(posts[1]![0]).toBe(
+      "/api/production/runs/run-reconcile/reconciliation/manual/adopt",
+    );
+    expect(JSON.parse(bodyOf(posts[1]![1]))).toEqual({
+      markdown: "# collé",
+      expected_sha256: "d".repeat(64),
+    });
+  });
+
+  it("n’offre jamais de retry pour un article annulé", async () => {
+    renderReview(
+      makeReview([
+        makeItem({
+          run_status: "cancelled",
+          effective_decision: null,
+          included: false,
+          blocking: true,
+          can_retry: false,
+          retry_stage: null,
+          document_artifact_id: null,
+          document_artifact_version: null,
+          document_input_hash: null,
+        }),
+      ]),
+    );
+
+    await screen.findByText("Article de test");
+    expect(
+      screen.queryByRole("button", { name: "Réessayer" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Récupération ChatGPT"),
+    ).not.toBeInTheDocument();
+    // Il reste exclusible, seule sortie cohérente avec le domaine.
+    expect(screen.getByRole("button", { name: "Exclure" })).toBeInTheDocument();
   });
 });

@@ -104,6 +104,8 @@ const review = {
       included: true,
       blocking: false,
       can_retry: false,
+      requires_reconciliation: false,
+      reconciliation: null,
       retry_stage: null,
       error_code: null,
       error_message: null,

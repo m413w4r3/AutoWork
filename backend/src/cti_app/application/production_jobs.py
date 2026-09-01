@@ -342,9 +342,7 @@ def register_production_jobs(
         if current.status is SubjectProductionStatus.CANCELLED:
             return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
         if reconciliation_resume:
-            reconciliation_parameters = cast(
-                ProductionReconciliationResumeParameters, parameters
-            )
+            reconciliation_parameters = cast(ProductionReconciliationResumeParameters, parameters)
             identity = current.reconciliation
             async with uow_factory() as uow:
                 adopted = await uow.model_runs.get(
@@ -450,9 +448,7 @@ def register_production_jobs(
                 async with uow_factory() as uow:
                     ending = await uow.subject_production_runs.get_for_update(parameters.run_id)
                     if ending is not None and ending.status not in _TERMINAL_STATUSES:
-                        reconciliation = await _reconciliation_identity(
-                            uow, ending, stage, result
-                        )
+                        reconciliation = await _reconciliation_identity(uow, ending, stage, result)
                         ending.mark_needs_review(
                             code=error_code,
                             message=error_message,

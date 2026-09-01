@@ -7,10 +7,16 @@ from uuid import UUID
 from sqlalchemy import String, and_, case, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cti_app.application.edition_review import EditionReviewReadItem
+from cti_app.application.edition_review import (
+    EditionReviewReadItem,
+    requires_reconciliation,
+    review_item_can_retry,
+)
+from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionSubmissionReconciliation,
     SubjectProductionStage,
     SubjectProductionStatus,
 )
@@ -138,6 +144,23 @@ class SqlAlchemyEditionReviewReadRepository:
                 current_artifacts.c.artifact_status,
                 SubjectProductionRunRow.error_code.label("error_code"),
                 SubjectProductionRunRow.error_message.label("error_message"),
+                SubjectProductionRunRow.reconciliation_model_run_id.label(
+                    "reconciliation_model_run_id"
+                ),
+                SubjectProductionRunRow.reconciliation_stage.label("reconciliation_stage"),
+                SubjectProductionRunRow.reconciliation_bridge_response_id.label(
+                    "reconciliation_bridge_response_id"
+                ),
+                SubjectProductionRunRow.reconciliation_submission_state.label(
+                    "reconciliation_submission_state"
+                ),
+                SubjectProductionRunRow.reconciliation_phase.label("reconciliation_phase"),
+                SubjectProductionRunRow.reconciliation_output_sha256.label(
+                    "reconciliation_output_sha256"
+                ),
+                SubjectProductionRunRow.reconciliation_provenance.label(
+                    "reconciliation_provenance"
+                ),
                 PublicationReviewDecisionRow.id.label("decision_id"),
                 PublicationReviewDecisionRow.decision.label("decision"),
                 func.row_number()
@@ -219,6 +242,26 @@ def _decision_from_row(row: PublicationReviewDecisionRow) -> PublicationReviewDe
     )
 
 
+def _reconciliation_from_row(row: Any, run_id: UUID) -> ProductionSubmissionReconciliation | None:
+    """Rebuild the exact submission identity persisted next to the run."""
+    model_run_id = row["reconciliation_model_run_id"]
+    stage = row["reconciliation_stage"]
+    submission_state = row["reconciliation_submission_state"]
+    phase = row["reconciliation_phase"]
+    if model_run_id is None or stage is None or submission_state is None or not phase:
+        return None
+    return ProductionSubmissionReconciliation(
+        production_run_id=run_id,
+        model_run_id=model_run_id,
+        stage=SubjectProductionStage(stage),
+        bridge_response_id=row["reconciliation_bridge_response_id"],
+        submission_state=ModelSubmissionState(submission_state),
+        phase=phase,
+        output_sha256=row["reconciliation_output_sha256"],
+        provenance=row["reconciliation_provenance"],
+    )
+
+
 def _read_item_from_row(row: Any) -> EditionReviewReadItem:
     run_status = SubjectProductionStatus(row["run_status"])
     artifact_status = (
@@ -227,11 +270,14 @@ def _read_item_from_row(row: Any) -> EditionReviewReadItem:
         else None
     )
     artifact_verified = artifact_status is ProductionArtifactStatus.VERIFIED
-    can_retry = run_status in {
-        SubjectProductionStatus.FAILED,
-        SubjectProductionStatus.NEEDS_REVIEW,
-        SubjectProductionStatus.CANCELLED,
-    } or (run_status is SubjectProductionStatus.READY and not artifact_verified)
+    reconciliation = _reconciliation_from_row(row, row["run_id"])
+    can_retry = review_item_can_retry(
+        run_status,
+        artifact_verified=artifact_verified,
+        reconciliation_required=requires_reconciliation(
+            run_status, row["error_code"], reconciliation
+        ),
+    )
     return EditionReviewReadItem(
         position=row["position"],
         subject_id=row["subject_id"],
@@ -250,4 +296,5 @@ def _read_item_from_row(row: Any) -> EditionReviewReadItem:
             PublicationDecision(row["decision"]) if row["decision"] is not None else None
         ),
         retry_stage=SubjectProductionStage(row["current_stage"]) if can_retry else None,
+        reconciliation=reconciliation,
     )

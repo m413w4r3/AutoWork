@@ -330,13 +330,16 @@ async def test_reconciliation_resume_consumes_exact_archived_run_and_same_genera
     assert run.current_stage is SubjectProductionStage.SYNTHESIS
     assert jobs.submitted[0].kind == stage_job_kind(SubjectProductionStage.SYNTHESIS)
     assert jobs.submitted[0].idempotency_key == f"production-synthesis-{run.id}-g11"
-    assert production_reconciliation_resume_idempotency_key(
-        run.id,
-        SubjectProductionStage.EXTRACTION,
-        11,
-        model_run_id,
-        output_sha256,
-    ) != jobs.submitted[0].idempotency_key
+    assert (
+        production_reconciliation_resume_idempotency_key(
+            run.id,
+            SubjectProductionStage.EXTRACTION,
+            11,
+            model_run_id,
+            output_sha256,
+        )
+        != jobs.submitted[0].idempotency_key
+    )
 
 
 async def test_cancelled_run_is_a_worker_fence(uow: _Uow, monkeypatch: pytest.MonkeyPatch) -> None:

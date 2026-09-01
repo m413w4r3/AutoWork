@@ -45,9 +45,7 @@ class ActiveProductionEditionError(ValueError):
     code = "active_production_requires_cancellation"
 
     def __init__(self) -> None:
-        super().__init__(
-            "Active production must be stopped before the edition can be archived"
-        )
+        super().__init__("Active production must be stopped before the edition can be archived")
 
 
 _USE_CASE_OWNED_TRANSITIONS = {

@@ -70,9 +70,26 @@ class _EditionRepo:
 class _BatchRepo:
     def __init__(self, batch: EditionProductionBatch) -> None:
         self.batch = batch
+        self.saves = 0
+
+    async def get(self, batch_id: UUID):
+        return self.batch if batch_id == self.batch.id else None
 
     async def get_for_update(self, batch_id: UUID):
-        return self.batch if batch_id == self.batch.id else None
+        return await self.get(batch_id)
+
+    async def get_active_for_edition(self, edition_id: UUID):
+        if self.batch.edition_id != edition_id:
+            return None
+        return (
+            self.batch
+            if self.batch.status in {ProductionBatchStatus.QUEUED, ProductionBatchStatus.RUNNING}
+            else None
+        )
+
+    async def save(self, batch: EditionProductionBatch) -> None:
+        self.batch = batch
+        self.saves += 1
 
 
 class _Items:
@@ -95,12 +112,19 @@ class _Manifests:
 
 
 class _Uow:
-    def __init__(self, run: SubjectProductionRun, model: ModelRun) -> None:
-        edition = SimpleNamespace(id=run.edition_id, status=EditionStatus.PRODUCTION)
+    def __init__(
+        self,
+        run: SubjectProductionRun,
+        model: ModelRun,
+        *,
+        edition_status: EditionStatus = EditionStatus.PRODUCTION,
+        batch_status: ProductionBatchStatus = ProductionBatchStatus.RUNNING,
+    ) -> None:
+        edition = SimpleNamespace(id=run.edition_id, status=edition_status)
         batch = EditionProductionBatch(
             id=uuid4(),
             edition_id=run.edition_id,
-            status=ProductionBatchStatus.RUNNING,
+            status=batch_status,
             phase=ProductionBatchPhase.REVIEW,
         )
         item = EditionProductionBatchItem(
@@ -204,13 +228,14 @@ class _Dispatcher:
         self.dispatched.append(job_id)
 
 
-ReconciliationFixture = tuple[
-    ProductionReconciliationService, _Uow, _Gateway, _Bridge, _Jobs
-]
+ReconciliationFixture = tuple[ProductionReconciliationService, _Uow, _Gateway, _Bridge, _Jobs]
 
 
-@pytest.fixture
-def fixture() -> ReconciliationFixture:
+def _build_fixture(
+    *,
+    edition_status: EditionStatus = EditionStatus.PRODUCTION,
+    batch_status: ProductionBatchStatus = ProductionBatchStatus.RUNNING,
+) -> ReconciliationFixture:
     edition_id, subject_id = uuid4(), uuid4()
     model_id = uuid4()
     model = ModelRun(
@@ -248,14 +273,37 @@ def fixture() -> ReconciliationFixture:
         submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
         phase="reconciliation",
     )
-    uow = _Uow(run, model)
+    uow = _Uow(run, model, edition_status=edition_status, batch_status=batch_status)
     gateway = _Gateway(model)
     bridge = _Bridge("bridge-1", "# recovered\n\nanswer")
     jobs = _Jobs()
     service = ProductionReconciliationService(
-        lambda: uow, gateway, jobs, _Dispatcher(), bridge  # type: ignore[arg-type]
+        lambda: uow,
+        gateway,
+        jobs,
+        _Dispatcher(),
+        bridge,  # type: ignore[arg-type]
     )
     return service, uow, gateway, bridge, jobs
+
+
+@pytest.fixture
+def fixture() -> ReconciliationFixture:
+    return _build_fixture()
+
+
+@pytest.fixture
+def review_fixture() -> ReconciliationFixture:
+    """The state actually reached after a production that finished with issues.
+
+    The batch is terminal, its phase is review, and the edition already moved
+    on to review.  Nothing here is hypothetical: this is what an operator sees
+    when a single article stopped on an ambiguous ChatGPT submission.
+    """
+    return _build_fixture(
+        edition_status=EditionStatus.REVIEW,
+        batch_status=ProductionBatchStatus.COMPLETED_WITH_ISSUES,
+    )
 
 
 @pytest.mark.asyncio
@@ -370,3 +418,106 @@ async def test_resume_safety_fences_are_typed_conflicts(
     assert gateway.model.status is ModelRunStatus.NEEDS_REVIEW
     assert jobs.submissions == 0
     assert bridge.releases == 0
+
+
+@pytest.mark.asyncio
+async def test_adoption_reopens_the_finished_batch_for_a_review_recovery(
+    review_fixture: ReconciliationFixture,
+) -> None:
+    """The batch is the dispatch fence, so the resume must reopen it."""
+    service, uow, _, _, jobs = review_fixture
+    run = next(iter(uow.subject_production_runs.runs.values()))
+    expected = hashlib.sha256(b"# recovered\n\nanswer").hexdigest()
+
+    result = await service.adopt_visible(run.id, expected, actor_id="analyst")
+
+    batch = uow.edition_production_batches.batch
+    assert batch.status is ProductionBatchStatus.RUNNING
+    assert batch.phase is ProductionBatchPhase.REVIEW
+    assert batch.finished_at is None
+    assert run.status is SubjectProductionStatus.RUNNING
+    # The exact archived answer is resumed: same generation, no new prompt.
+    assert run.pipeline_generation == 7
+    assert result["pipeline_generation"] == 7
+    assert jobs.submissions == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_adoption_reopens_once_and_submits_one_job(
+    review_fixture: ReconciliationFixture,
+) -> None:
+    service, uow, _, _, jobs = review_fixture
+    run = next(iter(uow.subject_production_runs.runs.values()))
+    expected = hashlib.sha256(b"# recovered\n\nanswer").hexdigest()
+
+    await service.adopt_visible(run.id, expected, actor_id="analyst")
+    saves_after_first = uow.edition_production_batches.saves
+    await service.adopt_visible(run.id, expected, actor_id="analyst")
+
+    assert jobs.submissions == 1
+    assert len(jobs.jobs) == 1
+    # The second call finds a dispatchable batch and changes nothing.
+    assert uow.edition_production_batches.saves == saves_after_first
+
+
+@pytest.mark.asyncio
+async def test_cancelled_batch_is_never_reopened_by_a_review_recovery(
+    review_fixture: ReconciliationFixture,
+) -> None:
+    service, uow, gateway, _, jobs = review_fixture
+    run = next(iter(uow.subject_production_runs.runs.values()))
+    uow.edition_production_batches.batch.status = ProductionBatchStatus.CANCELLED
+
+    with pytest.raises(ProductionReconciliationError) as error:
+        await service.adopt_visible(
+            run.id, hashlib.sha256(b"# recovered\n\nanswer").hexdigest(), actor_id="analyst"
+        )
+
+    assert error.value.code == "production_reconciliation_batch_cancelled"
+    assert uow.edition_production_batches.batch.status is ProductionBatchStatus.CANCELLED
+    assert gateway.model.status is ModelRunStatus.NEEDS_REVIEW
+    assert jobs.submissions == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", ["frozen", "sibling", "assembling"])
+async def test_terminal_batch_recovery_keeps_every_publication_fence(
+    review_fixture: ReconciliationFixture, blocked: str
+) -> None:
+    service, uow, gateway, _, jobs = review_fixture
+    run = next(iter(uow.subject_production_runs.runs.values()))
+    if blocked == "frozen":
+        uow.publication_manifests.frozen = True
+    elif blocked == "assembling":
+        uow.editions.edition.status = EditionStatus.ASSEMBLING
+    else:
+        sibling = SubjectProductionRun(
+            subject_id=uuid4(),
+            edition_id=run.edition_id,
+            status=SubjectProductionStatus.RUNNING,
+            current_stage=SubjectProductionStage.SOURCES,
+        )
+        uow.subject_production_runs.runs[sibling.id] = sibling
+        uow.edition_production_batch_items.items.append(
+            EditionProductionBatchItem(
+                batch_id=uow.edition_production_batches.batch.id,
+                subject_id=sibling.subject_id,
+                production_run_id=sibling.id,
+                position=2,
+            )
+        )
+
+    with pytest.raises(ProductionReconciliationError) as error:
+        await service.adopt_manual(
+            run.id, "manual", hashlib.sha256(b"manual").hexdigest(), actor_id="analyst"
+        )
+
+    assert error.value.code in {
+        "production_reconciliation_publication_frozen",
+        "production_reconciliation_active_sibling",
+    }
+    assert uow.edition_production_batches.batch.status is (
+        ProductionBatchStatus.COMPLETED_WITH_ISSUES
+    )
+    assert gateway.model.status is ModelRunStatus.NEEDS_REVIEW
+    assert jobs.submissions == 0

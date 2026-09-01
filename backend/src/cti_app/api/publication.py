@@ -8,6 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from cti_app.api.production import ProductionReconciliationView, reconciliation_view
 from cti_app.application.edition_publication import (
     EditionPublicationService,
     EditionReleaseStatus,
@@ -88,8 +89,13 @@ class ReviewItemView(BaseModel):
     effective_decision_id: UUID | None
     included: bool
     blocking: bool
+    # The frontend must never infer the retry policy from an error message:
+    # ``can_retry`` and ``requires_reconciliation`` are mutually exclusive and
+    # each names exactly one operator action.
     can_retry: bool
     retry_stage: SubjectProductionStage | None
+    requires_reconciliation: bool = False
+    reconciliation: ProductionReconciliationView | None = None
 
 
 class EditionReviewView(BaseModel):
@@ -343,6 +349,12 @@ def _review_view(review: EditionReview) -> EditionReviewView:
                 blocking=item.blocking,
                 can_retry=item.can_retry,
                 retry_stage=item.retry_stage,
+                requires_reconciliation=item.requires_reconciliation,
+                reconciliation=reconciliation_view(
+                    item.run_id,
+                    item.reconciliation,
+                    pipeline_generation=item.pipeline_generation,
+                ),
             )
             for item in review.items
         ],

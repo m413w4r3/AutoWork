@@ -314,7 +314,7 @@ def _run_view(
     }
 
 
-def _reconciliation_view(
+def reconciliation_view(
     run_id: UUID,
     reconciliation: ProductionSubmissionReconciliation | None,
     *,
@@ -367,7 +367,7 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
                 error_message=item.error_message,
                 extraction_progress=item.extraction_progress,
                 reconciliation=(
-                    _reconciliation_view(
+                    reconciliation_view(
                         item.run_id,
                         item.reconciliation
                         if item.status is SubjectProductionStatus.NEEDS_REVIEW
@@ -811,7 +811,7 @@ async def get_subject_production(
             error_details=run.error_details,
             extraction_progress=run.extraction_progress,
             reconciliation=(
-                _reconciliation_view(
+                reconciliation_view(
                     run.id,
                     run.reconciliation
                     if run.status is SubjectProductionStatus.NEEDS_REVIEW

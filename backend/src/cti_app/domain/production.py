@@ -898,6 +898,16 @@ class ProductionBatchCancellationConflictError(ValueError):
         super().__init__(f"Production batch in {status.value} status cannot be cancelled")
 
 
+class ProductionBatchRecoveryConflictError(ValueError):
+    """Raised when a batch cannot be reopened for a Review-time recovery."""
+
+    code = "production_batch_not_recoverable"
+
+    def __init__(self, status: ProductionBatchStatus) -> None:
+        self.status = status
+        super().__init__(f"Production batch in {status.value} status cannot be reopened")
+
+
 @dataclass(slots=True, kw_only=True)
 class EditionProductionBatch:
     edition_id: UUID
@@ -974,6 +984,34 @@ class EditionProductionBatch:
         self.phase = ProductionBatchPhase.REVIEW
         self.next_dispatch_at = None
         self.version += 1
+
+    def open_review_recovery(self, *, now: datetime | None = None) -> bool:
+        """Reopen a finished batch so one reviewed article can run again.
+
+        A production batch is the serialization point for dispatch: every
+        fence only lets a QUEUED or RUNNING batch move a subject forward.  An
+        operator correcting one article from Review therefore needs the batch
+        to be dispatchable again, without reopening the whole edition in
+        production.  This is that explicit transition, and it is the only way
+        back out of a finished batch.
+
+        ``CANCELLED`` stays an absolute barrier: a compensated batch is never
+        reopened.  A batch that is already dispatchable is left untouched, so
+        an ordinary retry during initial production keeps its own phase.
+
+        Returns whether the batch actually changed.
+        """
+        if self.status is ProductionBatchStatus.CANCELLED:
+            raise ProductionBatchRecoveryConflictError(self.status)
+        if self.status in {ProductionBatchStatus.QUEUED, ProductionBatchStatus.RUNNING}:
+            return False
+        self.status = ProductionBatchStatus.RUNNING
+        self.phase = ProductionBatchPhase.REVIEW
+        self.next_dispatch_at = None
+        self.finished_at = None
+        self.started_at = self.started_at or now or datetime.now(UTC)
+        self.version += 1
+        return True
 
 
 @dataclass(slots=True, kw_only=True)
