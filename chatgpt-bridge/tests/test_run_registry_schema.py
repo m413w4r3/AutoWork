@@ -6,6 +6,7 @@ empty database path must produce the final canonical schema directly, with
 no ALTER TABLE / rename / backfill path involved.
 """
 
+import json
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -97,3 +98,28 @@ class TestFreshSchema:
 
         with pytest.raises(RuntimeError, match="bridge-runs.sqlite3"):
             RunRegistry(temp_db)
+
+    def test_interrupted_run_keeps_exact_identity_for_explicit_recovery(self, temp_db):
+        registry = RunRegistry(temp_db)
+        record, created = registry.claim("restart-key", "request-hash")
+        assert created is True
+        registry.set_state("restart-key", "running")
+
+        registry.recover_interrupted()
+        recovered = registry.get_by_run_id(record["bridge_run_id"])
+        assert recovered is not None
+        assert recovered["state"] == "failed"
+        stored = json.loads(recovered["error_json"])
+
+        assert stored["body"]["id"] == record["bridge_run_id"]
+        assert stored["body"]["error"] == {
+            "code": "bridge_server_error",
+            "message": "Le bridge a redémarré pendant cette exécution.",
+            "retryable": False,
+            "phase": "shutdown",
+            "submission_state": "submission_attempted",
+        }
+        # A second startup pass must not rewrite the terminal evidence.
+        before = recovered["error_json"]
+        registry.recover_interrupted()
+        assert registry.get_by_run_id(record["bridge_run_id"])["error_json"] == before

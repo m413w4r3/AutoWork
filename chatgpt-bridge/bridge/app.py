@@ -135,11 +135,14 @@ class BridgeApplication:
         pending = tracked
         if tracked and grace_seconds > 0:
             _, pending = await asyncio.wait(tracked, timeout=grace_seconds)
-        await self.bridge.close()
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        # Let cancellation handlers retain ambiguous browser targets while the
+        # WebSocket is still open. Closing first would strand a stateless
+        # Temporary Chat in the submitted state, making exact recovery fail.
+        await self.bridge.close()
         self.registry.checkpoint_and_close()
         logger.info("bridge_shutdown_completed cancelled_runs=%s", len(pending))
 

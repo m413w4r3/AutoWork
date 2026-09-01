@@ -96,5 +96,13 @@ async def test_shutdown_during_run_fails_safe_without_second_prompt(
     replay = await create_bridge_run(req, request_with_key("sigterm-run"))
 
     assert replay.status_code == 503
-    assert json.loads(replay.body)["error"]["code"] == "bridge_server_error"
+    body = json.loads(replay.body)
+    assert body["error"]["code"] == "bridge_server_error"
+    assert body["error"]["phase"] == "shutdown"
+    assert body["error"]["submission_state"] == "submission_attempted"
+    assert body["error"]["retryable"] is False
+    retains = [message for message in extension.sent if message["type"] == "browser_target_retain"]
+    assert len(retains) == 1
+    assert retains[0]["run_id"] == body["id"]
+    assert retains[0]["browser_target"]["id"] == f"bridge-run-{body['id']}"
     assert replacement.prompt_count == 0

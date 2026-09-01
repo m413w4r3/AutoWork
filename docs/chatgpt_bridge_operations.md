@@ -72,8 +72,10 @@ heartbeats de l'extension ne sont jamais concaténés au contenu final.
 - timeout ou déconnexion du client : la tâche bridge continue et le retry joint
   le run initial ;
 - redémarrage après un run terminé : replay SQLite, sans interaction UI ;
-- redémarrage pendant un run : échec sûr `bridge_server_error`, sans nouvelle
-  soumission implicite, car le bridge ne peut pas prouver si le clic a eu lieu.
+- redémarrage pendant un run : échec sûr `bridge_server_error` marqué
+  `submission_attempted`, sans nouvelle soumission implicite ; si l'onglet
+  Temporary Chat exact est encore disponible, l'opérateur peut lancer la
+  recovery visible, sinon il doit l'abandonner explicitement.
 
 L’extension garde en plus les `request_id` dans `chrome.storage.local`. Le
 background réserve l’ID avant tout envoi au content script, et le content script
@@ -103,6 +105,12 @@ les menus ChatGPT, attend le verrou de génération et renvoie une erreur typée
 | `bridge_auth_failed` | non | corriger/faire tourner le secret HTTP |
 | `bridge_payload_conflict` | non | corriger la génération de clé |
 | `bridge_protocol_error` | non | aligner versions/contrats |
+
+Le champ `submission_state` prime le tableau : `pre_submission` peut être
+retenté après nettoyage ; `submission_attempted` ou `post_submission` exige la
+réconciliation du run exact avant toute autre action. Une recovery visible
+réussie se confirme par le SHA-256 attendu, puis seulement la target exacte
+peut être libérée.
 
 Un POST n’est jamais retenté automatiquement sans clé stable. Avec une clé, le
 transport applique un backoff borné avec jitter aux seules erreurs transitoires,
@@ -136,9 +144,11 @@ l’en-tête Bearer dans le conteneur et n’affiche jamais le secret.
 `make up` démarre et attend la stack ; `make down` l’arrête sans supprimer les
 volumes. `make restart-bridge` recrée uniquement le bridge. À la réception de
 SIGTERM, le bridge refuse les nouveaux runs, draine ceux déjà engagés pendant
-`BRIDGE_SHUTDOWN_GRACE_SECONDS`, ferme le WebSocket, annule le reliquat avec un
-échec sûr, puis effectue le checkpoint SQLite. Au redémarrage, les états
-`queued` ou `running` sont transformés en échec et ne sont jamais resoumis.
+`BRIDGE_SHUTDOWN_GRACE_SECONDS`, marque le reliquat comme soumission ambiguë,
+conserve sa target exacte pour une recovery explicite, puis ferme le WebSocket
+et effectue le checkpoint SQLite. Au redémarrage, les états `queued` ou
+`running` sont transformés en échec `submission_attempted` et ne sont jamais
+resoumis.
 
 ## Test manuel de non-duplication
 

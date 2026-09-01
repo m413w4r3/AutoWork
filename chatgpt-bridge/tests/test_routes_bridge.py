@@ -539,6 +539,53 @@ async def test_stateless_incomplete_recovery_uses_canonical_target_and_release(
     )
 
 
+async def test_interrupted_stateless_run_recovers_by_exact_run_target(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    key = "interrupted-stateless"
+    record, created = runtime.bridge_routes.registry.claim(key, "request-hash")
+    assert created is True
+    runtime.bridge_routes.registry.set_state(key, "running")
+    runtime.bridge_routes.registry.recover_interrupted()
+
+    class RecoveryExtension:
+        def __init__(self) -> None:
+            self.runtime = runtime
+            self.payloads: list[dict[str, Any]] = []
+
+        async def send_json(self, payload: dict[str, Any]) -> None:
+            self.payloads.append(payload)
+            if payload["type"] == "recovery_capture":
+                target_id = payload["browser_target"]["id"]
+                self.runtime.bridge.dispatch(
+                    {
+                        "type": "recovery_preview",
+                        "id": payload["id"],
+                        "target_id": target_id,
+                        "bridge_run_id": payload["bridge_run_id"],
+                        "turn_id": "assistant-recovered",
+                        "text": "réponse après redémarrage",
+                        "metadata": {},
+                    }
+                )
+
+    extension = RecoveryExtension()
+    runtime.bridge.ws = extension
+    preview = await runtime.bridge_routes.preview_visible_recovery(record["bridge_run_id"])
+
+    assert preview["bridge_run_id"] == record["bridge_run_id"]
+    assert len(extension.payloads) == 1
+    payload = extension.payloads[0]
+    assert payload["type"] == "recovery_capture"
+    assert payload["bridge_run_id"] == record["bridge_run_id"]
+    assert payload["browser_target"] == {
+        "kind": "temporary_chat_run",
+        "id": f"bridge-run-{record['bridge_run_id']}",
+    }
+    assert payload["assistant_turn_id"] is None
+
+
 async def test_done_rejects_incoherent_output_chars(
     runtime: BridgeApplication, tmp_path: Path
 ) -> None:

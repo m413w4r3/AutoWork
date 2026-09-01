@@ -838,22 +838,29 @@ async function handlePrompt(msg) {
   try {
     await sendToTab(tab.id, msg);
   } catch (err) {
+    const route = requestRoutes.get(msg.id);
     inflight.delete(msg.id);
     busyTabs.delete(tab.id);
-    await cleanupReservationAfterDeliveryFailure(msg, requestRoutes.get(msg.id));
-    requestRoutes.delete(msg.id);
+    // chrome.tabs.sendMessage does not tell us whether the content script
+    // received the packet before the delivery error.  Treat the handoff as
+    // ambiguous: deleting the exact target here could lose a submitted
+    // Temporary Chat, while retrying it could click Send twice.
+    if (msg.browser_target) {
+      await retainBrowserTargetForRecovery(msg.id, route);
+    }
     requestStates.set(msg.id, "failed");
     persistRequestStates();
     send({
       type: "error",
       id: msg.id,
-      code: "bridge_server_error",
+      code: "bridge_extension_disconnected",
       message: `Onglet injoignable : ${err.message}`,
-      phase: "pre_submission",
-      submission_state: "pre_submission",
+      phase: "submission_confirmation",
+      submission_state: "submission_attempted",
       target_id: msg.browser_target?.id || null,
       tab_id: tab.id,
     });
+    requestRoutes.delete(msg.id);
   }
 }
 

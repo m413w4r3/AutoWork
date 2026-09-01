@@ -74,25 +74,42 @@ class RunRegistry:
         # Après un arrêt, il est impossible de prouver si le clic UI a eu lieu.
         # Ne jamais resoumettre est la seule reprise sûre. Cette transition se
         # fait au démarrage réel, pas au simple import du module par les tests.
-        interrupted = json.dumps(
-            {
-                "status_code": 503,
-                "body": {
-                    "error": {
-                        "code": "bridge_server_error",
-                        "message": "Le bridge a redémarré pendant cette exécution.",
-                        "retryable": True,
-                    }
-                },
-            },
-            separators=(",", ":"),
-        )
         with self._lock, self._connect() as db:
-            db.execute(
-                "UPDATE bridge_runs SET state='failed', error_json=?, updated_at=? "
-                "WHERE state IN ('queued','running')",
-                (interrupted, time.time()),
-            )
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT idempotency_key, bridge_run_id FROM bridge_runs "
+                "WHERE state IN ('queued','running')"
+            ).fetchall()
+            now = time.time()
+            for row in rows:
+                interrupted = json.dumps(
+                    {
+                        "status_code": 503,
+                        "body": {
+                            "id": row["bridge_run_id"],
+                            "object": "response",
+                            "status": "failed",
+                            "error": {
+                                "code": "bridge_server_error",
+                                "message": "Le bridge a redémarré pendant cette exécution.",
+                                "retryable": False,
+                                "phase": "shutdown",
+                                # A restart cannot prove whether the browser
+                                # received the prompt. Keep the exact
+                                # request-scoped target eligible for explicit
+                                # recovery, never for an implicit replay.
+                                "submission_state": "submission_attempted",
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+                db.execute(
+                    "UPDATE bridge_runs SET state='failed', error_json=?, updated_at=? "
+                    "WHERE idempotency_key=?",
+                    (interrupted, now, row["idempotency_key"]),
+                )
+            db.execute("COMMIT")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10, isolation_level=None)

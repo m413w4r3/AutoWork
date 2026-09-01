@@ -48,12 +48,8 @@ logger = logging.getLogger("chatgpt_bridge")
 def _record_submission_state(record: dict[str, Any]) -> str | None:
     if record.get("state") == "needs_review":
         return "post_submission"
-    raw = record.get("error_json")
-    if not isinstance(raw, str):
-        return None
-    try:
-        body = json.loads(raw)
-    except json.JSONDecodeError:
+    body = _stored_error_body(record)
+    if body is None:
         return None
     error = body.get("error") if isinstance(body, dict) else None
     if not isinstance(error, dict):
@@ -63,14 +59,8 @@ def _record_submission_state(record: dict[str, Any]) -> str | None:
 
 
 def _recovery_assistant_turn_id(record: dict[str, Any]) -> str | None:
-    raw = record.get("error_json")
-    if not isinstance(raw, str):
-        return None
-    try:
-        body = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(body, dict):
+    body = _stored_error_body(record)
+    if body is None:
         return None
     error = body.get("error")
     details = error.get("details") if isinstance(error, dict) else None
@@ -83,6 +73,20 @@ def _recovery_assistant_turn_id(record: dict[str, Any]) -> str | None:
             if isinstance(value, str) and 0 < len(value) <= 512:
                 return value
     return None
+
+
+def _stored_error_body(record: dict[str, Any]) -> dict[str, Any] | None:
+    raw = record.get("error_json")
+    if not isinstance(raw, str):
+        return None
+    try:
+        stored = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(stored, dict):
+        return None
+    body = stored.get("body")
+    return body if isinstance(body, dict) else stored
 
 
 def _bounded_recovery_metadata(packet: dict[str, Any]) -> dict[str, Any]:
@@ -332,11 +336,14 @@ class BridgeRoutes:
                     "status_code": 503,
                     "body": {
                         "id": run_id,
+                        "object": "response",
                         "status": "failed",
                         "error": {
                             "code": "bridge_server_error",
                             "message": "Le bridge a interrompu cette exécution pendant son arrêt.",
-                            "retryable": True,
+                            "retryable": False,
+                            "phase": "shutdown",
+                            "submission_state": "submission_attempted",
                         }
                     },
                 }

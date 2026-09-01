@@ -119,6 +119,18 @@ async def _release_browser_target_if_safe(
         await _release_browser_target(bridge, target, run_id)
 
 
+async def _release_browser_target_for_detail(
+    bridge: Bridge,
+    target: BridgeBrowserTarget | None,
+    run_id: str,
+    detail: dict[str, Any],
+) -> None:
+    if detail.get("submission_state") in {"submission_attempted", "post_submission"}:
+        await _retain_browser_target(bridge, target, run_id)
+    else:
+        await _release_browser_target(bridge, target, run_id)
+
+
 def _upstream_error_detail(exc: UpstreamError) -> dict[str, Any]:
     detail: dict[str, Any] = {
         "code": exc.code,
@@ -130,6 +142,34 @@ def _upstream_error_detail(exc: UpstreamError) -> dict[str, Any]:
     if exc.details:
         detail["details"] = exc.details
     return detail
+
+
+def _http_exception_detail(exc: HTTPException) -> dict[str, Any]:
+    """Keep typed bridge errors intact in the in-memory Responses cache."""
+    if isinstance(exc.detail, dict):
+        return dict(exc.detail)
+    return {
+        "code": "bridge_server_error",
+        "message": str(exc.detail),
+        "retryable": exc.status_code in {408, 429, 502, 503, 504},
+    }
+
+
+def _background_error_response(
+    response_id: str, req: ResponseRequest, detail: dict[str, Any]
+) -> dict[str, Any]:
+    response = _response_body(
+        response_id,
+        req,
+        status="failed",
+        error=str(detail.get("message") or detail.get("code") or "bridge error"),
+    )
+    response["error"] = detail
+    for key in ("phase", "submission_state"):
+        value = detail.get(key)
+        if isinstance(value, str):
+            response["metadata"][key] = value
+    return response
 
 
 class OpenAIRoutes:
@@ -253,13 +293,36 @@ class OpenAIRoutes:
             response["metadata"]["reason"] = exc.reason
             response["metadata"]["submission_state"] = "post_submission"
             self.background_responses[response_id] = response
+        except asyncio.CancelledError:
+            await _retain_browser_target(self.bridge, browser_target, response_id)
+            self.background_responses[response_id] = _background_error_response(
+                response_id,
+                req,
+                {
+                    "code": "bridge_server_error",
+                    "message": "Le bridge a interrompu cette exécution pendant son arrêt.",
+                    "retryable": False,
+                    "phase": "shutdown",
+                    "submission_state": "submission_attempted",
+                },
+            )
+            raise
+        except UpstreamError as exc:
+            await _release_browser_target_if_safe(self.bridge, browser_target, response_id, exc)
+            self.background_responses[response_id] = _background_error_response(
+                response_id, req, _upstream_error_detail(exc)
+            )
+            print(f"⚠️  Réponse de fond {response_id} refusée : {exc}")
         except HTTPException as exc:
-            await _release_browser_target(self.bridge, browser_target, response_id)
-            # Un contrôle d'interface refusé est un diagnostic actionnable, pas
-            # une fuite : on le rend tel quel, contrairement aux erreurs de
-            # génération.
-            self.background_responses[response_id] = _response_body(
-                response_id, req, status="failed", error=str(exc.detail)
+            # Preserve any structured code/phase/submission state; flattening
+            # here would turn a typed UI timeout into an unrecoverable generic
+            # bridge error.
+            detail = _http_exception_detail(exc)
+            await _release_browser_target_for_detail(
+                self.bridge, browser_target, response_id, detail
+            )
+            self.background_responses[response_id] = _background_error_response(
+                response_id, req, detail
             )
             print(f"⚠️  Réponse de fond {response_id} refusée : {exc.detail}")
         except Exception as exc:  # noqa: BLE001 - erreur publique nettoyée ci-dessous
@@ -340,6 +403,9 @@ class OpenAIRoutes:
                     report.target_id,
                     report.tab_id,
                 )
+            except asyncio.CancelledError:
+                await _retain_browser_target(self.bridge, browser_target, response_id)
+                raise
             except Exception:
                 await _release_browser_target(self.bridge, browser_target, response_id)
                 raise
@@ -362,6 +428,9 @@ class OpenAIRoutes:
                         extension_metadata=extension_metadata,
                     )
                 ]
+            except asyncio.CancelledError:
+                await _retain_browser_target(self.bridge, browser_target, response_id)
+                raise
             except NeedsReviewError:
                 await _retain_browser_target(self.bridge, browser_target, response_id)
                 raise

@@ -293,8 +293,9 @@ async function main() {
     assert.equal(await run('conversationRegistry.has("conv-A")'), false);
   }
 
-  // 9. A completely failed FRESH delivery removes the reservation and allows
-  // a clean retry without leaving an orphaned submitted binding.
+  // 9. A delivery error is ambiguous: Chrome does not tell us whether the
+  // content script received the prompt before sendMessage failed. Keep the
+  // exact submitted FRESH binding and refuse a second submission.
   {
     const mock = makeChromeMock();
     let sendMessageCalls = 0;
@@ -314,19 +315,42 @@ async function main() {
 
     await run(`handlePrompt(${JSON.stringify(fresh)})`);
     assert.equal(await run('requestStates.get("req-1")'), "failed");
-    assert.equal(await run('conversationRegistry.has("conv-A")'), false);
-    assert.equal(mock.tabsById.size, 0);
+    assert.equal(await run('conversationRegistry.get("conv-A").state'), "submitted");
+    assert.equal(await run('conversationRegistry.get("conv-A").bridge_run_id'), "req-1");
+    assert.equal(mock.tabsById.size, 1);
 
-    mock.chrome.tabs.sendMessage = async () => {
-      sendMessageCalls += 1;
-      return {};
-    };
     await run(
       `handlePrompt(${JSON.stringify({ ...fresh, id: "req-2" })})`,
     );
-    assert.equal(mock.tabsById.size, 1, "retry FRESH must create one new tab");
-    assert.equal(await run('conversationRegistry.get("conv-A").state'), "submitted");
-    assert.equal(sendMessageCalls, 2, "failed delivery rejects, then retry sends once");
+    assert.equal(mock.tabsById.size, 1, "retry FRESH must not create a replacement tab");
+    assert.equal(sendMessageCalls, 1, "ambiguous delivery must never send a second prompt");
+    const errorMsg = await run('enAttente.find((m) => m.id === "req-1" && m.type === "error")');
+    assert.equal(errorMsg.code, "bridge_extension_disconnected");
+    assert.equal(errorMsg.phase, "submission_confirmation");
+    assert.equal(errorMsg.submission_state, "submission_attempted");
+  }
+
+  // 9b. A stateless delivery error keeps the exact request-scoped target
+  // recoverable and a new request cannot reserve another Temporary Chat.
+  {
+    const mock = makeChromeMock();
+    let sendMessageCalls = 0;
+    mock.chrome.tabs.sendMessage = async () => {
+      sendMessageCalls += 1;
+      throw new Error("content script unavailable");
+    };
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-ambiguous" };
+    const prompt = { id: "req-stateless-1", prompt: "hello", browser_target: target };
+
+    await run(`handlePrompt(${JSON.stringify(prompt)})`);
+    assert.equal(await run('browserTargetRegistry.get("target-ambiguous").state'), "recoverable");
+    assert.equal(await run('browserTargetRegistry.get("target-ambiguous").bridge_run_id'), "req-stateless-1");
+    assert.equal(mock.tabsById.size, 1);
+
+    await run(`handlePrompt(${JSON.stringify({ ...prompt, id: "req-stateless-2" })})`);
+    assert.equal(mock.tabsById.size, 1, "recovery must not create a replacement tab");
+    assert.equal(sendMessageCalls, 1, "recovery must not submit a second prompt");
   }
 
   // 10. A content-script pre-submission error closes the exact reserved tab.

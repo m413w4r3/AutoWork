@@ -7,6 +7,7 @@ prompt-instruction fallback, and background `/v1/responses` completion.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -15,7 +16,12 @@ from starlette.requests import Request
 
 from bridge.app import BridgeApplication
 from bridge.contracts import ResponseRequest, RunControls
-from bridge.generation import NeedsReviewError, _response_body, _response_chat_request
+from bridge.generation import (
+    NeedsReviewError,
+    UpstreamError,
+    _response_body,
+    _response_chat_request,
+)
 from bridge.ui import prepare_run
 
 
@@ -177,6 +183,59 @@ async def test_responses_background_preserves_needs_review_reason(
     assert needs_review["status"] == "needs_review"
     assert needs_review["error"]["code"] == "active_signal_stalled"
     assert needs_review["metadata"]["reason"] == "active_signal_stalled"
+
+
+async def test_responses_background_preserves_typed_timeout_and_retains_target(
+    runtime: BridgeApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RetentionSpy:
+        def __init__(self) -> None:
+            self.messages: list[dict] = []
+
+        async def send_json(self, payload: dict) -> None:
+            self.messages.append(payload)
+
+    async def fake_prepare(*_: object, **__: object) -> SimpleNamespace:
+        return SimpleNamespace(target_id="target", tab_id=17)
+
+    async def timed_out_generation(*_: object, **__: object) -> AsyncIterator[str]:
+        raise UpstreamError(
+            "la génération UI a expiré",
+            code="bridge_ui_timeout",
+            retryable=True,
+            phase="generation",
+            submission_state="post_submission",
+            details={"assistant_turn_id": "turn-1"},
+        )
+        yield "unreachable"
+
+    globals_ = runtime.openai_routes._execute_background_response.__globals__
+    monkeypatch.setitem(globals_, "prepare_run", fake_prepare)
+    monkeypatch.setitem(globals_, "run_generation", timed_out_generation)
+    extension = RetentionSpy()
+    runtime.bridge.ws = extension
+
+    queued = await runtime.openai_routes.create_response(
+        ResponseRequest(input="Recherche autorisée", background=True), _request()
+    )
+    await runtime.openai_routes.background_tasks[queued["id"]]
+    failed = await runtime.openai_routes.retrieve_response(queued["id"])
+
+    assert failed["status"] == "failed"
+    assert failed["error"] == {
+        "code": "bridge_ui_timeout",
+        "message": "la génération UI a expiré",
+        "retryable": True,
+        "phase": "generation",
+        "submission_state": "post_submission",
+        "details": {"assistant_turn_id": "turn-1"},
+    }
+    assert failed["metadata"]["submission_state"] == "post_submission"
+    assert [message["type"] for message in extension.messages] == ["browser_target_retain"]
+    assert extension.messages[0]["browser_target"] == {
+        "kind": "temporary_chat_run",
+        "id": f"bridge-run-{queued['id']}",
+    }
 
 
 def _request() -> Request:
