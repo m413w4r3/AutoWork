@@ -417,6 +417,10 @@ class ChatGPTBridgeTransport(HttpResponsesTransport):
     async def preview_visible_recovery(self, bridge_run_id: str) -> dict[str, Any]:
         return await self._request("POST", f"/bridge/runs/{bridge_run_id}/recovery/visible")
 
+    async def release_visible_recovery(self, bridge_run_id: str) -> dict[str, Any]:
+        """Release only the exact browser target retained for this bridge run."""
+        return await self._request("POST", f"/bridge/runs/{bridge_run_id}/recovery/release")
+
     async def capabilities(self) -> dict[str, Any]:
         return await self._request(
             "GET", "/bridge/capabilities", timeout_seconds=self._capabilities_timeout

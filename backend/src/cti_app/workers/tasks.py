@@ -40,7 +40,11 @@ from cti_app.application.jobs import (
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_jobs import ProductionStageChain, stage_job_kind
+from cti_app.application.production_jobs import (
+    ProductionStageChain,
+    production_reconciliation_resume_job_kind,
+    stage_job_kind,
+)
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalRoutingPolicy
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
@@ -76,6 +80,7 @@ DURABLE_RESUME_JOB_KINDS = frozenset(
         EDITION_ASSEMBLE_JOB_KIND,
         DISCOVERY_JOB_KIND,
         *(stage_job_kind(stage) for stage in production_stages()),
+        production_reconciliation_resume_job_kind(),
     }
 )
 

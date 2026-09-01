@@ -24,6 +24,7 @@ from cti_app.domain.production import (
     ProductionInputSnapshot,
     ProductionInputSource,
     ProductionReuseInvalidation,
+    ProductionSubmissionReconciliation,
     SampleAcquisitionAttempt,
     SampleAcquisitionOutcome,
     SampleAcquisitionReason,
@@ -212,6 +213,29 @@ class SqlAlchemySubjectProductionRunRepository:
             error_code=run.error_code,
             error_message=run.error_message,
             error_details=run.error_details,
+            reconciliation_model_run_id=(
+                run.reconciliation.model_run_id if run.reconciliation is not None else None
+            ),
+            reconciliation_bridge_response_id=(
+                run.reconciliation.bridge_response_id if run.reconciliation is not None else None
+            ),
+            reconciliation_submission_state=(
+                run.reconciliation.submission_state.value
+                if run.reconciliation is not None
+                else None
+            ),
+            reconciliation_phase=(
+                run.reconciliation.phase if run.reconciliation is not None else None
+            ),
+            reconciliation_stage=(
+                run.reconciliation.stage.value if run.reconciliation is not None else None
+            ),
+            reconciliation_output_sha256=(
+                run.reconciliation.output_sha256 if run.reconciliation is not None else None
+            ),
+            reconciliation_provenance=(
+                run.reconciliation.provenance if run.reconciliation is not None else None
+            ),
             extraction_progress=run.extraction_progress,
             started_at=run.started_at,
             finished_at=run.finished_at,
@@ -264,6 +288,31 @@ class SqlAlchemySubjectProductionRunRepository:
                 error_code=run.error_code,
                 error_message=run.error_message,
                 error_details=run.error_details,
+                reconciliation_model_run_id=(
+                    run.reconciliation.model_run_id if run.reconciliation is not None else None
+                ),
+                reconciliation_bridge_response_id=(
+                    run.reconciliation.bridge_response_id
+                    if run.reconciliation is not None
+                    else None
+                ),
+                reconciliation_submission_state=(
+                    run.reconciliation.submission_state.value
+                    if run.reconciliation is not None
+                    else None
+                ),
+                reconciliation_phase=(
+                    run.reconciliation.phase if run.reconciliation is not None else None
+                ),
+                reconciliation_stage=(
+                    run.reconciliation.stage.value if run.reconciliation is not None else None
+                ),
+                reconciliation_output_sha256=(
+                    run.reconciliation.output_sha256 if run.reconciliation is not None else None
+                ),
+                reconciliation_provenance=(
+                    run.reconciliation.provenance if run.reconciliation is not None else None
+                ),
                 extraction_progress=run.extraction_progress,
                 started_at=run.started_at,
                 finished_at=run.finished_at,
@@ -807,6 +856,23 @@ class SqlAlchemyBatchStatusReadRepository:
                 SubjectProductionRunRow.error_code.label("error_code"),
                 SubjectProductionRunRow.error_message.label("error_message"),
                 SubjectProductionRunRow.extraction_progress.label("extraction_progress"),
+                SubjectProductionRunRow.reconciliation_model_run_id.label(
+                    "reconciliation_model_run_id"
+                ),
+                SubjectProductionRunRow.reconciliation_bridge_response_id.label(
+                    "reconciliation_bridge_response_id"
+                ),
+                SubjectProductionRunRow.reconciliation_submission_state.label(
+                    "reconciliation_submission_state"
+                ),
+                SubjectProductionRunRow.reconciliation_phase.label("reconciliation_phase"),
+                SubjectProductionRunRow.reconciliation_stage.label("reconciliation_stage"),
+                SubjectProductionRunRow.reconciliation_output_sha256.label(
+                    "reconciliation_output_sha256"
+                ),
+                SubjectProductionRunRow.reconciliation_provenance.label(
+                    "reconciliation_provenance"
+                ),
             )
             .select_from(EditionProductionBatchItemRow)
             .join(
@@ -835,6 +901,16 @@ class SqlAlchemyBatchStatusReadRepository:
                 error_code=row["error_code"],
                 error_message=row["error_message"],
                 extraction_progress=row.get("extraction_progress"),
+                reconciliation=_reconciliation_from_values(
+                    production_run_id=row["run_id"],
+                    model_run_id=row.get("reconciliation_model_run_id"),
+                    bridge_response_id=row.get("reconciliation_bridge_response_id"),
+                    submission_state=row.get("reconciliation_submission_state"),
+                    phase=row.get("reconciliation_phase"),
+                    stage=row.get("reconciliation_stage"),
+                    output_sha256=row.get("reconciliation_output_sha256"),
+                    provenance=row.get("reconciliation_provenance"),
+                ),
             )
             for row in rows
         ]
@@ -860,12 +936,56 @@ def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectPro
         error_code=row.error_code,
         error_message=row.error_message,
         error_details=row.error_details,
+        reconciliation=_reconciliation_from_values(
+            production_run_id=row.id,
+            model_run_id=row.reconciliation_model_run_id,
+            bridge_response_id=row.reconciliation_bridge_response_id,
+            submission_state=row.reconciliation_submission_state,
+            phase=row.reconciliation_phase,
+            stage=row.reconciliation_stage,
+            output_sha256=row.reconciliation_output_sha256,
+            provenance=row.reconciliation_provenance,
+        ),
         extraction_progress=row.extraction_progress,
         started_at=row.started_at,
         finished_at=row.finished_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
         version=row.version,
+    )
+
+
+def _reconciliation_from_values(
+    *,
+    production_run_id: UUID,
+    model_run_id: UUID | None,
+    bridge_response_id: str | None,
+    submission_state: str | None,
+    phase: str | None,
+    stage: str | None,
+    output_sha256: str | None,
+    provenance: str | None,
+) -> ProductionSubmissionReconciliation | None:
+    values = (model_run_id, submission_state, phase, stage)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ValueError("Incomplete persisted production reconciliation identity")
+    assert model_run_id is not None
+    assert submission_state is not None
+    assert phase is not None
+    assert stage is not None
+    from cti_app.domain.model_runs import ModelSubmissionState
+
+    return ProductionSubmissionReconciliation(
+        production_run_id=production_run_id,
+        model_run_id=model_run_id,
+        stage=SubjectProductionStage(stage),
+        bridge_response_id=bridge_response_id,
+        submission_state=ModelSubmissionState(submission_state),
+        phase=phase,
+        output_sha256=output_sha256,
+        provenance=provenance,
     )
 
 

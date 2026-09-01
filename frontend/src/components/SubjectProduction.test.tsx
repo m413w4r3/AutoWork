@@ -120,6 +120,58 @@ describe("SubjectProduction retry from stage", () => {
     },
   );
 
+  it("propose la récupération explicite sans afficher le retry générique", async () => {
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return Promise.resolve(
+          Response.json({
+            production_run_id: "r-1",
+            model_run_id: "m-1",
+            stage: "extraction",
+            pipeline_generation: 3,
+            bridge_response_id: "bridge-1",
+            submission_state: "submitted_or_unknown",
+            phase: "reconciliation",
+            text: "# réponse récupérée",
+            sha256: "a".repeat(64),
+            chars: 19,
+            metadata: {},
+            visible_available: true,
+          }),
+        );
+      }
+      return Promise.resolve(
+        Response.json({
+          ...status("needs_review"),
+          error_code: "model_submission_reconciliation_required",
+          reconciliation: {
+            production_run_id: "r-1",
+            model_run_id: "m-1",
+            bridge_response_id: "bridge-1",
+            submission_state: "submitted_or_unknown",
+            phase: "reconciliation",
+            stage: "extraction",
+            pipeline_generation: 3,
+            output_sha256: null,
+            provenance: null,
+            visible_available: true,
+            batch_id: null,
+          },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderProduction();
+    expect(
+      await screen.findByRole("heading", {
+        name: "Récupérer la réponse ChatGPT",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Relancer cette étape" }),
+    ).toBeNull();
+  });
+
   it("READY affiche un menu avec les cinq étapes", async () => {
     const readyBase = status("ready", "assembly");
     const ready = {

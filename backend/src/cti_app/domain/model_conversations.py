@@ -195,6 +195,26 @@ class ModelConversationTurn:
         self.status = ConversationTurnStatus.SUCCEEDED
         self.finished_at = now or datetime.now(UTC)
 
+    def adopt_recovery_output(
+        self,
+        *,
+        output_blob_reference: str,
+        output_sha256: str,
+        external_turn_id: str | None,
+        now: datetime | None = None,
+    ) -> None:
+        """Close a turn from an already-adopted exact ModelRun output."""
+        if self.status not in {ConversationTurnStatus.RUNNING, ConversationTurnStatus.NEEDS_REVIEW}:
+            raise ValueError("Conversation turn is not recoverable")
+        self.output_blob_reference = output_blob_reference
+        self.output_sha256 = output_sha256
+        self.external_turn_id = external_turn_id
+        self.status = ConversationTurnStatus.SUCCEEDED
+        self.error_code = None
+        self.error_message = None
+        self.error_details = None
+        self.finished_at = now or datetime.now(UTC)
+
     def fail(
         self,
         *,

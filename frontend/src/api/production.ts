@@ -85,9 +85,39 @@ export interface ProductionStatus {
   error_message: string | null;
   error_details: Record<string, unknown> | null;
   extraction_progress?: ExtractionProgress | null;
+  reconciliation?: ProductionReconciliation | null;
   /** Parser recoveries worth showing, never blocking. */
   warnings: string[];
   stages: Record<string, StageStatus>;
+}
+
+export interface ProductionReconciliation {
+  production_run_id: string;
+  model_run_id: string;
+  bridge_response_id: string | null;
+  submission_state: string;
+  phase: string;
+  stage: SubjectProductionStage;
+  pipeline_generation: number;
+  output_sha256: string | null;
+  provenance: string | null;
+  visible_available: boolean;
+  batch_id: string | null;
+}
+
+export interface ProductionRecoveryPreview {
+  production_run_id: string;
+  model_run_id: string;
+  stage: string;
+  pipeline_generation: number;
+  bridge_response_id: string | null;
+  submission_state: string;
+  phase: string;
+  text: string;
+  sha256: string;
+  chars: number;
+  metadata: Record<string, unknown>;
+  visible_available: boolean;
 }
 
 export function shouldPollProduction(
@@ -108,6 +138,7 @@ export interface BatchItemDetail {
   error_code: string | null;
   error_message: string | null;
   extraction_progress?: ExtractionProgress | null;
+  reconciliation?: ProductionReconciliation | null;
 }
 
 export interface BatchStatus {
@@ -340,6 +371,54 @@ export async function retryProductionStage(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ stage }),
+  });
+}
+
+export async function previewProductionReconciliationVisible(
+  runId: string,
+): Promise<ProductionRecoveryPreview> {
+  return request(
+    `/api/production/runs/${runId}/reconciliation/visible/preview`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export async function adoptProductionReconciliationVisible(
+  runId: string,
+  expectedSha256: string,
+): Promise<Record<string, unknown>> {
+  return request(`/api/production/runs/${runId}/reconciliation/visible/adopt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expected_sha256: expectedSha256 }),
+  });
+}
+
+export async function previewProductionReconciliationManual(
+  runId: string,
+  markdown: string,
+): Promise<ProductionRecoveryPreview> {
+  return request(
+    `/api/production/runs/${runId}/reconciliation/manual/preview`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ markdown }),
+    },
+  );
+}
+
+export async function adoptProductionReconciliationManual(
+  runId: string,
+  markdown: string,
+  expectedSha256: string,
+): Promise<Record<string, unknown>> {
+  return request(`/api/production/runs/${runId}/reconciliation/manual/adopt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ markdown, expected_sha256: expectedSha256 }),
   });
 }
 

@@ -180,6 +180,7 @@ class ModelRun:
         public_message: str,
         *,
         details: dict[str, Any] | None = None,
+        response_id: str | None = None,
         now: datetime | None = None,
     ) -> None:
         self._require_active()
@@ -188,6 +189,8 @@ class ModelRun:
         self.error_code = code[:64]
         self.error_message = " ".join(public_message.replace("\x00", "").split())[:500]
         self.error_details = details
+        if response_id:
+            self.response_id = response_id
         self.finished_at = timestamp
         self.updated_at = timestamp
 

@@ -342,7 +342,7 @@ def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
     retryable = bool(getattr(exc, "retryable", False))
     if isinstance(exc, ConversationTurnFailedError) and exc.status.value == "needs_review":
         status = "needs_review"
-    elif code in _REVIEW_CODES:
+    elif code == _MODEL_SUBMISSION_RECONCILIATION_CODE or code in _REVIEW_CODES:
         # The conversation is gone or busy: an operator has to look, but the
         # subject is not corrupted and the batch must keep moving.
         status = "needs_review"
@@ -350,13 +350,17 @@ def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
         status = "transient_error"
     else:
         status = "terminal_error"
-    return {
+    result = {
         "stage": stage,
         "status": status,
         "error_code": code or f"{stage}_failed",
         "error": str(exc),
         "details": getattr(exc, "details", None),
     }
+    model_run_id = getattr(exc, "model_run_id", None)
+    if isinstance(model_run_id, UUID):
+        result["model_run_id"] = str(model_run_id)
+    return result
 
 
 @dataclass(frozen=True, slots=True)

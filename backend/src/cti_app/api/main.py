@@ -273,6 +273,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.edition_service = EditionService(uow_factory)
     app.state.identity_provider = LocalIdentityProvider()
     app.state.model_gateway = model_gateway
+    app.state.bridge_capabilities_provider = bridge_provider
     app.state.model_conversation_service = model_conversation_service
     app.state.discovery_service = discovery_service
     app.state.cumulative_discovery_service = cumulative_discovery_service

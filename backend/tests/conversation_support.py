@@ -90,6 +90,12 @@ class InMemoryModelConversationTurnRepository:
             None,
         )
 
+    async def get_by_model_run_id(self, model_run_id: UUID) -> ModelConversationTurn | None:
+        return next(
+            (deepcopy(item) for item in self._state.values() if item.model_run_id == model_run_id),
+            None,
+        )
+
     async def list_for_conversation(self, conversation_id: UUID) -> list[ModelConversationTurn]:
         return [
             deepcopy(item)

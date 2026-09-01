@@ -510,6 +510,7 @@ class ModelConversationService:
                     "bridge_server_error",
                     "bridge_timeout",
                     "bridge_ui_timeout",
+                    "model_submission_reconciliation_required",
                 }
             )
             blocked = getattr(exc, "code", "") == "external_llm_blocked"
@@ -551,6 +552,8 @@ class ModelConversationService:
             # NEEDS_REVIEW et ne doit pas consommer les retries du job avec la
             # même clé d'idempotence.
             if uncertain:
+                if getattr(exc, "code", "") == "model_submission_reconciliation_required":
+                    raise exc
                 raise ConversationTurnFailedError(
                     str(exc),
                     code=str(getattr(exc, "code", "conversation_turn_failed")),

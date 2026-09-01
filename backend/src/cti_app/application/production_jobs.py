@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from typing import Any, cast
 from uuid import UUID
 
 from pydantic import ConfigDict, Field
@@ -29,7 +30,9 @@ from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import EditionProductionService
 from cti_app.domain.production import (
+    PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionBatchStatus,
+    ProductionSubmissionReconciliation,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -39,6 +42,8 @@ from cti_app.domain.production import (
 # Every automatic production stage job — SOURCES from the API, and every
 # chained stage submitted by ProductionStageChain — shares this retry policy.
 PRODUCTION_STAGE_MAX_ATTEMPTS = 3
+PRODUCTION_RECONCILIATION_RESUME_MAX_ATTEMPTS = 3
+PRODUCTION_RECONCILIATION_RESUME_JOB_KIND = "production.subject.reconciliation_resume"
 
 _TERMINAL_STATUSES = {
     SubjectProductionStatus.READY,
@@ -62,6 +67,13 @@ class ProductionStageParameters(JobParameters):
     pipeline_generation: int = Field(0, ge=0, description="Pipeline generation")
 
 
+class ProductionReconciliationResumeParameters(ProductionStageParameters):
+    """Exact adopted output identity carried by a reconciliation resume job."""
+
+    reconciliation_model_run_id: UUID = Field(..., description="Exact adopted ModelRun ID")
+    reconciled_output_sha256: str = Field(..., min_length=64, max_length=64)
+
+
 def stage_job_kind(stage: SubjectProductionStage) -> str:
     if stage is SubjectProductionStage.ASSEMBLY:
         return "production.subject.assemble"
@@ -72,6 +84,78 @@ def production_stage_idempotency_key(
     run: SubjectProductionRun, stage: SubjectProductionStage
 ) -> str:
     return f"production-{stage.value}-{run.id}-g{run.pipeline_generation}"
+
+
+def production_reconciliation_resume_job_kind() -> str:
+    return PRODUCTION_RECONCILIATION_RESUME_JOB_KIND
+
+
+def production_reconciliation_resume_idempotency_key(
+    run_id: UUID,
+    stage: SubjectProductionStage,
+    pipeline_generation: int,
+    model_run_id: UUID,
+    output_sha256: str,
+) -> str:
+    return (
+        f"production-reconciliation-{run_id}-{stage.value}-g{pipeline_generation}"
+        f"-m{model_run_id}-h{output_sha256}"
+    )
+
+
+def _reconciliation_model_run_id(value: object, inherited_exact: bool = False) -> UUID | None:
+    """Find an exact backend-produced identity; the UI never parses this tree."""
+    if isinstance(value, list):
+        for child in value:
+            found = _reconciliation_model_run_id(child, inherited_exact)
+            if found is not None:
+                return found
+        return None
+    if not isinstance(value, dict):
+        return None
+    exact = (
+        value.get("error_code") == PRODUCTION_RECONCILIATION_ERROR_CODE
+        if "error_code" in value
+        else inherited_exact
+    )
+    if exact:
+        for key in ("model_run_id", "batch_model_run_id"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                try:
+                    return UUID(candidate)
+                except ValueError:
+                    pass
+    for child in value.values():
+        found = _reconciliation_model_run_id(child, exact)
+        if found is not None:
+            return found
+    return None
+
+
+async def _reconciliation_identity(
+    uow: Any,
+    run: SubjectProductionRun,
+    stage: SubjectProductionStage,
+    result: dict[str, object],
+) -> ProductionSubmissionReconciliation | None:
+    if result.get("error_code") != PRODUCTION_RECONCILIATION_ERROR_CODE:
+        return None
+    model_run_id = _reconciliation_model_run_id(result)
+    model_runs = getattr(uow, "model_runs", None)
+    if model_run_id is None or model_runs is None:
+        return None
+    model_run = await model_runs.get(model_run_id)
+    if model_run is None or model_run.error_code != PRODUCTION_RECONCILIATION_ERROR_CODE:
+        return None
+    return ProductionSubmissionReconciliation(
+        production_run_id=run.id,
+        model_run_id=model_run.id,
+        stage=stage,
+        bridge_response_id=model_run.response_id,
+        submission_state=model_run.submission_state,
+        phase="reconciliation",
+    )
 
 
 class ProductionStageChain:
@@ -248,6 +332,7 @@ def register_production_jobs(
         if not isinstance(parameters, ProductionStageParameters):
             raise TypeError("Invalid production stage parameters")
 
+        reconciliation_resume = isinstance(parameters, ProductionReconciliationResumeParameters)
         stage = SubjectProductionStage(parameters.expected_stage)
         await context.check_cancelled()
         async with uow_factory() as uow:
@@ -256,6 +341,26 @@ def register_production_jobs(
             return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
         if current.status is SubjectProductionStatus.CANCELLED:
             return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
+        if reconciliation_resume:
+            reconciliation_parameters = cast(
+                ProductionReconciliationResumeParameters, parameters
+            )
+            identity = current.reconciliation
+            async with uow_factory() as uow:
+                adopted = await uow.model_runs.get(
+                    reconciliation_parameters.reconciliation_model_run_id
+                )
+            if (
+                current.status is not SubjectProductionStatus.RUNNING
+                or identity is None
+                or identity.stage is not stage
+                or identity.model_run_id != reconciliation_parameters.reconciliation_model_run_id
+                or identity.output_sha256 != reconciliation_parameters.reconciled_output_sha256
+                or adopted is None
+                or adopted.status.value != "succeeded"
+                or adopted.raw_output_sha256 != reconciliation_parameters.reconciled_output_sha256
+            ):
+                return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
         if current.current_stage is not stage:
             if (
                 current.status is SubjectProductionStatus.RUNNING
@@ -345,8 +450,14 @@ def register_production_jobs(
                 async with uow_factory() as uow:
                     ending = await uow.subject_production_runs.get_for_update(parameters.run_id)
                     if ending is not None and ending.status not in _TERMINAL_STATUSES:
+                        reconciliation = await _reconciliation_identity(
+                            uow, ending, stage, result
+                        )
                         ending.mark_needs_review(
-                            code=error_code, message=error_message, details=error_details
+                            code=error_code,
+                            message=error_message,
+                            details=error_details,
+                            reconciliation=reconciliation,
                         )
                         await uow.subject_production_runs.save(ending)
                         await uow.commit()
@@ -367,8 +478,12 @@ def register_production_jobs(
                 ending = await uow.subject_production_runs.get_for_update(parameters.run_id)
                 if ending is not None and ending.status not in _TERMINAL_STATUSES:
                     if outcome == "needs_review":
+                        reconciliation = await _reconciliation_identity(uow, ending, stage, result)
                         ending.mark_needs_review(
-                            code=error_code, message=error_message, details=error_details
+                            code=error_code,
+                            message=error_message,
+                            details=error_details,
+                            reconciliation=reconciliation,
                         )
                     else:
                         ending.mark_failed(
@@ -427,11 +542,22 @@ def register_production_jobs(
             handle_stage,
             resume_after_worker_loss=True,
         )
+    registry.register(
+        production_reconciliation_resume_job_kind(),
+        ProductionReconciliationResumeParameters,
+        handle_stage,
+        resume_after_worker_loss=True,
+    )
 
 
 __all__ = [
+    "PRODUCTION_RECONCILIATION_RESUME_JOB_KIND",
+    "PRODUCTION_RECONCILIATION_RESUME_MAX_ATTEMPTS",
+    "ProductionReconciliationResumeParameters",
     "ProductionStageChain",
     "ProductionStageParameters",
+    "production_reconciliation_resume_idempotency_key",
+    "production_reconciliation_resume_job_kind",
     "production_stage_idempotency_key",
     "register_production_jobs",
     "stage_job_kind",

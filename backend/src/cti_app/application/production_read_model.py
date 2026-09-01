@@ -12,7 +12,11 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
-from cti_app.domain.production import SubjectProductionStage, SubjectProductionStatus
+from cti_app.domain.production import (
+    ProductionSubmissionReconciliation,
+    SubjectProductionStage,
+    SubjectProductionStatus,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +34,7 @@ class BatchStatusItem:
     error_code: str | None
     error_message: str | None
     extraction_progress: dict[str, Any] | None = None
+    reconciliation: ProductionSubmissionReconciliation | None = None
 
 
 class BatchStatusReadRepository(Protocol):

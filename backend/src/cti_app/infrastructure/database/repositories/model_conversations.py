@@ -99,6 +99,14 @@ class SqlAlchemyModelConversationTurnRepository:
         )
         return _model_conversation_turn_from_row(row) if row else None
 
+    async def get_by_model_run_id(self, model_run_id: UUID) -> ModelConversationTurn | None:
+        row = await self._session.scalar(
+            select(ModelConversationTurnRow).where(
+                ModelConversationTurnRow.model_run_id == model_run_id
+            )
+        )
+        return _model_conversation_turn_from_row(row) if row else None
+
     async def list_for_conversation(self, conversation_id: UUID) -> Sequence[ModelConversationTurn]:
         rows = await self._session.scalars(
             select(ModelConversationTurnRow)

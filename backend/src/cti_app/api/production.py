@@ -6,7 +6,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.jobs import (
@@ -26,6 +26,10 @@ from cti_app.application.production_jobs import (
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_read_model import BatchStatusReadService
+from cti_app.application.production_reconciliation import (
+    ProductionReconciliationError,
+    ProductionReconciliationService,
+)
 from cti_app.application.production_stage_status import (
     build_stage_statuses,
     completed_stage_count,
@@ -46,10 +50,12 @@ from cti_app.application.subject_production import (
 )
 from cti_app.domain.editorial import EditorialGroup, EditorialGroupStatus
 from cti_app.domain.production import (
+    PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionArtifactStage,
     ProductionBatchCancellationConflictError,
     ProductionBatchStatus,
     ProductionReuseInvalidation,
+    ProductionSubmissionReconciliation,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -81,6 +87,22 @@ class ProductionReuseInvalidationRequest(BaseModel):
     from_stage: SubjectProductionStage
 
 
+class ReconciliationAdoptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_sha256: str = Field(..., min_length=64, max_length=64, pattern="^[0-9a-f]{64}$")
+
+
+class ManualReconciliationRequest(ReconciliationAdoptRequest):
+    markdown: str = Field(..., min_length=1, max_length=10_000_000)
+
+
+class ManualReconciliationPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    markdown: str = Field(..., min_length=1, max_length=10_000_000)
+
+
 class StageStatus(BaseModel):
     status: str  # pending, running, succeeded, needs_review, failed
     version: int | None = None
@@ -110,6 +132,7 @@ class ProductionStatus(BaseModel):
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
     extraction_progress: dict[str, Any] | None = None
+    reconciliation: ProductionReconciliationView | None = None
     # Parser recoveries worth showing to an analyst, never blocking.
     warnings: list[str] = []
     stages: dict[str, StageStatus]
@@ -128,6 +151,25 @@ class BatchItemDetail(BaseModel):
     error_code: str | None = None
     error_message: str | None = None
     extraction_progress: dict[str, Any] | None = None
+    reconciliation: ProductionReconciliationView | None = None
+
+
+class ProductionReconciliationView(BaseModel):
+    production_run_id: str
+    model_run_id: str
+    bridge_response_id: str | None
+    submission_state: str
+    phase: str
+    stage: SubjectProductionStage
+    pipeline_generation: int
+    output_sha256: str | None = None
+    provenance: str | None = None
+    visible_available: bool
+    batch_id: str | None = None
+
+
+ProductionStatus.model_rebuild()
+BatchItemDetail.model_rebuild()
 
 
 class BatchStatus(BaseModel):
@@ -208,6 +250,30 @@ def _production_state_service(request: Request) -> ProductionStateService:
     return ProductionStateService(request.app.state.uow_factory, artifact_store)
 
 
+def _production_reconciliation_service(request: Request) -> ProductionReconciliationService:
+    return ProductionReconciliationService(
+        request.app.state.uow_factory,
+        request.app.state.model_gateway,
+        request.app.state.job_service,
+        request.app.state.job_dispatcher,
+        getattr(request.app.state, "bridge_capabilities_provider", None),
+    )
+
+
+def _reconciliation_error(exc: ProductionReconciliationError) -> HTTPException:
+    not_found = {
+        "production_run_not_found",
+        "production_reconciliation_model_run_missing",
+        "production_reconciliation_batch_missing",
+    }
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND
+        if exc.code in not_found
+        else status.HTTP_409_CONFLICT,
+        detail={"code": exc.code, "message": exc.message},
+    )
+
+
 def _production_pacing(request: Request) -> ProductionPacingPolicy:
     return getattr(request.app.state, "production_pacing", ProductionPacingPolicy.zero())
 
@@ -248,6 +314,30 @@ def _run_view(
     }
 
 
+def _reconciliation_view(
+    run_id: UUID,
+    reconciliation: ProductionSubmissionReconciliation | None,
+    *,
+    pipeline_generation: int,
+    batch_id: UUID | None = None,
+) -> ProductionReconciliationView | None:
+    if reconciliation is None:
+        return None
+    return ProductionReconciliationView(
+        production_run_id=str(run_id),
+        model_run_id=str(reconciliation.model_run_id),
+        bridge_response_id=reconciliation.bridge_response_id,
+        submission_state=reconciliation.submission_state.value,
+        phase=reconciliation.phase,
+        stage=reconciliation.stage,
+        pipeline_generation=pipeline_generation,
+        output_sha256=reconciliation.output_sha256,
+        provenance=reconciliation.provenance,
+        visible_available=reconciliation.bridge_response_id is not None,
+        batch_id=str(batch_id) if batch_id else None,
+    )
+
+
 async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
     """Build a batch response from the UI-optimized read model."""
     items = await BatchStatusReadService(uow.batch_status_read_model).list_items(batch.id)
@@ -276,6 +366,17 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
                 error_code=item.error_code,
                 error_message=item.error_message,
                 extraction_progress=item.extraction_progress,
+                reconciliation=(
+                    _reconciliation_view(
+                        item.run_id,
+                        item.reconciliation
+                        if item.status is SubjectProductionStatus.NEEDS_REVIEW
+                        and item.error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
+                        else None,
+                        pipeline_generation=item.pipeline_generation,
+                        batch_id=batch.id,
+                    )
+                ),
             )
         )
     return BatchStatus(
@@ -709,6 +810,16 @@ async def get_subject_production(
             error_message=run.error_message,
             error_details=run.error_details,
             extraction_progress=run.extraction_progress,
+            reconciliation=(
+                _reconciliation_view(
+                    run.id,
+                    run.reconciliation
+                    if run.status is SubjectProductionStatus.NEEDS_REVIEW
+                    and run.error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
+                    else None,
+                    pipeline_generation=run.pipeline_generation,
+                )
+            ),
             warnings=_collect_warnings(artifacts),
             stages={name: StageStatus(**stage) for name, stage in stages.items()},
         )
@@ -768,6 +879,75 @@ async def retry_production_stage(
         current_run_id = current.id
 
     return await _retry_production_run(request, current_run_id, payload, await _actor_id(request))
+
+
+@router.post("/production/runs/{run_id}/reconciliation/visible/preview")
+async def preview_visible_production_reconciliation(
+    run_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        preview = await _production_reconciliation_service(request).preview_visible(run_id)
+    except ProductionReconciliationError as exc:
+        raise _reconciliation_error(exc) from exc
+    return preview.as_dict()
+
+
+@router.post("/production/runs/{run_id}/reconciliation/visible/adopt")
+async def adopt_visible_production_reconciliation(
+    run_id: UUID,
+    payload: ReconciliationAdoptRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return await _production_reconciliation_service(request).adopt_visible(
+            run_id, payload.expected_sha256, actor_id=await _actor_id(request)
+        )
+    except ProductionReconciliationError as exc:
+        raise _reconciliation_error(exc) from exc
+
+
+@router.post("/production/runs/{run_id}/reconciliation/manual/preview")
+async def preview_manual_production_reconciliation(
+    run_id: UUID,
+    payload: ManualReconciliationPreviewRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        preview = await _production_reconciliation_service(request).preview_manual(
+            run_id, payload.markdown
+        )
+    except ProductionReconciliationError as exc:
+        raise _reconciliation_error(exc) from exc
+    return preview.as_dict()
+
+
+@router.post("/production/runs/{run_id}/reconciliation/manual/adopt")
+async def adopt_manual_production_reconciliation(
+    run_id: UUID,
+    payload: ManualReconciliationRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return await _production_reconciliation_service(request).adopt_manual(
+            run_id,
+            payload.markdown,
+            payload.expected_sha256,
+            actor_id=await _actor_id(request),
+        )
+    except ProductionReconciliationError as exc:
+        raise _reconciliation_error(exc) from exc
+
+
+@router.post("/production/runs/{run_id}/reconciliation/visible/abandon")
+async def abandon_visible_production_reconciliation(
+    run_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        return await _production_reconciliation_service(request).abandon_visible(run_id)
+    except ProductionReconciliationError as exc:
+        raise _reconciliation_error(exc) from exc
 
 
 @router.post("/subjects/{subject_id}/production/reuse/invalidate")

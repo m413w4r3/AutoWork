@@ -94,6 +94,18 @@ class SubjectProductionRunRow(Base):
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(String(500))
     error_details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # Explicit identity for a provider submission that stopped production.
+    # These columns are intentionally not hidden in error_details: operators
+    # and the API must be able to address the exact ModelRun safely.
+    reconciliation_model_run_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("model_runs.id", ondelete="RESTRICT")
+    )
+    reconciliation_bridge_response_id: Mapped[str | None] = mapped_column(String(255))
+    reconciliation_submission_state: Mapped[str | None] = mapped_column(String(32))
+    reconciliation_phase: Mapped[str | None] = mapped_column(String(64))
+    reconciliation_stage: Mapped[str | None] = mapped_column(String(32))
+    reconciliation_output_sha256: Mapped[str | None] = mapped_column(String(64))
+    reconciliation_provenance: Mapped[str | None] = mapped_column(String(32))
     extraction_progress: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -34,7 +34,7 @@ from cti_app.domain.model_conversations import (
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelUsage
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
-from cti_app.integrations.models import BlobModelOutputStore, FakeModelAdapter
+from cti_app.integrations.models import BlobModelOutputStore, BridgeTransportError, FakeModelAdapter
 from tests.conversation_support import InMemoryConversationUnitOfWorkFactory
 
 
@@ -457,6 +457,63 @@ async def test_duplicate_delete_on_success_returns_succeeded_when_retry_close_fa
     assert replay.status is ConversationTurnStatus.SUCCEEDED
     assert len(adapter.calls) == 1
     assert closer.calls == [conversation.id, conversation.id]
+
+
+async def test_adopted_model_run_closes_exact_failed_turn_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    class _AmbiguousAdapter(_ScriptedBridgeAdapter):
+        async def invoke(
+            self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+        ) -> AdapterResult:
+            self.calls.append(request)
+            del role, output_schema
+            raise BridgeTransportError(
+                "bridge_ui_timeout",
+                "La confirmation du bridge est ambiguë.",
+                retryable=True,
+                phase="submission_confirmation",
+                bridge_run_id="bridge-recovery-1",
+                submission_state="submission_attempted",
+            )
+
+    adapter = _AmbiguousAdapter("unused")
+    service, state = _build_service(adapter, tmp_path)
+    conversation = await _fresh_conversation(service)
+
+    with pytest.raises(ModelGatewayError):
+        await service.add_turn(
+            conversation.id,
+            message="Question récupérable",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            idempotency_key="recovery-turn-key",
+            correlation_id="corr-recovery",
+        )
+
+    turn = next(iter(state.turns.values()))
+    model_run = state.model_runs[turn.model_run_id]
+    assert turn.status is ConversationTurnStatus.NEEDS_REVIEW
+    recovered = await service._gateway.adopt_recovery_output(  # type: ignore[attr-defined]
+        model_run.id,
+        b"Recovered answer",
+        provenance="visible_recovery",
+        actor_id="reviewer",
+    )
+    assert recovered.status.value == "succeeded"
+    assert state.turns[turn.id].status is ConversationTurnStatus.SUCCEEDED
+
+    replay = await service.add_turn(
+        conversation.id,
+        message="Question récupérable",
+        mode=ConversationMode.FRESH,
+        external_llm_allowed=True,
+        idempotency_key="recovery-turn-key",
+        correlation_id="corr-recovery-replay",
+    )
+    assert replay.status is ConversationTurnStatus.SUCCEEDED
+    assert len(adapter.calls) == 1
+    assert (await service.turns(conversation.id))[0].output_text == "Recovered answer"
 
 
 async def test_explicit_archive_closes_bridge_session(tmp_path: Path) -> None:

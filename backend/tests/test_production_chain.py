@@ -8,6 +8,7 @@ subject — including when it failed, so one bad subject cannot block the queue.
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -15,17 +16,24 @@ import pytest
 
 from cti_app.application.edition_workspace import EditionProductionCheckpointService
 from cti_app.application.jobs import JobHandlerError, JobRegistry
+from cti_app.application.model_gateway import ModelSubmissionReconciliationRequiredError
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_jobs import (
+    ProductionReconciliationResumeParameters,
     ProductionStageChain,
     ProductionStageParameters,
+    production_reconciliation_resume_idempotency_key,
+    production_reconciliation_resume_job_kind,
     register_production_jobs,
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.production_workflow import _transient_or_terminal
+from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
+    ProductionSubmissionReconciliation,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -94,6 +102,7 @@ class _Uow:
         self.edition_production_batches = _Batches()
         self.edition_production_batch_items = _BatchItems()
         self.jobs = _ExecutionJobs()
+        self.model_runs = _ModelRuns()
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -127,6 +136,14 @@ class _ExecutionJobs:
 
     async def get(self, job_id: UUID) -> _ExecutionJob | None:
         return self.items.get(job_id)
+
+
+class _ModelRuns:
+    def __init__(self) -> None:
+        self.items: dict[UUID, object] = {}
+
+    async def get(self, run_id: UUID) -> object | None:
+        return self.items.get(run_id)
 
 
 class _Jobs:
@@ -237,6 +254,18 @@ def _run(uow: _Uow, stage: SubjectProductionStage) -> SubjectProductionRun:
     return run
 
 
+def test_submission_reconciliation_error_is_a_review_outcome_with_identity() -> None:
+    model_run_id = uuid4()
+    result = _transient_or_terminal(
+        "synthesis",
+        ModelSubmissionReconciliationRequiredError(model_run_id=model_run_id),
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "model_submission_reconciliation_required"
+    assert result["model_run_id"] == str(model_run_id)
+
+
 async def test_successful_stage_queues_the_next_one(
     uow: _Uow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -257,6 +286,57 @@ async def test_successful_stage_queues_the_next_one(
     assert uow.subject_production_runs.items[run.id].current_stage is (
         SubjectProductionStage.REFERENCES
     )
+
+
+async def test_reconciliation_resume_consumes_exact_archived_run_and_same_generation(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, jobs, orchestrator = _build(
+        uow, monkeypatch, {"stage": "extraction", "status": "success"}
+    )
+    run = _run(uow, SubjectProductionStage.EXTRACTION)
+    run.pipeline_generation = 11
+    model_run_id = uuid4()
+    output_sha256 = "c" * 64
+    run.reconciliation = ProductionSubmissionReconciliation(
+        production_run_id=run.id,
+        model_run_id=model_run_id,
+        stage=SubjectProductionStage.EXTRACTION,
+        bridge_response_id="bridge-response-1",
+        submission_state="submitted_or_unknown",
+        phase="reconciliation",
+        output_sha256=output_sha256,
+        provenance="visible_recovery",
+    )
+    uow.model_runs.items[model_run_id] = SimpleNamespace(
+        status=ModelRunStatus.SUCCEEDED,
+        raw_output_sha256=output_sha256,
+    )
+
+    handler = registry.handler(production_reconciliation_resume_job_kind())
+    await handler(
+        ProductionReconciliationResumeParameters(
+            run_id=run.id,
+            expected_stage=SubjectProductionStage.EXTRACTION.value,
+            pipeline_generation=run.pipeline_generation,
+            reconciliation_model_run_id=model_run_id,
+            reconciled_output_sha256=output_sha256,
+        ),
+        _Context(),  # type: ignore[arg-type]
+    )
+
+    assert orchestrator.calls == [SubjectProductionStage.EXTRACTION]
+    assert run.pipeline_generation == 11
+    assert run.current_stage is SubjectProductionStage.SYNTHESIS
+    assert jobs.submitted[0].kind == stage_job_kind(SubjectProductionStage.SYNTHESIS)
+    assert jobs.submitted[0].idempotency_key == f"production-synthesis-{run.id}-g11"
+    assert production_reconciliation_resume_idempotency_key(
+        run.id,
+        SubjectProductionStage.EXTRACTION,
+        11,
+        model_run_id,
+        output_sha256,
+    ) != jobs.submitted[0].idempotency_key
 
 
 async def test_cancelled_run_is_a_worker_fence(uow: _Uow, monkeypatch: pytest.MonkeyPatch) -> None:

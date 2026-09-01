@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceCandidate, SourceRole
+from cti_app.domain.model_runs import ModelSubmissionState
 
 
 class SubjectProductionStatus(StrEnum):
@@ -30,6 +31,32 @@ class SubjectProductionStage(StrEnum):
     EXTRACTION = "extraction"
     SYNTHESIS = "synthesis"
     ASSEMBLY = "assembly"
+
+
+PRODUCTION_RECONCILIATION_ERROR_CODE = "model_submission_reconciliation_required"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProductionSubmissionReconciliation:
+    """Typed identity of a provider submission which must not be replayed."""
+
+    production_run_id: UUID
+    model_run_id: UUID
+    stage: SubjectProductionStage
+    bridge_response_id: str | None
+    submission_state: ModelSubmissionState
+    phase: str
+    output_sha256: str | None = None
+    provenance: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.phase.strip() == "":
+            raise ValueError("reconciliation phase is required")
+        if self.output_sha256 is not None and (
+            len(self.output_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.output_sha256)
+        ):
+            raise ValueError("output_sha256 must be lowercase SHA-256")
 
 
 class ProductionBatchPhase(StrEnum):
@@ -403,6 +430,7 @@ class SubjectProductionRun:
     error_code: str | None = None
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
+    reconciliation: ProductionSubmissionReconciliation | None = None
     extraction_progress: dict[str, Any] | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -468,6 +496,7 @@ class SubjectProductionRun:
         code: str,
         message: str,
         details: dict[str, Any] | None = None,
+        reconciliation: ProductionSubmissionReconciliation | None = None,
         now: datetime | None = None,
     ) -> None:
         if self.status is SubjectProductionStatus.CANCELLED:
@@ -476,6 +505,10 @@ class SubjectProductionRun:
         self.error_code = code[:64]
         self.error_message = " ".join(message.replace("\x00", "").split())[:500]
         self.error_details = details
+        if code == PRODUCTION_RECONCILIATION_ERROR_CODE:
+            self.reconciliation = reconciliation
+        else:
+            self.reconciliation = None
         self.finished_at = now or datetime.now(UTC)
         self.updated_at = self.finished_at
         self.version += 1
@@ -553,8 +586,48 @@ class SubjectProductionRun:
         self.error_code = None
         self.error_message = None
         self.error_details = None
+        self.reconciliation = None
         self.finished_at = None
         self.updated_at = now or datetime.now(UTC)
+        self.version += 1
+
+    def adopt_reconciliation_output(self, *, output_sha256: str, provenance: str) -> None:
+        """Record the exact adopted bytes without changing pipeline generation."""
+        if self.reconciliation is None:
+            raise ValueError("production_reconciliation_missing")
+        self.reconciliation = ProductionSubmissionReconciliation(
+            production_run_id=self.reconciliation.production_run_id,
+            model_run_id=self.reconciliation.model_run_id,
+            stage=self.reconciliation.stage,
+            bridge_response_id=self.reconciliation.bridge_response_id,
+            submission_state=self.reconciliation.submission_state,
+            phase=self.reconciliation.phase,
+            output_sha256=output_sha256,
+            provenance=provenance,
+        )
+
+    def resume_reconciled(self, *, expected_stage: SubjectProductionStage) -> None:
+        """Resume this exact generation after its archived ModelRun was adopted."""
+        if self.status is SubjectProductionStatus.CANCELLED:
+            raise ValueError("production_run_cancelled")
+        if self.current_stage is not expected_stage:
+            raise ValueError("production_reconciliation_stage_changed")
+        if self.reconciliation is None or self.reconciliation.stage is not expected_stage:
+            raise ValueError("production_reconciliation_identity_mismatch")
+        if self.reconciliation.output_sha256 is None:
+            raise ValueError("production_reconciliation_output_missing")
+        if self.status is SubjectProductionStatus.RUNNING and self.error_code is None:
+            return
+        if self.status is not SubjectProductionStatus.NEEDS_REVIEW:
+            raise ValueError("production_reconciliation_run_not_reviewable")
+        if self.error_code != PRODUCTION_RECONCILIATION_ERROR_CODE:
+            raise ValueError("production_reconciliation_error_changed")
+        self.status = SubjectProductionStatus.RUNNING
+        self.error_code = None
+        self.error_message = None
+        self.error_details = None
+        self.finished_at = None
+        self.updated_at = datetime.now(UTC)
         self.version += 1
 
 

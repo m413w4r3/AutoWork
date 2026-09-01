@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ValidationError
 
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import (
     ModelOutputRejection,
     ModelProvider,
@@ -49,9 +50,11 @@ class ModelSubmissionReconciliationRequiredError(ModelGatewayError):
         message: str = _MODEL_SUBMISSION_RECONCILIATION_MESSAGE,
         *,
         details: dict[str, Any] | None = None,
+        model_run_id: UUID | None = None,
     ) -> None:
         super().__init__(message)
         self.details = details or {}
+        self.model_run_id = model_run_id
 
 
 class ExternalModelBlockedError(ModelGatewayError):
@@ -441,6 +444,42 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 source_model_run_id=source_model_run_id,
             )
             await uow.model_runs.save(run)
+            # Conversation turns pre-persist their exact ModelRun before the
+            # bridge submission.  When recovery adopts that run, close the
+            # same turn from the archived bytes so a same-generation stage
+            # resume consumes the answer without replaying the prompt.
+            turns = getattr(uow, "model_conversation_turns", None)
+            conversations = getattr(uow, "model_conversations", None)
+            find_turn = getattr(turns, "get_by_model_run_id", None)
+            get_conversation = getattr(conversations, "get_for_update", None)
+            save_turn = getattr(turns, "save", None)
+            save_conversation = getattr(conversations, "save", None)
+            if all(
+                callable(operation)
+                for operation in (find_turn, get_conversation, save_turn, save_conversation)
+            ):
+                assert callable(find_turn)
+                assert callable(get_conversation)
+                assert callable(save_turn)
+                assert callable(save_conversation)
+                turn = await find_turn(run.id)
+                if turn is not None and turn.status in {
+                    ConversationTurnStatus.RUNNING,
+                    ConversationTurnStatus.NEEDS_REVIEW,
+                }:
+                    conversation = await get_conversation(turn.conversation_id)
+                    if conversation is not None:
+                        turn.adopt_recovery_output(
+                            output_blob_reference=reference,
+                            output_sha256=digest,
+                            external_turn_id=run.response_id,
+                        )
+                        conversation.finish_turn(
+                            turn.id,
+                            external_locator=conversation.external_locator,
+                        )
+                        await save_turn(turn)
+                        await save_conversation(conversation)
             await uow.commit()
             return run
 
@@ -617,6 +656,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         str(result.metadata.get("reason", "no_final_answer")),
                         "ChatGPT s'est arrêté sans produire de réponse finale.",
                         details=result.metadata,
+                        response_id=result.response_id or run.response_id,
                     )
                     await uow.model_runs.save(run)
                     await uow.commit()
@@ -708,7 +748,9 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         )
                         await uow.model_runs.save(run)
                         await uow.commit()
-                        raise ModelSubmissionReconciliationRequiredError(details=details)
+                        raise ModelSubmissionReconciliationRequiredError(
+                            details=details, model_run_id=run.id
+                        )
                     self._diagnostics.record(
                         event="model.initial_submission_claim",
                         run_id=run.id,
@@ -735,7 +777,9 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         recovery_action="reconciliation_required",
                     )
                     if run.error_code == ModelSubmissionReconciliationRequiredError.code:
-                        raise ModelSubmissionReconciliationRequiredError(details=run.error_details)
+                        raise ModelSubmissionReconciliationRequiredError(
+                            details=run.error_details, model_run_id=run.id
+                        )
                     raise ModelGatewayError("Model run needs reconciliation before resubmission")
                 elif run.status is ModelRunStatus.FAILED:
                     if not (
@@ -800,6 +844,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         str(result.metadata.get("reason", "no_final_answer")),
                         "ChatGPT s'est arrêté sans produire de réponse finale.",
                         details=result.metadata,
+                        response_id=result.response_id or persisted.response_id,
                     )
                     await uow.model_runs.save(persisted)
                     await uow.commit()
@@ -858,9 +903,10 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                             ModelSubmissionReconciliationRequiredError.code,
                             _MODEL_SUBMISSION_RECONCILIATION_MESSAGE,
                             details=details,
+                            response_id=getattr(exc, "bridge_run_id", None),
                         )
                         reconciliation_error = ModelSubmissionReconciliationRequiredError(
-                            details=details
+                            details=details, model_run_id=persisted.id
                         )
                     else:
                         persisted.fail(
@@ -1102,6 +1148,7 @@ def _reconciliation_details(
     effective_request_id = request_id or _bridge_request_id(run)
     if exc is None:
         details: dict[str, Any] = {
+            "model_run_id": str(run.id),
             "provider": run.provider.value[:64],
             "phase": "reconciliation",
             "retryable": False,

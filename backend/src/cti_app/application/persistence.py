@@ -419,6 +419,8 @@ class ModelConversationTurnRepository(Protocol):
 
     async def get_by_idempotency_key(self, key: str) -> ModelConversationTurn | None: ...
 
+    async def get_by_model_run_id(self, model_run_id: UUID) -> ModelConversationTurn | None: ...
+
     async def list_for_conversation(
         self, conversation_id: UUID
     ) -> Sequence[ModelConversationTurn]: ...
@@ -852,6 +854,7 @@ class EditionProductionBatchItemRepository(Protocol):
 
 class ProductionUnitOfWork(Protocol):
     jobs: JobRepository
+    model_runs: ModelRunRepository
     editions: EditionRepository
     edition_audit: EditionAuditRepository
     subject_production_runs: SubjectProductionRunRepository
