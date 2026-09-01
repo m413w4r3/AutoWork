@@ -263,8 +263,6 @@ async def test_archive_unavailable_or_tampered_fails_closed(
     )
 
     assert result["status"] == "needs_review", result
-    assert result["source_failures"]["S1"]["error_code"] == (
-        "q2_source_evidence_unavailable"
-    )
+    assert result["source_failures"]["S1"]["error_code"] == ("q2_source_evidence_unavailable")
     assert sink.calls == []
     assert run.extraction_progress["sources"][0]["status"] == "failed"

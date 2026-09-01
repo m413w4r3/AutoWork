@@ -165,9 +165,7 @@ _REVIEW_CODES = {
 }
 
 _MODEL_SUBMISSION_RECONCILIATION_CODE = "model_submission_reconciliation_required"
-_SOURCE_CONTENT_CODES = frozenset(
-    {"source_content_invalid", "q2_source_evidence_unavailable"}
-)
+_SOURCE_CONTENT_CODES = frozenset({"source_content_invalid", "q2_source_evidence_unavailable"})
 
 
 def _gate_archived_q2_output(
@@ -224,11 +222,7 @@ class _Q2SourceEvidenceUnavailable(_Q2SourceContentFailure):
         super().__init__(reason)
         self.details = {
             "reason": reason,
-            **(
-                {"expected_decoded_sha256": expected_sha256}
-                if expected_sha256 is not None
-                else {}
-            ),
+            **({"expected_decoded_sha256": expected_sha256} if expected_sha256 is not None else {}),
             **({"decoded_blob_id": str(blob_id)} if blob_id is not None else {}),
         }
 

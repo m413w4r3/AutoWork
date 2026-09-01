@@ -826,9 +826,7 @@ async def test_q2_checkpoint_is_created_only_after_local_archive_gate(
     second = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
 
     assert second["status"] == "needs_review", second
-    assert second["source_failures"]["S1"]["error_code"] == (
-        "q2_source_evidence_unavailable"
-    )
+    assert second["source_failures"]["S1"]["error_code"] == ("q2_source_evidence_unavailable")
     assert model_uow.state[model_run_id].parameters.get("q2_checkpoint_keys") == []
     assert len(adapter.calls) == 1
 
