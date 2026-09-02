@@ -51,7 +51,7 @@ def _safe_text(text: str) -> str:
 
 
 def _footnote_url(url: str) -> str:
-    return "".join(f"\\{char}" if char in "_~*" else char for char in url)
+    return "".join(f"\\{char}" if char in "_~*[]" else char for char in url)
 
 
 def _styled_block(style_key: str, content: str) -> str:

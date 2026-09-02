@@ -250,6 +250,50 @@ def test_pandoc_renderer_renders_one_footnote_per_citation(
     assert "^[https://example.test/1]^[https://example.test/2]" not in rendered
 
 
+def test_builder_never_emits_two_adjacent_footnotes_for_one_event() -> None:
+    report = _report()
+    second = ParsedSource(
+        local_id="S2",
+        title="Cavern follow-up",
+        url="https://research.example/followup",
+        canonical_url="https://research.example/followup",
+        publisher="Research",
+        published_at=date(2026, 7, 7),
+        role=SourceRole.INDEPENDENT,
+    )
+    report = ReferenceReport(
+        sources=(*report.sources, second),
+        events=(
+            ParsedEvent(
+                local_id="R1",
+                event_date=date(2026, 7, 6),
+                source_ids=("S1", "S2"),
+                text="Publication de l'analyse Cavern [S1].",
+            ),
+        ),
+        editorial_title=report.editorial_title,
+    )
+    document = build_publication_document(
+        subject_title="Cavern",
+        report=report,
+        extraction=_extraction(),
+        synthesis_text="Cavern Manticore utilise WinDirStat [S1].",
+    )
+
+    citations = [
+        span for span in document.timeline[0].content if span.kind is RichSpanKind.CITATION
+    ]
+    assert len(citations) == 1
+    assert citations[0].source_ids == ("S1", "S2")
+
+    paragraph = render_publication_pandoc(document).split("Synthèse")[0]
+    assert paragraph.count("^[") == 1
+    assert (
+        "^[https://research.example/cavern\\_report ; https://research.example/followup]"
+        in paragraph
+    )
+
+
 def test_synthesis_validator_blocks_inventory_only_ioc_but_accepts_both() -> None:
     rejected = validate_synthesis(
         "Le domaine cloudlanecdn[.]com sert au C2 [S1].", _report(), _extraction()
@@ -363,8 +407,16 @@ def test_real_pandoc_export_renders_multi_source_citation_as_word_footnote(
         document_root = ET.fromstring(archive.read("word/document.xml"))
         footnotes_root = ET.fromstring(archive.read("word/footnotes.xml"))
 
-    assert document_root.find(f".//{{{namespace}}}footnoteReference") is not None
+    references = document_root.findall(f".//{{{namespace}}}footnoteReference")
+    assert len(references) == 1
     assert "[https://" not in "".join(document_root.itertext())
-    footnotes_text = "".join(footnotes_root.itertext())
-    assert "https://example.test/1" in footnotes_text
-    assert "https://example.test/2" in footnotes_text
+
+    cited = [
+        "".join(footnote.itertext())
+        for footnote in footnotes_root.findall(f"{{{namespace}}}footnote")
+        if "https://example.test" in "".join(footnote.itertext())
+    ]
+    assert len(cited) == 1
+    assert "https://example.test/1" in cited[0]
+    assert "https://example.test/2" in cited[0]
+    assert cited[0].index("example.test/1") < cited[0].index("example.test/2")

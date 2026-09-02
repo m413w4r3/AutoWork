@@ -81,6 +81,22 @@ def _merge_citations(spans: RichText) -> RichText:
     return tuple(output)
 
 
+def _with_event_citation(spans: RichText, source_ids: tuple[str, ...]) -> RichText:
+    """Fold the event-level sources into the paragraph's last citation marker.
+
+    A timeline paragraph must never emit two adjacent footnotes, so the event
+    sources join the existing citation instead of adding a second one.
+    """
+    merged = list(spans)
+    for index in range(len(merged) - 1, -1, -1):
+        if merged[index].kind is RichSpanKind.CITATION:
+            combined = (*merged[index].source_ids, *source_ids)
+            merged[index] = RichSpan(RichSpanKind.CITATION, "", tuple(dict.fromkeys(combined)))
+            return tuple(merged)
+    merged.append(RichSpan(RichSpanKind.CITATION, "", tuple(dict.fromkeys(source_ids))))
+    return tuple(merged)
+
+
 def build_publication_document(
     *,
     subject_title: str,
@@ -109,14 +125,7 @@ def build_publication_document(
     timeline = tuple(
         TimelineEntry(
             date=event.event_date,
-            content=(
-                *annotate(event.text),
-                RichSpan(
-                    RichSpanKind.CITATION,
-                    "",
-                    tuple(dict.fromkeys(event.source_ids)),
-                ),
-            ),
+            content=_with_event_citation(annotate(event.text), event.source_ids),
             source_ids=event.source_ids,
         )
         for event in report.events
