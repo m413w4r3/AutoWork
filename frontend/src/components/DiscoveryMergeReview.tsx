@@ -165,6 +165,7 @@ function MergeGroupCard({
   warnings,
   decision,
   target,
+  readOnly,
   onDecision,
   onTarget,
 }: {
@@ -173,6 +174,7 @@ function MergeGroupCard({
   warnings: string[];
   decision: MergeDecisionAction;
   target: string;
+  readOnly: boolean;
   onDecision: (action: MergeDecisionAction) => void;
   onTarget: (handle: string) => void;
 }) {
@@ -263,6 +265,7 @@ function MergeGroupCard({
           Décision
           <select
             value={decision}
+            disabled={readOnly}
             onChange={(event) =>
               onDecision(event.target.value as MergeDecisionAction)
             }
@@ -282,6 +285,7 @@ function MergeGroupCard({
             Sujet cible
             <select
               value={target}
+              disabled={readOnly}
               onChange={(event) => onTarget(event.target.value)}
             >
               <option value="">— choisir —</option>
@@ -302,11 +306,13 @@ function MergeGroupCard({
 export function DiscoveryMergeReview({
   editionId,
   onReconciling,
+  readOnly = false,
 }: {
   editionId: string;
   /** Reports whether a merge-planning job is actively using the ChatGPT
    * bridge, so a caller can hold off on launching another bridge action. */
   onReconciling?: (active: boolean) => void;
+  readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
   const [decisions, setDecisions] = useState<
@@ -429,6 +435,7 @@ export function DiscoveryMergeReview({
       <JobStatusCard
         jobId={latestReconcileJob.id}
         onTerminal={refreshMergeState}
+        readOnly={readOnly}
       />
     </section>
   ) : null;
@@ -531,6 +538,7 @@ export function DiscoveryMergeReview({
             warnings={groupedWarnings.get(group.group_index) ?? []}
             decision={decisions[group.group_index]?.action ?? "accept"}
             target={decisions[group.group_index]?.target ?? ""}
+            readOnly={readOnly}
             onDecision={(action) =>
               setDecisions((current) => ({
                 ...current,
@@ -552,13 +560,15 @@ export function DiscoveryMergeReview({
           />
         ))}
 
-        <button
-          type="button"
-          disabled={incomplete || resolve.isPending}
-          onClick={() => resolve.mutate(run)}
-        >
-          {resolve.isPending ? "Fusion en cours…" : "Appliquer la fusion"}
-        </button>
+        {!readOnly ? (
+          <button
+            type="button"
+            disabled={incomplete || resolve.isPending}
+            onClick={() => resolve.mutate(run)}
+          >
+            {resolve.isPending ? "Fusion en cours…" : "Appliquer la fusion"}
+          </button>
+        ) : null}
 
         {incomplete ? (
           <p className="merge-review__blocked">

@@ -101,9 +101,11 @@ function invalidateAfterCancel(
 export function ReviewItemCard({
   editionId,
   item,
+  readOnly = false,
 }: {
   editionId: string;
   item: ReviewItem;
+  readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
   const [excludeOpen, setExcludeOpen] = useState(false);
@@ -210,13 +212,20 @@ export function ReviewItemCard({
         </span>
       </div>
 
+      {item.effective_decision ? (
+        <p className="review-item-card__decision">
+          Décision finale :{" "}
+          {item.effective_decision === "include" ? "inclure" : "exclure"}
+        </p>
+      ) : null}
+
       {isProblem && item.error_message ? (
         <p className="review-item-card__message">{item.error_message}</p>
       ) : null}
 
       <div className="review-item-card__actions">
         <Link to={`/subjects/${item.subject_id}`}>Ouvrir</Link>
-        {isActive ? (
+        {!readOnly && isActive ? (
           <button
             className="button button--danger"
             type="button"
@@ -226,7 +235,7 @@ export function ReviewItemCard({
             {cancel.isPending ? "Arrêt…" : "Arrêter cette tentative"}
           </button>
         ) : null}
-        {!isActive && isReadyIncluded ? (
+        {!readOnly && !isActive && isReadyIncluded ? (
           <button
             className="button button--danger"
             type="button"
@@ -236,7 +245,7 @@ export function ReviewItemCard({
             Exclure
           </button>
         ) : null}
-        {!isActive && canReinclude ? (
+        {!readOnly && !isActive && canReinclude ? (
           <button
             className="button"
             type="button"
@@ -246,7 +255,7 @@ export function ReviewItemCard({
             Réinclure
           </button>
         ) : null}
-        {!isActive && isProblem && !isExcluded ? (
+        {!readOnly && !isActive && isProblem && !isExcluded ? (
           <>
             {canRetry ? (
               <button
@@ -268,7 +277,7 @@ export function ReviewItemCard({
             </button>
           </>
         ) : null}
-        {!isActive && isProblem && isExcluded && canRetry ? (
+        {!readOnly && !isActive && isProblem && isExcluded && canRetry ? (
           <button
             className="button button--secondary"
             type="button"
@@ -280,7 +289,7 @@ export function ReviewItemCard({
         ) : null}
       </div>
 
-      {!isActive && needsReconciliation && item.reconciliation ? (
+      {!readOnly && !isActive && needsReconciliation && item.reconciliation ? (
         <ReconciliationPanel
           runId={item.run_id}
           reconciliation={item.reconciliation}
@@ -290,7 +299,7 @@ export function ReviewItemCard({
         />
       ) : null}
 
-      {excludeOpen ? (
+      {!readOnly && excludeOpen ? (
         <form className="review-item-card__exclude" onSubmit={confirmExclude}>
           <label htmlFor={`exclude-reason-${item.subject_id}`}>
             Raison de l’exclusion
@@ -321,11 +330,11 @@ export function ReviewItemCard({
         </form>
       ) : null}
 
-      {staleMessage ? (
+      {!readOnly && staleMessage ? (
         <p className="error-message" role="alert">
           {staleMessage}
         </p>
-      ) : mutationError && !isStaleReviewError(mutationError) ? (
+      ) : !readOnly && mutationError && !isStaleReviewError(mutationError) ? (
         <p className="error-message" role="alert">
           {mutationError instanceof Error
             ? mutationError.message

@@ -89,12 +89,15 @@ function ItemError({ item }: { item: BatchItemDetail }) {
 function ReconciliationFlow({
   item,
   onRecovered,
+  readOnly,
 }: {
   item: BatchItemDetail;
   onRecovered: () => void;
+  readOnly: boolean;
 }) {
   const reconciliation = item.reconciliation;
   if (
+    readOnly ||
     item.status !== "needs_review" ||
     item.error_code !== "model_submission_reconciliation_required" ||
     !reconciliation
@@ -115,11 +118,13 @@ function ProductionItem({
   total,
   dispatchPending,
   onRecovered,
+  readOnly,
 }: {
   item: BatchItemDetail;
   total: number;
   dispatchPending: boolean;
   onRecovered: () => void;
+  readOnly: boolean;
 }) {
   const isActive = item.status === "running" && !dispatchPending;
   const isWaitingForDispatch = item.status === "running" && dispatchPending;
@@ -159,12 +164,22 @@ function ProductionItem({
         <ExtractionProgressView progress={item.extraction_progress} />
       ) : null}
       <ItemError item={item} />
-      <ReconciliationFlow item={item} onRecovered={onRecovered} />
+      <ReconciliationFlow
+        item={item}
+        onRecovered={onRecovered}
+        readOnly={readOnly}
+      />
     </li>
   );
 }
 
-export function ProductionConsole({ editionId }: { editionId: string }) {
+export function ProductionConsole({
+  editionId,
+  readOnly = false,
+}: {
+  editionId: string;
+  readOnly?: boolean;
+}) {
   const queryClient = useQueryClient();
   const editionInvalidated = useRef(false);
   const batch = useQuery({
@@ -230,7 +245,11 @@ export function ProductionConsole({ editionId }: { editionId: string }) {
   if (!batch.data) {
     return (
       <section className="production-panel">
-        <p className="empty-state">Aucun lot de production n’est disponible.</p>
+        <p className="empty-state">
+          {readOnly
+            ? "L’historique de production n’est plus disponible pour cette édition."
+            : "Aucun lot de production n’est disponible."}
+        </p>
       </section>
     );
   }
@@ -258,8 +277,9 @@ export function ProductionConsole({ editionId }: { editionId: string }) {
           <span>Phase courante</span>
           <strong>{PHASE_LABELS[currentBatch.phase]}</strong>
         </div>
-        {currentBatch.status === "queued" ||
-        currentBatch.status === "running" ? (
+        {!readOnly &&
+        (currentBatch.status === "queued" ||
+          currentBatch.status === "running") ? (
           <button
             className="button button--danger"
             type="button"
@@ -292,6 +312,12 @@ export function ProductionConsole({ editionId }: { editionId: string }) {
         {progress} %
       </progress>
       <BatchCounters batch={currentBatch} />
+      {readOnly ? (
+        <p className="workflow-read-only-note" role="note">
+          Historique de production : aucune action ne peut modifier cette
+          édition.
+        </p>
+      ) : null}
       {currentBatch.item_details.length > 0 ? (
         <ol className="production-item-list" aria-label="Suivi des articles">
           {currentBatch.item_details.map((item) => (
@@ -300,6 +326,7 @@ export function ProductionConsole({ editionId }: { editionId: string }) {
               item={item}
               total={currentBatch.items}
               dispatchPending={countdown !== null}
+              readOnly={readOnly}
               onRecovered={() => {
                 void queryClient.invalidateQueries({
                   queryKey: ["batch", editionId],

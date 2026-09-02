@@ -36,7 +36,13 @@ const typeLabels: Record<string, string> = {
 
 type DecisionChoice = EditorialDecision | "undecided";
 
-export function EditorialBoard({ editionId }: { editionId: string }) {
+export function EditorialBoard({
+  editionId,
+  readOnly = false,
+}: {
+  editionId: string;
+  readOnly?: boolean;
+}) {
   const queryClient = useQueryClient();
   const [checkedGroups, setCheckedGroups] = useState<string[]>([]);
   const [drafts, setDrafts] = useState<Record<string, EditorialDecision>>({});
@@ -105,6 +111,12 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
             <strong>{currentUndecided}</strong> encore à décider
           </div>
         </div>
+        {readOnly ? (
+          <p className="workflow-read-only-note" role="note">
+            Consultation historique : les décisions éditoriales ne sont pas
+            modifiables.
+          </p>
+        ) : null}
         <p className="verification-warning" role="note">
           IOC repérés pendant la recherche — non encore vérifiés depuis les
           sources.
@@ -127,6 +139,7 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
                   group={group}
                   decision={drafts[group.id] ?? "undecided"}
                   pending={action.isPending}
+                  readOnly={readOnly}
                   onAddToArticle={() =>
                     action.mutate(() =>
                       confirmEditorialDecisions(editionId, [
@@ -152,26 +165,28 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
               ))}
             </div>
           )}
-          <button
-            className="button confirm-selection"
-            disabled={activeDraftEntries.length === 0 || action.isPending}
-            onClick={() =>
-              action.mutate(() =>
-                confirmEditorialDecisions(
-                  editionId,
-                  activeDraftEntries.map(([groupId, decision]) => ({
-                    group_id: groupId,
-                    version:
-                      proposed.find((group) => group.id === groupId)?.version ??
-                      0,
-                    decision,
-                  })),
-                ),
-              )
-            }
-          >
-            Confirmer la sélection ({activeDraftEntries.length})
-          </button>
+          {!readOnly ? (
+            <button
+              className="button confirm-selection"
+              disabled={activeDraftEntries.length === 0 || action.isPending}
+              onClick={() =>
+                action.mutate(() =>
+                  confirmEditorialDecisions(
+                    editionId,
+                    activeDraftEntries.map(([groupId, decision]) => ({
+                      group_id: groupId,
+                      version:
+                        proposed.find((group) => group.id === groupId)
+                          ?.version ?? 0,
+                      decision,
+                    })),
+                  ),
+                )
+              }
+            >
+              Confirmer la sélection ({activeDraftEntries.length})
+            </button>
+          ) : null}
         </section>
 
         <section className="ready-subjects" aria-labelledby="ready-heading">
@@ -187,43 +202,45 @@ export function EditorialBoard({ editionId }: { editionId: string }) {
           )}
         </section>
 
-        <details className="advanced-editorial-panel">
-          <summary>Organiser les publications</summary>
-          <p>
-            Fusion, séparation et signaux de regroupement restent disponibles
-            pour les cas ambigus.
-          </p>
-          <button
-            className="button button--secondary"
-            disabled={checkedProposed.length < 2 || action.isPending}
-            onClick={() =>
-              action.mutate(() =>
-                mergeEditorialGroups(editionId, checkedProposed),
-              )
-            }
-          >
-            Fusionner les groupes cochés
-          </button>
-          <div className="advanced-group-list">
-            {proposed.map((group) => (
-              <AdvancedGroupControls
-                key={group.id}
-                group={group}
-                checked={checkedGroups.includes(group.id)}
-                pending={action.isPending}
-                editionId={editionId}
-                onChecked={(checked) =>
-                  setCheckedGroups((current) =>
-                    checked
-                      ? [...new Set([...current, group.id])]
-                      : current.filter((id) => id !== group.id),
-                  )
-                }
-                onAction={(operation) => action.mutate(operation)}
-              />
-            ))}
-          </div>
-        </details>
+        {!readOnly ? (
+          <details className="advanced-editorial-panel">
+            <summary>Organiser les publications</summary>
+            <p>
+              Fusion, séparation et signaux de regroupement restent disponibles
+              pour les cas ambigus.
+            </p>
+            <button
+              className="button button--secondary"
+              disabled={checkedProposed.length < 2 || action.isPending}
+              onClick={() =>
+                action.mutate(() =>
+                  mergeEditorialGroups(editionId, checkedProposed),
+                )
+              }
+            >
+              Fusionner les groupes cochés
+            </button>
+            <div className="advanced-group-list">
+              {proposed.map((group) => (
+                <AdvancedGroupControls
+                  key={group.id}
+                  group={group}
+                  checked={checkedGroups.includes(group.id)}
+                  pending={action.isPending}
+                  editionId={editionId}
+                  onChecked={(checked) =>
+                    setCheckedGroups((current) =>
+                      checked
+                        ? [...new Set([...current, group.id])]
+                        : current.filter((id) => id !== group.id),
+                    )
+                  }
+                  onAction={(operation) => action.mutate(operation)}
+                />
+              ))}
+            </div>
+          </details>
+        ) : null}
       </section>
     </>
   );
@@ -233,12 +250,14 @@ function EditorialDecisionCard({
   group,
   decision,
   pending,
+  readOnly,
   onAddToArticle,
   onDecision,
 }: {
   group: EditorialGroup;
   decision: DecisionChoice;
   pending: boolean;
+  readOnly: boolean;
   onAddToArticle: () => void;
   onDecision: (decision: DecisionChoice) => void;
 }) {
@@ -363,13 +382,15 @@ function EditorialDecisionCard({
           ) : null}
         </div>
       ) : null}
-      <button
-        className="button add-to-article"
-        disabled={pending}
-        onClick={onAddToArticle}
-      >
-        Ajouter aux articles
-      </button>
+      {!readOnly ? (
+        <button
+          className="button add-to-article"
+          disabled={pending}
+          onClick={onAddToArticle}
+        >
+          Ajouter aux articles
+        </button>
+      ) : null}
       <fieldset className="decision-options">
         <legend>Décision éditoriale</legend>
         {(
@@ -385,7 +406,7 @@ function EditorialDecisionCard({
               name={`decision-${group.id}`}
               value={value}
               checked={decision === value}
-              disabled={pending}
+              disabled={readOnly || pending}
               onChange={() => onDecision(value)}
             />
             {label}

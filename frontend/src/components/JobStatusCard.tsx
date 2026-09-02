@@ -103,11 +103,13 @@ export function JobStatusCard({
   onTerminal,
   onUpdate,
   onReprocessReport,
+  readOnly = false,
 }: {
   jobId: string;
   onTerminal?: (status: JobStatus) => void;
   onUpdate?: (job: JobView) => void;
   onReprocessReport?: (researchModelRunId: string) => void;
+  readOnly?: boolean;
 }) {
   const job = useJobTracking(jobId);
   const queryClient = useQueryClient();
@@ -158,6 +160,7 @@ export function JobStatusCard({
     job.data.attempt < job.data.max_attempts;
   const details = job.data.error_details;
   const canRetryStructuring =
+    !readOnly &&
     job.data.status === "failed" &&
     details?.can_retry_structuring === true &&
     typeof details.research_model_run_id === "string" &&
@@ -233,7 +236,8 @@ export function JobStatusCard({
           ) : null}
         </div>
       ) : null}
-      {job.data.status === "queued" || job.data.status === "running" ? (
+      {!readOnly &&
+      (job.data.status === "queued" || job.data.status === "running") ? (
         <button
           className="button button--secondary"
           disabled={cancellation.isPending || job.data.cancellation_requested}
@@ -341,7 +345,7 @@ export function JobStatusCard({
           Retraiter le rapport archivé
         </button>
       ) : null}
-      {canRetry ? (
+      {!readOnly && canRetry ? (
         <button
           className="button button--secondary"
           disabled={retry.isPending}

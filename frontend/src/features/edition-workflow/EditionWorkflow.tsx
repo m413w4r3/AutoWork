@@ -11,6 +11,7 @@ import {
 import { EditorialBoard } from "../../components/EditorialBoard";
 import { DiscoveryPanel } from "../discovery/DiscoveryPanel";
 import { discoveryJobStorageKey } from "../discovery/discoveryStorage";
+import { navigate } from "../../routing";
 import { ProductionBatchSelector } from "./ProductionBatchSelector";
 import {
   isEligibleSubject,
@@ -29,7 +30,9 @@ const WORKFLOW_STEPS = [
   ["publication", "Publication"],
 ] as const;
 
-function stepForStatus(status: EditionStatus): string {
+type WorkflowPhase = (typeof WORKFLOW_STEPS)[number][0];
+
+function stepForStatus(status: EditionStatus): WorkflowPhase {
   if (status === "draft" || status === "discovery") return "discovery";
   if (status === "selection") return "selection";
   if (status === "production") return "production";
@@ -37,15 +40,113 @@ function stepForStatus(status: EditionStatus): string {
   return "publication";
 }
 
-function WorkflowStepper({ status }: { status: EditionStatus }) {
-  const currentStep = stepForStatus(status);
+function phaseIndex(phase: WorkflowPhase): number {
+  return WORKFLOW_STEPS.findIndex(([step]) => step === phase);
+}
+
+function isTerminalStatus(status: EditionStatus): boolean {
+  return status === "published" || status === "archived";
+}
+
+function isPhaseViewable(status: EditionStatus, phase: WorkflowPhase): boolean {
+  if (isTerminalStatus(status)) return true;
+  return phaseIndex(phase) <= phaseIndex(stepForStatus(status));
+}
+
+function isWorkflowPhase(value: string | null): value is WorkflowPhase {
+  return WORKFLOW_STEPS.some(([phase]) => phase === value);
+}
+
+function phaseFromLocation(status: EditionStatus): WorkflowPhase {
+  const requested = new URLSearchParams(window.location.search).get("phase");
+  const fallback = stepForStatus(status);
+  return isWorkflowPhase(requested) && isPhaseViewable(status, requested)
+    ? requested
+    : fallback;
+}
+
+function phaseUrl(phase: WorkflowPhase): string {
+  const params = new URLSearchParams(window.location.search);
+  params.set("phase", phase);
+  const query = params.toString();
+  return `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`;
+}
+
+function useViewedPhase(status: EditionStatus): {
+  phase: WorkflowPhase;
+  selectPhase: (phase: WorkflowPhase) => void;
+} {
+  const [, setLocationVersion] = useState(0);
+
+  useEffect(() => {
+    const update = () => setLocationVersion((version) => version + 1);
+    window.addEventListener("popstate", update);
+    return () => window.removeEventListener("popstate", update);
+  }, []);
+
+  return {
+    phase: phaseFromLocation(status),
+    selectPhase: (phase) => {
+      if (isPhaseViewable(status, phase)) navigate(phaseUrl(phase));
+    },
+  };
+}
+
+function WorkflowStepper({
+  status,
+  viewedPhase,
+  onSelect,
+}: {
+  status: EditionStatus;
+  viewedPhase: WorkflowPhase;
+  onSelect: (phase: WorkflowPhase) => void;
+}) {
+  const currentPhase = stepForStatus(status);
   return (
     <ol className="workflow-steps" aria-label="Workflow de l’édition">
-      {WORKFLOW_STEPS.map(([step, label]) => (
-        <li key={step} aria-current={step === currentStep ? "step" : undefined}>
-          {label}
-        </li>
-      ))}
+      {WORKFLOW_STEPS.map(([phase, label]) => {
+        const viewable = isPhaseViewable(status, phase);
+        const current = phase === viewedPhase;
+        return (
+          <li
+            key={phase}
+            className={
+              [
+                phase === currentPhase ? "is-business-current" : null,
+                current ? "is-viewed" : null,
+                !viewable ? "is-unavailable" : null,
+              ]
+                .filter(Boolean)
+                .join(" ") || undefined
+            }
+            data-phase={phase}
+          >
+            {viewable ? (
+              <a
+                href={phaseUrl(phase)}
+                aria-current={current ? "step" : undefined}
+                onClick={(event) => {
+                  event.preventDefault();
+                  onSelect(phase);
+                }}
+              >
+                {label}
+              </a>
+            ) : (
+              <button type="button" disabled>
+                {label}
+              </button>
+            )}
+            {phase === currentPhase ? (
+              <small className="workflow-step-status">
+                {phase === viewedPhase
+                  ? "Phase actuelle"
+                  : "Phase actuelle de l’édition"}
+              </small>
+            ) : null}
+          </li>
+        );
+      })}
     </ol>
   );
 }
@@ -89,7 +190,13 @@ function StatusAction({
   );
 }
 
-function DiscoveryPhase({ edition }: { edition: Edition }) {
+function DiscoveryPhase({
+  edition,
+  readOnly = false,
+}: {
+  edition: Edition;
+  readOnly?: boolean;
+}) {
   const [discoveryRunning, setDiscoveryRunning] = useState(() =>
     Boolean(window.localStorage.getItem(discoveryJobStorageKey(edition.id))),
   );
@@ -120,15 +227,18 @@ function DiscoveryPhase({ edition }: { edition: Edition }) {
       <DiscoveryPanel
         editionId={edition.id}
         onRunningChange={setDiscoveryRunning}
+        readOnly={readOnly}
       />
-      <StatusAction
-        edition={edition}
-        target="selection"
-        disabled={discoveryRunning}
-      >
-        Ouvrir la sélection
-      </StatusAction>
-      {discoveryRunning ? (
+      {!readOnly ? (
+        <StatusAction
+          edition={edition}
+          target="selection"
+          disabled={discoveryRunning}
+        >
+          Ouvrir la sélection
+        </StatusAction>
+      ) : null}
+      {!readOnly && discoveryRunning ? (
         <p className="workflow-note" role="status">
           La recherche en cours doit se terminer avant la sélection.
         </p>
@@ -137,11 +247,18 @@ function DiscoveryPhase({ edition }: { edition: Edition }) {
   );
 }
 
-function SelectionPhase({ edition }: { edition: Edition }) {
+function SelectionPhase({
+  edition,
+  readOnly = false,
+}: {
+  edition: Edition;
+  readOnly?: boolean;
+}) {
   const queryClient = useQueryClient();
   const board = useQuery({
     queryKey: ["editorial-board", edition.id],
     queryFn: () => fetchEditorialBoard(edition.id),
+    enabled: !readOnly,
   });
 
   // The production-batch selection: which of the editorially eligible
@@ -189,76 +306,87 @@ function SelectionPhase({ edition }: { edition: Edition }) {
 
   return (
     <>
-      <EditorialBoard editionId={edition.id} />
-      <ProductionBatchSelector
-        groups={eligibleGroups}
-        selected={selected}
-        onToggle={(subjectId, checked) =>
-          setSelected((current) => {
-            const next = new Set(current);
-            if (checked) next.add(subjectId);
-            else next.delete(subjectId);
-            return next;
-          })
-        }
-        onSelectAll={() => setSelected(new Set(eligibleIds))}
-        onSelectNone={() => setSelected(new Set())}
-      />
-      <section
-        className="production-start-panel"
-        aria-labelledby="production-start-heading"
-      >
-        <p className="eyebrow">Production</p>
-        <h2 id="production-start-heading">
-          {eligibleCount} article{eligibleCount > 1 ? "s" : ""} éligible
-          {eligibleCount > 1 ? "s" : ""}
-        </h2>
-        <p className="production-batch-count" aria-live="polite">
-          {`${selectedCount} sélectionné${selectedCount > 1 ? "s" : ""} pour ce lot`}
-        </p>
-        {start.error ? (
-          <p className="error-message" role="alert">
-            Le lancement de la production a échoué : {String(start.error)}
-          </p>
-        ) : null}
-        <button
-          className="button"
-          disabled={start.isPending || selectedCount === 0}
-          onClick={() => start.mutate()}
-        >
-          {start.isPending
-            ? "Lancement…"
-            : selectedCount > 0
-              ? `Lancer la production de ${selectedCount} article${selectedCount > 1 ? "s" : ""}`
-              : "Sélectionnez au moins un article"}
-        </button>
-      </section>
+      <EditorialBoard editionId={edition.id} readOnly={readOnly} />
+      {!readOnly ? (
+        <>
+          <ProductionBatchSelector
+            groups={eligibleGroups}
+            selected={selected}
+            onToggle={(subjectId, checked) =>
+              setSelected((current) => {
+                const next = new Set(current);
+                if (checked) next.add(subjectId);
+                else next.delete(subjectId);
+                return next;
+              })
+            }
+            onSelectAll={() => setSelected(new Set(eligibleIds))}
+            onSelectNone={() => setSelected(new Set())}
+          />
+          <section
+            className="production-start-panel"
+            aria-labelledby="production-start-heading"
+          >
+            <p className="eyebrow">Production</p>
+            <h2 id="production-start-heading">
+              {eligibleCount} article{eligibleCount > 1 ? "s" : ""} éligible
+              {eligibleCount > 1 ? "s" : ""}
+            </h2>
+            <p className="production-batch-count" aria-live="polite">
+              {`${selectedCount} sélectionné${selectedCount > 1 ? "s" : ""} pour ce lot`}
+            </p>
+            {start.error ? (
+              <p className="error-message" role="alert">
+                Le lancement de la production a échoué : {String(start.error)}
+              </p>
+            ) : null}
+            <button
+              className="button"
+              disabled={start.isPending || selectedCount === 0}
+              onClick={() => start.mutate()}
+            >
+              {start.isPending
+                ? "Lancement…"
+                : selectedCount > 0
+                  ? `Lancer la production de ${selectedCount} article${selectedCount > 1 ? "s" : ""}`
+                  : "Sélectionnez au moins un article"}
+            </button>
+          </section>
+        </>
+      ) : null}
     </>
   );
 }
 
 export function EditionWorkflow({ edition }: { edition: Edition }) {
+  const { phase, selectPhase } = useViewedPhase(edition.status);
+  const currentPhase = stepForStatus(edition.status);
+  const readOnly = isTerminalStatus(edition.status) || phase !== currentPhase;
+
   return (
     <section className="edition-workflow" aria-label="Workflow de l’édition">
-      <WorkflowStepper status={edition.status} />
-      {edition.status === "draft" || edition.status === "discovery" ? (
-        <DiscoveryPhase edition={edition} />
+      <WorkflowStepper
+        status={edition.status}
+        viewedPhase={phase}
+        onSelect={selectPhase}
+      />
+      {phase === "discovery" ? (
+        <DiscoveryPhase edition={edition} readOnly={readOnly} />
       ) : null}
-      {edition.status === "selection" ? (
-        <SelectionPhase edition={edition} />
+      {phase === "selection" ? (
+        <SelectionPhase edition={edition} readOnly={readOnly} />
       ) : null}
-      {edition.status === "production" ? (
-        <ProductionConsole editionId={edition.id} />
+      {phase === "production" ? (
+        <ProductionConsole editionId={edition.id} readOnly={readOnly} />
       ) : null}
-      {edition.status === "review" ? (
-        <ReviewConsole editionId={edition.id} />
+      {phase === "review" ? (
+        <ReviewConsole editionId={edition.id} readOnly={readOnly} />
       ) : null}
-      {edition.status === "assembling" ||
-      edition.status === "published" ||
-      edition.status === "archived" ? (
+      {phase === "publication" ? (
         <PublicationConsole
           editionId={edition.id}
           editionStatus={edition.status}
+          readOnly={readOnly}
         />
       ) : null}
     </section>

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -167,6 +167,7 @@ function renderWorkflow(value: Edition) {
 afterEach(() => {
   window.localStorage.clear();
   vi.unstubAllGlobals();
+  window.history.replaceState({}, "", "/editions/edition-1");
 });
 
 it("exige de cocher le sujet éligible avant de lancer, puis invalide Edition après le POST", async () => {
@@ -395,6 +396,151 @@ describe("rendu strict des états Edition", () => {
       await screen.findByRole("heading", { name: "Édition archivée" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+});
+
+describe("navigation historique du workflow", () => {
+  function historyFetchMock() {
+    return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = urlOf(input);
+      if (init?.method === "POST") {
+        throw new Error(`Unexpected workflow mutation ${url}`);
+      }
+      if (url.endsWith("/release")) return Response.json(release);
+      if (url.endsWith("/editorial-groups")) return Response.json(board);
+      if (url.endsWith("/production")) return Response.json(batch);
+      if (url.endsWith("/review")) return Response.json(review);
+      throw new Error(`Unexpected GET ${url}`);
+    });
+  }
+
+  it("permet de consulter les cinq phases d’une édition archivée sans mutation", async () => {
+    const fetchMock = historyFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+
+    renderWorkflow(editionWith("archived"));
+
+    expect(
+      await screen.findByRole("heading", { name: "Édition archivée" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Publication" })).toHaveAttribute(
+      "aria-current",
+      "step",
+    );
+
+    await user.click(screen.getByRole("link", { name: "Sélection" }));
+    expect(
+      await screen.findByRole("heading", { name: "Sélection des sujets" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Campagne A")).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Ouvrir le sujet" }),
+    ).toHaveAttribute("href", "/subjects/subject-1");
+    expect(
+      screen.queryByRole("button", { name: /Lancer la production/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Tout sélectionner" }),
+    ).not.toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([, init]) => init?.method === "POST"),
+    ).toBe(false);
+
+    await user.click(screen.getByRole("link", { name: "Production" }));
+    expect(
+      await screen.findByRole("heading", { name: "0 / 1 articles traités" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Arrêter|Réessayer|Récupérer/ }),
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("link", { name: "Revue" }));
+    expect(
+      await screen.findByRole("heading", { name: "Revue de publication" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("État final de la revue")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", {
+        name: /Accepter|Réessayer|Exclure|Arrêter/,
+      }),
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("link", { name: "Publication" }));
+    expect(
+      await screen.findByRole("heading", { name: "Édition archivée" }),
+    ).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([, init]) => init?.method === "POST"),
+    ).toBe(false);
+  });
+
+  it("ouvre la phase demandée par URL et retombe sur la phase courante si elle est invalide", async () => {
+    const fetchMock = historyFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState({}, "", "/editions/edition-1?phase=production");
+
+    renderWorkflow(editionWith("archived"));
+    expect(
+      await screen.findByRole("heading", { name: "0 / 1 articles traités" }),
+    ).toBeInTheDocument();
+    expect(window.location.search).toBe("?phase=production");
+    cleanup();
+
+    window.history.replaceState({}, "", "/editions/edition-1?phase=unknown");
+    renderWorkflow(editionWith("archived"));
+    expect(
+      await screen.findByRole("heading", { name: "Édition archivée" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Publication" })).toHaveAttribute(
+      "aria-current",
+      "step",
+    );
+    expect(
+      fetchMock.mock.calls.some(([, init]) => init?.method === "POST"),
+    ).toBe(false);
+  });
+
+  it("conserve les contrôles de la phase courante pour une édition active", async () => {
+    const fetchMock = historyFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+
+    renderWorkflow(editionWith("production"));
+    expect(
+      await screen.findByRole("heading", { name: "0 / 1 articles traités" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "Arrêter et revenir à la sélection",
+      }),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("link", { name: "Sélection" }));
+    expect(
+      await screen.findByRole("heading", { name: "Sélection des sujets" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Tout sélectionner" }),
+    ).not.toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([, init]) => init?.method === "POST"),
+    ).toBe(false);
+
+    await user.click(screen.getByRole("link", { name: "Production" }));
+    expect(
+      await screen.findByRole("button", {
+        name: "Arrêter et revenir à la sélection",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([, init]) => init?.method === "POST"),
+    ).toBe(false);
+
+    window.history.back();
+    expect(
+      await screen.findByRole("heading", { name: "Sélection des sujets" }),
+    ).toBeInTheDocument();
   });
 });
 

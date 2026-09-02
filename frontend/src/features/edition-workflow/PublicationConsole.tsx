@@ -69,9 +69,11 @@ function ArchivedPublication({
 export function PublicationConsole({
   editionId,
   editionStatus,
+  readOnly = false,
 }: {
   editionId: string;
   editionStatus: EditionStatus;
+  readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
   const release = useQuery({
@@ -168,7 +170,7 @@ export function PublicationConsole({
       {failed && current.assembly_error_message ? (
         <p className="error-message">{current.assembly_error_message}</p>
       ) : null}
-      {current.can_retry_assembly ? (
+      {!readOnly && current.can_retry_assembly ? (
         <button
           className="button"
           type="button"
@@ -178,7 +180,7 @@ export function PublicationConsole({
           {accept.isPending ? "Relancement…" : "Relancer l'assemblage"}
         </button>
       ) : null}
-      {accept.error ? (
+      {!readOnly && accept.error ? (
         <p className="error-message" role="alert">
           {accept.error instanceof Error
             ? accept.error.message

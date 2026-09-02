@@ -8,7 +8,13 @@ import { ApiError } from "../../api/editions";
 import { ReviewItemCard } from "./ReviewItemCard";
 import { reviewPollingInterval } from "./reviewPolling";
 
-export function ReviewConsole({ editionId }: { editionId: string }) {
+export function ReviewConsole({
+  editionId,
+  readOnly = false,
+}: {
+  editionId: string;
+  readOnly?: boolean;
+}) {
   const queryClient = useQueryClient();
   const review = useQuery({
     queryKey: ["edition-review", editionId],
@@ -83,6 +89,7 @@ export function ReviewConsole({ editionId }: { editionId: string }) {
               key={`${item.subject_id}-${item.position}`}
               editionId={editionId}
               item={item}
+              readOnly={readOnly}
             />
           ))}
         </ol>
@@ -92,14 +99,18 @@ export function ReviewConsole({ editionId }: { editionId: string }) {
 
       <section className="review-acceptance" aria-labelledby="accept-heading">
         <div>
-          <h3 id="accept-heading">Accepter la production</h3>
+          <h3 id="accept-heading">
+            {readOnly ? "État final de la revue" : "Accepter la production"}
+          </h3>
           <p>
-            {currentReview.can_accept
-              ? "L’assemblage final sera activé à l’étape de publication."
-              : "Résolvez ou excluez les articles bloquants."}
+            {readOnly
+              ? "Cette revue historique est disponible en lecture seule."
+              : currentReview.can_accept
+                ? "L’assemblage final sera activé à l’étape de publication."
+                : "Résolvez ou excluez les articles bloquants."}
           </p>
         </div>
-        {accept.error ? (
+        {!readOnly && accept.error ? (
           <p className="error-message" role="alert">
             {accept.error instanceof ApiError &&
             accept.error.code === "review_cannot_be_accepted"
@@ -109,14 +120,16 @@ export function ReviewConsole({ editionId }: { editionId: string }) {
                 : "La publication n’a pas pu être acceptée."}
           </p>
         ) : null}
-        <button
-          className="button"
-          type="button"
-          disabled={!currentReview.can_accept || accept.isPending}
-          onClick={() => accept.mutate()}
-        >
-          {accept.isPending ? "Acceptation…" : "Accepter la production"}
-        </button>
+        {!readOnly ? (
+          <button
+            className="button"
+            type="button"
+            disabled={!currentReview.can_accept || accept.isPending}
+            onClick={() => accept.mutate()}
+          >
+            {accept.isPending ? "Acceptation…" : "Accepter la production"}
+          </button>
+        ) : null}
       </section>
     </section>
   );

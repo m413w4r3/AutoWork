@@ -76,9 +76,11 @@ function IncompleteSourceUrlForm({
 export function DiscoveryPanel({
   editionId,
   onRunningChange,
+  readOnly = false,
 }: {
   editionId: string;
   onRunningChange: (running: boolean) => void;
+  readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
   const storageKey = discoveryJobStorageKey(editionId);
@@ -346,23 +348,31 @@ export function DiscoveryPanel({
         </div>
         {/* Les deux actions restent disponibles tout au long du cycle de vie :
             avant la première recherche, après un import, après plusieurs lots. */}
-        <div className="input-choice-buttons">
-          <button
-            className="button"
-            disabled={launch.isPending || searchRunning || mergeReconciling}
-            onClick={() => launch.mutate()}
-          >
-            {launch.isPending ? "Lancement…" : "Nouvelle recherche ChatGPT"}
-          </button>
-          <button
-            className="button button--secondary"
-            disabled={confirmImport.isPending}
-            onClick={() => setShowManualImport((open) => !open)}
-          >
-            Coller une réponse ChatGPT
-          </button>
-        </div>
+        {!readOnly ? (
+          <div className="input-choice-buttons">
+            <button
+              className="button"
+              disabled={launch.isPending || searchRunning || mergeReconciling}
+              onClick={() => launch.mutate()}
+            >
+              {launch.isPending ? "Lancement…" : "Nouvelle recherche ChatGPT"}
+            </button>
+            <button
+              className="button button--secondary"
+              disabled={confirmImport.isPending}
+              onClick={() => setShowManualImport((open) => !open)}
+            >
+              Coller une réponse ChatGPT
+            </button>
+          </div>
+        ) : null}
       </div>
+      {readOnly ? (
+        <p className="workflow-read-only-note" role="note">
+          Historique de découverte : les recherches et corrections sont
+          désactivées.
+        </p>
+      ) : null}
       {mergeReconciling ? (
         <p className="merge-review__blocked" role="status">
           Le bridge ChatGPT est occupé à évaluer la dernière contribution pour
@@ -379,6 +389,7 @@ export function DiscoveryPanel({
         Axe de recherche
         <input
           value={axis}
+          disabled={readOnly}
           onChange={(event) => setAxis(event.target.value)}
           placeholder="initial ou axe complémentaire"
         />
@@ -390,7 +401,7 @@ export function DiscoveryPanel({
       {launch.error ? (
         <ErrorMessage error={launch.error} fallback="Recherche impossible." />
       ) : null}
-      {showManualImport ? (
+      {!readOnly && showManualImport ? (
         <section
           className="manual-import"
           aria-labelledby="manual-import-heading"
@@ -498,6 +509,7 @@ export function DiscoveryPanel({
       {jobId ? (
         <JobStatusCard
           jobId={jobId}
+          readOnly={readOnly}
           onUpdate={handleJobUpdate}
           onTerminal={handleJobTerminal}
           onReprocessReport={(researchModelRunId) =>
@@ -505,7 +517,7 @@ export function DiscoveryPanel({
           }
         />
       ) : null}
-      {jobId && recoveryRunId ? (
+      {!readOnly && jobId && recoveryRunId ? (
         <section className="recovery-panel" aria-labelledby="recovery-heading">
           <h3 id="recovery-heading">Reprendre la recherche ChatGPT</h3>
           <p>
@@ -789,6 +801,7 @@ export function DiscoveryPanel({
         ) : null}
         <DiscoveryMergeReview
           editionId={editionId}
+          readOnly={readOnly}
           onReconciling={setMergeReconciling}
         />
         <div className="candidate-list">
@@ -908,7 +921,7 @@ export function DiscoveryPanel({
                     <select
                       aria-label={`État de ${source.title}`}
                       value={source.verification_status}
-                      disabled={markSource.isPending}
+                      disabled={readOnly || markSource.isPending}
                       onChange={(event) =>
                         markSource.mutate({
                           sourceId: source.id,
@@ -938,25 +951,27 @@ export function DiscoveryPanel({
                     {source.parsing_warnings.map((warning) => (
                       <small key={warning}>{warning}</small>
                     ))}
-                    <IncompleteSourceUrlForm
-                      pending={
-                        attachUrl.isPending &&
-                        attachUrl.variables?.incompleteSourceId === source.id
-                      }
-                      error={
-                        attachUrl.isError &&
-                        attachUrl.variables?.incompleteSourceId === source.id
-                          ? attachUrl.error
-                          : null
-                      }
-                      onSubmit={(url) =>
-                        attachUrl.mutate({
-                          subjectId: candidate.id,
-                          incompleteSourceId: source.id,
-                          url,
-                        })
-                      }
-                    />
+                    {!readOnly ? (
+                      <IncompleteSourceUrlForm
+                        pending={
+                          attachUrl.isPending &&
+                          attachUrl.variables?.incompleteSourceId === source.id
+                        }
+                        error={
+                          attachUrl.isError &&
+                          attachUrl.variables?.incompleteSourceId === source.id
+                            ? attachUrl.error
+                            : null
+                        }
+                        onSubmit={(url) =>
+                          attachUrl.mutate({
+                            subjectId: candidate.id,
+                            incompleteSourceId: source.id,
+                            url,
+                          })
+                        }
+                      />
+                    ) : null}
                   </li>
                 ))}
               </ul>
@@ -1002,31 +1017,33 @@ export function DiscoveryPanel({
                 Le rapport ChatGPT archivé sera réutilisé. Aucun nouvel appel au
                 bridge ne sera effectué.
               </p>
-              <div className="editorial-actions">
-                <button
-                  className="button button--secondary"
-                  disabled={reprocessReport.isPending}
-                  onClick={() =>
-                    reprocessReport.mutate(batch.discovery_model_run_id)
-                  }
-                >
-                  Retraiter le rapport archivé
-                </button>
-                <button
-                  className="button button--secondary"
-                  disabled={relaunch.isPending || mergeReconciling}
-                  onClick={() => {
-                    if (
-                      window.confirm(
-                        "Relancer la recherche web créera une nouvelle conversation ChatGPT et conservera le rapport actuel. Continuer ?",
+              {!readOnly ? (
+                <div className="editorial-actions">
+                  <button
+                    className="button button--secondary"
+                    disabled={reprocessReport.isPending}
+                    onClick={() =>
+                      reprocessReport.mutate(batch.discovery_model_run_id)
+                    }
+                  >
+                    Retraiter le rapport archivé
+                  </button>
+                  <button
+                    className="button button--secondary"
+                    disabled={relaunch.isPending || mergeReconciling}
+                    onClick={() => {
+                      if (
+                        window.confirm(
+                          "Relancer la recherche web créera une nouvelle conversation ChatGPT et conservera le rapport actuel. Continuer ?",
+                        )
                       )
-                    )
-                      relaunch.mutate();
-                  }}
-                >
-                  Relancer la recherche web
-                </button>
-              </div>
+                        relaunch.mutate();
+                    }}
+                  >
+                    Relancer la recherche web
+                  </button>
+                </div>
+              ) : null}
               <h3>Requêtes</h3>
               <ul>
                 {batch.queries.map((query) => (
