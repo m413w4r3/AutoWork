@@ -438,6 +438,8 @@ def _merge_verified(items: Sequence[ExtractionItem]) -> tuple[list[ExtractionIte
         statuses = {previous.indicator_status, item.indicator_status}
         if len(statuses) > 1:
             warnings.append("semantic_status_conflict")
+        # An explicit IOC publication is stronger than a contextual label from
+        # another source; keep the diagnostic without downgrading the IOC.
         status = _merged_status(statuses)
         context = " | ".join(
             dict.fromkeys(part for part in (previous.context, item.context) if part)

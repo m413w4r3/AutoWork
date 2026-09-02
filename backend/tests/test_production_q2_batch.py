@@ -295,11 +295,21 @@ def test_batch_prompt_lists_exact_urls_and_frames_only_the_output() -> None:
         "This restriction does not apply to IOC values: extract URL, MD5, SHA1, SHA256 and"
         " SHA512 indicators normally"
     ) in prompt_on_one_line
+    assert (
+        "Use `confirmed` when the publication explicitly presents a value as an IOC"
+        in prompt_on_one_line
+    )
+    assert "Use `contextual` only when the technical value is relevant" in prompt_on_one_line
+    assert "do not sample, summarize, collapse ranges" in prompt_on_one_line
+    assert (
+        "A single table cell may contain multiple IOC literals separated by whitespace"
+        in prompt_on_one_line
+    )
     for ioc_type in ("url", "md5", "sha1", "sha256", "sha512"):
         assert ioc_type in prompt
     assert " :: " not in prompt
     assert "S1" not in prompt
-    assert IOC_RULES_BATCH_PROMPT_VERSION == "8"
+    assert IOC_RULES_BATCH_PROMPT_VERSION == "9"
     assert production_q2_batch.Q2_BATCH_PARSER_VERSION == "q2-batch-v3"
 
 

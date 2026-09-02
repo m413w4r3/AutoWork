@@ -9,17 +9,17 @@ from cti_app.domain.production import ExtractionProfile
 REFERENCES_PROMPT_VERSION = "5"
 # Q2 uses free-text GPT plus a stateless Markdown wire-format parser. The bridge does
 # not guarantee response_format / JSON Schema.
-# "16" / "9": Q2 analyses the live publication behind the exact canonical URL,
+# "17" / "10": Q2 analyses the live publication behind the exact canonical URL,
 # including its rendered tables, code and visible images. The local archive is
 # collection provenance and is never inlined in the prompt. Extraction is now
 # bounded by the requested Subject: exhaustiveness applies to subject-relevant
 # IOCs/rules, not to every indicator visible in a multi-actor publication.
-EXTRACTION_PROMPT_VERSION = "16"
-IOC_RULES_PROMPT_VERSION = "9"
-# "8": the batch input is the compact list of exact source URLs plus the single
+EXTRACTION_PROMPT_VERSION = "17"
+IOC_RULES_PROMPT_VERSION = "10"
+# "9": the batch input is the compact list of exact source URLs plus the single
 # shared Subject. Only the output stays marker-framed: a marker starts the next
 # block; EOF closes the final block.
-IOC_RULES_BATCH_PROMPT_VERSION = "8"
+IOC_RULES_BATCH_PROMPT_VERSION = "9"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -104,6 +104,27 @@ Do NOT emit an IOC when the source explicitly associates it with:
 When an IOC's relationship to the subject is ambiguous, do not emit it as
 confirmed.
 
+IOC status is about the source's publication and association decision, not your
+confidence about the indicator's exact technical function. Use `confirmed` when
+the publication explicitly presents a value as an IOC, malicious infrastructure,
+C2 infrastructure, malware/file indicator or other defensive indicator belonging
+to the requested Subject. If the source places the value in a subject-relevant
+block headed `Indicators of Compromise`, `Indicators`, `IOCs`, `C2
+infrastructure`, `Malicious infrastructure`, `Network indicators`, `File
+indicators`, `Hashes`, `Domains and IPs`, or an IOC appendix/table, preserve it
+as `confirmed` even when it says potentially associated infrastructure, the
+exact operational role is unknown, or the purpose of the host is uncertain.
+Those qualifications concern function, not whether the source published the
+value for the Subject.
+
+Use `contextual` only when the technical value is relevant but the source does
+not itself establish it as an IOC of the requested Subject. This includes an
+example-only narrative mention, historically related infrastructure not tied to
+the campaign, a legitimate service domain, a research pivot, an explicitly
+hypothetical or ambiguous subject association, or an indicator belonging to a
+nearby but distinct activity. Do not promote every value appearing in the
+publication to `confirmed`.
+
 Shared legitimate infrastructure is not a useful IOC by itself. Generic roots
 or services such as GitHub, Telegram, Google Drive, common cloud platforms,
 public CDNs or vendor infrastructure must not be emitted solely because the
@@ -120,7 +141,14 @@ IOC, not every IOC in the publication. Perform an exhaustive subject-relevant
 IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/SHA512 and email addresses,
 including tables, appendices, images and code. Omit irrelevant, example-only,
 placeholder, masked, truncated, REDACTED or FUZZ values; never reconstruct
-hidden values.
+hidden values. Exhaustiveness includes every literal value in a subject-relevant
+IOC table or appendix: do not sample, summarize, collapse ranges, omit
+repetitive-looking subdomains, or stop after representative examples. A single
+table cell may contain multiple IOC literals separated by whitespace, newline,
+comma or semicolon. Treat each separator-delimited valid literal as a separate
+IOC and emit each one on its own `- <value>` line; never treat the whole cell as
+one value. For example, emit `uae1.example` and `uae14.example` separately; do
+not replace them with `uae1-uae14.example` or `multiple uae*.example subdomains`.
 
 Never sacrifice coverage of subject-relevant IOCs to reduce cost. Never
 increase coverage by importing indicators belonging to other activities

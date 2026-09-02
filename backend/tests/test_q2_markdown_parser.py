@@ -66,7 +66,7 @@ def test_full_prompt_requires_compact_facts_iocs_and_rules() -> None:
     assert "Emit no source id, URL, provenance" not in one_line
     assert "Never repeat its URL" not in one_line
     assert "url, email, md5, sha1, sha256, sha512" in one_line
-    assert EXTRACTION_PROMPT_VERSION == "16"
+    assert EXTRACTION_PROMPT_VERSION == "17"
     assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v5"
 
 
@@ -101,7 +101,7 @@ def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
     assert "Emit no source id, URL, provenance" not in one_line
     assert "Never repeat its URL" not in one_line
     assert "url, email, md5, sha1, sha256, sha512" in one_line
-    assert IOC_RULES_PROMPT_VERSION == "9"
+    assert IOC_RULES_PROMPT_VERSION == "10"
     # The transport format stays a bare value line: filtering happens during
     # extraction, not through a new annotated wire format.
     assert "IOC <confirmed|contextual> <type>\n- <value>" in prompt
@@ -154,6 +154,22 @@ def test_q2_prompt_states_the_multi_actor_relevance_contract(profile: Extraction
         "Exhaustiveness applies after relevance filtering: find every subject-relevant"
         " IOC, not every IOC in the publication." in one_line
     )
+    assert (
+        "Use `confirmed` when the publication explicitly presents a value as an IOC"
+        in one_line
+    )
+    assert (
+        "the exact operational role is unknown, or the purpose of the host is uncertain"
+        in one_line
+    )
+    assert "Use `contextual` only when the technical value is relevant" in one_line
+    assert "Do not promote every value appearing in the publication to `confirmed`." in one_line
+    assert "do not sample, summarize, collapse ranges" in one_line
+    assert (
+        "A single table cell may contain multiple IOC literals separated by whitespace,"
+        " newline, comma or semicolon." in one_line
+    )
+    assert "emit each one on its own `- <value>` line" in one_line
     assert (
         "Never increase coverage by importing indicators belonging to other activities"
         " mentioned in the source." in one_line
