@@ -101,9 +101,13 @@ async function boundTabState(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
     let windowFocused = null;
+    let windowState = null;
+    let windowType = null;
     try {
       const window = await chrome.windows?.get(tab.windowId);
       windowFocused = window?.focused ?? null;
+      windowState = window?.state ?? null;
+      windowType = window?.type ?? null;
     } catch (_) {
       windowFocused = null;
     }
@@ -112,9 +116,15 @@ async function boundTabState(tabId) {
       exists: true,
       active: tab.active ?? null,
       discarded: tab.discarded ?? null,
+      // `tab.frozen` n'existe pas sur les Chrome plus anciens : son absence
+      // vaut `null`, jamais une erreur ni un run en échec.
+      frozen: tab.frozen ?? null,
       auto_discardable: tab.autoDiscardable ?? null,
       status: tab.status ?? null,
+      window_id: tab.windowId ?? null,
       window_focused: windowFocused,
+      window_state: windowState,
+      window_type: windowType,
     };
   } catch (_) {
     return { tab_id: tabId, exists: false };
@@ -396,7 +406,7 @@ async function handleConversationArchive(msg) {
       "écrite dans l'historique ChatGPT, donc rien à y supprimer)",
     { conversation_id: msg.conversation_id, tab_id: known?.tab_id ?? null },
   );
-  if (known?.tab_id) await chrome.tabs.remove(known.tab_id).catch(() => {});
+  if (known?.tab_id) await closeBoundTarget(known);
   conversationRegistry.delete(msg.conversation_id);
   persistConversationRegistry();
   send({ type: "conversation_archive", id: msg.id, ok: true });
@@ -466,6 +476,178 @@ async function waitForTab(tabId) {
   throw new Error("chargement de la conversation expiré");
 }
 
+// --------------------------------------------------------------------------- //
+// Fenêtre Chrome dédiée
+//
+// Un onglet créé `active: false` dans la fenêtre de l'opérateur reste un onglet
+// d'arrière-plan : `document.visibilityState` y vaut `hidden` pendant toute la
+// génération. Une production réelle de ~13 min l'a prouvé (`started_hidden=true`,
+// terminée seulement après une visite humaine de la page).
+//
+// L'expérience testée ici est différente : chaque Temporary Chat live devient
+// l'onglet *actif* de sa *propre* fenêtre Chrome, elle-même *non focalisée*.
+// Attendu côté page : `visibilityState=visible`, `hasFocus()=false`.
+//
+// Une fenêtre par Temporary Chat, jamais une fenêtre partagée : une seule
+// fenêtre ne peut avoir qu'un onglet actif, donc deux générations simultanées
+// dans une même fenêtre recréeraient exactement le défaut d'arrière-plan.
+//
+// Interdits : demander le focus à la création, mettre à jour le focus d'une
+// fenêtre, activer un onglet dans la fenêtre de l'opérateur, ou minimiser la
+// fenêtre dédiée (une fenêtre minimisée peut remettre la page en cycle de vie
+// masqué et invaliderait l'expérience).
+// --------------------------------------------------------------------------- //
+
+/**
+ * Crée un Temporary Chat comme onglet actif d'une fenêtre dédiée non focalisée.
+ * L'onglet est résolu explicitement depuis le `windowId` exact — jamais par une
+ * recherche d'URL, jamais « le premier onglet chatgpt.com ».
+ */
+async function createDedicatedTemporaryChat() {
+  if (!chrome.windows?.create) {
+    throw new BridgeRoutingError(
+      "conversation_unavailable",
+      "chrome.windows indisponible : aucune fenêtre dédiée ne peut être créée",
+    );
+  }
+  const created = await chrome.windows.create({
+    url: TEMPORARY_CHAT_URL,
+    type: "normal",
+    focused: false,
+    state: "normal",
+  });
+  const windowId = created?.id;
+  if (typeof windowId !== "number") {
+    throw new BridgeRoutingError(
+      "conversation_unavailable",
+      "la fenêtre dédiée n'a pas d'identifiant exact",
+    );
+  }
+  try {
+    const tabs = await chrome.tabs.query({ windowId });
+    if (tabs.length !== 1) {
+      throw new BridgeRoutingError(
+        "conversation_unavailable",
+        "la fenêtre dédiée ne contient pas exactement un onglet",
+      );
+    }
+    const [candidate] = tabs;
+    if (candidate.windowId !== windowId || typeof candidate.id !== "number") {
+      throw new BridgeRoutingError(
+        "conversation_unavailable",
+        "l'onglet créé n'appartient pas à la fenêtre dédiée",
+      );
+    }
+    const loaded = await waitForTab(candidate.id);
+    if (loaded.windowId !== windowId) {
+      throw new BridgeRoutingError(
+        "conversation_unavailable",
+        "l'onglet a quitté la fenêtre dédiée avant d'être chargé",
+      );
+    }
+    if (!isAllowedChatOrigin(loaded.url)) {
+      throw new BridgeRoutingError(
+        "conversation_unavailable",
+        "l'onglet Temporary Chat créé n'est pas sur une origine ChatGPT",
+      );
+    }
+    if (loaded.active !== true) {
+      throw new BridgeRoutingError(
+        "conversation_unavailable",
+        "l'onglet Temporary Chat n'est pas actif dans sa fenêtre dédiée",
+      );
+    }
+    let windowFocused = null;
+    let windowState = null;
+    let windowType = null;
+    try {
+      const window = await chrome.windows.get(windowId);
+      windowFocused = window?.focused ?? null;
+      windowState = window?.state ?? null;
+      windowType = window?.type ?? null;
+    } catch (_) {
+      // Diagnostic seulement : ne jamais faire échouer une réservation valide.
+    }
+    console.log("bridge_run_phase", {
+      phase: "dedicated_window_created",
+      window_id: windowId,
+      tab_id: loaded.id,
+      tab_active: loaded.active ?? null,
+      window_focused: windowFocused,
+      window_state: windowState,
+      window_type: windowType,
+    });
+    return { window_id: windowId, tab: loaded };
+  } catch (err) {
+    await removeWindowById(windowId);
+    if (err instanceof BridgeRoutingError) throw err;
+    throw new BridgeRoutingError(
+      "conversation_unavailable",
+      `création de la fenêtre dédiée impossible : ${err.message}`,
+    );
+  }
+}
+
+/**
+ * La fenêtre dédiée créée par le bridge est-elle toujours celle qui héberge
+ * l'onglet ? Un binding réécrit depuis un événement du content script ne doit
+ * jamais revendiquer une fenêtre que le bridge n'a pas ouverte.
+ */
+function ownsDedicatedWindow(existing, observedWindowId) {
+  if (existing?.bridge_owned_window !== true) return false;
+  if (typeof observedWindowId !== "number") return false;
+  return existing.window_id === observedWindowId;
+}
+
+async function removeWindowById(windowId) {
+  if (typeof windowId !== "number" || !chrome.windows?.remove) return;
+  await chrome.windows.remove(windowId).catch(() => {});
+}
+
+/**
+ * Ferme la ressource exacte d'un binding.
+ *
+ * Une fenêtre n'est fermée que si la propriété est *prouvée* depuis l'entrée de
+ * registre créée par le bridge : `bridge_owned_window`, l'onglet exact existe
+ * encore, il est toujours dans cette fenêtre, et cette fenêtre ne contient que
+ * lui. Sinon — propriété non prouvable, ou onglets ajoutés par l'opérateur — on
+ * ne ferme au plus que l'onglet exact du bridge. Jamais une fenêtre repérée
+ * parce qu'elle contient une URL ChatGPT.
+ */
+async function closeBoundTarget(binding) {
+  const tabId = binding?.tab_id;
+  if (typeof tabId !== "number") return;
+  const windowId = binding.window_id;
+  if (
+    binding.bridge_owned_window !== true ||
+    typeof windowId !== "number" ||
+    !chrome.windows?.get
+  ) {
+    await chrome.tabs.remove(tabId).catch(() => {});
+    return;
+  }
+  let ownershipProven = false;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.windowId !== windowId) throw new Error("l'onglet a changé de fenêtre");
+    const window = await chrome.windows.get(windowId, { populate: true });
+    const tabs = window?.tabs || [];
+    ownershipProven = tabs.length === 1 && tabs[0]?.id === tabId;
+  } catch (_) {
+    ownershipProven = false;
+  }
+  if (ownershipProven) {
+    await removeWindowById(windowId);
+    console.log("bridge_run_phase", {
+      phase: "dedicated_window_removed",
+      window_id: windowId,
+      tab_id: tabId,
+    });
+    return;
+  }
+  await chrome.tabs.remove(tabId).catch(() => {});
+}
+
 function isBrowserTarget(value) {
   if (!value || typeof value !== "object") return false;
   const keys = Object.keys(value).sort();
@@ -483,38 +665,24 @@ function isBrowserTarget(value) {
 
 async function reserveBrowserTarget(browserTarget) {
   const targetId = browserTarget.id;
-  const created = await chrome.tabs.create({ url: TEMPORARY_CHAT_URL, active: false });
-  try {
-    const loaded = await waitForTab(created.id);
-    if (!isAllowedChatOrigin(loaded.url)) {
-      throw new BridgeRoutingError(
-        "conversation_unavailable",
-        "l'onglet Temporary Chat créé n'est pas sur une origine ChatGPT",
-      );
-    }
-    await setTabAutoDiscardable(loaded.id, false);
-    browserTargetRegistry.set(targetId, {
-      target_id: targetId,
-      tab_id: loaded.id,
-      window_id: loaded.windowId,
-      state: "reserved",
-      last_verified_at: Date.now(),
-    });
-    persistBrowserTargetRegistry();
-    console.log("bridge_run_phase", {
-      phase: "browser_target_reserved",
-      target_id: targetId,
-      tab_id: loaded.id,
-    });
-    return loaded;
-  } catch (err) {
-    await chrome.tabs.remove(created.id).catch(() => {});
-    if (err instanceof BridgeRoutingError) throw err;
-    throw new BridgeRoutingError(
-      "conversation_unavailable",
-      `réservation Temporary Chat impossible : ${err.message}`,
-    );
-  }
+  const { window_id: windowId, tab: loaded } = await createDedicatedTemporaryChat();
+  await setTabAutoDiscardable(loaded.id, false);
+  browserTargetRegistry.set(targetId, {
+    target_id: targetId,
+    tab_id: loaded.id,
+    window_id: windowId,
+    bridge_owned_window: true,
+    state: "reserved",
+    last_verified_at: Date.now(),
+  });
+  persistBrowserTargetRegistry();
+  console.log("bridge_run_phase", {
+    phase: "browser_target_reserved",
+    target_id: targetId,
+    tab_id: loaded.id,
+    window_id: windowId,
+  });
+  return loaded;
 }
 
 /** Résout exclusivement le binding exact d'une cible stateless request-scoped. */
@@ -626,15 +794,12 @@ async function resolveConversationTab(conversation) {
         persistConversationRegistry();
       }
     }
-    const tab = await chrome.tabs.create({ url: TEMPORARY_CHAT_URL, active: false });
-    const loaded = await waitForTab(tab.id);
-    if (!isAllowedChatOrigin(loaded.url)) {
-      throw new BridgeRoutingError("conversation_unavailable", "l'onglet créé n'est pas sur une origine ChatGPT");
-    }
+    const { window_id: windowId, tab: loaded } = await createDedicatedTemporaryChat();
     await setTabAutoDiscardable(loaded.id, false);
     conversationRegistry.set(conversation.id, {
       tab_id: loaded.id,
-      window_id: loaded.windowId,
+      window_id: windowId,
+      bridge_owned_window: true,
       head_turn_id: null,
       state: "reserved",
       external_locator: null,
@@ -707,7 +872,7 @@ async function cleanupReservationAfterDeliveryFailure(msg, route) {
   if (msg.conversation?.mode === "fresh") {
     const binding = conversationRegistry.get(msg.conversation.id);
     if (binding?.state === "submitted" && binding.bridge_run_id === msg.id) {
-      await chrome.tabs.remove(binding.tab_id).catch(() => {});
+      await closeBoundTarget(binding);
       conversationRegistry.delete(msg.conversation.id);
       persistConversationRegistry();
     }
@@ -722,13 +887,14 @@ async function cleanupBrowserTargetForRequest(requestId, route = requestRoutes.g
   const binding = browserTargetRegistry.get(targetId);
   if (!binding) return;
   if (binding.bridge_run_id && binding.bridge_run_id !== requestId) return;
-  await chrome.tabs.remove(binding.tab_id).catch(() => {});
+  await closeBoundTarget(binding);
   browserTargetRegistry.delete(targetId);
   persistBrowserTargetRegistry();
   console.log("bridge_run_phase", {
     phase: "browser_target_released",
     target_id: targetId,
     tab_id: binding.tab_id,
+    window_id: binding.window_id ?? null,
   });
 }
 
@@ -1079,7 +1245,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const existing = conversationRegistry.get(msg.conversation.id);
       conversationRegistry.set(msg.conversation.id, {
         tab_id: sender.tab?.id || null,
-        window_id: sender.tab?.windowId || null,
+        window_id: sender.tab?.windowId ?? existing?.window_id ?? null,
+        // La propriété de la fenêtre ne survit que si l'onglet est resté dans
+        // exactement la fenêtre que le bridge a créée : sinon on repasse en
+        // mode sûr (fermeture de l'onglet exact seulement).
+        bridge_owned_window: ownsDedicatedWindow(existing, sender.tab?.windowId),
         head_turn_id: existing ? existing.head_turn_id : null,
         state: "submitted",
         // Diagnostic uniquement : jamais utilisé pour router ou rouvrir un onglet.
@@ -1111,7 +1281,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const existing = conversationRegistry.get(msg.conversation.id);
         conversationRegistry.set(msg.conversation.id, {
           tab_id: sender.tab?.id || existing?.tab_id || null,
-          window_id: sender.tab?.windowId || existing?.window_id || null,
+          window_id: sender.tab?.windowId ?? existing?.window_id ?? null,
+          bridge_owned_window: ownsDedicatedWindow(existing, sender.tab?.windowId),
           // Le tour externe vérifié devient la nouvelle tête : c'est ce qui
           // autorise un futur CONTINUE (KEEP) sur exactement cet onglet.
           head_turn_id: msg.conversation.turn_id || existing?.head_turn_id || null,
@@ -1154,7 +1325,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.type === "error" && msg.conversation?.id && msg.submission_state === "pre_submission") {
         const binding = conversationRegistry.get(msg.conversation.id);
         if (binding?.state === "submitted" && binding.bridge_run_id === msg.id) {
-          chrome.tabs.remove(binding.tab_id).catch(() => {});
+          void closeBoundTarget(binding);
           conversationRegistry.delete(msg.conversation.id);
           persistConversationRegistry();
         }
@@ -1181,6 +1352,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // Nettoyage proactif : un onglet fermé ou parti hors origine ChatGPT ne doit
 // jamais laisser un binding vivant pointer dans le vide.
 chrome.tabs.onRemoved.addListener((tabId) => {
+  // Fermeture manuelle de l'onglet ou de la fenêtre dédiée pendant un run.
+  // Les bindings sont purgés d'abord, *puis* l'échec est émis : rien ne doit
+  // ressusciter une target qui pointerait vers un onglet définitivement mort.
+  const lost = [...inflight.entries()].filter(([, boundTabId]) => boundTabId === tabId);
   let changed = false;
   for (const [id, entry] of conversationRegistry.entries()) {
     if (entry.tab_id === tabId) {
@@ -1197,10 +1372,42 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     }
   }
   if (browserChanged) persistBrowserTargetRegistry();
+  for (const [requestId] of lost) {
+    void failRunOnLostBoundTab(
+      requestId,
+      tabId,
+      "l'onglet ChatGPT lié (ou sa fenêtre dédiée) a été fermé pendant le run",
+    );
+  }
 });
 
 /**
- * Onglet déchargé par Chrome pendant un run lié.
+ * Une fenêtre dédiée disparue emporte ses bindings. Chrome émet déjà
+ * `tabs.onRemoved` pour chacun de ses onglets ; ce filet ne fait que garantir
+ * qu'aucun binding ne prétend posséder une fenêtre qui n'existe plus.
+ */
+chrome.windows?.onRemoved?.addListener((windowId) => {
+  let changed = false;
+  for (const [id, entry] of conversationRegistry.entries()) {
+    if (entry.bridge_owned_window === true && entry.window_id === windowId) {
+      conversationRegistry.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) persistConversationRegistry();
+  let browserChanged = false;
+  for (const [targetId, entry] of browserTargetRegistry.entries()) {
+    if (entry.bridge_owned_window === true && entry.window_id === windowId) {
+      browserTargetRegistry.delete(targetId);
+      browserChanged = true;
+    }
+  }
+  if (browserChanged) persistBrowserTargetRegistry();
+});
+
+/**
+ * Onglet lié perdu pendant un run : déchargé par Chrome, ou fermé à la main
+ * (onglet ou fenêtre dédiée) par l'opérateur.
  *
  * Le content script est mort avec la page : plus aucun heartbeat n'arrivera et
  * la génération observée est perdue. On le dit tout de suite, de façon typée et
@@ -1208,7 +1415,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
  * est conservée pour une recovery explicite). Jamais de resoumission, jamais
  * d'onglet de remplacement, jamais d'activation pour « réveiller » l'onglet.
  */
-async function failRunOnDiscardedTab(requestId, tabId) {
+async function failRunOnLostBoundTab(
+  requestId,
+  tabId,
+  message = "l'onglet ChatGPT lié a été déchargé par le navigateur (tab discarded)",
+) {
   const route = requestRoutes.get(requestId);
   inflight.delete(requestId);
   busyTabs.delete(tabId);
@@ -1218,8 +1429,7 @@ async function failRunOnDiscardedTab(requestId, tabId) {
     type: "error",
     id: requestId,
     code: "bridge_extension_disconnected",
-    message:
-      "l'onglet ChatGPT lié a été déchargé par le navigateur (tab discarded)",
+    message,
     phase: "generation",
     submission_state: "post_submission",
     retryable: false,
@@ -1235,7 +1445,7 @@ async function failRunOnDiscardedTab(requestId, tabId) {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.discarded !== true) return;
   for (const [requestId, boundTabId] of [...inflight.entries()]) {
-    if (boundTabId === tabId) void failRunOnDiscardedTab(requestId, tabId);
+    if (boundTabId === tabId) void failRunOnLostBoundTab(requestId, tabId);
   }
 });
 

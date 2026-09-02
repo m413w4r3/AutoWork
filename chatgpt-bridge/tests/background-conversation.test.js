@@ -36,12 +36,20 @@ FakeWebSocket.CLOSED = 3;
  * directly, storage.session/local are plain objects a test can inspect. */
 function makeChromeMock() {
   let nextTabId = 1;
+  let nextWindowId = 900;
   const tabsById = new Map();
+  const windowsById = new Map();
   const sessionStore = {};
   const localStore = {};
   const removedListeners = [];
   const updatedListeners = [];
   const messageListeners = [];
+  const windowRemovedListeners = [];
+  const windowCreateCalls = [];
+
+  /** L'opérateur a une fenêtre normale focalisée, comme dans la vraie vie. */
+  const userWindow = { id: nextWindowId++, type: "normal", focused: true, state: "normal" };
+  windowsById.set(userWindow.id, userWindow);
 
   const chrome = {
     storage: {
@@ -64,8 +72,14 @@ function makeChromeMock() {
       },
     },
     tabs: {
-      create: async ({ url, active }) => {
-        const tab = { id: nextTabId++, url, windowId: 900, status: "complete", active: !!active };
+      create: async ({ url, active, windowId }) => {
+        const tab = {
+          id: nextTabId++,
+          url,
+          windowId: windowId ?? userWindow.id,
+          status: "complete",
+          active: !!active,
+        };
         tabsById.set(tab.id, tab);
         return { ...tab };
       },
@@ -74,7 +88,10 @@ function makeChromeMock() {
         if (!tab) throw new Error(`No tab with id: ${tabId}`);
         return { ...tab };
       },
-      query: async () => [...tabsById.values()].map((tab) => ({ ...tab })),
+      query: async (filter = {}) =>
+        [...tabsById.values()]
+          .filter((tab) => filter.windowId === undefined || tab.windowId === filter.windowId)
+          .map((tab) => ({ ...tab })),
       remove: async (tabId) => {
         const existed = tabsById.has(tabId);
         tabsById.delete(tabId);
@@ -93,6 +110,51 @@ function makeChromeMock() {
       onUpdated: { addListener: (fn) => updatedListeners.push(fn) },
       reload: async () => {},
     },
+    windows: {
+      create: async (options) => {
+        windowCreateCalls.push({ ...options });
+        const window = {
+          id: nextWindowId++,
+          type: options.type ?? "normal",
+          focused: options.focused === true,
+          state: options.state ?? "normal",
+        };
+        windowsById.set(window.id, window);
+        const urls = Array.isArray(options.url) ? options.url : [options.url];
+        const tabs = urls.map((url, index) => {
+          const tab = {
+            id: nextTabId++,
+            url,
+            windowId: window.id,
+            status: "complete",
+            // Chrome rend actif le premier onglet de la nouvelle fenêtre,
+            // même quand celle-ci n'est pas focalisée.
+            active: index === 0,
+          };
+          tabsById.set(tab.id, tab);
+          return { ...tab };
+        });
+        return { ...window, tabs };
+      },
+      get: async (windowId, options = {}) => {
+        const window = windowsById.get(windowId);
+        if (!window) throw new Error(`No window with id: ${windowId}`);
+        if (!options.populate) return { ...window };
+        const tabs = [...tabsById.values()]
+          .filter((tab) => tab.windowId === windowId)
+          .map((tab) => ({ ...tab }));
+        return { ...window, tabs };
+      },
+      remove: async (windowId) => {
+        if (!windowsById.has(windowId)) throw new Error(`No window with id: ${windowId}`);
+        windowsById.delete(windowId);
+        for (const tab of [...tabsById.values()]) {
+          if (tab.windowId === windowId) await chrome.tabs.remove(tab.id);
+        }
+        for (const fn of windowRemovedListeners) fn(windowId);
+      },
+      onRemoved: { addListener: (fn) => windowRemovedListeners.push(fn) },
+    },
     scripting: { executeScript: async () => {} },
     runtime: {
       onMessage: { addListener: (fn) => messageListeners.push(fn) },
@@ -102,7 +164,18 @@ function makeChromeMock() {
     alarms: { create: () => {}, onAlarm: { addListener: () => {} } },
   };
 
-  return { chrome, tabsById, sessionStore, localStore, removedListeners, updatedListeners, messageListeners };
+  return {
+    chrome,
+    tabsById,
+    windowsById,
+    userWindow,
+    windowCreateCalls,
+    sessionStore,
+    localStore,
+    removedListeners,
+    updatedListeners,
+    messageListeners,
+  };
 }
 
 /** Loads background.js fresh into its own vm context. Passing the *same*
@@ -130,7 +203,11 @@ async function main() {
     const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
 
     assert.equal(tab.url, "https://chatgpt.com/?temporary-chat=true");
-    assert.equal(tab.active, false);
+    // Actif dans sa fenêtre dédiée, mais cette fenêtre n'est pas focalisée.
+    assert.equal(tab.active, true);
+    assert.notEqual(tab.windowId, mock.userWindow.id);
+    assert.equal(mock.windowsById.get(tab.windowId).focused, false);
+    assert.equal(mock.userWindow.focused, true, "la fenêtre de l'opérateur garde le focus");
     assert.equal(mock.tabsById.size, 1);
   }
 
@@ -426,7 +503,8 @@ async function main() {
     assert.equal(mock.tabsById.size, 1, "un run stateless ne doit créer qu'un Temporary Chat");
     const tab = [...mock.tabsById.values()][0];
     assert.equal(tab.url, "https://chatgpt.com/?temporary-chat=true");
-    assert.equal(tab.active, false);
+    assert.equal(tab.active, true);
+    assert.equal(mock.windowsById.get(tab.windowId).focused, false);
     assert.deepEqual(
       sentToTabs.map(({ tabId }) => tabId),
       [tab.id, tab.id, tab.id],
@@ -699,7 +777,12 @@ async function main() {
     );
     const tab = [...mock.tabsById.values()][0];
     assert.equal(tab.autoDiscardable, false, "l'onglet lié ne doit pas être déchargeable");
-    assert.equal(tab.active, false, "l'onglet ne doit jamais être activé");
+    assert.equal(
+      mock.windowsById.get(tab.windowId).focused,
+      false,
+      "la fenêtre dédiée ne doit jamais prendre le focus",
+    );
+    assert.equal(mock.userWindow.focused, true);
   }
 
   // 17. Ticks d'observation : le ping du serveur réveille exactement l'onglet
@@ -771,6 +854,266 @@ async function main() {
       (err) => err.code === "recovery_unavailable",
     );
     assert.equal(mock.tabsById.size, tabsBefore);
+  }
+
+  // --- Fenêtre Chrome dédiée ------------------------------------------------ //
+
+  // 19. FRESH crée une fenêtre normale non focalisée dont l'onglet Temporary
+  // Chat exact est actif. La fenêtre de l'opérateur garde le focus.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-W" })');
+
+    assert.equal(mock.windowCreateCalls.length, 1);
+    assert.deepEqual(mock.windowCreateCalls[0], {
+      url: "https://chatgpt.com/?temporary-chat=true",
+      type: "normal",
+      focused: false,
+      state: "normal",
+    });
+    const window = mock.windowsById.get(tab.windowId);
+    assert.equal(window.type, "normal");
+    assert.equal(window.focused, false);
+    assert.equal(window.state, "normal");
+    assert.notEqual(window.state, "minimized");
+    assert.equal(tab.active, true);
+    assert.equal(tab.windowId, window.id);
+
+    const entry = await run('conversationRegistry.get("conv-W")');
+    assert.equal(entry.tab_id, tab.id);
+    assert.equal(entry.window_id, window.id);
+    assert.equal(entry.bridge_owned_window, true);
+    // Le binding de fenêtre vit en session uniquement.
+    assert.equal(
+      mock.sessionStore.bridgeConversationRegistry["conv-W"].bridge_owned_window,
+      true,
+    );
+    assert.equal(mock.localStore.bridgeConversationRegistry, undefined);
+  }
+
+  // 20. CONTINUE réutilise exactement la même fenêtre et le même onglet :
+  // une seule création de fenêtre pour tout le cycle de vie.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const fresh = await run('resolveConversationTab({ mode: "fresh", id: "conv-K" })');
+    await run('conversationRegistry.get("conv-K").head_turn_id = "turn-1"');
+    const continued = await run(
+      'resolveConversationTab({ mode: "continue", id: "conv-K", expected_turn_id: "turn-1" })',
+    );
+
+    assert.equal(continued.id, fresh.id);
+    assert.equal(continued.windowId, fresh.windowId);
+    assert.equal(mock.windowCreateCalls.length, 1, "CONTINUE ne crée jamais de fenêtre");
+    assert.equal(mock.tabsById.size, 1);
+  }
+
+  // 21. Deux générations fraîches concurrentes : deux fenêtres dédiées, deux
+  // onglets actifs, aucune des deux focalisée, aucun routage croisé.
+  {
+    const mock = makeChromeMock();
+    const sent = [];
+    mock.chrome.tabs.sendMessage = async (tabId, msg) => {
+      sent.push({ tabId, msg });
+      return {};
+    };
+    const { run } = loadBackground(mock.chrome);
+    const targetA = { kind: "temporary_chat_run", id: "target-win-A" };
+    const targetB = { kind: "temporary_chat_run", id: "target-win-B" };
+    await Promise.all([
+      run(`handlePrompt(${JSON.stringify({ type: "prompt", id: "run-win-A", prompt: "a", new_chat: true, browser_target: targetA })})`),
+      run(`handlePrompt(${JSON.stringify({ type: "prompt", id: "run-win-B", prompt: "b", new_chat: true, browser_target: targetB })})`),
+    ]);
+
+    const bindingA = await run('browserTargetRegistry.get("target-win-A")');
+    const bindingB = await run('browserTargetRegistry.get("target-win-B")');
+    assert.notEqual(bindingA.window_id, bindingB.window_id);
+    assert.notEqual(bindingA.tab_id, bindingB.tab_id);
+    for (const binding of [bindingA, bindingB]) {
+      assert.equal(binding.bridge_owned_window, true);
+      assert.equal(mock.tabsById.get(binding.tab_id).active, true);
+      assert.equal(mock.windowsById.get(binding.window_id).focused, false);
+      assert.equal(mock.windowsById.get(binding.window_id).state, "normal");
+    }
+    assert.equal(mock.userWindow.focused, true, "aucun run ne vole le focus");
+    const prompts = sent.filter(({ msg }) => msg.type === "prompt");
+    assert.equal(prompts.length, 2, "chaque prompt est soumis exactement une fois");
+    assert.equal(prompts.find(({ msg }) => msg.id === "run-win-A").tabId, bindingA.tab_id);
+    assert.equal(prompts.find(({ msg }) => msg.id === "run-win-B").tabId, bindingB.tab_id);
+  }
+
+  // 22. Archive : seule la fenêtre dédiée exacte disparaît. Une autre fenêtre
+  // dédiée et la fenêtre de l'opérateur restent intactes.
+  {
+    const mock = makeChromeMock();
+    const userTab = await mock.chrome.tabs.create({ url: "https://chatgpt.com/", active: true });
+    const { run } = loadBackground(mock.chrome);
+    const tabA = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    const tabB = await run('resolveConversationTab({ mode: "fresh", id: "conv-B" })');
+
+    await run('handleConversationArchive({ conversation_id: "conv-A", id: "archive-1" })');
+
+    assert.equal(mock.windowsById.has(tabA.windowId), false, "la fenêtre dédiée exacte est fermée");
+    assert.equal(mock.tabsById.has(tabA.id), false);
+    assert.equal(mock.windowsById.has(tabB.windowId), true);
+    assert.equal(mock.tabsById.has(tabB.id), true);
+    assert.equal(mock.windowsById.has(mock.userWindow.id), true, "la fenêtre utilisateur survit");
+    assert.equal(mock.tabsById.has(userTab.id), true);
+    assert.equal(await run('conversationRegistry.has("conv-A")'), false);
+    assert.equal(await run('conversationRegistry.has("conv-B")'), true);
+  }
+
+  // 22b. Sécurité : si l'opérateur a ajouté ses propres onglets dans la fenêtre
+  // dédiée, on ne ferme que l'onglet exact du bridge, jamais la fenêtre.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    const operatorTab = await mock.chrome.tabs.create({
+      url: "https://example.com/",
+      active: false,
+      windowId: tab.windowId,
+    });
+
+    await run('handleConversationArchive({ conversation_id: "conv-A", id: "archive-1" })');
+
+    assert.equal(mock.tabsById.has(tab.id), false, "l'onglet exact du bridge est fermé");
+    assert.equal(mock.windowsById.has(tab.windowId), true, "la fenêtre n'est pas fermée");
+    assert.equal(mock.tabsById.has(operatorTab.id), true, "l'onglet de l'opérateur survit");
+  }
+
+  // 22c. Propriété non prouvable (l'onglet a changé de fenêtre) : on ne ferme
+  // jamais la fenêtre enregistrée.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    const dedicatedWindowId = tab.windowId;
+    // L'onglet a été déplacé dans la fenêtre de l'opérateur.
+    mock.tabsById.get(tab.id).windowId = mock.userWindow.id;
+
+    await run('handleConversationArchive({ conversation_id: "conv-A", id: "archive-1" })');
+
+    assert.equal(mock.tabsById.has(tab.id), false);
+    assert.equal(
+      mock.windowsById.has(dedicatedWindowId),
+      true,
+      "une propriété non prouvée ne ferme jamais une fenêtre",
+    );
+    assert.equal(mock.windowsById.has(mock.userWindow.id), true);
+  }
+
+  // 23. Target stateless : retenue -> conservée, libération finale -> fenêtre
+  // dédiée exacte fermée, jamais remplacée, jamais focalisée.
+  {
+    const mock = makeChromeMock();
+    mock.chrome.tabs.sendMessage = async () => ({});
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-retain" };
+    await run(`handlePrompt(${JSON.stringify({ type: "prompt", id: "run-retain", prompt: "a", new_chat: true, browser_target: target })})`);
+    const binding = await run('browserTargetRegistry.get("target-retain")');
+
+    await run(`handleBrowserTargetRetain({ id: "retain-1", run_id: "run-retain", browser_target: ${JSON.stringify(target)} })`);
+    assert.equal(await run('browserTargetRegistry.get("target-retain").state'), "recoverable");
+    assert.equal(
+      await run('browserTargetRegistry.get("target-retain").bridge_owned_window'),
+      true,
+      "la retenue conserve la propriété de la fenêtre",
+    );
+    assert.equal(mock.windowsById.has(binding.window_id), true, "retenue : fenêtre gardée vivante");
+    assert.equal(mock.windowCreateCalls.length, 1, "une target retenue n'est jamais remplacée");
+
+    await run(`handleBrowserTargetRelease({ id: "release-1", run_id: "run-retain", browser_target: ${JSON.stringify(target)} })`);
+    assert.equal(mock.windowsById.has(binding.window_id), false, "libération : fenêtre fermée");
+    assert.equal(mock.tabsById.has(binding.tab_id), false);
+    assert.equal(await run('browserTargetRegistry.has("target-retain")'), false);
+    assert.equal(mock.windowCreateCalls.length, 1, "aucune fenêtre de remplacement");
+    assert.equal(mock.userWindow.focused, true);
+  }
+
+  // 24. Fermeture manuelle de la fenêtre dédiée pendant un run : échec typé et
+  // fermé, aucun rejeu, aucune fenêtre de remplacement.
+  {
+    const mock = makeChromeMock();
+    mock.chrome.tabs.sendMessage = async () => ({});
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-closed" };
+    await run(`handlePrompt(${JSON.stringify({ type: "prompt", id: "run-closed", prompt: "a", new_chat: true, browser_target: target })})`);
+    const binding = await run('browserTargetRegistry.get("target-closed")');
+
+    // L'opérateur ferme la fenêtre dédiée à la main.
+    await mock.chrome.windows.remove(binding.window_id);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const failure = await run('enAttente.find((m) => m.id === "run-closed" && m.type === "error")');
+    assert.ok(failure, "une fermeture manuelle doit produire un échec typé");
+    assert.equal(failure.code, "bridge_extension_disconnected");
+    assert.equal(failure.submission_state, "post_submission");
+    assert.equal(failure.retryable, false);
+    assert.equal(await run('requestStates.get("run-closed")'), "failed");
+    assert.equal(await run('inflight.has("run-closed")'), false);
+    assert.equal(await run('browserTargetRegistry.has("target-closed")'), false);
+    assert.equal(mock.windowCreateCalls.length, 1, "aucune fenêtre de remplacement");
+    assert.equal(mock.tabsById.size, 0);
+  }
+
+  // 25. Redémarrage du service worker : le binding de session porte le même
+  // onglet ET la même fenêtre ; CONTINUE ne crée pas de seconde fenêtre.
+  {
+    const mock = makeChromeMock();
+    const first = loadBackground(mock.chrome);
+    const tabA = await first.run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    await first.run('conversationRegistry.get("conv-A").head_turn_id = "turn-1"');
+    await first.run("persistConversationRegistry()");
+
+    const second = loadBackground(mock.chrome);
+    const resumed = await second.run(
+      'resolveConversationTab({ mode: "continue", id: "conv-A", expected_turn_id: "turn-1" })',
+    );
+
+    assert.equal(resumed.id, tabA.id);
+    assert.equal(resumed.windowId, tabA.windowId);
+    assert.equal(await second.run('conversationRegistry.get("conv-A").window_id'), tabA.windowId);
+    assert.equal(await second.run('conversationRegistry.get("conv-A").bridge_owned_window'), true);
+    assert.equal(mock.windowCreateCalls.length, 1, "un redémarrage ne crée pas de seconde fenêtre");
+  }
+
+  // 26. Diagnostics de cycle de vie : les champs fenêtre/onglet sont présents,
+  // et un `tab.frozen` absent vaut `null` sans jamais faire échouer la lecture.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    const state = await run(`boundTabState(${tab.id})`);
+
+    assert.equal(state.exists, true);
+    assert.equal(state.tab_id, tab.id);
+    assert.equal(state.active, true);
+    assert.equal(state.frozen, null, "un tab.frozen absent vaut null");
+    assert.equal(state.discarded, null);
+    assert.equal(state.window_id, tab.windowId);
+    assert.equal(state.window_focused, false);
+    assert.equal(state.window_state, "normal");
+    assert.equal(state.window_type, "normal");
+
+    mock.tabsById.get(tab.id).frozen = false;
+    assert.equal((await run(`boundTabState(${tab.id})`)).frozen, false);
+
+    const gone = await run("boundTabState(999999)");
+    assert.equal(gone.exists, false);
+  }
+
+  // 27. Contrat « pas de vol de focus » sur la source elle-même.
+  {
+    assert.doesNotMatch(BACKGROUND_SOURCE, /focused:\s*true/);
+    assert.doesNotMatch(BACKGROUND_SOURCE, /chrome\.windows\.update/);
+    assert.doesNotMatch(BACKGROUND_SOURCE, /active:\s*true/);
+    assert.doesNotMatch(BACKGROUND_SOURCE, /window\.focus\(/);
+    assert.doesNotMatch(BACKGROUND_SOURCE, /state:\s*"minimized"/);
+    // chrome.tabs.update ne sert qu'à autoDiscardable.
+    const updates = BACKGROUND_SOURCE.match(/chrome\.tabs\.update\([^)]*\)/g) || [];
+    assert.deepEqual(updates, ["chrome.tabs.update(tabId, { autoDiscardable })"]);
   }
 
   console.log("background conversation routing contract: ok");

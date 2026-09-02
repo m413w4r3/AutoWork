@@ -98,9 +98,46 @@ explicite décider.
 
 ### Autonomie en arrière-plan
 
-L’onglet de génération est créé volontairement inactif (`active: false`) et ne
-doit **jamais** avoir besoin d’être focalisé pour qu’une réponse soit consommée.
-Le focus reste un outil de debug humain, jamais un mécanisme de complétion.
+Chaque Temporary Chat live est l’onglet **actif** de sa **propre fenêtre Chrome**
+créée par le bridge (`type: normal`, `focused: false`, `state: normal`, jamais
+minimisée). Il ne doit **jamais** avoir besoin d’être focalisé pour qu’une
+réponse soit consommée. Le focus reste un outil de debug humain, jamais un
+mécanisme de complétion.
+
+**Pourquoi une fenêtre dédiée.** Un onglet créé `active: false` dans la fenêtre
+de l’opérateur est un onglet d’arrière-plan : `document.visibilityState` y vaut
+`hidden` pendant toute la génération. Une production réelle de ~13 min l’a
+prouvé (`started_hidden=true`, `started_has_focus=false`), et elle ne s’est
+terminée qu’après une visite humaine de la page. Le cycle de vie visé est :
+
+    tab.active = true            document.visibilityState = visible
+    window.focused = false       document.hasFocus() = false
+
+**Une fenêtre par session live**, jamais une fenêtre partagée : une fenêtre
+Chrome n’a qu’un seul onglet actif, donc deux générations simultanées dans la
+même fenêtre recréeraient exactement le défaut d’arrière-plan pour l’une des
+deux.
+
+**Un seul chemin de création** : `createDedicatedTemporaryChat()` dans
+`background.js`, utilisé par la réservation de `browser_target` comme par le
+`fresh` d’une conversation. L’onglet est résolu depuis le `windowId` exact
+(`chrome.tabs.query({ windowId })`, un seul onglet attendu), jamais par une
+recherche d’URL ni « le premier onglet chatgpt.com ». Un `continue` ne crée ni
+fenêtre ni onglet : il retrouve le binding exact.
+
+**Un seul chemin de fermeture** : `closeBoundTarget()`. La fenêtre dédiée n’est
+fermée que si la propriété est *prouvée* depuis l’entrée de registre créée par
+le bridge — `bridge_owned_window`, l’onglet exact existe encore, il est toujours
+dans le `window_id` enregistré, et cette fenêtre ne contient que lui. Sinon
+(propriété non prouvable, ou onglets ajoutés par l’opérateur dans cette
+fenêtre), seul l’onglet exact du bridge est fermé. Aucune fenêtre n’est jamais
+fermée parce qu’elle contient une URL ChatGPT.
+
+**Fermeture manuelle pendant un run.** Si l’opérateur ferme l’onglet ou la
+fenêtre dédiée, `chrome.tabs.onRemoved` purge d’abord les bindings puis émet un
+échec typé et fermé : `bridge_extension_disconnected`,
+`submission_state=post_submission`, `retryable=false`. Aucune resoumission,
+aucune fenêtre de remplacement, aucune conversation reconstruite.
 
 Chrome ralentit les minuteries d’une page masquée : ~1 s en arrière-plan, puis
 au plus **une exécution par minute** au-delà de cinq minutes cachées
@@ -261,39 +298,68 @@ et effectue le checkpoint SQLite. Au redémarrage, les états `queued` ou
 `running` sont transformés en échec `submission_attempted` et ne sont jamais
 resoumis.
 
-## Test manuel d’autonomie (onglet jamais focalisé)
+## Test manuel d’autonomie (fenêtre dédiée jamais focalisée)
 
 Procédure de reproduction et de preuve. Elle doit permettre de trancher
-objectivement entre « a exigé un focus humain » et « terminé masqué ».
+objectivement entre « a exigé un focus humain » et « terminé sans focus ».
+
+### Smoke A — contrat court (routage seulement)
+
+`uv run examples/verify_ephemeral_conversation.py` : `fresh` → `continue` →
+`conversation_archive`. Le script ne voit pas les identités Chrome ; les
+vérifier dans la console du service worker : un seul
+`phase=dedicated_window_created`, puis le même `tab_id`/`window_id` sur les deux
+tours (`phase=bound_tab_state`), et `phase=dedicated_window_removed` à
+l’archivage. **Ne rien toucher à la fenêtre du bridge.** Ses réponses tiennent en ~10–15 s : ce smoke prouve le routage et le
+cycle de vie de la fenêtre, **jamais** l’absence de dépendance au premier plan.
+
+### Smoke B — cycle de vie long (obligatoire)
 
 1. `make up`, puis vérifier le pont : `make bridge-status`.
 2. Recharger l’extension dans Chrome et vérifier la version du content script :
    dans la console de l’onglet ChatGPT, la ligne
-   `🔌 ChatGPT Mini-Bridge : content script prêt — version 30`. Une version plus
+   `🔌 ChatGPT Mini-Bridge : content script prêt — version 31`. Une version plus
    ancienne signifie que Chrome sert encore le code précédent.
-3. Lancer une production normale (deux articles, recherche approfondie).
-4. **Ne toucher à aucun onglet ChatGPT** : ne pas cliquer dessus, ne pas le
-   survoler, ne pas le mettre au premier plan. Travailler dans une autre
-   application, idéalement dans une autre fenêtre, pour que la fenêtre du
-   navigateur elle-même ne soit pas focalisée.
+3. Lancer une génération qui occupe ChatGPT **au moins 6 à 10 minutes**
+   (recherche approfondie), sans effet de bord de production.
+4. **Ne toucher à aucune fenêtre ni onglet du bridge** : ne pas cliquer dessus,
+   ne pas le survoler, ne pas remonter la fenêtre dédiée. Garder une autre
+   fenêtre / application focalisée pendant toute la génération.
 5. N’inspecter les logs qu’**après** la fin du run : `make bridge-logs`.
+
+Critères de réussite, tous requis :
+
+    completion_signal=assistant_actions
+    started_visibility_state=visible   started_hidden=false   started_has_focus=false
+    visibility_state=visible           hidden=false           has_focus=false
+    focus_gains_during_run=0
+    aucun finalization_stalled / active_signal_stalled / bridge_extension_disconnected
+    un seul Send, aucun rejeu
+
+Un `visibility_state=hidden` malgré `tab.active=true` et `window.focused=false`
+signifie que Chrome considère toujours la page masquée : l’architecture de
+fenêtre dédiée ne résout alors pas le problème → **NO-GO**, à rapporter tel quel
+plutôt qu’à masquer.
 
 Ce que la télémétrie permet de vérifier, sans aucun contenu :
 
 | Question | Où regarder |
 | --- | --- |
-| L’onglet est-il resté masqué ? | `bridge_run_autonomy … visibility_state=hidden` |
+| La fenêtre dédiée a-t-elle bien été créée ? | `bridge_run_phase phase=dedicated_window_created` : `window_focused=false`, `window_state=normal`, `window_type=normal`, `tab_active=true` |
+| La page est-elle restée *visible* ? | `bridge_run_autonomy … visibility_state=visible`, `started_hidden=false` — un `hidden` ici invalide l’architecture de fenêtre dédiée |
 | Est-il resté sans focus ? | `has_focus=False`, `focus_gains=0`, `visible_transitions=0` |
 | Un focus humain a-t-il précédé la détection ? | `focus_gains`/`visible_transitions` > 0 sur le `done` |
 | Quand le DOM final est-il apparu ? | `ms_since_dom_mutation` sur le `done` (recul depuis la dernière mutation) |
 | Comment la fin a-t-elle été détectée ? | `wake_mutation` / `wake_tick` / `wake_timer` |
 | L’onglet a-t-il été déchargé ? | `tab_state.discarded=true` (console du service worker, ou diagnostics de l’erreur `bridge_extension_disconnected`) |
-| L’onglet est-il resté en arrière-plan ? | `bridge_run_phase phase=bound_tab_state` (console du service worker) : `active=false`, `auto_discardable=false` |
+| L’onglet est-il resté hors focus ? | `bridge_run_phase phase=bound_tab_state` (console du service worker) : `active=true`, `window_focused=false`, `window_state=normal`, `auto_discardable=false`, `frozen=false` ou `null` si non supporté |
 
-Un `done` accompagné de `visibility_state=hidden`, `has_focus=False`,
-`focus_gains=0` et `visible_transitions=0` **prouve** une complétion autonome :
-la page n’est jamais repassée au premier plan avant que la fin ne soit
-constatée. À l’inverse, `focus_gains>0` sur ce même `done` est la signature d’une
+Un `done` accompagné de `visibility_state=visible`, `hidden=false`,
+`has_focus=False`, `focus_gains=0` et `visible_transitions=0` **prouve** une
+complétion autonome sans dépendance au premier plan : la page est restée
+visible pour Chrome sans jamais avoir été focalisée par un humain.
+Un `visibility_state=hidden` sur un run en fenêtre dédiée est au contraire un
+**NO-GO** pour cette architecture : la fenêtre non focalisée n’a pas suffi. À l’inverse, `focus_gains>0` sur ce même `done` est la signature d’une
 complétion qui a suivi une intervention humaine, et doit être traitée comme une
 régression.
 

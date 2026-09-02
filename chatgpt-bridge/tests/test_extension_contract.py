@@ -49,10 +49,78 @@ def test_fresh_conversations_are_temporary_chat_url_based() -> None:
         'const TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";' in background
     )
     assert "?temporary-chat=true" in background
-    assert "chrome.tabs.create({ url: TEMPORARY_CHAT_URL, active: false })" in background
     # The original regression: opening a bare chatgpt.com/ root and depending
     # on a later navigation for identity must never come back.
     assert 'chrome.tabs.create({ url: "https://chatgpt.com/", active: false })' not in background
+    # Every NEW Temporary Chat goes through the one dedicated-window helper.
+    assert "async function createDedicatedTemporaryChat()" in background
+    assert background.count("await createDedicatedTemporaryChat()") == 2
+    assert "chrome.tabs.create(" not in background
+
+
+def test_new_temporary_chats_live_in_a_dedicated_unfocused_window() -> None:
+    """Chaque Temporary Chat live est l'onglet actif de sa propre fenêtre.
+
+    Un onglet `active: false` dans la fenêtre de l'opérateur reste masqué
+    (`document.visibilityState=hidden`) pendant toute la génération : c'est la
+    dépendance au premier plan que cette architecture teste.
+    """
+    root = Path(__file__).parents[1] / "extension"
+    background = (root / "background.js").read_text()
+
+    start = background.index("async function createDedicatedTemporaryChat()")
+    end = background.index("\nasync function removeWindowById(", start)
+    body = background[start:end]
+
+    assert "chrome.windows.create({" in body
+    assert 'type: "normal",' in body
+    assert "focused: false," in body
+    assert 'state: "normal",' in body
+    # Jamais minimisée : une fenêtre minimisée peut remettre la page en cycle
+    # de vie masqué et invaliderait l'expérience.
+    assert '"minimized"' not in background
+    # L'onglet est résolu depuis le windowId exact, jamais par recherche d'URL.
+    assert "chrome.tabs.query({ windowId })" in body
+    assert "tabs.length !== 1" in body
+    assert "candidate.windowId !== windowId" in body
+    assert "loaded.windowId !== windowId" in body
+    assert "isAllowedChatOrigin(loaded.url)" in body
+    assert "loaded.active !== true" in body
+    assert 'phase: "dedicated_window_created"' in body
+
+
+def test_dedicated_window_ownership_is_recorded_in_session_only() -> None:
+    root = Path(__file__).parents[1] / "extension"
+    background = (root / "background.js").read_text()
+
+    assert background.count("bridge_owned_window: true,") == 2
+    assert "bridge_owned_window" not in _local_storage_calls(background)
+
+
+def test_window_cleanup_requires_proven_ownership() -> None:
+    """Aucune fenêtre n'est fermée parce qu'elle contient une URL ChatGPT."""
+    root = Path(__file__).parents[1] / "extension"
+    background = (root / "background.js").read_text()
+
+    start = background.index("async function closeBoundTarget(binding)")
+    end = background.index("\nfunction isBrowserTarget(", start)
+    body = background[start:end]
+
+    assert 'binding.bridge_owned_window !== true' in body
+    assert "tab.windowId !== windowId" in body
+    assert "chrome.windows.get(windowId, { populate: true })" in body
+    assert "tabs.length === 1 && tabs[0]?.id === tabId" in body
+    # Propriété non prouvée ou onglets ajoutés par l'opérateur : au plus
+    # l'onglet exact du bridge est fermé.
+    assert body.rstrip().endswith("await chrome.tabs.remove(tabId).catch(() => {});\n}")
+    assert "chrome.tabs.query(" not in body
+    # Toute fermeture de session live passe par ce chemin exact : les seuls
+    # `chrome.tabs.remove` du service worker sont les deux replis sûrs ici.
+    assert background.count("chrome.tabs.remove(") == 2
+    assert body.count("chrome.tabs.remove(") == 2
+    # Une fenêtre n'est jamais fermée ailleurs que par le helper de propriété.
+    assert background.count("chrome.windows.remove(") == 1
+    assert "async function removeWindowById(windowId)" in background
 
 
 def test_conversation_registry_lives_in_session_storage_only() -> None:
@@ -149,12 +217,16 @@ def test_focus_is_never_a_completion_mechanism() -> None:
     background = (root / "background.js").read_text()
     content = (root / "content.js").read_text()
 
-    # Le service worker n'active jamais un onglet, ni ne déplace une fenêtre.
+    # Le service worker n'active jamais un onglet, ni ne focalise une fenêtre.
     assert "active: true" not in background
+    assert "focused: true" not in background
     assert "chrome.windows.update" not in background
     assert "highlight" not in background
-    # Les onglets de génération restent créés en arrière-plan.
-    assert background.count("chrome.tabs.create({ url: TEMPORARY_CHAT_URL, active: false })") == 2
+    # `chrome.tabs.update` ne sert qu'à la protection contre le déchargement.
+    assert background.count("chrome.tabs.update(") == 1
+    assert "chrome.tabs.update(tabId, { autoDiscardable })" in background
+    # Les fenêtres dédiées naissent non focalisées et le restent.
+    assert background.count("focused: false,") == 1
     # Le content script ne ramène jamais la page au premier plan.
     assert "window.focus()" not in content
     assert "globalThis.focus()" not in content
@@ -174,17 +246,66 @@ def test_background_tab_is_protected_from_discard_without_activation() -> None:
     # n'est lié à cet onglet exact.
     assert "await setTabAutoDiscardable(tab.id, false);" in background
     assert "releaseTabAutoDiscardable" in background
-    # Un onglet déchargé échoue de façon typée et fermée : jamais un rejeu,
-    # jamais un onglet de remplacement.
-    assert "async function failRunOnDiscardedTab(" in background
-    discard_start = background.index("async function failRunOnDiscardedTab(")
+    # Un onglet perdu — déchargé par Chrome, ou fermé à la main avec sa fenêtre
+    # dédiée — échoue de façon typée et fermée : jamais un rejeu, jamais un
+    # onglet ou une fenêtre de remplacement.
+    assert "async function failRunOnLostBoundTab(" in background
+    discard_start = background.index("async function failRunOnLostBoundTab(")
     discard_end = background.index("chrome.tabs.onUpdated.addListener", discard_start)
     discard_body = background[discard_start:discard_end]
     assert '"bridge_extension_disconnected"' in discard_body
     assert 'submission_state: "post_submission"' in discard_body
     assert "retryable: false" in discard_body
-    assert "chrome.tabs.create(" not in discard_body
+    assert "createDedicatedTemporaryChat(" not in discard_body
+    assert "chrome.windows.create(" not in discard_body
     assert "sendToTab(" not in discard_body
+
+
+def test_manual_window_closure_fails_closed() -> None:
+    """Fermer l'onglet ou la fenêtre dédiée pendant un run est un échec fermé."""
+    root = Path(__file__).parents[1] / "extension"
+    background = (root / "background.js").read_text()
+
+    start = background.index("chrome.tabs.onRemoved.addListener((tabId) => {")
+    end = background.index("chrome.windows?.onRemoved?.addListener", start)
+    body = background[start:end]
+
+    assert "const lost = [...inflight.entries()]" in body
+    assert "failRunOnLostBoundTab(" in body
+    # Les bindings sont purgés avant l'émission : rien ne ressuscite une target
+    # dont l'onglet est définitivement mort.
+    assert body.index("conversationRegistry.delete(id)") < body.index("failRunOnLostBoundTab(")
+    assert body.index("browserTargetRegistry.delete(targetId)") < body.index(
+        "failRunOnLostBoundTab("
+    )
+    assert "createDedicatedTemporaryChat(" not in body
+    assert "sendToTab(" not in body
+
+
+def test_bound_tab_state_reports_window_lifecycle_without_being_fatal() -> None:
+    root = Path(__file__).parents[1] / "extension"
+    background = (root / "background.js").read_text()
+
+    start = background.index("async function boundTabState(tabId)")
+    end = background.index("\nasync function logBoundTabState(", start)
+    body = background[start:end]
+
+    for field in (
+        "tab_id:",
+        "active:",
+        "discarded:",
+        "frozen:",
+        "auto_discardable:",
+        "status:",
+        "window_id:",
+        "window_focused:",
+        "window_state:",
+        "window_type:",
+    ):
+        assert field in body
+    # Un champ de cycle de vie absent (Chrome plus ancien) vaut null.
+    assert "tab.frozen ?? null" in body
+    assert "chrome.windows?.get(" in body
 
 
 def test_observation_tick_wakes_the_loop_without_claiming_liveness() -> None:

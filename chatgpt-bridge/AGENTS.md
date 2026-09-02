@@ -100,8 +100,19 @@ response text can never change what conversation is opened or closed.
   `external_locator` is diagnostic only and is never used to route or reopen
   a conversation — it may be identical across multiple live conversations.
 - **needs_review** never triggers implicit replay.
-- **background autonomy**: the generation tab is created with `active: false`
-  and must never need focus to complete. Chrome throttles a hidden page's
+- **background autonomy**: each live Temporary Chat is the *active* tab of its
+  own Bridge-created Chrome window (`type: normal`, `focused: false`,
+  `state: normal`, never minimized) and must never need focus to complete.
+  One window per live Temporary Chat / browser target — a single Chrome window
+  has only one active tab, so a shared window would recreate the background
+  lifecycle for every other session. `createDedicatedTemporaryChat()` in
+  `background.js` is the *only* path that opens a new Temporary Chat; the exact
+  tab is resolved from the exact `windowId`, never by URL match.
+  `closeBoundTarget()` is the only path that closes one: it removes the
+  Bridge-owned window only when ownership is proven (registry flag
+  `bridge_owned_window`, the exact tab still exists, still lives in the stored
+  `window_id`, and is that window's only tab) and otherwise closes at most the
+  exact Bridge tab. Chrome throttles a hidden page's
   timers (once per minute past five minutes hidden), so completion-critical
   observation is woken by a `MutationObserver`, by the service worker's
   `observe_tick` (paced by the server ping), and only lastly by the throttled
@@ -120,6 +131,9 @@ Every conversation the bridge opens fresh is a ChatGPT Temporary Chat
 
     application conversation UUID -> exact Chrome tab_id -> last verified
     external assistant turn id (expected_turn_id)
+
+The binding also carries the Bridge-owned window (`window_id` +
+`bridge_owned_window`), session-only like the rest.
 
 `background.js` keeps this binding in `chrome.storage.session`
 (`bridgeConversationRegistry`), never in `chrome.storage.local`: a
