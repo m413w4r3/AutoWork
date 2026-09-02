@@ -890,6 +890,50 @@ async def test_native_needs_review_is_not_collapsed_into_a_generic_error(
     assert len(adapter.calls) == 1
 
 
+class _UnpersistedCandidateAdapter(_StalledVisibleAnswerAdapter):
+    """Le texte a été vu, mais l'aperçu n'a jamais atteint le registre."""
+
+    async def invoke(
+        self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        result = await super().invoke(request, role=role, output_schema=output_schema)
+        result.metadata["recovery_preview_available"] = False
+        return result
+
+
+async def test_explicit_unavailable_recovery_is_never_upgraded_by_output_chars(
+    tmp_path: Path,
+) -> None:
+    """`recovery_preview_available=False` est une affirmation, pas une absence.
+
+    Le bridge ne la pose qu'après l'échec de la persistance durable : la
+    réécrire en `True` parce que `output_chars > 0` enverrait un humain adopter
+    un aperçu qui n'existe pas. Et un échec de persistance ne redevient jamais
+    un replay implicite du modèle.
+    """
+    adapter = _UnpersistedCandidateAdapter("Réponse visible mais jamais persistée")
+    service, _state = _build_service(adapter, tmp_path)
+    conversation = await _fresh_conversation(service)
+
+    with pytest.raises(ConversationNeedsReviewError) as raised:
+        await service.add_turn(
+            conversation.id,
+            message="Question de recherche",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            idempotency_key="unpersisted-candidate-key",
+            correlation_id="corr-unpersisted",
+        )
+
+    error = raised.value
+    assert error.reason == "active_signal_stalled"
+    assert error.details["output_chars"] > 0
+    assert error.details["candidate_output_present"] is True
+    assert error.recovery_available is False
+    assert error.details["recovery_available"] is False
+    assert len(adapter.calls) == 1
+
+
 async def test_adopting_the_stalled_candidate_never_sends_a_second_prompt(
     tmp_path: Path,
 ) -> None:

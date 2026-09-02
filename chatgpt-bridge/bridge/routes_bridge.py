@@ -240,16 +240,20 @@ class BridgeRoutes:
 
     def _store_incomplete_preview(
         self, req: BridgeRunRequest, run_id: str, exc: NeedsReviewError
-    ) -> None:
+    ) -> bool:
         """Rendre durable la réponse visible jointe à un `incomplete`.
 
         Le candidat n'est jamais adopté ici : il devient seulement récupérable.
         Sa provenance (`captured_incomplete`) le distingue explicitement d'une
         relecture DOM ultérieure (`live_dom_capture`).
+
+        Renvoie `True` uniquement si l'aperçu est réellement écrit dans le
+        registre. Un échec de persistance ne casse pas le `needs_review` — il
+        ne doit simplement jamais être annoncé comme une récupération durable.
         """
         candidate = exc.candidate
         if not candidate:
-            return
+            return False
         conversation = req.conversation.model_dump(mode="json") if req.conversation else None
         target = _browser_target_for_run(run_id, req.conversation)
         preview = {
@@ -288,7 +292,7 @@ class BridgeRoutes:
             self.registry.store_preview(run_id, preview)
         except Exception:  # noqa: BLE001 - l'état needs_review reste prioritaire
             logger.exception("bridge_incomplete_preview_not_persisted bridge_run_id=%s", run_id)
-            return
+            return False
         logger.info(
             "bridge_incomplete_preview_persisted bridge_run_id=%s reason=%s output_chars=%s "
             "external_turn_id_verified=%s",
@@ -297,6 +301,7 @@ class BridgeRoutes:
             candidate["output_chars"],
             candidate["turn_id"] is not None,
         )
+        return True
 
     def _consume_task_exception(self, task: asyncio.Task) -> None:
         """Observe detached failures; the typed result already lives in SQLite."""
@@ -398,7 +403,12 @@ class BridgeRoutes:
                 # le run passe en needs_review. L'onglet ChatGPT peut être fermé
                 # dans la seconde qui suit la réponse HTTP ; l'aperçu de
                 # récupération doit alors survivre sans aucun accès au DOM.
-                self._store_incomplete_preview(req, run_id, exc)
+                stored = self._store_incomplete_preview(req, run_id, exc)
+                # `recovery_preview_available` décrit la persistance, pas
+                # l'observation : il ne passe à True qu'après une écriture
+                # réussie dans le registre. `candidate_output_present` reste,
+                # lui, le fait brut « un texte était visible ».
+                exc.details["recovery_preview_available"] = stored
                 body = {
                     "id": run_id,
                     "object": "response",

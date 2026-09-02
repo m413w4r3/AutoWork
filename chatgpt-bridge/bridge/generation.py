@@ -710,7 +710,12 @@ async def run_generation(
                     "submission_state": submission_state,
                     "candidate_output_present": candidate is not None,
                     "candidate_output_sha256": candidate["sha256"] if candidate else None,
-                    "recovery_preview_available": candidate is not None,
+                    # Un candidat *observé* n'est pas encore un candidat
+                    # *récupérable* : seul l'appelant qui a réussi à persister
+                    # l'aperçu peut passer ce drapeau à True (routes_bridge).
+                    # Annoncer une récupération durable qui n'existe pas ferait
+                    # croire à un humain qu'il peut adopter un texte disparu.
+                    "recovery_preview_available": False,
                     "external_turn_id_verified": bool(candidate and candidate["turn_id"]),
                 }
                 if rejected:

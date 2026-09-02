@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "27";
+const VERSION = "28";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -1342,7 +1342,11 @@ function incompleteAnswer({
     streaming_signal_sources: signalSources || [],
     incomplete: true,
     incomplete_reason: reason,
+    // Identité lue sur le tour *courant* — celui qui vient d'être re-résolu et
+    // dont le texte est ce candidat — jamais sur le premier nœud assistant,
+    // que React a pu remplacer entre-temps.
     turn_locator: turn ? turnLocator(turn) : null,
+    external_turn_id: turn ? turnExternalId(turn) : null,
   };
 }
 
@@ -1360,6 +1364,11 @@ async function streamAnswer(job, locator, before) {
   const debut = Date.now();
   let lastHeartbeatAt = debut;
   let finalSerialized = null;
+  // Identité externe et locator du tour re-résolu qui a produit/vérifié le
+  // snapshot final. Ils sont capturés dans la même itération que le texte : le
+  // texte et l'identité décrivent toujours le même nœud DOM courant.
+  let finalTurnLocator = locator;
+  let finalExternalTurnId = null;
   let finalCompletion = {
     finished: null,
     signal: "unknown",
@@ -1569,6 +1578,8 @@ async function streamAnswer(job, locator, before) {
         output.observe(verification.text);
         finalSerialized = verification;
         finalCompletion = completion;
+        finalTurnLocator = turnLocator(turn) || locator;
+        finalExternalTurnId = turnExternalId(turn);
         break;
       }
 
@@ -1589,7 +1600,25 @@ async function streamAnswer(job, locator, before) {
     completion_signal: finalCompletion.signal,
     completion_confidence: finalCompletion.confidence,
     stable_for_ms: stableForMs,
+    turn_locator: finalTurnLocator,
+    external_turn_id: finalExternalTurnId,
   };
+}
+
+/**
+ * Identité externe du tour qui a réellement produit le snapshot rendu.
+ *
+ * `streamAnswer` re-résout le tour à chaque itération, car React remplace le
+ * nœud assistant entre réflexion, streaming et rendu final. Le premier nœud
+ * observé peut donc être détaché — et ne porter qu'un `request-placeholder-…`
+ * alors que le nœud courant porte déjà le vrai `data-message-id`. On lit donc
+ * l'identité capturée par `streamAnswer`, et à défaut on re-résout ce même
+ * tour par son locator, sans jamais réutiliser une référence DOM conservée.
+ */
+function resolveExternalTurnId(serialized, locator, before) {
+  if (serialized.external_turn_id) return serialized.external_turn_id;
+  const turn = findTurn(serialized.turn_locator || locator, before);
+  return turn ? turnExternalId(turn) : null;
 }
 
 /** Erreur de content script typée : `.code` traverse jusqu'au client, jamais aplati. */
@@ -1906,25 +1935,39 @@ async function handlePrompt({
       before,
     );
     if (!premier) return;
-    const serialized = await streamAnswer(job, turnLocator(premier), before);
+    const streamLocator = turnLocator(premier);
+    const serialized = await streamAnswer(job, streamLocator, before);
 
     if (!job.aborted) {
-      const externalTurnId = turnExternalId(premier);
+      // Le nœud `premier` peut être détaché : l'identité vient du tour courant
+      // qui a produit ce texte, jamais de la référence gardée avant streaming.
+      const externalTurnId = resolveExternalTurnId(
+        serialized,
+        streamLocator,
+        before,
+      );
       console.log("bridge_run_phase", { phase: "generation" });
       // Un `done` promet une conversation poursuivable : sans identité externe
-      // stable, cette promesse serait fausse. Un `incomplete` ne promet rien —
-      // il ne doit surtout pas détruire le candidat visible parce que l'UI n'a
-      // pas encore posé le vrai data-message-id.
-      if (!externalTurnId && !serialized.incomplete) {
-        throw new BridgeError(
-          "conversation_unavailable",
-          "aucun identifiant externe data-message-id stable pour le tour assistant",
-        );
+      // stable, cette promesse serait fausse. Mais détruire un texte final déjà
+      // sérialisé parce que l'UI n'a pas posé de `data-message-id` durable
+      // serait pire : on dégrade en `incomplete` typé, candidat joint, sans
+      // aucune identité de continuation fabriquée.
+      let incomplete = serialized.incomplete === true;
+      let reason = serialized.incomplete_reason;
+      if (!externalTurnId && !incomplete) {
+        if (!serialized.text) {
+          throw new BridgeError(
+            "conversation_unavailable",
+            "aucun identifiant externe data-message-id stable pour le tour assistant",
+          );
+        }
+        incomplete = true;
+        reason = "external_turn_identity_unavailable";
       }
       reply({
-        type: serialized.incomplete ? "incomplete" : "done",
+        type: incomplete ? "incomplete" : "done",
         id,
-        reason: serialized.incomplete_reason,
+        reason,
         text: serialized.text,
         submission_state: "post_submission",
         metadata: {

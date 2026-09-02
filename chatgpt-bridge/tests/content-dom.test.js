@@ -1178,3 +1178,207 @@ function useVirtualClock(window) {
   console.error(err);
   process.exit(1);
 });
+
+// --------------------------------------------------------------------------- //
+// Cycle de vie React : le premier nœud assistant observé n'est PAS celui qui
+// porte l'identité finale. `handlePrompt` doit lire l'identité sur le tour
+// courant re-résolu par streamAnswer, jamais sur la référence détachée.
+// --------------------------------------------------------------------------- //
+/**
+ * Rejoue le remplacement observé en production : l'UI insère d'abord un tour
+ * assistant portant `request-placeholder-request-WEB:<uuid>-0`, puis React
+ * remplace ce nœud, dans le MÊME conteneur `conversation-turn`, par le vrai
+ * message assistant.
+ */
+function replacementPage() {
+  return `<form id="composer-form"><textarea data-id="prompt"></textarea>
+      <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
+}
+
+const PLACEHOLDER_ID =
+  "request-placeholder-request-WEB:1f4c0a2e-1d47-4a5b-9d0a-2f1b3c4d5e6f-0";
+
+(async () => {
+  // A/B/C/D : placeholder -> remplacement par un id stable -> texte final.
+  {
+    const { window, run } = loadExtension(
+      replacementPage(),
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    const doc = window.document;
+    let clock = 0;
+    let replacedAt = null;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      // C. React remplace le nœud assistant à l'intérieur du même conteneur.
+      if (replacedAt !== null && clock >= replacedAt) {
+        replacedAt = null;
+        const container = doc.querySelector("[data-testid='conversation-turn-1']");
+        container.querySelector("[data-message-author-role='assistant']").remove();
+        container.insertAdjacentHTML(
+          "afterbegin",
+          `<div data-message-author-role="assistant" data-message-id="stable-assistant-42">
+             <div class="markdown"><p>réponse finale stable</p></div>
+           </div>`,
+        );
+        container.insertAdjacentHTML("beforeend", copyButton);
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+    let submitEvents = 0;
+    doc.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      doc.querySelector("textarea[data-id='prompt']").value = "";
+      // A. Premier tour assistant : uniquement un placeholder d'interface.
+      doc.body.insertAdjacentHTML(
+        "beforeend",
+        `<article data-testid="conversation-turn-1">
+           <div data-message-author-role="assistant" data-message-id="${PLACEHOLDER_ID}">
+             <div class="markdown"><p>réponse partielle</p></div>
+           </div>
+         </article>`,
+      );
+      replacedAt = clock + 2_000;
+    });
+
+    // B/D.
+    await run(`handlePrompt({ id: "req-replaced", prompt: "bonjour", conversation: { id: "conv-replaced", mode: "fresh" } })`);
+
+    const done = sent.find((message) => message.type === "done");
+    assert.equal(submitEvents, 1, "un remplacement DOM ne doit jamais provoquer un second envoi");
+    assert.equal(
+      sent.some((message) => message.type === "error"),
+      false,
+      "aucun conversation_unavailable ne doit être émis quand l'id stable existe",
+    );
+    assert.ok(done, "le tour remplacé doit aboutir à un done");
+    assert.equal(done.text, "réponse finale stable");
+    assert.equal(
+      done.conversation?.turn_id,
+      "stable-assistant-42",
+      "l'identité doit venir du nœud courant, pas du placeholder détaché",
+    );
+    assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
+    assert.equal(done.metadata?.content_script_version, "28");
+  }
+
+  // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
+  // part en incomplete avec l'identité stable du nœud courant.
+  {
+    const { window, run } = loadExtension(
+      replacementPage(),
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    const doc = window.document;
+    let clock = 0;
+    let replacedAt = null;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      if (replacedAt !== null && clock >= replacedAt) {
+        replacedAt = null;
+        const container = doc.querySelector("[data-testid='conversation-turn-1']");
+        container.querySelector("[data-message-author-role='assistant']").remove();
+        container.insertAdjacentHTML(
+          "afterbegin",
+          `<div data-message-author-role="assistant" data-message-id="stable-assistant-42">
+             <div class="markdown"><p>réponse finale stable</p></div>
+             <div class="result-streaming"></div>
+           </div>`,
+        );
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+    let submitEvents = 0;
+    doc.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      doc.querySelector("textarea[data-id='prompt']").value = "";
+      doc.body.insertAdjacentHTML(
+        "beforeend",
+        `<article data-testid="conversation-turn-1">
+           <div data-message-author-role="assistant" data-message-id="${PLACEHOLDER_ID}">
+             <div class="markdown"><p>réponse partielle</p></div>
+             <div class="result-streaming"></div>
+           </div>
+         </article>`,
+      );
+      replacedAt = clock + 2_000;
+    });
+
+    await run(`handlePrompt({ id: "req-replaced-stalled", prompt: "bonjour", conversation: { id: "conv-replaced-stalled", mode: "fresh" } })`);
+
+    const incomplete = sent.find((message) => message.type === "incomplete");
+    assert.equal(submitEvents, 1, "un stall ne doit jamais resoumettre");
+    assert.ok(incomplete, "un signal actif figé doit produire un incomplete");
+    assert.equal(incomplete.reason, "active_signal_stalled");
+    assert.equal(incomplete.text, "réponse finale stable");
+    assert.equal(
+      incomplete.metadata?.initial_turn_id,
+      "stable-assistant-42",
+      "le candidat durable doit porter l'identité du nœud courant",
+    );
+    assert.equal(incomplete.conversation?.turn_id, "stable-assistant-42");
+    assert.equal(sent.some((message) => message.type === "done"), false);
+  }
+
+  // Le placeholder ne devient jamais stable : le texte final n'est pas détruit,
+  // il devient un needs_review typé sans identité de continuation fabriquée.
+  {
+    const { window, run } = loadExtension(
+      replacementPage(),
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+    const doc = window.document;
+    useVirtualClock(window);
+    let submitEvents = 0;
+    doc.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      doc.querySelector("textarea[data-id='prompt']").value = "";
+      doc.body.insertAdjacentHTML(
+        "beforeend",
+        `<article data-testid="conversation-turn-1">
+           <div data-message-author-role="assistant" data-message-id="${PLACEHOLDER_ID}">
+             <div class="markdown"><p>réponse finale sans identité</p></div>
+           </div>${copyButton}
+         </article>`,
+      );
+    });
+
+    await run(`handlePrompt({ id: "req-placeholder-forever", prompt: "bonjour", conversation: { id: "conv-placeholder", mode: "fresh" } })`);
+
+    const incomplete = sent.find((message) => message.type === "incomplete");
+    assert.equal(submitEvents, 1);
+    assert.equal(
+      sent.some((message) => message.type === "done"),
+      false,
+      "sans identité stable, aucun done ne doit promettre une conversation poursuivable",
+    );
+    assert.equal(
+      sent.some((message) => message.type === "error"),
+      false,
+      "le texte final ne doit pas être détruit par une erreur sans texte",
+    );
+    assert.ok(incomplete, "le texte final doit survivre en incomplete typé");
+    assert.equal(incomplete.reason, "external_turn_identity_unavailable");
+    assert.equal(incomplete.text, "réponse finale sans identité");
+    assert.equal(incomplete.metadata?.initial_turn_id, null);
+    assert.equal(incomplete.conversation?.turn_id, null);
+  }
+
+  console.log("react turn replacement identity contract: ok");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

@@ -406,6 +406,41 @@ async def test_placeholder_turn_id_is_never_a_durable_external_identity(
     assert extension.prompt_count == 1
 
 
+async def test_failed_preview_persistence_never_claims_durable_recovery(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    """Un aperçu non persisté ne doit jamais être annoncé comme récupérable.
+
+    Le texte a bien été vu (`candidate_output_present`), mais rien ne survit à
+    la fermeture de l'onglet : promettre une adoption durable enverrait un
+    humain chercher un aperçu inexistant.
+    """
+    isolated_registry(runtime, tmp_path)
+    extension = _stalled_extension(runtime, text="réponse visible", turn_id="assistant-9")(
+        runtime
+    )
+    runtime.bridge.ws = extension
+
+    def refuse(run_id: str, value: dict[str, Any]) -> None:
+        raise RuntimeError("registre indisponible")
+
+    runtime.bridge_routes.registry.store_preview = refuse  # type: ignore[method-assign]
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="mission"), request_with_key("stalled-unpersisted")
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error"]["code"] == "active_signal_stalled"
+    assert result["metadata"]["candidate_output_present"] is True
+    assert result["metadata"]["output_chars"] == len("réponse visible")
+    assert result["metadata"]["recovery_preview_available"] is False
+    assert result["error"]["details"]["recovery_preview_available"] is False
+    # Aucune resoumission implicite : l'échec de persistance reste un
+    # needs_review, jamais un replay du prompt.
+    assert extension.prompt_count == 1
+
+
 async def test_empty_incomplete_stays_an_honest_no_final_answer(
     runtime: BridgeApplication, tmp_path: Path
 ) -> None:

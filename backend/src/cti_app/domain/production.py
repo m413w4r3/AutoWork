@@ -44,6 +44,7 @@ PRODUCTION_RECONCILIATION_ERROR_CODE = "model_submission_reconciliation_required
 BRIDGE_POST_SUBMISSION_REVIEW_CODES = frozenset(
     {
         "active_signal_stalled",
+        "external_turn_identity_unavailable",
         "finalization_stalled",
         "no_final_answer",
     }

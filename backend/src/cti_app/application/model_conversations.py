@@ -747,10 +747,18 @@ def _needs_review_error(execution: ModelExecution) -> ConversationNeedsReviewErr
     details = {**(run.error_details or {}), **execution.metadata}
     reason = str(details.get("reason") or run.error_code or "no_final_answer")[:64]
     output_chars = details.get("output_chars")
-    # A visible candidate answer the bridge captured is recoverable through the
-    # existing preview/adoption path; an empty one honestly is not.
-    recovery_available = bool(details.get("recovery_preview_available")) or (
-        isinstance(output_chars, int) and output_chars > 0
+    # `recovery_preview_available` is the bridge's own statement about durable
+    # persistence: it is True only once the preview really reached the run
+    # registry. An explicit False therefore means "the text was visible but is
+    # NOT durably recoverable" and must never be upgraded here just because
+    # output_chars > 0 — that would send a human to adopt a preview that does
+    # not exist. Only legacy runs recorded before the flag existed fall back on
+    # the character count.
+    explicit = details.get("recovery_preview_available")
+    recovery_available = (
+        explicit
+        if isinstance(explicit, bool)
+        else isinstance(output_chars, int) and output_chars > 0
     )
     return ConversationNeedsReviewError(
         f"{run.error_message or 'Le modèle n a pas conclu ce tour'} "

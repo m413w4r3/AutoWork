@@ -31,6 +31,7 @@ from cti_app.domain.production import (
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
+    model_run_awaits_reconciliation,
 )
 
 
@@ -634,3 +635,36 @@ async def test_bridge_reason_model_run_is_reconcilable_and_resumes_same_generati
     assert jobs.submissions == 1
     # One explicit operator preview, then the adoption's own hash-confirmed read.
     assert bridge.previews == 2
+
+
+@pytest.mark.asyncio
+async def test_external_turn_identity_unavailable_is_reconcilable_never_retried() -> None:
+    """Un texte final sans identité externe stable reste adoptable par un humain.
+
+    Le bridge a bien sérialisé la réponse, mais aucun `data-message-id` durable
+    n'a été posé : le run ne peut pas promettre un CONTINUE routable. Ce motif
+    appartient donc au jeu des réconciliations post-soumission explicites — pas
+    au retry ordinaire, qui resoumettrait le prompt.
+    """
+    assert model_run_awaits_reconciliation("external_turn_identity_unavailable")
+
+    service, uow, gateway, _bridge, jobs = _build_fixture()
+    run = next(iter(uow.subject_production_runs.runs.values()))
+    run.current_stage = SubjectProductionStage.REFERENCES
+    run.reconciliation = ProductionSubmissionReconciliation(
+        production_run_id=run.id,
+        model_run_id=gateway.model.id,
+        stage=SubjectProductionStage.REFERENCES,
+        bridge_response_id="bridge-1",
+        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        phase="reconciliation",
+    )
+    gateway.model.error_code = "external_turn_identity_unavailable"
+
+    preview = await service.preview_visible(run.id)
+    adopted = await service.adopt_visible(run.id, preview.sha256, actor_id="analyst")
+
+    assert gateway.model.status is ModelRunStatus.SUCCEEDED
+    assert adopted["provenance"] == "visible_recovery"
+    # Aucune resoumission : l'adoption reprend la même génération de pipeline.
+    assert jobs.submissions == 1
