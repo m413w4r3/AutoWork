@@ -16,6 +16,7 @@ import pytest
 
 from cti_app.application.edition_workspace import EditionProductionCheckpointService
 from cti_app.application.jobs import JobHandlerError, JobRegistry
+from cti_app.application.model_conversations import ConversationNeedsReviewError
 from cti_app.application.model_gateway import ModelSubmissionReconciliationRequiredError
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_jobs import (
@@ -28,11 +29,16 @@ from cti_app.application.production_jobs import (
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.production_recovery import (
+    ProductionRecoveryDisposition,
+    ProductionRecoveryPolicyV1,
+)
 from cti_app.application.production_workflow import _transient_or_terminal
-from cti_app.domain.model_runs import ModelRunStatus
+from cti_app.domain.model_runs import ModelRunStatus, ModelSubmissionState
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
+    ProductionReconciliationRequiredError,
     ProductionSubmissionReconciliation,
     SubjectProductionRun,
     SubjectProductionStage,
@@ -797,3 +803,80 @@ def test_registry_validates_the_parameters_it_receives_from_the_queue() -> None:
 
     assert isinstance(validated, ProductionStageParameters)
     assert validated.run_id == run_id
+
+
+def test_native_bridge_needs_review_keeps_the_reconciliation_identity() -> None:
+    """The real incident: ChatGPT answered on screen, the bridge said
+    active_signal_stalled, and the stage used to end as a terminal
+    model_conversation_error."""
+    model_run_id = uuid4()
+    result = _transient_or_terminal(
+        "references",
+        ConversationNeedsReviewError(
+            "ChatGPT s'est arrêté sans produire de réponse finale "
+            "(motif bridge : active_signal_stalled) ; réconciliation explicite requise.",
+            reason="active_signal_stalled",
+            model_run_id=model_run_id,
+            bridge_response_id="resp_65a707c50a5549a582b2fc3f",
+            details={"reason": "active_signal_stalled", "output_chars": 4211},
+            recovery_available=True,
+        ),
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "model_submission_reconciliation_required"
+    assert result["model_run_id"] == str(model_run_id)
+    assert result["details"]["reason"] == "active_signal_stalled"
+    assert result["details"]["output_chars"] == 4211
+
+
+async def test_stalled_references_run_parks_for_reconciliation_and_fences_retry(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_run_id = uuid4()
+    registry, jobs, _ = _build(
+        uow,
+        monkeypatch,
+        {
+            "stage": "references",
+            "status": "needs_review",
+            "error_code": "model_submission_reconciliation_required",
+            "error": "réconciliation explicite requise",
+            "model_run_id": str(model_run_id),
+            "details": {"reason": "active_signal_stalled", "output_chars": 4211},
+        },
+    )
+    run = _run(uow, SubjectProductionStage.REFERENCES)
+    uow.model_runs.items[model_run_id] = SimpleNamespace(
+        id=model_run_id,
+        # The ModelRun keeps the real bridge reason, not the state machine's code.
+        error_code="active_signal_stalled",
+        response_id="resp_65a707c50a5549a582b2fc3f",
+        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        status=ModelRunStatus.NEEDS_REVIEW,
+    )
+
+    handler = registry.handler(stage_job_kind(SubjectProductionStage.REFERENCES))
+    await handler(
+        ProductionStageParameters(
+            run_id=run.id, expected_stage=SubjectProductionStage.REFERENCES.value
+        ),
+        _Context(),  # type: ignore[arg-type]
+    )
+
+    parked = uow.subject_production_runs.items[run.id]
+    assert parked.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert parked.error_code == "model_submission_reconciliation_required"
+    assert parked.requires_reconciliation is True
+    assert parked.reconciliation is not None
+    assert parked.reconciliation.model_run_id == model_run_id
+    assert parked.reconciliation.bridge_response_id == "resp_65a707c50a5549a582b2fc3f"
+    assert parked.reconciliation.stage is SubjectProductionStage.REFERENCES
+    # No ordinary retry: neither the automatic policy nor a manual one.
+    assert (
+        ProductionRecoveryPolicyV1.disposition(parked.error_code)
+        is ProductionRecoveryDisposition.MANUAL_ONLY
+    )
+    with pytest.raises(ProductionReconciliationRequiredError):
+        parked.retry_from_stage(SubjectProductionStage.REFERENCES)
+    assert jobs.submitted == []

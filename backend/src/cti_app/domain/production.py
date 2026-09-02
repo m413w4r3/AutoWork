@@ -35,6 +35,28 @@ class SubjectProductionStage(StrEnum):
 
 PRODUCTION_RECONCILIATION_ERROR_CODE = "model_submission_reconciliation_required"
 
+# Bridge review reasons that all describe the same situation: the prompt was
+# submitted, ChatGPT did not close the turn, and the answer may still be visible
+# in the exact target. The ModelRun keeps this real reason as its error code --
+# it is the diagnosis -- while the production run speaks the state machine's
+# language (PRODUCTION_RECONCILIATION_ERROR_CODE). Both are reconciled by
+# explicit human adoption, never by an automatic replay.
+BRIDGE_POST_SUBMISSION_REVIEW_CODES = frozenset(
+    {
+        "active_signal_stalled",
+        "finalization_stalled",
+        "no_final_answer",
+    }
+)
+
+
+def model_run_awaits_reconciliation(error_code: str | None) -> bool:
+    """The single definition of "this ModelRun is the one to reconcile"."""
+    return (
+        error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
+        or error_code in BRIDGE_POST_SUBMISSION_REVIEW_CODES
+    )
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ProductionSubmissionReconciliation:

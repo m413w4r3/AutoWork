@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
@@ -177,10 +178,25 @@ class UpstreamError(RuntimeError):
 
 
 class NeedsReviewError(RuntimeError):
-    def __init__(self, reason: str, details: dict[str, Any]) -> None:
+    """Aucune réponse *finale* — ce qui ne veut pas dire aucune réponse visible.
+
+    `candidate` porte, quand elle existe, la réponse déjà affichée à l'écran au
+    moment où le bridge a rendu la main. Elle n'est jamais un succès implicite :
+    elle est persistée comme aperçu de récupération durable, et son adoption
+    reste une décision humaine explicite.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        details: dict[str, Any],
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.details = details
+        self.candidate = candidate
 
 
 def _visible_citations(value: object) -> list[dict[str, Any]]:
@@ -231,6 +247,84 @@ def _visible_citations(value: object) -> list[dict[str, Any]]:
 
 
 _ALLOWED_LOCATOR_HOSTS = {"chatgpt.com", "chat.openai.com"}
+
+# Même plafond que la lecture de récupération côté application : au-delà, le
+# candidat n'est pas tronqué (une réponse tronquée serait un faux), il est
+# refusé et signalé comme tel.
+MAX_CANDIDATE_OUTPUT_BYTES = 10_000_000
+MAX_SIGNAL_SOURCES = 10
+_SIGNAL_SOURCE_FIELDS = (
+    "source",
+    "visible",
+    "data_is_streaming",
+    "aria_hidden",
+    "data_state",
+)
+
+
+def _stable_external_turn_id(value: object) -> Optional[str]:
+    """Identité externe d'un tour assistant, ou None — jamais un ersatz.
+
+    L'UI ChatGPT expose un `data-message-id` temporaire
+    (`request-placeholder-request-WEB:<uuid>-0`) avant que le vrai message
+    existe. Non vide, il n'en reste pas moins un placeholder d'interface :
+    persisté comme identité de continuation, il ferait croire qu'un CONTINUE
+    est routable. Aucune identité vaut mieux qu'une identité fabriquée.
+    """
+    if not isinstance(value, str):
+        return None
+    turn_id = value.strip()
+    if not turn_id or len(turn_id) > 512:
+        return None
+    if "placeholder" in turn_id.casefold():
+        return None
+    return turn_id
+
+
+def _signal_sources(value: object) -> list[dict[str, Any]]:
+    """Diagnostic borné : identité du détecteur et état DOM sûr, jamais du contenu."""
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in value[:MAX_SIGNAL_SOURCES]:
+        if not isinstance(item, dict):
+            continue
+        entry: dict[str, Any] = {}
+        for field in _SIGNAL_SOURCE_FIELDS:
+            reported = item.get(field)
+            if isinstance(reported, str):
+                entry[field] = reported[:64]
+            elif isinstance(reported, bool) or reported is None:
+                entry[field] = reported
+        if entry.get("source"):
+            result.append(entry)
+    return result
+
+
+def _incomplete_candidate(
+    packet: dict[str, Any], metadata: dict[str, Any]
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Valide la réponse visible jointe à un paquet `incomplete`.
+
+    Renvoie `(candidat, motif_de_rejet)`. Un texte vide n'est pas un rejet :
+    c'est un honnête « aucune réponse finale ».
+    """
+    text = packet.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None, None
+    if len(text.encode("utf-8")) > MAX_CANDIDATE_OUTPUT_BYTES:
+        return None, "candidate_too_large"
+    citations = metadata.get("visible_citations")
+    candidate: dict[str, Any] = {
+        "text": text,
+        "output_chars": len(text),
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "turn_id": _stable_external_turn_id(metadata.get("initial_turn_id")),
+        "visible_citations": (
+            _visible_citations(citations) if isinstance(citations, list) else []
+        ),
+    }
+    return candidate, None
 
 
 def _sanitize_diagnostic_locator(value: object) -> Optional[str]:
@@ -373,7 +467,8 @@ async def run_generation(
             progress = _live_progress.get(request_id, {})
             logger.warning(
                 "%s bridge_run_id=%s phase=%s output_chars=%s stable_for_ms=%s "
-                "completion_signal=%s serialization_ms=%s js_heap_bytes=%s "
+                "completion_signal=%s streaming_signal_sources=%s serialization_ms=%s "
+                "js_heap_bytes=%s "
                 "dom_node_count=%s elapsed_seconds=%.3f idle_seconds=%.3f "
                 "total_timeout=%s idle_timeout=%s",
                 code,
@@ -382,6 +477,10 @@ async def run_generation(
                 progress.get("output_chars"),
                 progress.get("stable_for_ms"),
                 progress.get("completion_signal"),
+                [
+                    source.get("source")
+                    for source in progress.get("streaming_signal_sources", [])
+                ],
                 progress.get("serialization_ms"),
                 progress.get("js_heap_bytes"),
                 progress.get("dom_node_count"),
@@ -518,6 +617,9 @@ async def run_generation(
                             progress.get("completion_confidence", "low")
                         )[:16],
                     }
+                    sources = _signal_sources(progress.get("streaming_signal_sources"))
+                    if sources:
+                        _live_progress[request_id]["streaming_signal_sources"] = sources
                     for field, ceiling in (
                         ("serialization_ms", 60_000),
                         ("js_heap_bytes", 16 * 1024 * 1024 * 1024),
@@ -580,10 +682,11 @@ async def run_generation(
                     and _REVIEW_REASON.fullmatch(reported_reason)
                     else "no_final_answer"
                 )
-                metadata = packet.get("metadata")
-                initial_turn_id = (
-                    metadata.get("initial_turn_id") if isinstance(metadata, dict) else None
-                )
+                reported_metadata = packet.get("metadata")
+                metadata = reported_metadata if isinstance(reported_metadata, dict) else {}
+                # Un placeholder d'interface n'est pas une identité de tour :
+                # le persister comme handle de continuation serait un mensonge.
+                initial_turn_id = _stable_external_turn_id(metadata.get("initial_turn_id"))
                 if (
                     conversation is not None
                     and conversation_result is not None
@@ -591,23 +694,49 @@ async def run_generation(
                 ):
                     conversation_result["initial_assistant_turn_id"] = initial_turn_id
                     registry.bind_conversation(request_id, conversation_result)
-                details = {
+                candidate, rejected = _incomplete_candidate(packet, metadata)
+                signal_sources = _signal_sources(metadata.get("streaming_signal_sources"))
+                stable_for_ms = metadata.get("stable_for_ms")
+                details: dict[str, Any] = {
                     "reason": reason,
                     "conversation": dict(conversation_result or {}),
-                    "completion_signal": (
-                        metadata.get("completion_signal") if isinstance(metadata, dict) else None
-                    ),
-                    "completion_confidence": (
-                        metadata.get("completion_confidence")
-                        if isinstance(metadata, dict)
-                        else None
-                    ),
+                    "completion_signal": metadata.get("completion_signal"),
+                    "completion_confidence": metadata.get("completion_confidence"),
                     "initial_turn_id": initial_turn_id,
-                    "output_chars": 0,
+                    # La réponse visible existe ou non ; elle n'est jamais
+                    # comptée pour zéro alors qu'elle est à l'écran.
+                    "output_chars": candidate["output_chars"] if candidate else 0,
                     "phase": submission_phase,
                     "submission_state": submission_state,
+                    "candidate_output_present": candidate is not None,
+                    "candidate_output_sha256": candidate["sha256"] if candidate else None,
+                    "recovery_preview_available": candidate is not None,
+                    "external_turn_id_verified": bool(candidate and candidate["turn_id"]),
                 }
-                raise NeedsReviewError(reason, details)
+                if rejected:
+                    details["candidate_output_rejected"] = rejected
+                if isinstance(stable_for_ms, int) and 0 <= stable_for_ms <= 3_600_000:
+                    details["stable_for_ms"] = stable_for_ms
+                for field, limit in (
+                    ("serializer_version", 64),
+                    ("content_script_version", 64),
+                ):
+                    value = metadata.get(field)
+                    if isinstance(value, str):
+                        details[field] = value[:limit]
+                if signal_sources:
+                    details["streaming_signal_sources"] = signal_sources
+                logger.warning(
+                    "bridge_run_incomplete bridge_run_id=%s reason=%s output_chars=%s "
+                    "completion_signal=%s stable_for_ms=%s streaming_signal_sources=%s",
+                    request_id,
+                    reason,
+                    details["output_chars"],
+                    details["completion_signal"],
+                    details.get("stable_for_ms"),
+                    [source["source"] for source in signal_sources],
+                )
+                raise NeedsReviewError(reason, details, candidate=candidate)
             elif kind == "done":
                 submission_state = "post_submission"
                 submission_phase = "generation"
@@ -630,10 +759,15 @@ async def run_generation(
                             "conversation": dict(conversation_result or {}),
                             "completion_signal": metadata.get("completion_signal"),
                             "completion_confidence": metadata.get("completion_confidence"),
-                            "initial_turn_id": metadata.get("initial_turn_id"),
+                            "initial_turn_id": _stable_external_turn_id(
+                                metadata.get("initial_turn_id")
+                            ),
                             "output_chars": 0,
                             "phase": submission_phase,
                             "submission_state": submission_state,
+                            "candidate_output_present": False,
+                            "candidate_output_sha256": None,
+                            "recovery_preview_available": False,
                         },
                     )
                 reported_metadata = packet.get("metadata")
@@ -698,8 +832,9 @@ async def run_generation(
                         not isinstance(reported, dict)
                         or reported.get("id") != str(conversation.id)
                         or reported.get("mode") != conversation.mode
-                        or not isinstance(reported.get("turn_id"), str)
-                        or not reported["turn_id"]
+                        # Un placeholder d'interface ne rend aucun CONTINUE
+                        # routable : il est rejeté comme une identité absente.
+                        or _stable_external_turn_id(reported.get("turn_id")) is None
                     ):
                         raise UpstreamError(
                             "métadonnées de conversation absentes ou incohérentes",

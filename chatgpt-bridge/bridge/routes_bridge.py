@@ -24,6 +24,7 @@ from bridge.contracts import (
 from bridge.generation import (
     NeedsReviewError,
     _BackgroundRequest,
+    _stable_external_turn_id,
     _visible_citations,
     generation_progress,
 )
@@ -69,8 +70,10 @@ def _recovery_assistant_turn_id(record: dict[str, Any]) -> str | None:
         if not isinstance(source, dict):
             continue
         for key in ("initial_turn_id", "assistant_turn_id"):
-            value = source.get(key)
-            if isinstance(value, str) and 0 < len(value) <= 512:
+            # Un placeholder d'interface ne désigne aucun tour : router une
+            # capture dessus ne retrouverait jamais la réponse.
+            value = _stable_external_turn_id(source.get(key))
+            if value is not None:
                 return value
     return None
 
@@ -87,6 +90,32 @@ def _stored_error_body(record: dict[str, Any]) -> dict[str, Any] | None:
         return None
     body = stored.get("body")
     return body if isinstance(body, dict) else stored
+
+
+def _stored_incomplete_preview(
+    record: dict[str, Any], response_id: str
+) -> dict[str, Any] | None:
+    """Aperçu durable issu du paquet `incomplete` d'origine, s'il existe.
+
+    Seule la provenance `captured_incomplete` court-circuite la relecture DOM :
+    un aperçu issu d'une capture live reste relu (et donc revérifié) à chaque
+    appel, comme avant.
+    """
+    raw = record.get("preview_json")
+    if not isinstance(raw, str):
+        return None
+    try:
+        stored = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(stored, dict) or stored.get("provenance") != "captured_incomplete":
+        return None
+    if stored.get("bridge_run_id") != response_id:
+        return None
+    text = stored.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return stored
 
 
 def _bounded_recovery_metadata(packet: dict[str, Any]) -> dict[str, Any]:
@@ -209,6 +238,66 @@ class BridgeRoutes:
             bridge_recovery=req.recovery,
         )
 
+    def _store_incomplete_preview(
+        self, req: BridgeRunRequest, run_id: str, exc: NeedsReviewError
+    ) -> None:
+        """Rendre durable la réponse visible jointe à un `incomplete`.
+
+        Le candidat n'est jamais adopté ici : il devient seulement récupérable.
+        Sa provenance (`captured_incomplete`) le distingue explicitement d'une
+        relecture DOM ultérieure (`live_dom_capture`).
+        """
+        candidate = exc.candidate
+        if not candidate:
+            return
+        conversation = req.conversation.model_dump(mode="json") if req.conversation else None
+        target = _browser_target_for_run(run_id, req.conversation)
+        preview = {
+            "bridge_run_id": run_id,
+            "target_id": target.id if target else None,
+            "conversation_id": conversation.get("id") if conversation else None,
+            # Identité externe vérifiée uniquement : un placeholder d'interface
+            # a déjà été rejeté en amont, et rien ne le remplace.
+            "turn_id": candidate["turn_id"],
+            "text": candidate["text"],
+            "provenance": "captured_incomplete",
+            "metadata": {
+                "provenance": "captured_incomplete",
+                "reason": exc.reason,
+                "output_chars": candidate["output_chars"],
+                "sha256": candidate["sha256"],
+                "visible_citations": candidate["visible_citations"],
+                "capture_confidence": "captured_incomplete",
+                "external_turn_id_verified": candidate["turn_id"] is not None,
+                **{
+                    key: exc.details[key]
+                    for key in (
+                        "completion_signal",
+                        "completion_confidence",
+                        "stable_for_ms",
+                        "serializer_version",
+                        "content_script_version",
+                        "streaming_signal_sources",
+                        "submission_state",
+                    )
+                    if exc.details.get(key) is not None
+                },
+            },
+        }
+        try:
+            self.registry.store_preview(run_id, preview)
+        except Exception:  # noqa: BLE001 - l'état needs_review reste prioritaire
+            logger.exception("bridge_incomplete_preview_not_persisted bridge_run_id=%s", run_id)
+            return
+        logger.info(
+            "bridge_incomplete_preview_persisted bridge_run_id=%s reason=%s output_chars=%s "
+            "external_turn_id_verified=%s",
+            run_id,
+            exc.reason,
+            candidate["output_chars"],
+            candidate["turn_id"] is not None,
+        )
+
     def _consume_task_exception(self, task: asyncio.Task) -> None:
         """Observe detached failures; the typed result already lives in SQLite."""
         try:
@@ -305,6 +394,11 @@ class BridgeRoutes:
                 )
                 return response
             except NeedsReviewError as exc:
+                # Ordre imposé : le candidat visible est rendu durable AVANT que
+                # le run passe en needs_review. L'onglet ChatGPT peut être fermé
+                # dans la seconde qui suit la réponse HTTP ; l'aperçu de
+                # récupération doit alors survivre sans aucun accès au DOM.
+                self._store_incomplete_preview(req, run_id, exc)
                 body = {
                     "id": run_id,
                     "object": "response",
@@ -431,6 +525,13 @@ class BridgeRoutes:
         record = self.registry.get_by_run_id(response_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Run bridge inconnu")
+        # Un candidat capturé au moment du `incomplete` est déjà durable : il est
+        # servi tel quel, sans aucun aller-retour DOM. L'onglet peut avoir
+        # disparu, l'extension être déconnectée — la réponse visible reste
+        # récupérable, et deux aperçus successifs sont identiques.
+        stored = _stored_incomplete_preview(record, response_id)
+        if stored is not None:
+            return stored
         if not record.get("conversation_json"):
             target = _browser_target_for_run(response_id, None)
             if (
@@ -464,8 +565,8 @@ class BridgeRoutes:
                     status_code=409,
                     detail="Cible ou run de recovery incohérent",
                 )
-            turn_id = packet.get("turn_id")
-            if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 512:
+            turn_id = _stable_external_turn_id(packet.get("turn_id"))
+            if turn_id is None:
                 raise HTTPException(
                     status_code=409,
                     detail="Identifiant externe du tour de recovery absent ou invalide",
@@ -473,12 +574,15 @@ class BridgeRoutes:
             text = packet.get("text")
             if not isinstance(text, str) or not text.strip():
                 raise HTTPException(status_code=404, detail="Aucune réponse finale récupérable")
+            metadata = _bounded_recovery_metadata(packet)
+            metadata["provenance"] = "live_dom_capture"
             preview = {
                 "bridge_run_id": response_id,
                 "target_id": target.id,
                 "turn_id": turn_id,
                 "text": text,
-                "metadata": _bounded_recovery_metadata(packet),
+                "provenance": "live_dom_capture",
+                "metadata": metadata,
             }
             self.registry.store_preview(response_id, preview)
             return preview
@@ -518,13 +622,18 @@ class BridgeRoutes:
         text = packet.get("text")
         if not isinstance(text, str) or not text.strip():
             raise HTTPException(status_code=404, detail="Aucune réponse finale récupérable")
+        live_metadata = (
+            dict(packet["metadata"]) if isinstance(packet.get("metadata"), dict) else {}
+        )
+        live_metadata["provenance"] = "live_dom_capture"
         preview = {
             "bridge_run_id": response_id,
             "conversation_id": conversation["id"],
             "external_locator": conversation.get("external_locator"),
-            "turn_id": packet.get("turn_id"),
+            "turn_id": _stable_external_turn_id(packet.get("turn_id")),
             "text": text,
-            "metadata": packet.get("metadata") if isinstance(packet.get("metadata"), dict) else {},
+            "provenance": "live_dom_capture",
+            "metadata": live_metadata,
         }
         self.registry.store_preview(response_id, preview)
         return preview

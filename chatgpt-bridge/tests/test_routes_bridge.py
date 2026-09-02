@@ -272,6 +272,161 @@ async def test_active_signal_stalled_incomplete_is_native_needs_review(
     assert extension.prompt_count == 1
 
 
+def _stalled_extension(
+    runtime: BridgeApplication, *, text: str, turn_id: str | None
+) -> type[FakeExtension]:
+    """Reproduit l'incident : réponse visible, UI qui se dit encore en streaming."""
+
+    class StalledWithVisibleAnswer(FakeExtension):
+        async def _respond(self, payload: dict[str, Any]) -> None:
+            if payload["type"] != "prompt":
+                await super()._respond(payload)
+                return
+            self.prompt_count += 1
+            browser_target = payload.get("browser_target")
+            route = (
+                {"target_id": browser_target["id"], "tab_id": 1}
+                if isinstance(browser_target, dict)
+                else {}
+            )
+            self.runtime.bridge.dispatch(
+                {
+                    "type": "incomplete",
+                    "id": payload["id"],
+                    "event_id": "stalled",
+                    "reason": "active_signal_stalled",
+                    "text": text,
+                    "submission_state": "post_submission",
+                    "metadata": {
+                        "completion_signal": "streaming",
+                        "completion_confidence": "high",
+                        "stable_for_ms": 300_000,
+                        "output_chars": len(text),
+                        "initial_turn_id": turn_id,
+                        "serializer_version": "chatgpt-dom-v3",
+                        "content_script_version": "27",
+                        "visible_citations": [],
+                        "streaming_signal_sources": [
+                            {
+                                "source": ".result-streaming",
+                                "visible": True,
+                                "data_is_streaming": None,
+                                "aria_hidden": None,
+                                "data_state": None,
+                            }
+                        ],
+                    },
+                    **route,
+                }
+            )
+
+    return StalledWithVisibleAnswer
+
+
+async def test_visible_answer_survives_active_signal_stall_and_lost_tab(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    """L'incident réel : la réponse était à l'écran, le run disait output_chars=0.
+
+    Le candidat doit être compté, persisté avant le needs_review, et rester
+    lisible une fois l'onglet ChatGPT (et l'extension) disparus.
+    """
+    isolated_registry(runtime, tmp_path)
+    answer = "## SUBJECT S1\ntitle: Réponse visible mais jamais conclue\n"
+    extension = _stalled_extension(runtime, text=answer, turn_id="assistant-42")(runtime)
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="mission"), request_with_key("stalled-visible")
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error"]["code"] == "active_signal_stalled"
+    assert result["error"]["details"]["output_chars"] == len(answer)
+    assert result["metadata"]["output_chars"] == len(answer)
+    assert result["metadata"]["candidate_output_present"] is True
+    assert result["metadata"]["recovery_preview_available"] is True
+    assert result["metadata"]["completion_signal"] == "streaming"
+    assert result["metadata"]["streaming_signal_sources"] == [
+        {
+            "source": ".result-streaming",
+            "visible": True,
+            "data_is_streaming": None,
+            "aria_hidden": None,
+            "data_state": None,
+        }
+    ]
+    # Le texte lui-même n'entre jamais dans les métadonnées d'erreur.
+    assert answer not in json.dumps(result, ensure_ascii=False)
+
+    run_id = result["id"]
+    stored = runtime.bridge_routes.registry.get_by_run_id(run_id)
+    assert stored is not None
+    persisted = json.loads(stored["preview_json"])
+    assert persisted["provenance"] == "captured_incomplete"
+    assert persisted["text"] == answer
+
+    # L'onglet ChatGPT est fermé et l'extension déconnectée : aucun aller-retour
+    # DOM n'est possible, et le candidat doit pourtant rester récupérable.
+    runtime.bridge.ws = None
+    preview = await runtime.bridge_routes.preview_visible_recovery(run_id)
+    repeated = await runtime.bridge_routes.preview_visible_recovery(run_id)
+
+    assert preview == repeated
+    assert preview["text"] == answer
+    assert preview["turn_id"] == "assistant-42"
+    assert preview["metadata"]["output_chars"] == len(answer)
+    assert preview["metadata"]["provenance"] == "captured_incomplete"
+    assert preview["metadata"]["reason"] == "active_signal_stalled"
+    assert extension.prompt_count == 1
+
+
+async def test_placeholder_turn_id_is_never_a_durable_external_identity(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    placeholder = "request-placeholder-request-WEB:822ff1a2-6c1f-49a1-b10e-3143f7ca53b3-0"
+    extension = _stalled_extension(runtime, text="réponse visible", turn_id=placeholder)(runtime)
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="mission"), request_with_key("stalled-placeholder")
+    )
+    run_id = result["id"]
+    preview = await runtime.bridge_routes.preview_visible_recovery(run_id)
+
+    assert result["metadata"]["initial_turn_id"] is None
+    assert result["metadata"]["external_turn_id_verified"] is False
+    # Le texte reste adoptable ; seule l'identité de continuation est refusée,
+    # et rien ne la remplace.
+    assert preview["text"] == "réponse visible"
+    assert preview["turn_id"] is None
+    assert preview["metadata"]["external_turn_id_verified"] is False
+    assert placeholder not in json.dumps(preview, ensure_ascii=False)
+    assert extension.prompt_count == 1
+
+
+async def test_empty_incomplete_stays_an_honest_no_final_answer(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    isolated_registry(runtime, tmp_path)
+    extension = _stalled_extension(runtime, text="", turn_id="assistant-7")(runtime)
+    runtime.bridge.ws = extension
+
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="mission"), request_with_key("stalled-empty")
+    )
+    run_id = result["id"]
+    record = runtime.bridge_routes.registry.get_by_run_id(run_id)
+
+    assert result["status"] == "needs_review"
+    assert result["metadata"]["output_chars"] == 0
+    assert result["metadata"]["candidate_output_present"] is False
+    assert result["metadata"]["recovery_preview_available"] is False
+    assert record is not None and record["preview_json"] is None
+    assert extension.prompt_count == 1
+
+
 async def test_empty_done_is_never_reported_as_completed(
     runtime: BridgeApplication, tmp_path: Path
 ) -> None:

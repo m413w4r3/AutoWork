@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "26";
+const VERSION = "27";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -55,6 +55,14 @@ const SELECTORS = {
   // Conteneur d'un échange complet. La barre d'actions vit ici, *au-dessus* du
   // div [data-message-author-role] : chercher dans le seul tour ne la trouve pas.
   turnContainer: ["[data-testid^='conversation-turn']", "article"],
+  // Indicateurs « ChatGPT écrit encore ». Un seul point de vérité : la boucle de
+  // génération, la confirmation de soumission et les diagnostics de stall
+  // doivent parler du même ensemble de détecteurs.
+  streaming: [
+    ".streaming-animation",
+    ".result-streaming",
+    "[data-is-streaming='true']",
+  ],
 
   // --- Contrôles de l'interface (cf. section « Contrôles typés » plus bas) --- //
   // Déclencheur du sélecteur de modèle, dans l'en-tête de la conversation.
@@ -253,17 +261,52 @@ function activeReasoningSignal(element) {
   return submissionSignalVisible(element);
 }
 
+// Nombre maximal de détecteurs décrits dans un diagnostic : borne dure, pour
+// qu'une page pathologique ne puisse pas gonfler une métadonnée de run.
+const MAX_SIGNAL_SOURCES = 10;
+
+/**
+ * Décrit *quel* détecteur de streaming est actif, sans jamais lire de contenu.
+ *
+ * Un `completion_signal = streaming` figé est aujourd'hui indiscernable : les
+ * trois sélecteurs sont fusionnés en un seul booléen, et l'incident de
+ * production ne dit pas lequel est resté allumé. Ce diagnostic ne renvoie que
+ * l'identité du sélecteur et un état DOM sûr (visibilité, `data-is-streaming`,
+ * `aria-hidden`, `data-state`) — jamais de texte, de HTML ni d'attribut
+ * arbitraire.
+ */
+function streamingSignalSources(scope) {
+  const root = scope || document;
+  const sources = [];
+  for (const selector of SELECTORS.streaming) {
+    let nodes;
+    try {
+      nodes = root.querySelectorAll(selector);
+    } catch (_) {
+      continue;
+    }
+    for (const element of nodes) {
+      if (!submissionSignalVisible(element)) continue;
+      sources.push({
+        source: selector,
+        visible: true,
+        data_is_streaming: element.getAttribute("data-is-streaming"),
+        aria_hidden: element.getAttribute("aria-hidden"),
+        data_state: element.getAttribute("data-state"),
+      });
+      if (sources.length >= MAX_SIGNAL_SOURCES) return sources;
+    }
+  }
+  return sources;
+}
+
 function currentSubmissionGenerationSignals() {
   const stopSignals = activeSubmissionSignals(SELECTORS.stop);
   const reasoningSignals = activeSubmissionSignals(
     SELECTORS.reasoning,
     activeReasoningSignal,
   );
-  const streamingSignals = activeSubmissionSignals([
-    ".streaming-animation",
-    ".result-streaming",
-    "[data-is-streaming='true']",
-  ]);
+  const streamingSignals = activeSubmissionSignals(SELECTORS.streaming);
   const elements = [
     ...stopSignals,
     ...reasoningSignals,
@@ -427,6 +470,7 @@ function firstAssistantWaitDiagnostics(
     stop_visible: after.generation.stop,
     reasoning_visible: after.generation.reasoning,
     streaming_generation_signal_visible: after.generation.present,
+    streaming_signal_sources: streamingSignalSources(document),
   };
 }
 
@@ -648,14 +692,18 @@ function readAnswer(root, streaming) {
   return DOM_SERIALIZER.serializeResponse(root, ouvert);
 }
 
+/** Périmètre DOM dans lequel les signaux d'un tour sont lus (jamais la page). */
+function turnSignalScope(turn) {
+  return closestOf(turn, SELECTORS.turnContainer) || turn.parentElement || turn;
+}
+
 /**
  * La réponse est-elle terminée ?  true / false / null quand aucun signal connu
  * n'est reconnaissable — ce dernier cas est capital : conclure « terminé » par
  * défaut tronquait la réponse pendant la phase de réflexion (« Thinking »).
  */
 function completionState(turn) {
-  const scope =
-    closestOf(turn, SELECTORS.turnContainer) || turn.parentElement || turn;
+  const scope = turnSignalScope(turn);
   // Le Stop est un contrôle de la génération courante : il ne se cherche que
   // dans le composer. Un bouton portant le même libellé ailleurs dans la page
   // ne doit jamais maintenir ce tour en état « running ». Volontairement sans
@@ -691,11 +739,7 @@ function completionState(turn) {
     // Le streaming se lit dans le tour surveillé : un indicateur laissé par un
     // ancien tour ou par un widget latéral ne doit pas empêcher sa finalisation.
     streamingVisible: Boolean(
-      [
-        ...scope.querySelectorAll(
-          ".streaming-animation, .result-streaming, [data-is-streaming='true']",
-        ),
-      ].some(visible),
+      [...scope.querySelectorAll(SELECTORS.streaming.join(", "))].some(visible),
     ),
     reasoningVisible: SELECTORS.reasoning.some((selector) =>
       [...scope.querySelectorAll(selector)].some(activeReasoning),
@@ -1268,6 +1312,41 @@ function reply(payload) {
 }
 
 /**
+ * Résultat `incomplete` d'un tour : le texte déjà visible n'est JAMAIS jeté.
+ *
+ * Un abandon sur `finalization_stalled` / `active_signal_stalled` signifie
+ * « l'UI ne conclut pas », pas « ChatGPT n'a rien écrit ». Rendre la main sans
+ * le candidat visible détruisait une réponse complète (incident de production
+ * du 2026-08 : output_chars=0 alors que la réponse était affichée à l'écran).
+ * Ce candidat n'est jamais un succès implicite : il reste soumis à une
+ * adoption humaine explicite côté application.
+ */
+function incompleteAnswer({
+  reason,
+  text,
+  snapshot,
+  completion,
+  stableForMs,
+  turn,
+  signalSources,
+}) {
+  const candidate = typeof text === "string" ? text : "";
+  return {
+    text: candidate,
+    visible_citations: candidate ? snapshot?.visible_citations || [] : [],
+    serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
+    completion_signal: completion.signal,
+    completion_confidence: completion.confidence,
+    stable_for_ms: stableForMs,
+    output_chars: globalThis.ChatGPTBridgeFinalOutput.outputChars(candidate),
+    streaming_signal_sources: signalSources || [],
+    incomplete: true,
+    incomplete_reason: reason,
+    turn_locator: turn ? turnLocator(turn) : null,
+  };
+}
+
+/**
  * Suit la réponse dans le DOM sans transmettre les snapshots intermédiaires.
  * Chaque observation remplace la précédente, car le rendu n'est pas append-only.
  */
@@ -1411,6 +1490,14 @@ async function streamAnswer(job, locator, before) {
               ? "stabilizing"
               : "answering";
 
+    // Diagnostic borné et sans contenu : quand l'UI se dit « en streaming »,
+    // dire *quel* détecteur l'affirme. Un stall futur doit être imputable à un
+    // sélecteur nommé, jamais à un booléen agrégé.
+    const signalSources =
+      completion.signal === "streaming"
+        ? streamingSignalSources(turnSignalScope(turn))
+        : [];
+
     lastProgress = {
       phase,
       output_chars:
@@ -1419,6 +1506,9 @@ async function streamAnswer(job, locator, before) {
       completion_signal: completion.signal,
       completion_confidence: completion.confidence,
       serialization_ms: lastSerializationMs,
+      ...(signalSources.length
+        ? { streaming_signal_sources: signalSources }
+        : {}),
       ...sampledRuntimeMetrics(now),
     };
     const outcome = globalThis.ChatGPTBridgeFinalOutput.settledOutcome({
@@ -1427,18 +1517,20 @@ async function streamAnswer(job, locator, before) {
       stableForMs,
       emptySettleMs: EMPTY_FINAL_SETTLE_MS,
     });
+    const incompleteFields = {
+      snapshot,
+      completion,
+      stableForMs,
+      turn,
+      signalSources,
+    };
     if (outcome === "incomplete") {
-      return {
+      // Fin confirmée mais rien d'écrit : il n'y a honnêtement aucun candidat.
+      return incompleteAnswer({
+        reason: "no_final_answer",
         text: "",
-        visible_citations: [],
-        serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
-        completion_signal: completion.signal,
-        completion_confidence: completion.confidence,
-        stable_for_ms: stableForMs,
-        incomplete: true,
-        incomplete_reason: "no_final_answer",
-        turn_locator: turnLocator(turn),
-      };
+        ...incompleteFields,
+      });
     }
 
     if (
@@ -1446,17 +1538,11 @@ async function streamAnswer(job, locator, before) {
       finished !== false &&
       stableForMs >= FINALIZATION_STALL_MS
     ) {
-      return {
+      return incompleteAnswer({
+        reason: "finalization_stalled",
         text: full,
-        visible_citations: snapshot?.visible_citations || [],
-        serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
-        completion_signal: completion.signal,
-        completion_confidence: completion.confidence,
-        stable_for_ms: stableForMs,
-        incomplete: true,
-        incomplete_reason: "finalization_stalled",
-        turn_locator: turnLocator(turn),
-      };
+        ...incompleteFields,
+      });
     }
 
     if (
@@ -1464,17 +1550,11 @@ async function streamAnswer(job, locator, before) {
       finished === false &&
       stableForMs >= ACTIVE_SIGNAL_STALL_MS
     ) {
-      return {
+      return incompleteAnswer({
+        reason: "active_signal_stalled",
         text: full,
-        visible_citations: snapshot?.visible_citations || [],
-        serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
-        completion_signal: completion.signal,
-        completion_confidence: completion.confidence,
-        stable_for_ms: stableForMs,
-        incomplete: true,
-        incomplete_reason: "active_signal_stalled",
-        turn_locator: turnLocator(turn),
-      };
+        ...incompleteFields,
+      });
     }
     if (stable && finished !== false && full.length > 0) {
       const verificationRoot = answerRoot(turn, true);
@@ -1544,12 +1624,31 @@ function diagnosticLocator() {
   }
 }
 
+/**
+ * Un `data-message-id` temporaire posé par l'UI avant que le vrai message
+ * existe (« request-placeholder-request-WEB:<uuid>-0 »). Non vide, mais il ne
+ * désigne aucun tour assistant durable : le persister comme identité de
+ * continuation ferait croire qu'un CONTINUE est routable alors qu'il ne l'est
+ * pas. Observé tel quel en production le 2026-08.
+ */
+function isPlaceholderTurnId(value) {
+  return (
+    typeof value === "string" && value.toLowerCase().includes("placeholder")
+  );
+}
+
 /** Identifiant externe stable d'un tour assistant : jamais son index ou son compte. */
 function turnExternalId(turn) {
   const container = closestOf(turn, SELECTORS.turnContainer);
   // data-testid conversation-turn-N is only a local DOM locator. Persisting it
   // would turn a position/counter into a false continuation identity.
-  return turn.getAttribute("data-message-id") || container?.getAttribute("data-message-id") || null;
+  const id =
+    turn.getAttribute("data-message-id") ||
+    container?.getAttribute("data-message-id") ||
+    null;
+  // Aucune identité vaut mieux qu'une identité fabriquée : un placeholder est
+  // rejeté ici, jamais remplacé par un identifiant de substitution.
+  return isPlaceholderTurnId(id) ? null : id;
 }
 
 /** Retrouve le tour assistant portant exactement `externalId`, jamais par position. */
@@ -1812,7 +1911,11 @@ async function handlePrompt({
     if (!job.aborted) {
       const externalTurnId = turnExternalId(premier);
       console.log("bridge_run_phase", { phase: "generation" });
-      if (!externalTurnId) {
+      // Un `done` promet une conversation poursuivable : sans identité externe
+      // stable, cette promesse serait fausse. Un `incomplete` ne promet rien —
+      // il ne doit surtout pas détruire le candidat visible parce que l'UI n'a
+      // pas encore posé le vrai data-message-id.
+      if (!externalTurnId && !serialized.incomplete) {
         throw new BridgeError(
           "conversation_unavailable",
           "aucun identifiant externe data-message-id stable pour le tour assistant",
@@ -1836,6 +1939,9 @@ async function handlePrompt({
           content_script_version: VERSION,
           submission_state: "post_submission",
           initial_turn_id: externalTurnId,
+          ...(serialized.streaming_signal_sources?.length
+            ? { streaming_signal_sources: serialized.streaming_signal_sources }
+            : {}),
         },
         conversation: conversation
           ? {

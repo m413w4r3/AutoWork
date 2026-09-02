@@ -596,3 +596,41 @@ def test_unverified_turn_ids_degrade_to_none(value: object) -> None:
 
 def test_verified_turn_id_is_kept_verbatim() -> None:
     assert _verified_external_turn_id(" dom-turn-77 ") == "dom-turn-77"
+
+
+@pytest.mark.asyncio
+async def test_bridge_reason_model_run_is_reconcilable_and_resumes_same_generation() -> None:
+    """The exact production incident, end to end on the application side.
+
+    The ModelRun carries the real bridge reason (`active_signal_stalled`), not
+    the state machine's reconciliation code; it must still be previewable and
+    adoptable, and adoption must resume the same pipeline generation.
+    """
+    service, uow, gateway, bridge, jobs = _build_fixture()
+    run = next(iter(uow.subject_production_runs.runs.values()))
+    run.current_stage = SubjectProductionStage.REFERENCES
+    run.reconciliation = ProductionSubmissionReconciliation(
+        production_run_id=run.id,
+        model_run_id=gateway.model.id,
+        stage=SubjectProductionStage.REFERENCES,
+        bridge_response_id="bridge-1",
+        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        phase="reconciliation",
+    )
+    gateway.model.error_code = "active_signal_stalled"
+
+    preview = await service.preview_visible(run.id)
+    assert preview.stage == "references"
+    assert preview.external_turn_id == "dom-turn-77"
+
+    adopted = await service.adopt_visible(run.id, preview.sha256, actor_id="analyst")
+
+    assert gateway.model.status is ModelRunStatus.SUCCEEDED
+    assert run.status is SubjectProductionStatus.RUNNING
+    assert run.pipeline_generation == 7
+    assert adopted["pipeline_generation"] == 7
+    assert adopted["provenance"] == "visible_recovery"
+    assert gateway.adoptions[0]["external_turn_id"] == "dom-turn-77"
+    assert jobs.submissions == 1
+    # One explicit operator preview, then the adoption's own hash-confirmed read.
+    assert bridge.previews == 2

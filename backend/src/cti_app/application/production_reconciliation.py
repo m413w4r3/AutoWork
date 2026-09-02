@@ -32,6 +32,7 @@ from cti_app.domain.production import (
     ProductionSubmissionReconciliation,
     SubjectProductionRun,
     SubjectProductionStatus,
+    model_run_awaits_reconciliation,
 )
 
 MAX_RECOVERY_BYTES = 10_000_000
@@ -470,7 +471,10 @@ class ProductionReconciliationService:
                 )
             if reviewable and (
                 model.status is not ModelRunStatus.NEEDS_REVIEW
-                or model.error_code != PRODUCTION_RECONCILIATION_ERROR_CODE
+                # The exact ModelRun keeps the real bridge reason as its error
+                # code; both it and the reconciliation code identify the same
+                # unresolved submission.
+                or not model_run_awaits_reconciliation(model.error_code)
             ):
                 raise ProductionReconciliationError(
                     "production_reconciliation_identity_mismatch",
@@ -649,6 +653,12 @@ def _verified_external_turn_id(value: object) -> str | None:
         return None
     turn_id = value.strip()
     if not turn_id or len(turn_id) > 512:
+        return None
+    # The ChatGPT UI stamps a temporary `data-message-id`
+    # (`request-placeholder-request-WEB:<uuid>-0`) before the real assistant
+    # message exists.  Adopting the text is fine; claiming that placeholder as a
+    # durable continuation handle would make a future CONTINUE unroutable.
+    if "placeholder" in turn_id.casefold():
         return None
     return turn_id
 

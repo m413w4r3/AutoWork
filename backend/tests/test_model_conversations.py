@@ -7,6 +7,7 @@ import pytest
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.model_conversations import (
+    ConversationNeedsReviewError,
     ConversationPolicyError,
     ModelConversationError,
     ModelConversationService,
@@ -34,7 +35,7 @@ from cti_app.domain.model_conversations import (
     ConversationTurnStatus,
     ModelConversation,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelUsage
+from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus, ModelUsage
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.integrations.models import BlobModelOutputStore, BridgeTransportError, FakeModelAdapter
 from tests.conversation_support import InMemoryConversationUnitOfWorkFactory
@@ -815,3 +816,125 @@ async def test_stateless_recovery_creates_no_conversational_identity(
     assert state.turns == {}
     assert state.conversations == {}
     assert state.model_runs[run_id].status.value == "succeeded"
+
+
+class _StalledVisibleAnswerAdapter(_ScriptedBridgeAdapter):
+    """Reproduit l'incident : ChatGPT a répondu à l'écran, le bridge rend
+    `needs_review` avec `active_signal_stalled` et un candidat récupérable."""
+
+    async def invoke(
+        self, request: SafeModelRequest, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del role, output_schema
+        self.calls.append(request)
+        return AdapterResult(
+            status=AdapterResultStatus.NEEDS_REVIEW,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            response_id="resp_65a707c50a5549a582b2fc3f",
+            usage=ModelUsage(input_tokens=3, output_tokens=0, total_tokens=3),
+            metadata={
+                "reason": "active_signal_stalled",
+                "completion_signal": "streaming",
+                "completion_confidence": "high",
+                "output_chars": len(self._answer),
+                "candidate_output_present": True,
+                "recovery_preview_available": True,
+                "submission_state": "post_submission",
+            },
+        )
+
+
+async def test_native_needs_review_is_not_collapsed_into_a_generic_error(
+    tmp_path: Path,
+) -> None:
+    """L'incident : un needs_review natif devenait « pas de réponse finale ».
+
+    Le motif du bridge, le ModelRun exact, l'identité de la réponse bridge et la
+    disponibilité d'une récupération doivent survivre au passage par la
+    conversation, sinon Production enregistre une erreur terminale pour un sujet
+    dont la réponse est à l'écran.
+    """
+    adapter = _StalledVisibleAnswerAdapter("Réponse visible mais jamais conclue")
+    service, state = _build_service(adapter, tmp_path)
+    conversation = await _fresh_conversation(service)
+
+    with pytest.raises(ConversationNeedsReviewError) as raised:
+        await service.add_turn(
+            conversation.id,
+            message="Question de recherche",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            idempotency_key="stalled-visible-key",
+            correlation_id="corr-stalled",
+        )
+
+    error = raised.value
+    turn = next(iter(state.turns.values()))
+    model_run = state.model_runs[turn.model_run_id]
+
+    assert error.code == "model_submission_reconciliation_required"
+    assert error.reason == "active_signal_stalled"
+    assert error.model_run_id == model_run.id
+    assert error.bridge_response_id == "resp_65a707c50a5549a582b2fc3f"
+    assert error.recovery_available is True
+    assert error.details["output_chars"] == len("Réponse visible mais jamais conclue")
+    assert error.details["submission_state"] == "submitted_or_unknown"
+    assert "n'a pas produit de réponse finale" not in str(error)
+    # Le ModelRun garde le vrai motif du bridge : c'est le diagnostic.
+    assert model_run.status is ModelRunStatus.NEEDS_REVIEW
+    assert model_run.error_code == "active_signal_stalled"
+    assert model_run.response_id == "resp_65a707c50a5549a582b2fc3f"
+    assert turn.status is ConversationTurnStatus.NEEDS_REVIEW
+    assert len(adapter.calls) == 1
+
+
+async def test_adopting_the_stalled_candidate_never_sends_a_second_prompt(
+    tmp_path: Path,
+) -> None:
+    adapter = _StalledVisibleAnswerAdapter("Réponse visible mais jamais conclue")
+    service, state = _build_service(adapter, tmp_path)
+    conversation = await _fresh_conversation(service)
+
+    with pytest.raises(ConversationNeedsReviewError):
+        await service.add_turn(
+            conversation.id,
+            message="Question de recherche",
+            mode=ConversationMode.FRESH,
+            external_llm_allowed=True,
+            idempotency_key="stalled-adoption-key",
+            correlation_id="corr-stalled-adopt",
+        )
+
+    turn = next(iter(state.turns.values()))
+    await service._gateway.adopt_recovery_output(  # type: ignore[attr-defined]
+        turn.model_run_id,
+        "Réponse visible mais jamais conclue".encode(),
+        provenance="visible_recovery",
+        actor_id="reviewer",
+        external_turn_id="assistant-42",
+    )
+
+    replay = await service.add_turn(
+        conversation.id,
+        message="Question de recherche",
+        mode=ConversationMode.FRESH,
+        external_llm_allowed=True,
+        idempotency_key="stalled-adoption-key",
+        correlation_id="corr-stalled-adopt-2",
+    )
+
+    assert replay.status is ConversationTurnStatus.SUCCEEDED
+    assert replay.external_turn_id == "assistant-42"
+    assert len(adapter.calls) == 1
+    assert (await service.turns(conversation.id))[0].output_text == (
+        "Réponse visible mais jamais conclue"
+    )
+
+
+async def test_placeholder_turn_id_is_rejected_as_a_durable_identity() -> None:
+    placeholder = "request-placeholder-request-WEB:822ff1a2-6c1f-49a1-b10e-3143f7ca53b3-0"
+
+    assert _verified_external_turn_id(placeholder) is None
+    assert _verified_external_turn_id("assistant-42") == "assistant-42"

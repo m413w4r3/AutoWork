@@ -305,6 +305,75 @@ function recoverFencedCode(markdown) {
   );
 }
 
+// --- Identité externe : un placeholder d'UI n'en est pas une --------------- //
+{
+  const placeholder =
+    "request-placeholder-request-WEB:822ff1a2-6c1f-49a1-b10e-3143f7ca53b3-0";
+  const { run } = loadExtension(`
+    <article data-testid="conversation-turn-4">
+      <div data-message-author-role="assistant" data-message-id="${placeholder}">
+        <div class="markdown"><p>réponse</p></div>
+      </div>
+    </article>
+    <article data-testid="conversation-turn-5">
+      <div data-message-author-role="assistant" data-message-id="m-stable">
+        <div class="markdown"><p>réponse</p></div>
+      </div>
+    </article>`);
+
+  assert.equal(
+    run(
+      `turnExternalId(document.querySelector("[data-message-id='${placeholder}']"))`,
+    ),
+    null,
+    "un data-message-id placeholder ne devient jamais une identité durable",
+  );
+  assert.equal(
+    run(`turnExternalId(document.querySelector("[data-message-id='m-stable']"))`),
+    "m-stable",
+    "un vrai data-message-id reste l'identité externe du tour",
+  );
+  assert.equal(
+    run(`findAssistantTurnByExternalId(${JSON.stringify(placeholder)})`),
+    null,
+    "aucun tour n'est routable par un placeholder",
+  );
+}
+
+// --- Diagnostic de streaming : quel détecteur, et rien d'autre -------------- //
+{
+  const { run } = loadExtension(`
+    <div id="scope">
+      <div class="streaming-animation" aria-hidden="false"></div>
+      <div data-is-streaming="true" data-state="open"></div>
+      <div class="result-streaming" data-test-offscreen></div>
+      <p>texte de réponse à ne jamais journaliser</p>
+    </div>`);
+  const sources = JSON.parse(
+    JSON.stringify(run(`streamingSignalSources(document.querySelector("#scope"))`)),
+  );
+  assert.deepEqual(sources, [
+    {
+      source: ".streaming-animation",
+      visible: true,
+      data_is_streaming: null,
+      aria_hidden: "false",
+      data_state: null,
+    },
+    {
+      source: "[data-is-streaming='true']",
+      visible: true,
+      data_is_streaming: "true",
+      aria_hidden: null,
+      data_state: "open",
+    },
+  ]);
+  assert.ok(
+    !JSON.stringify(sources).includes("texte de réponse"),
+    "le diagnostic ne doit contenir aucun contenu de page",
+  );
+}
+
 // --- Garde-fou : un signal actif figé ne boucle pas indéfiniment ------------ //
 (async () => {
   const { window, run } = loadExtension(page({ watchedStreaming: true }));
@@ -328,6 +397,23 @@ function recoverFencedCode(markdown) {
   assert.equal(result.incomplete_reason, "active_signal_stalled");
   assert.equal(result.completion_signal, "streaming");
   assert.equal(result.text, "réponse finale");
+  // Incident de production : la réponse était visible et le run a pourtant été
+  // journalisé output_chars=0. Le candidat et son décompte réel restent joints.
+  assert.equal(result.output_chars, "réponse finale".length);
+  // Et le diagnostic dit *quel* détecteur est resté allumé, sans contenu.
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(result.streaming_signal_sources)),
+    [
+      {
+        source: ".result-streaming",
+        visible: true,
+        data_is_streaming: null,
+        aria_hidden: null,
+        data_state: null,
+      },
+    ],
+    "le stall doit nommer le sélecteur de streaming encore actif",
+  );
   // Le seuil est relu dans le script : le test protège le garde-fou, pas une
   // valeur particulière, qui peut être desserrée quand ChatGPT ralentit.
   const seuil = run("ACTIVE_SIGNAL_STALL_MS");

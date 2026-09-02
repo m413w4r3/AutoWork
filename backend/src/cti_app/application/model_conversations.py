@@ -18,6 +18,7 @@ from cti_app.application.model_gateway import (
     ModelGateway,
     ModelRequest,
     ModelRoutingHint,
+    ModelSubmissionReconciliationRequiredError,
 )
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.blobs import BlobRecord
@@ -39,6 +40,8 @@ from cti_app.domain.model_runs import (
 )
 
 logger = logging.getLogger("cti_app.model_conversations")
+
+MODEL_SUBMISSION_RECONCILIATION_CODE = ModelSubmissionReconciliationRequiredError.code
 
 NO_EVIDENCE_PACK_HASH = hashlib.sha256(b"model-conversation:no-evidence-pack").hexdigest()
 CONVERSATION_PROMPT_ID = "analyst-conversation"
@@ -83,6 +86,40 @@ class ConversationTurnFailedError(ModelConversationError):
 class ConversationPolicyError(ModelConversationError):
     code = "conversation_policy_blocked"
     status_code = 422
+
+
+class ConversationNeedsReviewError(ModelConversationError):
+    """The provider answered, but not with a final answer this turn can close.
+
+    The bridge already sealed its own run as `needs_review` after the prompt was
+    submitted. Collapsing that into a generic "no final answer" error lost the
+    reason, the exact ModelRun and the fact that a visible candidate answer may
+    still be recoverable -- and made Production record a terminal failure for a
+    subject whose answer was on screen. This error carries that identity so the
+    run lands on the explicit reconciliation path instead.
+    """
+
+    code = MODEL_SUBMISSION_RECONCILIATION_CODE
+    status_code = 409
+    retryable = False
+    submission_state = "post_submission"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        model_run_id: UUID,
+        bridge_response_id: str | None,
+        details: dict[str, Any],
+        recovery_available: bool,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.model_run_id = model_run_id
+        self.bridge_response_id = bridge_response_id
+        self.details = details
+        self.recovery_available = recovery_available
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,6 +483,10 @@ class ModelConversationService:
 
         try:
             execution = await self._gateway.execute(request, _role(conversation.purpose))
+            if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
+                # A native provider needs_review is already a reviewable,
+                # non-replayable outcome with its own reason. Keep it typed.
+                raise _needs_review_error(execution)
             if execution.run.status is not ModelRunStatus.SUCCEEDED or not execution.output_text:
                 raise ModelConversationError("Le modèle n'a pas produit de réponse finale")
             metadata = execution.conversation
@@ -698,6 +739,35 @@ class ModelConversationService:
         if blob is None:
             raise ModelConversationError("Blob conversationnel introuvable")
         return (await self._blob_store.read(blob.descriptor, max_bytes=2_000_000)).decode()
+
+
+def _needs_review_error(execution: ModelExecution) -> ConversationNeedsReviewError:
+    """Turn a native provider needs_review into a typed reconciliation outcome."""
+    run = execution.run
+    details = {**(run.error_details or {}), **execution.metadata}
+    reason = str(details.get("reason") or run.error_code or "no_final_answer")[:64]
+    output_chars = details.get("output_chars")
+    # A visible candidate answer the bridge captured is recoverable through the
+    # existing preview/adoption path; an empty one honestly is not.
+    recovery_available = bool(details.get("recovery_preview_available")) or (
+        isinstance(output_chars, int) and output_chars > 0
+    )
+    return ConversationNeedsReviewError(
+        f"{run.error_message or 'Le modèle n a pas conclu ce tour'} "
+        f"(motif bridge : {reason}) ; réconciliation explicite requise.",
+        reason=reason,
+        model_run_id=run.id,
+        bridge_response_id=run.response_id,
+        details={
+            **details,
+            "reason": reason,
+            "model_run_id": str(run.id),
+            "bridge_response_id": run.response_id,
+            "submission_state": run.submission_state.value,
+            "recovery_available": recovery_available,
+        },
+        recovery_available=recovery_available,
+    )
 
 
 def _blob_id(reference: str | None) -> UUID | None:

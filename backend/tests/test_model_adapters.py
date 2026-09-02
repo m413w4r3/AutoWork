@@ -219,6 +219,42 @@ async def test_openai_needs_review_preserves_bridge_reason() -> None:
     assert result.metadata["reason"] == "active_signal_stalled"
 
 
+async def test_needs_review_keeps_the_visible_candidate_facts() -> None:
+    """A stalled run whose answer is on screen must not be reported as empty."""
+    transport = FakeResponsesTransport(
+        {
+            "id": "resp_65a707c50a5549a582b2fc3f",
+            "status": "needs_review",
+            "model": "chatgpt-web",
+            "error": {"code": "active_signal_stalled", "message": "stalled"},
+            "metadata": {
+                "completion_signal": "streaming",
+                "completion_confidence": "high",
+                "output_chars": 4211,
+                "candidate_output_present": True,
+                "recovery_preview_available": True,
+                "external_turn_id_verified": False,
+                "candidate_output_sha256": "d" * 64,
+                "streaming_signal_sources": [
+                    {"source": ".result-streaming", "visible": True, "aria_hidden": None}
+                ],
+            },
+        }
+    )
+    adapter = OpenAIResearchAdapter(transport, model="chatgpt-web")
+
+    result = await adapter.invoke(safe_request(), role=ModelRole.RESEARCH)
+
+    assert result.metadata["output_chars"] == 4211
+    assert result.metadata["candidate_output_present"] is True
+    assert result.metadata["recovery_preview_available"] is True
+    assert result.metadata["external_turn_id_verified"] is False
+    assert result.metadata["candidate_output_sha256"] == "d" * 64
+    assert result.metadata["streaming_signal_sources"] == [
+        {"source": ".result-streaming", "visible": True, "aria_hidden": None}
+    ]
+
+
 async def test_openai_completed_empty_output_is_a_contract_error() -> None:
     transport = FakeResponsesTransport(
         {

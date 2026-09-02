@@ -36,6 +36,7 @@ from cti_app.domain.production import (
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
+    model_run_awaits_reconciliation,
     production_stages,
 )
 
@@ -146,7 +147,9 @@ async def _reconciliation_identity(
     if model_run_id is None or model_runs is None:
         return None
     model_run = await model_runs.get(model_run_id)
-    if model_run is None or model_run.error_code != PRODUCTION_RECONCILIATION_ERROR_CODE:
+    # The ModelRun keeps the real bridge reason (active_signal_stalled...) as its
+    # error code; only the production run speaks the reconciliation code.
+    if model_run is None or not model_run_awaits_reconciliation(model_run.error_code):
         return None
     return ProductionSubmissionReconciliation(
         production_run_id=run.id,

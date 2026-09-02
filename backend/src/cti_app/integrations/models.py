@@ -899,10 +899,35 @@ def _response_metadata(raw: dict[str, Any]) -> dict[str, Any]:
         "completion_confidence",
         "content_script_version",
         "submission_state",
+        # SHA-256 of the visible candidate answer the bridge captured, if any.
+        "candidate_output_sha256",
+        "candidate_output_rejected",
     ):
         value = metadata.get(name)
         if isinstance(value, str):
             result[name] = value[:64]
+    # A needs_review with a visible candidate answer is recoverable through the
+    # existing preview/adoption path; keep that fact and the stalled detector's
+    # identity attached to the run instead of rediscovering them by hand.
+    for name in (
+        "candidate_output_present",
+        "recovery_preview_available",
+        "external_turn_id_verified",
+    ):
+        value = metadata.get(name)
+        if isinstance(value, bool):
+            result[name] = value
+    sources = metadata.get("streaming_signal_sources")
+    if isinstance(sources, list):
+        result["streaming_signal_sources"] = [
+            {
+                str(key)[:32]: (item[key][:64] if isinstance(item[key], str) else item[key])
+                for key in item
+                if isinstance(item.get(key), (str, bool, type(None)))
+            }
+            for item in sources[:10]
+            if isinstance(item, dict)
+        ]
     for name in ("stable_for_ms", "output_chars", "visible_citation_count"):
         value = metadata.get(name)
         if isinstance(value, int) and value >= 0:
