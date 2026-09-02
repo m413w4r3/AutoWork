@@ -70,7 +70,7 @@ def test_full_prompt_requires_compact_facts_iocs_and_rules() -> None:
     assert "Never repeat its URL" not in one_line
     assert "url, email, md5, sha1, sha256, sha512" in one_line
     assert EXTRACTION_PROMPT_VERSION == "18"
-    assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v5"
+    assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v6"
 
 
 def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:

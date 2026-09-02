@@ -11,11 +11,15 @@ from cti_app.domain.publication import ArtifactType
 _DOT = re.compile(r"\[\.\]|\(\.\)|\{\.\}", re.IGNORECASE)
 _COLON = re.compile(r"\[:\]", re.IGNORECASE)
 _AT = re.compile(r"\[(?:at|@)\]|\((?:at|@)\)", re.IGNORECASE)
+# Soft hyphen and zero-width characters are line-wrapping artifacts of the
+# publishing pipeline, never part of an indicator.  Removing them here keeps a
+# copied value valid, comparable and deduplicable instead of silently invalid.
+_INVISIBLE = str.maketrans(dict.fromkeys("\u00ad\u200b\u200c\u200d\u2060\ufeff"))
 
 
 def refang(raw: str) -> str:
     """Undo supported CTI defanging without performing validation."""
-    value = raw.strip().replace(r"\:", ":")
+    value = raw.strip().translate(_INVISIBLE).replace(r"\:", ":")
     value = _DOT.sub(".", value)
     value = _COLON.sub(":", value)
     value = _AT.sub("@", value)

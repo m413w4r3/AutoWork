@@ -33,7 +33,7 @@ from cti_app.domain.publication import ArtifactType
 # validation rule, a public-suffix check, or how facts get a semantic type).
 # Participates in the extraction artifact's input_hash so a canonical
 # extraction artifact gets recomputed, without forcing a new Q2 model call.
-ARTIFACT_VERIFIER_VERSION = "4"
+ARTIFACT_VERIFIER_VERSION = "5"
 
 
 class ProposalStatus(StrEnum):
@@ -81,6 +81,13 @@ class ArtifactVerificationResult:
     def rejected(self) -> tuple[ProposalDiagnostic, ...]:
         return tuple(item for item in self.diagnostics if item.status is ProposalStatus.REJECTED)
 
+
+# A redaction marker is a substring anywhere in the value.  A stand-in word is
+# only a placeholder when it *is* the whole value: `na`, `none` and `unknown`
+# are legitimate labels of real indicators (`na.locat.sbs`), and treating them
+# as redactions dropped published IOCs under a misleading reason code.
+_PLACEHOLDER_MARKER = r"redacted|\bfuzz\b|<[^>]+>|example\.(?:com|org|net)"
+_PLACEHOLDER_VALUE = re.compile(r"(?:unknown|inconnue?|n/?a|none|null)\.?")
 
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
 _CVE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
@@ -255,13 +262,9 @@ def _rule_rejection_reason(
 def _is_placeholder(value: str) -> bool:
     folded = value.casefold()
     refanged = refang(value).casefold()
-    return bool(
-        re.search(
-            r"redacted|\bfuzz\b|<[^>]+>|\b(?:unknown|inconnu|inconnue|n/?a|none|null)\b|"
-            r"example\.(?:com|org|net)",
-            f"{folded} {refanged}",
-        )
-    )
+    if any(_PLACEHOLDER_VALUE.fullmatch(candidate.strip()) for candidate in (folded, refanged)):
+        return True
+    return bool(re.search(_PLACEHOLDER_MARKER, f"{folded} {refanged}"))
 
 
 def _to_item(

@@ -21,10 +21,14 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.domain.publication import ArtifactType
 
-SOURCE_EVIDENCE_VERSION = "4"
+SOURCE_EVIDENCE_VERSION = "5"
 
 _NBSP = "\u00a0"
 _NARROW_NBSP = "\u202f"
+# Zero-width and soft-hyphen characters are inserted by publishing pipelines to
+# allow long IOC cells to wrap. They carry no value and must never decide
+# whether a published indicator can be proven in its own source.
+_INVISIBLE = str.maketrans(dict.fromkeys("\u00ad\u200b\u200c\u200d\u2060\ufeff"))
 _DOT = re.compile(r"\[\.\]|\(\.\)|\{\.\}", re.IGNORECASE)
 _COLON = re.compile(r"\[:\]", re.IGNORECASE)
 _AT = re.compile(r"\[(?:at|@)\]|\((?:at|@)\)", re.IGNORECASE)
@@ -59,16 +63,63 @@ class SourceEvidenceDocument:
 class _SafeHtmlEvidenceParser(HTMLParser):
     _SKIPPED_TAGS = frozenset({"script", "style", "noscript", "template", "svg"})
     _VISUAL_TAGS = frozenset({"img", "picture", "canvas", "object", "embed", "svg"})
+    # An inline element never separates two indicator characters: publishers
+    # routinely wrap part of an IOC cell in ``<span>``, ``<b>`` or ``<wbr>``.
+    # Breaking a line there would make a published indicator unprovable in its
+    # own source. Every other element, ``<br>`` included, ends the line.
+    _INLINE_TAGS = frozenset(
+        {
+            "a",
+            "abbr",
+            "b",
+            "bdi",
+            "bdo",
+            "big",
+            "cite",
+            "code",
+            "data",
+            "del",
+            "dfn",
+            "em",
+            "font",
+            "i",
+            "ins",
+            "kbd",
+            "mark",
+            "q",
+            "s",
+            "samp",
+            "small",
+            "span",
+            "strike",
+            "strong",
+            "sub",
+            "sup",
+            "time",
+            "tt",
+            "u",
+            "var",
+            "wbr",
+        }
+    )
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.skip_depth = 0
         self.has_unverifiable_visuals = False
+        self._line: list[str] = []
 
     @property
     def text(self) -> str:
+        self._flush()
         return "\n".join(part for part in self.parts if part).strip()
+
+    def _flush(self) -> None:
+        line = "".join(self._line).strip()
+        self._line = []
+        if line:
+            self.parts.append(line)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.casefold()
@@ -81,22 +132,32 @@ class _SafeHtmlEvidenceParser(HTMLParser):
         if tag in self._SKIPPED_TAGS:
             self.skip_depth += 1
             return
+        if tag not in self._INLINE_TAGS:
+            self._flush()
         for key, value in attrs:
             if key.casefold() in {"alt", "title"} and value:
                 cleaned = " ".join(unescape(value).split())
                 if cleaned:
+                    self._flush()
                     self.parts.append(cleaned)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.casefold() in self._SKIPPED_TAGS and self.skip_depth:
+        tag = tag.casefold()
+        if tag in self._SKIPPED_TAGS and self.skip_depth:
             self.skip_depth -= 1
+            return
+        if not self.skip_depth and tag not in self._INLINE_TAGS:
+            self._flush()
 
     def handle_data(self, data: str) -> None:
         if self.skip_depth:
             return
-        cleaned = " ".join(data.split())
+        # Collapse runs of whitespace but keep the boundaries: an indicator
+        # split across inline elements is joined, one separated by real
+        # whitespace stays two tokens.
+        cleaned = re.sub(r"\s+", " ", data)
         if cleaned:
-            self.parts.append(cleaned)
+            self._line.append(cleaned)
 
 
 def source_evidence_document_from_html(
@@ -260,6 +321,7 @@ def _artifact_comparison_view(value: str) -> str:
     """Apply only the transport and CTI refanging allowed by this gate."""
     view = value.replace("\r\n", "\n").replace("\r", "\n")
     view = view.replace(_NBSP, " ").replace(_NARROW_NBSP, " ")
+    view = view.translate(_INVISIBLE)
     view = view.replace(r"\:", ":")
     view = _DOT.sub(".", view)
     view = _COLON.sub(":", view)

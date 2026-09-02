@@ -254,7 +254,7 @@ Q2_EXTRACTION_CONTRACT_VERSION = "q2-source-extraction-v3"
 
 # Bump whenever the Q2 Markdown dialect or its lexing rules change. Participates
 # in the Q2 checkpoint identity so a parser change forces a fresh model call.
-Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v5"
+Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v6"
 
 
 def q2_source_output_to_json(output: Q2SourceOutput) -> dict[str, Any]:
@@ -943,10 +943,27 @@ def _q2_fence_close(lines: list[str], opening_index: int) -> int | None:
     )
 
 
+def _q2_undecorate_value(value: str) -> str:
+    """Remove balanced Markdown code/emphasis wrappers around a whole value.
+
+    A chat model routinely renders an IOC as `` `1.2.3.4` `` or ``**1.2.3.4**``.
+    Those wrappers are presentation, not part of the indicator, and keeping
+    them turned a published IOC into an invalid value.  Only wrappers balanced
+    around the entire token are removed, and nothing inside the value is
+    touched.
+    """
+    for wrapper in ("```", "``", "`", "***", "**", "*"):
+        while (
+            value.startswith(wrapper) and value.endswith(wrapper) and len(value) > 2 * len(wrapper)
+        ):
+            value = value[len(wrapper) : -len(wrapper)].strip()
+    return value
+
+
 def _q2_value_and_context(raw: str) -> tuple[str, str]:
     """Split an optional annotation, leaving IPv6 ``::`` literals intact."""
     parts = re.split(r"\s+::\s+", raw.strip(), maxsplit=1)
-    value = parts[0].strip()
+    value = _q2_undecorate_value(parts[0].strip())
     context = parts[1].strip() if len(parts) == 2 else ""
     return value, context
 

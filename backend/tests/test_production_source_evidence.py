@@ -33,7 +33,7 @@ def test_version_and_ioc_from_same_source_are_kept_with_value_only() -> None:
 
     result = verify_ioc_rules_output_against_source(output, "The domain is evil.com.")
 
-    assert SOURCE_EVIDENCE_VERSION == "4"
+    assert SOURCE_EVIDENCE_VERSION == "5"
     assert result.output.artifacts[0].value == "evil[.]com"
     assert result.output.artifacts[0].context == ""
     assert result.output.artifacts[0].evidence_quote == ""
