@@ -9,15 +9,17 @@ from cti_app.domain.production import ExtractionProfile
 REFERENCES_PROMPT_VERSION = "5"
 # Q2 uses free-text GPT plus a stateless Markdown wire-format parser. The bridge does
 # not guarantee response_format / JSON Schema.
-# "15" / "8": Q2 analyses the live publication behind the exact canonical URL,
+# "16" / "9": Q2 analyses the live publication behind the exact canonical URL,
 # including its rendered tables, code and visible images. The local archive is
-# collection provenance and is never inlined in the prompt.
-EXTRACTION_PROMPT_VERSION = "15"
-IOC_RULES_PROMPT_VERSION = "8"
-# "7": the batch input is the compact list of exact source URLs. Only the
-# output stays marker-framed: a marker starts the next block; EOF closes the
-# final block.
-IOC_RULES_BATCH_PROMPT_VERSION = "7"
+# collection provenance and is never inlined in the prompt. Extraction is now
+# bounded by the requested Subject: exhaustiveness applies to subject-relevant
+# IOCs/rules, not to every indicator visible in a multi-actor publication.
+EXTRACTION_PROMPT_VERSION = "16"
+IOC_RULES_PROMPT_VERSION = "9"
+# "8": the batch input is the compact list of exact source URLs plus the single
+# shared Subject. Only the output stays marker-framed: a marker starts the next
+# block; EOF closes the final block.
+IOC_RULES_BATCH_PROMPT_VERSION = "8"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -67,6 +69,62 @@ UNAVAILABLE"""
 # the actual source list below; there is no static B1/B2/B3 example to
 # extrapolate. The input side needs no framing: it is a list of exact URLs.
 Q2_BATCH_OUTPUT_MARKER = "@@Q2:{batch_id}@@"
+
+# Subject relevance policy shared by the three Q2 extraction paths. Selection
+# happens during extraction, while the model still has the full publication in
+# context: there is no post-Q2 classification pass and no deterministic actor
+# list on the Python side.
+_Q2_SUBJECT_RELEVANCE_POLICY = """Subject relevance is mandatory.
+
+Analyse the complete source, but emit only technical facts, IOCs and detection
+rules relevant to the requested Subject.
+
+A publication may discuss several actors, campaigns, malware families or
+operations. Relevance of the publication does not imply relevance of every
+indicator contained in it.
+
+For every IOC, determine from its local source context what actor, campaign,
+malware, operation or technical activity it belongs to before emitting it.
+
+Emit an IOC when the source associates it with:
+- the requested subject;
+- the actor/campaign represented by the requested subject;
+- the malware/family central to the requested subject;
+- infrastructure or artifacts explicitly supporting that subject.
+
+Do NOT emit an IOC merely because it appears elsewhere in the same publication.
+
+Do NOT emit an IOC when the source explicitly associates it with:
+- another actor;
+- another campaign or operation;
+- another unrelated malware family;
+- a comparison or historical-background section unrelated to the subject;
+- another row/group of a multi-actor IOC table.
+
+When an IOC's relationship to the subject is ambiguous, do not emit it as
+confirmed.
+
+Shared legitimate infrastructure is not a useful IOC by itself. Generic roots
+or services such as GitHub, Telegram, Google Drive, common cloud platforms,
+public CDNs or vendor infrastructure must not be emitted solely because the
+subject used the service. A campaign-specific repository, account, URL,
+subdomain or other discriminating artifact may be emitted when explicitly
+supported.
+
+A detection rule must also be relevant to the requested Subject. Do not emit a
+rule explicitly associated only with another actor, campaign, malware family or
+operation mentioned in the publication.
+
+Exhaustiveness applies after relevance filtering: find every subject-relevant
+IOC, not every IOC in the publication. Perform an exhaustive subject-relevant
+IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/SHA512 and email addresses,
+including tables, appendices, images and code. Omit irrelevant, example-only,
+placeholder, masked, truncated, REDACTED or FUZZ values; never reconstruct
+hidden values.
+
+Never sacrifice coverage of subject-relevant IOCs to reduce cost. Never
+increase coverage by importing indicators belonging to other activities
+mentioned in the source."""
 
 _Q2_IOC_RULES_BATCH_BODY_FORMAT = """IOC <confirmed|contextual> <type>
 - <value>
@@ -162,9 +220,15 @@ Rules:
     TECHNICAL_EXTRACTION_MARKDOWN_V1 = (
         """You are analysing one specific CTI source for a reusable, source-centric extraction.
 
+**Subject**: {subject_title}
+
 **Source title**: {source_title}
 
 {source_access}
+
+"""
+        + _Q2_SUBJECT_RELEVANCE_POLICY
+        + """
 
 **Output format** — plain Markdown, no outer code fence, no JSON. Use only this
 wire format:
@@ -177,11 +241,15 @@ Rules:
 - The response is bound to this one source. Do not emit source ids, provenance,
   evidence quotes, model run ids or other internal identifiers. Do not repeat
   the input source URL merely as provenance.
-- Emit source-supported facts about malware, tools, files, TTPs, infrastructure,
-  victims and campaign context only in non-empty FACT groups. FACT categories
-  are exactly: actors, campaigns, malware, tools, infection_chain, ttps,
-  victimology, protocols, infrastructure, files, commands, persistence,
-  detections, other_technical.
+- Emit source-supported, subject-relevant facts about malware, tools, files,
+  TTPs, infrastructure, victims and campaign context only in non-empty FACT
+  groups. FACT categories are exactly: actors, campaigns, malware, tools,
+  infection_chain, ttps, victimology, protocols, infrastructure, files,
+  commands, persistence, detections, other_technical.
+- Facts about another activity may be emitted only when they materially clarify
+  the requested subject's attribution, malware sharing, infrastructure sharing,
+  technical relationship or uncertainty. Do not extract unrelated parallel
+  activity as standalone subject facts.
 - IOC types are exactly: domain, ip, url, email, md5, sha1, sha256, sha512,
   filename, filepath, cve. `confirmed` means confirmed IOC and `contextual`
   means contextual IOC.
@@ -193,12 +261,10 @@ Rules:
 - Use `:: short context` on FACT values only when useful, with whitespace on
   both sides of `::`. IOC value lines carry no annotation. Keep every IPv6
   literal intact.
-- Perform an exhaustive IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/
-  SHA512 and email addresses, including tables, appendices, images and code.
-  Omit irrelevant, example-only, placeholder, masked, truncated, REDACTED or
-  FUZZ values; never reconstruct hidden values.
-- Put complete literal detection rules visible in this source only in RULE. The
-  fence is mandatory.
+- Apply the subject relevance policy above to every IOC and rule, then be
+  exhaustive within what it allows.
+- Put complete literal detection rules visible in this source, and relevant to
+  the requested Subject, only in RULE. The fence is mandatory.
   Preserve the complete literal body, syntax, visible line breaks and visible
   rule name. Never reconstruct truncated content, invent missing variables,
   repair braces, refang, reformat, flatten, unflatten, merge or transform a
@@ -214,9 +280,15 @@ Rules:
     IOC_RULES_EXTRACTION_MARKDOWN_V1 = (
         """You are performing a reusable, source-centric IOC and detection-rule extraction for one CTI source.
 
+**Subject**: {subject_title}
+
 **Source title**: {source_title}
 
 {source_access}
+
+"""
+        + _Q2_SUBJECT_RELEVANCE_POLICY
+        + """
 
 This profile emits no FACT group or narrative facts: do not extract FACTS, TTP
 narrative, victimology, chronology, campaign context, tooling narrative,
@@ -241,15 +313,13 @@ Rules:
 - Emit only values literally visible in this source. This restriction does not
   apply to IOC values: extract URL indicators normally when they are actually
   published by this source.
-- Never sacrifice IOC coverage to reduce cost. Perform an exhaustive IOC pass:
-  IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/SHA512 and email addresses,
-  including tables, appendices, images and code.
-  Omit irrelevant, example-only, placeholder, masked, truncated, REDACTED or
-  FUZZ values; never reconstruct hidden values. Emit only source-supported
-  indicators and meaningful uncertainties.
-- IOC value lines carry no annotation. Keep every IPv6 literal intact.
-- Put complete literal detection rules visible in this source only in RULE. The
-  fence is mandatory.
+- Apply the subject relevance policy above to every IOC and rule, then be
+  exhaustive within what it allows. Emit only source-supported indicators and
+  meaningful uncertainties.
+- IOC value lines carry no annotation: emit the bare value, with no attribution,
+  campaign label or justification. Keep every IPv6 literal intact.
+- Put complete literal detection rules visible in this source, and relevant to
+  the requested Subject, only in RULE. The fence is mandatory.
   Preserve the complete literal body, syntax, visible line breaks and visible
   rule name. Never reconstruct truncated content, invent missing variables,
   repair braces, refang, reformat, flatten, unflatten, merge or transform a
@@ -265,6 +335,8 @@ Rules:
     IOC_RULES_BATCH_EXTRACTION_MARKDOWN_V1 = (
         """You are performing an IOC and detection-rule extraction over several independent CTI publications.
 
+**Subject**: {subject_title}
+
 Open every exact source URL listed below.
 
 Analyse each publication itself. Inspect the complete accessible rendered
@@ -276,6 +348,17 @@ Do not replace a source with unrelated search results and do not use another
 publication as evidence for that B#.
 
 Treat every B# independently.
+
+"""
+        + _Q2_SUBJECT_RELEVANCE_POLICY
+        + """
+
+The Subject is the relevance boundary for every B#. Source independence does not
+suspend subject filtering. For each publication independently:
+1. inspect the complete publication;
+2. identify which IOC/rule groups belong to the requested Subject;
+3. discard indicators/rules explicitly belonging to other activities;
+4. exhaustively emit the remaining subject-relevant indicators/rules.
 
 For every B#, emit exactly one output section beginning with its exact
 @@Q2:B#@@ marker, alone on its line. The next output marker terminates the
@@ -295,8 +378,9 @@ Use EMPTY only after analysing that publication and finding no IOC or rule. Use
 UNAVAILABLE only when that publication could not be analysed. Do not let one
 failure suppress the other sources.
 
-Extract every source-supported literal IOC and every complete literal YARA,
-Sigma, Suricata or Snort rule. Preserve rule syntax, visible line breaks and
+Extract every subject-relevant source-supported literal IOC and every
+subject-relevant complete literal YARA, Sigma, Suricata or Snort rule from that
+publication. Preserve rule syntax, visible line breaks and
 visible names. Never invent, repair, refang, reformat, flatten, merge or
 transform a rule. Put partial rules in no RULE block.
 
@@ -432,13 +516,14 @@ accessed, return `UNAVAILABLE` alone and do not invent an extraction."""
         source_url: str = "",
         profile: ExtractionProfile = ExtractionProfile.FULL,
     ) -> str:
-        del subject_title, source_id
+        del source_id
         template = (
             cls.TECHNICAL_EXTRACTION_MARKDOWN_V1
             if profile is ExtractionProfile.FULL
             else cls.IOC_RULES_EXTRACTION_MARKDOWN_V1
         )
         return template.format(
+            subject_title=subject_title,
             source_title=source_title,
             source_url=source_url,
             source_access=cls.LIVE_SOURCE_ACCESS_V1.format(source_url=source_url),
@@ -447,9 +532,14 @@ accessed, return `UNAVAILABLE` alone and do not invent an extraction."""
     @classmethod
     def get_ioc_rules_batch_prompt(
         cls,
+        subject_title: str,
         batch_sources: Sequence[tuple[str, str]],
     ) -> str:
-        """Render a URL-only IOC_RULES batch using local B# labels."""
+        """Render a URL-only IOC_RULES batch using local B# labels.
+
+        The Subject is stated once for the whole batch: it is the relevance
+        boundary shared by every B#, never repeated per source block.
+        """
         blocks = "\n".join(f"{batch_id} {source_url}" for batch_id, source_url in batch_sources)
         if not blocks.strip():
             raise ValueError("A Q2 batch prompt requires at least one source")
@@ -459,6 +549,7 @@ accessed, return `UNAVAILABLE` alone and do not invent an extraction."""
             for batch_id, _ in batch_sources
         )
         return cls.IOC_RULES_BATCH_EXTRACTION_MARKDOWN_V1.format(
+            subject_title=subject_title,
             batch_sources=blocks,
             batch_output_structure=output_structure,
         )

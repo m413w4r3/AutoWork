@@ -2248,6 +2248,7 @@ class ProductionWorkflowOrchestrator:
             ):
                 raise _Q2ControlFailure("Batch source mapping is not deterministic")
             prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
+                subject_title,
                 [(item.batch_id, item.canonical_url) for item in batch_sources],
             )
             light_calls += 1

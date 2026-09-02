@@ -271,10 +271,11 @@ def test_source_header_text_inside_a_rule_has_no_structural_meaning() -> None:
 
 def test_batch_prompt_lists_exact_urls_and_frames_only_the_output() -> None:
     prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
+        "RedKitten",
         [
             ("B1", "https://vendor.example/report"),
             ("B2", "https://cert.example/advisory"),
-        ]
+        ],
     )
     assert "B1 https://vendor.example/report" in prompt
     assert "B2 https://cert.example/advisory" in prompt
@@ -298,13 +299,14 @@ def test_batch_prompt_lists_exact_urls_and_frames_only_the_output() -> None:
         assert ioc_type in prompt
     assert " :: " not in prompt
     assert "S1" not in prompt
-    assert IOC_RULES_BATCH_PROMPT_VERSION == "7"
+    assert IOC_RULES_BATCH_PROMPT_VERSION == "8"
     assert production_q2_batch.Q2_BATCH_PARSER_VERSION == "q2-batch-v3"
 
 
 def test_batch_prompt_renders_exactly_the_real_eight_source_output_structure() -> None:
     prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
-        [(f"B{index}", f"https://example.test/source-{index}") for index in range(1, 9)]
+        "RedKitten",
+        [(f"B{index}", f"https://example.test/source-{index}") for index in range(1, 9)],
     )
 
     for index in range(1, 9):
@@ -313,6 +315,29 @@ def test_batch_prompt_renders_exactly_the_real_eight_source_output_structure() -
     assert "@@Q2:B9@@" not in prompt
     assert "BEGIN" not in prompt
     assert ":END@@" not in prompt
+    # The Subject is stated once for the whole batch, never per B# block.
+    assert prompt.count("RedKitten") == 1
+    assert prompt.count("**Subject**:") == 1
+    assert prompt.index("**Subject**: RedKitten") < prompt.index("B1 https://example.test/source-1")
+
+
+def test_batch_prompt_makes_the_subject_the_relevance_boundary_of_every_block() -> None:
+    prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
+        "RedKitten",
+        [("B1", "https://vendor.example/multi-actor-report")],
+    )
+    one_line = " ".join(prompt.split())
+
+    # Source independence must not be read as "no subject filtering".
+    assert "Never use one publication to interpret or classify another." in one_line
+    assert "Never move an IOC or rule between publications." in one_line
+    assert "The Subject is the relevance boundary for every B#." in one_line
+    assert "Source independence does not suspend subject filtering." in one_line
+    assert "discard indicators/rules explicitly belonging to other activities" in one_line
+    assert "exhaustively emit the remaining subject-relevant indicators/rules" in one_line
+    # No unqualified "extract every IOC of the publication" instruction remains.
+    assert "Extract every source-supported literal IOC" not in one_line
+    assert "Extract every subject-relevant source-supported literal IOC" in one_line
 
 
 def test_batch_model_run_id_is_run_url_and_version_scoped(
