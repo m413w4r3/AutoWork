@@ -96,6 +96,67 @@ Aucune de ces bornes ne resoumet le prompt : elles terminent le run
 (`bridge_timeout` ou `bridge_ui_timeout`) et laissent la réconciliation
 explicite décider.
 
+### Autonomie en arrière-plan
+
+L’onglet de génération est créé volontairement inactif (`active: false`) et ne
+doit **jamais** avoir besoin d’être focalisé pour qu’une réponse soit consommée.
+Le focus reste un outil de debug humain, jamais un mécanisme de complétion.
+
+Chrome ralentit les minuteries d’une page masquée : ~1 s en arrière-plan, puis
+au plus **une exécution par minute** au-delà de cinq minutes cachées
+(*intensive throttling*). Une boucle d’observation uniquement minutée en subit
+deux conséquences, qu’il faut distinguer :
+
+- **latence** — constater une fin déjà rendue pouvait prendre deux réveils
+  minutés, soit jusqu’à ~2 minutes. C’est légitime, borné, et invisible pour le
+  résultat ;
+- **correction** — un unique réveil throttlé faisait bondir `stable_for_ms` de 0
+  à 60 000 ms, donc au-delà de `FINALIZATION_STALL_MS` (45 s) *à la première
+  observation qui suivait la fin*. Une réponse parfaitement terminée
+  (`completion_signal=assistant_actions`) partait alors en
+  `incomplete/finalization_stalled` au lieu d’un `done`. C’est le seul défaut de
+  correction imputable à l’arrière-plan, et il est corrigé.
+
+Trois protections indépendantes, aucune ne pouvant conclure seule :
+
+1. **MutationObserver** (content script) — réveille la boucle d’observation dès
+   qu’un nœud, un texte ou un attribut surveillé change. Les callbacks
+   d’observateur ne sont pas soumis au throttling des minuteries. La portée est
+   la racine du document (React remplace le tour surveillé), compensée par un
+   filtre d’attributs fermé et un callback trivial. Les observateurs sont
+   déconnectés à la fin de chaque job (`disconnectDomWatchers()`), jamais
+   partagés entre deux runs.
+2. **`observe_tick`** (service worker → onglet exact) — cadencé par le ping du
+   serveur (`KEEPALIVE_INTERVAL`, 20 s), donc par une horloge extérieure à la
+   page. Le tick ne fait que **réveiller** la boucle du run exact : il n’émet ni
+   heartbeat ni `done` et ne peut donc jamais prétendre que l’observateur DOM
+   est vivant. Le content script reste seul auteur de la liveness et de la fin.
+3. **Minuterie `POLL_MS`** — repli borné, throttlé, jamais supprimé. Sans ping
+   serveur et sans mutation, la boucle continue de tourner (au pire une fois par
+   minute), donc les heartbeats continuent : ~60 s au pire face à
+   `BRIDGE_IDLE_TIMEOUT` (300 s), soit une marge de 5×. **Ne pas descendre
+   `BRIDGE_IDLE_TIMEOUT` sous 120 s**, et ne jamais l’augmenter pour masquer un
+   problème d’observation.
+
+`MIN_STALL_OBSERVATIONS` (3) complète ces bornes : un verdict de « figé »
+(`finalization_stalled`, `active_signal_stalled`, watchdog du premier tour)
+exige désormais une durée longue **et** plusieurs observations réelles. Un seul
+réveil tardif n’est pas la preuve que la boucle n’a jamais conclu.
+
+**Déchargement d’onglet (*discard*).** Pendant tout un run lié, l’onglet exact
+est marqué `autoDiscardable = false` (jamais activé, jamais focalisé), et il le
+reste tant qu’une conversation live (KEEP) ou une target y est liée. Si Chrome
+le décharge malgré tout, `chrome.tabs.onUpdated` le détecte et le run échoue de
+façon typée et fermée : `bridge_extension_disconnected`,
+`submission_state=post_submission`, `retryable=false`, `tab_state.discarded=true`
+dans les diagnostics. La target exacte est conservée pour une recovery
+explicite — aucune resoumission, aucun onglet de remplacement, aucune
+conversation reconstruite.
+
+**Ce qui reste interdit** comme chemin de complétion :
+`chrome.tabs.update(tabId, { active: true })`, `window.focus()`, un clic
+synthétique dans la page ChatGPT, ou tout changement de fenêtre active.
+
 Dans Chrome : charger `chatgpt-bridge/extension`, ouvrir le popup, saisir
 `ws://127.0.0.1:8001/ws` et `BRIDGE_WS_TOKEN`, puis reconnecter. Le jeton est
 conservé dans `chrome.storage.local`; il n’est ni affiché dans le statut ni écrit
@@ -199,6 +260,47 @@ conserve sa target exacte pour une recovery explicite, puis ferme le WebSocket
 et effectue le checkpoint SQLite. Au redémarrage, les états `queued` ou
 `running` sont transformés en échec `submission_attempted` et ne sont jamais
 resoumis.
+
+## Test manuel d’autonomie (onglet jamais focalisé)
+
+Procédure de reproduction et de preuve. Elle doit permettre de trancher
+objectivement entre « a exigé un focus humain » et « terminé masqué ».
+
+1. `make up`, puis vérifier le pont : `make bridge-status`.
+2. Recharger l’extension dans Chrome et vérifier la version du content script :
+   dans la console de l’onglet ChatGPT, la ligne
+   `🔌 ChatGPT Mini-Bridge : content script prêt — version 30`. Une version plus
+   ancienne signifie que Chrome sert encore le code précédent.
+3. Lancer une production normale (deux articles, recherche approfondie).
+4. **Ne toucher à aucun onglet ChatGPT** : ne pas cliquer dessus, ne pas le
+   survoler, ne pas le mettre au premier plan. Travailler dans une autre
+   application, idéalement dans une autre fenêtre, pour que la fenêtre du
+   navigateur elle-même ne soit pas focalisée.
+5. N’inspecter les logs qu’**après** la fin du run : `make bridge-logs`.
+
+Ce que la télémétrie permet de vérifier, sans aucun contenu :
+
+| Question | Où regarder |
+| --- | --- |
+| L’onglet est-il resté masqué ? | `bridge_run_autonomy … visibility_state=hidden` |
+| Est-il resté sans focus ? | `has_focus=False`, `focus_gains=0`, `visible_transitions=0` |
+| Un focus humain a-t-il précédé la détection ? | `focus_gains`/`visible_transitions` > 0 sur le `done` |
+| Quand le DOM final est-il apparu ? | `ms_since_dom_mutation` sur le `done` (recul depuis la dernière mutation) |
+| Comment la fin a-t-elle été détectée ? | `wake_mutation` / `wake_tick` / `wake_timer` |
+| L’onglet a-t-il été déchargé ? | `tab_state.discarded=true` (console du service worker, ou diagnostics de l’erreur `bridge_extension_disconnected`) |
+| L’onglet est-il resté en arrière-plan ? | `bridge_run_phase phase=bound_tab_state` (console du service worker) : `active=false`, `auto_discardable=false` |
+
+Un `done` accompagné de `visibility_state=hidden`, `has_focus=False`,
+`focus_gains=0` et `visible_transitions=0` **prouve** une complétion autonome :
+la page n’est jamais repassée au premier plan avant que la fin ne soit
+constatée. À l’inverse, `focus_gains>0` sur ce même `done` est la signature d’une
+complétion qui a suivi une intervention humaine, et doit être traitée comme une
+régression.
+
+Les timeouts journalisent les mêmes champs (`bridge_idle_timeout` /
+`bridge_total_timeout` portent `visibility_state`, `has_focus`, `focus_gains`,
+`ms_since_dom_mutation`, `ms_since_heartbeat`), ce qui distingue un onglet
+masqué mais sain d’un onglet gelé ou déchargé.
 
 ## Test manuel de non-duplication
 

@@ -83,6 +83,12 @@ function makeChromeMock() {
         }
       },
       sendMessage: async () => ({}),
+      update: async (tabId, props) => {
+        const tab = tabsById.get(tabId);
+        if (!tab) throw new Error(`No tab with id: ${tabId}`);
+        Object.assign(tab, props);
+        return { ...tab };
+      },
       onRemoved: { addListener: (fn) => removedListeners.push(fn) },
       onUpdated: { addListener: (fn) => updatedListeners.push(fn) },
       reload: async () => {},
@@ -677,6 +683,94 @@ async function main() {
     const tabB = await run(`resolveBrowserTarget(${JSON.stringify(targetB)})`);
     assert.notEqual(tabA.id, tabB.id);
     assert.equal(mock.tabsById.size, 1);
+  }
+
+  // --- Autonomie de l'onglet d'arrière-plan --------------------------------- //
+
+  // 16. L'onglet exact d'un run lié est protégé du déchargement de Chrome,
+  // sans jamais être activé ni focalisé.
+  {
+    const mock = makeChromeMock();
+    mock.chrome.tabs.sendMessage = async () => ({});
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-E" };
+    await run(
+      `handlePrompt(${JSON.stringify({ type: "prompt", id: "run-E", prompt: "bonjour", new_chat: true, browser_target: target })})`,
+    );
+    const tab = [...mock.tabsById.values()][0];
+    assert.equal(tab.autoDiscardable, false, "l'onglet lié ne doit pas être déchargeable");
+    assert.equal(tab.active, false, "l'onglet ne doit jamais être activé");
+  }
+
+  // 17. Ticks d'observation : le ping du serveur réveille exactement l'onglet
+  // du run en vol, et lui seul. Aucun autre onglet n'est touché, et le tick ne
+  // porte aucun contenu.
+  {
+    const mock = makeChromeMock();
+    const ticks = [];
+    mock.chrome.tabs.sendMessage = async (tabId, message) => {
+      if (message?.type === "observe_tick") ticks.push({ tabId, message });
+      return {};
+    };
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-F" };
+    await run(
+      `handlePrompt(${JSON.stringify({ type: "prompt", id: "run-F", prompt: "bonjour", new_chat: true, browser_target: target })})`,
+    );
+    const bound = [...mock.tabsById.values()][0];
+    // Un onglet ChatGPT étranger au run : il ne doit jamais recevoir de tick.
+    const other = await mock.chrome.tabs.create({ url: "https://chatgpt.com/", active: false });
+    await run("pumpObservationTicks()");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(
+      ticks.map((tick) => tick.tabId),
+      [bound.id],
+      "seul l'onglet exact du run en vol reçoit un tick",
+    );
+    assert.notEqual(ticks[0].tabId, other.id);
+    assert.deepEqual(
+      { ...ticks[0].message },
+      { type: "observe_tick", id: "run-F" },
+      "le tick ne porte que le type et l'id du run",
+    );
+  }
+
+  // 18. Onglet déchargé pendant un run : échec typé et fermé. Aucune
+  // resoumission, aucun onglet de remplacement, target exacte conservée pour
+  // une recovery explicite.
+  {
+    const mock = makeChromeMock();
+    mock.chrome.tabs.sendMessage = async () => ({});
+    const { run } = loadBackground(mock.chrome);
+    const target = { kind: "temporary_chat_run", id: "target-G" };
+    await run(
+      `handlePrompt(${JSON.stringify({ type: "prompt", id: "run-G", prompt: "bonjour", new_chat: true, browser_target: target })})`,
+    );
+    const tab = [...mock.tabsById.values()][0];
+    const tabsBefore = mock.tabsById.size;
+
+    tab.discarded = true;
+    for (const fn of mock.updatedListeners) fn(tab.id, { discarded: true });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const failure = await run('enAttente.find((m) => m.id === "run-G" && m.type === "error")');
+    assert.ok(failure, "un déchargement doit produire un échec typé");
+    assert.equal(failure.code, "bridge_extension_disconnected");
+    assert.equal(failure.submission_state, "post_submission");
+    assert.equal(failure.retryable, false, "un run déchargé n'est jamais rejoué");
+    assert.equal(failure.tab_id, tab.id);
+    assert.equal(failure.diagnostics.tab_state.discarded, true);
+    assert.equal(await run('requestStates.get("run-G")'), "failed");
+    assert.equal(await run('inflight.has("run-G")'), false);
+    assert.equal(mock.tabsById.size, tabsBefore, "aucun onglet de remplacement");
+    // Fin ambiguë : la target exacte est conservée pour une recovery explicite,
+    // jamais réutilisée pour une nouvelle réservation sous la même identité.
+    assert.equal(await run('browserTargetRegistry.get("target-G").state'), "recoverable");
+    await assert.rejects(
+      run(`resolveBrowserTarget(${JSON.stringify(target)})`),
+      (err) => err.code === "recovery_unavailable",
+    );
+    assert.equal(mock.tabsById.size, tabsBefore);
   }
 
   console.log("background conversation routing contract: ok");

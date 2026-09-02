@@ -301,6 +301,45 @@ def _signal_sources(value: object) -> list[dict[str, Any]]:
     return result
 
 
+_PAGE_STATE_VISIBILITY = {"visible", "hidden", "prerender", "unloaded"}
+_PAGE_STATE_COUNTERS = (
+    ("visible_transitions", 1_000_000),
+    ("focus_gains", 1_000_000),
+    ("ms_since_dom_mutation", 86_400_000),
+    ("ms_since_observation", 86_400_000),
+    ("ms_since_heartbeat", 86_400_000),
+    ("wake_mutation", 100_000_000),
+    ("wake_tick", 100_000_000),
+    ("wake_timer", 100_000_000),
+)
+
+
+def _page_state(value: object) -> dict[str, Any]:
+    """Diagnostic d'autonomie du content script : état de plan, jamais du contenu.
+
+    Ces champs répondent à une seule question, vérifiable après coup dans les
+    logs : la fin a-t-elle été détectée alors que l'onglet était masqué et sans
+    focus ? Ils ne participent à aucune décision de génération.
+    """
+    if not isinstance(value, dict):
+        return {}
+    state: dict[str, Any] = {}
+    visibility = value.get("visibility_state")
+    if isinstance(visibility, str) and visibility in _PAGE_STATE_VISIBILITY:
+        state["visibility_state"] = visibility
+    for field in ("hidden", "has_focus"):
+        reported = value.get(field)
+        if isinstance(reported, bool):
+            state[field] = reported
+    for field, ceiling in _PAGE_STATE_COUNTERS:
+        reported = value.get(field)
+        if isinstance(reported, bool):
+            continue
+        if isinstance(reported, int) and 0 <= reported <= ceiling:
+            state[field] = reported
+    return state
+
+
 def _incomplete_candidate(
     packet: dict[str, Any], metadata: dict[str, Any]
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
@@ -465,11 +504,14 @@ async def run_generation(
             heartbeat toutes les cinq secondes.
             """
             progress = _live_progress.get(request_id, {})
+            page_state = progress.get("page_state", {})
             logger.warning(
                 "%s bridge_run_id=%s phase=%s output_chars=%s stable_for_ms=%s "
                 "completion_signal=%s streaming_signal_sources=%s serialization_ms=%s "
                 "js_heap_bytes=%s "
-                "dom_node_count=%s elapsed_seconds=%.3f idle_seconds=%.3f "
+                "dom_node_count=%s visibility_state=%s has_focus=%s focus_gains=%s "
+                "ms_since_dom_mutation=%s ms_since_heartbeat=%s "
+                "elapsed_seconds=%.3f idle_seconds=%.3f "
                 "total_timeout=%s idle_timeout=%s",
                 code,
                 request_id,
@@ -484,6 +526,11 @@ async def run_generation(
                 progress.get("serialization_ms"),
                 progress.get("js_heap_bytes"),
                 progress.get("dom_node_count"),
+                page_state.get("visibility_state"),
+                page_state.get("has_focus"),
+                page_state.get("focus_gains"),
+                page_state.get("ms_since_dom_mutation"),
+                page_state.get("ms_since_heartbeat"),
                 now - started_at,
                 now - last_packet_at,
                 TOTAL_TIMEOUT,
@@ -620,6 +667,9 @@ async def run_generation(
                     sources = _signal_sources(progress.get("streaming_signal_sources"))
                     if sources:
                         _live_progress[request_id]["streaming_signal_sources"] = sources
+                    page_state = _page_state(progress.get("page_state"))
+                    if page_state:
+                        _live_progress[request_id]["page_state"] = page_state
                     for field, ceiling in (
                         ("serialization_ms", 60_000),
                         ("js_heap_bytes", 16 * 1024 * 1024 * 1024),
@@ -731,6 +781,9 @@ async def run_generation(
                         details[field] = value[:limit]
                 if signal_sources:
                     details["streaming_signal_sources"] = signal_sources
+                page_state = _page_state(metadata.get("page_state"))
+                if page_state:
+                    details["page_state"] = page_state
                 logger.warning(
                     "bridge_run_incomplete bridge_run_id=%s reason=%s output_chars=%s "
                     "completion_signal=%s stable_for_ms=%s streaming_signal_sources=%s",
@@ -866,6 +919,28 @@ async def run_generation(
                     )
                     if conversation_result is not None:
                         conversation_result.update(sanitized)
+                # Autonomie : état de plan de l'onglet au moment exact où le
+                # content script a constaté la fin. `focus_gains=0` et
+                # `visible_transitions=0` avec `visibility_state=hidden`
+                # prouvent une complétion sans aucune intervention humaine.
+                autonomy = _page_state(reported_metadata.get("page_state"))
+                if autonomy:
+                    logger.info(
+                        "bridge_run_autonomy bridge_run_id=%s visibility_state=%s "
+                        "hidden=%s has_focus=%s focus_gains=%s visible_transitions=%s "
+                        "ms_since_dom_mutation=%s wake_mutation=%s wake_tick=%s "
+                        "wake_timer=%s",
+                        request_id,
+                        autonomy.get("visibility_state"),
+                        autonomy.get("hidden"),
+                        autonomy.get("has_focus"),
+                        autonomy.get("focus_gains"),
+                        autonomy.get("visible_transitions"),
+                        autonomy.get("ms_since_dom_mutation"),
+                        autonomy.get("wake_mutation"),
+                        autonomy.get("wake_tick"),
+                        autonomy.get("wake_timer"),
+                    )
                 logger.info("bridge_run_phase bridge_run_id=%s phase=response_retrieval", request_id)
                 if final_text:
                     yield final_text

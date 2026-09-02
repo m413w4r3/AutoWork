@@ -49,6 +49,100 @@ const requestRoutes = new Map();
 /** Sérialise la réservation initiale d'une même target dans un service worker. */
 const browserTargetReservations = new Map();
 
+// --------------------------------------------------------------------------- //
+// Autonomie de l'onglet d'arrière-plan
+//
+// L'onglet de génération est créé volontairement inactif et ne doit jamais
+// avoir besoin d'être focalisé. Deux protections indépendantes vivent ici :
+//   - `autoDiscardable = false` pendant un run lié, pour que Chrome ne décharge
+//     pas l'onglet exact sous pression mémoire (jamais d'activation) ;
+//   - un `observe_tick` cadencé par le ping du serveur, horloge que le
+//     throttling des minuteries de page n'atteint pas. Le tick ne fait que
+//     réveiller la boucle du content script : il n'émet ni heartbeat ni `done`
+//     et ne peut donc jamais prétendre que l'observateur DOM est vivant.
+// --------------------------------------------------------------------------- //
+
+/** Marque/démarque l'onglet exact comme non déchargeable. Jamais d'activation. */
+async function setTabAutoDiscardable(tabId, autoDiscardable) {
+  if (typeof tabId !== "number") return;
+  try {
+    await chrome.tabs.update(tabId, { autoDiscardable });
+  } catch (_) {
+    // Un onglet disparu ou une API indisponible ne doit jamais faire échouer
+    // un run : c'est une protection opportuniste, pas une garantie.
+  }
+}
+
+/** L'onglet est-il encore lié à une conversation live ou à une target ? */
+function tabIsStillBound(tabId) {
+  for (const entry of conversationRegistry.values()) {
+    if (entry.tab_id === tabId) return true;
+  }
+  for (const entry of browserTargetRegistry.values()) {
+    if (entry.tab_id === tabId) return true;
+  }
+  return false;
+}
+
+/**
+ * Rend l'onglet déchargeable à nouveau — sauf s'il reste lié (KEEP), auquel
+ * cas un déchargement casserait le CONTINUE de cette conversation exacte.
+ */
+async function releaseTabAutoDiscardable(tabId) {
+  if (typeof tabId !== "number" || tabIsStillBound(tabId)) return;
+  await setTabAutoDiscardable(tabId, true);
+}
+
+/**
+ * État de l'onglet exact d'un run, sans contenu : uniquement les champs de
+ * cycle de vie que Chrome expose. Jamais d'autre onglet que celui-là.
+ */
+async function boundTabState(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    let windowFocused = null;
+    try {
+      const window = await chrome.windows?.get(tab.windowId);
+      windowFocused = window?.focused ?? null;
+    } catch (_) {
+      windowFocused = null;
+    }
+    return {
+      tab_id: tab.id ?? tabId,
+      exists: true,
+      active: tab.active ?? null,
+      discarded: tab.discarded ?? null,
+      auto_discardable: tab.autoDiscardable ?? null,
+      status: tab.status ?? null,
+      window_focused: windowFocused,
+    };
+  } catch (_) {
+    return { tab_id: tabId, exists: false };
+  }
+}
+
+async function logBoundTabState(phase, requestId, tabId) {
+  console.log("bridge_run_phase", {
+    phase,
+    bridge_run_id: requestId,
+    tab_state: await boundTabState(tabId),
+  });
+}
+
+/**
+ * Réveille la boucle d'observation des onglets exacts encore en vol.
+ * Déclenché par le ping serveur (20 s), donc par une horloge extérieure à la
+ * page : c'est ce qui rend la détection de fin indépendante du throttling
+ * d'arrière-plan sans jamais activer ni focaliser l'onglet.
+ */
+function pumpObservationTicks() {
+  for (const [requestId, tabId] of inflight.entries()) {
+    chrome.tabs
+      .sendMessage(tabId, { type: "observe_tick", id: requestId })
+      .catch(() => {});
+  }
+}
+
 /** Erreur de routage typée : `.code` est ce que le serveur doit voir, jamais aplati. */
 class BridgeRoutingError extends Error {
   constructor(code, message) {
@@ -192,6 +286,7 @@ async function connect() {
     }
     if (msg.type === "ping") {
       send({ type: "pong" }); // maintient aussi le service worker éveillé
+      pumpObservationTicks();
       return;
     }
     if (msg.type === "prompt") {
@@ -397,6 +492,7 @@ async function reserveBrowserTarget(browserTarget) {
         "l'onglet Temporary Chat créé n'est pas sur une origine ChatGPT",
       );
     }
+    await setTabAutoDiscardable(loaded.id, false);
     browserTargetRegistry.set(targetId, {
       target_id: targetId,
       tab_id: loaded.id,
@@ -535,6 +631,7 @@ async function resolveConversationTab(conversation) {
     if (!isAllowedChatOrigin(loaded.url)) {
       throw new BridgeRoutingError("conversation_unavailable", "l'onglet créé n'est pas sur une origine ChatGPT");
     }
+    await setTabAutoDiscardable(loaded.id, false);
     conversationRegistry.set(conversation.id, {
       tab_id: loaded.id,
       window_id: loaded.windowId,
@@ -800,6 +897,11 @@ async function handlePrompt(msg) {
     tab_id: tab.id,
   });
   busyTabs.add(tab.id);
+  // Pendant tout le run lié, Chrome ne doit pas décharger cet onglet exact :
+  // un déchargement tue le content script et donc l'observation en cours.
+  // C'est une protection contre le *discard*, jamais une activation.
+  await setTabAutoDiscardable(tab.id, false);
+  void logBoundTabState("bound_tab_state", msg.id, tab.id);
   if (msg.conversation?.mode === "fresh") {
     const binding = conversationRegistry.get(msg.conversation.id);
     if (binding?.state === "reserved") {
@@ -991,6 +1093,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const tabId = inflight.get(msg.id);
       inflight.delete(msg.id);
       if (tabId !== undefined) busyTabs.delete(tabId);
+      // Le run lié est fini : l'onglet redevient déchargeable, sauf s'il reste
+      // la session live d'une conversation (KEEP) ou d'une target conservée.
+      if (tabId !== undefined) {
+        void logBoundTabState("bound_tab_settled", msg.id, tabId);
+      }
       requestStates.set(
         msg.id,
         msg.type === "done"
@@ -1057,6 +1164,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (targetRoute?.target_id) {
         void settleBrowserTargetForResult(msg.id, targetRoute, msg);
       }
+      if (tabId !== undefined) void releaseTabAutoDiscardable(tabId);
       requestRoutes.delete(msg.id);
     }
     send({
@@ -1091,6 +1199,46 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (browserChanged) persistBrowserTargetRegistry();
 });
 
+/**
+ * Onglet déchargé par Chrome pendant un run lié.
+ *
+ * Le content script est mort avec la page : plus aucun heartbeat n'arrivera et
+ * la génération observée est perdue. On le dit tout de suite, de façon typée et
+ * *fermée* — le run échoue en `post_submission` (donc ambigu : sa target exacte
+ * est conservée pour une recovery explicite). Jamais de resoumission, jamais
+ * d'onglet de remplacement, jamais d'activation pour « réveiller » l'onglet.
+ */
+async function failRunOnDiscardedTab(requestId, tabId) {
+  const route = requestRoutes.get(requestId);
+  inflight.delete(requestId);
+  busyTabs.delete(tabId);
+  requestStates.set(requestId, "failed");
+  persistRequestStates();
+  const packet = {
+    type: "error",
+    id: requestId,
+    code: "bridge_extension_disconnected",
+    message:
+      "l'onglet ChatGPT lié a été déchargé par le navigateur (tab discarded)",
+    phase: "generation",
+    submission_state: "post_submission",
+    retryable: false,
+    diagnostics: { tab_state: await boundTabState(tabId) },
+    target_id: route?.target_id ?? null,
+    tab_id: tabId,
+  };
+  if (route) await settleBrowserTargetForResult(requestId, route, packet);
+  requestRoutes.delete(requestId);
+  send(packet);
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.discarded !== true) return;
+  for (const [requestId, boundTabId] of [...inflight.entries()]) {
+    if (boundTabId === tabId) void failRunOnDiscardedTab(requestId, tabId);
+  }
+});
+
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   // Seul un changement d'origine invalide le binding : une navigation à
   // l'intérieur de chatgpt.com (query/path) ne le fait jamais, l'URL n'étant
@@ -1112,6 +1260,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     }
   }
   if (browserChanged) persistBrowserTargetRegistry();
+  // Plus aucun binding : l'onglet n'a plus à être protégé du déchargement.
+  if (changed || browserChanged) void setTabAutoDiscardable(tabId, true);
 });
 
 // Réveils : le service worker MV3 peut être arrêté quand il est inactif.

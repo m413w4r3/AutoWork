@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "29";
+const VERSION = "30";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -122,6 +122,23 @@ const MOTS_RECHERCHE =
 const MOTS_PLUS_MODELES = /plus de mod|autres mod|more models|legacy models/;
 
 const POLL_MS = 120;
+// Réveil minimal entre deux itérations d'observation quand c'est une mutation
+// (et non la minuterie) qui réveille la boucle : une tempête de mutations ne
+// doit pas transformer l'observation en boucle serrée. Aucune conséquence sur
+// la sémantique : la boucle est idempotente, seul son coût CPU est borné ici.
+const OBSERVER_MIN_INTERVAL_MS = 100;
+// Attributs dont la mutation change une décision de fin. Volontairement fermé :
+// observer tous les attributs de chatgpt.com produirait un bruit inutile.
+const OBSERVED_ATTRIBUTES = [
+  "class",
+  "data-is-streaming",
+  "data-message-id",
+  "data-testid",
+  "data-state",
+  "aria-hidden",
+  "aria-label",
+  "open",
+];
 // La première fenêtre reste courte pour rendre rapidement un diagnostic, mais
 // elle n'est plus la borne de la soumission. Après celle-ci, on conserve le
 // même job et le même onglet dans une phase ambiguë jusqu'à cette borne finale.
@@ -139,6 +156,19 @@ const RUNTIME_METRICS_INTERVAL_MS = 30000;
 // Une réponse non vide et inchangée ne doit jamais rester "running"
 // pendant plusieurs minutes uniquement à cause d'un signal DOM périmé.
 const FINALIZATION_STALL_MS = 45000;
+
+// Un « figé » se mesure en durée ET en nombre d'observations réelles.
+//
+// Chrome throttle les minuteries d'un onglet masqué : au-delà de cinq minutes
+// cachées, une itération de la boucle peut ne revenir qu'une minute plus tard.
+// Une seule itération fait alors bondir `stable_for_ms` de 0 à 60 000 ms, et
+// tous les garde-fous ci-dessous se déclenchent d'un coup — y compris sur une
+// réponse parfaitement terminée, qui partait en `incomplete` au lieu d'un
+// `done` (mesuré : réponse finale rendue, `completion_signal=assistant_actions`,
+// `finalization_stalled` à la première observation suivante). Exiger plusieurs
+// observations distinctes distingue « la boucle a vraiment tourné sans jamais
+// conclure » de « la boucle n'a tourné qu'une fois, tard ».
+const MIN_STALL_OBSERVATIONS = 3;
 
 // Deux garde-fous distincts, longtemps confondus sous un même nom.
 //
@@ -213,6 +243,185 @@ async function waitFor(fn, timeout, label) {
     await sleep(100);
   }
   throw new Error(`Timeout : ${label}`);
+}
+
+// --------------------------------------------------------------------------- //
+// Autonomie en arrière-plan : diagnostics d'état de page et réveil événementiel
+//
+// Un onglet de génération est créé volontairement en arrière-plan (`active:
+// false`) et ne doit jamais avoir besoin d'être focalisé pour qu'une réponse
+// soit consommée. Chrome ralentit pourtant les minuteries d'une page masquée
+// (jusqu'à une exécution par minute au-delà de cinq minutes), ce qui rend une
+// boucle uniquement minutée lente à *constater* une fin déjà rendue.
+//
+// Trois sources de réveil indépendantes sont donc combinées, sans qu'aucune ne
+// puisse produire un `done` ni un heartbeat à elle seule :
+//   - MutationObserver : non soumis au throttling des minuteries ;
+//   - tick du service worker (`observe_tick`), cadencé par le ping serveur ;
+//   - minuterie `POLL_MS`, repli borné, throttlée mais jamais supprimée.
+// --------------------------------------------------------------------------- //
+
+/**
+ * Compteurs de passage au premier plan, sans contenu. Ils rendent vérifiable
+ * après coup la seule question qui compte : la détection de la fin a-t-elle été
+ * précédée d'un focus humain ? `focus_gains === 0` et `visible_transitions === 0`
+ * sur tout un run prouvent une complétion autonome, onglet masqué.
+ */
+const foregroundActivity = { visible_transitions: 0, focus_gains: 0 };
+try {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      foregroundActivity.visible_transitions += 1;
+    }
+  });
+  globalThis.addEventListener?.("focus", () => {
+    foregroundActivity.focus_gains += 1;
+  });
+} catch (_) {
+  // Un diagnostic absent ne doit jamais empêcher une génération.
+}
+
+function documentHasFocus() {
+  try {
+    return typeof document.hasFocus === "function" ? document.hasFocus() : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * État de plan de la page et fraîcheur des trois horloges d'observation.
+ * Strictement sans contenu : états standards et durées uniquement — jamais de
+ * texte, de HTML ni d'attribut arbitraire du DOM.
+ */
+function pageStateDiagnostics(now, sources = {}) {
+  const since = (value) =>
+    Number.isFinite(value) && value > 0 ? Math.max(0, now - value) : null;
+  const watcher = sources.watcher;
+  return {
+    visibility_state: document.visibilityState ?? null,
+    hidden: document.hidden ?? null,
+    has_focus: documentHasFocus(),
+    visible_transitions: foregroundActivity.visible_transitions,
+    focus_gains: foregroundActivity.focus_gains,
+    ms_since_dom_mutation: since(watcher ? watcher.lastMutationAt : null),
+    ms_since_observation: since(sources.lastObservationAt),
+    ms_since_heartbeat: since(sources.lastHeartbeatAt),
+    wake_mutation: watcher ? watcher.wakes.mutation : 0,
+    wake_tick: watcher ? watcher.wakes.tick : 0,
+    wake_timer: watcher ? watcher.wakes.timer : 0,
+  };
+}
+
+/** Observateurs vivants : garantit qu'aucun ne survit à la fin d'un job. */
+const activeDomWatchers = new Set();
+
+/**
+ * Réveille la boucle d'observation sur mutation du DOM, avec repli minuté.
+ *
+ * `wait(ms)` résout dès qu'une mutation pertinente survient (au plus une fois
+ * par `OBSERVER_MIN_INTERVAL_MS`), sinon à l'expiration de la minuterie. Le
+ * réveil ne décide jamais rien : il rend seulement la main à la boucle, qui
+ * relit le DOM et applique exactement les mêmes règles qu'avant.
+ */
+function createDomWatcher(label) {
+  const watcher = {
+    label,
+    lastMutationAt: 0,
+    mutations: 0,
+    wakes: { mutation: 0, tick: 0, timer: 0 },
+    disconnected: false,
+    pending: null,
+    armedAt: 0,
+  };
+
+  const settle = (reason) => {
+    const pending = watcher.pending;
+    if (!pending) return false;
+    if (
+      reason !== "timer" &&
+      reason !== "disconnected" &&
+      Date.now() - watcher.armedAt < OBSERVER_MIN_INTERVAL_MS
+    ) {
+      return false;
+    }
+    watcher.pending = null;
+    if (watcher.wakes[reason] !== undefined) watcher.wakes[reason] += 1;
+    pending(reason);
+    return true;
+  };
+
+  let observer = null;
+  try {
+    observer = new MutationObserver(() => {
+      watcher.lastMutationAt = Date.now();
+      watcher.mutations += 1;
+      settle("mutation");
+    });
+    // Portée : la racine du document. Le tour surveillé est remplacé par React
+    // entre réflexion, streaming et rendu final — observer un nœud de tour
+    // laisserait l'observateur attaché à un nœud détaché. La portée large est
+    // compensée par un filtre d'attributs fermé et un callback trivial.
+    observer.observe(document.documentElement || document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: OBSERVED_ATTRIBUTES,
+    });
+  } catch (_) {
+    // Pas de MutationObserver : la boucle retombe sur sa minuterie, comme avant.
+    observer = null;
+  }
+
+  watcher.wake = (reason) => settle(reason);
+
+  watcher.wait = (ms) =>
+    new Promise((resolve) => {
+      if (watcher.disconnected) {
+        setTimeout(() => resolve("timer"), ms);
+        return;
+      }
+      watcher.armedAt = Date.now();
+      watcher.pending = resolve;
+      setTimeout(() => {
+        if (watcher.pending !== resolve) return;
+        watcher.pending = null;
+        watcher.wakes.timer += 1;
+        resolve("timer");
+      }, ms);
+    });
+
+  watcher.disconnect = () => {
+    if (watcher.disconnected) return;
+    watcher.disconnected = true;
+    if (observer) observer.disconnect();
+    activeDomWatchers.delete(watcher);
+    settle("disconnected");
+  };
+
+  activeDomWatchers.add(watcher);
+  return watcher;
+}
+
+/** Aucun observateur ne doit survivre à un job : appelé en fin de handlePrompt. */
+function disconnectDomWatchers() {
+  for (const watcher of [...activeDomWatchers]) watcher.disconnect();
+}
+
+/**
+ * Tick d'observation émis par le service worker (cadencé par le ping serveur).
+ * C'est une horloge que le throttling d'arrière-plan n'atteint pas — mais elle
+ * ne prouve rien : elle réveille la boucle, qui reste seule à lire le DOM, à
+ * émettre les heartbeats et à conclure.
+ */
+function handleObservationTick(msg) {
+  if (!currentJob || currentJob.id !== msg?.id) return false;
+  let woken = false;
+  for (const watcher of activeDomWatchers) {
+    if (watcher.wake("tick")) woken = true;
+  }
+  return woken;
 }
 
 function composerText(el) {
@@ -535,50 +744,81 @@ async function waitForFirstAssistantTurn(
   const startedAt = Date.now();
   let lastActivityAt = startedAt;
   let lastHeartbeatAt = startedAt;
+  let lastObservationAt = startedAt;
+  let observationsSinceActivity = 0;
   // Baseline = the state observed at submission time, so a pre-existing signal
   // is already "seen" and cannot register as an appearance.
   let observedSignals = submissionSnapshot.generation;
-  const progress = {
-    phase: "waiting_answer",
-    output_chars: 0,
-    stable_for_ms: 0,
-    completion_signal: "unknown",
-    completion_confidence: "low",
-  };
+  const watcher = createDomWatcher("first_assistant_turn");
 
-  while (!job.aborted) {
-    await sleep(POLL_MS);
-    const now = Date.now();
+  try {
+    while (!job.aborted) {
+      await watcher.wait(POLL_MS);
+      const now = Date.now();
 
-    if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
-      reply({ type: "heartbeat", id: job.id, progress });
-      lastHeartbeatAt = now;
+      if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+        reply({
+          type: "heartbeat",
+          id: job.id,
+          progress: {
+            phase: "waiting_answer",
+            output_chars: 0,
+            stable_for_ms: 0,
+            completion_signal: "unknown",
+            completion_confidence: "low",
+            page_state: pageStateDiagnostics(now, {
+              watcher,
+              lastObservationAt,
+              lastHeartbeatAt,
+            }),
+          },
+        });
+        lastHeartbeatAt = now;
+      }
+      lastObservationAt = now;
+
+      const turns = document.querySelectorAll(SELECTORS.assistant);
+      if (turns.length > assistantTurnsBefore) return turns[turns.length - 1];
+
+      const currentSignals = currentSubmissionGenerationSignals();
+      if (generationSignalTransition(observedSignals, currentSignals)) {
+        lastActivityAt = now;
+        observationsSinceActivity = 0;
+      } else {
+        observationsSinceActivity += 1;
+      }
+      observedSignals = currentSignals;
+      // Même règle que dans `streamAnswer` : une unique itération throttlée ne
+      // prouve pas qu'une UI est figée (cf. MIN_STALL_OBSERVATIONS).
+      if (
+        now - lastActivityAt >= FIRST_ASSISTANT_ACTIVITY_STALL_MS &&
+        observationsSinceActivity >= MIN_STALL_OBSERVATIONS
+      ) {
+        const error = new BridgeError(
+          "bridge_ui_timeout",
+          "aucun tour assistant après la soumission du prompt",
+        );
+        error.diagnostics = {
+          ...firstAssistantWaitDiagnostics(
+            composer,
+            sendBtn,
+            submissionSnapshot,
+            assistantTurnsBefore,
+            startedAt,
+          ),
+          page_state: pageStateDiagnostics(now, {
+            watcher,
+            lastObservationAt,
+            lastHeartbeatAt,
+          }),
+        };
+        throw error;
+      }
     }
-
-    const turns = document.querySelectorAll(SELECTORS.assistant);
-    if (turns.length > assistantTurnsBefore) return turns[turns.length - 1];
-
-    const currentSignals = currentSubmissionGenerationSignals();
-    if (generationSignalTransition(observedSignals, currentSignals)) {
-      lastActivityAt = now;
-    }
-    observedSignals = currentSignals;
-    if (now - lastActivityAt >= FIRST_ASSISTANT_ACTIVITY_STALL_MS) {
-      const error = new BridgeError(
-        "bridge_ui_timeout",
-        "aucun tour assistant après la soumission du prompt",
-      );
-      error.diagnostics = firstAssistantWaitDiagnostics(
-        composer,
-        sendBtn,
-        submissionSnapshot,
-        assistantTurnsBefore,
-        startedAt,
-      );
-      throw error;
-    }
+    return null;
+  } finally {
+    watcher.disconnect();
   }
-  return null;
 }
 
 /**
@@ -1363,9 +1603,11 @@ function incompleteAnswer({
   stableForMs,
   turn,
   signalSources,
+  pageState,
 }) {
   const candidate = typeof text === "string" ? text : "";
   return {
+    page_state: pageState || null,
     text: candidate,
     visible_citations: candidate ? snapshot?.visible_citations || [] : [],
     serializer_version: DOM_SERIALIZER.SERIALIZER_VERSION,
@@ -1392,6 +1634,8 @@ async function streamAnswer(job, locator, before) {
   const output = globalThis.ChatGPTBridgeFinalOutput.createAccumulator();
   let vu = ""; // relevé précédent, pour mesurer la stabilité
   let stableSince = null;
+  // Observations consécutives où le texte n'a pas bougé (cf. MIN_STALL_OBSERVATIONS).
+  let stableObservations = 0;
   let full = "";
   let debugSig = "";
   let completionSignature = "";
@@ -1412,6 +1656,18 @@ async function streamAnswer(job, locator, before) {
   let lastSerializationMs = 0;
   let lastRuntimeMetricsAt = 0;
   let runtimeMetrics = {};
+  let lastObservationAt = debut;
+  // Réveil événementiel + repli minuté : l'onglet reste en arrière-plan, la
+  // boucle ne dépend donc pas de la cadence des minuteries pour *constater*
+  // une fin déjà rendue. Aucune règle de décision n'est modifiée.
+  const watcher = createDomWatcher("stream_answer");
+  const pageState = () =>
+    pageStateDiagnostics(Date.now(), {
+      watcher,
+      lastObservationAt,
+      lastHeartbeatAt,
+    });
+  let finalPageState = null;
 
   // Scalars only: never retain DOM nodes, snapshots, or response buffers.
   const sampledRuntimeMetrics = (now) => {
@@ -1441,194 +1697,218 @@ async function streamAnswer(job, locator, before) {
     completion_confidence: "low",
   };
 
-  while (!job.aborted) {
-    await sleep(POLL_MS);
+  try {
+    while (!job.aborted) {
+      await watcher.wait(POLL_MS);
 
-    const now = Date.now();
+      const now = Date.now();
 
-    // Liveness indépendant du DOM : le heartbeat doit être émis même quand
-    // ChatGPT remplace temporairement le tour assistant (recherche web, reasoning).
-    if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
-      reply({
-        type: "heartbeat",
-        id: job.id,
-        progress: lastProgress,
-      });
-      lastHeartbeatAt = now;
-    }
+      // Liveness indépendant du DOM : le heartbeat doit être émis même quand
+      // ChatGPT remplace temporairement le tour assistant (recherche web, reasoning).
+      if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+        reply({
+          type: "heartbeat",
+          id: job.id,
+          progress: {
+            ...lastProgress,
+            page_state: pageStateDiagnostics(now, {
+              watcher,
+              lastObservationAt,
+              lastHeartbeatAt,
+            }),
+          },
+        });
+        lastHeartbeatAt = now;
+      }
+      lastObservationAt = now;
 
-    // Re-recherche du tour à chaque itération, jamais de référence gardée :
-    // React remplace le nœud du message entre la phase de réflexion et la
-    // réponse, et un nœud détaché resterait figé sur « Thinking ».
-    const turn = findTurn(locator, before);
-    if (!turn) continue;
+      // Re-recherche du tour à chaque itération, jamais de référence gardée :
+      // React remplace le nœud du message entre la phase de réflexion et la
+      // réponse, et un nœud détaché resterait figé sur « Thinking ».
+      const turn = findTurn(locator, before);
+      if (!turn) continue;
 
-    // `finished === false` (ChatGPT écrit encore) interdit de sortir ; `null`
-    // (aucun signal reconnu) exige une stabilité bien plus longue.
-    const completion = completionState(turn);
-    const finished = completion.finished;
-    const nextCompletionSignature = `${finished}:${completion.signal}`;
-    if (nextCompletionSignature !== completionSignature) {
-      completionSignature = nextCompletionSignature;
-      stableSince = null;
-    }
-    const root = answerRoot(
-      turn,
-      finished === true || Date.now() - debut > NO_MARKDOWN_FALLBACK_MS,
-    );
-    const serializationStartedAt = globalThis.performance?.now?.();
-    const snapshot = root ? readAnswer(root, finished !== true) : null;
-    const serializationFinishedAt = globalThis.performance?.now?.();
-    if (
-      Number.isFinite(serializationStartedAt) &&
-      Number.isFinite(serializationFinishedAt)
-    ) {
-      lastSerializationMs = Math.max(
-        0,
-        Math.round(serializationFinishedAt - serializationStartedAt),
+      // `finished === false` (ChatGPT écrit encore) interdit de sortir ; `null`
+      // (aucun signal reconnu) exige une stabilité bien plus longue.
+      const completion = completionState(turn);
+      const finished = completion.finished;
+      const nextCompletionSignature = `${finished}:${completion.signal}`;
+      if (nextCompletionSignature !== completionSignature) {
+        completionSignature = nextCompletionSignature;
+        stableSince = null;
+        stableObservations = 0;
+      }
+      const root = answerRoot(
+        turn,
+        finished === true || Date.now() - debut > NO_MARKDOWN_FALLBACK_MS,
       );
-    }
-    full = snapshot ? snapshot.text : "";
-    output.observe(full);
-
-    if (DEBUG) {
-      const pres = root ? root.querySelectorAll("pre") : [];
-      const sig = `fini=${finished} root=${root ? root.tagName + "." + (root.className || "-").slice(0, 24) : "null"} pre=${pres.length}`;
-      if (sig !== debugSig) {
-        debugSig = sig;
-        console.log(
-          `[bridge] ${sig} | queue=${JSON.stringify(full.slice(-40))}`,
+      const serializationStartedAt = globalThis.performance?.now?.();
+      const snapshot = root ? readAnswer(root, finished !== true) : null;
+      const serializationFinishedAt = globalThis.performance?.now?.();
+      if (
+        Number.isFinite(serializationStartedAt) &&
+        Number.isFinite(serializationFinishedAt)
+      ) {
+        lastSerializationMs = Math.max(
+          0,
+          Math.round(serializationFinishedAt - serializationStartedAt),
         );
       }
-    }
+      full = snapshot ? snapshot.text : "";
+      output.observe(full);
 
-    if (full !== vu) {
-      vu = full;
-      stableSince = null;
-    } else if (stableSince === null) {
-      stableSince = Date.now();
-    }
-
-    const need =
-      finished === true && full.length === 0
-        ? EMPTY_FINAL_SETTLE_MS
-        : finished === null
-          ? SETTLE_UNKNOWN_MS
-          : SETTLE_MS;
-    stableForMs = stableSince === null ? 0 : Date.now() - stableSince;
-    const stable = stableForMs >= need;
-
-    // Mettre à jour l'état courant pour le prochain heartbeat.
-    // Ce calcul n'envoie rien : le heartbeat lui-même est émis plus haut,
-    // indépendamment de la présence du tour.
-    const phase =
-      completion.signal === "reasoning"
-        ? "reasoning"
-        : completion.signal === "stop_button" ||
-            completion.signal === "streaming"
-          ? "generating"
-          : full.length === 0
-            ? "waiting_answer"
-            : stableForMs > 0
-              ? "stabilizing"
-              : "answering";
-
-    // Diagnostic borné et sans contenu : quand l'UI se dit « en streaming »,
-    // dire *quel* détecteur l'affirme. Un stall futur doit être imputable à un
-    // sélecteur nommé, jamais à un booléen agrégé.
-    const signalSources =
-      completion.signal === "streaming"
-        ? streamingSignalSources(turnSignalScope(turn))
-        : [];
-
-    lastProgress = {
-      phase,
-      output_chars:
-        globalThis.ChatGPTBridgeFinalOutput.outputChars(full),
-      stable_for_ms: stableForMs,
-      completion_signal: completion.signal,
-      completion_confidence: completion.confidence,
-      serialization_ms: lastSerializationMs,
-      ...(signalSources.length
-        ? { streaming_signal_sources: signalSources }
-        : {}),
-      ...sampledRuntimeMetrics(now),
-    };
-    const outcome = globalThis.ChatGPTBridgeFinalOutput.settledOutcome({
-      completion,
-      text: full,
-      stableForMs,
-      emptySettleMs: EMPTY_FINAL_SETTLE_MS,
-    });
-    const incompleteFields = {
-      snapshot,
-      completion,
-      stableForMs,
-      turn,
-      signalSources,
-    };
-    if (outcome === "incomplete") {
-      // Fin confirmée mais rien d'écrit : il n'y a honnêtement aucun candidat.
-      return incompleteAnswer({
-        reason: "no_final_answer",
-        text: "",
-        ...incompleteFields,
-      });
-    }
-
-    if (
-      full.length > 0 &&
-      finished !== false &&
-      stableForMs >= FINALIZATION_STALL_MS
-    ) {
-      return incompleteAnswer({
-        reason: "finalization_stalled",
-        text: full,
-        ...incompleteFields,
-      });
-    }
-
-    // Un texte stable n'est PAS la preuve qu'une génération active a échoué.
-    // Quand `.streaming-animation` est visible dans le tour surveillé, ChatGPT
-    // recherche encore : deux runs de production sont restés à ~30 caractères
-    // pendant 300 003 ms et 352 002 ms, puis le même tour a rendu la réponse
-    // complète. On continue donc d'observer et de battre, sans jamais conclure
-    // ni resoumettre ; la borne dure appartient au serveur (bridge_total_timeout).
-    if (
-      full.length > 0 &&
-      finished === false &&
-      stableForMs >= WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS &&
-      !longRunningStreamingSignalActive(signalSources)
-    ) {
-      return incompleteAnswer({
-        reason: "active_signal_stalled",
-        text: full,
-        ...incompleteFields,
-      });
-    }
-    if (stable && finished !== false && full.length > 0) {
-      const verificationRoot = answerRoot(turn, true);
-      const verification = verificationRoot
-        ? readAnswer(verificationRoot, false)
-        : null;
-
-      // La décision de fin porte uniquement sur le contenu textuel.
-      // Les citations restent des métadonnées et peuvent encore être
-      // réordonnées/enrichies par l'UI après la fin visible de la réponse.
-      if (verification && verification.text === full) {
-        output.observe(verification.text);
-        finalSerialized = verification;
-        finalCompletion = completion;
-        finalTurnLocator = turnLocator(turn) || locator;
-        finalExternalTurnId = turnExternalId(turn);
-        break;
+      if (DEBUG) {
+        const pres = root ? root.querySelectorAll("pre") : [];
+        const sig = `fini=${finished} root=${root ? root.tagName + "." + (root.className || "-").slice(0, 24) : "null"} pre=${pres.length}`;
+        if (sig !== debugSig) {
+          debugSig = sig;
+          console.log(
+            `[bridge] ${sig} | queue=${JSON.stringify(full.slice(-40))}`,
+          );
+        }
       }
 
-      // Le texte a réellement changé entre les deux lectures :
-      // on recommence la fenêtre de stabilisation.
-      vu = verification ? verification.text : "";
-      stableSince = null;
+      if (full !== vu) {
+        vu = full;
+        stableSince = null;
+        stableObservations = 0;
+      } else if (stableSince === null) {
+        stableSince = Date.now();
+        stableObservations = 1;
+      } else {
+        stableObservations += 1;
+      }
+
+      const need =
+        finished === true && full.length === 0
+          ? EMPTY_FINAL_SETTLE_MS
+          : finished === null
+            ? SETTLE_UNKNOWN_MS
+            : SETTLE_MS;
+      stableForMs = stableSince === null ? 0 : Date.now() - stableSince;
+      const stable = stableForMs >= need;
+
+      // Mettre à jour l'état courant pour le prochain heartbeat.
+      // Ce calcul n'envoie rien : le heartbeat lui-même est émis plus haut,
+      // indépendamment de la présence du tour.
+      const phase =
+        completion.signal === "reasoning"
+          ? "reasoning"
+          : completion.signal === "stop_button" ||
+              completion.signal === "streaming"
+            ? "generating"
+            : full.length === 0
+              ? "waiting_answer"
+              : stableForMs > 0
+                ? "stabilizing"
+                : "answering";
+
+      // Diagnostic borné et sans contenu : quand l'UI se dit « en streaming »,
+      // dire *quel* détecteur l'affirme. Un stall futur doit être imputable à un
+      // sélecteur nommé, jamais à un booléen agrégé.
+      const signalSources =
+        completion.signal === "streaming"
+          ? streamingSignalSources(turnSignalScope(turn))
+          : [];
+
+      lastProgress = {
+        phase,
+        output_chars:
+          globalThis.ChatGPTBridgeFinalOutput.outputChars(full),
+        stable_for_ms: stableForMs,
+        completion_signal: completion.signal,
+        completion_confidence: completion.confidence,
+        serialization_ms: lastSerializationMs,
+        ...(signalSources.length
+          ? { streaming_signal_sources: signalSources }
+          : {}),
+        ...sampledRuntimeMetrics(now),
+      };
+      const outcome = globalThis.ChatGPTBridgeFinalOutput.settledOutcome({
+        completion,
+        text: full,
+        stableForMs,
+        emptySettleMs: EMPTY_FINAL_SETTLE_MS,
+      });
+      const incompleteFields = {
+        snapshot,
+        completion,
+        stableForMs,
+        turn,
+        signalSources,
+        pageState: pageState(),
+      };
+      if (outcome === "incomplete") {
+        // Fin confirmée mais rien d'écrit : il n'y a honnêtement aucun candidat.
+        return incompleteAnswer({
+          reason: "no_final_answer",
+          text: "",
+          ...incompleteFields,
+        });
+      }
+
+      if (
+        full.length > 0 &&
+        finished !== false &&
+        stableForMs >= FINALIZATION_STALL_MS &&
+        stableObservations >= MIN_STALL_OBSERVATIONS
+      ) {
+        return incompleteAnswer({
+          reason: "finalization_stalled",
+          text: full,
+          ...incompleteFields,
+        });
+      }
+
+      // Un texte stable n'est PAS la preuve qu'une génération active a échoué.
+      // Quand `.streaming-animation` est visible dans le tour surveillé, ChatGPT
+      // recherche encore : deux runs de production sont restés à ~30 caractères
+      // pendant 300 003 ms et 352 002 ms, puis le même tour a rendu la réponse
+      // complète. On continue donc d'observer et de battre, sans jamais conclure
+      // ni resoumettre ; la borne dure appartient au serveur (bridge_total_timeout).
+      if (
+        full.length > 0 &&
+        finished === false &&
+        stableForMs >= WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS &&
+        stableObservations >= MIN_STALL_OBSERVATIONS &&
+        !longRunningStreamingSignalActive(signalSources)
+      ) {
+        return incompleteAnswer({
+          reason: "active_signal_stalled",
+          text: full,
+          ...incompleteFields,
+        });
+      }
+      if (stable && finished !== false && full.length > 0) {
+        const verificationRoot = answerRoot(turn, true);
+        const verification = verificationRoot
+          ? readAnswer(verificationRoot, false)
+          : null;
+
+        // La décision de fin porte uniquement sur le contenu textuel.
+        // Les citations restent des métadonnées et peuvent encore être
+        // réordonnées/enrichies par l'UI après la fin visible de la réponse.
+        if (verification && verification.text === full) {
+          output.observe(verification.text);
+          finalSerialized = verification;
+          finalCompletion = completion;
+          finalTurnLocator = turnLocator(turn) || locator;
+          finalExternalTurnId = turnExternalId(turn);
+          // État de plan au moment exact où la fin est constatée : c'est cette
+          // valeur qui rend vérifiable « terminé sans focus » après coup.
+          finalPageState = pageState();
+          break;
+        }
+
+        // Le texte a réellement changé entre les deux lectures :
+        // on recommence la fenêtre de stabilisation.
+        vu = verification ? verification.text : "";
+        stableSince = null;
+        stableObservations = 0;
+      }
     }
+  } finally {
+    watcher.disconnect();
   }
 
   const serialized = finalSerialized || {
@@ -1643,6 +1923,7 @@ async function streamAnswer(job, locator, before) {
     stable_for_ms: stableForMs,
     turn_locator: finalTurnLocator,
     external_turn_id: finalExternalTurnId,
+    page_state: finalPageState || pageState(),
   };
 }
 
@@ -2023,6 +2304,9 @@ async function handlePrompt({
           content_script_version: VERSION,
           submission_state: "post_submission",
           initial_turn_id: externalTurnId,
+          // Diagnostic d'autonomie : état de plan de l'onglet au moment où la
+          // fin a été constatée. Sans contenu, jamais un signal de décision.
+          ...(serialized.page_state ? { page_state: serialized.page_state } : {}),
           ...(serialized.streaming_signal_sources?.length
             ? { streaming_signal_sources: serialized.streaming_signal_sources }
             : {}),
@@ -2047,7 +2331,10 @@ async function handlePrompt({
         code: err.code || "bridge_server_error",
         message: err.message,
         phase: job.phase,
-        diagnostics: err.diagnostics || null,
+        diagnostics: err.diagnostics || {
+          content_script_version: VERSION,
+          page_state: pageStateDiagnostics(Date.now(), {}),
+        },
         target_id: browserTarget?.id ?? null,
         conversation: conversation
           ? { id: conversation.id, mode: conversation.mode }
@@ -2057,6 +2344,9 @@ async function handlePrompt({
     }
   } finally {
     if (currentJob === job) currentJob = null;
+    // Aucun observateur ne survit à un job : ni fuite entre deux runs, ni
+    // réveil d'une boucle qui n'existe plus.
+    disconnectDomWatchers();
   }
 }
 
@@ -2174,6 +2464,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg?.type === "recovery_capture") {
     captureLaterResponse(msg).then(sendResponse);
+    return true;
+  }
+  if (msg?.type === "observe_tick") {
+    // Horloge insensible au throttling d'arrière-plan : elle ne fait que
+    // réveiller la boucle du job exact. Elle n'émet ni heartbeat ni `done`,
+    // et ne peut donc jamais prétendre à la santé de l'observateur DOM.
+    sendResponse({ ok: true, woken: handleObservationTick(msg) });
     return true;
   }
   if (msg?.type === "prompt") {

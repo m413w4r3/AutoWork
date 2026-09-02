@@ -10,6 +10,7 @@ disconnected.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
@@ -458,3 +459,154 @@ async def test_endless_streaming_animation_is_bounded_only_by_the_total_timeout(
     assert not [msg for msg in extension.sent if msg.get("type") == "abort"], (
         "aucun abort : cliquer Stop fabriquerait une fin de génération"
     )
+
+
+class HiddenTabExtension:
+    """Onglet masqué et sans focus, du premier heartbeat au `done` final.
+
+    Reproduit le contrat d'autonomie côté serveur : la liveness et la fin
+    arrivent d'une page qui n'a jamais été ramenée au premier plan. Le
+    diagnostic joint est borné, typé et sans contenu.
+    """
+
+    PAGE_STATE = {
+        "visibility_state": "hidden",
+        "hidden": True,
+        "has_focus": False,
+        "visible_transitions": 0,
+        "focus_gains": 0,
+        "ms_since_dom_mutation": 40_000,
+        "ms_since_observation": 0,
+        "ms_since_heartbeat": 0,
+        "wake_mutation": 12,
+        "wake_tick": 31,
+        "wake_timer": 5,
+        # Champs hostiles : jamais retenus par le serveur.
+        "answer_text": "réponse confidentielle",
+        "visibility_state_extra": "visible",
+    }
+
+    def __init__(self, runtime: BridgeApplication, *, interval: float, beats: int) -> None:
+        self.runtime = runtime
+        self.interval = interval
+        self.beats_target = beats
+        self.beats = 0
+        self.sent: list[dict[str, Any]] = []
+        self.task: asyncio.Task[None] | None = None
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        self.sent.append(payload)
+        if payload.get("type") == "prompt":
+            self.task = asyncio.create_task(self._run(payload["id"]))
+
+    async def _run(self, request_id: str) -> None:
+        while self.beats < self.beats_target:
+            await asyncio.sleep(self.interval)
+            self.beats += 1
+            self.runtime.bridge.dispatch(
+                {
+                    "type": "heartbeat",
+                    "id": request_id,
+                    "event_id": f"hb-{self.beats}",
+                    "progress": {
+                        "phase": "generating",
+                        "output_chars": 12,
+                        "stable_for_ms": 0,
+                        "completion_signal": "streaming",
+                        "completion_confidence": "high",
+                        "page_state": dict(self.PAGE_STATE),
+                    },
+                }
+            )
+        self.runtime.bridge.dispatch(
+            {
+                "type": "done",
+                "id": request_id,
+                "event_id": "done",
+                "text": "rapport final",
+                "metadata": {
+                    "completion_signal": "assistant_actions",
+                    "completion_confidence": "high",
+                    "stable_for_ms": 2_100,
+                    "output_chars": len("rapport final"),
+                    "visible_citation_count": 0,
+                    "content_script_version": "30",
+                    "page_state": dict(self.PAGE_STATE),
+                },
+            }
+        )
+
+    async def close(self, code: int, reason: str) -> None:
+        del code, reason
+
+    def stop(self) -> None:
+        if self.task is not None:
+            self.task.cancel()
+
+
+async def test_hidden_unfocused_tab_completes_and_is_provably_autonomous(
+    runtime: BridgeApplication,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Onglet masqué : le run aboutit, et les logs le prouvent objectivement.
+
+    C'est la contrepartie serveur du test d'extension : la liveness et la fin
+    viennent d'une page jamais focalisée, et `bridge_run_autonomy` permet de
+    trancher après coup entre « a exigé un focus » et « terminé masqué ».
+    """
+    extension = HiddenTabExtension(runtime, interval=0.05, beats=4)
+
+    with caplog.at_level(logging.INFO, logger="chatgpt_bridge"):
+        chunks, failure, _ = await _generate(
+            runtime, extension, "hidden-tab", total_timeout=3.0, idle_timeout=0.5
+        )
+    extension.stop()
+
+    assert failure is None
+    assert "".join(chunks) == "rapport final"
+    assert extension.beats == 4
+    # Un seul prompt : aucune resoumission n'a été provoquée par l'arrière-plan.
+    assert len([msg for msg in extension.sent if msg.get("type") == "prompt"]) == 1
+
+    autonomy = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("bridge_run_autonomy")
+    ]
+    assert len(autonomy) == 1
+    assert "visibility_state=hidden" in autonomy[0]
+    assert "has_focus=False" in autonomy[0]
+    assert "focus_gains=0" in autonomy[0]
+    assert "visible_transitions=0" in autonomy[0]
+    assert "wake_tick=31" in autonomy[0]
+    # Aucun contenu ne fuit dans la télémétrie d'autonomie.
+    assert "confidentielle" not in autonomy[0]
+
+
+def test_page_state_diagnostics_are_bounded_and_content_free() -> None:
+    from bridge.generation import _page_state
+
+    state = _page_state(
+        {
+            "visibility_state": "hidden",
+            "hidden": True,
+            "has_focus": False,
+            "focus_gains": 2,
+            "ms_since_dom_mutation": 40_000,
+            # Rejets attendus : hors domaine, hors borne, mauvais type, inconnu.
+            "visible_transitions": -1,
+            "wake_timer": 10**12,
+            "wake_tick": True,
+            "answer_text": "réponse confidentielle",
+        }
+    )
+
+    assert state == {
+        "visibility_state": "hidden",
+        "hidden": True,
+        "has_focus": False,
+        "focus_gains": 2,
+        "ms_since_dom_mutation": 40_000,
+    }
+    assert _page_state({"visibility_state": "focused"}) == {}
+    assert _page_state("hidden") == {}

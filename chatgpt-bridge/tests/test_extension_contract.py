@@ -137,3 +137,110 @@ def test_stateless_prompt_never_uses_new_chat_dom_click() -> None:
     route_end = background.index("\n\n/** Envoie", route_start)
     route_body = background[route_start:route_end]
     assert route_body.index('if (msg.type === "prompt")') < route_body.index("return findChatTab();")
+
+
+def test_focus_is_never_a_completion_mechanism() -> None:
+    """Aucun chemin de complétion ne passe par l'activation de l'onglet.
+
+    Le focus reste un outil de debug humain : il ne doit exister nulle part
+    dans l'extension comme moyen de faire aboutir une génération.
+    """
+    root = Path(__file__).parents[1] / "extension"
+    background = (root / "background.js").read_text()
+    content = (root / "content.js").read_text()
+
+    # Le service worker n'active jamais un onglet, ni ne déplace une fenêtre.
+    assert "active: true" not in background
+    assert "chrome.windows.update" not in background
+    assert "highlight" not in background
+    # Les onglets de génération restent créés en arrière-plan.
+    assert background.count("chrome.tabs.create({ url: TEMPORARY_CHAT_URL, active: false })") == 2
+    # Le content script ne ramène jamais la page au premier plan.
+    assert "window.focus()" not in content
+    assert "globalThis.focus()" not in content
+    # `document.hasFocus()` reste lu — mais seulement comme diagnostic borné,
+    # jamais comme condition d'une décision de fin.
+    assert content.count("document.hasFocus()") == 1
+    assert "documentHasFocus" in content
+
+
+def test_background_tab_is_protected_from_discard_without_activation() -> None:
+    root = Path(__file__).parents[1] / "extension"
+    background = (root / "background.js").read_text()
+
+    assert "async function setTabAutoDiscardable(tabId, autoDiscardable)" in background
+    assert "chrome.tabs.update(tabId, { autoDiscardable })" in background
+    # Protection posée pour la durée du run lié, puis relâchée si plus rien
+    # n'est lié à cet onglet exact.
+    assert "await setTabAutoDiscardable(tab.id, false);" in background
+    assert "releaseTabAutoDiscardable" in background
+    # Un onglet déchargé échoue de façon typée et fermée : jamais un rejeu,
+    # jamais un onglet de remplacement.
+    assert "async function failRunOnDiscardedTab(" in background
+    discard_start = background.index("async function failRunOnDiscardedTab(")
+    discard_end = background.index("chrome.tabs.onUpdated.addListener", discard_start)
+    discard_body = background[discard_start:discard_end]
+    assert '"bridge_extension_disconnected"' in discard_body
+    assert 'submission_state: "post_submission"' in discard_body
+    assert "retryable: false" in discard_body
+    assert "chrome.tabs.create(" not in discard_body
+    assert "sendToTab(" not in discard_body
+
+
+def test_observation_tick_wakes_the_loop_without_claiming_liveness() -> None:
+    """Le tick du service worker réveille, il ne prouve rien.
+
+    S'il pouvait produire un heartbeat ou un `done`, il affirmerait la santé
+    d'un observateur DOM qu'il n'observe pas.
+    """
+    root = Path(__file__).parents[1] / "extension"
+    background = (root / "background.js").read_text()
+    content = (root / "content.js").read_text()
+
+    assert "function pumpObservationTicks()" in background
+    pump_start = background.index("function pumpObservationTicks()")
+    pump_end = background.index("\n\n", pump_start)
+    pump_body = background[pump_start:pump_end]
+    assert '{ type: "observe_tick", id: requestId }' in pump_body
+    assert "heartbeat" not in pump_body
+    assert "done" not in pump_body
+
+    tick_start = content.index("function handleObservationTick(")
+    tick_end = content.index("\n}", tick_start)
+    tick_body = content[tick_start:tick_end]
+    # Le tick ne fait que réveiller la boucle du job exact.
+    assert "currentJob.id !== msg?.id" in tick_body
+    assert "reply(" not in tick_body
+    assert 'type: "done"' not in tick_body
+
+
+def test_dom_observation_is_event_driven_and_leak_free() -> None:
+    root = Path(__file__).parents[1] / "extension"
+    content = (root / "content.js").read_text()
+
+    assert "new MutationObserver(" in content
+    # La boucle d'observation attend un réveil (mutation / tick / minuterie),
+    # jamais un simple sleep minuté.
+    assert "await watcher.wait(POLL_MS)" in content
+    assert "await sleep(POLL_MS)" not in content
+    # Aucun observateur ne survit à un job.
+    assert "function disconnectDomWatchers()" in content
+    assert "disconnectDomWatchers();" in content
+    assert content.count("watcher.disconnect();") >= 2
+
+
+def test_stall_guards_require_several_real_observations() -> None:
+    """Un unique réveil throttlé ne prouve pas qu'une UI est figée.
+
+    Sans cette règle, une réponse terminée dans un onglet masqué partait en
+    `incomplete` (`finalization_stalled`) au lieu d'un `done`.
+    """
+    root = Path(__file__).parents[1] / "extension"
+    content = (root / "content.js").read_text()
+
+    assert "const MIN_STALL_OBSERVATIONS = 3;" in content
+    assert content.count("stableObservations >= MIN_STALL_OBSERVATIONS") == 2
+    assert "observationsSinceActivity >= MIN_STALL_OBSERVATIONS" in content
+    # La sémantique v29 de `.streaming-animation` reste intacte.
+    assert 'longRunningStreaming: [".streaming-animation"]' in content
+    assert "!longRunningStreamingSignalActive(signalSources)" in content

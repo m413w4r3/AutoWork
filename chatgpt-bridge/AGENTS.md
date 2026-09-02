@@ -100,6 +100,17 @@ response text can never change what conversation is opened or closed.
   `external_locator` is diagnostic only and is never used to route or reopen
   a conversation — it may be identical across multiple live conversations.
 - **needs_review** never triggers implicit replay.
+- **background autonomy**: the generation tab is created with `active: false`
+  and must never need focus to complete. Chrome throttles a hidden page's
+  timers (once per minute past five minutes hidden), so completion-critical
+  observation is woken by a `MutationObserver`, by the service worker's
+  `observe_tick` (paced by the server ping), and only lastly by the throttled
+  timer. A stall verdict needs both a long duration *and*
+  `MIN_STALL_OBSERVATIONS` real observations: a single throttled wake-up once
+  turned a finished answer into `finalization_stalled`. The tick wakes the loop
+  and nothing else — the content script stays the only author of heartbeats and
+  of `done`. See "Autonomie en arrière-plan" in
+  `docs/chatgpt_bridge_operations.md`.
 
 ## Temporary Chat browser session identity
 
@@ -145,13 +156,15 @@ uv run \
   python -m pytest tests/ -q --tb=short
 ```
 
-Run the JavaScript gate (3+ passed):
+Run the JavaScript gate (5+ passed):
 
 ```bash
 node --test \
   tests/completion.test.js \
   tests/content-dom.test.js \
-  tests/final-output.test.js
+  tests/final-output.test.js \
+  tests/background-conversation.test.js \
+  tests/content-background-tab.test.js
 ```
 
 Run lint and type checks:
