@@ -10,6 +10,7 @@ from cti_app.application.production_parsers import (
     SynthesisViolation,
     TechnicalExtraction,
     parse_reference_report,
+    validate_synthesis,
 )
 from cti_app.application.production_prompts import (
     SYNTHESIS_PROMPT_VERSION,
@@ -80,7 +81,7 @@ text: Event
         },
     )
 
-    assert pack["version"] == "3"
+    assert pack["version"] == "4"
     assert [source["tier"] for source in pack["reference_report"]["sources"]] == [
         "core",
         "supporting",
@@ -271,7 +272,7 @@ def test_synthesis_pack_excludes_detection_rules_and_preserves_extraction() -> N
         _minimal_report(), extraction, {"https://core.example/report": "core"}
     )
 
-    assert pack["version"] == "3"
+    assert pack["version"] == "4"
     assert "detection_rules" not in pack["technical_extraction"]
     assert extraction.rules == (rule, unsupported)
     serialized = json.dumps(pack, ensure_ascii=False)
@@ -375,7 +376,7 @@ def test_synthesis_pack_drops_metadata_only_ioc_rows_and_keeps_body_detail() -> 
     )
 
     items = pack["technical_extraction"]["items"]
-    assert pack["version"] == "3"
+    assert pack["version"] == "4"
 
     # No IOC-section row survives with neither a value nor context.
     assert not [
@@ -425,6 +426,95 @@ def test_synthesis_pack_keeps_ioc_section_rows_that_still_carry_context() -> Non
     assert len(items) == 1
     assert "value" not in items[0]
     assert items[0]["context"] == "serveur de C2"
+
+
+# --- Q4 pack: a forbidden network value never leaks through a Q2 fact -------
+
+
+def _meetingapp_extraction(*extra: ExtractionItem) -> TechnicalExtraction:
+    return TechnicalExtraction(
+        items=(
+            _artifact_item("D1", "meetingapp.site", ArtifactType.DOMAIN),
+            _item("infrastructure", "meetingapp[.]site", "domaine C2 réutilisé"),
+            _item(
+                "commands",
+                "ClickFix PowerShell",
+                "télécharge WinWebex.exe depuis hxxps://meetingapp[.]site/webexdownload",
+            ),
+            *extra,
+        ),
+        uncertainties=(),
+    )
+
+
+def test_synthesis_pack_strips_forbidden_network_value_from_facts_and_contexts() -> None:
+    extraction = _meetingapp_extraction()
+
+    pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
+        _minimal_report(), extraction, {"https://core.example/report": "core"}
+    )
+    serialized = json.dumps(pack, ensure_ascii=False)
+
+    assert "meetingapp.site" not in serialized
+    assert "meetingapp[.]site" not in serialized
+    assert "meetingapp" not in serialized
+    assert "hxxps://meetingapp[.]site/webexdownload" not in serialized
+
+    items = pack["technical_extraction"]["items"]
+    infrastructure = next(item for item in items if item["category"] == "infrastructure")
+    commands = next(item for item in items if item["category"] == "commands")
+
+    # The bare-IOC fact keeps no value, but its functional context survives.
+    assert "value" not in infrastructure
+    assert infrastructure["context"] == "domaine C2 réutilisé"
+    # Only the indicator is rewritten, the sentence around it is preserved.
+    assert commands["value"] == "ClickFix PowerShell"
+    assert "WinWebex.exe" in commands["context"]
+    assert "[network indicator omitted]" in commands["context"]
+
+    # The canonical extraction is untouched.
+    assert extraction.items[1].value == "meetingapp[.]site"
+    assert "hxxps://meetingapp[.]site/webexdownload" in extraction.items[2].context
+
+
+def test_synthesis_pack_keeps_network_values_published_in_the_body() -> None:
+    extraction = _meetingapp_extraction(
+        _artifact_item("D2", "allowed.example", ArtifactType.DOMAIN, policy=DisplayPolicy.BOTH),
+    )
+
+    pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
+        _minimal_report(), extraction, {"https://core.example/report": "core"}
+    )
+
+    values = {item.get("value") for item in pack["technical_extraction"]["items"]}
+    assert "allowed.example" in values
+
+
+def test_synthesis_pack_leaves_nothing_validate_synthesis_would_reject() -> None:
+    """No pack string can be copied into the prose and rejected afterwards."""
+    extraction = _meetingapp_extraction(
+        _artifact_item("D2", "allowed.example", ArtifactType.DOMAIN, policy=DisplayPolicy.BOTH),
+        _artifact_item("I1", "203.0.113.9", ArtifactType.IP),
+        _artifact_item("U1", "https://meetingapp.site/webexdownload", ArtifactType.URL),
+        _item("infrastructure", "second stage sur 203[.]0[.]113[.]9", ""),
+    )
+    report = _minimal_report()
+
+    pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
+        report, extraction, {"https://core.example/report": "core"}
+    )
+
+    body_candidates = [
+        text
+        for item in pack["technical_extraction"]["items"]
+        for text in (item.get("value", ""), item["context"])
+        if text
+    ]
+    assert body_candidates
+    for text in body_candidates:
+        result = validate_synthesis(f"{text} [S1]", report, extraction)
+        assert "ioc_repeated_in_body" not in result.errors, text
+        assert "raw_url" not in result.errors, text
 
 
 def test_synthesis_repair_prompt_names_the_offending_value() -> None:
