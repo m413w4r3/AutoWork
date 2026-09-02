@@ -46,22 +46,46 @@ extérieur au port 8001.
 | `OPENAI_BRIDGE_CAPABILITIES_TIMEOUT_SECONDS` | capabilities, au plus 2 secondes |
 | `OPENAI_BRIDGE_MAX_ATTEMPTS` | tentatives réseau bornées avec clé stable |
 
-### Trois bornes indépendantes
+### Quatre bornes indépendantes
 
-Elles ne se remplacent pas et ne doivent jamais être confondues.
+Elles ne se remplacent pas et ne doivent jamais être confondues :
+
+    watchdog avant le premier tour
+        ≠ tour surveillé avec `.streaming-animation` active
+        ≠ idle timeout serveur
+        ≠ total timeout serveur
 
 1. **Idle timeout réseau/extension** — `BRIDGE_IDLE_TIMEOUT` (300 s). Silence
    total de l’extension côté serveur : plus aucun paquet, heartbeat compris. Un
    heartbeat le réarme, parce qu’il prouve que l’extension et l’onglet vivent.
-2. **UI/activity stall watchdog** — dans le content script :
-   `ACTIVE_SIGNAL_STALL_MS` (300 s) pendant l’attente du premier tour assistant,
-   `FINALIZATION_STALL_MS` (45 s) pendant la finalisation. Il mesure l’activité
+2. **Watchdog d’activité avant le premier tour assistant** — dans le content
+   script, `FIRST_ASSISTANT_ACTIVITY_STALL_MS` (300 s). Il mesure l’activité
    *observable du DOM* : apparition, disparition, changement de signature ou
    d’état d’un signal Stop/reasoning/streaming. Un signal apparu puis
    strictement figé n’est **pas** de l’activité et n’en repousse pas l’échéance.
    Un heartbeat ne peut donc jamais masquer indéfiniment une UI bloquée : le
-   heartbeat réarme la borne 1, jamais celle-ci.
-3. **Total generation timeout** — `BRIDGE_TOTAL_TIMEOUT` (3600 s). Plafond
+   heartbeat réarme la borne 1, jamais celle-ci. Cette borne reste volontairement
+   locale : « aucun tour assistant n’apparaît jamais » doit échouer en
+   `bridge_ui_timeout` sans attendre `BRIDGE_TOTAL_TIMEOUT`.
+3. **Garde-fous du tour assistant surveillé** — `FINALIZATION_STALL_MS` (45 s)
+   quand l’UI ne se dit plus active, et `WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS`
+   (300 s) quand elle se dit encore active alors que le texte ne bouge plus.
+
+   **Exception `.streaming-animation`.** Quand ce détecteur-là est visible dans
+   le périmètre du tour surveillé, la génération est active : le texte peut
+   légitimement rester inchangé pendant plusieurs minutes de recherche
+   approfondie (deux runs de production sont restés à ~30 caractères pendant
+   300 003 ms et 352 002 ms, puis le même tour a rendu la réponse complète). La
+   stabilité du texte ne prouve alors rien et ne produit **jamais**
+   `active_signal_stalled` : le content script continue d’observer le même tour,
+   continue ses heartbeats sans contenu, n’émet ni `done` ni `incomplete` et ne
+   resoumet rien. La borne dure redevient la borne 4.
+
+   `.result-streaming` et `[data-is-streaming='true']` gardent leur sémantique
+   bornée : aucune preuve de production ne les montre longuement actifs sans
+   mutation. `assistant_actions` reste le signal final le plus fort et finalise
+   immédiatement, même si un signal d’activité est encore présent.
+4. **Total generation timeout** — `BRIDGE_TOTAL_TIMEOUT` (3600 s). Plafond
    absolu d’une génération, quelle que soit l’activité observée. Une recherche
    approfondie ChatGPT dépasse couramment le quart d’heure : cette borne protège
    d’une génération réellement bloquée, elle n’arbitre pas la durée normale

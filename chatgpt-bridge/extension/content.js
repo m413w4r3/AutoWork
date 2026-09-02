@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "28";
+const VERSION = "29";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -63,6 +63,13 @@ const SELECTORS = {
     ".result-streaming",
     "[data-is-streaming='true']",
   ],
+  // Sous-ensemble de `streaming` dont la production a prouvé qu'il peut rester
+  // allumé plusieurs minutes SANS mutation de texte, pendant une recherche
+  // approfondie (deux runs indépendants : 300 003 ms et 352 002 ms de stabilité,
+  // puis le même tour a produit la vraie réponse finale). Pour ces détecteurs,
+  // « le texte n'a pas bougé » ne prouve rien : seule la borne totale du serveur
+  // fait autorité. Les autres détecteurs conservent le garde-fou local.
+  longRunningStreaming: [".streaming-animation"],
 
   // --- Contrôles de l'interface (cf. section « Contrôles typés » plus bas) --- //
   // Déclencheur du sélecteur de modèle, dans l'en-tête de la conversation.
@@ -133,15 +140,25 @@ const RUNTIME_METRICS_INTERVAL_MS = 30000;
 // pendant plusieurs minutes uniquement à cause d'un signal DOM périmé.
 const FINALIZATION_STALL_MS = 45000;
 
-// Garde-fou du cas symétrique : l'UI se prétend encore active (`finished=false`,
-// donc le garde-fou ci-dessus est désarmé) alors que la réponse n'a plus bougé
-// d'un caractère. On ne conclut pas « terminé » — un Stop réellement visible
-// peut signifier que ChatGPT travaille — mais on rend la main en `incomplete`
-// plutôt que de rester « running » indéfiniment.
-// Volontairement large : une recherche approfondie marque de vraies pauses de
-// plusieurs minutes sans écrire un caractère. Ce garde-fou vise la boucle
-// infinie, jamais une génération lente encore en cours.
-const ACTIVE_SIGNAL_STALL_MS = 300000;
+// Deux garde-fous distincts, longtemps confondus sous un même nom.
+//
+// 1) AVANT le premier tour assistant : rien n'est encore observable côté
+//    réponse, seule l'activité des signaux de génération dit que quelque chose
+//    se passe. Une UI totalement figée après Send doit échouer de façon bornée,
+//    sans attendre la borne totale du serveur.
+const FIRST_ASSISTANT_ACTIVITY_STALL_MS = 300000;
+
+// 2) APRÈS le premier tour assistant : l'UI se prétend encore active
+//    (`finished=false`, donc le garde-fou de finalisation ci-dessus est
+//    désarmé) alors que la réponse n'a plus bougé d'un caractère. On ne conclut
+//    pas « terminé » — un Stop réellement visible peut signifier que ChatGPT
+//    travaille — mais on rend la main en `incomplete` plutôt que de rester
+//    « running » indéfiniment.
+//    Exception : cf. `longRunningStreamingSignalActive()` — quand
+//    `.streaming-animation` est visible dans le tour surveillé, la stabilité du
+//    texte n'est PAS une preuve d'échec et ce garde-fou est désarmé ; la borne
+//    dure redevient alors le `bridge_total_timeout` du serveur.
+const WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS = 300000;
 
 let currentJob = null;
 const claimedRequestIds = new Set();
@@ -298,6 +315,23 @@ function streamingSignalSources(scope) {
     }
   }
   return sources;
+}
+
+/**
+ * Un détecteur de streaming « longue durée » est-il actif dans ce diagnostic ?
+ *
+ * Entrée : la sortie de `streamingSignalSources(turnSignalScope(turn))`, donc
+ * déjà limitée au tour surveillé et déjà filtrée par la visibilité. Aucun
+ * élargissement : seuls les sélecteurs de `SELECTORS.longRunningStreaming`
+ * comptent, les autres gardent leur sémantique historique.
+ */
+function longRunningStreamingSignalActive(signalSources) {
+  return (signalSources || []).some(
+    (entry) =>
+      entry &&
+      entry.visible === true &&
+      SELECTORS.longRunningStreaming.includes(entry.source),
+  );
 }
 
 function currentSubmissionGenerationSignals() {
@@ -486,7 +520,7 @@ function firstAssistantWaitDiagnostics(
  * matters for two symmetric failures:
  *   - a signal already visible before Send never counts (it never transitions);
  *   - a signal that appears after Send and then freezes counts exactly once,
- *     so a stuck UI still reaches ACTIVE_SIGNAL_STALL_MS instead of being kept
+ *     so a stuck UI still reaches FIRST_ASSISTANT_ACTIVITY_STALL_MS instead of being kept
  *     alive forever by its own persistence.
  * Real activity — appearance, disappearance, signature/state change, a new
  * element — keeps refreshing the deadline for as long as the UI truly moves.
@@ -529,7 +563,7 @@ async function waitForFirstAssistantTurn(
       lastActivityAt = now;
     }
     observedSignals = currentSignals;
-    if (now - lastActivityAt >= ACTIVE_SIGNAL_STALL_MS) {
+    if (now - lastActivityAt >= FIRST_ASSISTANT_ACTIVITY_STALL_MS) {
       const error = new BridgeError(
         "bridge_ui_timeout",
         "aucun tour assistant après la soumission du prompt",
@@ -1554,10 +1588,17 @@ async function streamAnswer(job, locator, before) {
       });
     }
 
+    // Un texte stable n'est PAS la preuve qu'une génération active a échoué.
+    // Quand `.streaming-animation` est visible dans le tour surveillé, ChatGPT
+    // recherche encore : deux runs de production sont restés à ~30 caractères
+    // pendant 300 003 ms et 352 002 ms, puis le même tour a rendu la réponse
+    // complète. On continue donc d'observer et de battre, sans jamais conclure
+    // ni resoumettre ; la borne dure appartient au serveur (bridge_total_timeout).
     if (
       full.length > 0 &&
       finished === false &&
-      stableForMs >= ACTIVE_SIGNAL_STALL_MS
+      stableForMs >= WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS &&
+      !longRunningStreamingSignalActive(signalSources)
     ) {
       return incompleteAnswer({
         reason: "active_signal_stalled",

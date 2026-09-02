@@ -416,7 +416,7 @@ function recoverFencedCode(markdown) {
   );
   // Le seuil est relu dans le script : le test protège le garde-fou, pas une
   // valeur particulière, qui peut être desserrée quand ChatGPT ralentit.
-  const seuil = run("ACTIVE_SIGNAL_STALL_MS");
+  const seuil = run("WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS");
   assert.ok(seuil >= 120_000, `garde-fou trop court : ${seuil} ms`);
   assert.ok(
     result.stable_for_ms >= seuil,
@@ -981,7 +981,7 @@ function useVirtualClock(window) {
     );
     assert.ok(
       clock < 400_000,
-      `le stall doit rester borné par ACTIVE_SIGNAL_STALL_MS (clock=${clock})`,
+      `le stall doit rester borné par FIRST_ASSISTANT_ACTIVITY_STALL_MS (clock=${clock})`,
     );
     assert.equal(
       JSON.stringify(sent).includes("recherche figée"),
@@ -991,7 +991,7 @@ function useVirtualClock(window) {
   }
 
   // 10i. Une vraie activité prolongée (signature qui change réellement) garde
-  // le watchdog vivant bien au-delà de ACTIVE_SIGNAL_STALL_MS, puis le tour
+  // le watchdog vivant bien au-delà de FIRST_ASSISTANT_ACTIVITY_STALL_MS, puis le tour
   // assistant arrive et la finalisation se poursuit normalement.
   {
     const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
@@ -1339,7 +1339,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "28");
+    assert.equal(done.metadata?.content_script_version, "29");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat
@@ -1453,6 +1453,328 @@ const PLACEHOLDER_ID =
   }
 
   console.log("react turn replacement identity contract: ok");
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+
+// --------------------------------------------------------------------------- //
+// `.streaming-animation` = génération encore active
+//
+// Incident de production (deux runs indépendants) : un tour assistant affichait
+// ~30 caractères intermédiaires, `.streaming-animation` restait visible, le
+// texte n'a pas bougé pendant 300 003 ms puis 352 002 ms, et le content script
+// concluait `active_signal_stalled`. ChatGPT travaillait pourtant toujours : le
+// MÊME tour a ensuite produit la vraie réponse finale, l'animation a disparu et
+// la barre d'actions est apparue. « Le texte n'a pas bougé » n'est donc pas une
+// preuve d'échec pour ce détecteur-là.
+// --------------------------------------------------------------------------- //
+
+const RECHERCHE_INTERMEDIAIRE = "Recherche en cours sur la menace";
+const RECHERCHE_FINALE_CORPS = "Analyse détaillée du rapport final. ".repeat(200).trim();
+const RECHERCHE_FINALE = `# REFERENCES\n\n${RECHERCHE_FINALE_CORPS}`;
+
+(async () => {
+  // --- Timeline de production : >300 s figés, puis la vraie réponse finale --- //
+  {
+    const body = `<form id="composer-form"><textarea data-id="prompt"></textarea>
+      <button aria-disabled="false" data-testid="send-button">Send</button></form>`;
+    const { window, run } = loadExtension(
+      body,
+      "https://chatgpt.com/?temporary-chat=true",
+    );
+    const doc = window.document;
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+
+    let clock = 0;
+    let polls = 0;
+    let finalisee = false;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      polls += 1;
+      if (polls > 40_000) throw new Error("boucle non bornée");
+      // 10/11/12/13. Bien au-delà de l'ancienne borne de 300 s, le MÊME tour
+      // remplace le texte intermédiaire par la réponse complète, retire
+      // `.streaming-animation` et expose la barre d'actions.
+      if (!finalisee && clock >= 400_000) {
+        finalisee = true;
+        const article = doc.querySelector("[data-testid='conversation-turn-research']");
+        article.querySelector(".streaming-animation").remove();
+        article.querySelector(".markdown").innerHTML =
+          `<h1>REFERENCES</h1><p>${RECHERCHE_FINALE_CORPS}</p>`;
+        article.insertAdjacentHTML("beforeend", copyButton);
+      }
+      queueMicrotask(fn);
+      return 0;
+    };
+
+    // 1. Une seule soumission, jamais rejouée.
+    let submitEvents = 0;
+    let sendClicks = 0;
+    doc.querySelector("button[data-testid='send-button']").addEventListener(
+      "click",
+      () => { sendClicks += 1; },
+    );
+    doc.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+      doc.querySelector("textarea[data-id='prompt']").value = "";
+      // 2/3/4/5. Tour assistant stable, identité externe stable, sortie
+      // intermédiaire d'environ 30 caractères, `.streaming-animation` visible
+      // dans le tour surveillé.
+      doc.body.insertAdjacentHTML(
+        "beforeend",
+        `<article data-testid="conversation-turn-research">
+           <div data-message-author-role="assistant" data-message-id="turn-research-1">
+             <div class="markdown"><p>${RECHERCHE_INTERMEDIAIRE}</p></div>
+             <div class="streaming-animation"></div>
+           </div>
+         </article>`,
+      );
+    });
+
+    await run(`handlePrompt({ id: "req-long-research", prompt: "recherche approfondie", conversation: { id: "conv-long-research", mode: "fresh" } })`);
+
+    const heartbeats = sent.filter((message) => message.type === "heartbeat");
+    const done = sent.find((message) => message.type === "done");
+
+    // 6/7. Le texte n'a pas bougé pendant plus de 300 s — l'ancienne frontière
+    // de régression est réellement franchie — sans jamais devenir un stall.
+    const seuil = run("WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS");
+    assert.ok(
+      heartbeats.some(
+        (message) =>
+          message.progress?.completion_signal === "streaming" &&
+          message.progress?.stable_for_ms > seuil,
+      ),
+      `la stabilité observée doit dépasser ${seuil} ms sans conclure`,
+    );
+    assert.equal(
+      sent.some(
+        (message) =>
+          message.type === "incomplete" ||
+          message.reason === "active_signal_stalled",
+      ),
+      false,
+      "`.streaming-animation` active interdit active_signal_stalled",
+    );
+    assert.equal(sent.filter((message) => message.type === "error").length, 0);
+
+    // 8/9. Aucun `done` prématuré, et des heartbeats sans contenu pendant l'attente.
+    assert.ok(heartbeats.length >= 5, "les heartbeats doivent continuer");
+    assert.equal(
+      heartbeats.some((message) => JSON.stringify(message).includes(RECHERCHE_INTERMEDIAIRE)),
+      false,
+      "un heartbeat ne transporte jamais de contenu de réponse",
+    );
+    assert.equal(
+      heartbeats.some((message) => JSON.stringify(message).includes("recherche approfondie")),
+      false,
+      "un heartbeat ne transporte jamais le prompt",
+    );
+
+    // 14/15/16. `done` final autoritaire, texte complet, identité externe attendue.
+    assert.ok(done, "le tour terminé doit produire un done");
+    assert.equal(done.text, RECHERCHE_FINALE);
+    assert.equal(done.metadata?.completion_signal, "assistant_actions");
+    assert.equal(done.metadata?.initial_turn_id, "turn-research-1");
+    assert.equal(done.conversation?.turn_id, "turn-research-1");
+    assert.ok(clock >= 400_000, `la génération doit dépasser 400 s (clock=${clock})`);
+
+    // 17. Exactement une soumission de prompt, aucun second envoi.
+    assert.equal(submitEvents, 1, "exactement une soumission de prompt");
+    assert.equal(sendClicks, 0, "aucun clic d'envoi supplémentaire");
+  }
+
+  // --- Cas pathologique : `.streaming-animation` sans fin -------------------- //
+  // Le content script n'invente jamais de succès et ne resoumet jamais ; c'est
+  // le `bridge_total_timeout` du serveur qui borne la durée (cf.
+  // tests/test_generation_timeouts.py). Ici, l'abandon du job simule la
+  // fermeture du canal HTTP par cette borne serveur.
+  {
+    const body = `
+      <main>
+        <article data-testid="conversation-turn-endless">
+          <div data-message-author-role="assistant" data-message-id="turn-endless-1">
+            <div class="markdown"><p>${RECHERCHE_INTERMEDIAIRE}</p></div>
+            <div class="streaming-animation"></div>
+          </div>
+        </article>
+      </main>
+      <form id="composer-form">
+        <div id="prompt-textarea" contenteditable="true"></div>
+        <button data-testid="send-button">Envoyer</button>
+      </form>`;
+    const { window, run } = loadExtension(body);
+    const doc = window.document;
+    const sent = [];
+    window.chrome.runtime.sendMessage = async (message) => { sent.push(message); };
+
+    let submitEvents = 0;
+    let sendClicks = 0;
+    doc.querySelector("button[data-testid='send-button']").addEventListener(
+      "click",
+      () => { sendClicks += 1; },
+    );
+    doc.querySelector("#composer-form").addEventListener("submit", (event) => {
+      submitEvents += 1;
+      event.preventDefault();
+    });
+
+    let clock = 1_000_000;
+    let polls = 0;
+    window.testEndlessJob = { id: "endless", aborted: false };
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      polls += 1;
+      if (polls > 60_000) throw new Error("boucle non bornée");
+      // Le texte ne mute jamais et l'animation ne disparaît jamais. Au-delà de
+      // six fois l'ancienne borne, le serveur aurait coupé : on abandonne le job.
+      if (clock >= 1_000_000 + 1_800_000) window.testEndlessJob.aborted = true;
+      queueMicrotask(fn);
+      return 0;
+    };
+
+    const result = await run(
+      `streamAnswer(testEndlessJob, "conversation-turn-endless", 0)`,
+    );
+
+    assert.ok(
+      clock - 1_000_000 >= 1_800_000,
+      `l'observation doit se poursuivre bien au-delà de 300 s (écoulé=${clock - 1_000_000})`,
+    );
+    assert.notEqual(
+      result.incomplete_reason,
+      "active_signal_stalled",
+      "la seule stabilité du texte ne doit jamais produire active_signal_stalled",
+    );
+    assert.notEqual(
+      result.completion_signal,
+      "assistant_actions",
+      "aucune finalisation ne doit être inventée",
+    );
+    assert.equal(
+      sent.some((message) => ["done", "incomplete", "error"].includes(message.type)),
+      false,
+      "aucun succès ni échec fabriqué pendant l'observation",
+    );
+    const heartbeats = sent.filter((message) => message.type === "heartbeat");
+    assert.ok(heartbeats.length >= 5, "les heartbeats doivent continuer indéfiniment");
+    assert.ok(
+      heartbeats.every(
+        (message) =>
+          message.progress?.completion_signal === "streaming" &&
+          !JSON.stringify(message).includes(RECHERCHE_INTERMEDIAIRE),
+      ),
+      "les heartbeats restent des signaux de liveness sans contenu",
+    );
+    assert.equal(submitEvents, 0, "aucune seconde soumission");
+    assert.equal(sendClicks, 0, "aucun second envoi");
+  }
+
+  // --- La barre d'actions prime toujours sur `.streaming-animation` ---------- //
+  {
+    const { state } = loadExtension(`
+      <main>
+        <article data-testid="conversation-turn-3">
+          <div data-message-author-role="assistant" data-message-id="m3">
+            <div class="markdown"><p>réponse finale</p></div>
+            <div class="streaming-animation"></div>
+          </div>
+          ${copyButton}
+        </article>
+      </main>`);
+    assert.deepEqual(
+      state(`completionState(${WATCHED})`),
+      { finished: true, signal: "assistant_actions", confidence: "high" },
+      "assistant_actions reste le signal final le plus fort",
+    );
+  }
+
+  // --- Le désarmement est local au tour surveillé ---------------------------- //
+  // Une `.streaming-animation` laissée par un ANCIEN tour ne doit ni maintenir
+  // le tour surveillé en vie, ni désarmer son garde-fou : sur ce tour-ci, seul
+  // `.result-streaming` est actif, et le stall borné doit rester en vigueur.
+  {
+    const body = `
+      <main>
+        <article data-testid="conversation-turn-1">
+          <div data-message-author-role="assistant" data-message-id="m1">
+            <div class="markdown"><p>ancienne réponse</p></div>
+            <div class="streaming-animation"></div>
+          </div>
+          ${copyButton}
+        </article>
+        <article data-testid="conversation-turn-3">
+          <div data-message-author-role="assistant" data-message-id="m3">
+            <div class="markdown"><p>réponse finale</p></div>
+            <div class="result-streaming"></div>
+          </div>
+        </article>
+      </main>
+      <form>
+        <div id="prompt-textarea" contenteditable="true"></div>
+        <button data-testid="send-button">Envoyer</button>
+      </form>`;
+    const { window, run } = loadExtension(body);
+    let clock = 1_000_000;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      queueMicrotask(fn);
+      return 0;
+    };
+    window.testScopedJob = { id: "scoped", aborted: false };
+    const result = await run(
+      `streamAnswer(testScopedJob, "conversation-turn-3", 1)`,
+    );
+
+    assert.equal(
+      result.incomplete_reason,
+      "active_signal_stalled",
+      "`.result-streaming` garde sa sémantique bornée",
+    );
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(result.streaming_signal_sources)).map((s) => s.source),
+      [".result-streaming"],
+      "l'animation d'un ancien tour n'entre jamais dans le périmètre surveillé",
+    );
+  }
+
+  // --- `[data-is-streaming='true']` : sémantique inchangée, faute de preuve --- //
+  {
+    const body = `
+      <main>
+        <article data-testid="conversation-turn-3">
+          <div data-message-author-role="assistant" data-message-id="m3">
+            <div class="markdown"><p>réponse finale</p></div>
+            <div data-is-streaming="true"></div>
+          </div>
+        </article>
+      </main>
+      <form>
+        <div id="prompt-textarea" contenteditable="true"></div>
+        <button data-testid="send-button">Envoyer</button>
+      </form>`;
+    const { window, run } = loadExtension(body);
+    let clock = 1_000_000;
+    window.Date.now = () => clock;
+    window.setTimeout = (fn, ms) => {
+      clock += ms || 0;
+      queueMicrotask(fn);
+      return 0;
+    };
+    window.testAttrJob = { id: "attr", aborted: false };
+    const result = await run(`streamAnswer(testAttrJob, "conversation-turn-3", 0)`);
+
+    assert.equal(result.incomplete_reason, "active_signal_stalled");
+    assert.equal(result.text, "réponse finale");
+  }
+
+  console.log("streaming-animation long research contract: ok");
 })().catch((err) => {
   console.error(err);
   process.exit(1);

@@ -366,3 +366,95 @@ async def test_long_but_live_generation_completes_before_the_total_deadline(
     assert "".join(chunks) == "rapport final"
     # Le run a duré bien plus longtemps que l'idle timeout sans jamais expirer.
     assert extension.beats >= 3
+
+
+class EndlessStreamingAnimationExtension:
+    """Génération pathologique : `.streaming-animation` sans fin, texte figé.
+
+    Reproduit l'incident de production côté serveur : le content script observe
+    un tour dont la sortie ne mute plus depuis plus de 300 s, mais dont
+    `.streaming-animation` reste visible. Il n'invente donc ni `done` ni
+    `incomplete` — il ne fait que battre. La durée n'est bornée que par
+    `bridge_total_timeout`, et cette borne ne rejoue jamais le prompt.
+    """
+
+    FROZEN_OUTPUT_CHARS = 32
+
+    def __init__(self, runtime: BridgeApplication, *, interval: float) -> None:
+        self.runtime = runtime
+        self.interval = interval
+        self.sent: list[dict[str, Any]] = []
+        self.beats = 0
+        self.task: asyncio.Task[None] | None = None
+        self.closed: tuple[int, str] | None = None
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        self.sent.append(payload)
+        if payload.get("type") == "prompt":
+            self.task = asyncio.create_task(self._beat(payload["id"]))
+
+    async def _beat(self, request_id: str) -> None:
+        stable_for_ms = 300_000
+        while True:
+            await asyncio.sleep(self.interval)
+            self.beats += 1
+            stable_for_ms += 5_000
+            self.runtime.bridge.dispatch(
+                {
+                    "type": "heartbeat",
+                    "id": request_id,
+                    "event_id": f"hb-{self.beats}",
+                    "progress": {
+                        "phase": "generating",
+                        "output_chars": self.FROZEN_OUTPUT_CHARS,
+                        "stable_for_ms": stable_for_ms,
+                        "completion_signal": "streaming",
+                        "completion_confidence": "high",
+                        "streaming_signal_sources": [
+                            {"source": ".streaming-animation", "visible": True}
+                        ],
+                    },
+                }
+            )
+
+    async def close(self, code: int, reason: str) -> None:
+        self.closed = (code, reason)
+
+    def stop(self) -> None:
+        if self.task is not None:
+            self.task.cancel()
+
+
+async def test_endless_streaming_animation_is_bounded_only_by_the_total_timeout(
+    runtime: BridgeApplication,
+) -> None:
+    """`.streaming-animation` sans fin : borné par la durée totale, jamais rejoué.
+
+    Les heartbeats — sans contenu — réarment l'attente d'inactivité à chaque
+    paquet, donc l'échéance atteinte doit être `bridge_total_timeout` et jamais
+    `bridge_idle_timeout`. Aucun `done` fabriqué, aucun second prompt, aucun
+    `abort` (qui cliquerait Stop dans ChatGPT).
+    """
+    extension = EndlessStreamingAnimationExtension(runtime, interval=0.05)
+
+    chunks, failure, elapsed = await _generate(
+        runtime,
+        extension,
+        "endless-streaming-animation",
+        total_timeout=0.6,
+        idle_timeout=0.2,
+    )
+
+    assert isinstance(failure, UpstreamError)
+    assert failure.code == "bridge_total_timeout"
+    assert "aucune donnée de l'extension" not in str(failure)
+    assert elapsed >= 0.6
+    # Les heartbeats ont bien tenu l'idle timeout en échec pendant tout le run.
+    assert extension.beats >= 3
+    # Aucun contenu n'a été rendu : un heartbeat n'est jamais une réponse.
+    assert chunks == []
+    prompts = [msg for msg in extension.sent if msg.get("type") == "prompt"]
+    assert len(prompts) == 1, "la borne totale ne doit jamais rejouer le prompt"
+    assert not [msg for msg in extension.sent if msg.get("type") == "abort"], (
+        "aucun abort : cliquer Stop fabriquerait une fin de génération"
+    )

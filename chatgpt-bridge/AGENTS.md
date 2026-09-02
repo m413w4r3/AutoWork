@@ -87,6 +87,13 @@ response text can never change what conversation is opened or closed.
 - **done snapshot** = authoritative final output, never incomplete.
 - **heartbeat** = liveness signal only, never carries user content.
 - **idle timeout** ≠ **total timeout**: idle detects stalls; total caps duration.
+- **text stability is not failure evidence** while `.streaming-animation` is
+  visible in the watched turn: production proved it stays active for minutes
+  during deep research. The content script keeps observing and beating; only
+  `bridge_total_timeout` bounds the duration. `.result-streaming` and
+  `[data-is-streaming='true']` keep their bounded `active_signal_stalled`
+  guard. See "Quatre bornes indépendantes" in
+  `docs/chatgpt_bridge_operations.md`.
 - **No timeout resubmits** the prompt.
 - **conversation_id + exact live tab binding + expected_turn_id** remain strict
   (no inference, no recovery search, no URL-based reopening).
