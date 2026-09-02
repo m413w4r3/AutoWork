@@ -33,7 +33,15 @@ WORD_STYLE_MAP: Final[Mapping[str, str | None]] = {
     "actor": None,
     "malware": "Veille - Outil Char",
     "analyst_note": "Veille - Titre d'avis",
+    "analyst_note_body": "Veille - Fond d'avis",
 }
+
+ANALYST_NOTE_TITLE = "Note de l'analyste"
+
+# Pandoc has no portable page-break syntax for DOCX, so the renderer emits the
+# Word element itself through a raw OOXML block.  Tildes keep the fence out of
+# the backtick budget enforced on publication Markdown.
+PAGE_BREAK_MARKDOWN = '~~~~{=openxml}\n<w:p><w:r><w:br w:type="page"/></w:r></w:p>\n~~~~'
 
 _GROUPS = (
     (ArtifactType.IP, "Adresses IP"),
@@ -114,6 +122,14 @@ def render_publication_pandoc(document: BriefDocumentV1 | PublicationDocumentV2)
         for paragraph in document.synthesis
     )
 
+    # The note is never synthesised by the renderer: it is only displayed when
+    # an analyst explicitly attached one to the publication.
+    if document.analyst_note is not None:
+        blocks.append(_styled_block("analyst_note", _safe_text(ANALYST_NOTE_TITLE)))
+        blocks.append(
+            _styled_block("analyst_note_body", _render_rich(document.analyst_note, sources))
+        )
+
     by_type = {group.artifact_type: group for group in document.indicators}
     populated = [pair for pair in _GROUPS if pair[0] in by_type and by_type[pair[0]].values]
     if populated:
@@ -138,7 +154,8 @@ def render_edition_pandoc(document: EditionDocumentV1 | EditionDocumentV2) -> st
     """Render an ordered edition from its already frozen publication documents."""
     if not document.publications:
         raise ValueError("An edition document must contain at least one publication")
-    rendered = "\n\n".join(
+    separator = f"\n\n{PAGE_BREAK_MARKDOWN}\n\n"
+    rendered = separator.join(
         render_publication_pandoc(publication.document).rstrip()
         for publication in document.publications
     )

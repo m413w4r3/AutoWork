@@ -7,13 +7,24 @@ import xml.etree.ElementTree as ET
 import zipfile
 from datetime import date
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
-from cti_app.application.pandoc_export import export_publication_docx
+from cti_app.application.docx_postprocessing import (
+    TEMPLATE_PART_PATTERN,
+    edition_template_values,
+)
+from cti_app.application.pandoc_export import (
+    DEFAULT_REFERENCE_DOC,
+    export_markdown_docx,
+    export_publication_docx,
+)
 from cti_app.application.pandoc_rendering import (
+    PAGE_BREAK_MARKDOWN,
     WORD_STYLE_MAP,
     _render_rich,
+    render_edition_pandoc,
     render_publication_pandoc,
 )
 from cti_app.application.production_normalization import (
@@ -40,12 +51,14 @@ from cti_app.application.publication_builder import (
 )
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.edition_publication import EditionDocumentV2, EditionPublicationV2
 from cti_app.domain.publication import (
     ArtifactType,
     PublicationDocumentV2,
     PublicationSource,
     RichSpan,
     RichSpanKind,
+    RichText,
     TimelineEntry,
     publication_document_from_json,
 )
@@ -368,9 +381,76 @@ def test_publication_document_title_uses_editorial_title_exactly() -> None:
     assert document.title == _report().editorial_title
 
 
+def _edition_document(count: int) -> EditionDocumentV2:
+    return EditionDocumentV2(
+        edition={"period_start": "2026-07-01", "country": "Iran"},
+        publications=tuple(
+            EditionPublicationV2(
+                position=position,
+                subject_id=UUID(int=position),
+                document=_publication(f"Publication {position}"),
+            )
+            for position in range(1, count + 1)
+        ),
+    )
+
+
+def _publication(title: str, *, analyst_note: RichText | None = None) -> PublicationDocumentV2:
+    return PublicationDocumentV2(
+        schema_version="2",
+        title=title,
+        timeline=(
+            TimelineEntry(
+                date=None,
+                content=(RichSpan(RichSpanKind.TEXT, "Contenu"),),
+                source_ids=(),
+            ),
+        ),
+        synthesis=((RichSpan(RichSpanKind.TEXT, "Synthèse du sujet"),),),
+        indicators=(),
+        sources=(),
+        uncertainties=(),
+        analyst_note=analyst_note,
+    )
+
+
+@pytest.mark.parametrize(("publications", "breaks"), ((1, 0), (2, 1), (3, 2)))
+def test_edition_markdown_separates_publications_with_one_page_break(
+    publications: int, breaks: int
+) -> None:
+    markdown = render_edition_pandoc(_edition_document(publications))
+
+    assert markdown.count(PAGE_BREAK_MARKDOWN) == breaks
+    assert not markdown.startswith(PAGE_BREAK_MARKDOWN)
+    assert not markdown.rstrip().endswith(PAGE_BREAK_MARKDOWN)
+
+
+def test_publication_without_analyst_note_renders_no_note_block() -> None:
+    markdown = render_publication_pandoc(_publication("Alpha"))
+
+    assert "Note de l'analyste" not in markdown
+    assert str(WORD_STYLE_MAP["analyst_note"]) not in markdown
+
+
+def test_publication_renders_an_explicit_analyst_note_with_editorial_styles() -> None:
+    note: RichText = (
+        RichSpan(RichSpanKind.TEXT, "Le lien avec "),
+        RichSpan(RichSpanKind.ACTOR, "Cavern Manticore"),
+        RichSpan(RichSpanKind.TEXT, " reste probable."),
+    )
+
+    markdown = render_publication_pandoc(_publication("Alpha", analyst_note=note))
+
+    title_style = WORD_STYLE_MAP["analyst_note"]
+    assert f'::: {{custom-style="{title_style}"}}\nNote de l\'analyste' in markdown
+    assert (
+        f'::: {{custom-style="{WORD_STYLE_MAP["analyst_note_body"]}"}}\n'
+        "Le lien avec **Cavern Manticore** reste probable."
+    ) in markdown
+
+
 def test_reference_doc_contains_every_mapped_style() -> None:
-    reference = ROOT / "backend/assets/pandoc/reference-doc-v1.docx"
-    with zipfile.ZipFile(reference) as archive:
+    with zipfile.ZipFile(DEFAULT_REFERENCE_DOC) as archive:
         root = ET.fromstring(archive.read("word/styles.xml"))
     namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     names = {
@@ -420,3 +500,66 @@ def test_real_pandoc_export_renders_multi_source_citation_as_word_footnote(
     assert "https://example.test/1" in cited[0]
     assert "https://example.test/2" in cited[0]
     assert cited[0].index("example.test/1") < cited[0].index("example.test/2")
+
+
+def _header_and_footer_text(archive: zipfile.ZipFile) -> str:
+    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    return "".join(
+        "".join(ET.fromstring(archive.read(name)).itertext())
+        for name in sorted(archive.namelist())
+        if TEMPLATE_PART_PATTERN.match(name)
+    ).replace(f"{{{namespace}}}", "")
+
+
+@pytest.mark.skipif(shutil.which("pandoc") is None, reason="Pandoc is not installed")
+@pytest.mark.parametrize(("publications", "breaks"), ((1, 0), (2, 1), (3, 2)))
+def test_real_pandoc_export_writes_one_word_page_break_between_publications(
+    tmp_path: Path, publications: int, breaks: int
+) -> None:
+    edition = _edition_document(publications)
+    output = export_markdown_docx(
+        render_edition_pandoc(edition),
+        tmp_path / f"edition-{publications}.docx",
+        template_values=edition_template_values(edition.edition),
+    )
+    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+    with zipfile.ZipFile(output) as archive:
+        document_root = ET.fromstring(archive.read("word/document.xml"))
+
+    page_breaks = [
+        node
+        for node in document_root.iter(f"{{{namespace}}}br")
+        if node.attrib.get(f"{{{namespace}}}type") == "page"
+    ]
+    assert len(page_breaks) == breaks
+
+
+@pytest.mark.skipif(shutil.which("pandoc") is None, reason="Pandoc is not installed")
+@pytest.mark.parametrize(
+    ("period_start", "expected"),
+    (("2026-07-01", "juillet 2026"), ("2026-08-01", "août 2026")),
+)
+def test_real_pandoc_export_stamps_the_edition_month_into_the_template(
+    tmp_path: Path, period_start: str, expected: str
+) -> None:
+    edition = EditionDocumentV2(
+        edition={"period_start": period_start, "country": "Iran"},
+        publications=_edition_document(1).publications,
+    )
+    output = export_markdown_docx(
+        render_edition_pandoc(edition),
+        tmp_path / f"edition-{period_start}.docx",
+        template_values=edition_template_values(edition.edition),
+    )
+
+    with zipfile.ZipFile(output) as archive:
+        text = _header_and_footer_text(archive)
+
+    assert expected in text
+    assert "Iran" in text
+    # The historical template metadata must not survive the export.
+    assert "Juillet 2024" not in text
+    assert "Bulletin n°32" not in text
+    assert "XXX" not in text
+    assert "{{" not in text

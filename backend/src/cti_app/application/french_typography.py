@@ -31,3 +31,8 @@ def apply_french_spacing(text: str) -> str:
 def format_french_date(value: date) -> str:
     day = "1^er^" if value.day == 1 else str(value.day)
     return f"{day} {_MONTHS[value.month - 1]} {value.year}"
+
+
+def format_french_month(value: date) -> str:
+    """Return the month and year of ``value``, as printed on a bulletin cover."""
+    return f"{_MONTHS[value.month - 1]} {value.year}"

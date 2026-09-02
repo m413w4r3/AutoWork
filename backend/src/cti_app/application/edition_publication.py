@@ -14,6 +14,7 @@ from uuid import UUID
 
 from pydantic import ConfigDict
 
+from cti_app.application.docx_postprocessing import edition_template_values
 from cti_app.application.edition_release_materialization import (
     EditionReleaseRematerializationService,
 )
@@ -543,7 +544,11 @@ class EditionAssemblyService:
             )
             with tempfile.TemporaryDirectory(prefix="autowork-edition-docx-") as directory:
                 docx_path = Path(directory) / "bulletin.docx"
-                export_markdown_docx(markdown, docx_path)
+                export_markdown_docx(
+                    markdown,
+                    docx_path,
+                    template_values=edition_template_values(edition_document.edition),
+                )
                 docx = docx_path.read_bytes()
             docx_hash = hashlib.sha256(docx).hexdigest()
             docx_blob_id = await self._artifact_store.put_bytes(
