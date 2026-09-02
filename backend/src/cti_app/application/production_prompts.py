@@ -533,9 +533,6 @@ Hunting and detection:
 Describe observable pivots that come from the evidence itself, such as an
 unusual launch of a named interpreter, a runtime downloaded by a command-line
 utility, a script host started from a persistence key, or a specific WMI query.
-When the evidence pack reports published detection rules, you may state that a
-source publishes a YARA/Sigma/Suricata/Snort rule; never invent or reproduce
-rule content.
 
 Do not write unsupported defensive advice such as "Il est recommandé de
 bloquer..." or "Les organisations devraient...", unless the corpus explicitly

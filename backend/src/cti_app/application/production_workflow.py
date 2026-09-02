@@ -2768,23 +2768,8 @@ class ProductionWorkflowOrchestrator:
                 published["value"] = item.value
             items.append(published)
 
-        # Q4 writes prose: it only needs to know that a source publishes a rule,
-        # never the rule body, its evidence quote or its internal identity.
-        detection_rules = sorted(
-            (
-                {
-                    "type": rule.rule_type.value,
-                    "name": rule.name,
-                    "source_ids": sorted(rule.source_ids),
-                }
-                for rule in getattr(extraction, "rules", ())
-                if rule.supported
-            ),
-            key=lambda rule: (rule["type"], rule["name"] or "", ",".join(rule["source_ids"])),
-        )
-
         return {
-            "version": "3",
+            "version": "2",
             "reference_report": {
                 "sources": [
                     {
@@ -2829,7 +2814,6 @@ class ProductionWorkflowOrchestrator:
                     ),
                 ),
                 "uncertainties": sorted(extraction.uncertainties),
-                **({"detection_rules": detection_rules} if detection_rules else {}),
             },
         }
 
@@ -3288,7 +3272,7 @@ def _synthesis_input_hash(
             "reference_report_hash": reference_report_hash,
             "extraction_hash": extraction_hash,
             "technical_extraction_hash": technical_extraction_hash,
-            "synthesis_evidence_pack_version": "3",
+            "synthesis_evidence_pack_version": "2",
             "synthesis_evidence_pack_hash": synthesis_evidence_pack_hash,
             "prompt_version": prompt_version,
             "format_repair_version": format_repair_version,

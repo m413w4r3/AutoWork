@@ -74,7 +74,7 @@ text: Event
         },
     )
 
-    assert pack["version"] == "3"
+    assert pack["version"] == "2"
     assert [source["tier"] for source in pack["reference_report"]["sources"]] == [
         "core",
         "supporting",
@@ -137,6 +137,11 @@ def test_synthesis_prompt_requires_technical_cti_depth() -> None:
     assert "Il est recommandé de\nbloquer" in prompt
     assert "Les organisations devraient" in prompt
     assert "Never invent a SOC playbook." in prompt
+
+    # Literal detection rules are reserved for future annexes; behavioral
+    # detection and hunting pivots remain part of the main synthesis.
+    for rule_format in ("yara", "sigma", "suricata", "snort"):
+        assert rule_format not in lowered
 
     # Timeline restatement is discouraged.
     assert "Do not repeat chronology merely to restate the reference timeline." in prompt
@@ -224,7 +229,7 @@ def test_synthesis_pack_keeps_behavioral_categories() -> None:
     assert "port local 51337" in values
 
 
-def test_synthesis_pack_exposes_rule_metadata_without_body() -> None:
+def test_synthesis_pack_excludes_detection_rules_and_preserves_extraction() -> None:
     rule = DetectionRule(
         rule_type=DetectionRuleType.YARA,
         name="APT_ExampleRAT_loader",
@@ -253,12 +258,12 @@ def test_synthesis_pack_exposes_rule_metadata_without_body() -> None:
         _minimal_report(), extraction, {"https://core.example/report": "core"}
     )
 
-    assert pack["version"] == "3"
-    assert pack["technical_extraction"]["detection_rules"] == [
-        {"type": "yara", "name": "APT_ExampleRAT_loader", "source_ids": ["S1"]}
-    ]
+    assert pack["version"] == "2"
+    assert "detection_rules" not in pack["technical_extraction"]
+    assert extraction.rules == (rule, unsupported)
     serialized = json.dumps(pack, ensure_ascii=False)
     assert "SECRET_BODY" not in serialized
+    assert "APT_ExampleRAT_loader" not in serialized
     assert "citation interne" not in serialized
     assert "run-1" not in serialized
     assert "a" * 64 not in serialized
