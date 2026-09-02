@@ -92,15 +92,15 @@ def _stored_error_body(record: dict[str, Any]) -> dict[str, Any] | None:
     return body if isinstance(body, dict) else stored
 
 
-def _stored_incomplete_preview(
+CAPTURED_INCOMPLETE = "captured_incomplete"
+LIVE_VERIFIED_FINAL = "live_verified_final"
+VERIFIED_FINAL_CONFIDENCE = "verified_final"
+
+
+def _durable_preview_document(
     record: dict[str, Any], response_id: str
 ) -> dict[str, Any] | None:
-    """Aperçu durable issu du paquet `incomplete` d'origine, s'il existe.
-
-    Seule la provenance `captured_incomplete` court-circuite la relecture DOM :
-    un aperçu issu d'une capture live reste relu (et donc revérifié) à chaque
-    appel, comme avant.
-    """
+    """Document `preview_json` du registre, s'il décrit bien ce run."""
     raw = record.get("preview_json")
     if not isinstance(raw, str):
         return None
@@ -108,14 +108,54 @@ def _stored_incomplete_preview(
         stored = json.loads(raw)
     except json.JSONDecodeError:
         return None
-    if not isinstance(stored, dict) or stored.get("provenance") != "captured_incomplete":
-        return None
-    if stored.get("bridge_run_id") != response_id:
-        return None
-    text = stored.get("text")
-    if not isinstance(text, str) or not text.strip():
+    if not isinstance(stored, dict) or stored.get("bridge_run_id") != response_id:
         return None
     return stored
+
+
+def _preview_with_provenance(
+    candidate: object, response_id: str, provenance: str
+) -> dict[str, Any] | None:
+    if not isinstance(candidate, dict) or candidate.get("provenance") != provenance:
+        return None
+    if candidate.get("bridge_run_id") != response_id:
+        return None
+    text = candidate.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return candidate
+
+
+def _stored_verified_final_preview(
+    record: dict[str, Any], response_id: str
+) -> dict[str, Any] | None:
+    """Réponse finale vérifiée déjà rendue durable pour ce run.
+
+    Une fois écrite, elle est servie telle quelle : plus aucun aller-retour DOM
+    n'est requis, et deux aperçus successifs renvoient les mêmes octets.
+    """
+    return _preview_with_provenance(
+        _durable_preview_document(record, response_id), response_id, LIVE_VERIFIED_FINAL
+    )
+
+
+def _stored_incomplete_preview(
+    record: dict[str, Any], response_id: str
+) -> dict[str, Any] | None:
+    """Candidat incomplet durable d'origine — repli, jamais préférence.
+
+    Il reste lisible sans DOM, y compris après une promotion en finale vérifiée
+    (il est alors conservé sous la clé `fallback` du même document durable).
+    """
+    stored = _durable_preview_document(record, response_id)
+    if stored is None:
+        return None
+    direct = _preview_with_provenance(stored, response_id, CAPTURED_INCOMPLETE)
+    if direct is not None:
+        return direct
+    return _preview_with_provenance(
+        stored.get("fallback"), response_id, CAPTURED_INCOMPLETE
+    )
 
 
 def _bounded_recovery_metadata(packet: dict[str, Any]) -> dict[str, Any]:
@@ -264,14 +304,14 @@ class BridgeRoutes:
             # a déjà été rejeté en amont, et rien ne le remplace.
             "turn_id": candidate["turn_id"],
             "text": candidate["text"],
-            "provenance": "captured_incomplete",
+            "provenance": CAPTURED_INCOMPLETE,
             "metadata": {
-                "provenance": "captured_incomplete",
+                "provenance": CAPTURED_INCOMPLETE,
                 "reason": exc.reason,
                 "output_chars": candidate["output_chars"],
                 "sha256": candidate["sha256"],
                 "visible_citations": candidate["visible_citations"],
-                "capture_confidence": "captured_incomplete",
+                "capture_confidence": CAPTURED_INCOMPLETE,
                 "external_turn_id_verified": candidate["turn_id"] is not None,
                 **{
                     key: exc.details[key]
@@ -531,17 +571,151 @@ class BridgeRoutes:
             },
         }
 
+    async def _live_verified_final_upgrade(
+        self,
+        record: dict[str, Any],
+        response_id: str,
+        incomplete: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Relire, en lecture seule, la finale du MÊME tour ChatGPT.
+
+        Strictement optionnel : tout doute (cible perdue, tour absent, identité
+        externe différente, finalité non explicite, texte instable entre les
+        deux lectures, persistance impossible) renvoie `None`, et l'appelant
+        sert alors le candidat incomplet durable. Aucun prompt, aucun clic,
+        aucune mutation du DOM n'est possible depuis ce chemin : le seul
+        message émis est `recovery_capture`, une capture en lecture seule.
+        """
+        if record.get("state") not in {"needs_review", "failed"}:
+            return None
+        # Identité externe exacte obligatoire : sans tour attendu vérifié, rien
+        # ne prouve que la finale lue est bien la suite de ce candidat.
+        expected_turn_id = _stable_external_turn_id(
+            incomplete.get("turn_id")
+        ) or _recovery_assistant_turn_id(record)
+        if expected_turn_id is None:
+            return None
+
+        conversation: dict[str, Any] | None = None
+        target = None
+        raw_conversation = record.get("conversation_json")
+        if raw_conversation:
+            loaded = json.loads(raw_conversation)
+            if not isinstance(loaded, dict) or not loaded.get("id"):
+                return None
+            conversation = loaded
+            request: dict[str, Any] = {
+                "type": "recovery_capture",
+                "conversation": conversation,
+                "assistant_turn_id": expected_turn_id,
+            }
+        else:
+            if _record_submission_state(record) is None:
+                return None
+            target = _browser_target_for_run(response_id, None)
+            if target is None:
+                return None
+            request = {
+                "type": "recovery_capture",
+                "bridge_run_id": response_id,
+                "browser_target": target.model_dump(mode="json"),
+                "assistant_turn_id": expected_turn_id,
+            }
+
+        packet = await self.bridge.request(request, timeout=UI_TIMEOUT)
+        if not isinstance(packet, dict) or packet.get("error") or packet.get("code"):
+            return None
+        if target is not None:
+            if (
+                packet.get("target_id") != target.id
+                or packet.get("bridge_run_id") != response_id
+            ):
+                return None
+        elif conversation is not None:
+            if packet.get("conversation_id") != conversation.get("id"):
+                return None
+        turn_id = _stable_external_turn_id(packet.get("turn_id"))
+        if turn_id is None or turn_id != expected_turn_id:
+            return None
+        text = packet.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        metadata = _bounded_recovery_metadata(packet)
+        # Promouvoir un `captured_incomplete` exige une finalité explicite :
+        # un état de complétion inconnu ne suffit pas.
+        if metadata.get("capture_confidence") != VERIFIED_FINAL_CONFIDENCE:
+            return None
+        if metadata.get("completion_signal") == "streaming":
+            return None
+
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        superseded = incomplete.get("metadata")
+        superseded_sha = superseded.get("sha256") if isinstance(superseded, dict) else None
+        preview = {
+            "bridge_run_id": response_id,
+            "target_id": target.id if target is not None else None,
+            "conversation_id": conversation.get("id") if conversation else None,
+            "external_locator": (
+                conversation.get("external_locator") if conversation else None
+            ),
+            "turn_id": turn_id,
+            "text": text,
+            "provenance": LIVE_VERIFIED_FINAL,
+            "metadata": {
+                **metadata,
+                "provenance": LIVE_VERIFIED_FINAL,
+                "capture_confidence": VERIFIED_FINAL_CONFIDENCE,
+                # Empreinte calculée côté bridge, jamais reprise du DOM.
+                "sha256": digest,
+                "external_turn_id_verified": True,
+                "upgraded_from": CAPTURED_INCOMPLETE,
+                **(
+                    {"superseded_sha256": superseded_sha}
+                    if isinstance(superseded_sha, str)
+                    else {}
+                ),
+            },
+            # Le candidat incomplet d'origine reste durable pour l'audit et
+            # comme repli : la promotion ne détruit jamais ses octets.
+            "fallback": incomplete,
+        }
+        self.registry.store_preview(response_id, preview)
+        logger.info(
+            "bridge_recovery_final_upgraded bridge_run_id=%s turn_id=%s sha256=%s",
+            response_id,
+            turn_id,
+            digest,
+        )
+        return preview
+
     async def preview_visible_recovery(self, response_id: str):
         record = self.registry.get_by_run_id(response_id)
         if record is None:
             raise HTTPException(status_code=404, detail="Run bridge inconnu")
-        # Un candidat capturé au moment du `incomplete` est déjà durable : il est
-        # servi tel quel, sans aucun aller-retour DOM. L'onglet peut avoir
-        # disparu, l'extension être déconnectée — la réponse visible reste
-        # récupérable, et deux aperçus successifs sont identiques.
+        # Une finale vérifiée déjà durable est définitive : elle est servie sans
+        # aucune dépendance au navigateur et ne peut plus régresser.
+        final = _stored_verified_final_preview(record, response_id)
+        if final is not None:
+            return final
+        # Un candidat capturé au moment du `incomplete` est durable mais
+        # obsolète dès que le MÊME tour ChatGPT se termine. On tente donc une
+        # relecture finale en lecture seule, et on retombe sur lui à la moindre
+        # incertitude — l'onglet peut avoir disparu, l'extension être
+        # déconnectée : la réponse visible reste récupérable.
         stored = _stored_incomplete_preview(record, response_id)
         if stored is not None:
-            return stored
+            try:
+                upgraded = await self._live_verified_final_upgrade(
+                    record, response_id, stored
+                )
+            except Exception:  # noqa: BLE001 - le repli durable reste prioritaire
+                logger.warning(
+                    "bridge_recovery_final_upgrade_unavailable bridge_run_id=%s",
+                    response_id,
+                    exc_info=True,
+                )
+                upgraded = None
+            return upgraded if upgraded is not None else stored
         if not record.get("conversation_json"):
             target = _browser_target_for_run(response_id, None)
             if (

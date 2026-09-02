@@ -1157,6 +1157,81 @@ function useVirtualClock(window) {
     assert.equal(preview.error, "aucune réponse finale postérieure au tour initial");
   }
 
+  // Upgrading a `captured_incomplete` reads the SAME external assistant turn:
+  // another turn that happens to be final is never substituted for it.
+  {
+    const { run } = loadExtension(`
+      <article data-testid="conversation-turn-11">
+        <div data-message-author-role="assistant" data-message-id="assistant-43">
+          <div class="markdown"><p>réponse d'un autre tour</p></div>
+        </div>${copyButton}
+      </article>`);
+    const preview = await run(`captureLaterResponse(${JSON.stringify({
+      id: "recovery-other-turn",
+      bridge_run_id: "run-other-turn",
+      browser_target: { kind: "temporary_chat_run", id: "target-other-turn" },
+      assistant_turn_id: "assistant-42",
+    })})`);
+    assert.equal(preview.error, "aucune réponse finale postérieure au tour initial");
+    assert.equal(preview.text, undefined);
+  }
+
+  // The expected turn is found but still streaming: no `verified_final`
+  // capture, so the durable incomplete candidate stays the only answer.
+  {
+    const { run } = loadExtension(`
+      <article data-testid="conversation-turn-12">
+        <div data-message-author-role="assistant" data-message-id="assistant-42">
+          <div class="markdown"><p>réponse encore en cours</p></div>
+        </div>
+        <div class="result-streaming"></div>
+      </article>`);
+    const preview = await run(`captureLaterResponse(${JSON.stringify({
+      id: "recovery-streaming",
+      bridge_run_id: "run-streaming",
+      browser_target: { kind: "temporary_chat_run", id: "target-streaming" },
+      assistant_turn_id: "assistant-42",
+    })})`);
+    assert.equal(preview.error, "aucune réponse finale postérieure au tour initial");
+  }
+
+  // The same turn's text changes between the two read-only reads: the capture
+  // is discarded rather than returned as a final answer.
+  {
+    const { window, run } = loadExtension(`
+      <article data-testid="conversation-turn-13">
+        <div data-message-author-role="assistant" data-message-id="assistant-42">
+          <div class="markdown"><p>texte initial</p></div>
+        </div>${copyButton}
+      </article>`);
+    const paragraph = window.document.querySelector(".markdown p");
+    // Control: this exact DOM is capturable while the text is stable.
+    const stable = await run(`captureLaterResponse(${JSON.stringify({
+      id: "recovery-stable",
+      bridge_run_id: "run-drift",
+      browser_target: { kind: "temporary_chat_run", id: "target-drift" },
+      assistant_turn_id: "assistant-42",
+    })})`);
+    assert.equal(stable.text, "texte initial");
+    assert.equal(stable.metadata.capture_confidence, "verified_final");
+    // `findAssistantTurnByExternalId` re-resolves the turn between the two
+    // reads; mutate the DOM exactly there to simulate React still writing.
+    const original = window.eval("findAssistantTurnByExternalId");
+    window.eval(
+      `findAssistantTurnByExternalId = function (id) { globalThis.__drift(); return (${original.toString()})(id); }`,
+    );
+    window.__drift = () => {
+      paragraph.textContent = "texte réécrit";
+    };
+    const preview = await run(`captureLaterResponse(${JSON.stringify({
+      id: "recovery-drift",
+      bridge_run_id: "run-drift",
+      browser_target: { kind: "temporary_chat_run", id: "target-drift" },
+      assistant_turn_id: "assistant-42",
+    })})`);
+    assert.equal(preview.error, "aucune réponse finale postérieure au tour initial");
+  }
+
   // 7. Aucune attente de 15s sur un locator de conversation ne subsiste.
   {
     const source = fs.readFileSync(path.join(EXTENSION, "content.js"), "utf8");

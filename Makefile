@@ -22,7 +22,7 @@ down:
 # Kept in step with the `name:` at the top of compose.yaml.
 COMPOSE_PROJECT ?= cti-bulletin
 CLEAN_VOLUMES = postgres_data redis_data minio_data
-CLEAN_PATHS = var/diagnostics/runs
+CLEAN_PATHS = var/diagnostics/runs var/workspaces/editions var/workspaces/subjects
 
 clean:
 	$(COMPOSE) down

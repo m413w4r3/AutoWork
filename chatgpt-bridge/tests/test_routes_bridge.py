@@ -5,6 +5,7 @@ binding, model/UI controls, capabilities, and recovery.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -378,6 +379,257 @@ async def test_visible_answer_survives_active_signal_stall_and_lost_tab(
     assert preview["metadata"]["output_chars"] == len(answer)
     assert preview["metadata"]["provenance"] == "captured_incomplete"
     assert preview["metadata"]["reason"] == "active_signal_stalled"
+    assert extension.prompt_count == 1
+
+
+INCOMPLETE_CANDIDATE = "## SUBJECT S1\ntitle: en cours"
+RECOVERED_FINAL = "# Rapport final\n" + "contenu vérifié arrivé plus tard.\n" * 40
+
+
+def _upgradable_extension(
+    runtime: BridgeApplication, *, turn_id: str = "assistant-42"
+) -> Any:
+    """Le run cale sur un candidat visible, puis le MÊME tour se termine.
+
+    Le faux content script respecte le contrat v28 : `recovery_capture` est une
+    lecture seule, il ne répond jamais à un `assistant_turn_id` inconnu, et il
+    annonce explicitement sa finalité via `capture_confidence`.
+    """
+    base = _stalled_extension(runtime, text=INCOMPLETE_CANDIDATE, turn_id=turn_id)
+
+    class UpgradableExtension(base):  # type: ignore[valid-type, misc]
+        def __init__(self, inner: BridgeApplication) -> None:
+            super().__init__(inner)
+            self.recovery_payloads: list[dict[str, Any]] = []
+            self.live_turn_id: str | None = turn_id
+            self.live_text: str = RECOVERED_FINAL
+            self.capture_confidence = "verified_final"
+            self.completion_signal = "assistant_actions"
+            self.live_available = True
+            self.text_drifted = False
+
+        async def _respond(self, payload: dict[str, Any]) -> None:
+            if payload["type"] != "recovery_capture":
+                await super()._respond(payload)
+                return
+            self.recovery_payloads.append(payload)
+            route = {
+                "target_id": payload["browser_target"]["id"],
+                "bridge_run_id": payload["bridge_run_id"],
+            }
+            if not self.live_available:
+                self.runtime.bridge.dispatch(
+                    {
+                        "type": "recovery_preview",
+                        "id": payload["id"],
+                        "code": "recovery_unavailable",
+                        "error": "onglet exact disparu",
+                        **route,
+                    }
+                )
+                return
+            if self.text_drifted or self.live_turn_id is None:
+                # v28 abandonne la capture quand les deux lectures diffèrent.
+                self.runtime.bridge.dispatch(
+                    {
+                        "type": "recovery_preview",
+                        "id": payload["id"],
+                        "error": "aucune réponse finale postérieure au tour initial",
+                        **route,
+                    }
+                )
+                return
+            self.runtime.bridge.dispatch(
+                {
+                    "type": "recovery_preview",
+                    "id": payload["id"],
+                    "turn_id": self.live_turn_id,
+                    "text": self.live_text,
+                    "metadata": {
+                        "completion_signal": self.completion_signal,
+                        "completion_confidence": "high",
+                        "capture_confidence": self.capture_confidence,
+                        "content_script_version": "28",
+                        "serializer_version": "chatgpt-dom-v3",
+                        "output_chars": len(self.live_text),
+                        "visible_citations": [],
+                    },
+                    **route,
+                }
+            )
+
+    return UpgradableExtension(runtime)
+
+
+async def _stalled_run_with_visible_candidate(
+    runtime: BridgeApplication, tmp_path: Path, key: str, *, turn_id: str = "assistant-42"
+) -> tuple[Any, str]:
+    isolated_registry(runtime, tmp_path)
+    extension = _upgradable_extension(runtime, turn_id=turn_id)
+    runtime.bridge.ws = extension
+    result = await runtime.bridge_routes.create_bridge_run(
+        BridgeRunRequest(input="mission"), request_with_key(key)
+    )
+    assert result["status"] == "needs_review"
+    assert result["metadata"]["completion_signal"] == "streaming"
+    assert result["metadata"]["recovery_preview_available"] is True
+    return extension, result["id"]
+
+
+def _durable_preview(runtime: BridgeApplication, run_id: str) -> dict[str, Any]:
+    record = runtime.bridge_routes.registry.get_by_run_id(run_id)
+    assert record is not None and record["preview_json"]
+    return json.loads(record["preview_json"])
+
+
+async def test_captured_incomplete_is_upgraded_to_the_same_turn_verified_final(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    """L'incident réel : le candidat de 30 caractères ne doit plus être servi
+    alors que le MÊME tour ChatGPT s'est terminé entre-temps."""
+    extension, run_id = await _stalled_run_with_visible_candidate(
+        runtime, tmp_path, "upgrade-verified-final"
+    )
+    incomplete_sha = hashlib.sha256(INCOMPLETE_CANDIDATE.encode()).hexdigest()
+    assert _durable_preview(runtime, run_id)["metadata"]["sha256"] == incomplete_sha
+
+    preview = await runtime.bridge_routes.preview_visible_recovery(run_id)
+
+    # Run, cible et tour externe exacts — aucun repli sur un autre onglet.
+    assert len(extension.recovery_payloads) == 1
+    captured = extension.recovery_payloads[0]
+    assert captured["bridge_run_id"] == run_id
+    assert captured["browser_target"] == {
+        "kind": "temporary_chat_run",
+        "id": f"bridge-run-{run_id}",
+    }
+    assert captured["assistant_turn_id"] == "assistant-42"
+    assert preview["bridge_run_id"] == run_id
+    assert preview["target_id"] == f"bridge-run-{run_id}"
+    assert preview["turn_id"] == "assistant-42"
+    assert preview["text"] == RECOVERED_FINAL
+    assert preview["provenance"] == "live_verified_final"
+    assert preview["metadata"]["provenance"] == "live_verified_final"
+    assert preview["metadata"]["capture_confidence"] == "verified_final"
+    final_sha = hashlib.sha256(RECOVERED_FINAL.encode()).hexdigest()
+    assert preview["metadata"]["sha256"] == final_sha
+    assert final_sha != incomplete_sha
+    assert preview["metadata"]["superseded_sha256"] == incomplete_sha
+
+    # Les deux instantanés restent durables ; l'incomplet n'est jamais détruit.
+    persisted = _durable_preview(runtime, run_id)
+    assert persisted["provenance"] == "live_verified_final"
+    assert persisted["text"] == RECOVERED_FINAL
+    assert persisted["fallback"]["provenance"] == "captured_incomplete"
+    assert persisted["fallback"]["text"] == INCOMPLETE_CANDIDATE
+    assert persisted["fallback"]["metadata"]["sha256"] == incomplete_sha
+
+    # Deuxième aperçu : mêmes octets, plus aucune dépendance au DOM.
+    runtime.bridge.ws = None
+    repeated = await runtime.bridge_routes.preview_visible_recovery(run_id)
+    assert repeated == preview
+    assert len(extension.recovery_payloads) == 1
+
+    # Lecture seule stricte : un seul prompt, et aucun message d'écriture.
+    assert extension.prompt_count == 1
+    assert [payload["type"] for payload in extension.sent].count("prompt") == 1
+    # Le seul message émis par la récupération est une capture en lecture seule.
+    assert [
+        payload["type"]
+        for payload in extension.sent
+        if payload["type"] not in {"ui_state", "ui_control", "prompt", "browser_target_retain"}
+    ] == ["recovery_capture"]
+
+
+async def test_lost_tab_keeps_the_incomplete_candidate_recoverable(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    extension, run_id = await _stalled_run_with_visible_candidate(
+        runtime, tmp_path, "upgrade-lost-tab"
+    )
+    extension.live_available = False
+
+    preview = await runtime.bridge_routes.preview_visible_recovery(run_id)
+
+    assert preview["provenance"] == "captured_incomplete"
+    assert preview["text"] == INCOMPLETE_CANDIDATE
+    assert _durable_preview(runtime, run_id)["provenance"] == "captured_incomplete"
+    assert extension.prompt_count == 1
+
+
+async def test_a_different_external_turn_never_upgrades_the_candidate(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    extension, run_id = await _stalled_run_with_visible_candidate(
+        runtime, tmp_path, "upgrade-other-turn"
+    )
+    extension.live_turn_id = "assistant-43"
+
+    preview = await runtime.bridge_routes.preview_visible_recovery(run_id)
+
+    assert preview["provenance"] == "captured_incomplete"
+    assert preview["text"] == INCOMPLETE_CANDIDATE
+    assert _durable_preview(runtime, run_id)["provenance"] == "captured_incomplete"
+    assert extension.prompt_count == 1
+
+
+async def test_same_turn_still_streaming_never_upgrades_the_candidate(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    extension, run_id = await _stalled_run_with_visible_candidate(
+        runtime, tmp_path, "upgrade-still-streaming"
+    )
+    extension.capture_confidence = "visible_unknown"
+    extension.completion_signal = "streaming"
+
+    preview = await runtime.bridge_routes.preview_visible_recovery(run_id)
+
+    assert preview["provenance"] == "captured_incomplete"
+    assert preview["text"] == INCOMPLETE_CANDIDATE
+    assert _durable_preview(runtime, run_id)["provenance"] == "captured_incomplete"
+    assert extension.prompt_count == 1
+
+
+async def test_text_drifting_between_reads_never_becomes_a_final_answer(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    extension, run_id = await _stalled_run_with_visible_candidate(
+        runtime, tmp_path, "upgrade-drift"
+    )
+    extension.text_drifted = True
+
+    preview = await runtime.bridge_routes.preview_visible_recovery(run_id)
+
+    assert preview["provenance"] == "captured_incomplete"
+    assert preview["text"] == INCOMPLETE_CANDIDATE
+    assert _durable_preview(runtime, run_id)["provenance"] == "captured_incomplete"
+    assert extension.prompt_count == 1
+
+
+async def test_durable_verified_final_never_regresses_to_the_incomplete_candidate(
+    runtime: BridgeApplication, tmp_path: Path
+) -> None:
+    """Une fois la finale rendue durable, plus rien ne peut la faire régresser."""
+    database = tmp_path / "runs.sqlite3"
+    extension, run_id = await _stalled_run_with_visible_candidate(
+        runtime, tmp_path, "upgrade-deterministic"
+    )
+    upgraded = await runtime.bridge_routes.preview_visible_recovery(run_id)
+    assert upgraded["provenance"] == "live_verified_final"
+
+    # Le DOM ment maintenant (autre tour, texte instable) et le bridge redémarre :
+    # l'aperçu reste la finale vérifiée, à l'octet près.
+    extension.live_turn_id = "assistant-43"
+    extension.text_drifted = True
+    runtime.bridge_routes.registry = RunRegistry(database)
+    after_restart = await runtime.bridge_routes.preview_visible_recovery(run_id)
+    runtime.bridge.ws = None
+    without_browser = await runtime.bridge_routes.preview_visible_recovery(run_id)
+
+    assert after_restart == without_browser == upgraded
+    assert len(extension.recovery_payloads) == 1
+    # Le repli incomplet reste consultable pour l'audit.
+    assert after_restart["fallback"]["text"] == INCOMPLETE_CANDIDATE
     assert extension.prompt_count == 1
 
 
