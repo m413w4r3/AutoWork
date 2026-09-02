@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import hashlib
 from types import SimpleNamespace
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 
 from cti_app.application import production_workflow
-from cti_app.application.production_parsers import ReferenceReport
+from cti_app.application.production_artifact_verification import (
+    Q2ProposalSubmission,
+    verify_q2_proposals,
+)
+from cti_app.application.production_parsers import (
+    Q2ArtifactProposal,
+    Q2SourceOutput,
+    ReferenceReport,
+)
 from cti_app.application.production_q2_batch import q2_batch_output_marker
 from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
 from tests.test_production_extraction_profiles import (
@@ -136,9 +145,23 @@ async def test_batch_gate_uses_the_archive_of_the_framed_source(
     assert [item["value"] for item in items] == ["b2.security-lab.io"]
     assert items[0]["source_ids"] == ["S2"]
     assert any(
-        "q2_batch:B1:S1:source_evidence_missing" in warning
+        "q2_batch_source_evidence_rejected:B1:S1:domain:count=1:reason=source_evidence_missing"
+        in warning
         for warning in sink.calls[-1]["warnings"]
     )
+    verification_diagnostics = cast(
+        dict[str, object], sink.calls[-1]["verification_diagnostics"]
+    )
+    groups = verification_diagnostics["q2_source_evidence_rejection_groups"]
+    assert groups == [
+        {
+            "source_id": "S1",
+            "batch_id": "B1",
+            "artifact_type": "domain",
+            "rejection_count": 1,
+            "reason_code": "source_evidence_missing",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -266,3 +289,56 @@ async def test_archive_unavailable_or_tampered_fails_closed(
     assert result["source_failures"]["S1"]["error_code"] == ("q2_source_evidence_unavailable")
     assert sink.calls == []
     assert run.extraction_progress["sources"][0]["status"] == "failed"
+
+
+def test_hatching_article_cannot_borrow_triage_iocs() -> None:
+    triage_hash = "a" * 64
+    hatching = Q2SourceOutput(
+        artifacts=[
+            Q2ArtifactProposal(
+                value="evil.example",
+                artifact_type="domain",
+                indicator_status="confirmed_ioc",
+            ),
+            Q2ArtifactProposal(
+                value=triage_hash,
+                artifact_type="hash",
+                indicator_status="confirmed_ioc",
+            ),
+        ]
+    )
+    triage = Q2SourceOutput(
+        artifacts=[
+            Q2ArtifactProposal(
+                value="evil.example",
+                artifact_type="domain",
+                indicator_status="confirmed_ioc",
+            ),
+            Q2ArtifactProposal(
+                value=triage_hash,
+                artifact_type="hash",
+                indicator_status="confirmed_ioc",
+            ),
+        ]
+    )
+
+    hatching_gate = production_workflow.verify_q2_output_against_source(
+        hatching,
+        "NightLedger detection added; sample report linked.",
+    )
+    triage_gate = production_workflow.verify_q2_output_against_source(
+        triage,
+        f"Triage sample report\nevil.example\nSHA256 {triage_hash}",
+    )
+
+    assert hatching_gate.output.artifacts == []
+    assert all(
+        rejection.reason_code == "source_evidence_missing"
+        for rejection in hatching_gate.rejections
+    )
+    verification = verify_q2_proposals(
+        (
+            Q2ProposalSubmission(output=triage_gate.output, source_ids=("S8",)),
+        )
+    )
+    assert {item.source_ids for item in verification.canonical.items} == {("S8",)}

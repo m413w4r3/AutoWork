@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.collection import SubjectCollectionService
+from cti_app.application.jobs import JobHandlerError
 from cti_app.application.production_context import build_subject_production_context
 from cti_app.application.production_parsers import ParsedEvent, ParsedSource, ReferenceReport
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
@@ -342,3 +343,128 @@ async def test_q1_collects_only_report_urls_by_exact_collection_id() -> None:
     assert collection_service.calls == [q1_collection.id]
     assert result["archived_sources"] == 1
     assert result["report"].source_ids() == {"S1"}
+
+
+@pytest.mark.asyncio
+async def test_supplemental_failure_drops_only_unbacked_events_and_keeps_shared_event() -> None:
+    subject_id = uuid4()
+    failed = _source(
+        subject_id,
+        "https://hatching.example/article",
+        origin=SourceOriginKind.REFERENCE_RESEARCH,
+    )
+    failed.state = CollectionState.FAILED_RETRYABLE
+    archived = _source(
+        subject_id,
+        "https://tria.ge/sample",
+        origin=SourceOriginKind.REFERENCE_RESEARCH,
+    )
+    items = [failed, archived]
+
+    class CollectionService:
+        def __init__(self) -> None:
+            self.retry_calls: list[UUID] = []
+            self.collect_calls: list[UUID] = []
+
+        async def add_supplemental_sources(self, subject_id: UUID, sources: object) -> list[object]:
+            del subject_id, sources
+            return []
+
+        async def list_sources(self, subject_id: UUID) -> list[SourceCollection]:
+            del subject_id
+            return items
+
+        async def prepare_retry(self, collection_id: UUID) -> SourceCollection:
+            self.retry_calls.append(collection_id)
+            failed.state = CollectionState.PENDING
+            return failed
+
+        async def collect_subject(
+            self, subject_id: UUID, job_id: UUID, context: object, **kwargs: object
+        ) -> str:
+            del subject_id, job_id, context
+            collection_id = kwargs["collection_id"]
+            assert collection_id == failed.id
+            self.collect_calls.append(collection_id)
+            failed.state = CollectionState.FAILED_RETRYABLE
+            raise JobHandlerError(
+                "source_collection_no_success",
+                "Aucune publication n'a pu être archivée.",
+                transient=False,
+                details={
+                    "total": 1,
+                    "failed_retryable": 1,
+                    "blocked": 0,
+                    "unavailable": 0,
+                    "failed_terminal": 0,
+                },
+            )
+
+    diagnostics = SimpleNamespace(events=[])
+    diagnostics.record = lambda **fields: diagnostics.events.append(fields)
+    collection_service = CollectionService()
+    orchestrator = ProductionWorkflowOrchestrator.__new__(ProductionWorkflowOrchestrator)
+    orchestrator._collection_service = cast(Any, collection_service)
+    orchestrator._uow_factory = cast(Any, lambda: _Uow(items))
+    orchestrator._diagnostics = diagnostics
+    orchestrator._correlation_id = "test"
+    report = ReferenceReport(
+        sources=(
+            ParsedSource(
+                local_id="S3",
+                title="Hatching",
+                url=failed.requested_url,
+                canonical_url=failed.canonical_url,
+                publisher="Hatching",
+                published_at=date(2026, 8, 1),
+                role=SourceRole.INDEPENDENT,
+            ),
+            ParsedSource(
+                local_id="S4",
+                title="Triage",
+                url=archived.requested_url,
+                canonical_url=archived.canonical_url,
+                publisher="Triage",
+                published_at=date(2026, 8, 2),
+                role=SourceRole.INDEPENDENT,
+            ),
+        ),
+        events=(
+            ParsedEvent(
+                local_id="R1",
+                event_date=date(2026, 8, 1),
+                source_ids=("S3",),
+                text="only failed",
+            ),
+            ParsedEvent(
+                local_id="R2",
+                event_date=date(2026, 8, 2),
+                source_ids=("S3", "S4"),
+                text="shared evidence",
+            ),
+        ),
+    )
+    run = SubjectProductionRun(subject_id=subject_id, edition_id=uuid4())
+
+    result = await orchestrator._integrate_reference_sources(run, report, _Context())
+
+    assert collection_service.retry_calls == [failed.id]
+    assert collection_service.collect_calls == [failed.id]
+    assert [event.local_id for event in result["kept_events"]] == ["R2"]
+    assert result["kept_events"][0].source_ids == ("S4",)
+    assert result["report"].source_ids() == {"S4"}
+    assert result["supplemental_collection_failures"][0]["canonical_url"] == failed.canonical_url
+    assert result["supplemental_collection_failures"][0]["failed_retryable"] == 1
+    assert any(
+        "supplemental_collection_failed:url=https://hatching.example/article:"
+        "code=source_collection_no_success:failed_retryable=1:blocked=0:unavailable=0:failed_terminal=0"
+        in warning
+        for warning in result["warnings"]
+    )
+    assert any(
+        event["event"] == "q1.supplemental_collection_failed"
+        and event["canonical_url"] == failed.canonical_url
+        and event["error_code"] == "source_collection_no_success"
+        and event["retry_attempted"] is True
+        for event in diagnostics.events
+    )

@@ -12,6 +12,7 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.production_prompts import (
+    REFERENCES_PROMPT_VERSION,
     SYNTHESIS_PROMPT_VERSION,
     ProductionPromptTemplates,
 )
@@ -39,6 +40,32 @@ def test_references_prompt_keeps_core_and_supporting_separate() -> None:
     assert "**Core Publications**" in prompt
     assert "**Previously Known Supporting References**" in prompt
     assert "they do not replace them" in prompt
+
+
+def test_references_prompt_separates_linked_technical_sources_without_following_all_links() -> None:
+    prompt = ProductionPromptTemplates.get_references_prompt(
+        subject_title="Subject",
+        subject_description="Description",
+        actor_info="Actor",
+        technical_summary="Summary",
+        research_date="2026-08-01",
+        period_start="2026-07-01",
+        period_end="2026-07-31",
+        core_sources_text="- https://core.example/report",
+        supporting_sources_text="",
+    )
+    one_line = " ".join(prompt.split())
+
+    for linked_resource in (
+        "malware sandbox/report page",
+        "downloadable IOC TXT/CSV",
+        "vendor IOC page",
+        "GitHub repository/file",
+    ):
+        assert linked_resource in one_line
+    assert "same subject" in one_line
+    assert "Do not turn every hyperlink into a SOURCE" in one_line
+    assert REFERENCES_PROMPT_VERSION == "6"
 
 
 def test_synthesis_pack_assigns_tiers_without_defaulting_unknown_to_core() -> None:

@@ -6,20 +6,20 @@ from collections.abc import Sequence
 
 from cti_app.domain.production import ExtractionProfile
 
-REFERENCES_PROMPT_VERSION = "5"
+REFERENCES_PROMPT_VERSION = "6"
 # Q2 uses free-text GPT plus a stateless Markdown wire-format parser. The bridge does
 # not guarantee response_format / JSON Schema.
-# "17" / "10": Q2 analyses the live publication behind the exact canonical URL,
+# "18" / "11": Q2 analyses the live publication behind the exact canonical URL,
 # including its rendered tables, code and visible images. The local archive is
 # collection provenance and is never inlined in the prompt. Extraction is now
 # bounded by the requested Subject: exhaustiveness applies to subject-relevant
 # IOCs/rules, not to every indicator visible in a multi-actor publication.
-EXTRACTION_PROMPT_VERSION = "17"
-IOC_RULES_PROMPT_VERSION = "10"
-# "9": the batch input is the compact list of exact source URLs plus the single
+EXTRACTION_PROMPT_VERSION = "18"
+IOC_RULES_PROMPT_VERSION = "11"
+# "10": the batch input is the compact list of exact source URLs plus the single
 # shared Subject. Only the output stays marker-framed: a marker starts the next
 # block; EOF closes the final block.
-IOC_RULES_BATCH_PROMPT_VERSION = "9"
+IOC_RULES_BATCH_PROMPT_VERSION = "10"
 EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
@@ -136,13 +136,20 @@ A detection rule must also be relevant to the requested Subject. Do not emit a
 rule explicitly associated only with another actor, campaign, malware family or
 operation mentioned in the publication.
 
+Source-local boundary is mandatory. Analyse only material belonging to this
+exact source URL: its rendered text, tables, code blocks and visible visual
+content that belongs to that page. Do not follow a link to another publication,
+IOC page, repository, sandbox report or appendix and attribute its indicators to
+this source. Linked technical resources are distinct sources for Q1.
+
 Exhaustiveness applies after relevance filtering: find every subject-relevant
 IOC, not every IOC in the publication. Perform an exhaustive subject-relevant
 IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/SHA512 and email addresses,
-including tables, appendices, images and code. Omit irrelevant, example-only,
+including rendered tables, visible images and code. Omit irrelevant, example-only,
 placeholder, masked, truncated, REDACTED or FUZZ values; never reconstruct
 hidden values. Exhaustiveness includes every literal value in a subject-relevant
-IOC table or appendix: do not sample, summarize, collapse ranges, omit
+IOC table or appendix rendered in this exact source: do not sample, summarize,
+collapse ranges, omit
 repetitive-looking subdomains, or stop after representative examples. A single
 table cell may contain multiple IOC literals separated by whitespace, newline,
 comma or semicolon. Treat each separator-delimited valid literal as a separate
@@ -201,11 +208,14 @@ class ProductionPromptTemplates:
 5. Verify all dates are on or before the research date
 6. Use only publicly available information
 7. When a relevant publication links directly to an IOC list, technical
-   appendix/annex, technical indicator list, YARA/Sigma/Suricata content, or
-   its associated official technical repository for the same incident or
-   campaign, add that URL as a distinct SOURCE. Do not add generic download or
-   database pages, navigation, marketing, generic documentation, or unrelated
-   reports.
+   appendix/annex, technical indicator list, YARA/Sigma/Suricata content, a
+   malware sandbox/report page, a downloadable IOC TXT/CSV, a vendor IOC page,
+   or its associated official technical repository/file (including a GitHub
+   repository/file) containing directly linked technical material for the same
+   incident or campaign, add that URL as a distinct SOURCE. Only add it when
+   the resource concerns the same subject. Do not turn every hyperlink into a
+   SOURCE; do not add generic download or database pages, navigation, marketing,
+   generic documentation, or unrelated reports.
 8. Core publications define the central editorial subject. Preserve every
    relevant accessible core publication in the resulting SOURCE set.
 9. Web research is additive. New references supplement or corroborate core
@@ -283,9 +293,9 @@ Rules:
   means contextual IOC.
 - The complete header is authoritative and self-contained. Do not rely on a
   previous header and do not repeat category, status or type on value lines.
-- Emit only values literally visible in this source. This restriction does not
-  apply to IOC values: extract URL indicators normally when they are actually
-  published by this source.
+- Emit only values literally published or rendered in this exact source page.
+  Extract a URL indicator only when this exact page publishes it; never follow
+  a linked URL to obtain an indicator.
 - Use `:: short context` on FACT values only when useful, with whitespace on
   both sides of `::`. IOC value lines carry no annotation. Keep every IPv6
   literal intact.
@@ -338,9 +348,9 @@ Rules:
   means confirmed IOC and `contextual` means contextual IOC.
 - The complete header is authoritative and self-contained. Do not rely on a
   previous header and do not repeat status or type on value lines.
-- Emit only values literally visible in this source. This restriction does not
-  apply to IOC values: extract URL indicators normally when they are actually
-  published by this source.
+- Emit only values literally published or rendered in this exact source page.
+  Extract a URL indicator only when this exact page publishes it; never follow
+  a linked URL to obtain an indicator.
 - Apply the subject relevance policy above to every IOC and rule, then be
   exhaustive within what it allows. Emit only source-supported indicators and
   meaningful uncertainties.
@@ -368,9 +378,12 @@ Rules:
 Open every exact source URL listed below.
 
 Analyse each publication itself. Inspect the complete accessible rendered
-source, including technical tables, code blocks, indicator lists,
-appendices/annexes reachable from the publication and visible
-images/screenshots when available.
+material belonging to that exact URL, including technical tables, code blocks,
+indicator lists and visible images/screenshots when available.
+
+Do not follow a link to another publication, IOC page, repository, sandbox
+report or appendix and attribute its indicators to the current B#. Linked
+technical resources must be handled as distinct sources by Q1.
 
 Do not replace a source with unrelated search results and do not use another
 publication as evidence for that B#.
@@ -399,8 +412,9 @@ compact response. The only provenance labels you may emit are the local B#
 labels carried by the output markers. Do not repeat an input source URL as
 provenance. Do not emit model ids, internal ids or internal content hashes.
 
-This restriction does not apply to IOC values: extract URL, MD5, SHA1, SHA256
-and SHA512 indicators normally when they are actually published by that source.
+Extract URL, MD5, SHA1, SHA256 and SHA512 indicators only when they are
+actually published by that exact source URL; never follow a linked resource to
+obtain an indicator.
 
 Use EMPTY only after analysing that publication and finding no IOC or rule. Use
 UNAVAILABLE only when that publication could not be analysed. Do not let one
@@ -637,11 +651,14 @@ never add a fact, a source or an indicator. Return only French prose.
     LIVE_SOURCE_ACCESS_V1 = """Open this exact source:
 {source_url}
 
-Analyse the source itself. Read the complete accessible page; inspect technical
-tables, code blocks, appendices/annexes reachable from the publication and
-visible images/screenshots when available. Do not replace it with unrelated
-search results or use memory as evidence. If the exact source cannot be
-accessed, return `UNAVAILABLE` alone and do not invent an extraction."""
+Analyse only material belonging to this exact source URL. Read the complete
+accessible page; inspect its rendered text, technical tables, code blocks and
+visible images/screenshots that belong to the page. Do not follow a link to
+another publication, IOC page, repository, sandbox report or appendix and
+attribute its indicators to this source. Linked technical resources must be
+handled as distinct sources by Q1. Do not replace the exact source with
+unrelated search results or use memory as evidence. If the exact source cannot
+be accessed, return `UNAVAILABLE` alone and do not invent an extraction."""
 
     @classmethod
     def get_extraction_prompt(

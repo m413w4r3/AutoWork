@@ -17,7 +17,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.extraction import parse_document
+from cti_app.application.extraction import _html_encoding, parse_document
 from cti_app.application.iana_tlds_snapshot import IANA_TLD_SNAPSHOT_VERSION
 from cti_app.application.jobs import JobCancelledError, JobExecutionContext
 from cti_app.application.model_conversations import (
@@ -86,7 +86,9 @@ from cti_app.application.production_q2_batch import (
 )
 from cti_app.application.production_source_evidence import (
     SOURCE_EVIDENCE_VERSION,
+    SourceEvidenceDocument,
     SourceEvidenceResult,
+    source_evidence_document_from_html,
     verify_ioc_rules_output_against_source,
     verify_q2_output_against_source,
 )
@@ -98,7 +100,7 @@ from cti_app.application.production_stages import (
     SynthesisService,
     compute_input_hash,
 )
-from cti_app.domain.collection import DetectedMimeType, SourceOriginKind
+from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceOriginKind
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
@@ -175,7 +177,7 @@ _SOURCE_CONTENT_CODES = frozenset({"source_content_invalid", "q2_source_evidence
 def _gate_archived_q2_output(
     output: Q2SourceOutput,
     *,
-    source_text: str,
+    source_text: str | SourceEvidenceDocument,
     profile: ExtractionProfile,
 ) -> SourceEvidenceResult:
     """Apply the profile-specific source-local gate to one parsed output."""
@@ -365,6 +367,74 @@ def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
     if isinstance(model_run_id, UUID):
         result["model_run_id"] = str(model_run_id)
     return result
+
+
+def _supplemental_failure_fields(
+    exc: Exception,
+    *,
+    canonical_url: str | None = None,
+    collection_state: str | None = None,
+    retry_attempted: bool = False,
+) -> dict[str, Any]:
+    """Keep structured collection failure context without exposing raw values."""
+    raw_details = getattr(exc, "details", None)
+    details = dict(raw_details) if isinstance(raw_details, dict) else {}
+    fields: dict[str, Any] = {}
+    if canonical_url is not None:
+        fields["canonical_url"] = canonical_url
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        fields["error_code"] = code
+    if collection_state is not None:
+        fields["collection_state"] = collection_state
+    retryable = getattr(exc, "retryable", None)
+    if retryable is None:
+        retryable = getattr(exc, "transient", None)
+    if "failed_retryable" in details:
+        retryable = bool(details["failed_retryable"])
+    if isinstance(retryable, bool):
+        fields["retryable"] = retryable
+    if retry_attempted:
+        fields["retry_attempted"] = True
+    for key in ("failed_retryable", "blocked", "unavailable", "failed_terminal"):
+        if key in details:
+            fields[key] = details[key]
+    if details:
+        fields["details"] = details
+    fields["error_type"] = type(exc).__name__
+    message = str(exc).strip()
+    if message and message != fields.get("error_code"):
+        fields["error_message"] = message[:1000]
+    return fields
+
+
+def _supplemental_failure_warning(
+    exc: Exception,
+    *,
+    canonical_url: str | None = None,
+) -> str:
+    """Render a compact UI warning; full fields stay in structured diagnostics."""
+    raw_details = getattr(exc, "details", None)
+    details = raw_details if isinstance(raw_details, dict) else {}
+    parts = ["supplemental_collection_failed"]
+    if canonical_url is not None:
+        parts.append(f"url={canonical_url}")
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        parts.append(f"code={code}")
+    else:
+        parts.append(f"type={type(exc).__name__}")
+    retryable = getattr(exc, "retryable", None)
+    if retryable is None:
+        retryable = getattr(exc, "transient", None)
+    if isinstance(retryable, bool) and not any(
+        key in details for key in ("failed_retryable", "blocked", "unavailable", "failed_terminal")
+    ):
+        parts.append(f"retryable={int(retryable)}")
+    for key in ("failed_retryable", "blocked", "unavailable", "failed_terminal"):
+        if key in details:
+            parts.append(f"{key}={details[key]}")
+    return ":".join(parts)
 
 
 def _repair_problem_descriptions(result: Any) -> list[str]:
@@ -1055,6 +1125,7 @@ class ProductionWorkflowOrchestrator:
         URL already attached to the subject is reused, never re-downloaded.
         """
         warnings: list[str] = []
+        supplemental_failures: list[dict[str, Any]] = []
         new_sources = 0
 
         if self._collection_service is not None:
@@ -1082,8 +1153,22 @@ class ProductionWorkflowOrchestrator:
                             or collection.state.value in _ARCHIVED_STATES
                         ):
                             continue
+                        collection_state = getattr(collection.state, "value", collection.state)
+                        retry_attempted = False
                         try:
                             await self._check_cancellation(run.id, context)
+                            if (
+                                collection_state == CollectionState.FAILED_RETRYABLE.value
+                                and callable(
+                                    getattr(self._collection_service, "prepare_retry", None)
+                                )
+                            ):
+                                # One targeted retry is allowed for a retryable
+                                # supplemental collection. Blocked and terminal
+                                # states never enter this branch.
+                                await self._collection_service.prepare_retry(collection.id)
+                                retry_attempted = True
+                                await self._check_cancellation(run.id, context)
                             await self._collection_service.collect_subject(
                                 run.subject_id,
                                 context.job_id,
@@ -1095,12 +1180,44 @@ class ProductionWorkflowOrchestrator:
                             raise
                         except Exception as exc:
                             warnings.append(
-                                f"supplemental_collection_failed:{collection.canonical_url}:{exc}"
+                                _supplemental_failure_warning(
+                                    exc,
+                                    canonical_url=collection.canonical_url,
+                                )
                             )
+                            failure_fields = _supplemental_failure_fields(
+                                exc,
+                                canonical_url=collection.canonical_url,
+                                collection_state=str(collection_state),
+                                retry_attempted=retry_attempted,
+                            )
+                            supplemental_failures.append(failure_fields)
+                            diagnostics = getattr(self, "_diagnostics", None)
+                            if diagnostics is not None:
+                                diagnostics.record(
+                                    event="q1.supplemental_collection_failed",
+                                    run_id=run.id,
+                                    subject_id=run.subject_id,
+                                    stage="references",
+                                    correlation_id=getattr(self, "_correlation_id", None),
+                                    **failure_fields,
+                                )
             except JobCancelledError:
                 raise
             except Exception as exc:
-                warnings.append(f"supplemental_collection_failed:{exc}")
+                warnings.append(_supplemental_failure_warning(exc))
+                failure_fields = _supplemental_failure_fields(exc)
+                supplemental_failures.append(failure_fields)
+                diagnostics = getattr(self, "_diagnostics", None)
+                if diagnostics is not None:
+                    diagnostics.record(
+                        event="q1.supplemental_collection_failed",
+                        run_id=run.id,
+                        subject_id=run.subject_id,
+                        stage="references",
+                        correlation_id=getattr(self, "_correlation_id", None),
+                        **failure_fields,
+                    )
 
         archived_urls: set[str] = set()
         async with self._uow_factory() as uow:
@@ -1138,6 +1255,7 @@ class ProductionWorkflowOrchestrator:
             "warnings": warnings,
             "new_sources": new_sources,
             "archived_sources": len(archived_ids),
+            "supplemental_collection_failures": supplemental_failures,
         }
 
     async def _load_qa_inputs(
@@ -1459,11 +1577,14 @@ class ProductionWorkflowOrchestrator:
     ) -> dict[str, Any]:
         return await self._execute_direct_url_extraction(run, context, snapshot)
 
-    async def _load_archived_source_text(self, archived: _ArchivedSource | None) -> str:
+    async def _load_archived_source_text(
+        self, archived: _ArchivedSource | None
+    ) -> SourceEvidenceDocument:
         """Read and integrity-check one decoded archive for local validation.
 
-        The returned text is never put in a ModelRequest. It is read only after
-        a live Q2 response exists, and the digest is checked before parsing it.
+        The returned local evidence views are never put in a ModelRequest. They
+        are read only after a live Q2 response exists, and the digest is checked
+        before parsing them.
         """
         if archived is None:
             raise _Q2SourceEvidenceUnavailable("Archived source is missing")
@@ -1514,7 +1635,13 @@ class ProductionWorkflowOrchestrator:
 
         try:
             mime_type = DetectedMimeType(archived.mime_type or DetectedMimeType.HTML.value)
-            return parse_document(content, mime_type).text
+            parsed = parse_document(content, mime_type)
+            if mime_type is DetectedMimeType.HTML:
+                return source_evidence_document_from_html(
+                    parsed.text,
+                    content.decode(_html_encoding(content), errors="replace"),
+                )
+            return SourceEvidenceDocument(parsed_text=parsed.text)
         except Exception as exc:
             raise _Q2SourceEvidenceUnavailable(
                 "Archived source text is unreadable",
@@ -1606,6 +1733,7 @@ class ProductionWorkflowOrchestrator:
         failed_attempts: list[str] = []
         failures: dict[str, dict[str, Any]] = {}
         source_evidence_rejections: list[dict[str, Any]] = []
+        source_evidence_rejection_counts: dict[tuple[str, str | None, str, str], int] = {}
         plans_by_url = {plan.canonical_url: plan for plan in source_plans}
         full_calls = 0
         light_calls = 0
@@ -1731,8 +1859,15 @@ class ProductionWorkflowOrchestrator:
                         "value_hash": hashlib.sha256(rejection.value.encode()).hexdigest(),
                     }
                 )
-                warning_prefix = f"q2_batch:{batch_id}" if batch_id else "q2_source"
-                warnings.append(f"{warning_prefix}:{work.source.local_id}:{rejection.reason_code}")
+                group_key = (
+                    work.source.local_id,
+                    batch_id,
+                    rejection.artifact_type or rejection.proposal_kind,
+                    rejection.reason_code,
+                )
+                source_evidence_rejection_counts[group_key] = (
+                    source_evidence_rejection_counts.get(group_key, 0) + 1
+                )
                 self._diagnostics.record(
                     event="q2.source.evidence_rejected",
                     run_id=run.id,
@@ -2699,6 +2834,32 @@ class ProductionWorkflowOrchestrator:
             status.value: sum(item.indicator_status is status for item in extraction.items)
             for status in IndicatorStatus
         }
+        source_evidence_rejection_groups = [
+            {
+                "source_id": source_id,
+                "batch_id": batch_id,
+                "artifact_type": artifact_type,
+                "rejection_count": count,
+                "reason_code": reason_code,
+            }
+            for (source_id, batch_id, artifact_type, reason_code), count in (
+                source_evidence_rejection_counts.items()
+            )
+        ]
+        source_evidence_warnings = [
+            (
+                f"q2_batch_source_evidence_rejected:{batch_id}:{source_id}:"
+                f"{artifact_type}:count={count}:reason={reason_code}"
+                if batch_id
+                else (
+                    f"q2_source_evidence_rejected:{source_id}:{artifact_type}:"
+                    f"count={count}:reason={reason_code}"
+                )
+            )
+            for (source_id, batch_id, artifact_type, reason_code), count in (
+                source_evidence_rejection_counts.items()
+            )
+        ]
         await self._check_cancellation(run.id, context)
         artifact = await self._extraction.store_extraction_result(
             run_id=run.id,
@@ -2709,6 +2870,7 @@ class ProductionWorkflowOrchestrator:
             warnings=[
                 *warnings,
                 *verification.warnings,
+                *source_evidence_warnings,
                 *(f"q2_rejected:{item.reason_code}" for item in verification.rejected),
             ],
             verification_diagnostics={
@@ -2739,6 +2901,16 @@ class ProductionWorkflowOrchestrator:
                     for item in verification.diagnostics
                 ],
                 "q2_source_evidence_rejections": source_evidence_rejections,
+                "q2_source_evidence_rejection_groups": source_evidence_rejection_groups,
+                "semantic_status_conflicts": [
+                    {
+                        "artifact_type": item.artifact_type,
+                        "value_hash": item.value_hash,
+                        "statuses": list(item.statuses),
+                        "source_ids": list(item.source_ids),
+                    }
+                    for item in verification.semantic_status_conflicts
+                ],
             },
         )
         await self._persist_extraction_progress(run.id, progress)

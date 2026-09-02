@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from cti_app.application.extraction import parse_document
 from cti_app.application.production_parsers import (
     Q2ArtifactProposal,
     Q2FactProposal,
@@ -8,9 +9,11 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.application.production_source_evidence import (
     SOURCE_EVIDENCE_VERSION,
+    source_evidence_document_from_html,
     verify_ioc_rules_output_against_source,
     verify_q2_output_against_source,
 )
+from cti_app.domain.collection import DetectedMimeType
 
 
 def _artifact(
@@ -30,7 +33,7 @@ def test_version_and_ioc_from_same_source_are_kept_with_value_only() -> None:
 
     result = verify_ioc_rules_output_against_source(output, "The domain is evil.com.")
 
-    assert SOURCE_EVIDENCE_VERSION == "3"
+    assert SOURCE_EVIDENCE_VERSION == "4"
     assert result.output.artifacts[0].value == "evil[.]com"
     assert result.output.artifacts[0].context == ""
     assert result.output.artifacts[0].evidence_quote == ""
@@ -60,6 +63,45 @@ def test_full_gate_preserves_facts_but_filters_artifacts_and_rules() -> None:
     assert result.output.artifacts == []
     assert len(result.output.rules) == 1
     assert result.rejections[0].reason_code == "source_evidence_missing"
+
+
+def test_html_safe_fallback_keeps_visible_alt_text_but_not_tracking_or_scripts() -> None:
+    html = (
+        b'<article><img alt="visual-ioc.security-lab.io" '
+        b'src="https://tracking.example/pixel?id=visual-ioc.security-lab.io">'
+        b'<a href="https://linked.example/linked-ioc.example">linked</a>'
+        b'<script>script-ioc.example</script>'
+        b'<meta name="description" content="metadata-ioc.example"></article>'
+    )
+    parsed = parse_document(html, DetectedMimeType.HTML)
+    assert "visual-ioc.security-lab.io" not in parsed.text
+
+    document = source_evidence_document_from_html(
+        parsed.text,
+        html.decode("utf-8"),
+    )
+    kept = verify_ioc_rules_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact("visual-ioc.security-lab.io", "domain")]),
+        document,
+    )
+    assert len(kept.output.artifacts) == 1
+    assert "tracking.example" not in document.decoded_source_view
+    assert "script-ioc.example" not in document.decoded_source_view
+    assert "metadata-ioc.example" not in document.decoded_source_view
+    assert "linked-ioc.example" not in document.decoded_source_view
+
+
+def test_html_image_without_text_has_a_distinct_non_text_diagnostic() -> None:
+    html = '<img src="https://cdn.example/screenshot.png">'
+    document = source_evidence_document_from_html("Screenshot below", html)
+
+    result = verify_ioc_rules_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact("visual-ioc.security-lab.io", "domain")]),
+        document,
+    )
+
+    assert result.output.artifacts == []
+    assert result.rejections[0].reason_code == "source_evidence_not_text_verifiable"
 
 
 def test_ioc_present_only_in_another_source_is_rejected() -> None:

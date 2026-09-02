@@ -58,15 +58,18 @@ def test_full_prompt_requires_compact_facts_iocs_and_rules() -> None:
     assert "<ARCHIVED_SOURCE>" not in prompt
     assert "images/screenshots" in prompt
     one_line = " ".join(prompt.split())
+    assert "Source-local boundary is mandatory." in one_line
+    assert "Do not follow a link to another publication, IOC page, repository" in one_line
+    assert "appendices/annexes reachable from the publication" not in one_line
     assert "Do not repeat the input source URL merely as provenance." in one_line
     assert (
-        "This restriction does not apply to IOC values: extract URL indicators normally "
-        "when they are actually published by this source."
+        "Extract a URL indicator only when this exact page publishes it; never follow a "
+        "linked URL to obtain an indicator."
     ) in one_line
     assert "Emit no source id, URL, provenance" not in one_line
     assert "Never repeat its URL" not in one_line
     assert "url, email, md5, sha1, sha256, sha512" in one_line
-    assert EXTRACTION_PROMPT_VERSION == "17"
+    assert EXTRACTION_PROMPT_VERSION == "18"
     assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v5"
 
 
@@ -93,15 +96,18 @@ def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
     assert "<ARCHIVED_SOURCE>" not in prompt
     assert "images/screenshots" in prompt
     one_line = " ".join(prompt.split())
+    assert "Source-local boundary is mandatory." in one_line
+    assert "Do not follow a link to another publication, IOC page, repository" in one_line
+    assert "appendices/annexes reachable from the publication" not in one_line
     assert "Do not repeat the input source URL merely as provenance." in one_line
     assert (
-        "This restriction does not apply to IOC values: extract URL indicators normally "
-        "when they are actually published by this source."
+        "Extract a URL indicator only when this exact page publishes it; never follow a "
+        "linked URL to obtain an indicator."
     ) in one_line
     assert "Emit no source id, URL, provenance" not in one_line
     assert "Never repeat its URL" not in one_line
     assert "url, email, md5, sha1, sha256, sha512" in one_line
-    assert IOC_RULES_PROMPT_VERSION == "10"
+    assert IOC_RULES_PROMPT_VERSION == "11"
     # The transport format stays a bare value line: filtering happens during
     # extraction, not through a new annotated wire format.
     assert "IOC <confirmed|contextual> <type>\n- <value>" in prompt

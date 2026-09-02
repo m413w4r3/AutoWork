@@ -285,15 +285,20 @@ def test_batch_prompt_lists_exact_urls_and_frames_only_the_output() -> None:
     assert "@@Q2IN" not in prompt
     assert "Open every exact source URL" in prompt
     assert "images/screenshots" in prompt
-    assert "appendices/annexes reachable from the publication" in prompt
+    assert "Do not follow a link to another publication, IOC page, repository" in prompt
     assert "independently" in prompt
     prompt_on_one_line = " ".join(prompt.split())
+    assert (
+        "Linked technical resources must be handled as distinct sources by Q1."
+        in prompt_on_one_line
+    )
     assert "Do not emit URLs, hashes" not in prompt_on_one_line
     assert "Do not repeat an input source URL as provenance." in prompt_on_one_line
     assert "Do not emit model ids, internal ids or internal content hashes." in prompt_on_one_line
     assert (
-        "This restriction does not apply to IOC values: extract URL, MD5, SHA1, SHA256 and"
-        " SHA512 indicators normally"
+        "Extract URL, MD5, SHA1, SHA256 and SHA512 indicators only when they are actually"
+        " published by that exact source URL; never follow a linked resource to obtain an"
+        " indicator."
     ) in prompt_on_one_line
     assert (
         "Use `confirmed` when the publication explicitly presents a value as an IOC"
@@ -309,7 +314,7 @@ def test_batch_prompt_lists_exact_urls_and_frames_only_the_output() -> None:
         assert ioc_type in prompt
     assert " :: " not in prompt
     assert "S1" not in prompt
-    assert IOC_RULES_BATCH_PROMPT_VERSION == "9"
+    assert IOC_RULES_BATCH_PROMPT_VERSION == "10"
     assert production_q2_batch.Q2_BATCH_PARSER_VERSION == "q2-batch-v3"
 
 

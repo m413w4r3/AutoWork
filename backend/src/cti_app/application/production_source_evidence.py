@@ -2,12 +2,17 @@
 
 This module deliberately knows about one source text only.  It does not assign
 provenance, call external services, or attempt to repair a model proposal.
+It never performs OCR: ``source_evidence_not_text_verifiable`` means that a
+proposal could not be proven in safe local text while the archive contains
+visual material, not that the source collection itself is missing.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from html import unescape
+from html.parser import HTMLParser
 
 from cti_app.application.production_parsers import (
     Q2ArtifactProposal,
@@ -16,7 +21,7 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.domain.publication import ArtifactType
 
-SOURCE_EVIDENCE_VERSION = "3"
+SOURCE_EVIDENCE_VERSION = "4"
 
 _NBSP = "\u00a0"
 _NARROW_NBSP = "\u202f"
@@ -38,8 +43,83 @@ _FILEPATH_CONTINUATION = "._-/\\:"
 
 
 @dataclass(frozen=True, slots=True)
+class SourceEvidenceDocument:
+    """The local views allowed to prove one Q2 proposal.
+
+    ``decoded_source_view`` is deliberately not the raw HTML.  It is a safe
+    text projection containing rendered text and visible ``alt``/``title``
+    attributes, while excluding URL-bearing attributes, scripts and metadata.
+    """
+
+    parsed_text: str
+    decoded_source_view: str = ""
+    has_unverifiable_visuals: bool = False
+
+
+class _SafeHtmlEvidenceParser(HTMLParser):
+    _SKIPPED_TAGS = frozenset({"script", "style", "noscript", "template", "svg"})
+    _VISUAL_TAGS = frozenset({"img", "picture", "canvas", "object", "embed", "svg"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip_depth = 0
+        self.has_unverifiable_visuals = False
+
+    @property
+    def text(self) -> str:
+        return "\n".join(part for part in self.parts if part).strip()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.casefold()
+        if self.skip_depth:
+            if tag in self._SKIPPED_TAGS:
+                self.skip_depth += 1
+            return
+        if tag in self._VISUAL_TAGS:
+            self.has_unverifiable_visuals = True
+        if tag in self._SKIPPED_TAGS:
+            self.skip_depth += 1
+            return
+        for key, value in attrs:
+            if key.casefold() in {"alt", "title"} and value:
+                cleaned = " ".join(unescape(value).split())
+                if cleaned:
+                    self.parts.append(cleaned)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() in self._SKIPPED_TAGS and self.skip_depth:
+            self.skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self.skip_depth:
+            return
+        cleaned = " ".join(data.split())
+        if cleaned:
+            self.parts.append(cleaned)
+
+
+def source_evidence_document_from_html(
+    parsed_text: str,
+    decoded_html: str,
+) -> SourceEvidenceDocument:
+    """Add the minimal safe HTML view needed after a demonstrated text loss."""
+    parser = _SafeHtmlEvidenceParser()
+    try:
+        parser.feed(decoded_html)
+        parser.close()
+    except Exception:
+        return SourceEvidenceDocument(parsed_text=parsed_text)
+    return SourceEvidenceDocument(
+        parsed_text=parsed_text,
+        decoded_source_view=parser.text,
+        has_unverifiable_visuals=parser.has_unverifiable_visuals,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class SourceEvidenceRejection:
-    """One Q2 proposal removed because this source cannot prove it."""
+    """One Q2 proposal removed because this source cannot prove it locally."""
 
     proposal_index: int
     proposal_kind: str
@@ -72,7 +152,7 @@ class SourceEvidenceResult:
 
 def verify_ioc_rules_output_against_source(
     output: Q2SourceOutput,
-    source_text: str,
+    source_text: str | SourceEvidenceDocument,
 ) -> SourceEvidenceResult:
     """Keep only IOC/rule proposals with literal proof in ``source_text``.
 
@@ -85,7 +165,7 @@ def verify_ioc_rules_output_against_source(
 
 def verify_q2_output_against_source(
     output: Q2SourceOutput,
-    source_text: str,
+    source_text: str | SourceEvidenceDocument,
 ) -> SourceEvidenceResult:
     """Gate archived Q2 output while preserving the FULL facts channel.
 
@@ -99,13 +179,26 @@ def verify_q2_output_against_source(
 
 def _verify_output_against_source(
     output: Q2SourceOutput,
-    source_text: str,
+    source_text: str | SourceEvidenceDocument,
     *,
     preserve_facts: bool,
 ) -> SourceEvidenceResult:
     """Apply the shared artifact/rule source-local gate."""
-    source_view = _artifact_comparison_view(source_text)
-    rule_source_view = _rule_comparison_view(source_text)
+    evidence_document = (
+        source_text
+        if isinstance(source_text, SourceEvidenceDocument)
+        else SourceEvidenceDocument(parsed_text=source_text)
+    )
+    source_views = tuple(
+        _artifact_comparison_view(value)
+        for value in (evidence_document.parsed_text, evidence_document.decoded_source_view)
+        if value
+    )
+    rule_source_views = tuple(
+        _rule_comparison_view(value)
+        for value in (evidence_document.parsed_text, evidence_document.decoded_source_view)
+        if value
+    )
     artifacts: list[Q2ArtifactProposal] = []
     rules: list[Q2RuleProposal] = []
     warnings: list[str] = []
@@ -117,14 +210,18 @@ def _verify_output_against_source(
     proposal_index = len(output.facts)
     for artifact in output.artifacts:
         proposal_index += 1
-        if _artifact_is_proven(artifact, source_view):
+        if any(_artifact_is_proven(artifact, source) for source in source_views):
             artifacts.append(artifact.model_copy(update={"context": "", "evidence_quote": ""}))
         else:
             rejections.append(
                 SourceEvidenceRejection(
                     proposal_index=proposal_index,
                     proposal_kind="artifact",
-                    reason_code="source_evidence_missing",
+                    reason_code=(
+                        "source_evidence_not_text_verifiable"
+                        if evidence_document.has_unverifiable_visuals
+                        else "source_evidence_missing"
+                    ),
                     value=artifact.value,
                     artifact_type=artifact.artifact_type,
                 )
@@ -133,7 +230,7 @@ def _verify_output_against_source(
     for rule in output.rules:
         proposal_index += 1
         body = _rule_comparison_view(rule.body)
-        if body.strip() and body in rule_source_view:
+        if body.strip() and any(body in source for source in rule_source_views):
             rules.append(rule.model_copy(update={"context": "", "evidence_quote": ""}))
         else:
             rejections.append(

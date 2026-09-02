@@ -33,7 +33,7 @@ from cti_app.domain.publication import ArtifactType
 # validation rule, a public-suffix check, or how facts get a semantic type).
 # Participates in the extraction artifact's input_hash so a canonical
 # extraction artifact gets recomputed, without forcing a new Q2 model call.
-ARTIFACT_VERIFIER_VERSION = "3"
+ARTIFACT_VERIFIER_VERSION = "4"
 
 
 class ProposalStatus(StrEnum):
@@ -61,10 +61,21 @@ class ProposalDiagnostic:
 
 
 @dataclass(frozen=True)
+class SemanticStatusConflictDiagnostic:
+    """A duplicate indicator whose source proposals disagree on status."""
+
+    artifact_type: str | None
+    value_hash: str
+    statuses: tuple[str, ...]
+    source_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ArtifactVerificationResult:
     canonical: TechnicalExtraction
     diagnostics: tuple[ProposalDiagnostic, ...]
     warnings: tuple[str, ...]
+    semantic_status_conflicts: tuple[SemanticStatusConflictDiagnostic, ...] = ()
 
     @property
     def rejected(self) -> tuple[ProposalDiagnostic, ...]:
@@ -158,7 +169,7 @@ def verify_q2_proposals(
                     _value_hash(_proposal_body_or_value(proposal)),
                 )
             )
-    merged, item_warnings = _merge_verified(verified)
+    merged, item_warnings, semantic_status_conflicts = _merge_verified(verified)
     merged_rules, rule_warnings = _merge_rules(verified_rules)
     uncertainties = tuple(
         dict.fromkeys(
@@ -175,6 +186,7 @@ def verify_q2_proposals(
         ),
         tuple(diagnostics),
         tuple(dict.fromkeys((*item_warnings, *warnings, *rule_warnings))),
+        tuple(semantic_status_conflicts),
     )
 
 
@@ -195,7 +207,16 @@ def _rejection_reason(
         try:
             _validate_value(proposal.value, artifact_type)
         except ValueError:
-            return "invalid_value"
+            return {
+                ArtifactType.IP: "invalid_ip",
+                ArtifactType.DOMAIN: "invalid_domain",
+                ArtifactType.URL: "invalid_url",
+                ArtifactType.HASH: "invalid_hash",
+                ArtifactType.EMAIL: "invalid_email",
+                ArtifactType.CVE: "invalid_cve",
+                ArtifactType.FILENAME: "invalid_file_value",
+                ArtifactType.FILEPATH: "invalid_file_value",
+            }.get(artifact_type, "invalid_value")
         try:
             normalize_indicator_value(proposal.value, artifact_type)
         except ValueError:
@@ -422,9 +443,12 @@ def _display_policy(status: IndicatorStatus, *, allow_ioc: bool = True) -> Displ
     return DisplayPolicy.BODY_ONLY
 
 
-def _merge_verified(items: Sequence[ExtractionItem]) -> tuple[list[ExtractionItem], list[str]]:
+def _merge_verified(
+    items: Sequence[ExtractionItem],
+) -> tuple[list[ExtractionItem], list[str], list[SemanticStatusConflictDiagnostic]]:
     merged: dict[tuple[object, ...], ExtractionItem] = {}
     warnings: list[str] = []
+    conflicts: list[SemanticStatusConflictDiagnostic] = []
     for item in items:
         key = (
             (item.artifact_type, item.normalized_value)
@@ -438,6 +462,16 @@ def _merge_verified(items: Sequence[ExtractionItem]) -> tuple[list[ExtractionIte
         statuses = {previous.indicator_status, item.indicator_status}
         if len(statuses) > 1:
             warnings.append("semantic_status_conflict")
+            conflicts.append(
+                SemanticStatusConflictDiagnostic(
+                    artifact_type=(
+                        previous.artifact_type.value if previous.artifact_type is not None else None
+                    ),
+                    value_hash=_value_hash(previous.value),
+                    statuses=tuple(sorted(status.value for status in statuses)),
+                    source_ids=tuple(sorted(set(previous.source_ids + item.source_ids))),
+                )
+            )
         # An explicit IOC publication is stronger than a contextual label from
         # another source; keep the diagnostic without downgrading the IOC.
         status = _merged_status(statuses)
@@ -466,7 +500,7 @@ def _merge_verified(items: Sequence[ExtractionItem]) -> tuple[list[ExtractionIte
             artifact_number += 1
             local_id = f"Q2A{artifact_number}"
         canonical.append(replace(item, local_id=local_id))
-    return canonical, list(dict.fromkeys(warnings))
+    return canonical, list(dict.fromkeys(warnings)), list(dict.fromkeys(conflicts))
 
 
 def _merge_rules(rules: Sequence[DetectionRule]) -> tuple[list[DetectionRule], list[str]]:

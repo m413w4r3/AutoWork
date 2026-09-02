@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from cti_app.application.production_artifact_verification import (
@@ -177,3 +178,27 @@ def test_confirmed_status_wins_contextual_status_conflict_without_hiding_diagnos
     assert item.indicator_status is IndicatorStatus.CONFIRMED_IOC
     assert len(collect_indicators(verification.canonical)) == 1
     assert "semantic_status_conflict" in verification.warnings
+    assert verification.semantic_status_conflicts[0].artifact_type == "domain"
+    assert verification.semantic_status_conflicts[0].value_hash == hashlib.sha256(
+        value.encode()
+    ).hexdigest()
+    assert verification.semantic_status_conflicts[0].statuses == ("confirmed_ioc", "contextual")
+    assert verification.semantic_status_conflicts[0].source_ids == ("S1", "S2")
+
+
+def test_invalid_ioc_diagnostic_keeps_type_index_hash_and_specific_reason() -> None:
+    value = "999.999.999.999"
+    verification = verify_q2_proposals(
+        (
+            Q2ProposalSubmission(
+                output=Q2SourceOutput(artifacts=[_artifact(value, "ip")]),
+                source_ids=("S1",),
+            ),
+        )
+    )
+
+    diagnostic = verification.rejected[0]
+    assert diagnostic.artifact_type == "ip"
+    assert diagnostic.proposal_index == 1
+    assert diagnostic.value_hash == hashlib.sha256(value.encode()).hexdigest()
+    assert diagnostic.reason_code == "invalid_ip"
