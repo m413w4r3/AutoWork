@@ -22,7 +22,6 @@ from cti_app.application.production_parsers import (
     ReferenceReport,
     SemanticType,
     TechnicalExtraction,
-    exact_artifact_value_allowed_in_body,
     parse_reference_report,
     validate_synthesis,
 )
@@ -121,8 +120,6 @@ def test_heading_and_field_variants_are_tolerated(variant: str) -> None:
     result = parse_reference_report(variant, RESEARCH_DATE)
 
     assert result.usable, result.errors
-
-
 def test_multiline_field_is_joined() -> None:
     text = PERFECT_Q1.replace(
         "text: Premiere observation de la campagne.",
@@ -580,19 +577,14 @@ def test_body_only_file_artifacts_are_not_ioc_repetition() -> None:
     assert result.usable, result.errors
 
 
-def test_ioc_section_domain_stays_forbidden_in_body() -> None:
+def test_ioc_section_domain_can_be_used_in_body() -> None:
     result = validate_synthesis(
         f"{DUST_SPECTER_SYNTHESIS[:-1]} et contacte evil.example [S1].",
         _corpus(),
         _dust_specter_extraction(),
     )
 
-    assert not result.usable
-    assert "ioc_repeated_in_body" in result.errors
-    assert any(
-        violation.code == "ioc_repeated_in_body" and "evil.example" in violation.detail
-        for violation in result.violations
-    )
+    assert result.usable, result.errors
 
 
 def test_body_only_filepath_and_cve_values_are_allowed() -> None:
@@ -618,12 +610,12 @@ def test_body_only_filepath_and_cve_values_are_allowed() -> None:
     (
         (ArtifactType.DOMAIN, "evil.example", "evil[.]example"),
         (ArtifactType.IP, "203.0.113.9", "203[.]0[.]113[.]9"),
-        (ArtifactType.URL, "hxxps://evil.example/gate", "hxxps://evil[.]example/gate"),
+        (ArtifactType.URL, "hxxps://evil.example/gate", "hxxps[://]evil[.]example/gate"),
         (ArtifactType.HASH, "b" * 64, "b" * 64),
         (ArtifactType.EMAIL, "operator@evil.example", "operator(at)evil[.]example"),
     ),
 )
-def test_network_ioc_section_values_stay_rejected(
+def test_network_ioc_section_values_can_be_used_for_analysis(
     artifact_type: ArtifactType, value: str, written: str
 ) -> None:
     extraction = TechnicalExtraction(
@@ -640,35 +632,7 @@ def test_network_ioc_section_values_stay_rejected(
 
     result = validate_synthesis(f"L'implant contacte {written} [S1].", _corpus(), extraction)
 
-    assert not result.usable
-    assert "ioc_repeated_in_body" in result.errors
-
-
-def test_hidden_artifact_value_stays_rejected() -> None:
-    extraction = TechnicalExtraction(
-        items=(
-            _artifact(
-                "H1",
-                "hidden.example",
-                ArtifactType.DOMAIN,
-                status=IndicatorStatus.EXCLUDED,
-                policy=DisplayPolicy.HIDDEN,
-                category="network_artifacts",
-            ),
-            _artifact(
-                "H2",
-                "secret.dll",
-                ArtifactType.FILENAME,
-                status=IndicatorStatus.EXCLUDED,
-                policy=DisplayPolicy.HIDDEN,
-            ),
-        )
-    )
-
-    for value in ("hidden.example", "secret.dll"):
-        result = validate_synthesis(f"Le chargeur utilise {value} [S1].", _corpus(), extraction)
-        assert not result.usable
-        assert "ioc_repeated_in_body" in result.errors
+    assert result.usable, result.errors
 
 
 def test_both_policy_domain_remains_publishable() -> None:
@@ -689,17 +653,3 @@ def test_both_policy_domain_remains_publishable() -> None:
     )
 
     assert result.usable, result.errors
-
-
-def test_exact_value_permission_separates_status_from_destination() -> None:
-    confirmed_filename = _artifact("F1", "libvlc.dll", ArtifactType.FILENAME)
-    confirmed_domain = _artifact(
-        "D1",
-        "evil.example",
-        ArtifactType.DOMAIN,
-        policy=DisplayPolicy.IOC_SECTION,
-        category="network_artifacts",
-    )
-
-    assert exact_artifact_value_allowed_in_body(confirmed_filename)
-    assert not exact_artifact_value_allowed_in_body(confirmed_domain)

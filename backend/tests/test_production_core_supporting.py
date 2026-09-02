@@ -7,7 +7,6 @@ from cti_app.application.production_parsers import (
     ExtractionItem,
     IndicatorStatus,
     ParseResult,
-    SynthesisViolation,
     TechnicalExtraction,
     parse_reference_report,
     validate_synthesis,
@@ -81,7 +80,7 @@ text: Event
         },
     )
 
-    assert pack["version"] == "4"
+    assert pack["version"] == "5"
     assert [source["tier"] for source in pack["reference_report"]["sources"]] == [
         "core",
         "supporting",
@@ -98,13 +97,13 @@ def test_synthesis_prompt_makes_core_backbone_without_quota() -> None:
     assert "quota" not in prompt.lower()
 
 
-def test_synthesis_prompt_version_matches_v7_template() -> None:
-    assert SYNTHESIS_PROMPT_VERSION == "7"
-    assert hasattr(ProductionPromptTemplates, "TECHNICAL_SYNTHESIS_V7")
+def test_synthesis_prompt_version_matches_v8_template() -> None:
+    assert SYNTHESIS_PROMPT_VERSION == "8"
+    assert hasattr(ProductionPromptTemplates, "TECHNICAL_SYNTHESIS_V8")
 
 
 def test_synthesis_prompt_requires_technical_cti_depth() -> None:
-    """The V7 contract, not any particular model wording."""
+    """The V8 contract, not any particular model wording."""
     prompt = ProductionPromptTemplates.get_synthesis_prompt("Subject")
     lowered = prompt.lower()
 
@@ -156,15 +155,15 @@ def test_synthesis_prompt_requires_technical_cti_depth() -> None:
     # Preserved invariants.
     assert "Produce no Markdown title or heading." in prompt
     assert "Produce no raw URL." in prompt
-    assert "Do not copy the IOC inventory" in prompt
+    assert "Do not reproduce the IOC section as a" in prompt
     assert "no final bibliography" in prompt
 
-    # V7 separates IOC destination from artifact type.
-    assert "may appear in prose only when their display-policy permits" in prompt
-    assert "both body and IOC-section use" in prompt
-    assert "not IOC-section inventory" in prompt
-    assert "exhaustive file inventory" in prompt
-    assert "A precise IOC value may appear only when its display-policy is both." not in prompt
+    # V8 lets Q4 select exact technical values for analytical reasons.
+    assert "any exact technical indicator or artifact supplied" in prompt
+    assert "materially improves the analysis" in prompt
+    assert "presence of a value in the final IOC section does not prevent" in prompt
+    assert "raw inventory" in prompt
+    assert "mechanically enumerate indicators" in prompt
 
 
 def test_synthesis_repair_prompt_stays_structural() -> None:
@@ -272,7 +271,7 @@ def test_synthesis_pack_excludes_detection_rules_and_preserves_extraction() -> N
         _minimal_report(), extraction, {"https://core.example/report": "core"}
     )
 
-    assert pack["version"] == "4"
+    assert pack["version"] == "5"
     assert "detection_rules" not in pack["technical_extraction"]
     assert extraction.rules == (rule, unsupported)
     serialized = json.dumps(pack, ensure_ascii=False)
@@ -306,6 +305,7 @@ def _artifact_item(
     policy: DisplayPolicy = DisplayPolicy.IOC_SECTION,
     category: str = "network_artifacts",
     context: str = "",
+    supported: bool = True,
 ) -> ExtractionItem:
     return ExtractionItem(
         local_id=local_id,
@@ -316,7 +316,7 @@ def _artifact_item(
         attack_id=None,
         reference_ids=(),
         source_ids=("S1",),
-        supported=True,
+        supported=supported,
         indicator_status=status,
         display_policy=policy,
     )
@@ -368,7 +368,7 @@ def _dust_specter_pack_extraction() -> TechnicalExtraction:
     )
 
 
-def test_synthesis_pack_drops_metadata_only_ioc_rows_and_keeps_body_detail() -> None:
+def test_synthesis_pack_keeps_all_visible_supported_items() -> None:
     extraction = _dust_specter_pack_extraction()
 
     pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
@@ -376,15 +376,9 @@ def test_synthesis_pack_drops_metadata_only_ioc_rows_and_keeps_body_detail() -> 
     )
 
     items = pack["technical_extraction"]["items"]
-    assert pack["version"] == "4"
+    assert pack["version"] == "5"
 
-    # No IOC-section row survives with neither a value nor context.
-    assert not [
-        item
-        for item in items
-        if item["artifact_type"] in {"hash", "domain"}
-        and item["display_policy"] == "ioc_section"
-    ]
+    assert len(items) == len(extraction.items)
 
     values = {item.get("value") for item in items}
     for expected in (
@@ -396,14 +390,8 @@ def test_synthesis_pack_drops_metadata_only_ioc_rows_and_keeps_body_detail() -> 
     ):
         assert expected in values
 
-    # Every remaining row carries either a publishable value or usable context.
-    assert all(item.get("value") or item["context"].strip() for item in items)
-
-    # The 50 metadata-only IOC rows are gone, the behavioral evidence stays.
-    assert len(items) == len(extraction.items) - 50
-    serialized = json.dumps(pack, ensure_ascii=False)
-    assert "c2-0.example" not in serialized
-    assert f"{0:064x}" not in serialized
+    assert "c2-0.example" in values
+    assert f"{0:064x}" in values
 
     # The canonical extraction is untouched.
     assert len(extraction.items) == 57
@@ -424,121 +412,110 @@ def test_synthesis_pack_keeps_ioc_section_rows_that_still_carry_context() -> Non
 
     items = pack["technical_extraction"]["items"]
     assert len(items) == 1
-    assert "value" not in items[0]
+    assert items[0]["value"] == "c2.example"
     assert items[0]["context"] == "serveur de C2"
 
 
-# --- Q4 pack: a forbidden network value never leaks through a Q2 fact -------
+# --- Q4 pack: visible canonical values reach the model ----------------------
 
 
-def _meetingapp_extraction(*extra: ExtractionItem) -> TechnicalExtraction:
-    return TechnicalExtraction(
+def test_synthesis_pack_exposes_canonical_indicator_values() -> None:
+    extraction = TechnicalExtraction(
         items=(
             _artifact_item("D1", "meetingapp.site", ArtifactType.DOMAIN),
-            _item("infrastructure", "meetingapp[.]site", "domaine C2 réutilisé"),
-            _item(
-                "commands",
-                "ClickFix PowerShell",
-                "télécharge WinWebex.exe depuis hxxps://meetingapp[.]site/webexdownload",
+            _artifact_item("I1", "203.0.113.9", ArtifactType.IP),
+            _artifact_item("H1", "a" * 64, ArtifactType.HASH),
+            _artifact_item("E1", "operator@example.com", ArtifactType.EMAIL),
+            _artifact_item(
+                "F1", "libvlc.dll", ArtifactType.FILENAME, policy=DisplayPolicy.BODY_ONLY
             ),
-            *extra,
+            _artifact_item(
+                "P1",
+                "C:\\Users\\Public\\payload.dll",
+                ArtifactType.FILEPATH,
+                policy=DisplayPolicy.BODY_ONLY,
+            ),
         ),
         uncertainties=(),
     )
 
-
-def test_synthesis_pack_strips_forbidden_network_value_from_facts_and_contexts() -> None:
-    extraction = _meetingapp_extraction()
-
-    pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
-        _minimal_report(), extraction, {"https://core.example/report": "core"}
-    )
-    serialized = json.dumps(pack, ensure_ascii=False)
-
-    assert "meetingapp.site" not in serialized
-    assert "meetingapp[.]site" not in serialized
-    assert "meetingapp" not in serialized
-    assert "hxxps://meetingapp[.]site/webexdownload" not in serialized
-
-    items = pack["technical_extraction"]["items"]
-    infrastructure = next(item for item in items if item["category"] == "infrastructure")
-    commands = next(item for item in items if item["category"] == "commands")
-
-    # The bare-IOC fact keeps no value, but its functional context survives.
-    assert "value" not in infrastructure
-    assert infrastructure["context"] == "domaine C2 réutilisé"
-    # Only the indicator is rewritten, the sentence around it is preserved.
-    assert commands["value"] == "ClickFix PowerShell"
-    assert "WinWebex.exe" in commands["context"]
-    assert "[network indicator omitted]" in commands["context"]
-
-    # The canonical extraction is untouched.
-    assert extraction.items[1].value == "meetingapp[.]site"
-    assert "hxxps://meetingapp[.]site/webexdownload" in extraction.items[2].context
-
-
-def test_synthesis_pack_keeps_network_values_published_in_the_body() -> None:
-    extraction = _meetingapp_extraction(
-        _artifact_item("D2", "allowed.example", ArtifactType.DOMAIN, policy=DisplayPolicy.BOTH),
-    )
-
-    pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
-        _minimal_report(), extraction, {"https://core.example/report": "core"}
-    )
-
-    values = {item.get("value") for item in pack["technical_extraction"]["items"]}
-    assert "allowed.example" in values
-
-
-def test_synthesis_pack_leaves_nothing_validate_synthesis_would_reject() -> None:
-    """No pack string can be copied into the prose and rejected afterwards."""
-    extraction = _meetingapp_extraction(
-        _artifact_item("D2", "allowed.example", ArtifactType.DOMAIN, policy=DisplayPolicy.BOTH),
-        _artifact_item("I1", "203.0.113.9", ArtifactType.IP),
-        _artifact_item("U1", "https://meetingapp.site/webexdownload", ArtifactType.URL),
-        _item("infrastructure", "second stage sur 203[.]0[.]113[.]9", ""),
-    )
     report = _minimal_report()
-
     pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
         report, extraction, {"https://core.example/report": "core"}
     )
+    values = {item["value"] for item in pack["technical_extraction"]["items"]}
+    assert values == {
+        "meetingapp.site",
+        "203.0.113.9",
+        "a" * 64,
+        "operator@example.com",
+        "libvlc.dll",
+        "C:\\Users\\Public\\payload.dll",
+    }
 
-    body_candidates = [
-        text
-        for item in pack["technical_extraction"]["items"]
-        for text in (item.get("value", ""), item["context"])
-        if text
-    ]
-    assert body_candidates
-    for text in body_candidates:
-        result = validate_synthesis(f"{text} [S1]", report, extraction)
-        assert "ioc_repeated_in_body" not in result.errors, text
-        assert "raw_url" not in result.errors, text
+    synthesis = (
+        "Le second étage est récupéré depuis meetingapp.site ; l'implant communique "
+        "avec 203.0.113.9 et l'échantillon a pour SHA-256 "
+        + "a" * 64
+        + ". L'opérateur utilise operator@example.com ; VLC.exe charge libvlc.dll "
+        "depuis C:\\Users\\Public\\payload.dll [S1]."
+    )
+    result = validate_synthesis(synthesis, report, extraction)
+    assert result.usable, result.errors
 
 
-def test_synthesis_repair_prompt_names_the_offending_value() -> None:
-    result: ParseResult[str] = ParseResult()
-    result.errors.extend(["ioc_repeated_in_body", "ioc_repeated_in_body"])
-    result.violations.extend(
-        (
-            SynthesisViolation("ioc_repeated_in_body", "domain:evil.example", (10, 22)),
-            SynthesisViolation("ioc_repeated_in_body", "ip:203[.]0[.]113[.]9", (30, 45)),
-        )
+def test_synthesis_pack_filters_unsupported_excluded_and_hidden_items() -> None:
+    extraction = TechnicalExtraction(
+        items=(
+            _artifact_item("V1", "visible.example", ArtifactType.DOMAIN),
+            _artifact_item(
+                "U1", "unsupported.example", ArtifactType.DOMAIN, supported=False
+            ),
+            _artifact_item(
+                "E1",
+                "excluded.example",
+                ArtifactType.DOMAIN,
+                status=IndicatorStatus.EXCLUDED,
+            ),
+            _artifact_item(
+                "H1", "hidden.example", ArtifactType.DOMAIN, policy=DisplayPolicy.HIDDEN
+            ),
+        ),
+        uncertainties=(),
     )
 
-    problems = _repair_problem_descriptions(result)
-    prompt = ProductionPromptTemplates.get_format_repair_prompt(
-        stage="synthesis", problems=problems
+    pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
+        _minimal_report(), extraction, {"https://core.example/report": "core"}
     )
 
-    assert problems == [
-        "ioc_repeated_in_body: domain:evil.example",
-        "ioc_repeated_in_body: ip:203[.]0[.]113[.]9",
+    assert [item["value"] for item in pack["technical_extraction"]["items"]] == [
+        "visible.example"
     ]
-    assert "ioc_repeated_in_body: domain:evil.example" in prompt
-    assert "ioc_repeated_in_body: ip:203[.]0[.]113[.]9" in prompt
-    assert "Do not research, add, remove, or alter any fact." in prompt
+
+
+def test_dust_specter_exact_values_are_not_rejected_or_enumerated() -> None:
+    extraction = TechnicalExtraction(
+        items=(
+            _artifact_item("D1", "meetingapp.site", ArtifactType.DOMAIN),
+            _artifact_item(
+                "F1", "libvlc.dll", ArtifactType.FILENAME, policy=DisplayPolicy.BODY_ONLY
+            ),
+            _artifact_item(
+                "F2", "hostfxr.dll", ArtifactType.FILENAME, policy=DisplayPolicy.BODY_ONLY
+            ),
+        ),
+        uncertainties=(),
+    )
+    text = (
+        "La chaîne ClickFix récupère un second étage depuis meetingapp[.]site, "
+        "puis VLC.exe charge libvlc.dll avant le chargement de hostfxr.dll [S1]."
+    )
+
+    result = validate_synthesis(text, _minimal_report(), extraction)
+
+    assert result.usable, result.errors
+    assert "mass_network_enumeration" not in result.errors
+    assert "mass_hash_enumeration" not in result.errors
 
 
 def test_repair_problem_descriptions_fall_back_to_codes() -> None:

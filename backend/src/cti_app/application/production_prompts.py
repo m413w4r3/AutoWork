@@ -24,9 +24,9 @@ EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
 }
-SYNTHESIS_PROMPT_VERSION = "7"
+SYNTHESIS_PROMPT_VERSION = "8"
 REFERENCES_FORMAT_REPAIR_VERSION = "1"
-SYNTHESIS_FORMAT_REPAIR_VERSION = "3"
+SYNTHESIS_FORMAT_REPAIR_VERSION = "4"
 
 
 _Q2_WIRE_FORMAT = """FACT <category>
@@ -421,7 +421,7 @@ Expected structure:
 {expected_structure}
 """
 
-    TECHNICAL_SYNTHESIS_V7 = """You are a senior CTI technical writer. Write dense sourced French CTI prose.
+    TECHNICAL_SYNTHESIS_V8 = """You are a senior CTI technical writer. Write dense sourced French CTI prose.
 
 **Subject**: {subject_title}
 
@@ -538,28 +538,31 @@ Do not write unsupported defensive advice such as "Il est recommandé de
 bloquer..." or "Les organisations devraient...", unless the corpus explicitly
 provides that recommendation and it is relevant. Never invent a SOC playbook.
 
+Indicator selection:
+- You may cite any exact technical indicator or artifact supplied in the
+  SynthesisEvidencePack when it materially improves the analysis.
+- This includes IP addresses, domains, URLs, hashes, email addresses,
+  filenames, file paths, CVEs, process names, commands, ports and other
+  technical values.
+- Select examples for analytical value. Do not reproduce the IOC section as a
+  raw inventory or mechanically enumerate indicators when they add no
+  explanatory value.
+- The presence of a value in the final IOC section does not prevent you from
+  using the same value in the prose.
+- When mentioning network indicators in prose, prefer standard defanged CTI
+  notation where appropriate.
+
 Strict publication rules:
 - Produce no Markdown title or heading.
 - Produce no line named "Sources du corpus" and no final bibliography.
 - Produce no raw URL.
-- Do not enumerate IP addresses, domains, URLs or hashes.
-- Do not copy the IOC inventory; describe the functional role of indicators.
-- Precise network IOC values such as IP addresses, domains, URLs, hashes and
-  email addresses may appear in prose only when their display-policy permits
-  both body and IOC-section use. Otherwise describe their functional role.
-- Filenames, file paths and CVEs with display-policy body_only are technical or
-  behavioral details, not IOC-section inventory. They may appear exactly when
-  they add discriminating CTI value.
-- Do not turn those body-only artifacts into an exhaustive file inventory.
-  Retain only the examples needed to explain execution, persistence, C2,
-  evasion or hunting behavior.
 - Use no bold, backtick, code fence or italics; typography is applied downstream.
 - Keep paragraphs simple and omit empty or invented sections.
 
 Return only the synthesis prose with [S#] markers.
 """
 
-    SYNTHESIS_REPAIR_V3 = """Your previous synthesis violates deterministic publication rules.
+    SYNTHESIS_REPAIR_V4 = """Your previous synthesis violates deterministic publication rules.
 
 Violations, each as `code: offending detail`:
 {problems}
@@ -570,12 +573,6 @@ Keep valid [S#] citations.
 Apply the minimal rewrite that clears each listed violation:
 - Remove headings, bibliography, raw URLs, "Sources du corpus" lines and
   formatting marks.
-- For ioc_repeated_in_body, the detail names the exact forbidden value. Replace
-  only that precise value by a functional description of its role, for example
-  "un domaine de commande et contrôle" or "un serveur de collecte". Leave the
-  surrounding sentence and its technical meaning intact.
-- Replace an IOC inventory by a functional description instead of deleting the
-  paragraph.
 
 Never delete a whole technical fact when rewording one value is enough, and
 never add a fact, a source or an indicator. Return only French prose.
@@ -690,7 +687,7 @@ text: <event>
     def get_format_repair_prompt(cls, *, stage: str, problems: Sequence[str]) -> str:
         listed = "\n".join(f"- {problem}" for problem in problems) or "- structure illisible"
         if stage == "synthesis":
-            return cls.SYNTHESIS_REPAIR_V3.format(problems=listed)
+            return cls.SYNTHESIS_REPAIR_V4.format(problems=listed)
         # references is the only remaining stage using the generic repair.
         return cls.FORMAT_REPAIR_V1.format(
             problems=listed, expected_structure=cls._REFERENCES_STRUCTURE
@@ -702,7 +699,7 @@ text: <event>
         subject_title: str,
         synthesis_evidence_pack: str = "{}",
     ) -> str:
-        return cls.TECHNICAL_SYNTHESIS_V7.format(
+        return cls.TECHNICAL_SYNTHESIS_V8.format(
             subject_title=subject_title,
             synthesis_evidence_pack=synthesis_evidence_pack,
         )

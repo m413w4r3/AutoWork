@@ -307,11 +307,11 @@ def test_builder_never_emits_two_adjacent_footnotes_for_one_event() -> None:
     )
 
 
-def test_synthesis_validator_blocks_inventory_only_ioc_but_accepts_both() -> None:
-    rejected = validate_synthesis(
+def test_synthesis_validator_allows_ioc_section_values_in_body() -> None:
+    accepted = validate_synthesis(
         "Le domaine cloudlanecdn[.]com sert au C2 [S1].", _report(), _extraction()
     )
-    assert "ioc_repeated_in_body" in rejected.errors
+    assert accepted.usable, accepted.errors
     both = TechnicalExtraction(
         items=(
             _item(

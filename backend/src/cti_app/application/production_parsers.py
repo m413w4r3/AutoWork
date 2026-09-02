@@ -23,8 +23,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from cti_app.application.discovery_report_parser import extract_http_urls
 from cti_app.application.production_normalization import (
-    canonical_indicator_key,
-    display_indicator_value,
     normalize_indicator_value,
 )
 from cti_app.domain.discovery import SourceRole
@@ -1207,50 +1205,6 @@ _SYNTHESIS_IOC_PATTERNS = {
 }
 
 
-# A filename, file path or CVE is a behavioral/technical detail: the verifier
-# deliberately keeps them out of the IOC section (`allow_ioc=False`), so a
-# CONFIRMED_IOC status alone never makes their exact value unpublishable.
-BODY_DETAIL_ARTIFACT_TYPES = frozenset(
-    {ArtifactType.FILENAME, ArtifactType.FILEPATH, ArtifactType.CVE}
-)
-
-# Network indicators are IOC-section inventory: their exact value reaches the
-# prose only when the display policy explicitly covers both destinations.
-NETWORK_IOC_ARTIFACT_TYPES = frozenset(
-    {
-        ArtifactType.IP,
-        ArtifactType.DOMAIN,
-        ArtifactType.URL,
-        ArtifactType.HASH,
-        ArtifactType.EMAIL,
-    }
-)
-
-
-def exact_artifact_value_allowed_in_body(item: ExtractionItem) -> bool:
-    """Whether the exact value of ``item`` may appear in the synthesis prose.
-
-    Indicator status and display policy are two different dimensions: the
-    editorial destination is carried by ``display_policy`` and the artifact
-    type, never by ``indicator_status`` alone.
-    """
-    artifact_type = item.artifact_type
-    if artifact_type is None:
-        return True
-    if item.display_policy is DisplayPolicy.HIDDEN:
-        return False
-    if artifact_type in BODY_DETAIL_ARTIFACT_TYPES:
-        return item.display_policy in {DisplayPolicy.BODY_ONLY, DisplayPolicy.BOTH}
-    if artifact_type in NETWORK_IOC_ARTIFACT_TYPES:
-        return item.display_policy is DisplayPolicy.BOTH
-    # Detection rules and other non-indicator artifacts keep the historical
-    # rule: only a confirmed IOC kept out of the body is forbidden.
-    return (
-        item.indicator_status is not IndicatorStatus.CONFIRMED_IOC
-        or item.display_policy is DisplayPolicy.BOTH
-    )
-
-
 def validate_synthesis(
     text: str,
     reference_report: ReferenceReport,
@@ -1310,53 +1264,7 @@ def validate_synthesis(
         for match in pattern.finditer(body):
             reject(code, detail, match.span())
 
-    if isinstance(known_indicators, TechnicalExtraction):
-        extraction = known_indicators
-        for item in extraction.items:
-            if item.artifact_type is None or exact_artifact_value_allowed_in_body(item):
-                continue
-            artifact_type = item.artifact_type
-            try:
-                variants = {
-                    canonical_indicator_key(item.value, artifact_type),
-                    display_indicator_value(item.value, artifact_type, defanged=True),
-                }
-            except ValueError:
-                continue
-            for variant in sorted(variants, key=len, reverse=True):
-                occurrence = re.search(re.escape(variant), body, re.IGNORECASE)
-                if occurrence:
-                    reject(
-                        "ioc_repeated_in_body",
-                        f"{artifact_type.value}:{variant}",
-                        occurrence.span(),
-                    )
-                    break
-
-        hash_count = sum(
-            len(pattern.findall(body))
-            for kind, pattern in _SYNTHESIS_IOC_PATTERNS.items()
-            if kind in {"sha256", "sha1", "md5"}
-        )
-        if hash_count >= 3:
-            reject("mass_hash_enumeration", f"{hash_count} hash values")
-        # Compare only against extraction values: dotted prose is never guessed as a domain.
-        repeated_network = 0
-        for item in extraction.items:
-            if item.artifact_type not in {ArtifactType.IP, ArtifactType.DOMAIN}:
-                continue
-            try:
-                variants = {
-                    canonical_indicator_key(item.value, item.artifact_type),
-                    display_indicator_value(item.value, item.artifact_type, defanged=True),
-                }
-            except ValueError:
-                continue
-            if any(re.search(re.escape(value), body, re.IGNORECASE) for value in variants):
-                repeated_network += 1
-        if repeated_network >= 3:
-            reject("mass_network_enumeration", f"{repeated_network} network values")
-    else:
+    if not isinstance(known_indicators, TechnicalExtraction):
         normalized_known = {value.strip().lower() for value in known_indicators}
         for pattern in _SYNTHESIS_IOC_PATTERNS.values():
             for match in pattern.finditer(body):

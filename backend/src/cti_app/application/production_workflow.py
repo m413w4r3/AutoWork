@@ -45,13 +45,8 @@ from cti_app.application.production_artifact_verification import (
     verify_q2_proposals,
 )
 from cti_app.application.production_context import build_subject_production_context
-from cti_app.application.production_normalization import (
-    canonical_indicator_key,
-    display_indicator_value,
-)
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_parsers import (
-    NETWORK_IOC_ARTIFACT_TYPES,
     PARSER_VERSION,
     Q2_EXTRACTION_CONTRACT_VERSION,
     Q2_MARKDOWN_PARSER_VERSION,
@@ -61,7 +56,6 @@ from cti_app.application.production_parsers import (
     ParseResult,
     Q2SourceOutput,
     ReferenceReport,
-    exact_artifact_value_allowed_in_body,
     parse_q2_proposals_markdown,
     parse_reference_report,
     reference_report_from_json,
@@ -144,12 +138,8 @@ Q2_SUCCESSFUL_CHECKPOINT_VERSION = "q2-run-local-v1"
 REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
 
 # Functional content of the Q4 evidence pack. Bumped whenever what Q4 can read
-# changes, so a cached synthesis built on a leakier pack is never reused.
-SYNTHESIS_EVIDENCE_PACK_VERSION = "4"
-
-# Deterministic, obviously non-factual stand-in for a network indicator Q4 is
-# not allowed to publish. It must never look like an indicator itself.
-NETWORK_VALUE_PLACEHOLDER = "[network indicator omitted]"
+# changes, so a cached synthesis built on an older pack is never reused.
+SYNTHESIS_EVIDENCE_PACK_VERSION = "5"
 
 # Keep archive reads within the same decoded-document limit as collection and
 # deterministic source processing. This is a local proof read, never prompt
@@ -381,8 +371,8 @@ def _repair_problem_descriptions(result: Any) -> list[str]:
     """Describe the parse failures precisely enough for a repair turn.
 
     Bare error codes collapse several distinct violations into the same line
-    ("ioc_repeated_in_body" three times) and hide which value must be rewritten.
-    When the parse result carries violations, expose ``code: detail``.
+    and hide which value must be rewritten. When the parse result carries
+    violations, expose ``code: detail``.
     """
     violations = getattr(result, "violations", None) or ()
     described: list[str] = []
@@ -2772,73 +2762,6 @@ class ProductionWorkflowOrchestrator:
         }
 
     @staticmethod
-    def _forbidden_network_variants(extraction: Any) -> tuple[str, ...]:
-        """Exact spellings ``validate_synthesis`` would reject inside the prose.
-
-        Built from the network artifacts of the canonical extraction only: a Q2
-        FACT carries no artifact type, so the same indicator reaching Q4 through
-        a fact value or a free-text context must be matched against this set.
-        """
-        variants: set[str] = set()
-        for item in getattr(extraction, "items", ()):
-            artifact_type = item.artifact_type
-            if artifact_type not in NETWORK_IOC_ARTIFACT_TYPES:
-                continue
-            if exact_artifact_value_allowed_in_body(item):
-                continue
-            try:
-                variants.update(
-                    {
-                        canonical_indicator_key(item.value, artifact_type),
-                        display_indicator_value(item.value, artifact_type, defanged=True),
-                    }
-                )
-            except ValueError:
-                # A malformed literal is never publishable prose either; the raw
-                # spelling is still the only thing Q4 could copy.
-                pass
-            variants.add(item.value.strip())
-        # Longest first so a URL is never partially rewritten by its own host.
-        return tuple(sorted((variant for variant in variants if variant), key=len, reverse=True))
-
-    @staticmethod
-    def _sanitize_forbidden_network_values(text: str, variants: tuple[str, ...]) -> str:
-        """Replace every forbidden network spelling by a neutral marker.
-
-        Only the indicator is rewritten: the functional sentence around it is
-        preserved. A URL token carrying a forbidden host is replaced whole, so
-        no dangling scheme or path survives as a publishable fragment.
-        """
-        if not text or not variants:
-            return text
-
-        def contains_forbidden(candidate: str) -> bool:
-            lowered = candidate.lower()
-            return any(variant.lower() in lowered for variant in variants)
-
-        def replace_token(match: re.Match[str]) -> str:
-            token = match.group(0)
-            return NETWORK_VALUE_PLACEHOLDER if contains_forbidden(token) else token
-
-        sanitized = re.sub(
-            r"\b(?:https?|hxxps?)://[^\s<>\"'\]}]*",
-            replace_token,
-            text,
-            flags=re.IGNORECASE,
-        )
-        for variant in variants:
-            sanitized = re.sub(
-                re.escape(variant), NETWORK_VALUE_PLACEHOLDER, sanitized, flags=re.IGNORECASE
-            )
-        return sanitized
-
-    @staticmethod
-    def _carries_information(text: str) -> bool:
-        """Whether ``text`` still says something once the markers are removed."""
-        residue = text.replace(NETWORK_VALUE_PLACEHOLDER, " ")
-        return any(character.isalnum() for character in residue)
-
-    @staticmethod
     def _build_synthesis_evidence_pack(
         report: ReferenceReport,
         extraction: Any,
@@ -2850,10 +2773,6 @@ class ProductionWorkflowOrchestrator:
         material. In particular, never expose source URLs or model IDs, or
         items explicitly kept out of publication.
         """
-        forbidden = ProductionWorkflowOrchestrator._forbidden_network_variants(extraction)
-        sanitize = ProductionWorkflowOrchestrator._sanitize_forbidden_network_values
-        carries_information = ProductionWorkflowOrchestrator._carries_information
-
         items: list[dict[str, Any]] = []
         for item in extraction.items:
             if (
@@ -2862,34 +2781,15 @@ class ProductionWorkflowOrchestrator:
                 or item.display_policy.value == "hidden"
             ):
                 continue
-            # A forbidden indicator also travels through untyped Q2 facts and
-            # through the free-text context of unrelated rows; strip it there
-            # too, otherwise Q4 receives a value it may never publish.
-            context = sanitize(item.context, forbidden)
             published: dict[str, Any] = {
                 "category": item.category,
-                "context": context,
+                "value": item.value,
+                "context": item.context,
                 "source_ids": sorted(item.source_ids),
                 "indicator_status": item.indicator_status.value,
                 "display_policy": item.display_policy.value,
                 "artifact_type": item.artifact_type.value if item.artifact_type else None,
             }
-            # Q4 only receives the exact values it is allowed to write: file
-            # names, file paths and CVEs are body detail, network indicators
-            # reach the prose only with BOTH.
-            exposes_value = exact_artifact_value_allowed_in_body(item)
-            if exposes_value:
-                value = sanitize(item.value, forbidden)
-                # A fact whose value is only the forbidden indicator keeps no
-                # value at all; a sentence around it survives sanitized.
-                if carries_information(value):
-                    published["value"] = value
-                else:
-                    exposes_value = False
-            if not exposes_value and not carries_information(context):
-                # Neither a value nor context: an IOC-section row with nothing
-                # left to say. Dozens of those only burn Q4 tokens.
-                continue
             items.append(published)
 
         return {
