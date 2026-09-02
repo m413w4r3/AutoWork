@@ -56,6 +56,7 @@ from cti_app.application.production_parsers import (
     ParseResult,
     Q2SourceOutput,
     ReferenceReport,
+    exact_artifact_value_allowed_in_body,
     parse_q2_proposals_markdown,
     parse_reference_report,
     reference_report_from_json,
@@ -361,6 +362,28 @@ def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
     if isinstance(model_run_id, UUID):
         result["model_run_id"] = str(model_run_id)
     return result
+
+
+def _repair_problem_descriptions(result: Any) -> list[str]:
+    """Describe the parse failures precisely enough for a repair turn.
+
+    Bare error codes collapse several distinct violations into the same line
+    ("ioc_repeated_in_body" three times) and hide which value must be rewritten.
+    When the parse result carries violations, expose ``code: detail``.
+    """
+    violations = getattr(result, "violations", None) or ()
+    described: list[str] = []
+    for violation in violations:
+        code = getattr(violation, "code", "")
+        if not code:
+            continue
+        detail = " ".join((getattr(violation, "detail", "") or "").split())
+        if len(detail) > 200:
+            detail = f"{detail[:200]}…"
+        described.append(f"{code}: {detail}" if detail else code)
+    if described:
+        return list(dict.fromkeys(described))
+    return list(getattr(result, "errors", ()) or ())
 
 
 @dataclass(frozen=True, slots=True)
@@ -977,7 +1000,7 @@ class ProductionWorkflowOrchestrator:
             return result, raw, turn.id, model_run_id
 
         repair_prompt = ProductionPromptTemplates.get_format_repair_prompt(
-            stage=stage, problems=result.errors
+            stage=stage, problems=_repair_problem_descriptions(result)
         )
         repair_idempotency_key = (
             f"{stage}-format-repair-{run.id}-v{prompt_version}{identity}-rv{repair_version}"
@@ -2763,13 +2786,20 @@ class ProductionWorkflowOrchestrator:
                 "display_policy": item.display_policy.value,
                 "artifact_type": item.artifact_type.value if item.artifact_type else None,
             }
-            # Precise indicators are publishable in prose only with BOTH.
-            if item.artifact_type is None or item.display_policy.value == "both":
+            # Q4 only receives the exact values it is allowed to write: file
+            # names, file paths and CVEs are body detail, network indicators
+            # reach the prose only with BOTH.
+            exposes_value = exact_artifact_value_allowed_in_body(item)
+            if exposes_value:
                 published["value"] = item.value
+            elif not item.context.strip():
+                # Neither a value nor context: an IOC-section row with nothing
+                # left to say. Dozens of those only burn Q4 tokens.
+                continue
             items.append(published)
 
         return {
-            "version": "2",
+            "version": "3",
             "reference_report": {
                 "sources": [
                     {
@@ -3272,7 +3302,7 @@ def _synthesis_input_hash(
             "reference_report_hash": reference_report_hash,
             "extraction_hash": extraction_hash,
             "technical_extraction_hash": technical_extraction_hash,
-            "synthesis_evidence_pack_version": "2",
+            "synthesis_evidence_pack_version": "3",
             "synthesis_evidence_pack_hash": synthesis_evidence_pack_hash,
             "prompt_version": prompt_version,
             "format_repair_version": format_repair_version,

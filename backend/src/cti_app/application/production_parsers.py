@@ -1207,6 +1207,50 @@ _SYNTHESIS_IOC_PATTERNS = {
 }
 
 
+# A filename, file path or CVE is a behavioral/technical detail: the verifier
+# deliberately keeps them out of the IOC section (`allow_ioc=False`), so a
+# CONFIRMED_IOC status alone never makes their exact value unpublishable.
+BODY_DETAIL_ARTIFACT_TYPES = frozenset(
+    {ArtifactType.FILENAME, ArtifactType.FILEPATH, ArtifactType.CVE}
+)
+
+# Network indicators are IOC-section inventory: their exact value reaches the
+# prose only when the display policy explicitly covers both destinations.
+NETWORK_IOC_ARTIFACT_TYPES = frozenset(
+    {
+        ArtifactType.IP,
+        ArtifactType.DOMAIN,
+        ArtifactType.URL,
+        ArtifactType.HASH,
+        ArtifactType.EMAIL,
+    }
+)
+
+
+def exact_artifact_value_allowed_in_body(item: ExtractionItem) -> bool:
+    """Whether the exact value of ``item`` may appear in the synthesis prose.
+
+    Indicator status and display policy are two different dimensions: the
+    editorial destination is carried by ``display_policy`` and the artifact
+    type, never by ``indicator_status`` alone.
+    """
+    artifact_type = item.artifact_type
+    if artifact_type is None:
+        return True
+    if item.display_policy is DisplayPolicy.HIDDEN:
+        return False
+    if artifact_type in BODY_DETAIL_ARTIFACT_TYPES:
+        return item.display_policy in {DisplayPolicy.BODY_ONLY, DisplayPolicy.BOTH}
+    if artifact_type in NETWORK_IOC_ARTIFACT_TYPES:
+        return item.display_policy is DisplayPolicy.BOTH
+    # Detection rules and other non-indicator artifacts keep the historical
+    # rule: only a confirmed IOC kept out of the body is forbidden.
+    return (
+        item.indicator_status is not IndicatorStatus.CONFIRMED_IOC
+        or item.display_policy is DisplayPolicy.BOTH
+    )
+
+
 def validate_synthesis(
     text: str,
     reference_report: ReferenceReport,
@@ -1269,11 +1313,7 @@ def validate_synthesis(
     if isinstance(known_indicators, TechnicalExtraction):
         extraction = known_indicators
         for item in extraction.items:
-            if (
-                item.indicator_status is not IndicatorStatus.CONFIRMED_IOC
-                or item.display_policy is DisplayPolicy.BOTH
-                or item.artifact_type is None
-            ):
+            if item.artifact_type is None or exact_artifact_value_allowed_in_body(item):
                 continue
             artifact_type = item.artifact_type
             try:

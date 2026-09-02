@@ -6,6 +6,8 @@ from cti_app.application.production_parsers import (
     DisplayPolicy,
     ExtractionItem,
     IndicatorStatus,
+    ParseResult,
+    SynthesisViolation,
     TechnicalExtraction,
     parse_reference_report,
 )
@@ -13,8 +15,12 @@ from cti_app.application.production_prompts import (
     SYNTHESIS_PROMPT_VERSION,
     ProductionPromptTemplates,
 )
-from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
+from cti_app.application.production_workflow import (
+    ProductionWorkflowOrchestrator,
+    _repair_problem_descriptions,
+)
 from cti_app.domain.production import DetectionRule, DetectionRuleType
+from cti_app.domain.publication import ArtifactType
 
 
 def test_references_prompt_keeps_core_and_supporting_separate() -> None:
@@ -74,7 +80,7 @@ text: Event
         },
     )
 
-    assert pack["version"] == "2"
+    assert pack["version"] == "3"
     assert [source["tier"] for source in pack["reference_report"]["sources"]] == [
         "core",
         "supporting",
@@ -91,13 +97,13 @@ def test_synthesis_prompt_makes_core_backbone_without_quota() -> None:
     assert "quota" not in prompt.lower()
 
 
-def test_synthesis_prompt_version_matches_v6_template() -> None:
-    assert SYNTHESIS_PROMPT_VERSION == "6"
-    assert hasattr(ProductionPromptTemplates, "TECHNICAL_SYNTHESIS_V6")
+def test_synthesis_prompt_version_matches_v7_template() -> None:
+    assert SYNTHESIS_PROMPT_VERSION == "7"
+    assert hasattr(ProductionPromptTemplates, "TECHNICAL_SYNTHESIS_V7")
 
 
 def test_synthesis_prompt_requires_technical_cti_depth() -> None:
-    """The V6 contract, not any particular model wording."""
+    """The V7 contract, not any particular model wording."""
     prompt = ProductionPromptTemplates.get_synthesis_prompt("Subject")
     lowered = prompt.lower()
 
@@ -151,6 +157,13 @@ def test_synthesis_prompt_requires_technical_cti_depth() -> None:
     assert "Produce no raw URL." in prompt
     assert "Do not copy the IOC inventory" in prompt
     assert "no final bibliography" in prompt
+
+    # V7 separates IOC destination from artifact type.
+    assert "may appear in prose only when their display-policy permits" in prompt
+    assert "both body and IOC-section use" in prompt
+    assert "not IOC-section inventory" in prompt
+    assert "exhaustive file inventory" in prompt
+    assert "A precise IOC value may appear only when its display-policy is both." not in prompt
 
 
 def test_synthesis_repair_prompt_stays_structural() -> None:
@@ -258,7 +271,7 @@ def test_synthesis_pack_excludes_detection_rules_and_preserves_extraction() -> N
         _minimal_report(), extraction, {"https://core.example/report": "core"}
     )
 
-    assert pack["version"] == "2"
+    assert pack["version"] == "3"
     assert "detection_rules" not in pack["technical_extraction"]
     assert extraction.rules == (rule, unsupported)
     serialized = json.dumps(pack, ensure_ascii=False)
@@ -278,3 +291,168 @@ def test_synthesis_pack_omits_detection_rules_when_none() -> None:
     )
 
     assert "detection_rules" not in pack["technical_extraction"]
+
+
+# --- Q4 pack: body detail keeps its value, IOC-section noise is dropped -----
+
+
+def _artifact_item(
+    local_id: str,
+    value: str,
+    artifact_type: ArtifactType,
+    *,
+    status: IndicatorStatus = IndicatorStatus.CONFIRMED_IOC,
+    policy: DisplayPolicy = DisplayPolicy.IOC_SECTION,
+    category: str = "network_artifacts",
+    context: str = "",
+) -> ExtractionItem:
+    return ExtractionItem(
+        local_id=local_id,
+        category=category,
+        value=value,
+        context=context,
+        artifact_type=artifact_type,
+        attack_id=None,
+        reference_ids=(),
+        source_ids=("S1",),
+        supported=True,
+        indicator_status=status,
+        display_policy=policy,
+    )
+
+
+def _dust_specter_pack_extraction() -> TechnicalExtraction:
+    hashes = tuple(
+        _artifact_item(f"H{index}", f"{index:064x}", ArtifactType.HASH)
+        for index in range(40)
+    )
+    domains = tuple(
+        _artifact_item(f"D{index}", f"c2-{index}.example", ArtifactType.DOMAIN)
+        for index in range(10)
+    )
+    files = tuple(
+        _artifact_item(
+            f"F{index}",
+            name,
+            ArtifactType.FILENAME,
+            policy=DisplayPolicy.BODY_ONLY,
+            category="files",
+            context="chaîne d'exécution",
+        )
+        for index, name in enumerate(("libvlc.dll", "in.txt", "hostfxr.dll"))
+    )
+    filepath = _artifact_item(
+        "P1",
+        "C:\\Users\\Public\\twintask\\in.txt",
+        ArtifactType.FILEPATH,
+        policy=DisplayPolicy.BODY_ONLY,
+        category="files",
+        context="chemin de travail",
+    )
+    cve = _artifact_item(
+        "C1",
+        "CVE-2026-1234",
+        ArtifactType.CVE,
+        policy=DisplayPolicy.BODY_ONLY,
+        category="cves",
+        context="vulnérabilité exploitée",
+    )
+    behavioral = (
+        _item("infection_chain", "VLC.exe charge libvlc.dll", "side-loading"),
+        _item("persistence", "tâche planifiée TWINTASK", "persistance"),
+    )
+    return TechnicalExtraction(
+        items=(*hashes, *domains, *files, filepath, cve, *behavioral),
+        uncertainties=(),
+    )
+
+
+def test_synthesis_pack_drops_metadata_only_ioc_rows_and_keeps_body_detail() -> None:
+    extraction = _dust_specter_pack_extraction()
+
+    pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
+        _minimal_report(), extraction, {"https://core.example/report": "core"}
+    )
+
+    items = pack["technical_extraction"]["items"]
+    assert pack["version"] == "3"
+
+    # No IOC-section row survives with neither a value nor context.
+    assert not [
+        item
+        for item in items
+        if item["artifact_type"] in {"hash", "domain"}
+        and item["display_policy"] == "ioc_section"
+    ]
+
+    values = {item.get("value") for item in items}
+    for expected in (
+        "libvlc.dll",
+        "in.txt",
+        "hostfxr.dll",
+        "C:\\Users\\Public\\twintask\\in.txt",
+        "CVE-2026-1234",
+    ):
+        assert expected in values
+
+    # Every remaining row carries either a publishable value or usable context.
+    assert all(item.get("value") or item["context"].strip() for item in items)
+
+    # The 50 metadata-only IOC rows are gone, the behavioral evidence stays.
+    assert len(items) == len(extraction.items) - 50
+    serialized = json.dumps(pack, ensure_ascii=False)
+    assert "c2-0.example" not in serialized
+    assert f"{0:064x}" not in serialized
+
+    # The canonical extraction is untouched.
+    assert len(extraction.items) == 57
+    assert sum(item.artifact_type is ArtifactType.HASH for item in extraction.items) == 40
+
+
+def test_synthesis_pack_keeps_ioc_section_rows_that_still_carry_context() -> None:
+    extraction = TechnicalExtraction(
+        items=(
+            _artifact_item("D1", "c2.example", ArtifactType.DOMAIN, context="serveur de C2"),
+        ),
+        uncertainties=(),
+    )
+
+    pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
+        _minimal_report(), extraction, {"https://core.example/report": "core"}
+    )
+
+    items = pack["technical_extraction"]["items"]
+    assert len(items) == 1
+    assert "value" not in items[0]
+    assert items[0]["context"] == "serveur de C2"
+
+
+def test_synthesis_repair_prompt_names_the_offending_value() -> None:
+    result: ParseResult[str] = ParseResult()
+    result.errors.extend(["ioc_repeated_in_body", "ioc_repeated_in_body"])
+    result.violations.extend(
+        (
+            SynthesisViolation("ioc_repeated_in_body", "domain:evil.example", (10, 22)),
+            SynthesisViolation("ioc_repeated_in_body", "ip:203[.]0[.]113[.]9", (30, 45)),
+        )
+    )
+
+    problems = _repair_problem_descriptions(result)
+    prompt = ProductionPromptTemplates.get_format_repair_prompt(
+        stage="synthesis", problems=problems
+    )
+
+    assert problems == [
+        "ioc_repeated_in_body: domain:evil.example",
+        "ioc_repeated_in_body: ip:203[.]0[.]113[.]9",
+    ]
+    assert "ioc_repeated_in_body: domain:evil.example" in prompt
+    assert "ioc_repeated_in_body: ip:203[.]0[.]113[.]9" in prompt
+    assert "Do not research, add, remove, or alter any fact." in prompt
+
+
+def test_repair_problem_descriptions_fall_back_to_codes() -> None:
+    result: ParseResult[str] = ParseResult()
+    result.errors.append("empty_response")
+
+    assert _repair_problem_descriptions(result) == ["empty_response"]

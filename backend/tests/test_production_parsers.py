@@ -12,15 +12,23 @@ from datetime import date
 
 import pytest
 
+from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.production_parsers import (
+    DisplayPolicy,
+    ExtractionItem,
+    IndicatorStatus,
     ParsedEvent,
     ParsedSource,
     ReferenceReport,
+    SemanticType,
+    TechnicalExtraction,
+    exact_artifact_value_allowed_in_body,
     parse_reference_report,
     validate_synthesis,
 )
 from cti_app.application.production_prompts import ProductionPromptTemplates
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.publication import ArtifactType
 
 RESEARCH_DATE = date(2026, 8, 1)
 
@@ -503,3 +511,195 @@ def test_prose_is_never_mistaken_for_a_bare_heading() -> None:
     assert len(result.value.events) == 6
     joined = " ".join(event.text for event in result.value.events)
     assert "qui continue ici" in joined
+
+
+# --- Body-only artifacts vs network IOC section (Dust-Specter regression) ---
+
+
+def _artifact(
+    local_id: str,
+    value: str,
+    artifact_type: ArtifactType,
+    *,
+    status: IndicatorStatus = IndicatorStatus.CONFIRMED_IOC,
+    policy: DisplayPolicy = DisplayPolicy.BODY_ONLY,
+    category: str = "files",
+    context: str = "chaîne d'exécution",
+) -> ExtractionItem:
+    return ExtractionItem(
+        local_id=local_id,
+        category=category,
+        value=value,
+        context=context,
+        artifact_type=artifact_type,
+        attack_id=None,
+        reference_ids=(),
+        source_ids=("S1",),
+        supported=True,
+        semantic_type=(
+            SemanticType.FILE
+            if artifact_type in {ArtifactType.FILENAME, ArtifactType.FILEPATH}
+            else SemanticType.INDICATOR
+        ),
+        indicator_status=status,
+        display_policy=policy,
+        normalized_value=normalize_indicator_value(value, artifact_type),
+    )
+
+
+def _dust_specter_extraction() -> TechnicalExtraction:
+    return TechnicalExtraction(
+        items=(
+            _artifact("F1", "libvlc.dll", ArtifactType.FILENAME),
+            _artifact("F2", "in.txt", ArtifactType.FILENAME, status=IndicatorStatus.CONTEXTUAL),
+            _artifact("F3", "hostfxr.dll", ArtifactType.FILENAME),
+            _artifact(
+                "D1",
+                "evil.example",
+                ArtifactType.DOMAIN,
+                policy=DisplayPolicy.IOC_SECTION,
+                category="network_artifacts",
+                context="C2",
+            ),
+        )
+    )
+
+
+DUST_SPECTER_SYNTHESIS = (
+    "VLC.exe charge latéralement libvlc.dll ; TWINTASK surveille in.txt, "
+    "puis WingetUI.exe charge hostfxr.dll [S1]."
+)
+
+
+def test_body_only_file_artifacts_are_not_ioc_repetition() -> None:
+    """A confirmed filename kept out of the IOC section is behavioral detail."""
+    result = validate_synthesis(
+        DUST_SPECTER_SYNTHESIS, _corpus(), _dust_specter_extraction()
+    )
+
+    assert result.usable, result.errors
+
+
+def test_ioc_section_domain_stays_forbidden_in_body() -> None:
+    result = validate_synthesis(
+        f"{DUST_SPECTER_SYNTHESIS[:-1]} et contacte evil.example [S1].",
+        _corpus(),
+        _dust_specter_extraction(),
+    )
+
+    assert not result.usable
+    assert "ioc_repeated_in_body" in result.errors
+    assert any(
+        violation.code == "ioc_repeated_in_body" and "evil.example" in violation.detail
+        for violation in result.violations
+    )
+
+
+def test_body_only_filepath_and_cve_values_are_allowed() -> None:
+    extraction = TechnicalExtraction(
+        items=(
+            _artifact("P1", "C:\\Users\\Public\\twintask\\in.txt", ArtifactType.FILEPATH),
+            _artifact("C1", "CVE-2026-1234", ArtifactType.CVE, category="cves"),
+        )
+    )
+
+    result = validate_synthesis(
+        "Le chargeur écrit C:\\Users\\Public\\twintask\\in.txt et exploite "
+        "CVE-2026-1234 [S1].",
+        _corpus(),
+        extraction,
+    )
+
+    assert result.usable, result.errors
+
+
+@pytest.mark.parametrize(
+    ("artifact_type", "value", "written"),
+    (
+        (ArtifactType.DOMAIN, "evil.example", "evil[.]example"),
+        (ArtifactType.IP, "203.0.113.9", "203[.]0[.]113[.]9"),
+        (ArtifactType.URL, "hxxps://evil.example/gate", "hxxps://evil[.]example/gate"),
+        (ArtifactType.HASH, "b" * 64, "b" * 64),
+        (ArtifactType.EMAIL, "operator@evil.example", "operator(at)evil[.]example"),
+    ),
+)
+def test_network_ioc_section_values_stay_rejected(
+    artifact_type: ArtifactType, value: str, written: str
+) -> None:
+    extraction = TechnicalExtraction(
+        items=(
+            _artifact(
+                "N1",
+                value,
+                artifact_type,
+                policy=DisplayPolicy.IOC_SECTION,
+                category="network_artifacts",
+            ),
+        )
+    )
+
+    result = validate_synthesis(f"L'implant contacte {written} [S1].", _corpus(), extraction)
+
+    assert not result.usable
+    assert "ioc_repeated_in_body" in result.errors
+
+
+def test_hidden_artifact_value_stays_rejected() -> None:
+    extraction = TechnicalExtraction(
+        items=(
+            _artifact(
+                "H1",
+                "hidden.example",
+                ArtifactType.DOMAIN,
+                status=IndicatorStatus.EXCLUDED,
+                policy=DisplayPolicy.HIDDEN,
+                category="network_artifacts",
+            ),
+            _artifact(
+                "H2",
+                "secret.dll",
+                ArtifactType.FILENAME,
+                status=IndicatorStatus.EXCLUDED,
+                policy=DisplayPolicy.HIDDEN,
+            ),
+        )
+    )
+
+    for value in ("hidden.example", "secret.dll"):
+        result = validate_synthesis(f"Le chargeur utilise {value} [S1].", _corpus(), extraction)
+        assert not result.usable
+        assert "ioc_repeated_in_body" in result.errors
+
+
+def test_both_policy_domain_remains_publishable() -> None:
+    extraction = TechnicalExtraction(
+        items=(
+            _artifact(
+                "B1",
+                "public.example",
+                ArtifactType.DOMAIN,
+                policy=DisplayPolicy.BOTH,
+                category="network_artifacts",
+            ),
+        )
+    )
+
+    result = validate_synthesis(
+        "Le C2 public.example reste actif [S1].", _corpus(), extraction
+    )
+
+    assert result.usable, result.errors
+
+
+def test_exact_value_permission_separates_status_from_destination() -> None:
+    confirmed_filename = _artifact("F1", "libvlc.dll", ArtifactType.FILENAME)
+    confirmed_domain = _artifact(
+        "D1",
+        "evil.example",
+        ArtifactType.DOMAIN,
+        policy=DisplayPolicy.IOC_SECTION,
+        category="network_artifacts",
+    )
+
+    assert exact_artifact_value_allowed_in_body(confirmed_filename)
+    assert not exact_artifact_value_allowed_in_body(confirmed_domain)
