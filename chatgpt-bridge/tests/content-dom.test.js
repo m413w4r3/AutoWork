@@ -1339,7 +1339,7 @@ const PLACEHOLDER_ID =
       "l'identité doit venir du nœud courant, pas du placeholder détaché",
     );
     assert.equal(done.metadata?.initial_turn_id, "stable-assistant-42");
-    assert.equal(done.metadata?.content_script_version, "30");
+    assert.equal(done.metadata?.content_script_version, "31");
   }
 
   // Même remplacement, mais l'UI reste bloquée « en streaming » : le candidat

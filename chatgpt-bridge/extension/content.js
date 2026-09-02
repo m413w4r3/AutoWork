@@ -8,7 +8,7 @@
 
 // Affichée au chargement : permet de vérifier dans la console quel code tourne
 // réellement dans l'onglet (recharger l'extension ne suffit pas à le remplacer).
-const VERSION = "30";
+const VERSION = "31";
 
 // Journalise dans la console les décisions de la boucle de streaming, à chaque
 // changement d'état. Utile quand l'UI d'OpenAI change et qu'une réponse arrive
@@ -289,6 +289,18 @@ function documentHasFocus() {
   }
 }
 
+/** Snapshot immuable du début d'un run : les deltas restent propres à ce run. */
+function captureRunStartDiagnostics() {
+  return {
+    started_visibility_state: document.visibilityState ?? null,
+    started_hidden:
+      typeof document.hidden === "boolean" ? document.hidden : null,
+    started_has_focus: documentHasFocus(),
+    visible_transitions: foregroundActivity.visible_transitions,
+    focus_gains: foregroundActivity.focus_gains,
+  };
+}
+
 /**
  * État de plan de la page et fraîcheur des trois horloges d'observation.
  * Strictement sans contenu : états standards et durées uniquement — jamais de
@@ -298,12 +310,38 @@ function pageStateDiagnostics(now, sources = {}) {
   const since = (value) =>
     Number.isFinite(value) && value > 0 ? Math.max(0, now - value) : null;
   const watcher = sources.watcher;
+  const run = sources.run;
+  const delta = (current, baseline) =>
+    Number.isInteger(current) &&
+    Number.isInteger(baseline) &&
+    current >= baseline
+      ? current - baseline
+      : 0;
   return {
     visibility_state: document.visibilityState ?? null,
     hidden: document.hidden ?? null,
     has_focus: documentHasFocus(),
     visible_transitions: foregroundActivity.visible_transitions,
     focus_gains: foregroundActivity.focus_gains,
+    ...(run
+      ? {
+          started_visibility_state: run.started_visibility_state,
+          started_hidden: run.started_hidden,
+          started_has_focus: run.started_has_focus,
+          focus_gains_during_run: delta(
+            foregroundActivity.focus_gains,
+            run.focus_gains,
+          ),
+          visible_transitions_during_run: delta(
+            foregroundActivity.visible_transitions,
+            run.visible_transitions,
+          ),
+        }
+      : {}),
+    ...(Number.isInteger(sources.stableObservations) &&
+    sources.stableObservations >= 0
+      ? { stable_observations: sources.stableObservations }
+      : {}),
     ms_since_dom_mutation: since(watcher ? watcher.lastMutationAt : null),
     ms_since_observation: since(sources.lastObservationAt),
     ms_since_heartbeat: since(sources.lastHeartbeatAt),
@@ -740,6 +778,7 @@ async function waitForFirstAssistantTurn(
   sendBtn,
   submissionSnapshot,
   assistantTurnsBefore,
+  run,
 ) {
   const startedAt = Date.now();
   let lastActivityAt = startedAt;
@@ -770,6 +809,7 @@ async function waitForFirstAssistantTurn(
               watcher,
               lastObservationAt,
               lastHeartbeatAt,
+              run,
             }),
           },
         });
@@ -810,6 +850,7 @@ async function waitForFirstAssistantTurn(
             watcher,
             lastObservationAt,
             lastHeartbeatAt,
+            run,
           }),
         };
         throw error;
@@ -1630,7 +1671,7 @@ function incompleteAnswer({
  * Suit la réponse dans le DOM sans transmettre les snapshots intermédiaires.
  * Chaque observation remplace la précédente, car le rendu n'est pas append-only.
  */
-async function streamAnswer(job, locator, before) {
+async function streamAnswer(job, locator, before, run) {
   const output = globalThis.ChatGPTBridgeFinalOutput.createAccumulator();
   let vu = ""; // relevé précédent, pour mesurer la stabilité
   let stableSince = null;
@@ -1666,6 +1707,8 @@ async function streamAnswer(job, locator, before) {
       watcher,
       lastObservationAt,
       lastHeartbeatAt,
+      run,
+      stableObservations,
     });
   let finalPageState = null;
 
@@ -1715,6 +1758,8 @@ async function streamAnswer(job, locator, before) {
               watcher,
               lastObservationAt,
               lastHeartbeatAt,
+              run,
+              stableObservations,
             }),
           },
         });
@@ -1847,61 +1892,94 @@ async function streamAnswer(job, locator, before) {
         });
       }
 
-      if (
-        full.length > 0 &&
-        finished !== false &&
-        stableForMs >= FINALIZATION_STALL_MS &&
-        stableObservations >= MIN_STALL_OBSERVATIONS
-      ) {
-        return incompleteAnswer({
-          reason: "finalization_stalled",
-          text: full,
-          ...incompleteFields,
-        });
+      let verifyFinal = false;
+      if (finished === true) {
+        // `assistant_actions` est une finalité explicite : elle ne peut jamais
+        // devenir `finalization_stalled`, même après un réveil tardif.
+        verifyFinal = stable && full.length > 0;
+      } else if (finished === false) {
+        // Un texte stable n'est PAS la preuve qu'une génération active a échoué.
+        // Quand `.streaming-animation` est visible dans le tour surveillé,
+        // ChatGPT recherche encore : la borne dure appartient au serveur
+        // (`bridge_total_timeout`).
+        if (
+          full.length > 0 &&
+          stableForMs >= WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS &&
+          stableObservations >= MIN_STALL_OBSERVATIONS &&
+          !longRunningStreamingSignalActive(signalSources)
+        ) {
+          return incompleteAnswer({
+            reason: "active_signal_stalled",
+            text: full,
+            ...incompleteFields,
+          });
+        }
+      } else {
+        // Finalité inconnue : c'est le seul état auquel le stall de finalisation
+        // peut s'appliquer.
+        if (
+          full.length > 0 &&
+          stableForMs >= FINALIZATION_STALL_MS &&
+          stableObservations >= MIN_STALL_OBSERVATIONS
+        ) {
+          return incompleteAnswer({
+            reason: "finalization_stalled",
+            text: full,
+            ...incompleteFields,
+          });
+        }
+        verifyFinal = stable && full.length > 0;
       }
 
-      // Un texte stable n'est PAS la preuve qu'une génération active a échoué.
-      // Quand `.streaming-animation` est visible dans le tour surveillé, ChatGPT
-      // recherche encore : deux runs de production sont restés à ~30 caractères
-      // pendant 300 003 ms et 352 002 ms, puis le même tour a rendu la réponse
-      // complète. On continue donc d'observer et de battre, sans jamais conclure
-      // ni resoumettre ; la borne dure appartient au serveur (bridge_total_timeout).
-      if (
-        full.length > 0 &&
-        finished === false &&
-        stableForMs >= WATCHED_TURN_ACTIVE_SIGNAL_STALL_MS &&
-        stableObservations >= MIN_STALL_OBSERVATIONS &&
-        !longRunningStreamingSignalActive(signalSources)
-      ) {
-        return incompleteAnswer({
-          reason: "active_signal_stalled",
-          text: full,
-          ...incompleteFields,
-        });
-      }
-      if (stable && finished !== false && full.length > 0) {
-        const verificationRoot = answerRoot(turn, true);
+      if (verifyFinal) {
+        // React peut remplacer le nœud entre les observations : re-résoudre le
+        // même tour, puis revérifier finalité, identité et texte sur ce nœud.
+        const verificationTurn = findTurn(
+          turnLocator(turn) || locator,
+          before,
+        );
+        const verificationCompletion = verificationTurn
+          ? completionState(verificationTurn)
+          : null;
+        const verificationRoot = verificationTurn
+          ? answerRoot(verificationTurn, true)
+          : null;
         const verification = verificationRoot
           ? readAnswer(verificationRoot, false)
           : null;
+        const currentExternalTurnId = turnExternalId(turn);
+        const verificationExternalTurnId = verificationTurn
+          ? turnExternalId(verificationTurn)
+          : null;
+        const finalityVerified =
+          finished === true
+            ? verificationCompletion?.finished === true
+            : verificationCompletion?.finished !== false;
+        const externalTurnIdentityStable =
+          currentExternalTurnId === verificationExternalTurnId;
 
         // La décision de fin porte uniquement sur le contenu textuel.
         // Les citations restent des métadonnées et peuvent encore être
         // réordonnées/enrichies par l'UI après la fin visible de la réponse.
-        if (verification && verification.text === full) {
+        if (
+          finalityVerified &&
+          externalTurnIdentityStable &&
+          verification &&
+          verification.text === full
+        ) {
           output.observe(verification.text);
           finalSerialized = verification;
-          finalCompletion = completion;
-          finalTurnLocator = turnLocator(turn) || locator;
-          finalExternalTurnId = turnExternalId(turn);
+          finalCompletion = verificationCompletion;
+          finalTurnLocator = turnLocator(verificationTurn) || locator;
+          finalExternalTurnId = verificationExternalTurnId;
           // État de plan au moment exact où la fin est constatée : c'est cette
           // valeur qui rend vérifiable « terminé sans focus » après coup.
           finalPageState = pageState();
           break;
         }
 
-        // Le texte a réellement changé entre les deux lectures :
-        // on recommence la fenêtre de stabilisation.
+        // Le texte, la finalité ou l'identité a réellement changé entre les
+        // deux lectures : on recommence la fenêtre de stabilisation.
         vu = verification ? verification.text : "";
         stableSince = null;
         stableObservations = 0;
@@ -2125,6 +2203,7 @@ async function handlePrompt({
     phase: "pre_submission",
     submissionState: "pre_submission",
   };
+  const runDiagnostics = captureRunStartDiagnostics();
   currentJob = job;
   if (!(await claimPrompt(id))) {
     if (currentJob === job) currentJob = null;
@@ -2255,10 +2334,16 @@ async function handlePrompt({
       sendBtn,
       submissionBaseline,
       before,
+      runDiagnostics,
     );
     if (!premier) return;
     const streamLocator = turnLocator(premier);
-    const serialized = await streamAnswer(job, streamLocator, before);
+    const serialized = await streamAnswer(
+      job,
+      streamLocator,
+      before,
+      runDiagnostics,
+    );
 
     if (!job.aborted) {
       // Le nœud `premier` peut être détaché : l'identité vient du tour courant
@@ -2333,7 +2418,7 @@ async function handlePrompt({
         phase: job.phase,
         diagnostics: err.diagnostics || {
           content_script_version: VERSION,
-          page_state: pageStateDiagnostics(Date.now(), {}),
+          page_state: pageStateDiagnostics(Date.now(), { run: runDiagnostics }),
         },
         target_id: browserTarget?.id ?? null,
         conversation: conversation

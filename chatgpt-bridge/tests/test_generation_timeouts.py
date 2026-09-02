@@ -473,8 +473,14 @@ class HiddenTabExtension:
         "visibility_state": "hidden",
         "hidden": True,
         "has_focus": False,
+        "started_visibility_state": "hidden",
+        "started_hidden": True,
+        "started_has_focus": False,
         "visible_transitions": 0,
         "focus_gains": 0,
+        "visible_transitions_during_run": 0,
+        "focus_gains_during_run": 0,
+        "stable_observations": 4,
         "ms_since_dom_mutation": 40_000,
         "ms_since_observation": 0,
         "ms_since_heartbeat": 0,
@@ -530,7 +536,7 @@ class HiddenTabExtension:
                     "stable_for_ms": 2_100,
                     "output_chars": len("rapport final"),
                     "visible_citation_count": 0,
-                    "content_script_version": "30",
+                    "content_script_version": "31",
                     "page_state": dict(self.PAGE_STATE),
                 },
             }
@@ -576,6 +582,11 @@ async def test_hidden_unfocused_tab_completes_and_is_provably_autonomous(
     assert len(autonomy) == 1
     assert "visibility_state=hidden" in autonomy[0]
     assert "has_focus=False" in autonomy[0]
+    assert "started_visibility_state=hidden" in autonomy[0]
+    assert "started_hidden=True" in autonomy[0]
+    assert "started_has_focus=False" in autonomy[0]
+    assert "focus_gains_during_run=0" in autonomy[0]
+    assert "visible_transitions_during_run=0" in autonomy[0]
     assert "focus_gains=0" in autonomy[0]
     assert "visible_transitions=0" in autonomy[0]
     assert "wake_tick=31" in autonomy[0]
@@ -591,7 +602,13 @@ def test_page_state_diagnostics_are_bounded_and_content_free() -> None:
             "visibility_state": "hidden",
             "hidden": True,
             "has_focus": False,
+            "started_visibility_state": "hidden",
+            "started_hidden": True,
+            "started_has_focus": False,
             "focus_gains": 2,
+            "focus_gains_during_run": 2,
+            "visible_transitions_during_run": 0,
+            "stable_observations": 3,
             "ms_since_dom_mutation": 40_000,
             # Rejets attendus : hors domaine, hors borne, mauvais type, inconnu.
             "visible_transitions": -1,
@@ -605,7 +622,13 @@ def test_page_state_diagnostics_are_bounded_and_content_free() -> None:
         "visibility_state": "hidden",
         "hidden": True,
         "has_focus": False,
+        "started_visibility_state": "hidden",
+        "started_hidden": True,
+        "started_has_focus": False,
         "focus_gains": 2,
+        "focus_gains_during_run": 2,
+        "visible_transitions_during_run": 0,
+        "stable_observations": 3,
         "ms_since_dom_mutation": 40_000,
     }
     assert _page_state({"visibility_state": "focused"}) == {}

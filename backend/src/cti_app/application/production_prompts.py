@@ -24,7 +24,7 @@ EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
 }
-SYNTHESIS_PROMPT_VERSION = "5"
+SYNTHESIS_PROMPT_VERSION = "6"
 REFERENCES_FORMAT_REPAIR_VERSION = "1"
 SYNTHESIS_FORMAT_REPAIR_VERSION = "2"
 
@@ -421,7 +421,7 @@ Expected structure:
 {expected_structure}
 """
 
-    TECHNICAL_SYNTHESIS_V5 = """You are a senior CTI technical writer. Write concise sourced French CTI prose.
+    TECHNICAL_SYNTHESIS_V6 = """You are a senior CTI technical writer. Write dense sourced French CTI prose.
 
 **Subject**: {subject_title}
 
@@ -435,6 +435,82 @@ conflicts with canonical data, canonical data wins. Use only supplied [S#] marke
 {synthesis_evidence_pack}
 </synthesis-evidence-pack>
 
+Editorial priority:
+
+Write dense technical CTI prose. Prioritize operationally discriminating
+technical details over generic campaign description.
+
+When supported by the evidence, cover the following in priority order:
+
+1. subject scope, attribution and confidence limitations;
+2. infection and execution chain;
+3. distinctive malware components, processes, tools and commands;
+4. persistence, privilege, evasion or anti-analysis mechanisms;
+5. C2 protocols, communication structure and infrastructure role;
+6. concrete behavioral hunting or detection pivots;
+7. meaningful differences between variants, campaigns or operators;
+8. analytical limitations and unresolved attribution questions.
+
+Do not force a category when the evidence contains nothing useful for it.
+
+Keep discriminating technical detail:
+
+When supplied evidence contains concrete technical values that are useful for
+understanding or hunting the activity, retain the most discriminating examples
+in prose.
+
+Examples include:
+- executable or process names;
+- parent/child execution relationships;
+- command-line patterns;
+- registry or scheduled-task persistence;
+- distinctive file paths;
+- local ports;
+- protocol paths or request structure;
+- runtime/interpreter usage;
+- WMI/PowerShell behavior;
+- C2 communication mechanisms.
+
+Do not replace these with generic phrases such as "uses several techniques" or
+"establishes persistence" when the evidence supports a more precise description.
+
+A file path, process name, local port, protocol path or command pattern is
+behavioral detail, not an IOC inventory. The IOC-inventory prohibition below
+never justifies deleting the behavioral detail a CTI synthesis needs.
+
+Chronology:
+
+Do not repeat chronology merely to restate the reference timeline.
+
+Mention a date again only when it is necessary to explain:
+- technical evolution;
+- a change of variant or infrastructure;
+- attribution;
+- campaign scope;
+- an important analytical limitation.
+
+Shape:
+
+Target 3 to 6 dense paragraphs depending on available evidence.
+
+Each paragraph must add a distinct CTI function.
+Avoid generic introductions and conclusions.
+
+A useful default progression is:
+scope/attribution → execution chain → persistence/C2 → hunting/detection →
+limitations, but adapt to the evidence.
+
+Evidential status:
+
+Distinguish carefully between:
+- directly observed technical behavior;
+- attribution stated by a source;
+- analytical inference.
+
+Never turn correlation, malware sharing, infrastructure sharing or temporal
+proximity into stronger attribution than the evidence supports. This matters
+most for malware families operated by several distinct actors.
+
 The CORE sources are the editorial backbone of the publication. Base the main
 narrative primarily on CORE sources: the central incident or campaign, actor
 or malware relationship, essential chronology, main technical mechanism, and
@@ -445,6 +521,25 @@ absent from core sources. A supporting source may introduce genuinely useful
 information, but must not displace the core subject or become the dominant
 narrative unless canonical evidence makes that necessary. When the same claim
 is supported by CORE and SUPPORTING sources, prefer/cite the CORE source.
+
+A SUPPORTING source may contribute a high-value technical detail even when it
+must not become the narrative backbone.
+
+Do not discard a distinctive execution, persistence, C2 or hunting detail solely
+because it comes from a supporting source.
+
+Hunting and detection:
+
+Describe observable pivots that come from the evidence itself, such as an
+unusual launch of a named interpreter, a runtime downloaded by a command-line
+utility, a script host started from a persistence key, or a specific WMI query.
+When the evidence pack reports published detection rules, you may state that a
+source publishes a YARA/Sigma/Suricata/Snort rule; never invent or reproduce
+rule content.
+
+Do not write unsupported defensive advice such as "Il est recommandé de
+bloquer..." or "Les organisations devraient...", unless the corpus explicitly
+provides that recommendation and it is relevant. Never invent a SOC playbook.
 
 Strict publication rules:
 - Produce no Markdown title or heading.
@@ -591,7 +686,7 @@ text: <event>
         subject_title: str,
         synthesis_evidence_pack: str = "{}",
     ) -> str:
-        return cls.TECHNICAL_SYNTHESIS_V5.format(
+        return cls.TECHNICAL_SYNTHESIS_V6.format(
             subject_title=subject_title,
             synthesis_evidence_pack=synthesis_evidence_pack,
         )

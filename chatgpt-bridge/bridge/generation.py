@@ -305,6 +305,9 @@ _PAGE_STATE_VISIBILITY = {"visible", "hidden", "prerender", "unloaded"}
 _PAGE_STATE_COUNTERS = (
     ("visible_transitions", 1_000_000),
     ("focus_gains", 1_000_000),
+    ("focus_gains_during_run", 1_000_000),
+    ("visible_transitions_during_run", 1_000_000),
+    ("stable_observations", 1_000_000),
     ("ms_since_dom_mutation", 86_400_000),
     ("ms_since_observation", 86_400_000),
     ("ms_since_heartbeat", 86_400_000),
@@ -324,10 +327,11 @@ def _page_state(value: object) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     state: dict[str, Any] = {}
-    visibility = value.get("visibility_state")
-    if isinstance(visibility, str) and visibility in _PAGE_STATE_VISIBILITY:
-        state["visibility_state"] = visibility
-    for field in ("hidden", "has_focus"):
+    for field in ("visibility_state", "started_visibility_state"):
+        visibility = value.get(field)
+        if isinstance(visibility, str) and visibility in _PAGE_STATE_VISIBILITY:
+            state[field] = visibility
+    for field in ("hidden", "has_focus", "started_hidden", "started_has_focus"):
         reported = value.get(field)
         if isinstance(reported, bool):
             state[field] = reported
@@ -920,20 +924,27 @@ async def run_generation(
                     if conversation_result is not None:
                         conversation_result.update(sanitized)
                 # Autonomie : état de plan de l'onglet au moment exact où le
-                # content script a constaté la fin. `focus_gains=0` et
-                # `visible_transitions=0` avec `visibility_state=hidden`
-                # prouvent une complétion sans aucune intervention humaine.
+                # content script a constaté la fin. Les compteurs *_during_run
+                # répondent à la question de ce run ; les compteurs historiques
+                # restent présents pour compatibilité diagnostique.
                 autonomy = _page_state(reported_metadata.get("page_state"))
                 if autonomy:
                     logger.info(
                         "bridge_run_autonomy bridge_run_id=%s visibility_state=%s "
-                        "hidden=%s has_focus=%s focus_gains=%s visible_transitions=%s "
-                        "ms_since_dom_mutation=%s wake_mutation=%s wake_tick=%s "
-                        "wake_timer=%s",
+                        "started_visibility_state=%s started_hidden=%s "
+                        "started_has_focus=%s hidden=%s has_focus=%s "
+                        "focus_gains_during_run=%s visible_transitions_during_run=%s "
+                        "focus_gains=%s visible_transitions=%s ms_since_dom_mutation=%s "
+                        "wake_mutation=%s wake_tick=%s wake_timer=%s",
                         request_id,
                         autonomy.get("visibility_state"),
+                        autonomy.get("started_visibility_state"),
+                        autonomy.get("started_hidden"),
+                        autonomy.get("started_has_focus"),
                         autonomy.get("hidden"),
                         autonomy.get("has_focus"),
+                        autonomy.get("focus_gains_during_run"),
+                        autonomy.get("visible_transitions_during_run"),
                         autonomy.get("focus_gains"),
                         autonomy.get("visible_transitions"),
                         autonomy.get("ms_since_dom_mutation"),

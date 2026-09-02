@@ -186,7 +186,11 @@ const FINAL_TEXT = "réponse finale de la recherche approfondie";
  * `.streaming-animation` pendant plus de dix minutes sans que son texte bouge,
  * puis le rendu final. Aucun clic, aucun focus, aucune activation.
  */
-async function runHiddenGeneration({ observationTicks }) {
+async function runHiddenGeneration({
+  observationTicks,
+  multiMutationFinal = false,
+  preRunFocus = false,
+}) {
   const tab = loadHiddenTab(COMPOSER);
   const { window, run, sent } = tab;
   const requestId = observationTicks ? "req-hidden-ticks" : "req-hidden-no-ticks";
@@ -227,13 +231,36 @@ async function runHiddenGeneration({ observationTicks }) {
   // Plateau de recherche : plus aucune mutation de texte pendant ~10 minutes.
   // Seul `.streaming-animation` dit que ChatGPT travaille encore.
   const finalizedAt = 660_000;
-  tab.renderAt(finalizedAt, () => {
-    turn().querySelector(".markdown").innerHTML = `<p>${FINAL_TEXT}</p>`;
-    turn().querySelector(".streaming-animation").remove();
-    turn().closest("article").insertAdjacentHTML("beforeend", COPY_BUTTON);
-  });
+  if (multiMutationFinal) {
+    // React-style final rendering: three separate DOM batches, with no
+    // foreground 120 ms timer cadence at this point in the hidden tab.
+    tab.renderAt(finalizedAt, () => {
+      turn().querySelector(".markdown").innerHTML = `<p>${FINAL_TEXT}</p>`;
+    });
+    tab.renderAt(finalizedAt, () => {
+      turn().querySelector(".streaming-animation").remove();
+    });
+    tab.renderAt(finalizedAt, () => {
+      turn().closest("article").insertAdjacentHTML("beforeend", COPY_BUTTON);
+    });
+    // Separate post-final mutations provide enough real observations for
+    // MIN_STALL_OBSERVATIONS before the next hidden-page timer wake arrives.
+    for (const offset of [100, 200, 60_100, 60_200]) {
+      tab.renderAt(finalizedAt + offset, () => {
+        turn().closest("article").setAttribute("data-state", `settled-${offset}`);
+      });
+    }
+  } else {
+    tab.renderAt(finalizedAt, () => {
+      turn().querySelector(".markdown").innerHTML = `<p>${FINAL_TEXT}</p>`;
+      turn().querySelector(".streaming-animation").remove();
+      turn().closest("article").insertAdjacentHTML("beforeend", COPY_BUTTON);
+    });
+  }
 
   if (observationTicks) tab.startObservationTicks(requestId);
+
+  if (preRunFocus) window.dispatchEvent(new window.Event("focus"));
 
   let finished = false;
   run(`globalThis.__hiddenRun = handlePrompt(${JSON.stringify({
@@ -278,7 +305,7 @@ async function runHiddenGeneration({ observationTicks }) {
     assert.equal(done.text, FINAL_TEXT);
     assert.equal(done.metadata.initial_turn_id, "msg-hidden-1");
     assert.equal(done.conversation.turn_id, "msg-hidden-1");
-    assert.equal(done.metadata.content_script_version, "30");
+    assert.equal(done.metadata.content_script_version, "31");
 
     // Exactement une soumission, jamais un clic de secours.
     assert.equal(result.submitEvents, 1, "exactement un prompt soumis");
@@ -302,6 +329,11 @@ async function runHiddenGeneration({ observationTicks }) {
     assert.equal(pageState.has_focus, false);
     assert.equal(pageState.focus_gains, 0);
     assert.equal(pageState.visible_transitions, 0);
+    assert.equal(pageState.focus_gains_during_run, 0);
+    assert.equal(pageState.visible_transitions_during_run, 0);
+    assert.equal(pageState.started_visibility_state, "hidden");
+    assert.equal(pageState.started_hidden, true);
+    assert.equal(pageState.started_has_focus, false);
     assert.ok(
       pageState.wake_mutation > 0,
       "la boucle doit avoir été réveillée par des mutations DOM",
@@ -369,7 +401,67 @@ async function runHiddenGeneration({ observationTicks }) {
     );
   }
 
-  // --- 3. Les observateurs ne fuient pas d'un run à l'autre ------------------ //
+  // --- 3. Rendu final multi-mutations + réveil minuté throttlé -------------- //
+  {
+    const result = await runHiddenGeneration({
+      observationTicks: false,
+      multiMutationFinal: true,
+    });
+    const done = result.sent.find((message) => message.type === "done");
+    const terminal = result.sent.filter((message) =>
+      ["done", "incomplete", "error"].includes(message.type),
+    );
+    const pageState = JSON.parse(JSON.stringify(done?.metadata?.page_state));
+
+    assert.equal(result.completed, true);
+    assert.equal(terminal.length, 1, "un seul résultat terminal doit être émis");
+    assert.ok(done, "la finalité explicite doit produire done");
+    assert.equal(done.text, FINAL_TEXT);
+    assert.equal(done.metadata.completion_signal, "assistant_actions");
+    assert.equal(done.metadata.initial_turn_id, "msg-hidden-1");
+    assert.equal(done.conversation.turn_id, "msg-hidden-1");
+    assert.ok(
+      done.metadata.stable_for_ms > result.tab.run("FINALIZATION_STALL_MS"),
+      "le test doit dépasser le seuil de finalisation avant le réveil tardif",
+    );
+    assert.ok(
+      pageState.stable_observations >= result.tab.run("MIN_STALL_OBSERVATIONS"),
+      "des observations stables suffisantes doivent précéder le réveil tardif",
+    );
+    assert.ok(
+      pageState.wake_mutation >= 3,
+      "les mutations Markdown / animation / barre d'actions doivent réveiller la boucle",
+    );
+    assert.ok(
+      result.doneAt - result.finalizedAt >= INTENSIVE_THROTTLE_MS,
+      `le résultat doit attendre le timer caché (~60 s), délai=${result.doneAt - result.finalizedAt}`,
+    );
+    assert.equal(result.submitEvents, 1, "exactement une soumission");
+    assert.equal(result.sendClicks, 0, "aucun clic d'envoi");
+    assert.equal(result.tab.focusCounters().window_focus_calls, 0);
+  }
+
+  // --- 4. Un focus historique ne pollue pas le diagnostic du run ------------ //
+  {
+    const result = await runHiddenGeneration({
+      observationTicks: true,
+      preRunFocus: true,
+    });
+    const done = result.sent.find((message) => message.type === "done");
+    const pageState = JSON.parse(JSON.stringify(done.metadata.page_state));
+
+    assert.ok(
+      pageState.focus_gains >= 1,
+      "le compteur cumulatif conserve l'événement historique",
+    );
+    assert.equal(pageState.focus_gains_during_run, 0);
+    assert.equal(pageState.visible_transitions_during_run, 0);
+    assert.equal(pageState.started_visibility_state, "hidden");
+    assert.equal(pageState.started_hidden, true);
+    assert.equal(pageState.started_has_focus, false);
+  }
+
+  // --- 5. Les observateurs ne fuient pas d'un run à l'autre ------------------ //
   {
     const result = await runHiddenGeneration({ observationTicks: true });
     assert.equal(
