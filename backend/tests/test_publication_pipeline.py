@@ -13,6 +13,7 @@ import pytest
 from cti_app.application.pandoc_export import export_publication_docx
 from cti_app.application.pandoc_rendering import (
     WORD_STYLE_MAP,
+    _render_rich,
     render_publication_pandoc,
 )
 from cti_app.application.production_normalization import (
@@ -42,7 +43,10 @@ from cti_app.domain.discovery import SourceRole
 from cti_app.domain.publication import (
     ArtifactType,
     PublicationDocumentV2,
+    PublicationSource,
+    RichSpan,
     RichSpanKind,
+    TimelineEntry,
     publication_document_from_json,
 )
 
@@ -152,6 +156,30 @@ def _report() -> ReferenceReport:
     )
 
 
+def _multi_source_document() -> PublicationDocumentV2:
+    return PublicationDocumentV2(
+        schema_version="2",
+        title="Citation test",
+        timeline=(
+            TimelineEntry(
+                date=None,
+                content=(
+                    RichSpan(RichSpanKind.TEXT, "Information vérifiée"),
+                    RichSpan(RichSpanKind.CITATION, "", ("S1", "S2")),
+                ),
+                source_ids=("S1", "S2"),
+            ),
+        ),
+        synthesis=(),
+        indicators=(),
+        sources=(
+            PublicationSource("S1", "https://example.test/1"),
+            PublicationSource("S2", "https://example.test/2"),
+        ),
+        uncertainties=(),
+    )
+
+
 def test_indicator_normalization_and_collection_are_explicit() -> None:
     assert canonical_indicator_key("Example[.]COM", ArtifactType.DOMAIN) == "example.com"
     assert normalize_indicator_value("2001:0db8::1", ArtifactType.IP) == "2001:db8::1"
@@ -195,6 +223,31 @@ def test_semantic_annotation_prioritizes_entities_and_citations() -> None:
     assert kinds["WinDirStat"] is RichSpanKind.TOOL
     assert kinds["DLL side-loading"] is RichSpanKind.TECHNICAL
     assert next(span for span in spans if span.kind is RichSpanKind.CITATION).source_ids == ("S1",)
+
+
+@pytest.mark.parametrize(
+    ("source_ids", "expected"),
+    [
+        (("S1",), "^[https://example.test/1]"),
+        (("S1", "S2"), "^[https://example.test/1 ; https://example.test/2]"),
+        (("S1", "S1", "S2"), "^[https://example.test/1 ; https://example.test/2]"),
+        (("S1", "UNKNOWN", "S2"), "^[https://example.test/1 ; https://example.test/2]"),
+        (("UNKNOWN",), ""),
+    ],
+)
+def test_pandoc_renderer_renders_one_footnote_per_citation(
+    source_ids: tuple[str, ...], expected: str
+) -> None:
+    rendered = _render_rich(
+        (RichSpan(RichSpanKind.CITATION, "", source_ids),),
+        {
+            "S1": "https://example.test/1",
+            "S2": "https://example.test/2",
+        },
+    )
+
+    assert rendered == expected
+    assert "^[https://example.test/1]^[https://example.test/2]" not in rendered
 
 
 def test_synthesis_validator_blocks_inventory_only_ioc_but_accepts_both() -> None:
@@ -297,3 +350,21 @@ def test_real_pandoc_export_produces_an_openable_docx(tmp_path: Path) -> None:
         assert archive.testzip() is None
         styles = archive.read("word/styles.xml")
         assert b"Titre partie bulletin" in styles
+
+
+@pytest.mark.skipif(shutil.which("pandoc") is None, reason="Pandoc is not installed")
+def test_real_pandoc_export_renders_multi_source_citation_as_word_footnote(
+    tmp_path: Path,
+) -> None:
+    output = export_publication_docx(_multi_source_document(), tmp_path / "multi-source.docx")
+    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+    with zipfile.ZipFile(output) as archive:
+        document_root = ET.fromstring(archive.read("word/document.xml"))
+        footnotes_root = ET.fromstring(archive.read("word/footnotes.xml"))
+
+    assert document_root.find(f".//{{{namespace}}}footnoteReference") is not None
+    assert "[https://" not in "".join(document_root.itertext())
+    footnotes_text = "".join(footnotes_root.itertext())
+    assert "https://example.test/1" in footnotes_text
+    assert "https://example.test/2" in footnotes_text

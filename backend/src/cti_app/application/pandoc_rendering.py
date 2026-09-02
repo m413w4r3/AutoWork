@@ -71,11 +71,13 @@ def _render_rich(text: RichText, sources: dict[str, str]) -> str:
     for span in text:
         value = _safe_text(span.text)
         if span.kind is RichSpanKind.CITATION:
-            output.extend(
-                "^[" + _footnote_url(sources[source_id]) + "]"
+            urls = [
+                _footnote_url(sources[source_id])
                 for source_id in dict.fromkeys(span.source_ids)
                 if source_id in sources
-            )
+            ]
+            if urls:
+                output.append(f"^[{' ; '.join(urls)}]")
         elif span.kind in {RichSpanKind.ACTOR, RichSpanKind.MALWARE}:
             output.append(f"**{value}**")
         elif span.kind is RichSpanKind.TOOL:
