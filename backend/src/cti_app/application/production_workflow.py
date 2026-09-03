@@ -476,72 +476,12 @@ def plan_q2_extraction_profiles(
     period_start: date | str | None = None,
     period_end: date | str | None = None,
 ) -> tuple[Q2SourcePlan, ...]:
-    """Assign FULL/IOC_RULES without subject or model state.
-
-    Core publications always consume FULL. At most three dated, in-period
-    supporting publications receive FULL, ordered by distance from the closest
-    dated core publication and then by the specified deterministic tie-break.
-    """
+    """Assign FULL only to frozen core sources; all supporting sources use IOC_RULES."""
 
     if snapshot is None:
         raise ValueError("q2_extraction_plan_missing_snapshot")
 
-    def as_date(value: date | str | None) -> date | None:
-        if isinstance(value, date):
-            return value
-        if value:
-            try:
-                return date.fromisoformat(value)
-            except ValueError:
-                return None
-        return None
-
-    start = as_date(period_start) or snapshot.period_start
-    end = as_date(period_end) or snapshot.period_end
-    core_sources = snapshot.core_sources
-    core_urls = {source.canonical_url for source in core_sources}
-    core_dates = [
-        source.published_at
-        for source in report.sources
-        if source.canonical_url in core_urls and source.published_at
-    ]
-    if not core_dates:
-        core_dates = [source.published_at for source in core_sources if source.published_at]
-
-    midpoint: date | None = None
-    if start is not None and end is not None:
-        midpoint = start + (end - start) / 2
-
-    def distance(source: ParsedSource) -> float:
-        reference_dates: list[date] = core_dates or ([midpoint] if midpoint else [])
-        if not reference_dates or source.published_at is None:
-            return float("inf")
-        return float(
-            min(abs(source.published_at - reference).days for reference in reference_dates)
-        )
-
-    def published_ordinal(source: ParsedSource) -> int:
-        return source.published_at.toordinal() if source.published_at is not None else 0
-
-    dated_in_period = [
-        source
-        for source in report.sources
-        if source.canonical_url not in core_urls
-        and source.published_at is not None
-        and (start is None or source.published_at >= start)
-        and (end is None or source.published_at <= end)
-    ]
-    full_supporting_urls = {
-        source.canonical_url
-        for source in sorted(
-            dated_in_period,
-            key=lambda source: (
-                distance(source),
-                -published_ordinal(source),
-                source.canonical_url,
-            ),
-        )[:3]
-    }
+    core_urls = {source.canonical_url for source in snapshot.core_sources}
 
     return tuple(
         Q2SourcePlan(
@@ -549,17 +489,13 @@ def plan_q2_extraction_profiles(
             canonical_url=source.canonical_url,
             profile=(
                 ExtractionProfile.FULL
-                if source.canonical_url in core_urls or source.canonical_url in full_supporting_urls
+                if source.canonical_url in core_urls
                 else ExtractionProfile.IOC_RULES
             ),
             reason=(
                 "core_source"
                 if source.canonical_url in core_urls
-                else (
-                    "near_period_supporting"
-                    if source.canonical_url in full_supporting_urls
-                    else "historical_supporting"
-                )
+                else "supporting_source"
             ),
         )
         for source in report.sources
@@ -913,6 +849,48 @@ class ProductionWorkflowOrchestrator:
             if commit is not None:
                 await commit()
 
+    async def _close_completed_stage_conversation_best_effort(
+        self,
+        run: SubjectProductionRun,
+        stage: SubjectProductionStage,
+    ) -> None:
+        """Archive the model conversation after a durable stage result.
+
+        Archiving also asks the bridge to close the exact bound browser tab.
+        Cleanup is deliberately best-effort: the stage artifact is already
+        durable, so a browser cleanup failure must not turn a successful stage
+        into a production failure.
+        """
+        model_service = getattr(self, "_model_service", None)
+        if model_service is None:
+            return
+
+        conversation_id: UUID | None = None
+        if stage is SubjectProductionStage.REFERENCES:
+            conversation_id = run.references_conversation_id
+        elif stage is SubjectProductionStage.SYNTHESIS:
+            conversation_id = run.synthesis_conversation_id
+
+        if conversation_id is None:
+            return
+
+        try:
+            await model_service.archive(
+                conversation_id,
+                context_subject_id=run.subject_id,
+            )
+        except Exception as exc:
+            self._diagnostics.record(
+                event="production.conversation_close_failed",
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage=stage.value,
+                correlation_id=self._correlation_id,
+                conversation_id=str(conversation_id),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
     async def execute_stage(
         self,
         run_id: UUID,
@@ -960,6 +938,9 @@ class ProductionWorkflowOrchestrator:
                 raise ValueError(f"Unknown stage: {expected_stage.value}")
         except ProductionReuseStorageUnavailableError as exc:
             result = self._handle_stage_exception(run, expected_stage.value, exc)
+
+        if result.get("status") in {"success", "cached", "reused"}:
+            await self._close_completed_stage_conversation_best_effort(run, expected_stage)
 
         self._diagnostics.record_stage_outcome(
             run_id=run.id,

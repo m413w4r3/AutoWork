@@ -33,7 +33,7 @@ from cti_app.domain.publication import ArtifactType
 # validation rule, a public-suffix check, or how facts get a semantic type).
 # Participates in the extraction artifact's input_hash so a canonical
 # extraction artifact gets recomputed, without forcing a new Q2 model call.
-ARTIFACT_VERIFIER_VERSION = "5"
+ARTIFACT_VERIFIER_VERSION = "6"
 
 
 class ProposalStatus(StrEnum):
@@ -82,12 +82,14 @@ class ArtifactVerificationResult:
         return tuple(item for item in self.diagnostics if item.status is ProposalStatus.REJECTED)
 
 
-# A redaction marker is a substring anywhere in the value.  A stand-in word is
-# only a placeholder when it *is* the whole value: `na`, `none` and `unknown`
-# are legitimate labels of real indicators (`na.locat.sbs`), and treating them
-# as redactions dropped published IOCs under a misleading reason code.
-_PLACEHOLDER_MARKER = r"redacted|\bfuzz\b|<[^>]+>|example\.(?:com|org|net)"
-_PLACEHOLDER_VALUE = re.compile(r"(?:unknown|inconnue?|n/?a|none|null)\.?")
+# Stand-in words are placeholders only when they are the whole value.  They
+# are legitimate labels of real indicators (`none.locat.sbs`), and treating
+# them as redactions drops published IOCs under a misleading reason code.
+_PLACEHOLDER_STRUCTURED = re.compile(r"<[^>]+>")
+_PLACEHOLDER_VALUE = re.compile(
+    r"(?:unknown|inconnu(?:e)?|n/?a|none|null|redacted|fuzz)\.?"
+)
+_EXAMPLE_TLDS = frozenset({"com", "org", "net"})
 
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
 _CVE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
@@ -205,12 +207,12 @@ def _rejection_reason(
             return "excluded_artifact_not_emitted"
         if proposal.indicator_status == "not_applicable":
             return "not_applicable_artifact_not_emitted"
-        if _is_placeholder(proposal.value):
-            return "redacted_placeholder"
         try:
             artifact_type = ArtifactType(proposal.artifact_type)
         except ValueError:
             return "invalid_artifact_type"
+        if _is_placeholder(proposal.value, artifact_type):
+            return "redacted_placeholder"
         try:
             _validate_value(proposal.value, artifact_type)
         except ValueError:
@@ -259,12 +261,28 @@ def _rule_rejection_reason(
     return None
 
 
-def _is_placeholder(value: str) -> bool:
-    folded = value.casefold()
-    refanged = refang(value).casefold()
-    if any(_PLACEHOLDER_VALUE.fullmatch(candidate.strip()) for candidate in (folded, refanged)):
+def _is_placeholder(value: str, artifact_type: ArtifactType) -> bool:
+    refanged = refang(value).strip()
+    folded = refanged.casefold()
+    if _PLACEHOLDER_VALUE.fullmatch(folded) or _PLACEHOLDER_STRUCTURED.search(refanged):
         return True
-    return bool(re.search(_PLACEHOLDER_MARKER, f"{folded} {refanged}"))
+    if artifact_type is ArtifactType.DOMAIN:
+        return _is_example_hostname(folded)
+    if artifact_type is ArtifactType.URL:
+        try:
+            hostname = urlsplit(refanged).hostname
+        except ValueError:
+            return False
+        return hostname is not None and _is_example_hostname(hostname)
+    if artifact_type is ArtifactType.EMAIL:
+        _, separator, domain = folded.rpartition("@")
+        return bool(separator) and _is_example_hostname(domain)
+    return False
+
+
+def _is_example_hostname(hostname: str) -> bool:
+    labels = hostname.rstrip(".").casefold().split(".")
+    return len(labels) >= 2 and labels[-2] == "example" and labels[-1] in _EXAMPLE_TLDS
 
 
 def _to_item(

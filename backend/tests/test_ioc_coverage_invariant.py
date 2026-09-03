@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from cti_app.application.production_artifact_verification import (
     Q2ProposalSubmission,
     verify_q2_proposals,
@@ -458,6 +460,85 @@ def test_a_stand_in_word_used_as_a_label_is_not_treated_as_a_redaction() -> None
 
     assert verification.rejected == ()
     assert {item.value for item in collect_indicators(verification.canonical)} == set(values)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "notexample.com",
+        "fooexample.net",
+        "myexample.org",
+        "redacted-service.com",
+        "fuzz.io",
+        "unknown-host.locat.sbs",
+        "none.locat.sbs",
+    ),
+)
+def test_placeholder_like_labels_reach_confirmed_ioc_collection(value: str) -> None:
+    verification = verify_q2_proposals(
+        (
+            Q2ProposalSubmission(
+                output=Q2SourceOutput(
+                    artifacts=[
+                        Q2ArtifactProposal(
+                            value=value,
+                            artifact_type="domain",
+                            indicator_status="confirmed_ioc",
+                        )
+                    ]
+                ),
+                source_ids=("S1",),
+            ),
+        )
+    )
+
+    indicators = collect_indicators(verification.canonical)
+    assert verification.rejected == ()
+    assert len(indicators) == 1
+    assert indicators[0].value == value
+    assert indicators[0].indicator_status is IndicatorStatus.CONFIRMED_IOC
+
+
+@pytest.mark.parametrize(
+    ("value", "artifact_type"),
+    (
+        ("example.com", "domain"),
+        ("foo.example.com", "domain"),
+        ("example.org", "domain"),
+        ("https://example.com/path", "url"),
+        ("https://sub.example.net/a", "url"),
+        ("user@example.com", "email"),
+        ("unknown", "domain"),
+        ("N/A", "domain"),
+        ("none", "domain"),
+        ("null", "domain"),
+        ("redacted", "domain"),
+        ("<redacted>", "domain"),
+        ("FUZZ", "domain"),
+    ),
+)
+def test_explicit_placeholder_values_are_rejected_type_aware(
+    value: str, artifact_type: str
+) -> None:
+    verification = verify_q2_proposals(
+        (
+            Q2ProposalSubmission(
+                output=Q2SourceOutput(
+                    artifacts=[
+                        Q2ArtifactProposal(
+                            value=value,
+                            artifact_type=artifact_type,
+                            indicator_status="confirmed_ioc",
+                        )
+                    ]
+                ),
+                source_ids=("S1",),
+            ),
+        )
+    )
+
+    assert collect_indicators(verification.canonical) == []
+    assert [item.reason_code for item in verification.rejected] == ["redacted_placeholder"]
 
 
 def test_a_bare_stand_in_word_is_still_rejected_as_a_placeholder() -> None:

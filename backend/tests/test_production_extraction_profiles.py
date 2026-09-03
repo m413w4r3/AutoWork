@@ -83,7 +83,7 @@ def _snapshot(core_sources: tuple[ProductionInputSource, ...]) -> ProductionInpu
     )
 
 
-def test_policy_keeps_all_core_and_only_three_near_supporting_full() -> None:
+def test_policy_assigns_full_only_to_frozen_core_sources() -> None:
     core_urls = ["https://example.test/core-1", "https://example.test/core-2"]
     support_urls = [f"https://example.test/support-{index}" for index in range(1, 8)]
     report = ReferenceReport(
@@ -102,12 +102,17 @@ def test_policy_keeps_all_core_and_only_three_near_supporting_full() -> None:
 
     plans = plan_q2_extraction_profiles(report, snapshot=snapshot)
 
-    assert [plan.profile for plan in plans[:2]] == [
-        ExtractionProfile.FULL,
-        ExtractionProfile.FULL,
-    ]
-    assert sum(plan.profile is ExtractionProfile.FULL for plan in plans[2:]) == 3
-    assert sum(plan.profile is ExtractionProfile.IOC_RULES for plan in plans[2:]) == 4
+    assert all(
+        plan.profile is ExtractionProfile.FULL
+        for plan in plans
+        if plan.canonical_url in core_urls
+    )
+    assert all(
+        plan.profile is ExtractionProfile.IOC_RULES
+        for plan in plans
+        if plan.canonical_url not in core_urls
+    )
+    assert sum(plan.profile is ExtractionProfile.FULL for plan in plans) == len(core_urls)
 
 
 def test_large_corpus_never_falls_back_to_all_full() -> None:
@@ -126,8 +131,8 @@ def test_large_corpus_never_falls_back_to_all_full() -> None:
         snapshot=_snapshot((_input_source(core_url, date(2026, 7, 10)),)),
     )
 
-    assert sum(plan.profile is ExtractionProfile.FULL for plan in plans) == 4
-    assert sum(plan.profile is ExtractionProfile.IOC_RULES for plan in plans) == 97
+    assert sum(plan.profile is ExtractionProfile.FULL for plan in plans) == 1
+    assert sum(plan.profile is ExtractionProfile.IOC_RULES for plan in plans) == 100
 
 
 def test_missing_snapshot_fails_q2_planning_instead_of_selecting_all_full() -> None:
@@ -156,10 +161,11 @@ def test_policy_sends_old_and_undated_supporting_to_ioc_rules() -> None:
 
     assert plans[1].profile is ExtractionProfile.IOC_RULES
     assert plans[2].profile is ExtractionProfile.IOC_RULES
-    assert plans[2].reason == "historical_supporting"
+    assert plans[1].reason == "supporting_source"
+    assert plans[2].reason == "supporting_source"
 
 
-def test_policy_tie_break_is_published_descending_then_url() -> None:
+def test_policy_keeps_dated_supporting_sources_on_ioc_rules() -> None:
     urls = [
         "https://example.test/z",
         "https://example.test/a",
@@ -169,7 +175,7 @@ def test_policy_tie_break_is_published_descending_then_url() -> None:
     report = ReferenceReport(
         sources=tuple(
             [_source("https://example.test/core", date(2026, 7, 10))]
-            + [_source(url, date(2026, 7, 9)) for url in urls]
+            + [_source(url, date(2026, 7, 10)) for url in urls]
         ),
         events=(),
     )
@@ -178,12 +184,8 @@ def test_policy_tie_break_is_published_descending_then_url() -> None:
         snapshot=_snapshot((_input_source("https://example.test/core", date(2026, 7, 10)),)),
     )
 
-    assert [plan.canonical_url for plan in plans if plan.profile is ExtractionProfile.FULL] == [
-        "https://example.test/core",
-        "https://example.test/a",
-        "https://example.test/b",
-        "https://example.test/c",
-    ]
+    assert plans[0].profile is ExtractionProfile.FULL
+    assert all(plan.profile is ExtractionProfile.IOC_RULES for plan in plans[1:])
 
 
 def test_full_output_projection_for_ioc_rules_drops_narrative_facts() -> None:
