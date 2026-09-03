@@ -37,6 +37,12 @@ const eventCounters = new Map();
  * le perd volontairement (Temporary Chat n'est alors plus reconstructible).
  */
 const conversationRegistry = new Map();
+/**
+ * Proofs of successful exact closes. A missing live binding is not enough to
+ * answer `already_closed`: this map is written only after the exact tab or
+ * owned window close operation has completed successfully.
+ */
+const closedConversationRegistry = new Map();
 const busyTabs = new Set();
 const requestConversationResults = new Map();
 const requestExtensionMetadata = new Map();
@@ -161,6 +167,36 @@ class BridgeRoutingError extends Error {
   }
 }
 
+/** Erreur structurée du cleanup d'une conversation identifiée. */
+class ConversationArchiveError extends Error {
+  constructor(code, message, { retryable = false, details = {} } = {}) {
+    super(message || code);
+    this.code = code;
+    this.retryable = retryable;
+    this.phase = "conversation_archive";
+    this.details = details;
+  }
+}
+
+function archiveDiagnosticDetails(value, binding) {
+  const details = {};
+  for (const field of ["tab_id", "window_id", "window_closed", "operation"]) {
+    const candidate = value?.[field];
+    if (typeof candidate === "boolean" || typeof candidate === "number") {
+      details[field] = candidate;
+    } else if (typeof candidate === "string") {
+      details[field] = candidate.slice(0, 128);
+    }
+  }
+  if (typeof details.tab_id !== "number" && typeof binding?.tab_id === "number") {
+    details.tab_id = binding.tab_id;
+  }
+  if (typeof details.window_id !== "number" && typeof binding?.window_id === "number") {
+    details.window_id = binding.window_id;
+  }
+  return details;
+}
+
 const requestStatesReady = chrome.storage.local.get("bridgeRequestStates").then(({ bridgeRequestStates }) => {
   for (const [id, state] of Object.entries(bridgeRequestStates || {})) requestStates.set(id, state);
 });
@@ -207,6 +243,14 @@ const conversationRegistryReady = chrome.storage.session
     }
   });
 
+const closedConversationRegistryReady = chrome.storage.session
+  .get("bridgeClosedConversationRegistry")
+  .then(({ bridgeClosedConversationRegistry }) => {
+    for (const [id, entry] of Object.entries(bridgeClosedConversationRegistry || {})) {
+      closedConversationRegistry.set(id, entry);
+    }
+  });
+
 const browserTargetRegistryReady = chrome.storage.session
   .get("bridgeBrowserTargetRegistry")
   .then(({ bridgeBrowserTargetRegistry }) => {
@@ -234,6 +278,12 @@ function persistReplayMetadata() {
 function persistConversationRegistry() {
   chrome.storage.session.set({
     bridgeConversationRegistry: Object.fromEntries(conversationRegistry.entries()),
+  });
+}
+
+function persistClosedConversationRegistry() {
+  chrome.storage.session.set({
+    bridgeClosedConversationRegistry: Object.fromEntries(closedConversationRegistry.entries()),
   });
 }
 
@@ -399,17 +449,97 @@ async function handleRecoveryCapture(msg) {
 }
 
 async function handleConversationArchive(msg) {
-  await conversationRegistryReady;
-  const known = conversationRegistry.get(msg.conversation_id);
-  console.log(
-    "🗂️ conversation_archive reçu — ferme la session Temporary Chat exacte (jamais " +
-      "écrite dans l'historique ChatGPT, donc rien à y supprimer)",
-    { conversation_id: msg.conversation_id, tab_id: known?.tab_id ?? null },
-  );
-  if (known?.tab_id) await closeBoundTarget(known);
-  conversationRegistry.delete(msg.conversation_id);
-  persistConversationRegistry();
-  send({ type: "conversation_archive", id: msg.id, ok: true });
+  const conversationId = msg.conversation_id;
+  let known = null;
+  try {
+    await Promise.all([conversationRegistryReady, closedConversationRegistryReady]);
+    known = conversationRegistry.get(conversationId);
+    const previouslyClosed = closedConversationRegistry.get(conversationId);
+    console.log(
+      "🗂️ conversation_archive reçu — ferme la session Temporary Chat exacte (jamais " +
+        "écrite dans l'historique ChatGPT, donc rien à y supprimer)",
+      { conversation_id: conversationId, tab_id: known?.tab_id ?? previouslyClosed?.tab_id ?? null },
+    );
+
+    if (!known) {
+      if (
+        previouslyClosed?.conversation_id === conversationId &&
+        previouslyClosed?.close_state === "closed"
+      ) {
+        const packet = {
+          type: "conversation_archive",
+          id: msg.id,
+          ok: true,
+          conversation_id: conversationId,
+          close_state: "already_closed",
+          tab_id: previouslyClosed.tab_id,
+          window_id: previouslyClosed.window_id,
+          phase: "conversation_archive",
+        };
+        send(packet);
+        return packet;
+      }
+      throw new ConversationArchiveError(
+        "conversation_binding_missing",
+        "aucun binding exact n'est enregistré pour cette conversation",
+      );
+    }
+
+    if (
+      typeof known.tab_id !== "number" ||
+      typeof known.window_id !== "number" ||
+      known.tab_id < 0 ||
+      known.window_id < 0
+    ) {
+      throw new ConversationArchiveError(
+        "conversation_registry_inconsistent",
+        "le binding exact de la conversation est incohérent",
+        { details: { tab_id: known.tab_id ?? null, window_id: known.window_id ?? null } },
+      );
+    }
+
+    const closed = await closeBoundTargetWithOptions(known, { strict: true });
+    const packet = {
+      type: "conversation_archive",
+      id: msg.id,
+      ok: true,
+      conversation_id: conversationId,
+      close_state: closed?.close_state || "closed",
+      tab_id: known.tab_id,
+      window_id: known.window_id,
+      phase: "conversation_archive",
+    };
+    closedConversationRegistry.set(conversationId, {
+      conversation_id: conversationId,
+      tab_id: known.tab_id,
+      window_id: known.window_id,
+      close_state: "closed",
+      closed_at: Date.now(),
+    });
+    conversationRegistry.delete(conversationId);
+    persistConversationRegistry();
+    persistClosedConversationRegistry();
+    send(packet);
+    return packet;
+  } catch (err) {
+    const packet = {
+      type: "conversation_archive",
+      id: msg.id,
+      ok: false,
+      conversation_id: conversationId,
+      code:
+        typeof err?.code === "string" && err.code.length > 0
+          ? err.code.slice(0, 64)
+          : "conversation_archive_internal_error",
+      message: String(err?.message || "échec interne de fermeture").slice(0, 512),
+      retryable: typeof err?.retryable === "boolean" ? err.retryable : false,
+      phase:
+        typeof err?.phase === "string" ? err.phase.slice(0, 64) : "conversation_archive",
+      details: archiveDiagnosticDetails(err?.details, known),
+    };
+    send(packet);
+    return packet;
+  }
 }
 
 function scheduleReconnect(error) {
@@ -615,37 +745,106 @@ async function removeWindowById(windowId) {
  * parce qu'elle contient une URL ChatGPT.
  */
 async function closeBoundTarget(binding) {
+  return closeBoundTargetWithOptions(binding);
+}
+
+async function closeBoundTargetWithOptions(binding, { strict = false } = {}) {
   const tabId = binding?.tab_id;
   if (typeof tabId !== "number") return;
   const windowId = binding.window_id;
   if (
-    binding.bridge_owned_window !== true ||
     typeof windowId !== "number" ||
     !chrome.windows?.get
   ) {
+    if (strict) {
+      throw new ConversationArchiveError(
+        "conversation_registry_inconsistent",
+        "le binding exact ne contient pas une fenêtre exploitable",
+        { details: { tab_id: tabId, window_id: windowId ?? null } },
+      );
+    }
     await chrome.tabs.remove(tabId).catch(() => {});
+    return { close_state: "closed", window_closed: false };
+  }
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (_) {
+    if (strict) {
+      throw new ConversationArchiveError(
+        "conversation_tab_missing",
+        "l'onglet exact de la conversation n'existe plus",
+        { details: { tab_id: tabId, window_id: windowId } },
+      );
+    }
     return;
   }
+  if (tab.windowId !== windowId) {
+    // The exact tab is still the only safe target. Do not touch either window.
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch (err) {
+      if (strict) {
+        throw new ConversationArchiveError(
+          "conversation_tab_close_failed",
+          `fermeture de l'onglet exact impossible : ${err?.message || err}`,
+          { retryable: true, details: { tab_id: tabId, window_id: windowId } },
+        );
+      }
+    }
+    return { close_state: "closed", window_closed: false };
+  }
+
   let ownershipProven = false;
   try {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.windowId !== windowId) throw new Error("l'onglet a changé de fenêtre");
     const window = await chrome.windows.get(windowId, { populate: true });
     const tabs = window?.tabs || [];
-    ownershipProven = tabs.length === 1 && tabs[0]?.id === tabId;
+    if (binding.bridge_owned_window !== true) {
+      ownershipProven = false;
+    } else {
+      ownershipProven = tabs.length === 1 && tabs[0]?.id === tabId;
+    }
   } catch (_) {
-    ownershipProven = false;
+    if (strict) {
+      throw new ConversationArchiveError(
+        "conversation_registry_inconsistent",
+        "la fenêtre exacte du binding n'est plus exploitable",
+        { details: { tab_id: tabId, window_id: windowId } },
+      );
+    }
   }
   if (ownershipProven) {
-    await removeWindowById(windowId);
+    try {
+      await chrome.windows.remove(windowId);
+    } catch (err) {
+      if (strict) {
+        throw new ConversationArchiveError(
+          "conversation_window_close_failed",
+          `fermeture de la fenêtre exacte impossible : ${err?.message || err}`,
+          { retryable: true, details: { tab_id: tabId, window_id: windowId } },
+        );
+      }
+      return;
+    }
     console.log("bridge_run_phase", {
       phase: "dedicated_window_removed",
       window_id: windowId,
       tab_id: tabId,
     });
-    return;
+    return { close_state: "closed", window_closed: true };
   }
-  await chrome.tabs.remove(tabId).catch(() => {});
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch (err) {
+    if (strict) {
+      throw new ConversationArchiveError(
+        "conversation_tab_close_failed",
+        `fermeture de l'onglet exact impossible : ${err?.message || err}`,
+        { retryable: true, details: { tab_id: tabId, window_id: windowId } },
+      );
+    }
+  }
+  return { close_state: "closed", window_closed: false };
 }
 
 function isBrowserTarget(value) {

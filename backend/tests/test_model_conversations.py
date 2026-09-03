@@ -9,7 +9,7 @@ from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.model_conversations import (
     ConversationNeedsReviewError,
     ConversationPolicyError,
-    ModelConversationError,
+    ConversationSessionCloseError,
     ModelConversationService,
 )
 from cti_app.application.model_gateway import (
@@ -262,7 +262,14 @@ class _RecordingSessionCloser:
 
 class _FailingSessionCloser:
     async def archive_conversation(self, conversation_id: Any) -> None:
-        raise RuntimeError("simulated close failure")
+        raise BridgeTransportError(
+            "bridge_extension_disconnected",
+            "Extension Chrome non connectée.",
+            retryable=True,
+            phase="conversation_archive",
+            conversation_id=str(conversation_id),
+            diagnostics={"tab_id": 7, "window_id": 8},
+        )
 
 
 class _RecordingFailingSessionCloser:
@@ -271,7 +278,14 @@ class _RecordingFailingSessionCloser:
 
     async def archive_conversation(self, conversation_id: Any) -> None:
         self.calls.append(conversation_id)
-        raise RuntimeError("simulated close failure")
+        raise BridgeTransportError(
+            "bridge_extension_disconnected",
+            "Extension Chrome non connectée.",
+            retryable=True,
+            phase="conversation_archive",
+            conversation_id=str(conversation_id),
+            diagnostics={"tab_id": 7, "window_id": 8},
+        )
 
 
 def _build_service(
@@ -429,7 +443,7 @@ async def test_delete_on_success_does_not_close_on_failure_or_needs_review(
 
 
 async def test_duplicate_delete_on_success_returns_succeeded_when_retry_close_fails(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     adapter = _ScriptedBridgeAdapter("Réponse")
     closer = _RecordingFailingSessionCloser()
@@ -460,6 +474,7 @@ async def test_duplicate_delete_on_success_returns_succeeded_when_retry_close_fa
     assert replay.status is ConversationTurnStatus.SUCCEEDED
     assert len(adapter.calls) == 1
     assert closer.calls == [conversation.id, conversation.id]
+    assert "bridge_extension_disconnected" in caplog.text
 
 
 async def test_adopted_model_run_closes_exact_failed_turn_without_resubmission(
@@ -537,8 +552,15 @@ async def test_explicit_archive_stays_archived_even_if_close_fails(tmp_path: Pat
     )
     conversation = await _fresh_conversation(service)
 
-    with pytest.raises(ModelConversationError):
+    with pytest.raises(ConversationSessionCloseError) as caught:
         await service.archive(conversation.id)
+
+    assert caught.value.cause_code == "bridge_extension_disconnected"
+    assert caught.value.retryable is True
+    assert caught.value.phase == "conversation_archive"
+    assert caught.value.details == {"tab_id": 7, "window_id": 8}
+    assert isinstance(caught.value.__cause__, BridgeTransportError)
+    assert caught.value.__cause__.code == "bridge_extension_disconnected"
 
     async with uow_factory() as uow:
         persisted = await uow.model_conversations.get(conversation.id)

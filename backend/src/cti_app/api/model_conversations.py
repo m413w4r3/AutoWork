@@ -270,9 +270,14 @@ def _turn_view(
 
 def _raise(exc: Exception) -> NoReturn:
     if isinstance(exc, ModelConversationError):
+        detail: dict[str, object] = {"code": exc.code, "message": str(exc)}
+        for field in ("conversation_id", "cause_code", "retryable", "phase", "reason", "details"):
+            value = getattr(exc, field, None)
+            if value is not None:
+                detail[field] = value
         raise HTTPException(
             status_code=exc.status_code,
-            detail={"code": exc.code, "message": str(exc)},
+            detail=detail,
         ) from exc
     code = str(getattr(exc, "code", "model_conversation_failed"))
     status_code = (

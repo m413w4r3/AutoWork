@@ -31,6 +31,15 @@ from cti_app.logging import get_correlation_id
 
 logger = logging.getLogger(__name__)
 
+_ARCHIVE_ERROR_CODES = {
+    "conversation_binding_missing",
+    "conversation_registry_inconsistent",
+    "conversation_tab_missing",
+    "conversation_tab_close_failed",
+    "conversation_window_close_failed",
+    "conversation_archive_internal_error",
+}
+
 
 class ResponsesTransport(Protocol):
     async def create(
@@ -84,6 +93,7 @@ class HttpResponsesTransport:
         timeout_seconds: float | None = None,
         retry: bool = False,
         retry_status_codes: frozenset[int] | None = None,
+        phase: str = "generation",
     ) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         if idempotency_key:
@@ -113,7 +123,7 @@ class HttpResponsesTransport:
                             method, f"{self._base_url}{path}", json=json_body, headers=headers
                         )
                 if response.is_error:
-                    error = _bridge_http_error(response, attempt)
+                    error = _bridge_http_error(response, attempt, default_phase=phase)
                     retry_allowed = error.retryable and (
                         retry_status_codes is None or response.status_code in retry_status_codes
                     )
@@ -137,6 +147,7 @@ class HttpResponsesTransport:
                         "Le bridge a renvoyé une réponse JSON invalide.",
                         retryable=False,
                         attempts=attempt,
+                        phase=phase,
                     ) from exc
                 if not isinstance(value, dict):
                     raise BridgeTransportError(
@@ -144,6 +155,7 @@ class HttpResponsesTransport:
                         "Le bridge a renvoyé un contrat invalide.",
                         retryable=False,
                         attempts=attempt,
+                        phase=phase,
                     )
                 return value
             except httpx.ConnectError as exc:
@@ -153,6 +165,7 @@ class HttpResponsesTransport:
                     "Le bridge ChatGPT est inaccessible.",
                     retryable=True,
                     attempts=attempt,
+                    phase=phase,
                 )
             except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
                 cause = exc
@@ -161,6 +174,7 @@ class HttpResponsesTransport:
                     "Le bridge ChatGPT n'a pas répondu à temps.",
                     retryable=True,
                     attempts=attempt,
+                    phase=phase,
                 )
             if attempt >= attempts or not error.retryable:
                 raise error from cause
@@ -193,6 +207,8 @@ class BridgeTransportError(ModelGatewayError):
         bridge_status: str | None = None,
         submission_state: str | None = None,
         diagnostics: dict[str, Any] | None = None,
+        conversation_id: str | None = None,
+        reason: str | None = None,
     ) -> None:
         super().__init__(safe_description)
         self.code = code
@@ -204,6 +220,8 @@ class BridgeTransportError(ModelGatewayError):
         self.bridge_status = bridge_status
         self.submission_state = submission_state
         self.diagnostics = diagnostics or {}
+        self.conversation_id = conversation_id
+        self.reason = reason
 
 
 def _bounded_backoff(attempt: int) -> float:
@@ -228,15 +246,20 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
     return _retry_after_seconds(response.headers.get("Retry-After")) or _bounded_backoff(attempt)
 
 
-def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTransportError:
+def _bridge_http_error(
+    response: httpx.Response, attempts: int, *, default_phase: str = "generation"
+) -> BridgeTransportError:
     status = response.status_code
     server_code: str | None = None
     bridge_run_id: str | None = None
     bridge_status: str | None = None
-    phase = "generation"
+    phase = default_phase
     submission_state: str | None = None
     diagnostics: dict[str, Any] = {}
     explicit_retryable: bool | None = None
+    server_message: str | None = None
+    reason: str | None = None
+    conversation_id: str | None = None
     try:
         body = response.json()
         detail = body.get("detail") if isinstance(body, dict) else None
@@ -245,12 +268,34 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         if isinstance(source, dict):
             bridge_run_id = source.get("id") if isinstance(source.get("id"), str) else None
             bridge_status = source.get("status") if isinstance(source.get("status"), str) else None
+            if isinstance(source.get("code"), str):
+                server_code = source["code"]
+            if isinstance(source.get("message"), str):
+                server_message = source["message"]
+            if isinstance(source.get("reason"), str):
+                reason = source["reason"]
+            if isinstance(source.get("conversation_id"), str):
+                conversation_id = source["conversation_id"]
+            if isinstance(source.get("phase"), str):
+                phase = source["phase"][:64]
+            if isinstance(source.get("retryable"), bool):
+                explicit_retryable = source["retryable"]
             metadata = source.get("metadata")
             if isinstance(metadata, dict) and isinstance(metadata.get("phase"), str):
                 phase = metadata["phase"][:64]
+            if isinstance(source.get("details"), dict):
+                diagnostics = _safe_bridge_diagnostics(source["details"])
+            for field in ("tab_id", "window_id"):
+                value = source.get(field)
+                if isinstance(value, (bool, int, str)):
+                    diagnostics[field] = value
         if isinstance(error, dict):
             if isinstance(error.get("code"), str):
                 server_code = error["code"]
+            if isinstance(error.get("message"), str):
+                server_message = error["message"]
+            if isinstance(error.get("reason"), str):
+                reason = error["reason"]
             if isinstance(error.get("phase"), str):
                 phase = error["phase"][:64]
             if error.get("submission_state") in {
@@ -263,6 +308,12 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
                 diagnostics = _safe_bridge_diagnostics(error["details"])
             if isinstance(error.get("retryable"), bool):
                 explicit_retryable = error["retryable"]
+            if isinstance(error.get("conversation_id"), str):
+                conversation_id = error["conversation_id"]
+            for field in ("tab_id", "window_id"):
+                value = error.get(field)
+                if isinstance(value, (bool, int, str)):
+                    diagnostics[field] = value
     except ValueError:
         pass
     if server_code in {
@@ -280,7 +331,7 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         "conversation_busy",
         "conversation_unavailable",
         "conversation_profile_mismatch",
-    }:
+    } | _ARCHIVE_ERROR_CODES:
         code = server_code
     elif status in {401, 403}:
         code = "bridge_auth_failed"
@@ -326,9 +377,19 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         "conversation_unavailable": "La conversation ChatGPT est inaccessible.",
         "conversation_profile_mismatch": "La conversation appartient à un autre profil.",
     }
+    if reason is not None:
+        diagnostics["reason"] = reason[:256]
+    known_message = messages.get(code)
+    description = (
+        server_message[:512]
+        if server_message is not None
+        and server_code is not None
+        and (server_code in messages or server_code in _ARCHIVE_ERROR_CODES)
+        else known_message or "Le bridge ChatGPT a renvoyé une erreur."
+    )
     return BridgeTransportError(
         code,
-        messages[code],
+        description,
         retryable=retryable,
         attempts=attempts,
         retry_after=_retry_after_seconds(response.headers.get("Retry-After")),
@@ -337,6 +398,8 @@ def _bridge_http_error(response: httpx.Response, attempts: int) -> BridgeTranspo
         bridge_status=bridge_status,
         submission_state=submission_state,
         diagnostics=diagnostics,
+        conversation_id=conversation_id,
+        reason=reason,
     )
 
 
@@ -364,6 +427,47 @@ def _safe_bridge_diagnostics(value: dict[str, Any]) -> dict[str, Any]:
 
     result = clean(value)
     return result if isinstance(result, dict) else {}
+
+
+def _archive_response_error(
+    response: dict[str, Any], conversation_id: UUID
+) -> BridgeTransportError:
+    """Turn a 2xx archive response without `archived: true` into a typed error."""
+    raw_code = response.get("code")
+    code = (
+        raw_code[:64]
+        if isinstance(raw_code, str) and raw_code.strip()
+        else "bridge_protocol_error"
+    )
+    raw_message = response.get("message") or response.get("reason") or response.get("error")
+    message = (
+        " ".join(raw_message.split())[:512]
+        if isinstance(raw_message, str) and raw_message.strip()
+        else "Le bridge n'a pas confirmé la fermeture de la conversation."
+    )
+    raw_retryable = response.get("retryable")
+    retryable: bool = raw_retryable if isinstance(raw_retryable, bool) else False
+    raw_phase = response.get("phase")
+    phase: str = raw_phase if isinstance(raw_phase, str) else "conversation_archive"
+    raw_details = response.get("details")
+    diagnostics = _safe_bridge_diagnostics(raw_details if isinstance(raw_details, dict) else {})
+    diagnostics["conversation_id"] = str(conversation_id)
+    for field in ("tab_id", "window_id"):
+        value = response.get(field)
+        if isinstance(value, (bool, int, str)):
+            diagnostics[field] = value
+    reason = response.get("reason") if isinstance(response.get("reason"), str) else None
+    if reason:
+        diagnostics["reason"] = reason[:256]
+    return BridgeTransportError(
+        code,
+        message,
+        retryable=retryable,
+        phase=phase[:64],
+        diagnostics=diagnostics,
+        conversation_id=str(conversation_id),
+        reason=reason,
+    )
 
 
 class ChatGPTBridgeTransport(HttpResponsesTransport):
@@ -427,7 +531,13 @@ class ChatGPTBridgeTransport(HttpResponsesTransport):
         )
 
     async def archive_conversation(self, conversation_id: UUID) -> None:
-        await self._request("DELETE", f"/bridge/conversations/{conversation_id}")
+        response = await self._request(
+            "DELETE",
+            f"/bridge/conversations/{conversation_id}",
+            phase="conversation_archive",
+        )
+        if response.get("archived") is not True:
+            raise _archive_response_error(response, conversation_id)
 
 
 class HttpChatCompletionsTransport:

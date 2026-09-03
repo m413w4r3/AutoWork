@@ -2,7 +2,7 @@
 
 import asyncio
 import time
-from typing import Any, Dict, Optional
+from typing import Any
 
 from fastapi import HTTPException
 
@@ -20,26 +20,64 @@ from bridge.transport import Bridge
 
 
 class UiUnavailable(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "bridge_extension_disconnected",
+        retryable: bool = True,
+        phase: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+        self.phase = phase
+        self.details = details or {}
 
 
 async def _ui_roundtrip(bridge: Bridge, payload: dict) -> dict:
+    archive_phase = "conversation_archive" if payload.get("type") == "conversation_archive" else None
     if not bridge.online:
-        raise UiUnavailable("extension non connectée")
+        raise UiUnavailable(
+            "extension non connectée",
+            code="bridge_extension_disconnected",
+            phase=archive_phase,
+        )
     try:
         packet = await bridge.request(payload, UI_TIMEOUT)
     except asyncio.TimeoutError as exc:
-        raise UiUnavailable(f"aucune réponse de l'extension après {UI_TIMEOUT:.0f}s") from exc
-    except Exception as exc:  # noqa: BLE001 - socket fermé, encodage refusé…
-        raise UiUnavailable(f"{type(exc).__name__}: {exc}") from exc
+        raise UiUnavailable(
+            f"aucune réponse de l'extension après {UI_TIMEOUT:.0f}s",
+            code="bridge_ui_timeout",
+            phase=archive_phase,
+        ) from exc
+    except Exception as exc:
+        raise UiUnavailable(
+            f"{type(exc).__name__}: {exc}",
+            code="bridge_extension_disconnected",
+            phase=archive_phase,
+        ) from exc
     if packet.get("type") == "error":  # injecté par `_fail_after_grace`
-        raise UiUnavailable(str(packet.get("message") or "extension déconnectée"))
+        code = packet.get("code")
+        raise UiUnavailable(
+            str(packet.get("message") or "extension déconnectée"),
+            code=code if isinstance(code, str) else "bridge_extension_disconnected",
+            retryable=packet.get("retryable") if isinstance(packet.get("retryable"), bool) else True,
+            phase=packet.get("phase") if isinstance(packet.get("phase"), str) else archive_phase,
+            details=packet.get("details") if isinstance(packet.get("details"), dict) else None,
+        )
     if packet.get("error"):
-        raise UiUnavailable(str(packet["error"]))
+        raise UiUnavailable(
+            str(packet["error"]),
+            code="bridge_protocol_error",
+            retryable=False,
+            phase=archive_phase,
+        )
     return packet
 
 
-def _ui_state_of(packet: dict) -> Optional[UiState]:
+def _ui_state_of(packet: dict) -> UiState | None:
     state = packet.get("state")
     if not isinstance(state, dict):
         return None
@@ -53,8 +91,8 @@ def _ui_state_of(packet: dict) -> Optional[UiState]:
 
 
 def _routing_payload(
-    conversation: Optional[BridgeConversationTarget],
-    browser_target: Optional[BridgeBrowserTarget],
+    conversation: BridgeConversationTarget | None,
+    browser_target: BridgeBrowserTarget | None,
 ) -> dict:
     if conversation is not None and browser_target is not None:
         raise UiUnavailable("conversation et browser_target sont mutuellement exclusifs")
@@ -65,8 +103,8 @@ def _routing_payload(
 
 
 def _verify_target_packet(
-    packet: dict, browser_target: Optional[BridgeBrowserTarget]
-) -> Optional[int]:
+    packet: dict, browser_target: BridgeBrowserTarget | None
+) -> int | None:
     if browser_target is None:
         return None
     if packet.get("target_id") != browser_target.id:
@@ -80,8 +118,8 @@ def _verify_target_packet(
 async def fetch_ui_state(
     bridge: Bridge,
     probe: bool = False,
-    conversation: Optional[BridgeConversationTarget] = None,
-    browser_target: Optional[BridgeBrowserTarget] = None,
+    conversation: BridgeConversationTarget | None = None,
+    browser_target: BridgeBrowserTarget | None = None,
 ) -> UiState:
     """Lit l'état de l'UI. `probe` ouvre les menus pour énumérer les choix."""
     packet = await _ui_roundtrip(
@@ -101,11 +139,11 @@ async def fetch_ui_state(
     return state
 
 
-_probe_cache: Dict[str, Any] = {"at": 0.0, "state": None}
+_probe_cache: dict[str, Any] = {"at": 0.0, "state": None}
 
 
 async def probed_ui_state(bridge: Bridge, fresh: bool = False) -> UiState:
-    cached: Optional[UiState] = _probe_cache["state"]
+    cached: UiState | None = _probe_cache["state"]
     if not fresh and cached is not None and time.monotonic() - _probe_cache["at"] < UI_PROBE_TTL:
         return cached
     # La sonde manipule l'UI : elle ne doit jamais s'exécuter pendant une génération.
@@ -118,9 +156,9 @@ async def probed_ui_state(bridge: Bridge, fresh: bool = False) -> UiState:
 async def apply_controls(
     bridge: Bridge,
     controls: RunControls,
-    conversation: Optional[BridgeConversationTarget] = None,
-    browser_target: Optional[BridgeBrowserTarget] = None,
-) -> tuple[Outcomes, Optional[UiState]]:
+    conversation: BridgeConversationTarget | None = None,
+    browser_target: BridgeBrowserTarget | None = None,
+) -> tuple[Outcomes, UiState | None]:
     wanted = controls.wanted()
     if not wanted:
         return {}, await fetch_ui_state(
@@ -160,8 +198,8 @@ async def prepare_run(
     controls: RunControls,
     *,
     allow_unverified_model: bool,
-    conversation: Optional[BridgeConversationTarget] = None,
-    browser_target: Optional[BridgeBrowserTarget] = None,
+    conversation: BridgeConversationTarget | None = None,
+    browser_target: BridgeBrowserTarget | None = None,
 ) -> RunReport:
     """Applique les contrôles avant la génération, à l'intérieur du slot.
 
@@ -213,8 +251,8 @@ async def prepare_run(
     )
 
 
-def cached_probe() -> Optional[UiState]:
-    state: Optional[UiState] = _probe_cache["state"]
+def cached_probe() -> UiState | None:
+    state: UiState | None = _probe_cache["state"]
     if state is None or time.monotonic() - _probe_cache["at"] >= UI_PROBE_TTL:
         return None
     return state

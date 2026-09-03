@@ -23,6 +23,7 @@ from cti_app.application.jobs import JobCancelledError, JobExecutionContext
 from cti_app.application.model_conversations import (
     ConversationTurnFailedError,
     ModelConversationService,
+    conversation_close_failure_fields,
 )
 from cti_app.application.model_gateway import (
     ModelGateway,
@@ -915,6 +916,7 @@ class ProductionWorkflowOrchestrator:
                 context_subject_id=run.subject_id,
             )
         except Exception as exc:
+            failure = conversation_close_failure_fields(exc)
             self._diagnostics.record(
                 event="production.conversation_close_failed",
                 run_id=run.id,
@@ -923,7 +925,14 @@ class ProductionWorkflowOrchestrator:
                 correlation_id=self._correlation_id,
                 conversation_id=str(conversation_id),
                 error_type=type(exc).__name__,
-                error=str(exc),
+                error_code=failure["error_code"],
+                retryable=failure.get("retryable"),
+                phase=failure.get("phase"),
+                cause_code=failure.get("cause_code"),
+                reason=failure.get("reason"),
+                details=failure["details"],
+                error=str(exc)[:512],
+                error_message=str(exc)[:512],
             )
 
     async def execute_stage(

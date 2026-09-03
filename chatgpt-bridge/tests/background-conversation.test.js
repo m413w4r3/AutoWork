@@ -364,6 +364,127 @@ async function main() {
     assert.equal(await run('conversationRegistry.has("conv-B")'), true);
   }
 
+  // 7b. A missing binding is an explicit failure: no URL lookup and no other
+  // ChatGPT tab may be selected as a substitute.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tabB = await run('resolveConversationTab({ mode: "fresh", id: "conv-B" })');
+
+    const packet = await run(
+      'handleConversationArchive({ conversation_id: "conv-A", id: "archive-missing" })',
+    );
+
+    assert.equal(packet.ok, false);
+    assert.equal(packet.code, "conversation_binding_missing");
+    assert.equal(packet.conversation_id, "conv-A");
+    assert.equal(mock.tabsById.has(tabB.id), true);
+  }
+
+  // 7c. An exact tab that disappeared is not silently upgraded to
+  // already_closed, and no other tab is closed.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tabA = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    const tabB = await run('resolveConversationTab({ mode: "fresh", id: "conv-B" })');
+    mock.tabsById.delete(tabA.id); // keep the registry entry, omit onRemoved
+
+    const packet = await run(
+      'handleConversationArchive({ conversation_id: "conv-A", id: "archive-tab-missing" })',
+    );
+
+    assert.equal(packet.ok, false);
+    assert.equal(packet.code, "conversation_tab_missing");
+    assert.equal(mock.tabsById.has(tabB.id), true);
+  }
+
+  // 7d. A registry entry without an exact window is an inconsistency, not a
+  // reason to fall back to the active window or to an URL match.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    await run(`conversationRegistry.set("conv-A", { tab_id: ${tab.id} })`);
+
+    const packet = await run(
+      'handleConversationArchive({ conversation_id: "conv-A", id: "archive-inconsistent" })',
+    );
+
+    assert.equal(packet.ok, false);
+    assert.equal(packet.code, "conversation_registry_inconsistent");
+    assert.equal(mock.tabsById.has(tab.id), true);
+    assert.equal(mock.tabsById.has(999999), false);
+  }
+
+  // 7e. A tabs.remove failure is typed and leaves both the exact target and
+  // every unrelated tab alone.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    const other = await mock.chrome.tabs.create({
+      url: "https://chatgpt.com/",
+      active: false,
+      windowId: tab.windowId,
+    });
+    mock.chrome.tabs.remove = async (tabId) => {
+      throw new Error(`cannot remove tab ${tabId}`);
+    };
+
+    const packet = await run(
+      'handleConversationArchive({ conversation_id: "conv-A", id: "archive-tab-failure" })',
+    );
+
+    assert.equal(packet.ok, false);
+    assert.equal(packet.code, "conversation_tab_close_failed");
+    assert.equal(packet.retryable, true);
+    assert.equal(mock.tabsById.has(tab.id), true);
+    assert.equal(mock.tabsById.has(other.id), true);
+  }
+
+  // 7f. A windows.remove failure is not swallowed as a successful archive.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    mock.chrome.windows.remove = async (windowId) => {
+      throw new Error(`cannot remove window ${windowId}`);
+    };
+
+    const packet = await run(
+      'handleConversationArchive({ conversation_id: "conv-A", id: "archive-window-failure" })',
+    );
+
+    assert.equal(packet.ok, false);
+    assert.equal(packet.code, "conversation_window_close_failed");
+    assert.equal(packet.retryable, true);
+    assert.equal(mock.tabsById.has(tab.id), true);
+    assert.equal(mock.windowsById.has(tab.windowId), true);
+  }
+
+  // 7g. already_closed is only returned from a proof left by a prior exact
+  // successful close; an unknown conversation remains an error.
+  {
+    const mock = makeChromeMock();
+    const { run } = loadBackground(mock.chrome);
+    const tab = await run('resolveConversationTab({ mode: "fresh", id: "conv-A" })');
+    const first = await run(
+      'handleConversationArchive({ conversation_id: "conv-A", id: "archive-first" })',
+    );
+    const second = await run(
+      'handleConversationArchive({ conversation_id: "conv-A", id: "archive-second" })',
+    );
+
+    assert.equal(first.ok, true);
+    assert.equal(first.close_state, "closed");
+    assert.equal(first.tab_id, tab.id);
+    assert.equal(second.ok, true);
+    assert.equal(second.close_state, "already_closed");
+    assert.equal(second.tab_id, tab.id);
+    assert.equal(mock.tabsById.has(tab.id), false);
+  }
+
   // 8. A tab navigating off the ChatGPT origin invalidates its binding.
   {
     const mock = makeChromeMock();
@@ -1114,6 +1235,12 @@ async function main() {
     // chrome.tabs.update ne sert qu'à autoDiscardable.
     const updates = BACKGROUND_SOURCE.match(/chrome\.tabs\.update\([^)]*\)/g) || [];
     assert.deepEqual(updates, ["chrome.tabs.update(tabId, { autoDiscardable })"]);
+
+    const closeStart = BACKGROUND_SOURCE.indexOf("async function closeBoundTarget");
+    const closeEnd = BACKGROUND_SOURCE.indexOf("function isBrowserTarget", closeStart);
+    const closeSource = BACKGROUND_SOURCE.slice(closeStart, closeEnd);
+    assert.doesNotMatch(closeSource, /tabs\.query/);
+    assert.doesNotMatch(closeSource, /url/);
   }
 
   console.log("background conversation routing contract: ok");

@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
+from uuid import UUID
 
 import httpx
 import pytest
@@ -459,6 +460,60 @@ async def test_bridge_http_error_preserves_submission_boundary_and_safe_diagnost
     assert error.phase == "submission_confirmation"
     assert error.submission_state == "submission_attempted"
     assert error.diagnostics == {"user_turns_before": 1}
+
+
+async def test_bridge_archive_requires_archived_true_on_http_2xx() -> None:
+    conversation_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "archived": False,
+                "conversation_id": conversation_id,
+                "code": "conversation_window_close_failed",
+                "message": "fenêtre exacte encore ouverte",
+                "retryable": True,
+                "phase": "conversation_archive",
+                "details": {"tab_id": 3, "window_id": 4},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.archive_conversation(UUID(conversation_id))
+
+    assert caught.value.code == "conversation_window_close_failed"
+    assert caught.value.retryable is True
+    assert caught.value.phase == "conversation_archive"
+    assert caught.value.conversation_id == conversation_id
+    assert caught.value.diagnostics == {
+        "conversation_id": conversation_id,
+        "tab_id": 3,
+        "window_id": 4,
+    }
+    assert len(requests) == 1
+
+
+async def test_bridge_archive_accepts_only_explicit_archived_true() -> None:
+    conversation_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "archived": True,
+                "conversation_id": str(conversation_id),
+                "close_state": "closed",
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
+        await transport.archive_conversation(conversation_id)
 
 
 async def test_bridge_connect_error_is_typed_and_post_without_key_is_not_retried() -> None:

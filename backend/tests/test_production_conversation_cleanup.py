@@ -12,6 +12,7 @@ from cti_app.domain.production import (
     SubjectProductionRun,
     SubjectProductionStage,
 )
+from cti_app.integrations.models import BridgeTransportError
 
 
 class _Runs:
@@ -132,7 +133,18 @@ async def test_cleanup_failure_does_not_change_success_and_is_diagnosed() -> Non
     run.synthesis_conversation_id = uuid4()
     diagnostics = _Diagnostics()
     orchestrator = _orchestrator(
-        run, _ModelService(RuntimeError("bridge unavailable")), diagnostics
+        run,
+        _ModelService(
+            BridgeTransportError(
+                "bridge_extension_disconnected",
+                "Extension Chrome non connectée.",
+                retryable=True,
+                phase="conversation_archive",
+                conversation_id=str(run.synthesis_conversation_id),
+                diagnostics={"tab_id": 11, "window_id": 12},
+            )
+        ),
+        diagnostics,
     )
 
     async def completed(*args: object, **kwargs: object) -> dict[str, str]:
@@ -150,6 +162,12 @@ async def test_cleanup_failure_does_not_change_success_and_is_diagnosed() -> Non
     ]
     assert len(failures) == 1
     assert failures[0]["conversation_id"] == str(run.synthesis_conversation_id)
+    assert failures[0]["error_code"] == "bridge_extension_disconnected"
+    assert failures[0]["cause_code"] == "bridge_extension_disconnected"
+    assert failures[0]["retryable"] is True
+    assert failures[0]["phase"] == "conversation_archive"
+    assert failures[0]["details"] == {"tab_id": 11, "window_id": 12}
+    assert "Extension Chrome non connectée" in failures[0]["error_message"]
 
 
 @pytest.mark.asyncio

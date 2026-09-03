@@ -102,7 +102,7 @@ def test_window_cleanup_requires_proven_ownership() -> None:
     root = Path(__file__).parents[1] / "extension"
     background = (root / "background.js").read_text()
 
-    start = background.index("async function closeBoundTarget(binding)")
+    start = background.index("async function closeBoundTargetWithOptions(binding")
     end = background.index("\nfunction isBrowserTarget(", start)
     body = background[start:end]
 
@@ -112,14 +112,15 @@ def test_window_cleanup_requires_proven_ownership() -> None:
     assert "tabs.length === 1 && tabs[0]?.id === tabId" in body
     # Propriété non prouvée ou onglets ajoutés par l'opérateur : au plus
     # l'onglet exact du bridge est fermé.
-    assert body.rstrip().endswith("await chrome.tabs.remove(tabId).catch(() => {});\n}")
+    assert "await chrome.tabs.remove(tabId);" in body
+    assert "await chrome.tabs.remove(tabId).catch(() => {});" in body
     assert "chrome.tabs.query(" not in body
     # Toute fermeture de session live passe par ce chemin exact : les seuls
-    # `chrome.tabs.remove` du service worker sont les deux replis sûrs ici.
-    assert background.count("chrome.tabs.remove(") == 2
-    assert body.count("chrome.tabs.remove(") == 2
+    # `chrome.tabs.remove` du service worker sont les trois replis sûrs ici.
+    assert background.count("chrome.tabs.remove(") == 3
+    assert body.count("chrome.tabs.remove(") == 3
     # Une fenêtre n'est jamais fermée ailleurs que par le helper de propriété.
-    assert background.count("chrome.windows.remove(") == 1
+    assert background.count("chrome.windows.remove(") == 2
     assert "async function removeWindowById(windowId)" in background
 
 

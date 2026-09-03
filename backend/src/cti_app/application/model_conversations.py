@@ -64,6 +64,116 @@ class ModelConversationError(RuntimeError):
     status_code = 400
 
 
+class ConversationSessionCloseError(ModelConversationError):
+    """The durable conversation archive succeeded but browser cleanup failed."""
+
+    code = "conversation_session_close_failed"
+    status_code = 502
+
+    def __init__(
+        self,
+        conversation_id: UUID,
+        *,
+        cause_code: str | None,
+        retryable: bool,
+        details: dict[str, Any] | None = None,
+        phase: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        super().__init__(
+            "La conversation est archivée mais sa session navigateur n'a pas pu être fermée"
+        )
+        self.conversation_id = conversation_id
+        self.cause_code = cause_code
+        self.retryable = retryable
+        self.details = _bounded_close_details(details or {})
+        self.phase = phase
+        self.reason = _bounded_close_text(reason) if reason else None
+
+
+def _bounded_close_text(value: object) -> str:
+    return " ".join(str(value).replace("\x00", "").split())[:512]
+
+
+def _bounded_close_details(value: object, depth: int = 0) -> dict[str, Any]:
+    """Keep bridge cleanup diagnostics small and free of prompt-like fields."""
+    if not isinstance(value, dict) or depth > 2:
+        return {}
+    result: dict[str, Any] = {}
+    for key, child in list(value.items())[:32]:
+        name = str(key)
+        if any(
+            marker in name.casefold()
+            for marker in ("prompt", "composer", "input_text", "output_text")
+        ):
+            continue
+        if isinstance(child, dict):
+            cleaned = _bounded_close_details(child, depth + 1)
+            if cleaned:
+                result[name[:64]] = cleaned
+        elif isinstance(child, list):
+            result[name[:64]] = [
+                _bounded_close_text(item)
+                for item in child[:16]
+                if not isinstance(item, (dict, list))
+            ]
+        elif isinstance(child, (str, int, float, bool)) or child is None:
+            result[name[:64]] = _bounded_close_text(child) if isinstance(child, str) else child
+    return result
+
+
+def conversation_close_failure_fields(exc: BaseException) -> dict[str, Any]:
+    """Extract a bounded, structured view of a browser cleanup failure."""
+    chain: list[BaseException] = [exc]
+    cause = exc.__cause__
+    if cause is not None and cause is not exc:
+        chain.append(cause)
+
+    error_code = getattr(exc, "code", None)
+    error_code = error_code if isinstance(error_code, str) else None
+    cause_code = getattr(exc, "cause_code", None)
+    cause_code = cause_code if isinstance(cause_code, str) else None
+    if cause_code is None:
+        for candidate in chain[1:]:
+            candidate_code = getattr(candidate, "code", None)
+            if isinstance(candidate_code, str):
+                cause_code = candidate_code
+                break
+    if cause_code is None and error_code not in {None, ConversationSessionCloseError.code}:
+        cause_code = error_code
+
+    retryable: bool | None = None
+    phase: str | None = None
+    details: dict[str, Any] = {}
+    for candidate in chain:
+        candidate_retryable = getattr(candidate, "retryable", None)
+        if retryable is None and isinstance(candidate_retryable, bool):
+            retryable = candidate_retryable
+        candidate_phase = getattr(candidate, "phase", None)
+        if phase is None and isinstance(candidate_phase, str):
+            phase = candidate_phase[:64]
+        candidate_details = getattr(candidate, "details", None)
+        if not isinstance(candidate_details, dict):
+            candidate_details = getattr(candidate, "diagnostics", None)
+        if not details and isinstance(candidate_details, dict):
+            details = _bounded_close_details(candidate_details)
+
+    reason = getattr(exc, "reason", None)
+    if not isinstance(reason, str):
+        reason = _bounded_close_text(chain[1] if len(chain) > 1 else exc)
+    result: dict[str, Any] = {
+        "error_code": error_code or type(exc).__name__,
+        "cause_code": cause_code,
+        "reason": _bounded_close_text(reason),
+        "details": details,
+    }
+    if retryable is not None:
+        result["retryable"] = retryable
+    if phase is not None:
+        result["phase"] = phase
+    return result
+
+
 class ConversationNotFoundError(ModelConversationError):
     code = "conversation_not_found"
     status_code = 404
@@ -382,10 +492,18 @@ class ModelConversationService:
             ):
                 try:
                     await self._conversation_session_closer.archive_conversation(conversation_id)
-                except Exception:
+                except Exception as exc:
+                    failure = conversation_close_failure_fields(exc)
                     logger.warning(
-                        "conversation_session_close_failed conversation_id=%s",
+                        "conversation_session_close_failed conversation_id=%s error_code=%s "
+                        "cause_code=%s retryable=%s phase=%s reason=%s details=%s",
                         conversation_id,
+                        failure["error_code"],
+                        failure["cause_code"],
+                        failure.get("retryable"),
+                        failure.get("phase"),
+                        failure["reason"],
+                        failure["details"],
                         exc_info=True,
                     )
             return duplicate_success
@@ -536,12 +654,20 @@ class ModelConversationService:
             if should_close_session and self._conversation_session_closer is not None:
                 try:
                     await self._conversation_session_closer.archive_conversation(conversation.id)
-                except Exception:
+                except Exception as exc:
                     # A close failure never rewrites the already-successful model
                     # output as failed — it is only logged.
+                    failure = conversation_close_failure_fields(exc)
                     logger.warning(
-                        "conversation_session_close_failed conversation_id=%s",
+                        "conversation_session_close_failed conversation_id=%s error_code=%s "
+                        "cause_code=%s retryable=%s phase=%s reason=%s details=%s",
                         conversation.id,
+                        failure["error_code"],
+                        failure["cause_code"],
+                        failure.get("retryable"),
+                        failure.get("phase"),
+                        failure["reason"],
+                        failure["details"],
                         exc_info=True,
                     )
             return persisted_turn
@@ -671,19 +797,39 @@ class ModelConversationService:
         # No row lock is held here: the closer performs external HTTP/browser I/O.
         if transport is ConversationTransport.CHATGPT_BRIDGE:
             if self._conversation_session_closer is None:
-                raise ModelConversationError(
+                cause = ModelConversationError(
                     "Aucun mécanisme de fermeture de session bridge n'est configuré"
                 )
+                raise ConversationSessionCloseError(
+                    conversation_id,
+                    cause_code="conversation_session_closer_unconfigured",
+                    retryable=False,
+                    phase="conversation_archive",
+                    reason=str(cause),
+                ) from cause
             try:
                 await self._conversation_session_closer.archive_conversation(conversation_id)
             except Exception as exc:
+                failure = conversation_close_failure_fields(exc)
                 logger.warning(
-                    "conversation_session_close_failed conversation_id=%s",
+                    "conversation_session_close_failed conversation_id=%s error_code=%s "
+                    "cause_code=%s retryable=%s phase=%s reason=%s details=%s",
                     conversation_id,
+                    failure["error_code"],
+                    failure["cause_code"],
+                    failure.get("retryable"),
+                    failure.get("phase"),
+                    failure["reason"],
+                    failure["details"],
                     exc_info=True,
                 )
-                raise ModelConversationError(
-                    "La conversation est archivée mais sa session navigateur n'a pas pu être fermée"
+                raise ConversationSessionCloseError(
+                    conversation_id,
+                    cause_code=failure.get("cause_code"),
+                    retryable=bool(failure.get("retryable", False)),
+                    details=failure.get("details"),
+                    phase=failure.get("phase"),
+                    reason=failure.get("reason"),
                 ) from exc
         return conversation
 
