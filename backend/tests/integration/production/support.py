@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
@@ -232,8 +232,13 @@ class _ScriptedModelAdapter:
     requested_model = "scripted-production-model"
     is_external = False
 
-    def __init__(self, script: ScriptedModelScript) -> None:
+    def __init__(
+        self,
+        script: ScriptedModelScript,
+        provider_calls: list[SafeModelRequest],
+    ) -> None:
         self._script = script
+        self._provider_calls = provider_calls
 
     async def invoke(
         self,
@@ -243,6 +248,7 @@ class _ScriptedModelAdapter:
         output_schema: type[Any] | None = None,
     ) -> AdapterResult:
         del role, output_schema
+        self._provider_calls.append(request)
         output_text = self._script.response_for(request)
         if isinstance(output_text, Exception):
             raise output_text
@@ -290,7 +296,8 @@ class ScriptedModelGateway(ModelGateway):
     ) -> None:
         self.script = ScriptedModelScript()
         self.calls: list[ScriptedModelCall] = []
-        adapter = _ScriptedModelAdapter(self.script)
+        self.provider_calls: list[SafeModelRequest] = []
+        adapter = _ScriptedModelAdapter(self.script, self.provider_calls)
         router = ModelRouter(
             openai_research=adapter,
             openai_structured=adapter,
@@ -636,6 +643,31 @@ class ProductionScenario:
             run = await uow.subject_production_runs.get(self.run_id)
         assert run is not None
         return run
+
+    async def enqueue_persisted_jobs(self, *, recover_abandoned: bool = False) -> None:
+        """Rebuild the runner queue exclusively from durable job rows."""
+        if recover_abandoned:
+            await self.jobs.recover_abandoned(timedelta(seconds=0))
+        assert self.run_id is not None
+        jobs = await self.jobs.list_for_aggregate("subject", self.subject.id)
+        for job in sorted(jobs, key=lambda item: (item.created_at, item.id)):
+            if job.status is JobStatus.QUEUED:
+                await self.runner.dispatch(job.id)
+
+    async def restart(self, uow_factory: UnitOfWorkFactory) -> ProductionScenario:
+        """Create a fresh runtime while reloading its durable identities."""
+        assert self.run_id is not None
+        restarted = ProductionScenario(uow_factory, self.blob_root, self.sources)
+        async with uow_factory() as uow:
+            edition = await uow.editions.get(self.edition.id)
+            subject = await uow.subjects.get(self.subject.id)
+        if edition is None or subject is None:
+            raise AssertionError("restart identities were not found in PostgreSQL")
+        restarted.edition = edition
+        restarted.subject = subject
+        restarted.run_id = self.run_id
+        restarted.batch_id = self.batch_id
+        return restarted
 
 
 def _canonical_url(url: str) -> str:
