@@ -87,6 +87,22 @@ from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 _USED_EDITION_CODES: set[str] = set()
 
 
+def reserve_edition_code() -> str:
+    """Allocate an edition country code unused by any scenario in this process.
+
+    The integration database is session-scoped and shared by every business
+    test, and editions are unique on (country_code, period_start, period_end).
+    All scenarios use the same period, so codes must be allocated here rather
+    than picked independently by each test module.
+    """
+    while True:
+        edition_token = uuid4().int
+        code = "".join(chr(65 + (edition_token // (26**offset)) % 26) for offset in (0, 1))
+        if code not in _USED_EDITION_CODES:
+            _USED_EDITION_CODES.add(code)
+            return code
+
+
 class DeterministicSourceTransport(HttpTransport):
     """HTTP transport fake; SafeHttpCollector still owns all collection rules."""
 
@@ -407,14 +423,7 @@ class ProductionScenario:
             _canonical_url(url): dict(spec) for url, spec in self.sources.items()
         }
         self.sources = canonical_sources
-        while True:
-            edition_token = uuid4().int
-            country_code = "".join(
-                chr(65 + (edition_token // (26**offset)) % 26) for offset in (0, 1)
-            )
-            if country_code not in _USED_EDITION_CODES:
-                _USED_EDITION_CODES.add(country_code)
-                break
+        country_code = reserve_edition_code()
         self.edition = Edition(
             country=f"Business Test {country_code}",
             country_code=country_code,
@@ -688,4 +697,5 @@ __all__ = [
     "ProductionScenario",
     "ScriptedModelCall",
     "ScriptedModelGateway",
+    "reserve_edition_code",
 ]

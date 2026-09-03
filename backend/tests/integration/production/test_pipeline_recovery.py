@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Callable, Mapping
-from itertools import count
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID
@@ -43,7 +42,6 @@ pytestmark = pytest.mark.integration
 ScenarioFactory = Callable[
     [Mapping[str, Mapping[str, object]]], ProductionScenario
 ]
-_EDITION_CODES = count()
 
 
 def _urls(count: int) -> tuple[str, ...]:
@@ -113,12 +111,11 @@ def _configured(
 ) -> tuple[ProductionScenario, tuple[str, ...]]:
     urls = _urls(count)
     scenario = factory(_source_specs(urls))
-    # ProductionScenario uses a random two-letter code.  The integration DB is
-    # shared by the module, so reserve deterministic, unused codes to keep
-    # retries/concurrency tests independent of random collisions.
-    code = f"X{chr(65 + next(_EDITION_CODES))}"
-    scenario.edition.country_code = code
-    scenario.edition.country = f"Recovery Test {code}"
+    # The country code comes from ProductionScenario's shared allocator: the
+    # integration database is session-scoped and editions are unique on
+    # (country_code, period_start, period_end), so it must not be reassigned
+    # here.
+    scenario.edition.country = f"Recovery Test {scenario.edition.country_code}"
     scenario.model.script.references(_references_response(urls))
     scenario.model.script.synthesis(_synthesis_response(urls))
     for index, url in enumerate(urls, start=1):

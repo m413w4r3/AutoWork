@@ -6,7 +6,6 @@ import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from itertools import count
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID
@@ -36,7 +35,6 @@ from .support import ProductionScenario, ScriptedModelGateway
 pytestmark = pytest.mark.integration
 
 ScenarioFactory = Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario]
-_EDITION_CODES = count()
 
 
 class ProcessCrash(BaseException):
@@ -187,9 +185,7 @@ def _configured(
 ) -> tuple[ProductionScenario, tuple[str, ...]]:
     urls = _urls(source_count)
     scenario = factory(_source_specs(urls, bodies=bodies))
-    code = f"R{chr(65 + next(_EDITION_CODES))}"
-    scenario.edition.country_code = code
-    scenario.edition.country = f"Restart Safety {code}"
+    scenario.edition.country = f"Restart Safety {scenario.edition.country_code}"
     if all_core:
         scenario.restrict_core_sources(urls)
     _configure_gateway(scenario, urls)
@@ -709,9 +705,7 @@ async def test_restart_after_non_blocking_source_skip_keeps_skip_durable(
         _source_specs(urls, bodies={urls[0]: "", urls[1]: "ExampleRAT source-2.security-lab.io"})
     )
     scenario.restrict_core_sources(urls)
-    code = f"R{chr(65 + next(_EDITION_CODES))}"
-    scenario.edition.country_code = code
-    scenario.edition.country = f"Restart Safety {code}"
+    scenario.edition.country = f"Restart Safety {scenario.edition.country_code}"
     _configure_gateway(
         scenario,
         urls,

@@ -14,7 +14,6 @@ import hashlib
 import json
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
-from itertools import count
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID
@@ -60,16 +59,12 @@ from cti_app.domain.production import (
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.integrations.models import BridgeTransportError
-from tests.integration.production.support import ProductionScenario
 
-pytest_plugins = (
-    "tests.integration.conftest",
-    "tests.integration.production.conftest",
-)
+from .support import ProductionScenario
+
 pytestmark = pytest.mark.integration
 
 ScenarioFactory = Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario]
-_EDITION_CODES = count()
 _PRINCE_ARCHIVE = (
     "domain,first_seen\n"
     "reserve-one.example,2026-08-13\n"
@@ -142,11 +137,6 @@ def _synthesis(urls: tuple[str, ...]) -> str:
     return f"ExampleRAT activity is documented by the selected reports {citations}."
 
 
-def _edition_code() -> str:
-    value = next(_EDITION_CODES)
-    return f"{chr(65 + value % 26)}{chr(65 + (value // 26) % 26)}"
-
-
 def _configure(
     factory: ScenarioFactory,
     source_count: int,
@@ -158,7 +148,6 @@ def _configure(
 ) -> tuple[ProductionScenario, tuple[str, ...]]:
     urls = _urls(source_count)
     scenario = factory(_source_specs(urls, empty_urls=empty_urls))
-    scenario.edition.country_code = _edition_code()
     scenario.edition.country = "Production Invariant Tests"
     if all_core:
         scenario.restrict_core_sources(urls)
@@ -200,7 +189,6 @@ def _configure_prince_topology(
         source_specs[urls[-1]]["mime"] = "text/csv"
 
     scenario = factory(source_specs)
-    scenario.edition.country_code = _edition_code()
     scenario.edition.country = "Production Prince of Persia Regression"
     # This is the business input from which the production snapshot and Q2
     # profiles are derived; no profile is injected into the expected result.
