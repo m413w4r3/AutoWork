@@ -16,6 +16,11 @@ REFERENCES_PROMPT_VERSION = "6"
 # IOCs/rules, not to every indicator visible in a multi-actor publication.
 EXTRACTION_PROMPT_VERSION = "18"
 IOC_RULES_PROMPT_VERSION = "11"
+# Archive fallback is a separate access contract. The profile-specific Q2
+# contract remains the same; only the source-access block and its identity
+# change.
+ARCHIVED_SOURCE_ACCESS_VERSION = "1"
+ARCHIVE_FALLBACK_PROMPT_VERSION = "1"
 # "10": the batch input is the compact list of exact source URLs plus the single
 # shared Subject. Only the output stays marker-framed: a marker starts the next
 # block; EOF closes the final block.
@@ -660,6 +665,23 @@ handled as distinct sources by Q1. Do not replace the exact source with
 unrelated search results or use memory as evidence. If the exact source cannot
 be accessed, return `UNAVAILABLE` alone and do not invent an extraction."""
 
+    ARCHIVED_SOURCE_ACCESS_V1 = """The live source could not be accessed.
+
+Analyse only the archived capture supplied below.
+
+Canonical source URL (provenance only):
+{source_url}
+
+Do not browse the web.
+Do not follow links.
+Do not supplement this source from memory or other publications.
+Treat the archived content below as the complete source material available
+for this extraction.
+
+--- BEGIN ARCHIVED SOURCE ---
+{source_text}
+--- END ARCHIVED SOURCE ---"""
+
     @classmethod
     def get_extraction_prompt(
         cls,
@@ -680,6 +702,33 @@ be accessed, return `UNAVAILABLE` alone and do not invent an extraction."""
             source_title=source_title,
             source_url=source_url,
             source_access=cls.LIVE_SOURCE_ACCESS_V1.format(source_url=source_url),
+        )
+
+    @classmethod
+    def get_archived_extraction_prompt(
+        cls,
+        subject_title: str,
+        source_id: str = "",
+        source_title: str = "",
+        source_url: str = "",
+        source_text: str = "",
+        profile: ExtractionProfile = ExtractionProfile.FULL,
+    ) -> str:
+        """Render the normal Q2 contract against one supplied archive only."""
+        del source_id
+        template = (
+            cls.TECHNICAL_EXTRACTION_MARKDOWN_V1
+            if profile is ExtractionProfile.FULL
+            else cls.IOC_RULES_EXTRACTION_MARKDOWN_V1
+        )
+        return template.format(
+            subject_title=subject_title,
+            source_title=source_title,
+            source_url=source_url,
+            source_access=cls.ARCHIVED_SOURCE_ACCESS_V1.format(
+                source_url=source_url,
+                source_text=source_text,
+            ),
         )
 
     @classmethod

@@ -44,15 +44,15 @@ class _ArchiveReader:
 
 
 class _Gateway:
-    def __init__(self, response: str) -> None:
-        self.response = response
+    def __init__(self, response: str | list[str]) -> None:
+        self.responses = response if isinstance(response, list) else [response]
         self.requests: list[object] = []
 
     async def execute(self, request: object, role: object) -> object:
         del role
         self.requests.append(request)
         return SimpleNamespace(
-            output_text=self.response,
+            output_text=self.responses.pop(0),
             run=SimpleNamespace(
                 id=request.run_id,
                 status=production_workflow.ModelRunStatus.SUCCEEDED,
@@ -62,6 +62,17 @@ class _Gateway:
             ),
             metadata={},
         )
+
+
+class _RecordingDiagnostics:
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def record(self, **fields: object) -> None:
+        self.events.append(fields)
+
+    def record_parse(self, **fields: object) -> None:
+        del fields
 
 
 def _block(number: int, body: str) -> str:
@@ -75,7 +86,7 @@ def _batch_response(*bodies: str) -> str:
 def _workflow(
     monkeypatch: pytest.MonkeyPatch,
     archives: list[bytes],
-    response: str,
+    response: str | list[str],
 ) -> tuple[object, SubjectProductionRun, _CacheState, _ExtractionSink, _ArchiveReader]:
     subject = uuid4()
     documents: dict[UUID, SimpleNamespace] = {}
@@ -102,6 +113,7 @@ def _workflow(
         sink,
         monkeypatch,
     )
+    orchestrator._diagnostics = _RecordingDiagnostics()
     orchestrator._blob_reader = reader
     report = ReferenceReport(
         sources=tuple(_source(index) for index in range(1, len(archives) + 1)),
@@ -289,6 +301,123 @@ async def test_archive_unavailable_or_tampered_fails_closed(
     assert result["source_failures"]["S1"]["error_code"] == ("q2_source_evidence_unavailable")
     assert sink.calls == []
     assert run.extraction_progress["sources"][0]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_live_unavailable_uses_one_archive_fallback_without_web_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = b"archive-ioc.security-lab.io"
+    orchestrator, run, _state, sink, _reader = _workflow(
+        monkeypatch,
+        [archive],
+        ["UNAVAILABLE", "IOC confirmed domain\n- archive-ioc.security-lab.io"],
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", None),)),
+    )
+
+    assert result["status"] == "success", result
+    assert result["completed_source_ids"] == ["S1"]
+    assert result["skipped_source_ids"] == []
+    assert result["failed_source_ids"] == []
+    assert len(orchestrator._model_gateway.requests) == 2  # type: ignore[attr-defined]
+    live_request, archive_request = orchestrator._model_gateway.requests  # type: ignore[attr-defined]
+    assert live_request.web_search is True
+    assert archive_request.web_search is False
+    assert "archive-ioc.security-lab.io" in archive_request.text
+    assert "Canonical source URL (provenance only):" in archive_request.text
+    assert "Do not browse the web." in archive_request.text
+    assert "Open this exact source:" not in archive_request.text
+    assert sink.calls[-1]["verification_diagnostics"]["source_skips"] == {}
+    events = orchestrator._diagnostics.events  # type: ignore[attr-defined]
+    fallback_events = [
+        event for event in events if event.get("event") == "q2.source.archive_fallback_completed"
+    ]
+    assert fallback_events[0]["source_content_sha256"] == hashlib.sha256(archive).hexdigest()
+    assert fallback_events[0]["live_failure_code"] == "q2_source_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_live_unavailable_without_usable_archive_is_a_successful_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator, run, _state, sink, _reader = _workflow(
+        monkeypatch,
+        [b""],
+        "UNAVAILABLE",
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", None),)),
+    )
+
+    assert result["status"] == "success", result
+    assert result["completed_source_ids"] == []
+    assert result["skipped_source_ids"] == ["S1"]
+    assert result["failed_source_ids"] == []
+    assert len(orchestrator._model_gateway.requests) == 1  # type: ignore[attr-defined]
+    diagnostics = sink.calls[-1]["verification_diagnostics"]
+    assert diagnostics["source_skips"]["S1"]["blocking"] is False
+    assert "q2_source_coverage_failed" not in str(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("archive_state", ["missing_blob", "unreadable", "sha_mismatch"])
+async def test_live_unavailable_archive_integrity_failures_are_non_blocking_skips(
+    monkeypatch: pytest.MonkeyPatch,
+    archive_state: str,
+) -> None:
+    orchestrator, run, state, sink, reader = _workflow(
+        monkeypatch,
+        [b"archive-ioc.security-lab.io"],
+        "UNAVAILABLE",
+    )
+    document = next(iter(state._docs_by_id.values()))
+    collection = next(iter(state._collections_by_id.values()))
+    if archive_state == "missing_blob":
+        document.decoded_blob_id = None
+        collection.decoded_blob_id = None
+    elif archive_state == "unreadable":
+        reader.contents.clear()
+    else:
+        document.decoded_sha256 = "f" * 64
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", None),)),
+    )
+
+    assert result["status"] == "success", result
+    assert result["skipped_source_ids"] == ["S1"]
+    assert result["failed_source_ids"] == []
+    assert len(orchestrator._model_gateway.requests) == 1  # type: ignore[attr-defined]
+    assert sink.calls[-1]["verification_diagnostics"]["source_skips"]["S1"]["blocking"] is False
+
+
+@pytest.mark.asyncio
+async def test_archive_fallback_invalid_output_remains_a_real_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator, run, _state, sink, _reader = _workflow(
+        monkeypatch,
+        [b"archive-ioc.security-lab.io"],
+        ["UNAVAILABLE", "not Q2 markdown"],
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", None),)),
+    )
+
+    assert result["status"] == "needs_review", result
+    assert result["error_code"] == "q2_source_coverage_failed"
+    assert result["failed_source_ids"] == ["S1"]
+    assert result["skipped_source_ids"] == []
+    assert sink.calls == []
 
 
 def test_hatching_article_cannot_borrow_triage_iocs() -> None:

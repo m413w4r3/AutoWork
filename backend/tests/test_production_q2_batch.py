@@ -609,7 +609,7 @@ async def test_later_batch_remains_pending_until_its_provider_call(
 
 
 @pytest.mark.asyncio
-async def test_batch_partial_source_failure_keeps_safe_sources_and_marks_coverage_issue(
+async def test_batch_source_unavailable_uses_archive_fallback_for_only_that_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     response = _batch_response(
@@ -617,21 +617,24 @@ async def test_batch_partial_source_failure_keeps_safe_sources_and_marks_coverag
         "UNAVAILABLE",
         "IOC confirmed domain\n- domain-3.security-lab.io",
     )
-    orchestrator, run, state, sink, gateway = _batch_workflow(monkeypatch, 3, response)
+    gateway = _BatchGateway([response, "EMPTY"])
+    orchestrator, run, state, sink, gateway = _batch_workflow(
+        monkeypatch, 3, response, gateway=gateway
+    )
 
     result = await orchestrator._execute_direct_url_extraction(
         run,
         snapshot=_snapshot((_input_source("https://example.test/core", date(2026, 7, 10)),)),
     )
 
-    assert result["status"] == "needs_review"
-    assert result["error_code"] == "q2_source_coverage_failed"
-    assert result["completed_source_ids"] == ["S1", "S3"]
-    assert result["source_failures"]["S2"]["error_code"] == "batch_source_unavailable"
-    assert len(gateway.calls) == 1
+    assert result["status"] == "success", result
+    assert result["completed_source_ids"] == ["S1", "S3", "S2"]
+    assert result["skipped_source_ids"] == []
+    assert len(gateway.calls) == 2
+    assert gateway.calls[1].web_search is False
+    assert gateway.calls[1].metadata["source_id"] == "S2"
     assert state.extractions.rows == {}
-    items = sink.calls  # No extraction artifact is stored on coverage failure.
-    assert items == []
+    assert sink.calls  # The archive fallback makes extraction non-blocking.
 
 
 @pytest.mark.asyncio

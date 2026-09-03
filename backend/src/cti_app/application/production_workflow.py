@@ -65,6 +65,8 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.production_prompts import (
+    ARCHIVE_FALLBACK_PROMPT_VERSION,
+    ARCHIVED_SOURCE_ACCESS_VERSION,
     EXTRACTION_PROMPT_VERSION,
     EXTRACTION_PROMPT_VERSION_BY_PROFILE,
     IOC_RULES_BATCH_PROMPT_VERSION,
@@ -147,6 +149,9 @@ SYNTHESIS_EVIDENCE_PACK_VERSION = "5"
 # deterministic source processing. This is a local proof read, never prompt
 # material.
 MAX_ARCHIVED_SOURCE_BYTES = 25 * 1024 * 1024
+# The gateway's persisted text contract is capped at 10 MB. An archive
+# fallback is either sent as one complete request or not sent at all.
+MAX_Q2_ARCHIVE_FALLBACK_PROMPT_BYTES = 10_000_000
 
 # Bridge and network hiccups are worth retrying; anything else is a dead end
 # for this attempt and must not silently burn the subject.
@@ -231,6 +236,17 @@ class _Q2SourceEvidenceUnavailable(_Q2SourceContentFailure):
             **({"expected_decoded_sha256": expected_sha256} if expected_sha256 is not None else {}),
             **({"decoded_blob_id": str(blob_id)} if blob_id is not None else {}),
         }
+
+
+class _Q2LiveSourceUnavailable(_Q2SourceContentFailure):
+    """The model explicitly reported that the exact live source was unavailable."""
+
+    code = "q2_source_unavailable"
+
+
+def _is_q2_source_unavailable(errors: Sequence[str]) -> bool:
+    """Recognize only the parser's explicit terminal live-source response."""
+    return tuple(errors) == ("q2_source_unavailable",)
 
 
 class _Q2ControlFailure(RuntimeError):
@@ -548,6 +564,7 @@ def _new_extraction_progress(
         "ioc_rules_completed": 0,
         "cache_hits": 0,
         "model_calls": 0,
+        "skipped_sources": 0,
         "light_batches": 0,
         "light_sources_batched": 0,
         "confirmed_iocs": 0,
@@ -560,6 +577,7 @@ def _new_extraction_progress(
         "active_source_id": None,
         "active_source_title": None,
         "active_profile": None,
+        "source_skips": {},
         "sources": sources,
     }
 
@@ -687,6 +705,23 @@ def _mark_extraction_source_failed(
     status: str,
 ) -> None:
     _progress_source(progress, source_id)["status"] = status
+
+
+def _mark_extraction_source_skipped(
+    progress: dict[str, Any],
+    source_id: str,
+    details: dict[str, Any],
+) -> None:
+    """Record a non-blocking source skip without changing failure counters."""
+    _progress_source(progress, source_id)["status"] = "skipped"
+    _progress_source(progress, source_id)["skip"] = details
+    source_skips = progress.setdefault("source_skips", {})
+    if isinstance(source_skips, dict) and source_id not in source_skips:
+        source_skips[source_id] = details
+    progress["skipped_sources"] = sum(
+        item["status"] == "skipped"
+        for item in cast(list[dict[str, Any]], progress["sources"])
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1710,9 +1745,11 @@ class ProductionWorkflowOrchestrator:
         url_raw_parts: list[str] = []
         warnings: list[str] = []
         completed: list[str] = []
+        skipped: list[str] = []
         failed: list[str] = []
         failed_attempts: list[str] = []
         failures: dict[str, dict[str, Any]] = {}
+        source_skips: dict[str, dict[str, Any]] = {}
         source_evidence_rejections: list[dict[str, Any]] = []
         source_evidence_rejection_counts: dict[tuple[str, str | None, str, str], int] = {}
         plans_by_url = {plan.canonical_url: plan for plan in source_plans}
@@ -1788,7 +1825,27 @@ class ProductionWorkflowOrchestrator:
                 return None
             return content.decode("utf-8", errors="replace")
 
-        def checkpoint_key(work: _Q2SourceWork, *, batched: bool) -> str:
+        def checkpoint_key(
+            work: _Q2SourceWork,
+            *,
+            batched: bool,
+            access_mode: str = "live_url",
+        ) -> str:
+            if access_mode == "archive_fallback":
+                if work.source_content_sha256 is None:
+                    raise ValueError("Archive fallback checkpoints require a source hash")
+                return _q2_archive_fallback_checkpoint_key(
+                    production_run_id=run.id,
+                    pipeline_generation=run.pipeline_generation,
+                    source_id=work.source.local_id,
+                    canonical_url=work.source.canonical_url,
+                    source_content_sha256=work.source_content_sha256,
+                    profile=work.plan.profile,
+                    provider=ModelProvider.OPENAI,
+                    requested_model=requested_model,
+                )
+            if access_mode != "live_url":
+                raise ValueError(f"Unsupported Q2 access mode: {access_mode}")
             if batched:
                 prompt_version = IOC_RULES_BATCH_PROMPT_VERSION
                 batch_parser_version: str | None = Q2_BATCH_PARSER_VERSION
@@ -1816,10 +1873,15 @@ class ProductionWorkflowOrchestrator:
             *,
             model_run_id: UUID,
             batch_id: str | None = None,
+            source_text: SourceEvidenceDocument | None = None,
         ) -> Q2SourceOutput:
             """Validate one source output against only that source's archive."""
             archived = archived_sources.get(work.source.canonical_url)
-            archived_text = await self._load_archived_source_text(archived)
+            archived_text = (
+                source_text
+                if source_text is not None
+                else await self._load_archived_source_text(archived)
+            )
             evidence = _gate_archived_q2_output(
                 output,
                 source_text=archived_text,
@@ -1872,8 +1934,9 @@ class ProductionWorkflowOrchestrator:
             work: _Q2SourceWork,
             *,
             batched: bool,
+            access_mode: str = "live_url",
         ) -> _Q2ReusableSource | None:
-            key = checkpoint_key(work, batched=batched)
+            key = checkpoint_key(work, batched=batched, access_mode=access_mode)
             checkpoint = await find_q2_checkpoint(key)
             if checkpoint is None:
                 return None
@@ -1883,6 +1946,13 @@ class ProductionWorkflowOrchestrator:
 
             parameters = getattr(checkpoint, "parameters", {})
             kind = parameters.get("q2_execution_kind") if isinstance(parameters, dict) else None
+            persisted_access_mode = (
+                parameters.get("q2_access_mode") if isinstance(parameters, dict) else None
+            )
+            if access_mode == "archive_fallback" and persisted_access_mode != "archive_fallback":
+                return None
+            if access_mode == "live_url" and persisted_access_mode == "archive_fallback":
+                return None
             if kind == "batch":
                 batch_sources = parameters.get("q2_batch_sources", [])
                 target = next(
@@ -1974,6 +2044,10 @@ class ProductionWorkflowOrchestrator:
         async def record_reused_source(
             work: _Q2SourceWork,
             reusable: _Q2ReusableSource,
+            *,
+            access_mode: str = "live_url",
+            source_text: SourceEvidenceDocument | None = None,
+            live_failure_code: str | None = None,
         ) -> None:
             nonlocal cache_hits, model_calls_avoided
             try:
@@ -1984,13 +2058,16 @@ class ProductionWorkflowOrchestrator:
                     work,
                     profiled_output,
                     model_run_id=reusable.model_run_id,
+                    source_text=source_text,
                 )
             except _Q2SourceEvidenceUnavailable as exc:
                 await remove_q2_checkpoint_keys(
                     reusable.model_run_id,
                     (
-                        checkpoint_key(work, batched=False),
-                        checkpoint_key(work, batched=True),
+                        checkpoint_key(work, batched=False, access_mode=access_mode),
+                        checkpoint_key(work, batched=True, access_mode="live_url")
+                        if access_mode == "live_url"
+                        else checkpoint_key(work, batched=False, access_mode="live_url"),
                     ),
                 )
                 await record_source_failure(
@@ -2032,7 +2109,24 @@ class ProductionWorkflowOrchestrator:
                 model_run_id=str(reusable.model_run_id),
                 profile=work.plan.profile.value,
                 checkpoint_version=Q2_SUCCESSFUL_CHECKPOINT_VERSION,
+                access_mode=access_mode,
             )
+            if access_mode == "archive_fallback":
+                self._diagnostics.record(
+                    event="q2.source.archive_fallback_completed",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    source_id=work.source.local_id,
+                    source_url=work.source.canonical_url,
+                    source_content_sha256=work.source_content_sha256,
+                    profile=work.plan.profile.value,
+                    live_failure_code=live_failure_code,
+                    fallback_model_run_id=str(reusable.model_run_id),
+                    duration_ms=0,
+                    reused=True,
+                )
 
         async def pace_before_model_call() -> None:
             if progress["model_calls"]:
@@ -2084,6 +2178,7 @@ class ProductionWorkflowOrchestrator:
                 "retryable": False,
                 "phase": "response_validation",
                 "submission_state": "post_submission",
+                "access_mode": "live_url",
                 "failure_class": _Q2FailureClass.SOURCE_CONTENT_FAILURE.value,
                 "contributes_to_coverage": True,
                 "duration_ms": 0,
@@ -2105,7 +2200,53 @@ class ProductionWorkflowOrchestrator:
                 phase="response_validation",
                 submission_state="post_submission",
                 failure_class=_Q2FailureClass.SOURCE_CONTENT_FAILURE.value,
+                access_mode="live_url",
                 duration_ms=0,
+            )
+
+        async def record_source_skip(
+            work: _Q2SourceWork,
+            *,
+            live_error_code: str,
+            archive_error_code: str,
+            archive_reason: str | None,
+            profile: ExtractionProfile,
+            live_model_run_id: UUID | None = None,
+            batch_id: str | None = None,
+        ) -> None:
+            details: dict[str, Any] = {
+                "source_url": work.source.canonical_url,
+                "reason_code": "live_unavailable_archive_unusable",
+                "live_error_code": live_error_code,
+                "archive_error_code": archive_error_code,
+                "blocking": False,
+            }
+            if archive_reason:
+                details["archive_reason"] = archive_reason
+            if batch_id is not None:
+                details["batch_id"] = batch_id
+            source_skips[work.source.local_id] = details
+            if work.source.local_id not in skipped:
+                skipped.append(work.source.local_id)
+            _mark_extraction_source_skipped(progress, work.source.local_id, details)
+            clear_active_source()
+            await self._persist_extraction_progress(run.id, progress)
+            self._diagnostics.record(
+                event="q2.source.skipped",
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage="extraction",
+                correlation_id=self._correlation_id,
+                source_id=work.source.local_id,
+                source_url=work.source.canonical_url,
+                source_content_sha256=work.source_content_sha256,
+                profile=profile.value,
+                live_error_code=live_error_code,
+                archive_error_code=archive_error_code,
+                archive_reason=archive_reason,
+                live_model_run_id=(str(live_model_run_id) if live_model_run_id else None),
+                batch_id=batch_id,
+                blocking=False,
             )
 
         async def record_batch_source_failure(
@@ -2123,6 +2264,362 @@ class ProductionWorkflowOrchestrator:
                 profile=ExtractionProfile.IOC_RULES,
                 batch_id=item.batch_id,
             )
+
+        async def execute_archive_fallback(
+            work: _Q2SourceWork,
+            *,
+            live_failure_code: str,
+            live_model_run_id: UUID | None = None,
+            batch_id: str | None = None,
+        ) -> dict[str, Any] | None:
+            """Run the archive-only path after an explicit live UNAVAILABLE."""
+            nonlocal full_calls, light_calls
+            source = work.source
+            plan = work.plan
+            archived = archived_sources.get(source.canonical_url)
+            try:
+                archived_text = await self._load_archived_source_text(archived)
+                # The evidence document is also the object passed to the gate.
+                # Prefer the safe complete rendered view when available, and
+                # never slice either representation.
+                source_text = (
+                    archived_text.decoded_source_view or archived_text.parsed_text
+                ).strip()
+                if not source_text:
+                    raise _Q2SourceEvidenceUnavailable(
+                        "Archived source text is empty",
+                        expected_sha256=archived.content_sha256 if archived else None,
+                        blob_id=archived.decoded_blob_id if archived else None,
+                    )
+            except _Q2SourceEvidenceUnavailable as exc:
+                details = exc.details if isinstance(exc.details, dict) else {}
+                await record_source_skip(
+                    work,
+                    live_error_code=live_failure_code,
+                    archive_error_code=exc.code,
+                    archive_reason=(
+                        str(details["reason"])
+                        if isinstance(details.get("reason"), str)
+                        else None
+                    ),
+                    profile=plan.profile,
+                    live_model_run_id=live_model_run_id,
+                    batch_id=batch_id,
+                )
+                return None
+
+            archive_model_run_id = _q2_archive_fallback_model_run_id(
+                production_run_id=run.id,
+                pipeline_generation=run.pipeline_generation,
+                source_id=source.local_id,
+                canonical_url=source.canonical_url,
+                source_content_sha256=work.source_content_sha256 or "",
+                profile=plan.profile,
+                provider=ModelProvider.OPENAI,
+                requested_model=requested_model,
+            )
+            reusable = await load_reusable_source(
+                work,
+                batched=False,
+                access_mode="archive_fallback",
+            )
+            if reusable is not None:
+                await record_reused_source(
+                    work,
+                    reusable,
+                    access_mode="archive_fallback",
+                    source_text=archived_text,
+                    live_failure_code=live_failure_code,
+                )
+                return None
+
+            prompt = ProductionPromptTemplates.get_archived_extraction_prompt(
+                subject_title,
+                source.local_id,
+                source.title,
+                source.canonical_url,
+                source_text,
+                profile=plan.profile,
+            )
+            if len(prompt.encode("utf-8")) > MAX_Q2_ARCHIVE_FALLBACK_PROMPT_BYTES:
+                await record_source_skip(
+                    work,
+                    live_error_code=live_failure_code,
+                    archive_error_code="q2_archive_prompt_too_large",
+                    archive_reason="archive_fallback_prompt_exceeds_gateway_limit",
+                    profile=plan.profile,
+                    live_model_run_id=live_model_run_id,
+                    batch_id=batch_id,
+                )
+                return None
+            if plan.profile is ExtractionProfile.FULL:
+                full_calls += 1
+            else:
+                light_calls += 1
+            await pace_before_model_call()
+            _mark_extraction_source_running(progress, source, plan)
+            progress["model_calls"] += 1
+            await self._persist_extraction_progress(run.id, progress)
+            self._diagnostics.record(
+                event="q2.source.archive_fallback_started",
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage="extraction",
+                correlation_id=self._correlation_id,
+                source_id=source.local_id,
+                source_url=source.canonical_url,
+                source_content_sha256=work.source_content_sha256,
+                profile=plan.profile.value,
+                live_failure_code=live_failure_code,
+                fallback_model_run_id=str(archive_model_run_id),
+                web_search=False,
+            )
+            started_at = time.monotonic()
+            raw = ""
+            execution: Any | None = None
+            try:
+                execution = await model_gateway.execute(
+                    ModelRequest(
+                        text=prompt,
+                        prompt_template_id="production-q2-url-archive-fallback",
+                        prompt_template_version=ARCHIVE_FALLBACK_PROMPT_VERSION,
+                        evidence_pack_hash=hashlib.sha256(prompt.encode()).hexdigest(),
+                        external_llm_allowed=True,
+                        routing_hint=ModelRoutingHint.WEB_RESEARCH,
+                        provider=ModelProvider.OPENAI,
+                        web_search=False,
+                        run_id=archive_model_run_id,
+                        allow_failed_resubmit=True,
+                        metadata={
+                            "source_id": source.local_id,
+                            "source_url": source.canonical_url,
+                            "profile": plan.profile.value,
+                            "access_mode": "archive_fallback",
+                            "source_content_sha256": work.source_content_sha256,
+                            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+                            "parser_version": Q2_MARKDOWN_PARSER_VERSION,
+                            "verifier_version": ARTIFACT_VERIFIER_VERSION,
+                            "source_evidence_version": SOURCE_EVIDENCE_VERSION,
+                            "archive_fallback_prompt_version": ARCHIVE_FALLBACK_PROMPT_VERSION,
+                            "archived_source_access_version": ARCHIVED_SOURCE_ACCESS_VERSION,
+                        },
+                        parameters={
+                            "q2_execution_kind": "individual",
+                            "q2_access_mode": "archive_fallback",
+                            "source_content_sha256": work.source_content_sha256,
+                            "archive_fallback_prompt_version": ARCHIVE_FALLBACK_PROMPT_VERSION,
+                            "archived_source_access_version": ARCHIVED_SOURCE_ACCESS_VERSION,
+                        },
+                    ),
+                    ModelRole.RESEARCH,
+                )
+                remove_persisted_model_call(execution, profile=plan.profile)
+                await self._check_cancellation(run.id, context)
+                if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
+                    review_details = dict(execution.run.error_details or {})
+                    review_details.update(execution.metadata)
+                    raise _Q2ControlFailure(
+                        execution.run.error_message or "Model run needs review",
+                        code=execution.run.error_code or "q2_control_failure",
+                        details=review_details,
+                    )
+                if execution.run.status is not ModelRunStatus.SUCCEEDED:
+                    run_status = execution.run.status.value
+                    raise _Q2ControlFailure(
+                        f"Model run reached unexpected status {run_status}",
+                        code=execution.run.error_code or "q2_model_run_not_succeeded",
+                        details={
+                            **(execution.run.error_details or {}),
+                            **execution.metadata,
+                            "model_run_status": run_status,
+                        },
+                    )
+                raw = execution.output_text or ""
+                if not raw.strip():
+                    raise _Q2ControlFailure("Provider returned no Q2 response")
+                parsed = parse_q2_proposals_markdown(raw)
+                self._log_parse(run, "extraction", parsed)
+                if not parsed.usable or parsed.value is None:
+                    # An archive was actually supplied: this is a normal
+                    # fallback output failure, not another source skip.
+                    raise _Q2SourceContentFailure(
+                        "; ".join(parsed.errors) or "archive_fallback_output_invalid"
+                    )
+                filtered_output, profile_warnings = _enforce_q2_profile(
+                    parsed.value, plan.profile
+                )
+                filtered_output = await gate_source_output(
+                    work,
+                    filtered_output,
+                    model_run_id=execution.run.id,
+                    source_text=archived_text,
+                )
+                warnings.extend(profile_warnings)
+                submissions.append(
+                    Q2ProposalSubmission(
+                        output=filtered_output,
+                        source_ids=(source.local_id,),
+                        model_run_id=str(execution.run.id),
+                    )
+                )
+                completed.append(source.local_id)
+                _mark_extraction_source_complete(
+                    progress,
+                    source,
+                    status="succeeded",
+                    counts=_source_progress_counts(filtered_output, source.local_id),
+                )
+                await persist_q2_checkpoint_keys(
+                    execution.run.id,
+                    [checkpoint_key(work, batched=False, access_mode="archive_fallback")],
+                )
+                clear_active_source()
+                await self._persist_extraction_progress(run.id, progress)
+                url_raw_parts.append(raw)
+                warnings.extend(parsed.warnings)
+                duration_ms = int((time.monotonic() - started_at) * 1000)
+                self._diagnostics.record(
+                    event="q2.source.completed",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    source_id=source.local_id,
+                    source_url=source.canonical_url,
+                    source_content_sha256=work.source_content_sha256,
+                    model_run_id=str(execution.run.id),
+                    profile=plan.profile.value,
+                    access_mode="archive_fallback",
+                    answer_chars=len(raw),
+                    facts_count=len(filtered_output.facts),
+                    artifacts_count=len(filtered_output.artifacts),
+                    rules_count=len(filtered_output.rules),
+                    duration_ms=duration_ms,
+                )
+                self._diagnostics.record(
+                    event="q2.source.archive_fallback_completed",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    source_id=source.local_id,
+                    source_url=source.canonical_url,
+                    source_content_sha256=work.source_content_sha256,
+                    profile=plan.profile.value,
+                    live_failure_code=live_failure_code,
+                    fallback_model_run_id=str(execution.run.id),
+                    duration_ms=duration_ms,
+                )
+                return None
+            except JobCancelledError:
+                raise
+            except Exception as exc:
+                await self._check_cancellation(run.id, context)
+                if (
+                    execution is not None
+                    and getattr(execution, "run", None) is not None
+                    and execution.run.status is ModelRunStatus.SUCCEEDED
+                ):
+                    await persist_q2_checkpoint_keys(execution.run.id, [])
+                classification = _classify_q2_failure(
+                    exc,
+                    provider_response_produced=bool(raw),
+                )
+                _mark_extraction_source_failed(
+                    progress,
+                    source.local_id,
+                    "needs_review" if classification.status == "needs_review" else "failed",
+                )
+                clear_active_source()
+                await self._persist_extraction_progress(run.id, progress)
+                error = str(exc)[:1000]
+                duration_ms = int((time.monotonic() - started_at) * 1000)
+                failed_attempts.append(source.local_id)
+                if classification.contributes_to_coverage:
+                    failed.append(source.local_id)
+                exception_details = getattr(exc, "details", None)
+                failures[source.local_id] = {
+                    "model_run_id": str(archive_model_run_id),
+                    "source_url": source.canonical_url,
+                    "error_code": classification.error_code,
+                    "error": error,
+                    "details": (
+                        dict(exception_details) if isinstance(exception_details, dict) else {}
+                    ),
+                    "retryable": classification.retryable,
+                    "phase": classification.phase,
+                    "submission_state": classification.submission_state,
+                    "failure_class": classification.failure_class.value,
+                    "contributes_to_coverage": classification.contributes_to_coverage,
+                    "access_mode": "archive_fallback",
+                    "duration_ms": duration_ms,
+                }
+                self._diagnostics.record(
+                    event="q2.source.failed",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    source_id=source.local_id,
+                    source_url=source.canonical_url,
+                    source_content_sha256=work.source_content_sha256,
+                    model_run_id=str(archive_model_run_id),
+                    profile=plan.profile.value,
+                    access_mode="archive_fallback",
+                    error_code=classification.error_code,
+                    error=error,
+                    retryable=classification.retryable,
+                    phase=classification.phase,
+                    submission_state=classification.submission_state,
+                    failure_class=classification.failure_class.value,
+                    duration_ms=duration_ms,
+                )
+                if classification.failure_class is _Q2FailureClass.GLOBAL_TRANSIENT_PRE_SUBMISSION:
+                    return {
+                        "stage": "extraction",
+                        "status": "transient_error",
+                        "error_code": classification.error_code,
+                        "error": error,
+                        "details": {
+                            "completed_source_ids": completed,
+                            "skipped_source_ids": skipped,
+                            "failed_source_ids": failed_attempts,
+                            "source_skips": source_skips,
+                            "source_failures": failures,
+                            "failure_class": classification.failure_class.value,
+                        },
+                        "completed_source_ids": completed,
+                        "skipped_source_ids": skipped,
+                        "failed_source_ids": failed_attempts,
+                        "source_skips": source_skips,
+                        "source_failures": failures,
+                        **metrics(),
+                    }
+                if classification.failure_class in {
+                    _Q2FailureClass.RECONCILIATION_REQUIRED,
+                    _Q2FailureClass.CONTROL_INVARIANT_FAILURE,
+                }:
+                    return {
+                        "stage": "extraction",
+                        "status": classification.status,
+                        "error_code": classification.error_code,
+                        "error": error,
+                        "details": {
+                            "completed_source_ids": completed,
+                            "skipped_source_ids": skipped,
+                            "failed_source_ids": failed_attempts,
+                            "source_skips": source_skips,
+                            "source_failures": failures,
+                            "failure_class": classification.failure_class.value,
+                        },
+                        "completed_source_ids": completed,
+                        "skipped_source_ids": skipped,
+                        "failed_source_ids": failed_attempts,
+                        "source_skips": source_skips,
+                        "source_failures": failures,
+                        **metrics(),
+                    }
+                return None
 
         async def execute_individual(work: _Q2SourceWork) -> dict[str, Any] | None:
             nonlocal full_calls, light_calls
@@ -2166,6 +2663,7 @@ class ProductionWorkflowOrchestrator:
                 source_content_sha256=source_content_sha256,
                 model_run_id=str(model_run_id),
                 profile=plan.profile.value,
+                access_mode="live_url",
                 web_search=True,
             )
             started_at = time.monotonic()
@@ -2228,7 +2726,15 @@ class ProductionWorkflowOrchestrator:
                 parsed = parse_q2_proposals_markdown(raw)
                 self._log_parse(run, "extraction", parsed)
                 if not parsed.usable or parsed.value is None:
-                    raise _Q2SourceContentFailure("; ".join(parsed.errors) or "source_unavailable")
+                    if _is_q2_source_unavailable(parsed.errors):
+                        return await execute_archive_fallback(
+                            work,
+                            live_failure_code="q2_source_unavailable",
+                            live_model_run_id=execution.run.id,
+                        )
+                    raise _Q2SourceContentFailure(
+                        "; ".join(parsed.errors) or "source_content_invalid"
+                    )
                 filtered_output, profile_warnings = _enforce_q2_profile(parsed.value, plan.profile)
                 filtered_output = await gate_source_output(
                     work,
@@ -2268,6 +2774,7 @@ class ProductionWorkflowOrchestrator:
                     source_content_sha256=source_content_sha256,
                     model_run_id=str(model_run_id),
                     profile=plan.profile.value,
+                    access_mode="live_url",
                     answer_chars=len(raw),
                     facts_count=len(filtered_output.facts),
                     artifacts_count=len(filtered_output.artifacts),
@@ -2314,6 +2821,7 @@ class ProductionWorkflowOrchestrator:
                     "phase": classification.phase,
                     "submission_state": classification.submission_state,
                     "failure_class": classification.failure_class.value,
+                    "access_mode": "live_url",
                     "contributes_to_coverage": classification.contributes_to_coverage,
                     "duration_ms": duration_ms,
                 }
@@ -2334,6 +2842,7 @@ class ProductionWorkflowOrchestrator:
                     phase=classification.phase,
                     submission_state=classification.submission_state,
                     failure_class=classification.failure_class.value,
+                    access_mode="live_url",
                     duration_ms=duration_ms,
                 )
                 if classification.failure_class is _Q2FailureClass.GLOBAL_TRANSIENT_PRE_SUBMISSION:
@@ -2419,6 +2928,7 @@ class ProductionWorkflowOrchestrator:
                 batch_source_ids=[item.source.local_id for item in batch_sources],
                 batch_source_urls=[item.canonical_url for item in batch_sources],
                 source_count=len(batch_sources),
+                access_mode="live_url",
             )
             started_at = time.monotonic()
             raw = ""
@@ -2510,10 +3020,14 @@ class ProductionWorkflowOrchestrator:
                         details={"errors": list(parsed.errors)},
                     )
                 by_id = {item.batch_id: item for item in batch_sources}
+                archive_fallback_items: list[Q2BatchSource] = []
                 for source_result in parsed.sources:
                     item = by_id[source_result.batch_id]
                     warnings.extend(source_result.warnings)
                     if not source_result.usable or source_result.output is None:
+                        if source_result.error_code == "batch_source_unavailable":
+                            archive_fallback_items.append(item)
+                            continue
                         await record_batch_source_failure(
                             item,
                             error_code=source_result.error_code or "batch_source_invalid",
@@ -2585,6 +3099,15 @@ class ProductionWorkflowOrchestrator:
                 )
                 clear_active_source()
                 await self._persist_extraction_progress(run.id, progress)
+                for item in archive_fallback_items:
+                    fallback_result = await execute_archive_fallback(
+                        pending[item.source.local_id],
+                        live_failure_code="batch_source_unavailable",
+                        live_model_run_id=execution.run.id,
+                        batch_id=item.batch_id,
+                    )
+                    if fallback_result is not None:
+                        return fallback_result
                 return None
             except JobCancelledError:
                 raise
@@ -2641,6 +3164,7 @@ class ProductionWorkflowOrchestrator:
                     phase=classification.phase,
                     submission_state=classification.submission_state,
                     failure_class=classification.failure_class.value,
+                    access_mode="live_url",
                     duration_ms=duration_ms,
                 )
                 return {
@@ -2777,11 +3301,15 @@ class ProductionWorkflowOrchestrator:
                 "error": "One or more Q1 sources could not be analysed",
                 "details": {
                     "completed_source_ids": completed,
+                    "skipped_source_ids": skipped,
                     "failed_source_ids": failed,
+                    "source_skips": source_skips,
                     "source_failures": failures,
                 },
                 "completed_source_ids": completed,
+                "skipped_source_ids": skipped,
                 "failed_source_ids": failed,
+                "source_skips": source_skips,
                 "source_failures": failures,
                 "model_calls": progress["model_calls"],
                 "full_calls": full_calls,
@@ -2869,7 +3397,9 @@ class ProductionWorkflowOrchestrator:
                 "cache_hits": cache_hits,
                 "model_calls_avoided": model_calls_avoided,
                 "completed_source_ids": completed,
+                "skipped_source_ids": skipped,
                 "failed_source_ids": failed,
+                "source_skips": source_skips,
                 "q2_proposal_diagnostics": [
                     {
                         "status": item.status.value,
@@ -2904,7 +3434,9 @@ class ProductionWorkflowOrchestrator:
             "supported_items": len(extraction.supported_items()),
             "status_totals": status_totals,
             "completed_source_ids": completed,
+            "skipped_source_ids": skipped,
             "failed_source_ids": failed,
+            "source_skips": source_skips,
             "model_calls": progress["model_calls"],
             "full_calls": full_calls,
             "light_calls": light_calls,
@@ -3342,6 +3874,96 @@ def _q2_source_model_run_id(
         separators=(",", ":"),
     )
     return uuid5(NAMESPACE_URL, f"production-q2-source:{identity}")
+
+
+def _q2_archive_fallback_identity(
+    *,
+    production_run_id: UUID,
+    pipeline_generation: int,
+    source_id: str,
+    canonical_url: str,
+    source_content_sha256: str,
+    profile: ExtractionProfile,
+    provider: ModelProvider,
+    requested_model: str,
+) -> dict[str, Any]:
+    """Return the complete functional identity of an archive fallback."""
+    return {
+        "access_mode": "archive_fallback",
+        "production_run_id": str(production_run_id),
+        "pipeline_generation": pipeline_generation,
+        "source_id": source_id,
+        "canonical_url": canonical_url,
+        "source_content_sha256": source_content_sha256,
+        "profile": profile.value,
+        "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+        "prompt_version": EXTRACTION_PROMPT_VERSION_BY_PROFILE[profile],
+        "archive_fallback_prompt_version": ARCHIVE_FALLBACK_PROMPT_VERSION,
+        "archived_source_access_version": ARCHIVED_SOURCE_ACCESS_VERSION,
+        "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
+        "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
+        "source_evidence_version": SOURCE_EVIDENCE_VERSION,
+        "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+        "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
+        "provider": provider.value,
+        "requested_model": requested_model,
+    }
+
+
+def _q2_archive_fallback_model_run_id(
+    *,
+    production_run_id: UUID,
+    pipeline_generation: int,
+    source_id: str,
+    canonical_url: str,
+    source_content_sha256: str,
+    profile: ExtractionProfile,
+    provider: ModelProvider = ModelProvider.OPENAI,
+    requested_model: str = "unknown",
+) -> UUID:
+    """Return an ID that can never collide with the live URL ModelRun."""
+    identity = json.dumps(
+        _q2_archive_fallback_identity(
+            production_run_id=production_run_id,
+            pipeline_generation=pipeline_generation,
+            source_id=source_id,
+            canonical_url=canonical_url,
+            source_content_sha256=source_content_sha256,
+            profile=profile,
+            provider=provider,
+            requested_model=requested_model,
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return uuid5(NAMESPACE_URL, f"production-q2-archive-fallback:{identity}")
+
+
+def _q2_archive_fallback_checkpoint_key(
+    *,
+    production_run_id: UUID,
+    pipeline_generation: int,
+    source_id: str,
+    canonical_url: str,
+    source_content_sha256: str,
+    profile: ExtractionProfile,
+    provider: ModelProvider = ModelProvider.OPENAI,
+    requested_model: str = "unknown",
+) -> str:
+    """Return the reusable checkpoint key for one exact archived capture."""
+    identity = _q2_archive_fallback_identity(
+        production_run_id=production_run_id,
+        pipeline_generation=pipeline_generation,
+        source_id=source_id,
+        canonical_url=canonical_url,
+        source_content_sha256=source_content_sha256,
+        profile=profile,
+        provider=provider,
+        requested_model=requested_model,
+    )
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def _q2_batch_model_run_id(

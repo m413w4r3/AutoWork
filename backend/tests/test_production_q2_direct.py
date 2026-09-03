@@ -25,7 +25,13 @@ from cti_app.application.production_parsers import (
     parse_q2_proposals_markdown,
 )
 from cti_app.application.production_q2_batch import q2_batch_output_marker
-from cti_app.application.production_workflow import _extraction_input_hash, _q2_source_model_run_id
+from cti_app.application.production_workflow import (
+    _extraction_input_hash,
+    _q2_archive_fallback_checkpoint_key,
+    _q2_archive_fallback_model_run_id,
+    _q2_checkpoint_key,
+    _q2_source_model_run_id,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import (
@@ -93,6 +99,44 @@ def test_q2_source_model_run_id_changes_when_routing_policy_changes(
         canonical_url="https://example.test/report",
     )
     assert after != before
+
+
+def test_archive_fallback_identity_is_distinct_from_live_checkpoint() -> None:
+    run_id = uuid4()
+    live_model_run_id = _q2_source_model_run_id(
+        production_run_id=run_id,
+        pipeline_generation=0,
+        source_id="S1",
+        canonical_url="https://example.test/report",
+    )
+    archive_model_run_id = _q2_archive_fallback_model_run_id(
+        production_run_id=run_id,
+        pipeline_generation=0,
+        source_id="S1",
+        canonical_url="https://example.test/report",
+        source_content_sha256="a" * 64,
+        profile=production_workflow.ExtractionProfile.FULL,
+    )
+    live_key = _q2_checkpoint_key(
+        production_run_id=run_id,
+        canonical_url="https://example.test/report",
+        profile=production_workflow.ExtractionProfile.FULL,
+        prompt_version="18",
+        batch_parser_version=None,
+        provider=ModelProvider.OPENAI,
+        requested_model="unknown",
+    )
+    archive_key = _q2_archive_fallback_checkpoint_key(
+        production_run_id=run_id,
+        pipeline_generation=0,
+        source_id="S1",
+        canonical_url="https://example.test/report",
+        source_content_sha256="a" * 64,
+        profile=production_workflow.ExtractionProfile.FULL,
+    )
+
+    assert live_model_run_id != archive_model_run_id
+    assert live_key != archive_key
 
 
 def test_q2_failure_classification_keeps_checkpoint_errors_out_of_coverage() -> None:
@@ -371,6 +415,40 @@ class _Q2Gateway:
                 "metadata": {},
             },
         )()
+
+
+class _ArchiveFallbackAdapter:
+    provider = ModelProvider.OPENAI
+    requested_model = "chatgpt-web-fake"
+    is_external = True
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+        self.responses = [
+            "UNAVAILABLE",
+            "FACT malware\n- ExampleRAT\n",
+            "UNAVAILABLE",
+        ]
+
+    async def invoke(
+        self, request: Any, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del role, output_schema
+        self.calls.append(request)
+        return AdapterResult(
+            status=AdapterResultStatus.COMPLETED,
+            provider=self.provider,
+            requested_model=self.requested_model,
+            actual_model_version=self.requested_model,
+            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            output_text=self.responses.pop(0),
+        )
+
+    async def resume(
+        self, response_id: str, *, role: ModelRole, output_schema: Any = None
+    ) -> AdapterResult:
+        del response_id, role, output_schema
+        raise AssertionError("not used")
 
 
 class _NeedsReviewQ2Adapter:
@@ -742,11 +820,12 @@ async def test_manual_extraction_retry_reuses_successful_batch_members_only(
 
     first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
 
-    assert first["status"] == "needs_review"
+    assert first["status"] == "success"
     assert first["completed_source_ids"] == ["S1", "S2", "S3", "S4"]
+    assert first["skipped_source_ids"] == ["S5"]
     assert len(adapter.calls) == 1
 
-    adapter._research_text = "EMPTY"
+    adapter._research_text = "UNAVAILABLE"
     run.status = SubjectProductionStatus.NEEDS_REVIEW
     run.retry_from_stage(SubjectProductionStage.EXTRACTION)
 
@@ -829,6 +908,50 @@ async def test_q2_checkpoint_is_created_only_after_local_archive_gate(
     assert second["source_failures"]["S1"]["error_code"] == ("q2_source_evidence_unavailable")
     assert model_uow.state[model_run_id].parameters.get("q2_checkpoint_keys") == []
     assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_archive_fallback_checkpoint_is_reused_on_idempotent_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _ArchiveFallbackAdapter()
+    gateway, model_uow = _persistent_q2_gateway(adapter)
+    orchestrator, run, _ = _q2_orchestrator(
+        monkeypatch,
+        gateway,
+        _q2_report(1),
+        model_run_state=model_uow.state,
+    )
+
+    first = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
+    second = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
+
+    assert first["status"] == "success", first
+    assert second["status"] == "success", second
+    assert len(adapter.calls) == 2
+    assert adapter.calls[0].web_search is True
+    assert adapter.calls[1].web_search is False
+    assert adapter.calls[1].metadata["access_mode"] == "archive_fallback"
+    assert second["cache_hits"] == 1
+    assert second["model_calls_avoided"] == 1
+    live_id = _q2_source_model_run_id(
+        production_run_id=run.id,
+        pipeline_generation=run.pipeline_generation,
+        source_id="S1",
+        canonical_url="https://example.test/1",
+    )
+    archive_id = _q2_archive_fallback_model_run_id(
+        production_run_id=run.id,
+        pipeline_generation=run.pipeline_generation,
+        source_id="S1",
+        canonical_url="https://example.test/1",
+        source_content_sha256=hashlib.sha256(b"ExampleRAT").hexdigest(),
+        profile=production_workflow.ExtractionProfile.FULL,
+        requested_model="chatgpt-web-fake",
+    )
+    assert live_id in model_uow.state
+    assert archive_id in model_uow.state
+    assert live_id != archive_id
 
 
 @pytest.mark.asyncio
