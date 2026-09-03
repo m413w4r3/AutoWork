@@ -83,6 +83,24 @@ class ProductionRecoveryPolicyV1:
                 if cls._all_q2_blocking_failures_retryable(run)
                 else cls.MANUAL_ONLY
             )
+        # A transient transport error can be the aggregate code after a Q2
+        # batch/attempt stopped early.  In that shape the aggregate code alone
+        # would incorrectly hide a terminal source failure from the policy.
+        # Once source-local failures are present, every blocking one must be
+        # explicitly retryable before the batch may open a new generation.
+        details = run.error_details
+        source_failures = details.get("source_failures") if isinstance(details, dict) else None
+        has_blocking_failure = isinstance(source_failures, dict) and any(
+            not isinstance(failure, dict)
+            or failure.get("contributes_to_coverage", True) is not False
+            for failure in source_failures.values()
+        )
+        if has_blocking_failure:
+            return (
+                cls.AUTO
+                if cls._all_q2_blocking_failures_retryable(run)
+                else cls.MANUAL_ONLY
+            )
         return cls.disposition(run.error_code)
 
     @classmethod
