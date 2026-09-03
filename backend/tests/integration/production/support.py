@@ -8,7 +8,7 @@ workflow objects below are the application implementations.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from hashlib import sha256
@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection import SubjectCollectionService
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.http_collection import (
     CollectionPolicy,
     HttpTransport,
@@ -78,6 +79,7 @@ from cti_app.domain.editorial import (
     GroupingOutcome,
 )
 from cti_app.domain.entities import Subject
+from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import ModelProvider, ModelRun
 from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
@@ -156,23 +158,35 @@ class ScriptedModelScript:
     def __init__(self) -> None:
         self._references: str | None = None
         self._synthesis: str | None = None
-        self._q2: dict[tuple[str, str], str] = {}
+        self._q2: dict[tuple[str, str], str | Exception] = {}
 
     def references(self, response: str) -> None:
         self._references = response
 
-    def q2(self, *, source_url: str, access_mode: str, response: str) -> None:
+    def q2(
+        self,
+        *,
+        source_url: str,
+        access_mode: str,
+        response: str | Exception,
+    ) -> None:
         self._q2[(source_url, access_mode)] = response
 
     def synthesis(self, response: str) -> None:
         self._synthesis = response
 
-    def response_for(self, request: SafeModelRequest) -> str:
-        if request.prompt_template_id == "production-q2-url":
+    def response_for(self, request: SafeModelRequest) -> str | Exception:
+        if request.prompt_template_id in {
+            "production-q2-url",
+            "production-q2-url-archive-fallback",
+        }:
             source_url = request.metadata.get("source_url")
             if not isinstance(source_url, str):
                 raise AssertionError("Q2 request has no source_url metadata")
-            return self._q2_response(source_url, "live_url")
+            access_mode = request.metadata.get("access_mode", "live_url")
+            if not isinstance(access_mode, str):
+                raise AssertionError("Q2 request has an invalid access_mode metadata")
+            return self._q2_response(source_url, access_mode)
 
         if request.prompt_template_id == "production-q2-ioc-batch":
             source_urls = request.metadata.get("batch_source_urls")
@@ -186,6 +200,8 @@ class ScriptedModelScript:
             blocks = []
             for index, source_url in enumerate(source_urls, start=1):
                 response = self._q2_response(source_url, "live_url")
+                if isinstance(response, Exception):
+                    raise response
                 blocks.append(f"@@Q2:B{index}@@\n{response}")
             return "\n\n".join(blocks)
 
@@ -204,7 +220,7 @@ class ScriptedModelScript:
             f"{request.prompt_template_id}/{request.routing_hint.value}"
         )
 
-    def _q2_response(self, source_url: str, access_mode: str) -> str:
+    def _q2_response(self, source_url: str, access_mode: str) -> str | Exception:
         try:
             return self._q2[(source_url, access_mode)]
         except KeyError as exc:
@@ -228,6 +244,8 @@ class _ScriptedModelAdapter:
     ) -> AdapterResult:
         del role, output_schema
         output_text = self._script.response_for(request)
+        if isinstance(output_text, Exception):
+            raise output_text
         conversation = request.conversation
         return AdapterResult(
             status=AdapterResultStatus.COMPLETED,
@@ -268,6 +286,7 @@ class ScriptedModelGateway(ModelGateway):
         self,
         uow_factory: UnitOfWorkFactory,
         output_store: _CatalogModelOutputStore,
+        diagnostics: DiagnosticsLog | None = None,
     ) -> None:
         self.script = ScriptedModelScript()
         self.calls: list[ScriptedModelCall] = []
@@ -280,7 +299,7 @@ class ScriptedModelGateway(ModelGateway):
             qwen=adapter,
             fake=adapter,
         )
-        super().__init__(router, uow_factory, output_store)
+        super().__init__(router, uow_factory, output_store, diagnostics=diagnostics)
 
     async def execute(self, request: ModelRequest, role: ModelRole) -> ModelExecution:
         source_urls = _request_source_urls(request)
@@ -338,7 +357,16 @@ class DeterministicProductionJobRunner(JobDispatcher):
 
     async def run_until_idle(self) -> None:
         while self._pending:
-            await self._executor.execute(self._pending.popleft(), allow_early_retry=True)
+            await self.run_next()
+
+    async def run_next(self) -> bool:
+        """Execute exactly one queued job through the real JobExecutor."""
+        if not self._pending:
+            return False
+        job = await self._executor.execute(self._pending.popleft(), allow_early_retry=True)
+        if job.status is JobStatus.QUEUED and job.next_retry_at is not None:
+            self._pending.append(job.id)
+        return True
 
 
 @dataclass
@@ -356,6 +384,7 @@ class ProductionScenario:
     artifact_store: ProductionArtifactStore = field(init=False)
     model_output_store: _CatalogModelOutputStore = field(init=False)
     model: ScriptedModelGateway = field(init=False)
+    diagnostics: DiagnosticsLog = field(init=False)
     model_service: ModelConversationService = field(init=False)
     collection_transport: DeterministicSourceTransport = field(init=False)
     collection_service: SubjectCollectionService = field(init=False)
@@ -471,7 +500,12 @@ class ProductionScenario:
         catalog = BlobCatalogService(blob_store, self.uow_factory)
         self.artifact_store = ProductionArtifactStore(catalog)
         self.model_output_store = _CatalogModelOutputStore(catalog)
-        self.model = ScriptedModelGateway(self.uow_factory, self.model_output_store)
+        self.diagnostics = DiagnosticsLog.from_env(self.blob_root.parent / "diagnostics")
+        self.model = ScriptedModelGateway(
+            self.uow_factory,
+            self.model_output_store,
+            diagnostics=self.diagnostics,
+        )
         self.model_service = ModelConversationService(
             self.uow_factory,
             self.model,
@@ -506,8 +540,27 @@ class ProductionScenario:
             model_gateway=self.model,
             collection_service=self.collection_service,
             artifact_store=self.artifact_store,
+            diagnostics=self.diagnostics,
             pacing=ProductionPacingPolicy.zero(),
         )
+
+    def restrict_core_sources(self, canonical_urls: Sequence[str]) -> None:
+        """Keep only selected discovery sources in the frozen core input.
+
+        The remaining scripted URLs stay available to Q1 as supplemental
+        reference sources, which lets business tests exercise the real
+        supporting-source/IOC_RULES route.
+        """
+        allowed = {_canonical_url(url) for url in canonical_urls}
+        selected = tuple(
+            source for source in self.source_candidates if source.canonical_url in allowed
+        )
+        if not selected or len(selected) != len(allowed):
+            raise ValueError("restrict_core_sources must select known non-empty sources")
+        self.source_candidates = selected
+        if len(self.discovery_batch.candidates) != 1:
+            raise ValueError("ProductionScenario expects one discovery candidate")
+        self.discovery_batch.candidates[0].sources = list(selected)
 
     async def seed(self) -> None:
         discovery_run = ModelRun(
