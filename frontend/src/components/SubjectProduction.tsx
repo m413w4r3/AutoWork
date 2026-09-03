@@ -236,6 +236,7 @@ export function SubjectProduction({
         ? RETRY_STAGES.slice(0, issueStageIndex + 1)
         : [];
   const issueRetryStage = showIssue ? status.current_stage : null;
+  const currentStageRetryRecommended = status.recovery_disposition === "auto";
 
   return (
     <section className="production-panel">
@@ -345,6 +346,7 @@ export function SubjectProduction({
 
       {!reconciliationRequired &&
         showIssue &&
+        currentStageRetryRecommended &&
         issueRetryStage &&
         retryStages.includes(issueRetryStage) && (
           <div className="production-retry-primary">

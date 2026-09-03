@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -152,6 +153,31 @@ def _batch_uow(codes: list[str]) -> tuple[_Uow, list[SubjectProductionRun]]:
     return _Uow(batch, runs, items, edition), runs
 
 
+def _q2_recovery_case(
+    source_failures: Any,
+) -> tuple[EditionProductionBatchItem, SubjectProductionRun]:
+    uow, runs = _batch_uow(["q2_source_coverage_failed"])
+    run = runs[0]
+    run.error_details = {"source_failures": source_failures}
+    return uow.edition_production_batch_items.items[0], run
+
+
+def _q2_failure(
+    *,
+    retryable: Any = True,
+    contributes_to_coverage: Any = True,
+    failure_class: str | None = None,
+) -> dict[str, Any]:
+    failure: dict[str, Any] = {
+        "error_code": "source_content_invalid",
+        "retryable": retryable,
+        "contributes_to_coverage": contributes_to_coverage,
+    }
+    if failure_class is not None:
+        failure["failure_class"] = failure_class
+    return failure
+
+
 def test_recovery_policy_is_allow_list_only() -> None:
     assert ProductionRecoveryPolicyV1.is_auto_recoverable("bridge_server_error")
     for code in (
@@ -161,10 +187,84 @@ def test_recovery_policy_is_allow_list_only() -> None:
     ):
         assert ProductionRecoveryPolicyV1.is_auto_recoverable(code)
     assert ProductionRecoveryPolicyV1.is_auto_recoverable("synthesis_validation_failed")
+    assert not ProductionRecoveryPolicyV1.is_auto_recoverable("q2_source_coverage_failed")
     assert not ProductionRecoveryPolicyV1.is_auto_recoverable("unknown_code")
     assert not ProductionRecoveryPolicyV1.is_auto_recoverable(
         "model_submission_reconciliation_required"
     )
+
+
+def test_q2_terminal_source_failure_is_not_automatically_recoverable() -> None:
+    item, run = _q2_recovery_case(
+        {"S14": _q2_failure(retryable=False)},
+    )
+
+    assert not ProductionRecoveryPolicyV1.eligible(item, run)
+
+
+def test_q2_missing_error_details_is_not_automatically_recoverable() -> None:
+    item, run = _q2_recovery_case(None)
+
+    assert not ProductionRecoveryPolicyV1.eligible(item, run)
+
+
+def test_q2_malformed_source_failures_is_not_automatically_recoverable() -> None:
+    item, run = _q2_recovery_case([_q2_failure()])
+
+    assert not ProductionRecoveryPolicyV1.eligible(item, run)
+
+
+def test_q2_missing_retryability_is_not_automatically_recoverable() -> None:
+    failure = _q2_failure()
+    del failure["retryable"]
+    item, run = _q2_recovery_case({"S1": failure})
+
+    assert not ProductionRecoveryPolicyV1.eligible(item, run)
+
+
+def test_q2_mixed_retryability_is_not_automatically_recoverable() -> None:
+    item, run = _q2_recovery_case(
+        {
+            "S1": _q2_failure(retryable=True),
+            "S2": _q2_failure(retryable=False),
+        }
+    )
+
+    assert not ProductionRecoveryPolicyV1.eligible(item, run)
+
+
+def test_q2_all_blocking_failures_retryable_is_automatically_recoverable() -> None:
+    item, run = _q2_recovery_case(
+        {
+            "S1": _q2_failure(retryable=True),
+            "S2": _q2_failure(retryable=True),
+        }
+    )
+
+    assert ProductionRecoveryPolicyV1.eligible(item, run)
+
+
+def test_q2_non_blocking_failure_does_not_hide_a_terminal_blocking_failure() -> None:
+    item, run = _q2_recovery_case(
+        {
+            "S1": _q2_failure(retryable=True, contributes_to_coverage=False),
+            "S2": _q2_failure(retryable=False),
+        }
+    )
+
+    assert not ProductionRecoveryPolicyV1.eligible(item, run)
+
+
+@pytest.mark.parametrize(
+    "failure_class",
+    ("reconciliation_required", "control_invariant_failure"),
+)
+def test_q2_reconciliation_and_control_failures_are_manual_only(failure_class: str) -> None:
+    item, run = _q2_recovery_case(
+        {"S1": _q2_failure(failure_class=failure_class)},
+    )
+
+    assert not ProductionRecoveryPolicyV1.eligible(item, run)
 
 
 @pytest.mark.asyncio
@@ -305,6 +405,21 @@ async def test_unknown_error_is_manual_only_and_count_never_exceeds_one() -> Non
     assert item.auto_recovery_count == 0
     assert runs[0].pipeline_generation == 0
     assert uow.edition_production_batches.item.phase is ProductionBatchPhase.REVIEW
+
+
+@pytest.mark.asyncio
+async def test_auto_recovery_count_blocks_a_second_automatic_recovery() -> None:
+    uow, runs = _batch_uow(["bridge_timeout"])
+    service = EditionProductionService(lambda: uow)
+    batch_id = uow.edition_production_batches.item.id
+
+    recovered = await service.on_subject_terminal(batch_id, runs[0].id)
+    assert recovered is runs[0]
+    assert uow.edition_production_batch_items.items[0].auto_recovery_count == 1
+
+    recovered.mark_failed(code="bridge_timeout", message="bridge stopped again")
+    assert await service.on_subject_terminal(batch_id, recovered.id) is None
+    assert uow.edition_production_batch_items.items[0].auto_recovery_count == 1
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ export type SubjectProductionStage =
   "sources" | "references" | "extraction" | "synthesis" | "assembly";
 
 export type ProductionBatchPhase = "initial" | "recovery" | "review";
+export type ProductionRecoveryDisposition = "auto" | "manual_only";
 
 export type ExtractionProgressProfile = "full" | "ioc_rules";
 export type ExtractionProgressSourceStatus =
@@ -84,6 +85,7 @@ export interface ProductionStatus {
   error_code: string | null;
   error_message: string | null;
   error_details: Record<string, unknown> | null;
+  recovery_disposition: ProductionRecoveryDisposition;
   extraction_progress?: ExtractionProgress | null;
   reconciliation?: ProductionReconciliation | null;
   /**

@@ -2082,6 +2082,19 @@ async def test_subject_production_status_exposes_the_owning_batch(
     edition_id, subject_id = uuid4(), uuid4()
     uow.editorial_groups._groups.append(_group(edition_id, "TAG-900", subject_id))
     run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.FAILED)
+    run.mark_failed(
+        code="q2_source_coverage_failed",
+        message="A source could not be analysed",
+        details={
+            "source_failures": {
+                "S1": {
+                    "error_code": "source_content_invalid",
+                    "retryable": True,
+                    "contributes_to_coverage": True,
+                }
+            }
+        },
+    )
     await uow.subject_production_runs.add(run)
     await uow.production_input_snapshots.add(
         SimpleNamespace(
@@ -2110,7 +2123,9 @@ async def test_subject_production_status_exposes_the_owning_batch(
     response = await api.get(f"/api/subjects/{subject_id}/production")
 
     assert response.status_code == 200, response.text
-    assert response.json()["batch_id"] == str(batch.id)
+    body = response.json()
+    assert body["batch_id"] == str(batch.id)
+    assert body["recovery_disposition"] == "auto"
 
 
 async def test_a_cancelled_batch_article_is_not_restarted_as_a_standalone_run(

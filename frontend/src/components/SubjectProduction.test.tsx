@@ -80,6 +80,7 @@ function status(
         error_message: null,
       },
     },
+    recovery_disposition: "auto",
   };
 }
 
@@ -119,6 +120,30 @@ describe("SubjectProduction retry from stage", () => {
       );
     },
   );
+
+  it("failure terminale n’affiche pas le CTA de replay de l’étape courante", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("failed"),
+          recovery_disposition: "manual_only",
+        }),
+      ),
+    );
+    renderProduction();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Extraction");
+    expect(
+      screen.queryByRole("button", { name: "Relancer cette étape" }),
+    ).toBeNull();
+    expect(
+      screen.getByText("Relancer depuis une étape précédente"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Relancer depuis Références" }),
+    ).toBeInTheDocument();
+  });
 
   it("propose la récupération explicite sans afficher le retry générique", async () => {
     const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {

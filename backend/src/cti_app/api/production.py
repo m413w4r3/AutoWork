@@ -30,6 +30,10 @@ from cti_app.application.production_reconciliation import (
     ProductionReconciliationError,
     ProductionReconciliationService,
 )
+from cti_app.application.production_recovery import (
+    ProductionRecoveryDisposition,
+    ProductionRecoveryPolicyV1,
+)
 from cti_app.application.production_stage_status import (
     build_stage_statuses,
     completed_stage_count,
@@ -131,6 +135,7 @@ class ProductionStatus(BaseModel):
     error_code: str | None = None
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
+    recovery_disposition: ProductionRecoveryDisposition
     extraction_progress: dict[str, Any] | None = None
     reconciliation: ProductionReconciliationView | None = None
     # Set when this run belongs to an edition production batch: such a run is
@@ -831,6 +836,7 @@ async def get_subject_production(
             error_code=run.error_code,
             error_message=run.error_message,
             error_details=run.error_details,
+            recovery_disposition=ProductionRecoveryPolicyV1.disposition_for_run(run),
             extraction_progress=run.extraction_progress,
             reconciliation=(
                 reconciliation_view(

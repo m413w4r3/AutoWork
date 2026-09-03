@@ -68,6 +68,7 @@ function productionStatus(
     error_code: null,
     error_message: null,
     error_details: null,
+    recovery_disposition: "manual_only",
     warnings: [],
     stages: {},
   };
