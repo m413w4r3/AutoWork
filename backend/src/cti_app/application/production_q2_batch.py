@@ -25,7 +25,10 @@ from cti_app.application.production_prompts import (
 )
 from cti_app.domain.model_runs import ModelProvider
 
-MAX_Q2_BATCH_SOURCES = 8
+# Un lot large rate plus de sources : le modèle en omet, et chaque omission
+# repart en appel individuel. Quatre sources est le meilleur compromis observé
+# entre nombre d'appels et taux d'omission.
+MAX_Q2_BATCH_SOURCES = 4
 # "q2-batch-v3": source blocks are delimited by minimal Q2 markers. The
 # framing scanner is intentionally independent from Markdown fence state, so a
 # malformed rule fence in one block can no longer swallow the next block.
@@ -137,7 +140,9 @@ def make_q2_batch(candidates: Sequence[Q2BatchCandidate]) -> Q2Batch:
     """Assign deterministic local B1..Bn identifiers to one batch."""
 
     if not 2 <= len(candidates) <= MAX_Q2_BATCH_SOURCES:
-        raise ValueError("A Q2 batch must contain between 2 and 8 sources")
+        raise ValueError(
+            f"A Q2 batch must contain between 2 and {MAX_Q2_BATCH_SOURCES} sources"
+        )
     return Q2Batch(
         sources=tuple(
             Q2BatchSource(batch_id=f"B{index}", candidate=candidate)

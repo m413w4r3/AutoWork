@@ -837,8 +837,8 @@ async def test_manual_extraction_retry_reuses_successful_batch_members_only(
 ) -> None:
     response = "\n\n".join(
         f"{q2_batch_output_marker(f'B{index}')}\n"
-        + (f"IOC confirmed domain\n- retry-{index}.example" if index < 5 else "UNAVAILABLE")
-        for index in range(1, 6)
+        + (f"IOC confirmed domain\n- retry-{index}.example" if index < 4 else "UNAVAILABLE")
+        for index in range(1, 5)
     )
     adapter = FakeModelAdapter(research_text=response)
     model_uow = InMemoryModelRunUnitOfWorkFactory()
@@ -856,10 +856,10 @@ async def test_manual_extraction_retry_reuses_successful_batch_members_only(
     orchestrator, run, _ = _q2_orchestrator(
         monkeypatch,
         gateway,
-        _q2_report(5),
+        _q2_report(4),
         model_run_state=model_uow.state,
         source_contents={
-            f"S{index}": f"archive-{index}".encode() for index in range(1, 6)
+            f"S{index}": f"archive-{index}".encode() for index in range(1, 5)
         },
     )
     snapshot = replace(_q2_snapshot(), core_sources=(), reuse_basis_hash="", input_hash="")
@@ -867,8 +867,8 @@ async def test_manual_extraction_retry_reuses_successful_batch_members_only(
     first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
 
     assert first["status"] == "success"
-    assert first["completed_source_ids"] == ["S1", "S2", "S3", "S4"]
-    assert first["skipped_source_ids"] == ["S5"]
+    assert first["completed_source_ids"] == ["S1", "S2", "S3"]
+    assert first["skipped_source_ids"] == ["S4"]
     assert len(adapter.calls) == 1
 
     adapter._research_text = "UNAVAILABLE"
@@ -878,11 +878,11 @@ async def test_manual_extraction_retry_reuses_successful_batch_members_only(
     second = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
 
     assert second["status"] == "success", second
-    assert second["cache_hits"] == 4
+    assert second["cache_hits"] == 3
     assert second["model_calls"] == 1
     assert second["light_batches"] == 0
     assert len(adapter.calls) == 2
-    assert adapter.calls[-1].metadata["source_id"] == "S5"
+    assert adapter.calls[-1].metadata["source_id"] == "S4"
 
 
 @pytest.mark.asyncio

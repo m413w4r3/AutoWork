@@ -88,9 +88,9 @@ def test_batch_partition_keeps_report_order_and_limits_sources() -> None:
     nine = production_q2_batch.partition_q2_batch_candidates(
         tuple(_candidate(index) for index in range(1, 10))
     )
-    assert [len(batch) for batch in nine] == [8, 1]
-    assert [item.source.local_id for item in nine[0]] == [f"S{index}" for index in range(1, 9)]
-    assert production_q2_batch.MAX_Q2_BATCH_SOURCES == 8
+    assert [len(batch) for batch in nine] == [4, 4, 1]
+    assert [item.source.local_id for item in nine[0]] == [f"S{index}" for index in range(1, 5)]
+    assert production_q2_batch.MAX_Q2_BATCH_SOURCES == 4
 
 
 def test_a_source_without_an_http_url_is_never_a_batch_candidate() -> None:
@@ -498,13 +498,13 @@ def _batch_workflow(
 
 
 @pytest.mark.asyncio
-async def test_five_light_sources_use_one_web_batch_of_urls(
+async def test_four_light_sources_use_one_web_batch_of_urls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     response = _batch_response(
-        *(f"IOC confirmed domain\n- domain-{index}.security-lab.io" for index in range(1, 6))
+        *(f"IOC confirmed domain\n- domain-{index}.security-lab.io" for index in range(1, 5))
     )
-    orchestrator, run, state, sink, gateway = _batch_workflow(monkeypatch, 5, response)
+    orchestrator, run, state, sink, gateway = _batch_workflow(monkeypatch, 4, response)
 
     result = await orchestrator._execute_direct_url_extraction(
         run,
@@ -517,14 +517,14 @@ async def test_five_light_sources_use_one_web_batch_of_urls(
     assert request.prompt_template_id == "production-q2-ioc-batch"
     assert request.web_search is True
     assert request.routing_hint is ModelRoutingHint.WEB_RESEARCH
-    for index in range(1, 6):
+    for index in range(1, 5):
         assert f"B{index} https://example.test/source-{index}" in request.text
     assert "ARCHIVED" not in request.text
     assert "@@Q2IN" not in request.text
     assert result["model_calls"] == 1
     assert result["light_calls"] == 1
     assert result["light_batches"] == 1
-    assert result["light_sources_batched"] == 5
+    assert result["light_sources_batched"] == 4
     # The batch never reads or writes a content-addressed checkpoint.
     assert state.extractions.rows == {}
     assert state.extractions.lookups == 0
@@ -537,9 +537,9 @@ async def test_batch_progress_marks_only_current_sources_running_before_provider
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     response = _batch_response(
-        *(f"IOC confirmed domain\n- domain-{index}.security-lab.io" for index in range(1, 6))
+        *(f"IOC confirmed domain\n- domain-{index}.security-lab.io" for index in range(1, 5))
     )
-    orchestrator, run, _state, _sink, gateway = _batch_workflow(monkeypatch, 5, response)
+    orchestrator, run, _state, _sink, gateway = _batch_workflow(monkeypatch, 4, response)
     snapshots: list[dict[str, object]] = []
 
     async def persist(run_id: UUID, progress: dict[str, object]) -> None:
@@ -564,9 +564,8 @@ async def test_batch_progress_marks_only_current_sources_running_before_provider
         "running",
         "running",
         "running",
-        "running",
     ]
-    assert before_call["active_source_id"] in {f"S{index}" for index in range(1, 6)}
+    assert before_call["active_source_id"] in {f"S{index}" for index in range(1, 5)}
 
 
 @pytest.mark.asyncio
@@ -574,13 +573,17 @@ async def test_later_batch_remains_pending_until_its_provider_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first_response = _batch_response(
-        *(f"IOC confirmed domain\n- domain-{index}.security-lab.io" for index in range(1, 9))
+        *(f"IOC confirmed domain\n- domain-{index}.security-lab.io" for index in range(1, 5))
     )
     second_response = _batch_response(
+        *(f"IOC confirmed domain\n- domain-{index}.security-lab.io" for index in range(5, 9))
+    )
+    third_response = _batch_response(
         *(f"IOC confirmed domain\n- domain-{index}.security-lab.io" for index in range(9, 11))
     )
     orchestrator, run, _state, _sink, gateway = _batch_workflow(monkeypatch, 10, first_response)
     gateway.responses.append(second_response)
+    gateway.responses.append(third_response)
     snapshots: list[dict[str, object]] = []
 
     async def persist(run_id: UUID, progress: dict[str, object]) -> None:
@@ -596,16 +599,15 @@ async def test_later_batch_remains_pending_until_its_provider_call(
     )
 
     assert result["status"] == "success"
-    assert len(gateway.calls) == 2
+    assert len(gateway.calls) == 3
     second_call = next(
         snapshot
         for snapshot in snapshots
-        if {item["source_id"]: item["status"] for item in snapshot["sources"]}["S9"] == "running"
+        if {item["source_id"]: item["status"] for item in snapshot["sources"]}["S5"] == "running"
     )
     statuses = {item["source_id"]: item["status"] for item in second_call["sources"]}
-    assert all(statuses[f"S{index}"] == "succeeded" for index in range(1, 9))
-    assert statuses["S9"] == "running"
-    assert statuses["S10"] == "running"
+    assert all(statuses[f"S{index}"] == "succeeded" for index in range(1, 5))
+    assert all(statuses[f"S{index}"] == "running" for index in range(5, 9))
 
 
 @pytest.mark.asyncio
