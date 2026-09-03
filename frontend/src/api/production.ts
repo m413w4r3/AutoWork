@@ -11,7 +11,23 @@ export type ProductionRecoveryDisposition = "auto" | "manual_only";
 
 export type ExtractionProgressProfile = "full" | "ioc_rules";
 export type ExtractionProgressSourceStatus =
-  "pending" | "running" | "cached" | "succeeded" | "needs_review" | "failed";
+  | "pending"
+  | "running"
+  | "cached"
+  | "succeeded"
+  | "needs_review"
+  | "failed"
+  | "skipped";
+
+export interface ExtractionProgressSourceSkip {
+  source_url?: string | null;
+  reason_code?: string | null;
+  live_error_code?: string | null;
+  archive_error_code?: string | null;
+  archive_reason?: string | null;
+  blocking?: boolean;
+  [key: string]: unknown;
+}
 
 export interface ExtractionProgressSource {
   source_id: string;
@@ -20,6 +36,11 @@ export interface ExtractionProgressSource {
   status: ExtractionProgressSourceStatus;
   ioc_count: number;
   rule_count: number;
+  source_url?: string | null;
+  url?: string | null;
+  skip?: ExtractionProgressSourceSkip | null;
+  access_mode?: "live_url" | "archive_fallback" | null;
+  archive_fallback?: boolean;
 }
 
 export interface ExtractionProgress {
@@ -42,6 +63,9 @@ export interface ExtractionProgress {
   active_source_title: string | null;
   active_profile: ExtractionProgressProfile | null;
   sources: ExtractionProgressSource[];
+  skipped_sources?: number;
+  skipped_source_ids?: string[];
+  source_skips?: Record<string, ExtractionProgressSourceSkip>;
 }
 
 type ProductionBatchStatus =

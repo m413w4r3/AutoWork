@@ -3,10 +3,44 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { ExtractionProgress } from "../api/production";
 import { shouldPollProduction } from "../api/production";
 import { SubjectProduction } from "./SubjectProduction";
 
 const SUBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const ATTACHMENT_A_URL =
+  "https://www.whisper.security/attachment-a-reserve-domains.csv";
+const ATTACHMENT_B_URL =
+  "https://www.whisper.security/attachment-b-live-server.csv";
+
+function extractionProgress(
+  sources: ExtractionProgress["sources"],
+): ExtractionProgress {
+  return {
+    total_sources: sources.length,
+    completed_sources: sources.filter((source) =>
+      ["cached", "succeeded"].includes(source.status),
+    ).length,
+    full_total: sources.filter((source) => source.profile === "full").length,
+    full_completed: 0,
+    ioc_rules_total: sources.filter((source) => source.profile === "ioc_rules")
+      .length,
+    ioc_rules_completed: 0,
+    cache_hits: sources.filter((source) => source.status === "cached").length,
+    model_calls: 0,
+    confirmed_iocs: 0,
+    contextual_iocs: 0,
+    rules_total: 0,
+    yara_rules: 0,
+    sigma_rules: 0,
+    suricata_rules: 0,
+    snort_rules: 0,
+    active_source_id: null,
+    active_source_title: null,
+    active_profile: null,
+    sources,
+  };
+}
 
 function renderProduction() {
   const client = new QueryClient({
@@ -37,6 +71,9 @@ function status(
     created_at: "2026-08-10T10:00:00Z",
     started_at: "2026-08-10T10:00:00Z",
     finished_at: runStatus === "running" ? null : "2026-08-10T10:00:00Z",
+    error_code: null,
+    error_message: null,
+    error_details: null,
     warnings: [],
     stages: {
       sources: {
@@ -120,6 +157,199 @@ describe("SubjectProduction retry from stage", () => {
       );
     },
   );
+
+  it("place le bloqueur Q2 avant le warning Attachment B", async () => {
+    const warning = `supplemental_collection_failed:url=${ATTACHMENT_B_URL}:code=source_collection_no_success:blocked=1`;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("needs_review"),
+          error_code: "q2_source_coverage_failed",
+          error_message: "One or more Q1 sources could not be analysed",
+          error_details: {
+            failed_source_ids: ["S14"],
+            source_failures: {
+              S14: {
+                source_url: ATTACHMENT_A_URL,
+                error_code: "q2_source_unavailable",
+              },
+            },
+          },
+          warnings: [warning],
+          extraction_progress: extractionProgress([
+            {
+              source_id: "S14",
+              title: "attachment-a-reserve-domains.csv",
+              profile: "full",
+              status: "failed",
+              ioc_count: 0,
+              rule_count: 0,
+            },
+          ]),
+        }),
+      ),
+    );
+    renderProduction();
+
+    const alert = await screen.findByRole("alert");
+    const warningHeading = screen.getByRole("heading", {
+      name: "Avertissements non bloquants",
+    });
+    const warningSection = warningHeading.closest("section");
+    if (!warningSection) throw new Error("Warning section not found");
+
+    expect(alert).toHaveTextContent("Problème bloquant");
+    expect(alert).toHaveTextContent("attachment-a-reserve-domains.csv");
+    expect(alert).toHaveTextContent(ATTACHMENT_A_URL);
+    expect(alert).not.toHaveTextContent("attachment-b-live-server.csv");
+    expect(
+      alert.compareDocumentPosition(warningSection) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    const recovery = screen.getByRole("button", {
+      name: "Relancer cette étape",
+    });
+    expect(
+      alert.compareDocumentPosition(recovery) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      recovery.compareDocumentPosition(warningSection) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(warningSection).toHaveAttribute("role", "note");
+    expect(warningSection).toHaveTextContent(
+      "Source supplémentaire non archivée",
+    );
+    expect(warningSection).toHaveTextContent("attachment-b-live-server.csv");
+    expect(warningSection).not.toHaveTextContent(warning);
+
+    const diagnostics = screen.getByText(warning).closest("details");
+    expect(diagnostics).toBeInTheDocument();
+    expect(diagnostics).not.toHaveAttribute("open");
+  });
+
+  it("liste plusieurs sources bloquantes sans restituer le dump JSON", async () => {
+    const sourceBUrl = "https://www.whisper.security/attachment-b.csv";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("failed"),
+          error_code: "q2_source_coverage_failed",
+          error_details: {
+            failed_source_ids: ["S14", "S15"],
+            source_failures: {
+              S14: {
+                source_url: ATTACHMENT_A_URL,
+                error_code: "source_content_invalid",
+              },
+              S15: {
+                source_url: sourceBUrl,
+                error_code: "q2_source_unavailable",
+              },
+            },
+          },
+        }),
+      ),
+    );
+    renderProduction();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("S14");
+    expect(alert).toHaveTextContent(ATTACHMENT_A_URL);
+    expect(alert).toHaveTextContent("S15");
+    expect(alert).toHaveTextContent(sourceBUrl);
+    expect(alert).not.toHaveTextContent('"source_failures"');
+    expect(alert.querySelectorAll("li")).toHaveLength(2);
+  });
+
+  it("affiche un skip Q2 comme warning non bloquant", async () => {
+    const progress = extractionProgress([
+      {
+        source_id: "S14",
+        title: "attachment-a-reserve-domains.csv",
+        profile: "full",
+        status: "skipped",
+        ioc_count: 0,
+        rule_count: 0,
+        skip: {
+          source_url: ATTACHMENT_A_URL,
+          reason_code: "live_unavailable_archive_unusable",
+          blocking: false,
+        },
+      },
+    ]);
+    progress.skipped_sources = 1;
+    progress.skipped_source_ids = ["S14"];
+    progress.source_skips = {
+      S14: progress.sources[0]?.skip ?? { blocking: false },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("running"),
+          extraction_progress: progress,
+        }),
+      ),
+    );
+    renderProduction();
+
+    expect(
+      await screen.findByText("S14 — source ignorée pour l’extraction"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("note")).toHaveTextContent(
+      "aucune archive exploitable n’était disponible",
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("présente un succès avec le label d’archive de secours", async () => {
+    const progress = extractionProgress([
+      {
+        source_id: "S14",
+        title: "attachment-a-reserve-domains.csv",
+        profile: "full",
+        status: "succeeded",
+        ioc_count: 1,
+        rule_count: 0,
+        access_mode: "archive_fallback",
+      },
+    ]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("running"),
+          extraction_progress: progress,
+        }),
+      ),
+    );
+    renderProduction();
+
+    const fallback = await screen.findByText(/Archive de secours/);
+    expect(fallback.closest("li")).toHaveClass("is-succeeded");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("ne plante pas avec des détails d’erreur nuls ou malformés", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("failed"),
+          error_details: "unexpected legacy payload",
+        }),
+      ),
+    );
+    renderProduction();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Problème bloquant",
+    );
+  });
 
   it("failure terminale n’affiche pas le CTA de replay de l’étape courante", async () => {
     vi.stubGlobal(

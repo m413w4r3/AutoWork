@@ -157,9 +157,11 @@ describe("ProductionConsole", () => {
     expect(progress).toHaveTextContent(
       "Règles : 5 · YARA 3 · Sigma 1 · Suricata 1 · Snort 0",
     );
-    expect(progress).toHaveTextContent("Réutilisés : 1 · Appels modèle : 1");
+    expect(progress).toHaveTextContent(
+      "Résultats existants : 1 · Appels modèle : 1",
+    );
     expect(screen.getByText("S2")).toBeInTheDocument();
-    expect(progress).toHaveTextContent("Réutilisés");
+    expect(progress).toHaveTextContent("Résultat existant");
     expect(progress).toHaveTextContent("En cours");
   });
 

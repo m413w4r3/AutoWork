@@ -12,10 +12,11 @@ const PROFILE_LABELS: Record<ExtractionProgressProfile, string> = {
 const SOURCE_STATUS_LABELS: Record<ExtractionProgressSourceStatus, string> = {
   pending: "En attente",
   running: "En cours",
-  cached: "Réutilisé",
+  cached: "Résultat existant",
   succeeded: "Terminé",
   needs_review: "À vérifier",
   failed: "Échec",
+  skipped: "Ignorée (non bloquante)",
 };
 
 const SOURCE_STATUS_ICONS: Record<ExtractionProgressSourceStatus, string> = {
@@ -25,10 +26,21 @@ const SOURCE_STATUS_ICONS: Record<ExtractionProgressSourceStatus, string> = {
   succeeded: "✓",
   needs_review: "!",
   failed: "×",
+  skipped: "–",
 };
 
 function profileLabel(profile: ExtractionProgressProfile | null): string {
   return profile ? PROFILE_LABELS[profile] : "";
+}
+
+function usesArchiveFallback(source: {
+  access_mode?: "live_url" | "archive_fallback" | null;
+  archive_fallback?: boolean;
+}): boolean {
+  return (
+    source.access_mode === "archive_fallback" ||
+    source.archive_fallback === true
+  );
 }
 
 export function ExtractionProgressView({
@@ -80,7 +92,7 @@ export function ExtractionProgressView({
           {progress.snort_rules}
         </span>
         <span>
-          Réutilisés : {progress.cache_hits} · Appels modèle :{" "}
+          Résultats existants : {progress.cache_hits} · Appels modèle :{" "}
           {progress.model_calls}
         </span>
       </div>
@@ -96,6 +108,7 @@ export function ExtractionProgressView({
             <span>{PROFILE_LABELS[source.profile]}</span>
             <span className="extraction-progress__source-status">
               {SOURCE_STATUS_LABELS[source.status]}
+              {usesArchiveFallback(source) ? " · Archive de secours" : ""}
             </span>
           </li>
         ))}

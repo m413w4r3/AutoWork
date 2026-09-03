@@ -7,6 +7,11 @@ import {
 } from "../api/production";
 import { cancelProductionRun } from "../api/publication";
 import type { StageStatus } from "../api/production";
+import {
+  formatProductionWarning,
+  getBlockingSources,
+  getSkippedSources,
+} from "./productionFormatting";
 import { ReconciliationPanel } from "../features/edition-workflow/ReconciliationPanel";
 import { ExtractionProgressView } from "./ExtractionProgress";
 import { ProductionStageCard } from "./ProductionStageCard";
@@ -83,12 +88,20 @@ function stageArtifactHref(subjectId: string, stage: string): string {
   return `/subjects/${subjectId}/production/artifacts/${artifactStage}`;
 }
 
-function issueCopy(status: string, errorCode: string | null): string {
+function issueCopy(
+  status: string,
+  errorCode: string | null,
+  blockingSourceCount: number,
+): string {
   if (errorCode === "imported_production_state") {
     return "État restauré — références, extraction et synthèse sont disponibles. L’assemblage n’a pas été rejoué.";
   }
   if (errorCode === "q2_source_coverage_failed") {
-    return "Couverture des sources incomplète — certaines sources n’ont pas été analysées.";
+    return blockingSourceCount > 0
+      ? blockingSourceCount > 1
+        ? "sources non analysées"
+        : "source non analysée"
+      : "Couverture des sources incomplète — certaines sources n’ont pas été analysées.";
   }
   if (errorCode === "model_needs_review") {
     return "Le modèle demande une revue avant poursuite.";
@@ -211,9 +224,31 @@ export function SubjectProduction({
   // Tolerate a response without per-stage detail rather than crashing the page.
   const stages: Partial<Record<string, StageStatus>> = status.stages ?? {};
   const issueStage = stages[status.current_stage];
-  const issueCode = issueStage?.error_code ?? null;
+  const issueCode = status.error_code ?? issueStage?.error_code ?? null;
+  const issueMessage =
+    status.error_message ?? issueStage?.error_message ?? null;
   const showIssue =
     status.status === "needs_review" || status.status === "failed";
+  const blockingSources = showIssue
+    ? getBlockingSources(status.error_details, status.extraction_progress)
+    : [];
+  const skippedSources = getSkippedSources(
+    status.error_details,
+    status.extraction_progress,
+  );
+  const presentedWarnings = warnings
+    .map((warning) => formatProductionWarning(warning))
+    .concat(
+      skippedSources.map((source) => ({
+        code: "source_skip",
+        title: `${source.sourceId} — source ignorée pour l’extraction`,
+        source: source.title,
+        url: source.url,
+        message:
+          "L’analyse live était indisponible et aucune archive exploitable n’était disponible.",
+        raw: "",
+      })),
+    );
   const issueIsConversation =
     issueCode !== null && CONVERSATION_ERROR_CODES.has(issueCode);
   const completedStages = stageList.filter(
@@ -300,28 +335,40 @@ export function SubjectProduction({
         ) : null}
       </nav>
 
-      {warnings.length > 0 && (
-        <div className="verification-warning" role="note">
-          <strong>Avertissements de lecture</strong>
-          <ul>
-            {warnings.map((warning: string) => (
-              <li key={warning}>{warning}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
       {showIssue && (
         <div className="error-message" role="alert">
+          <h3>Problème bloquant</h3>
           <p>
             <strong>
               {STAGE_LABELS[status.current_stage] ?? status.current_stage}
             </strong>
             {" — "}
-            {issueCopy(status.status, issueCode)}
+            {issueCopy(status.status, issueCode, blockingSources.length)}
           </p>
+          {blockingSources.length > 0 ? (
+            <ul aria-label="Sources responsables">
+              {blockingSources.map((source) => (
+                <li key={source.sourceId}>
+                  <strong>{source.sourceId}</strong>
+                  {source.title ? <span> — {source.title}</span> : null}
+                  {source.url ? (
+                    <>
+                      <br />
+                      <a href={source.url}>{source.url}</a>
+                    </>
+                  ) : null}
+                  {source.errorCode ? (
+                    <>
+                      <br />
+                      <code>{source.errorCode}</code>
+                    </>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          ) : null}
           <p>Code : {issueCode ?? "inconnu"}</p>
-          {issueStage?.error_message ? <p>{issueStage.error_message}</p> : null}
+          {issueMessage ? <p>{issueMessage}</p> : null}
           {issueIsConversation &&
           (status.references_conversation_id ||
             status.synthesis_conversation_id) ? (
@@ -437,6 +484,35 @@ export function SubjectProduction({
         productionStatus={status}
       />
 
+      {presentedWarnings.length > 0 && (
+        <section
+          className="verification-warning"
+          role="note"
+          aria-labelledby="production-warnings-heading"
+        >
+          <h3 id="production-warnings-heading">Avertissements non bloquants</h3>
+          <ul>
+            {presentedWarnings.map((warning, index) => (
+              <li key={`${warning.code}-${warning.source ?? ""}-${index}`}>
+                <strong>{warning.title}</strong>
+                {warning.source ? (
+                  <>
+                    <br />
+                    {warning.url ? (
+                      <a href={warning.url}>{warning.source}</a>
+                    ) : (
+                      <span>{warning.source}</span>
+                    )}
+                  </>
+                ) : null}
+                <br />
+                <span>{warning.message}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <details className="production-diagnostics">
         <summary>Diagnostic</summary>
         <div className="production-meta">
@@ -449,6 +525,21 @@ export function SubjectProduction({
             <p>Terminé : {new Date(status.finished_at).toLocaleString()}</p>
           )}
           <p>Tentative pipeline : {status.pipeline_generation}</p>
+          {warnings.length > 0 ? (
+            <div>
+              <p>Avertissements bruts</p>
+              <ul>
+                {warnings.map((warning) => (
+                  <li key={warning}>
+                    <code>{warning}</code>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {status.error_details ? (
+            <pre>{JSON.stringify(status.error_details, null, 2)}</pre>
+          ) : null}
           {stageList
             .filter((stage) => stages[stage]?.reused)
             .map((stage) => {
