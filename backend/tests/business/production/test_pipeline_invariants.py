@@ -20,8 +20,11 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.production import _create_and_start_run
+from cti_app.api.production import router as production_router
 from cti_app.application.model_gateway import (
     ModelGatewayError,
     ModelRequest,
@@ -42,6 +45,7 @@ from cti_app.application.production_workflow import (
     _q2_checkpoint_key,
 )
 from cti_app.application.subject_production import SubjectProductionService
+from cti_app.domain.collection import CollectionState
 from cti_app.domain.model_runs import ModelProvider, ModelRunStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
@@ -66,6 +70,16 @@ pytestmark = pytest.mark.integration
 
 ScenarioFactory = Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario]
 _EDITION_CODES = count()
+_PRINCE_ARCHIVE = (
+    "domain,first_seen\n"
+    "reserve-one.example,2026-08-13\n"
+    "reserve-two.example,2026-08-13\n"
+)
+_PRINCE_FALLBACK = (
+    "IOC confirmed domain\n"
+    "- reserve-one.example :: Archived Prince of Persia annex.\n"
+    "- reserve-two.example :: Archived Prince of Persia annex."
+)
 
 
 def _urls(source_count: int) -> tuple[str, ...]:
@@ -165,6 +179,49 @@ def _configure(
     return scenario, urls
 
 
+def _prince_urls() -> tuple[str, ...]:
+    return tuple(
+        [f"https://example.test/prince-of-persia/s{index}" for index in range(1, 14)]
+        + ["https://example.test/prince-of-persia/annex.csv"]
+    )
+
+
+def _configure_prince_topology(
+    factory: ScenarioFactory,
+    *,
+    archive_s14: bool,
+) -> tuple[ProductionScenario, tuple[str, ...]]:
+    """Build the real 3-core/11-supporting Prince-of-Persia regression shape."""
+    urls = _prince_urls()
+    empty_urls = frozenset() if archive_s14 else frozenset({urls[-1]})
+    source_specs = _source_specs(urls, empty_urls=empty_urls)
+    if archive_s14:
+        source_specs[urls[-1]]["body"] = _PRINCE_ARCHIVE
+        source_specs[urls[-1]]["mime"] = "text/csv"
+
+    scenario = factory(source_specs)
+    scenario.edition.country_code = _edition_code()
+    scenario.edition.country = "Production Prince of Persia Regression"
+    # This is the business input from which the production snapshot and Q2
+    # profiles are derived; no profile is injected into the expected result.
+    scenario.restrict_core_sources(urls[9:12])
+    scenario.model.script.references(_references(urls))
+    scenario.model.script.synthesis(_synthesis(urls))
+    for index, url in enumerate(urls, start=1):
+        scenario.model.script.q2(
+            source_url=url,
+            access_mode="live_url",
+            response="UNAVAILABLE" if index == 14 else _q2(index),
+        )
+    if archive_s14:
+        scenario.model.script.q2(
+            source_url=urls[-1],
+            access_mode="archive_fallback",
+            response=_PRINCE_FALLBACK,
+        )
+    return scenario, urls
+
+
 async def _state(scenario: ProductionScenario) -> tuple[Any, list[Any], Any, Any]:
     assert scenario.run_id is not None
     async with scenario.uow_factory() as uow:
@@ -192,6 +249,74 @@ def _artifact_projection(artifacts: list[Any]) -> tuple[tuple[str, int, str, str
 
 def _q2_calls(scenario: ProductionScenario) -> list[Any]:
     return [call for call in scenario.model.calls if call.stage == "extraction"]
+
+
+def _q2_calls_for_source(scenario: ProductionScenario, url: str) -> list[Any]:
+    return [
+        call
+        for call in _q2_calls(scenario)
+        if url in call.source_urls or call.source_url == url
+    ]
+
+
+def _diagnostic_events(scenario: ProductionScenario) -> list[dict[str, Any]]:
+    path = scenario.blob_root.parent / "diagnostics" / "events.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+async def _production_api_views(
+    scenario: ProductionScenario,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Call both real Production read paths over an in-process ASGI boundary."""
+    app = FastAPI()
+    app.include_router(production_router)
+    app.state.uow_factory = scenario.uow_factory
+    app.state.job_service = scenario.jobs
+    app.state.job_dispatcher = scenario.runner
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://production.test"
+    ) as client:
+        subject_response = await client.get(f"/api/subjects/{scenario.subject.id}/production")
+        batch_response = await client.get(f"/api/editions/{scenario.edition.id}/production")
+    assert subject_response.status_code == 200, subject_response.text
+    assert batch_response.status_code == 200, batch_response.text
+    return subject_response.json(), batch_response.json()
+
+
+async def _assert_no_automatic_recovery(
+    scenario: ProductionScenario,
+    run: Any,
+    item: Any,
+) -> None:
+    assert run.pipeline_generation == 0
+    assert item is not None
+    assert item.auto_recovery_count == 0
+    jobs = await scenario.jobs.list_for_aggregate("subject", scenario.subject.id)
+    generations = [
+        int(job.input_parameters["pipeline_generation"])
+        for job in jobs
+        if "pipeline_generation" in job.input_parameters
+    ]
+    assert generations
+    assert set(generations) == {run.pipeline_generation}
+
+
+def _assert_prince_profiles(progress: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    sources = {item["source_id"]: item for item in progress["sources"]}
+    assert {
+        source_id for source_id, source in sources.items() if source["profile"] == "full"
+    } == {"S10", "S11", "S12"}
+    assert {
+        source_id for source_id, source in sources.items() if source["profile"] == "ioc_rules"
+    } == {
+        *{f"S{index}" for index in range(1, 10)},
+        "S13",
+        "S14",
+    }
+    return sources
 
 
 def _provider_q2_calls(scenario: ProductionScenario) -> list[Any]:
@@ -281,7 +406,8 @@ async def test_ready_requires_verified_publication_and_all_upstream_artifacts(
     production_scenario_factory: ScenarioFactory,
 ) -> None:
     scenario, urls = _configure(production_scenario_factory, 2)
-    await scenario.start()
+    started = await scenario.start()
+    assert started.current_stage is SubjectProductionStage.SOURCES
     run = await scenario.run_until_terminal()
     persisted, artifacts, _, _ = await _state(scenario)
 
@@ -304,6 +430,275 @@ async def test_ready_requires_verified_publication_and_all_upstream_artifacts(
         persisted, {f"S{index}" for index in range(1, len(urls) + 1)}
     )
     _assert_one_active_verified_per_stage(artifacts)
+
+
+@pytest.mark.asyncio
+async def test_archived_source_unavailable_live_does_not_block_publication(
+    production_scenario_factory: ScenarioFactory,
+) -> None:
+    """The Prince of Persia source topology survives live Q2 unavailability."""
+    scenario, urls = _configure_prince_topology(
+        production_scenario_factory,
+        archive_s14=True,
+    )
+    await scenario.start()
+    run = await scenario.run_until_terminal()
+    persisted, artifacts, item, batch = await _state(scenario)
+
+    assert run.status is SubjectProductionStatus.READY
+    assert persisted.status is SubjectProductionStatus.READY
+    assert persisted.current_stage is SubjectProductionStage.ASSEMBLY
+    assert persisted.error_code is None
+    assert "q2_source_coverage_failed" not in str(persisted.error_details)
+    assert not (persisted.error_details or {}).get("source_failures")
+    assert batch is not None
+
+    by_stage = {artifact.stage: artifact for artifact in artifacts}
+    assert set(by_stage) == {
+        ProductionArtifactStage.REFERENCES,
+        ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.SYNTHESIS,
+        ProductionArtifactStage.PUBLICATION,
+    }
+    assert all(
+        artifact.status is ProductionArtifactStatus.VERIFIED for artifact in by_stage.values()
+    )
+    assert persisted.reconciliation is None
+
+    references_artifact = by_stage[ProductionArtifactStage.REFERENCES]
+    assert references_artifact.canonical_blob_id is not None
+    references = await scenario.artifact_store.read_json(references_artifact.canonical_blob_id)
+    assert len(references["sources"]) == 14
+    assert {source["id"] for source in references["sources"]} == {
+        f"S{index}" for index in range(1, 15)
+    }
+
+    progress = persisted.extraction_progress
+    assert progress is not None
+    progress_sources = _assert_prince_profiles(progress)
+    assert progress["total_sources"] == 14
+    assert progress["completed_sources"] == 14
+    assert progress["full_total"] == 3
+    assert progress["full_completed"] == 3
+    assert progress["ioc_rules_total"] == 11
+    assert progress["ioc_rules_completed"] == 11
+    assert all(source["status"] == "succeeded" for source in progress_sources.values())
+    assert progress.get("source_skips") == {}
+
+    async with scenario.uow_factory() as uow:
+        snapshot = await uow.production_input_snapshots.get_by_run(persisted.id)
+        collections = tuple(await uow.source_collections.list_for_subject(scenario.subject.id))
+        documents = tuple(await uow.source_documents.list_for_subject(scenario.subject.id))
+        live_model_run = await uow.model_runs.get(
+            next(
+                call.model_run_id
+                for call in _q2_calls(scenario)
+                if urls[-1] in call.source_urls
+            )
+        )
+    assert snapshot is not None
+    assert {source.canonical_url for source in snapshot.core_sources} == set(urls[9:12])
+    assert {collection.canonical_url for collection in collections} == set(urls)
+    assert all(collection.state is CollectionState.ARCHIVED for collection in collections)
+    s14_collection = next(
+        collection for collection in collections if collection.canonical_url == urls[-1]
+    )
+    assert s14_collection.decoded_blob_id is not None
+    assert live_model_run is not None
+    assert live_model_run.output_references
+    live_batch_response = await scenario.model.read_output(live_model_run.output_references[0])
+    assert "UNAVAILABLE" in live_batch_response.decode("utf-8")
+    s14_document = next(
+        document
+        for document in documents
+        if document.source_collection_id == s14_collection.id
+    )
+    assert s14_document.decoded_blob_id == s14_collection.decoded_blob_id
+    assert s14_document.decoded_blob_id is not None
+    archived_content = await scenario.artifact_store.read_bytes(s14_document.decoded_blob_id)
+    assert archived_content.decode("utf-8") == _PRINCE_ARCHIVE
+    assert s14_document.decoded_sha256 == hashlib.sha256(archived_content).hexdigest()
+
+    q2_calls = _q2_calls(scenario)
+    assert len(q2_calls) == 6  # two IOC_RULES batches, three FULL calls, one fallback
+    assert len(scenario.model.calls) == 8  # references + Q2 + synthesis
+    assert [
+        call.source_urls
+        for call in q2_calls
+        if call.request.prompt_template_id == "production-q2-ioc-batch"
+    ] == [
+        tuple(urls[:8]),
+        (urls[8], urls[12], urls[13]),
+    ]
+    assert [
+        call.source_url
+        for call in q2_calls
+        if call.request.prompt_template_id == "production-q2-url"
+    ] == list(urls[9:12])
+    for url in urls[:-1]:
+        source_calls = _q2_calls_for_source(scenario, url)
+        assert len(source_calls) == 1, (url, source_calls)
+
+    live_s14_calls = [
+        call
+        for call in q2_calls
+        if urls[-1] in call.source_urls
+        and call.request.metadata.get("access_mode") != "archive_fallback"
+    ]
+    fallback_s14_calls = [
+        call
+        for call in q2_calls
+        if call.source_url == urls[-1]
+        and call.request.metadata.get("access_mode") == "archive_fallback"
+    ]
+    assert len(live_s14_calls) == 1
+    assert len(fallback_s14_calls) == 1
+    live_s14, fallback_s14 = live_s14_calls[0], fallback_s14_calls[0]
+    assert q2_calls.index(live_s14) < q2_calls.index(fallback_s14)
+    assert live_s14.request.web_search is True
+    assert fallback_s14.request.web_search is False
+    assert fallback_s14.request.metadata["access_mode"] == "archive_fallback"
+    assert fallback_s14.request.metadata["source_content_sha256"] == s14_document.decoded_sha256
+    assert _PRINCE_ARCHIVE.strip() in fallback_s14.request.text
+    assert _PRINCE_ARCHIVE not in live_s14.request.text
+
+    events = _diagnostic_events(scenario)
+    fallback_started = [
+        (index, event)
+        for index, event in enumerate(events)
+        if event.get("event") == "q2.source.archive_fallback_started"
+        and event.get("source_id") == "S14"
+    ]
+    fallback_completed = [
+        (index, event)
+        for index, event in enumerate(events)
+        if event.get("event") == "q2.source.archive_fallback_completed"
+        and event.get("source_id") == "S14"
+    ]
+    assert len(fallback_started) == 1
+    assert len(fallback_completed) == 1
+    assert fallback_started[0][1]["live_failure_code"] == "batch_source_unavailable"
+    assert fallback_started[0][1]["web_search"] is False
+    assert fallback_started[0][0] < fallback_completed[0][0]
+    assert not any(
+        event.get("event") == "q2.source.failed" and event.get("source_id") == "S14"
+        for event in events
+    )
+
+    await _assert_no_automatic_recovery(scenario, persisted, item)
+    subject_view, batch_view = await _production_api_views(scenario)
+    assert subject_view["status"] == "ready"
+    assert subject_view["error_code"] is None
+    assert "q2_source_coverage_failed" not in str(subject_view["error_details"])
+    assert subject_view["extraction_progress"]["sources"][-1]["status"] == "succeeded"
+    assert subject_view["extraction_progress"].get("source_skips") == {}
+    assert subject_view["stages"]["extraction"]["status"] == "succeeded"
+    assert batch_view["completed"] == 1
+    assert batch_view["needs_review"] == 0
+    assert batch_view["failed"] == 0
+    assert batch_view["item_details"][0]["status"] == "ready"
+    assert batch_view["item_details"][0]["error_code"] is None
+    assert batch_view["item_details"][0]["extraction_progress"]["sources"][-1]["status"] == (
+        "succeeded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unavailable_source_without_archive_is_warning_not_pipeline_failure(
+    production_scenario_factory: ScenarioFactory,
+) -> None:
+    """An unavailable source without usable archive evidence remains non-blocking."""
+    scenario, urls = _configure_prince_topology(
+        production_scenario_factory,
+        archive_s14=False,
+    )
+    started = await scenario.start()
+    assert started.current_stage is SubjectProductionStage.SOURCES
+    run = await scenario.run_until_terminal()
+    persisted, artifacts, item, batch = await _state(scenario)
+
+    assert run.status is SubjectProductionStatus.READY
+    assert persisted.status is SubjectProductionStatus.READY
+    assert persisted.current_stage is SubjectProductionStage.ASSEMBLY
+    assert persisted.error_code is None
+    assert "q2_source_coverage_failed" not in str(persisted.error_details)
+    assert not (persisted.error_details or {}).get("source_failures")
+    assert batch is not None
+
+    by_stage = {artifact.stage: artifact for artifact in artifacts}
+    assert set(by_stage) == {
+        ProductionArtifactStage.REFERENCES,
+        ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.SYNTHESIS,
+        ProductionArtifactStage.PUBLICATION,
+    }
+    assert all(
+        artifact.status is ProductionArtifactStatus.VERIFIED for artifact in by_stage.values()
+    )
+
+    progress = persisted.extraction_progress
+    assert progress is not None
+    progress_sources = _assert_prince_profiles(progress)
+    assert progress["total_sources"] == 14
+    assert progress["completed_sources"] == 13
+    assert progress["skipped_sources"] == 1
+    assert progress["full_completed"] == 3
+    assert progress["ioc_rules_completed"] == 10
+    assert all(
+        source["status"] == "succeeded"
+        for source_id, source in progress_sources.items()
+        if source_id != "S14"
+    )
+    assert progress_sources["S14"]["status"] == "skipped"
+    skip = progress["source_skips"]["S14"]
+    assert skip["blocking"] is False
+    assert skip["live_error_code"] == "batch_source_unavailable"
+    assert skip["archive_error_code"] == "q2_source_evidence_unavailable"
+    assert skip["archive_reason"] == "Archived source text is empty"
+
+    q2_calls = _q2_calls(scenario)
+    assert len(q2_calls) == 5  # two IOC_RULES batches and three FULL calls
+    assert len(scenario.model.calls) == 7  # references + Q2 + synthesis
+    for url in urls[:-1]:
+        assert len(_q2_calls_for_source(scenario, url)) == 1
+    assert len(_q2_calls_for_source(scenario, urls[-1])) == 1
+    assert not any(
+        call.request.metadata.get("access_mode") == "archive_fallback" for call in q2_calls
+    )
+
+    events = _diagnostic_events(scenario)
+    skipped_events = [
+        event
+        for event in events
+        if event.get("event") == "q2.source.skipped" and event.get("source_id") == "S14"
+    ]
+    assert len(skipped_events) == 1
+    assert skipped_events[0]["blocking"] is False
+    assert skipped_events[0]["archive_reason"] == "Archived source text is empty"
+    assert not any(
+        event.get("event") == "q2.source.failed" and event.get("source_id") == "S14"
+        for event in events
+    )
+
+    await _assert_no_automatic_recovery(scenario, persisted, item)
+    subject_view, batch_view = await _production_api_views(scenario)
+    assert subject_view["status"] == "ready"
+    assert subject_view["error_code"] is None
+    assert "q2_source_coverage_failed" not in str(subject_view["error_details"])
+    subject_progress = subject_view["extraction_progress"]
+    assert subject_progress["source_skips"]["S14"]["blocking"] is False
+    assert next(
+        source for source in subject_progress["sources"] if source["source_id"] == "S14"
+    )["status"] == "skipped"
+    assert batch_view["completed"] == 1
+    assert batch_view["needs_review"] == 0
+    assert batch_view["failed"] == 0
+    batch_progress = batch_view["item_details"][0]["extraction_progress"]
+    assert batch_progress["source_skips"]["S14"]["blocking"] is False
+    assert next(
+        source for source in batch_progress["sources"] if source["source_id"] == "S14"
+    )["status"] == "skipped"
+    assert batch_view["item_details"][0]["error_code"] is None
 
 
 @pytest.mark.parametrize("retryable", [False, None, True])
