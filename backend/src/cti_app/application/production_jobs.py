@@ -32,6 +32,7 @@ from cti_app.application.subject_production import EditionProductionService
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionBatchStatus,
+    ProductionReconciliationRequiredError,
     ProductionSubmissionReconciliation,
     SubjectProductionRun,
     SubjectProductionStage,
@@ -200,6 +201,8 @@ class ProductionStageChain:
             return None
         if run.status is SubjectProductionStatus.CANCELLED:
             raise JobCancelledError
+        if run.requires_reconciliation:
+            raise ProductionReconciliationRequiredError
         parameters = ProductionStageParameters(
             run_id=run.id,
             expected_stage=stage.value,
@@ -344,6 +347,8 @@ def register_production_jobs(
             return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
         if current.status is SubjectProductionStatus.CANCELLED:
             return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
+        if current.requires_reconciliation and not reconciliation_resume:
+            return f"production-stage://{parameters.run_id}/{stage.value}#reconciliation_required"
         if reconciliation_resume:
             reconciliation_parameters = cast(ProductionReconciliationResumeParameters, parameters)
             identity = current.reconciliation

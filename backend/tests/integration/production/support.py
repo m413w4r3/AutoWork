@@ -84,6 +84,8 @@ from cti_app.domain.model_runs import ModelProvider, ModelRun
 from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 
+_USED_EDITION_CODES: set[str] = set()
+
 
 class DeterministicSourceTransport(HttpTransport):
     """HTTP transport fake; SafeHttpCollector still owns all collection rules."""
@@ -405,10 +407,14 @@ class ProductionScenario:
             _canonical_url(url): dict(spec) for url, spec in self.sources.items()
         }
         self.sources = canonical_sources
-        edition_token = uuid4().int
-        country_code = "".join(
-            chr(65 + (edition_token // (26**offset)) % 26) for offset in (0, 1)
-        )
+        while True:
+            edition_token = uuid4().int
+            country_code = "".join(
+                chr(65 + (edition_token // (26**offset)) % 26) for offset in (0, 1)
+            )
+            if country_code not in _USED_EDITION_CODES:
+                _USED_EDITION_CODES.add(country_code)
+                break
         self.edition = Edition(
             country=f"Business Test {country_code}",
             country_code=country_code,
