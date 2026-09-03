@@ -29,6 +29,9 @@ class ProductionPacingPolicy:
     subject_jitter_max_seconds: float = 90.0
     model_jitter_min_seconds: float = 8.0
     model_jitter_max_seconds: float = 20.0
+    cooldown_every_n_subjects: int = 3
+    cooldown_min_seconds: float = 600.0
+    cooldown_max_seconds: float = 1200.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -43,6 +46,12 @@ class ProductionPacingPolicy:
             raise ValueError("subject jitter max must be >= min")
         if self.model_jitter_max_seconds < self.model_jitter_min_seconds:
             raise ValueError("model jitter max must be >= min")
+        if self.cooldown_every_n_subjects < 0:
+            raise ValueError("cooldown_every_n_subjects must be >= 0")
+        if self.cooldown_min_seconds < 0 or self.cooldown_max_seconds < 0:
+            raise ValueError("cooldown bounds must be >= 0")
+        if self.cooldown_max_seconds < self.cooldown_min_seconds:
+            raise ValueError("cooldown max must be >= min")
 
     @classmethod
     def zero(cls) -> ProductionPacingPolicy:
@@ -52,6 +61,9 @@ class ProductionPacingPolicy:
             subject_jitter_max_seconds=0,
             model_jitter_min_seconds=0,
             model_jitter_max_seconds=0,
+            cooldown_every_n_subjects=0,
+            cooldown_min_seconds=0,
+            cooldown_max_seconds=0,
         )
 
     @classmethod
@@ -61,6 +73,9 @@ class ProductionPacingPolicy:
             subject_jitter_max_seconds=float(settings.production_subject_jitter_max_seconds),
             model_jitter_min_seconds=float(settings.production_model_jitter_min_seconds),
             model_jitter_max_seconds=float(settings.production_model_jitter_max_seconds),
+            cooldown_every_n_subjects=int(settings.production_cooldown_every_n_subjects),
+            cooldown_min_seconds=float(settings.production_cooldown_min_seconds),
+            cooldown_max_seconds=float(settings.production_cooldown_max_seconds),
         )
 
     @staticmethod
@@ -81,7 +96,25 @@ class ProductionPacingPolicy:
             self.model_jitter_max_seconds,
         )
 
-    def subject_delay_ms(self) -> int:
+    def subject_delay_ms(self, *, sequence_index: int = 0) -> int:
+        """Delay before starting the subject at ``sequence_index`` (0-based).
+
+        Every ``cooldown_every_n_subjects`` subjects, the pipeline pauses far
+        longer than the ordinary jitter. The ChatGPT bridge drives a single
+        browser session and degrades measurably after a few hours of
+        uninterrupted production.
+        """
+        if (
+            self.cooldown_every_n_subjects > 0
+            and sequence_index > 0
+            and sequence_index % self.cooldown_every_n_subjects == 0
+        ):
+            return max(
+                0,
+                round(
+                    self._sample(self.cooldown_min_seconds, self.cooldown_max_seconds) * 1000
+                ),
+            )
         return max(0, round(self.subject_delay_seconds() * 1000))
 
     def model_delay_ms(self, stage: SubjectProductionStage | str) -> int:

@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     production_subject_jitter_max_seconds: float = Field(default=90.0, ge=0)
     production_model_jitter_min_seconds: float = Field(default=8.0, ge=0)
     production_model_jitter_max_seconds: float = Field(default=20.0, ge=0)
+    # Palier de repos long inséré périodiquement pour laisser le bridge
+    # ChatGPT récupérer. Zéro désactive le palier.
+    production_cooldown_every_n_subjects: int = Field(default=3, ge=0)
+    production_cooldown_min_seconds: float = Field(default=600.0, ge=0)
+    production_cooldown_max_seconds: float = Field(default=1200.0, ge=0)
     # Fenêtre pendant laquelle une extraction Q2 déjà réussie pour la même URL
     # canonique et le même profil peut être réutilisée par un autre run.
     production_q2_reuse_max_age_days: float = Field(default=14.0, ge=0, le=365)
@@ -159,6 +164,8 @@ class Settings(BaseSettings):
             raise ValueError("production subject jitter max must be >= min")
         if self.production_model_jitter_max_seconds < self.production_model_jitter_min_seconds:
             raise ValueError("production model jitter max must be >= min")
+        if self.production_cooldown_max_seconds < self.production_cooldown_min_seconds:
+            raise ValueError("production cooldown max must be >= min")
         return self
 
 

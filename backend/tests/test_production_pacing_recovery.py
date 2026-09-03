@@ -378,6 +378,9 @@ async def test_recovery_subject_schedule_is_persisted_before_dispatch() -> None:
         subject_jitter_max_seconds=7,
         model_jitter_min_seconds=0,
         model_jitter_max_seconds=0,
+        cooldown_every_n_subjects=3,
+        cooldown_min_seconds=600,
+        cooldown_max_seconds=600,
     )
     service = EditionProductionService(lambda: uow, policy)
 
@@ -389,7 +392,7 @@ async def test_recovery_subject_schedule_is_persisted_before_dispatch() -> None:
     assert uow.edition_production_batches.item.phase is ProductionBatchPhase.RECOVERY
     dispatch_at = uow.edition_production_batches.item.next_dispatch_at
     assert dispatch_at is not None
-    assert 0 < policy.delay_until(dispatch_at, now=datetime.now(UTC)) <= 7000
+    assert 599_000 <= policy.delay_until(dispatch_at, now=datetime.now(UTC)) <= 600_000
 
 
 @pytest.mark.asyncio

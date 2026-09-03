@@ -263,6 +263,7 @@ async def test_transient_source_failure_is_resumable_without_duplicate_archive(
     with pytest.raises(JobHandlerError) as transient:
         await app.collect_subject(subject.id, context.job_id, context)
     assert transient.value.code == "source_collection_no_success"
+    assert transient.value.transient is True
     assert (await app.list_sources(subject.id))[0].state is CollectionState.FAILED_RETRYABLE
 
     failed_source = (await app.list_sources(subject.id))[0]

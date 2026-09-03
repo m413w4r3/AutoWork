@@ -524,10 +524,13 @@ class SubjectCollectionService:
             },
         )
         if summary.success_count == 0:
+            # Un échec retryable doit rester retryable : le job dispatcher
+            # dispose de trois tentatives, et une collecte bloquée par un
+            # ralentissement réseau réussit souvent à la seconde.
             raise JobHandlerError(
                 "source_collection_no_success",
                 "Aucune publication n'a pu être archivée.",
-                transient=False,
+                transient=summary.failed_retryable > 0,
                 details=asdict(summary),
             )
         return output_reference

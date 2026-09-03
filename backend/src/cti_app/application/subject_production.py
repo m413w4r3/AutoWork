@@ -845,7 +845,12 @@ class EditionProductionService:
                     batch.start(now=started_at)
                 if pace_subject:
                     batch.schedule_next_dispatch(
-                        started_at + timedelta(milliseconds=self._pacing.subject_delay_ms())
+                        started_at
+                        + timedelta(
+                            milliseconds=self._pacing.subject_delay_ms(
+                                sequence_index=item.position
+                            )
+                        )
                     )
                 if batch.status is ProductionBatchStatus.RUNNING:
                     await uow.edition_production_batches.save(batch)
@@ -956,8 +961,15 @@ class EditionProductionService:
                 await save_item(item)
             if batch.phase is ProductionBatchPhase.INITIAL:
                 batch.enter_recovery()
+            # Une reprise automatique suit toujours un échec : elle mérite le
+            # palier de repos long, jamais le simple jitter.
             batch.schedule_next_dispatch(
-                datetime.now(UTC) + timedelta(milliseconds=self._pacing.subject_delay_ms())
+                datetime.now(UTC)
+                + timedelta(
+                    milliseconds=self._pacing.subject_delay_ms(
+                        sequence_index=self._pacing.cooldown_every_n_subjects
+                    )
+                )
             )
             await uow.edition_production_batches.save(batch)
             return retried.run
