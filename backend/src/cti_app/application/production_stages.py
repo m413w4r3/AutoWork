@@ -491,18 +491,14 @@ class ProductionQAService:
             )
 
         if publication_markdown:
-            used = {
-                int(match.group(1))
-                for match in _PUBLICATION_FOOTNOTE.finditer(publication_markdown)
-            }
-            declared = {
-                int(match.group(1))
-                for match in _PUBLICATION_DECLARED.finditer(publication_markdown)
-            }
+            # Le rendu Pandoc émet des notes inline `^[...]`, jamais une
+            # bibliographie numérotée : une note orpheline est ici une note
+            # vide, c'est-à-dire une citation dont aucune source du corpus
+            # n'a pu fournir d'URL.
             require(
-                "no_orphan_footnote",
-                used <= declared,
-                "La publication contient une note de bas de page orpheline",
+                "no_empty_footnote",
+                not _PUBLICATION_EMPTY_FOOTNOTE.search(publication_markdown),
+                "La publication contient une note de bas de page vide",
             )
 
         passed = all(checks.values()) and not errors
@@ -515,5 +511,4 @@ class ProductionQAService:
 
 
 _SYNTHESIS_MARKER = re.compile(r"\[(S\d{1,3})\]", re.IGNORECASE)
-_PUBLICATION_FOOTNOTE = re.compile(r"(?<!^)\[(\d{1,3})\]", re.MULTILINE)
-_PUBLICATION_DECLARED = re.compile(r"^\[(\d{1,3})\]\s", re.MULTILINE)
+_PUBLICATION_EMPTY_FOOTNOTE = re.compile(r"\^\[\s*\]")

@@ -279,10 +279,13 @@ async def test_qa_fails_on_a_stale_artifact() -> None:
     assert result["checks"]["no_stale_references"] is False
 
 
-async def test_qa_fails_on_an_orphan_footnote() -> None:
-    result = await _qa(publication_markdown="# T\n\nTexte avec [7] sans déclaration.\n")
+async def test_qa_allows_numeric_semantic_annotation() -> None:
+    result = await _qa(
+        publication_markdown='# T\n\nTexte avec [201]{custom-style="technical"}.\n'
+    )
 
-    assert result["checks"]["no_orphan_footnote"] is False
+    assert result["checks"]["no_empty_footnote"] is True
+    assert result["passed"] is True
 
 
 # --- machine_verified ------------------------------------------------------
