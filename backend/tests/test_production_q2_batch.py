@@ -463,7 +463,7 @@ def _batch_workflow(
         document = _archived_document(
             subject_id=subject,
             url=source.canonical_url,
-            content=f"ARCHIVED {source.canonical_url}".encode(),
+            content=(f"ARCHIVED {source.canonical_url} " * 50).encode(),
             blobs=blobs,
         )
         documents[document.id] = document

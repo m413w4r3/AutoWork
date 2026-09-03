@@ -309,6 +309,8 @@ class _Q2UnitOfWork:
         self,
         model_run_state: dict[Any, Any] | None = None,
         report: ReferenceReport | None = None,
+        *,
+        source_contents: dict[str, bytes] | None = None,
     ) -> None:
         self.production_artifacts = _Q2Artifacts()
         self.subject_production_runs = _Q2Runs()
@@ -317,7 +319,9 @@ class _Q2UnitOfWork:
             model_run_state if model_run_state is not None else {}
         )
         self.archive_reader = _Q2ArchiveReader()
-        self.source_documents = _Q2SourceDocuments(report, self.archive_reader)
+        self.source_documents = _Q2SourceDocuments(
+            report, self.archive_reader, source_contents=source_contents
+        )
         self.source_collections = _Q2SourceCollections(self.source_documents.documents)
 
     async def __aenter__(self) -> "_Q2UnitOfWork":
@@ -341,10 +345,17 @@ class _Q2SourceDocuments:
         self,
         report: ReferenceReport | None,
         reader: _Q2ArchiveReader,
+        *,
+        source_contents: dict[str, bytes] | None = None,
     ) -> None:
         self.documents: list[SimpleNamespace] = []
         for source in report.sources if report is not None else ():
-            content = b"ExampleRAT" if source.local_id == "S1" else b""
+            default_content = b"ExampleRAT" if source.local_id == "S1" else b""
+            content = (
+                source_contents.get(source.local_id, default_content)
+                if source_contents is not None
+                else default_content
+            )
             blob_id = uuid4()
             reader.contents[blob_id] = content
             self.documents.append(
@@ -558,10 +569,11 @@ def _q2_orchestrator(
     report: ReferenceReport,
     *,
     model_run_state: dict[Any, Any] | None = None,
+    source_contents: dict[str, bytes] | None = None,
 ) -> tuple[
     production_workflow.ProductionWorkflowOrchestrator, SubjectProductionRun, _Q2Diagnostics
 ]:
-    uow = _Q2UnitOfWork(model_run_state, report)
+    uow = _Q2UnitOfWork(model_run_state, report, source_contents=source_contents)
     diagnostics = _Q2Diagnostics()
     orchestrator = production_workflow.ProductionWorkflowOrchestrator.__new__(
         production_workflow.ProductionWorkflowOrchestrator
@@ -574,6 +586,7 @@ def _q2_orchestrator(
     orchestrator._blob_reader = uow.archive_reader
     orchestrator._pacing = type("Pacing", (), {"model_delay_seconds": lambda self: 0.0})()
     orchestrator._extraction = _Q2Extraction()
+    orchestrator._settings = SimpleNamespace(production_archive_fallback_min_chars=1200)
 
     async def load_reference(*args: object) -> ReferenceReport:
         del args
@@ -639,6 +652,40 @@ async def test_q2_duplicate_reference_source_id_fails_closed_before_batching(
     assert result["status"] == "needs_review"
     assert result["error_code"] == "duplicate_reference_source_id"
     assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_q2_content_duplicates_share_one_model_call_and_complete_both_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _Q2Gateway(None)
+    orchestrator, run, diagnostics = _q2_orchestrator(
+        monkeypatch,
+        gateway,
+        _q2_report(2),
+        source_contents={"S1": b"ExampleRAT", "S2": b"ExampleRAT"},
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run, snapshot=_q2_snapshot()
+    )
+
+    assert result["status"] == "success", result
+    assert gateway.calls == ["S1"]
+    assert result["completed_source_ids"] == ["S1", "S2"]
+    assert result["model_calls"] == 1
+    assert result["model_calls_avoided"] == 1
+    duplicate_events = [
+        event
+        for event in diagnostics.events
+        if event.get("event") == "q2.source.content_duplicate"
+    ]
+    assert len(duplicate_events) == 1
+    assert duplicate_events[0]["source_id"] == "S2"
+    assert duplicate_events[0]["primary_source_id"] == "S1"
+    assert duplicate_events[0]["source_content_sha256"] == hashlib.sha256(
+        b"ExampleRAT"
+    ).hexdigest()
 
 
 @pytest.mark.parametrize("error_code", ["bridge_ui_timeout", "transport_glitch"])
@@ -811,6 +858,9 @@ async def test_manual_extraction_retry_reuses_successful_batch_members_only(
         gateway,
         _q2_report(5),
         model_run_state=model_uow.state,
+        source_contents={
+            f"S{index}": f"archive-{index}".encode() for index in range(1, 6)
+        },
     )
     snapshot = replace(_q2_snapshot(), core_sources=(), reuse_basis_hash="", input_hash="")
 
@@ -985,6 +1035,7 @@ async def test_q2_checkpoint_is_created_only_after_local_archive_gate(
 async def test_archive_fallback_checkpoint_is_reused_on_idempotent_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    archive_content = b"ExampleRAT " * 200
     adapter = _ArchiveFallbackAdapter()
     gateway, model_uow = _persistent_q2_gateway(adapter)
     orchestrator, run, _ = _q2_orchestrator(
@@ -992,6 +1043,7 @@ async def test_archive_fallback_checkpoint_is_reused_on_idempotent_replay(
         gateway,
         _q2_report(1),
         model_run_state=model_uow.state,
+        source_contents={"S1": archive_content},
     )
 
     first = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
@@ -1016,13 +1068,42 @@ async def test_archive_fallback_checkpoint_is_reused_on_idempotent_replay(
         pipeline_generation=run.pipeline_generation,
         source_id="S1",
         canonical_url="https://example.test/1",
-        source_content_sha256=hashlib.sha256(b"ExampleRAT").hexdigest(),
+        source_content_sha256=hashlib.sha256(archive_content).hexdigest(),
         profile=production_workflow.ExtractionProfile.FULL,
         requested_model="chatgpt-web-fake",
     )
     assert live_id in model_uow.state
     assert archive_id in model_uow.state
     assert live_id != archive_id
+
+
+@pytest.mark.asyncio
+async def test_archive_fallback_skips_short_archived_text_without_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _ArchiveFallbackAdapter()
+    gateway, _ = _persistent_q2_gateway(adapter)
+    orchestrator, run, diagnostics = _q2_orchestrator(
+        monkeypatch,
+        gateway,
+        _q2_report(1),
+        source_contents={"S1": b"x" * 200},
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run, snapshot=_q2_snapshot()
+    )
+
+    assert result["status"] == "success", result
+    assert result["skipped_source_ids"] == ["S1"]
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0].web_search is True
+    skipped_event = next(
+        event
+        for event in diagnostics.events
+        if event.get("event") == "q2.source.skipped"
+    )
+    assert skipped_event["archive_error_code"] == "archive_source_not_substantive"
 
 
 @pytest.mark.asyncio

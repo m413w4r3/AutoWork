@@ -307,7 +307,7 @@ async def test_archive_unavailable_or_tampered_fails_closed(
 async def test_live_unavailable_uses_one_archive_fallback_without_web_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = b"archive-ioc.security-lab.io"
+    archive = b"archive-ioc.security-lab.io " * 50
     orchestrator, run, _state, sink, _reader = _workflow(
         monkeypatch,
         [archive],
@@ -404,7 +404,7 @@ async def test_archive_fallback_invalid_output_remains_a_real_failure(
 ) -> None:
     orchestrator, run, _state, sink, _reader = _workflow(
         monkeypatch,
-        [b"archive-ioc.security-lab.io"],
+        [b"archive-ioc.security-lab.io " * 50],
         ["UNAVAILABLE", "not Q2 markdown"],
     )
 

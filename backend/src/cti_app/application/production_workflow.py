@@ -103,6 +103,7 @@ from cti_app.application.production_stages import (
     SynthesisService,
     compute_input_hash,
 )
+from cti_app.config import get_settings
 from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceOriginKind
 from cti_app.domain.model_conversations import (
     ConversationMode,
@@ -230,8 +231,11 @@ class _Q2SourceEvidenceUnavailable(_Q2SourceContentFailure):
         *,
         expected_sha256: str | None = None,
         blob_id: UUID | None = None,
+        code: str | None = None,
     ) -> None:
         super().__init__(reason)
+        if code:
+            self.code = code[:64]
         self.details = {
             "reason": reason,
             **({"expected_decoded_sha256": expected_sha256} if expected_sha256 is not None else {}),
@@ -848,6 +852,7 @@ class ProductionWorkflowOrchestrator:
         self._seed_enrichment = seed_enrichment
         self._pacing = pacing or ProductionPacingPolicy.zero()
         self._q2_reuse_max_age_days = q2_reuse_max_age_days
+        self._settings = get_settings()
 
     async def _check_cancellation(self, run_id: UUID, context: JobExecutionContext | None) -> None:
         """Fence both the job cancellation flag and the persistent run state."""
@@ -1808,6 +1813,13 @@ class ProductionWorkflowOrchestrator:
             if reuse_max_age_days > 0
             else None
         )
+        archive_fallback_min_chars = int(
+            getattr(
+                getattr(self, "_settings", None),
+                "production_archive_fallback_min_chars",
+                1200,
+            )
+        )
 
         async def find_q2_checkpoint(checkpoint_key: str) -> Any | None:
             async with self._uow_factory() as uow:
@@ -2308,6 +2320,15 @@ class ProductionWorkflowOrchestrator:
                         "Archived source text is empty",
                         expected_sha256=archived.content_sha256 if archived else None,
                         blob_id=archived.decoded_blob_id if archived else None,
+                    )
+                if len(source_text) < archive_fallback_min_chars:
+                    # Coquille anti-bot ou page de blocage : un appel modèle
+                    # dessus coûte 45 s et ne produit rien.
+                    raise _Q2SourceEvidenceUnavailable(
+                        "Archived source text is not substantive",
+                        expected_sha256=archived.content_sha256 if archived else None,
+                        blob_id=archived.decoded_blob_id if archived else None,
+                        code="archive_source_not_substantive",
                     )
             except _Q2SourceEvidenceUnavailable as exc:
                 details = exc.details if isinstance(exc.details, dict) else {}
@@ -3248,15 +3269,49 @@ class ProductionWorkflowOrchestrator:
                 source_content_sha256=source_content_sha256,
             )
             pending[source.local_id] = work
+
+        # Deux sources différentes peuvent avoir archivé exactement le même
+        # contenu (page anti-bot, shell JavaScript, redirection). Une seule
+        # extraction est nécessaire ; les autres réutilisent son résultat.
+        content_twins: dict[str, str] = {}
+        duplicate_source_ids: dict[str, str] = {}
+        for source_id, work in pending.items():
+            digest = work.source_content_sha256
+            if not digest:
+                continue
+            primary = content_twins.get(digest)
+            if primary is None:
+                content_twins[digest] = source_id
+                continue
+            duplicate_source_ids[source_id] = primary
+            self._diagnostics.record(
+                event="q2.source.content_duplicate",
+                run_id=run.id,
+                subject_id=run.subject_id,
+                stage="extraction",
+                correlation_id=self._correlation_id,
+                source_id=source_id,
+                source_url=work.source.canonical_url,
+                primary_source_id=primary,
+                source_content_sha256=digest,
+            )
+
+        # Select reusable results and live candidates only after every source
+        # has been planned, so content twins can be excluded consistently.
+        for source in report.sources:
+            if source.local_id in duplicate_source_ids:
+                continue
+            plan = plans_by_url[source.canonical_url]
+            work = pending[source.local_id]
             candidate = (
                 _batch_candidate(source) if plan.profile is ExtractionProfile.IOC_RULES else None
             )
             if candidate is not None:
                 batch_candidates.append(candidate)
             else:
-                reusable = await load_reusable_source(pending[source.local_id], batched=False)
+                reusable = await load_reusable_source(work, batched=False)
                 if reusable is not None:
-                    await record_reused_source(pending[source.local_id], reusable)
+                    await record_reused_source(work, reusable)
                 else:
                     individual_source_ids.add(source.local_id)
 
@@ -3311,6 +3366,38 @@ class ProductionWorkflowOrchestrator:
                 if early_result is not None:
                     return early_result
                 handled_source_ids.add(source.local_id)
+
+        # Chaque doublon de contenu hérite du résultat de sa source primaire :
+        # les artefacts restent attribués à la source qui les publie.
+        for duplicate_id, primary_id in duplicate_source_ids.items():
+            primary_submission = next(
+                (item for item in submissions if primary_id in item.source_ids),
+                None,
+            )
+            if primary_submission is None:
+                _mark_extraction_source_failed(progress, duplicate_id, "skipped")
+                continue
+            submissions.append(
+                Q2ProposalSubmission(
+                    output=primary_submission.output,
+                    source_ids=(duplicate_id,),
+                    model_run_id=primary_submission.model_run_id,
+                )
+            )
+            completed.append(duplicate_id)
+            _mark_extraction_source_complete(
+                progress,
+                pending[duplicate_id].source,
+                status="cached",
+                counts=_source_progress_counts(
+                    primary_submission.output, duplicate_id
+                ),
+                cache_hit=True,
+            )
+            cache_hits += 1
+            model_calls_avoided += 1
+        await self._persist_extraction_progress(run.id, progress)
+
         if failed:
             return {
                 "stage": "extraction",

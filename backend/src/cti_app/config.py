@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     # Fenêtre pendant laquelle une extraction Q2 déjà réussie pour la même URL
     # canonique et le même profil peut être réutilisée par un autre run.
     production_q2_reuse_max_age_days: float = Field(default=14.0, ge=0, le=365)
+    # En dessous de ce nombre de caractères, un texte archivé est une coquille
+    # (page anti-bot, shell JavaScript) : un appel modèle dessus est perdu.
+    production_archive_fallback_min_chars: int = Field(default=1200, ge=0)
     openai_bridge_base_url: str = "http://127.0.0.1:8001/v1"
     openai_bridge_api_key: SecretStr | None = None
     openai_bridge_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
