@@ -21,7 +21,7 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.domain.publication import ArtifactType
 
-SOURCE_EVIDENCE_VERSION = "5"
+SOURCE_EVIDENCE_VERSION = "6"
 
 _NBSP = "\u00a0"
 _NARROW_NBSP = "\u202f"
@@ -250,13 +250,20 @@ def _verify_output_against_source(
         if isinstance(source_text, SourceEvidenceDocument)
         else SourceEvidenceDocument(parsed_text=source_text)
     )
-    source_views = tuple(
+    base_source_views = tuple(
         _artifact_comparison_view(value)
         for value in (evidence_document.parsed_text, evidence_document.decoded_source_view)
         if value
     )
+    # Un IOC publié dans une cellule de tableau est souvent replié : le rendu
+    # texte insère un saut de ligne ou une suite d'espaces au milieu du token.
+    # La vue compactée retire seulement ces coupures, sans rien réécrire.
+    source_views = (
+        *base_source_views,
+        *(_artifact_unwrapped_view(value) for value in base_source_views),
+    )
     rule_source_views = tuple(
-        _rule_comparison_view(value)
+        _rule_whitespace_view(value)
         for value in (evidence_document.parsed_text, evidence_document.decoded_source_view)
         if value
     )
@@ -271,7 +278,10 @@ def _verify_output_against_source(
     proposal_index = len(output.facts)
     for artifact in output.artifacts:
         proposal_index += 1
-        if any(_artifact_is_proven(artifact, source) for source in source_views):
+        if any(_artifact_is_proven(artifact, source) for source in base_source_views):
+            artifacts.append(artifact.model_copy(update={"context": "", "evidence_quote": ""}))
+        elif any(_artifact_is_proven(artifact, source) for source in source_views):
+            warnings.append("artifact_proven_after_unwrap")
             artifacts.append(artifact.model_copy(update={"context": "", "evidence_quote": ""}))
         else:
             rejections.append(
@@ -290,8 +300,8 @@ def _verify_output_against_source(
 
     for rule in output.rules:
         proposal_index += 1
-        body = _rule_comparison_view(rule.body)
-        if body.strip() and any(body in source for source in rule_source_views):
+        body = _rule_whitespace_view(rule.body)
+        if body and any(body in source for source in rule_source_views):
             rules.append(rule.model_copy(update={"context": "", "evidence_quote": ""}))
         else:
             rejections.append(
@@ -333,9 +343,37 @@ def _artifact_comparison_view(value: str) -> str:
     return view
 
 
+_ARTIFACT_WRAP = re.compile(r"[ \t]*\n[ \t]*")
+
+
+def _artifact_unwrapped_view(view: str) -> str:
+    """Remove renderer line wrapping inside an indicator token.
+
+    Only whitespace surrounding a newline is removed. No character of the
+    indicator is added, removed or rewritten, so a value proven in this view
+    is still literally present in the source.
+    """
+    return _ARTIFACT_WRAP.sub("", view)
+
+
 def _rule_comparison_view(value: str) -> str:
     """Rules permit line-ending normalization and nothing else."""
     return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+_RULE_WHITESPACE = re.compile(r"\s+")
+
+
+def _rule_whitespace_view(value: str) -> str:
+    """Collapse every run of whitespace to one space.
+
+    A rule published in a blog is re-indented, wrapped and decorated by the
+    renderer. Requiring a byte-identical body means no rule is ever published:
+    the pipeline emitted zero rules across twenty consecutive runs. Collapsing
+    whitespace keeps every token and their order, so the rule is still proven
+    in its own source.
+    """
+    return _RULE_WHITESPACE.sub(" ", _rule_comparison_view(value)).strip()
 
 
 def _artifact_is_proven(artifact: Q2ArtifactProposal, source: str) -> bool:

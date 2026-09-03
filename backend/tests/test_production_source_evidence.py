@@ -33,7 +33,7 @@ def test_version_and_ioc_from_same_source_are_kept_with_value_only() -> None:
 
     result = verify_ioc_rules_output_against_source(output, "The domain is evil.com.")
 
-    assert SOURCE_EVIDENCE_VERSION == "5"
+    assert SOURCE_EVIDENCE_VERSION == "6"
     assert result.output.artifacts[0].value == "evil[.]com"
     assert result.output.artifacts[0].context == ""
     assert result.output.artifacts[0].evidence_quote == ""
@@ -216,6 +216,32 @@ def test_domain_inside_a_longer_domain_is_not_proof() -> None:
     assert result.rejections[0].reason_code == "source_evidence_missing"
 
 
+def test_wrapped_domain_is_kept_with_unwrap_warning() -> None:
+    result = verify_ioc_rules_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact("exemple.com", "domain")]),
+        "Observed exemp\nle.com in the report.",
+    )
+
+    assert len(result.output.artifacts) == 1
+    assert "artifact_proven_after_unwrap" in result.warnings
+    assert result.rejections == ()
+
+
+def test_artifact_absent_from_both_source_views_is_rejected() -> None:
+    document = source_evidence_document_from_html(
+        "present.example",
+        "<p>decoded.example</p>",
+    )
+
+    result = verify_ioc_rules_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact("missing.example", "domain")]),
+        document,
+    )
+
+    assert result.output.artifacts == []
+    assert result.rejections[0].reason_code == "source_evidence_missing"
+
+
 def test_ipv4_is_proven_without_ip_reformatting() -> None:
     result = verify_ioc_rules_output_against_source(
         Q2SourceOutput(artifacts=[_artifact("192[.]0[.]2[.]10", "ip")]),
@@ -297,21 +323,21 @@ def test_exact_rule_is_kept_and_narrative_fields_are_removed() -> None:
     assert result.rejections == ()
 
 
-def test_rule_with_changed_whitespace_is_rejected() -> None:
+def test_rule_with_changed_whitespace_is_kept() -> None:
     result = verify_ioc_rules_output_against_source(
         Q2SourceOutput(
             rules=[
                 Q2RuleProposal(
                     rule_type="yara",
-                    body="rule R {\n  condition: true\n}",
+                    body="rule R {\n    condition: true\n}",
                 )
             ]
         ),
-        "rule R {\n condition: true\n}",
+        "rule R {\n\tcondition: true\n}",
     )
 
-    assert result.output.rules == []
-    assert result.rejections[0].reason_code == "source_rule_evidence_missing"
+    assert len(result.output.rules) == 1
+    assert result.rejections == ()
 
 
 def test_rule_present_only_in_another_source_is_rejected() -> None:
