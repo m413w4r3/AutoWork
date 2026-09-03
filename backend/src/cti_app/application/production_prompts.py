@@ -31,7 +31,7 @@ EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
 }
 SYNTHESIS_PROMPT_VERSION = "8"
 REFERENCES_FORMAT_REPAIR_VERSION = "1"
-SYNTHESIS_FORMAT_REPAIR_VERSION = "4"
+SYNTHESIS_FORMAT_REPAIR_VERSION = "5"
 
 
 _Q2_WIRE_FORMAT = """FACT <category>
@@ -611,15 +611,25 @@ Return only the synthesis prose with [S#] markers.
 
     SYNTHESIS_REPAIR_V4 = """Your previous synthesis violates deterministic publication rules.
 
-Violations, each as `code: offending detail`:
+Violations, each as `code: description: exact offending text`:
 {problems}
 
 Repair the previous answer once. Do not research, add, remove, or alter any fact.
 Keep valid [S#] citations.
 
-Apply the minimal rewrite that clears each listed violation:
-- Remove headings, bibliography, raw URLs, "Sources du corpus" lines and
-  formatting marks.
+Locate each exact offending text quoted above and apply the minimal rewrite that
+clears it:
+- heading / code_fence / inline_code / bold: delete the formatting mark only,
+  keep the words.
+- bibliography / sources_corpus: delete the whole offending line.
+- raw_url: delete the URL; keep the surrounding sentence.
+- internal_display_label: this is an internal pipeline field name or a
+  `field: value` label leaked from the evidence pack. Delete the label and its
+  value. Never delete a command line, a file path or a process name that merely
+  happens to contain a word such as "Hidden".
+- uncited_factual_paragraph: add the [S#] marker of the source the paragraph
+  already relies on. Add no new source.
+- unknown_source_marker / unknown_indicator: delete only that marker or value.
 
 Never delete a whole technical fact when rewording one value is enough, and
 never add a fact, a source or an indicator. Return only French prose.

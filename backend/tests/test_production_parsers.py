@@ -382,12 +382,24 @@ def test_url_outside_corpus_is_rejected() -> None:
     assert any("raw_url" in e for e in result.errors)
 
 
-@pytest.mark.parametrize("label", ("EXCLUDED", "hidden"))
+@pytest.mark.parametrize("label", ("indicator_status: excluded", "display_policy: hidden"))
 def test_internal_publication_labels_are_rejected(label: str) -> None:
     result = validate_synthesis(f"Élément {label} [S1].", _corpus(), set())
 
     assert not result.usable
     assert "internal_display_label" in result.errors
+
+
+def test_technical_hidden_command_is_not_an_internal_publication_label() -> None:
+    result = validate_synthesis(
+        "La commande powershell.exe -NonInteractive -WindowStyle Hidden "
+        "-ExecutionPolicy RemoteSigned -EncodedCommand est exécutée [S1].",
+        _corpus(),
+        set(),
+    )
+
+    assert result.usable
+    assert "internal_display_label" not in result.errors
 
 
 def test_indicator_absent_from_corpus_is_rejected() -> None:

@@ -107,7 +107,7 @@ text: Event
         },
     )
 
-    assert pack["version"] == "5"
+    assert pack["version"] == "6"
     assert [source["tier"] for source in pack["reference_report"]["sources"]] == [
         "core",
         "supporting",
@@ -298,7 +298,7 @@ def test_synthesis_pack_excludes_detection_rules_and_preserves_extraction() -> N
         _minimal_report(), extraction, {"https://core.example/report": "core"}
     )
 
-    assert pack["version"] == "5"
+    assert pack["version"] == "6"
     assert "detection_rules" not in pack["technical_extraction"]
     assert extraction.rules == (rule, unsupported)
     serialized = json.dumps(pack, ensure_ascii=False)
@@ -403,7 +403,7 @@ def test_synthesis_pack_keeps_all_visible_supported_items() -> None:
     )
 
     items = pack["technical_extraction"]["items"]
-    assert pack["version"] == "5"
+    assert pack["version"] == "6"
 
     assert len(items) == len(extraction.items)
 

@@ -144,7 +144,7 @@ REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
 
 # Functional content of the Q4 evidence pack. Bumped whenever what Q4 can read
 # changes, so a cached synthesis built on an older pack is never reused.
-SYNTHESIS_EVIDENCE_PACK_VERSION = "5"
+SYNTHESIS_EVIDENCE_PACK_VERSION = "6"
 
 # Keep archive reads within the same decoded-document limit as collection and
 # deterministic source processing. This is a local proof read, never prompt
@@ -472,7 +472,9 @@ def _repair_problem_descriptions(result: Any) -> list[str]:
             detail = f"{detail[:200]}…"
         described.append(f"{code}: {detail}" if detail else code)
     if described:
-        return list(dict.fromkeys(described))
+        # Chaque occurrence distincte doit rester visible : deux violations du
+        # même code portent sur deux valeurs différentes à réécrire.
+        return list(dict.fromkeys(described))[:12]
     return list(getattr(result, "errors", ()) or ())
 
 
@@ -3468,6 +3470,7 @@ class ProductionWorkflowOrchestrator:
         items explicitly kept out of publication.
         """
         items: list[dict[str, Any]] = []
+        seen_items: set[tuple[str, str, str]] = set()
         for item in extraction.items:
             if (
                 not item.supported
@@ -3475,13 +3478,25 @@ class ProductionWorkflowOrchestrator:
                 or item.display_policy.value == "hidden"
             ):
                 continue
+            # Le pack Q4 ne transporte jamais les libellés internes
+            # (`indicator_status`, `display_policy`) : le modèle les recopiait
+            # dans la prose, ce que la validation rejette ensuite.
+            dedup_key = (
+                item.category or "",
+                item.value.strip().casefold(),
+                item.artifact_type.value if item.artifact_type else "",
+            )
+            if dedup_key in seen_items:
+                continue
+            seen_items.add(dedup_key)
             published: dict[str, Any] = {
                 "category": item.category,
                 "value": item.value,
                 "context": item.context,
                 "source_ids": sorted(item.source_ids),
-                "indicator_status": item.indicator_status.value,
-                "display_policy": item.display_policy.value,
+                "is_confirmed_indicator": (
+                    item.indicator_status is IndicatorStatus.CONFIRMED_IOC
+                ),
                 "artifact_type": item.artifact_type.value if item.artifact_type else None,
             }
             items.append(published)

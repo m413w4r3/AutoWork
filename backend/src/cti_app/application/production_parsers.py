@@ -1212,6 +1212,18 @@ class SynthesisViolation:
     span: tuple[int, int] | None = None
 
 
+# Le modèle ne doit pas recopier les libellés internes du pack. Un mot isolé
+# ("hidden" dans `-WindowStyle Hidden`) est du contenu technique légitime :
+# seule la forme clé/valeur, ou le nom du champ lui-même, est un libellé.
+_INTERNAL_LABEL_PATTERN = re.compile(
+    r"(?:\b(?:display_policy|indicator_status|display\s+policy|indicator\s+status)\b"
+    r"|(?<![\w-])(?:excluded|hidden|not_applicable|body_only|ioc_section|confirmed_ioc)"
+    r"\s*(?:[:=]|\u00a0:)"
+    r"|[:=]\s*(?:excluded|hidden|not_applicable|body_only|ioc_section|confirmed_ioc)\b)",
+    re.IGNORECASE,
+)
+
+
 # Only kinds with a low false-positive rate in French prose. Bare IPv4 is
 # deliberately excluded: version numbers such as "4.2.1.3" match it.
 _SYNTHESIS_IOC_PATTERNS = {
@@ -1273,13 +1285,16 @@ def validate_synthesis(
         ("bold", re.compile(r"\*\*"), "Bold marker"),
         (
             "internal_display_label",
-            re.compile(r"\b(?:excluded|hidden)\b", re.IGNORECASE),
+            _INTERNAL_LABEL_PATTERN,
             "Internal publication label",
         ),
     )
     for code, pattern, detail in checks:
         for match in pattern.finditer(body):
-            reject(code, detail, match.span())
+            # Le tour de réparation a besoin du texte exact à réécrire, pas
+            # seulement du nom de la règle.
+            offending = " ".join(match.group(0).split())
+            reject(code, f"{detail}: {offending}" if offending else detail, match.span())
 
     if not isinstance(known_indicators, TechnicalExtraction):
         normalized_known = {value.strip().lower() for value in known_indicators}
