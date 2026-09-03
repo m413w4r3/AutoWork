@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime
 from types import TracebackType
 from uuid import UUID
 
@@ -24,12 +25,15 @@ class InMemoryModelRunRepository:
     async def get_for_update(self, run_id: UUID) -> ModelRun | None:
         return await self.get(run_id)
 
-    async def find_successful_q2_checkpoint(self, checkpoint_key: str) -> ModelRun | None:
+    async def find_successful_q2_checkpoint(
+        self, checkpoint_key: str, *, not_before: datetime | None = None
+    ) -> ModelRun | None:
         matches = [
             run
             for run in self._state.values()
             if run.status is ModelRunStatus.SUCCEEDED
             and checkpoint_key in run.parameters.get("q2_checkpoint_keys", [])
+            and (not_before is None or run.updated_at >= not_before)
         ]
         if not matches:
             return None

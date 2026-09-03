@@ -9,7 +9,7 @@ import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -139,7 +139,7 @@ Q2_ROUTING_POLICY_VERSION = "4"
 # Keep this separate from the routing policy so a model-policy change can
 # invalidate Q2 reuse without changing the live-web request format.
 Q2_MODEL_POLICY_VERSION = "openai-web-research-v1"
-Q2_SUCCESSFUL_CHECKPOINT_VERSION = "q2-run-local-v1"
+Q2_SUCCESSFUL_CHECKPOINT_VERSION = "q2-cross-run-v2"
 REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
 
 # Functional content of the Q4 evidence pack. Bumped whenever what Q4 can read
@@ -820,6 +820,7 @@ class ProductionWorkflowOrchestrator:
         seed_enrichment: VirusTotalSeedEnrichmentService | None = None,
         pacing: ProductionPacingPolicy | None = None,
         blob_reader: BlobContentReader | None = None,
+        q2_reuse_max_age_days: float = 14.0,
     ) -> None:
         self._uow_factory = uow_factory
         # The collection service owns the canonical blob catalog used for
@@ -846,6 +847,7 @@ class ProductionWorkflowOrchestrator:
         self._qa = ProductionQAService(production_uow_factory)
         self._seed_enrichment = seed_enrichment
         self._pacing = pacing or ProductionPacingPolicy.zero()
+        self._q2_reuse_max_age_days = q2_reuse_max_age_days
 
     async def _check_cancellation(self, run_id: UUID, context: JobExecutionContext | None) -> None:
         """Fence both the job cancellation flag and the persistent run state."""
@@ -1798,13 +1800,22 @@ class ProductionWorkflowOrchestrator:
                 "model_calls_avoided": model_calls_avoided,
             }
 
+        reuse_max_age_days = float(
+            getattr(self, "_q2_reuse_max_age_days", 14.0)
+        )
+        q2_reuse_not_before = (
+            datetime.now(UTC) - timedelta(days=reuse_max_age_days)
+            if reuse_max_age_days > 0
+            else None
+        )
+
         async def find_q2_checkpoint(checkpoint_key: str) -> Any | None:
             async with self._uow_factory() as uow:
                 model_runs = getattr(uow, "model_runs", None)
                 finder = getattr(model_runs, "find_successful_q2_checkpoint", None)
                 if finder is None:
                     return None
-                checkpoint = await finder(checkpoint_key)
+                checkpoint = await finder(checkpoint_key, not_before=q2_reuse_not_before)
                 if checkpoint is None or checkpoint.status is not ModelRunStatus.SUCCEEDED:
                     return None
                 return checkpoint
@@ -1846,9 +1857,6 @@ class ProductionWorkflowOrchestrator:
                 if work.source_content_sha256 is None:
                     raise ValueError("Archive fallback checkpoints require a source hash")
                 return _q2_archive_fallback_checkpoint_key(
-                    production_run_id=run.id,
-                    pipeline_generation=run.pipeline_generation,
-                    source_id=work.source.local_id,
                     canonical_url=work.source.canonical_url,
                     source_content_sha256=work.source_content_sha256,
                     profile=work.plan.profile,
@@ -1864,7 +1872,6 @@ class ProductionWorkflowOrchestrator:
                 prompt_version = EXTRACTION_PROMPT_VERSION_BY_PROFILE[work.plan.profile]
                 batch_parser_version = None
             return _q2_checkpoint_key(
-                production_run_id=run.id,
                 canonical_url=work.source.canonical_url,
                 profile=work.plan.profile,
                 prompt_version=prompt_version,
@@ -3836,7 +3843,6 @@ class ProductionWorkflowOrchestrator:
 
 def _q2_checkpoint_key(
     *,
-    production_run_id: UUID,
     canonical_url: str,
     profile: ExtractionProfile,
     prompt_version: str,
@@ -3846,13 +3852,14 @@ def _q2_checkpoint_key(
 ) -> str:
     """Return the identity of a reusable successful Q2 source response.
 
-    This is deliberately run-local and contains no archived-content hash. A
-    batch response carries one key for every source it was asked to process;
-    the parser decides which of those source results actually succeeded.
+    The identity is deliberately cross-run: the same canonical URL extracted
+    with the same profile, contract and prompt versions yields the same
+    result. Freshness is bounded at lookup time, not in the key. A batch
+    response carries one key for every source it was asked to process; the
+    parser decides which of those source results actually succeeded.
     """
     identity = {
         "checkpoint_version": Q2_SUCCESSFUL_CHECKPOINT_VERSION,
-        "production_run_id": str(production_run_id),
         "canonical_url": canonical_url,
         "profile": profile.value,
         "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
@@ -3902,9 +3909,6 @@ def _q2_source_model_run_id(
 
 def _q2_archive_fallback_identity(
     *,
-    production_run_id: UUID,
-    pipeline_generation: int,
-    source_id: str,
     canonical_url: str,
     source_content_sha256: str,
     profile: ExtractionProfile,
@@ -3914,9 +3918,6 @@ def _q2_archive_fallback_identity(
     """Return the complete functional identity of an archive fallback."""
     return {
         "access_mode": "archive_fallback",
-        "production_run_id": str(production_run_id),
-        "pipeline_generation": pipeline_generation,
-        "source_id": source_id,
         "canonical_url": canonical_url,
         "source_content_sha256": source_content_sha256,
         "profile": profile.value,
@@ -3934,6 +3935,32 @@ def _q2_archive_fallback_identity(
     }
 
 
+def _q2_archive_fallback_run_identity(
+    *,
+    production_run_id: UUID,
+    pipeline_generation: int,
+    source_id: str,
+    canonical_url: str,
+    source_content_sha256: str,
+    profile: ExtractionProfile,
+    provider: ModelProvider,
+    requested_model: str,
+) -> dict[str, Any]:
+    """Return the run-local identity used for archive ModelRun IDs."""
+    return {
+        "production_run_id": str(production_run_id),
+        "pipeline_generation": pipeline_generation,
+        "source_id": source_id,
+        **_q2_archive_fallback_identity(
+            canonical_url=canonical_url,
+            source_content_sha256=source_content_sha256,
+            profile=profile,
+            provider=provider,
+            requested_model=requested_model,
+        ),
+    }
+
+
 def _q2_archive_fallback_model_run_id(
     *,
     production_run_id: UUID,
@@ -3947,7 +3974,7 @@ def _q2_archive_fallback_model_run_id(
 ) -> UUID:
     """Return an ID that can never collide with the live URL ModelRun."""
     identity = json.dumps(
-        _q2_archive_fallback_identity(
+        _q2_archive_fallback_run_identity(
             production_run_id=production_run_id,
             pipeline_generation=pipeline_generation,
             source_id=source_id,
@@ -3965,9 +3992,6 @@ def _q2_archive_fallback_model_run_id(
 
 def _q2_archive_fallback_checkpoint_key(
     *,
-    production_run_id: UUID,
-    pipeline_generation: int,
-    source_id: str,
     canonical_url: str,
     source_content_sha256: str,
     profile: ExtractionProfile,
@@ -3976,9 +4000,6 @@ def _q2_archive_fallback_checkpoint_key(
 ) -> str:
     """Return the reusable checkpoint key for one exact archived capture."""
     identity = _q2_archive_fallback_identity(
-        production_run_id=production_run_id,
-        pipeline_generation=pipeline_generation,
-        source_id=source_id,
         canonical_url=canonical_url,
         source_content_sha256=source_content_sha256,
         profile=profile,

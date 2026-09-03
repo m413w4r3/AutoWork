@@ -989,9 +989,7 @@ async def test_q2_batch_outputs_keep_exact_url_batch_and_source_identity(
 def test_checkpoint_identity_is_content_profile_contract_and_access_mode_scoped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run_id = UUID("00000000-0000-0000-0000-000000000010")
     common = {
-        "production_run_id": run_id,
         "canonical_url": "https://invariants.test/source-1",
         "profile": ExtractionProfile.FULL,
         "prompt_version": "q2-prompt",
@@ -1008,9 +1006,6 @@ def test_checkpoint_identity_is_content_profile_contract_and_access_mode_scoped(
     assert _q2_checkpoint_key(**common) != live
 
     archive = _q2_archive_fallback_checkpoint_key(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
         canonical_url=common["canonical_url"],
         source_content_sha256="a" * 64,
         profile=common["profile"],
@@ -1018,9 +1013,6 @@ def test_checkpoint_identity_is_content_profile_contract_and_access_mode_scoped(
         requested_model="invariant-model",
     )
     changed_content = _q2_archive_fallback_checkpoint_key(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
         canonical_url=common["canonical_url"],
         source_content_sha256="b" * 64,
         profile=common["profile"],
@@ -1028,9 +1020,6 @@ def test_checkpoint_identity_is_content_profile_contract_and_access_mode_scoped(
         requested_model="invariant-model",
     )
     changed_profile = _q2_archive_fallback_checkpoint_key(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
         canonical_url=common["canonical_url"],
         source_content_sha256="a" * 64,
         profile=ExtractionProfile.IOC_RULES,

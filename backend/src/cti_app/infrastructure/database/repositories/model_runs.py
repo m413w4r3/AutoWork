@@ -1,3 +1,4 @@
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import select
@@ -36,13 +37,18 @@ class SqlAlchemyModelRunRepository:
         )
         return _model_run_from_row(row) if row else None
 
-    async def find_successful_q2_checkpoint(self, checkpoint_key: str) -> ModelRun | None:
+    async def find_successful_q2_checkpoint(
+        self, checkpoint_key: str, *, not_before: datetime | None = None
+    ) -> ModelRun | None:
+        conditions = [
+            ModelRunRow.status == ModelRunStatus.SUCCEEDED.value,
+            ModelRunRow.parameters.contains({"q2_checkpoint_keys": [checkpoint_key]}),
+        ]
+        if not_before is not None:
+            conditions.append(ModelRunRow.updated_at >= not_before)
         row = await self._session.scalar(
             select(ModelRunRow)
-            .where(
-                ModelRunRow.status == ModelRunStatus.SUCCEEDED.value,
-                ModelRunRow.parameters.contains({"q2_checkpoint_keys": [checkpoint_key]}),
-            )
+            .where(*conditions)
             .order_by(ModelRunRow.updated_at.desc(), ModelRunRow.id.desc())
             .limit(1)
         )

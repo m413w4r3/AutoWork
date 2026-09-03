@@ -1,6 +1,6 @@
 import hashlib
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -118,7 +118,6 @@ def test_archive_fallback_identity_is_distinct_from_live_checkpoint() -> None:
         profile=production_workflow.ExtractionProfile.FULL,
     )
     live_key = _q2_checkpoint_key(
-        production_run_id=run_id,
         canonical_url="https://example.test/report",
         profile=production_workflow.ExtractionProfile.FULL,
         prompt_version="18",
@@ -127,9 +126,6 @@ def test_archive_fallback_identity_is_distinct_from_live_checkpoint() -> None:
         requested_model="unknown",
     )
     archive_key = _q2_archive_fallback_checkpoint_key(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
         canonical_url="https://example.test/report",
         source_content_sha256="a" * 64,
         profile=production_workflow.ExtractionProfile.FULL,
@@ -875,6 +871,81 @@ async def test_manual_extraction_retry_reuses_successful_full_source(
     assert second["cache_hits"] == 1
     assert second["model_calls"] == 0
     assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_q2_checkpoint_is_reused_by_another_production_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeModelAdapter(research_text="FACT malware\n- ExampleRAT\n")
+    gateway, model_uow = _persistent_q2_gateway(adapter)
+    report = _q2_report(1)
+    snapshot = _q2_snapshot()
+
+    first_orchestrator, first_run, _ = _q2_orchestrator(
+        monkeypatch,
+        gateway,
+        report,
+        model_run_state=model_uow.state,
+    )
+    first = await first_orchestrator._execute_direct_url_extraction(
+        first_run, snapshot=snapshot
+    )
+
+    second_orchestrator, second_run, _ = _q2_orchestrator(
+        monkeypatch,
+        gateway,
+        report,
+        model_run_state=model_uow.state,
+    )
+    second = await second_orchestrator._execute_direct_url_extraction(
+        second_run, snapshot=snapshot
+    )
+
+    assert first["status"] == "success", first
+    assert second["status"] == "success", second
+    assert second["cache_hits"] == 1
+    assert second["model_calls"] == 0
+    assert len(adapter.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_q2_checkpoint_reuse_excludes_stale_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeModelAdapter(research_text="FACT malware\n- ExampleRAT\n")
+    gateway, model_uow = _persistent_q2_gateway(adapter)
+    report = _q2_report(1)
+    snapshot = _q2_snapshot()
+
+    first_orchestrator, first_run, _ = _q2_orchestrator(
+        monkeypatch,
+        gateway,
+        report,
+        model_run_state=model_uow.state,
+    )
+    first = await first_orchestrator._execute_direct_url_extraction(
+        first_run, snapshot=snapshot
+    )
+    assert first["status"] == "success", first
+
+    stored_run = next(iter(model_uow.state.values()))
+    stored_run.updated_at = datetime.now(UTC) - timedelta(days=15)
+
+    second_orchestrator, second_run, _ = _q2_orchestrator(
+        monkeypatch,
+        gateway,
+        report,
+        model_run_state=model_uow.state,
+    )
+    second = await second_orchestrator._execute_direct_url_extraction(
+        second_run, snapshot=snapshot
+    )
+
+    assert second["status"] == "success", second
+    assert second["cache_hits"] == 0
+    assert second["model_calls"] == 1
+    assert len(adapter.calls) == 2
 
 
 @pytest.mark.asyncio
