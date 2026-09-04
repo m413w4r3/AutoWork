@@ -17,6 +17,15 @@ export type ProductionRepairIssueKind =
 export type ProductionRepairAction =
   "include" | "exclude" | "continue_without_source";
 
+/**
+ * Durable state of a Q1 proposal missing from the current canonical
+ * ReferenceReport. `archived_pending_references` means the analyst already
+ * supplied the content and only the deterministic rebuild is missing: the
+ * backend keeps that debt, so a refresh can never erase it.
+ */
+export type SupplementalSourceRepairState =
+  "unarchived" | "collection_missing" | "archived_pending_references";
+
 export type AssemblyJobStatus =
   "queued" | "running" | "waiting_human" | "succeeded" | "failed" | "cancelled";
 
@@ -90,6 +99,7 @@ export interface EditionReview {
   can_accept: boolean;
   unresolved_repair_count?: number;
   repair_review_complete?: boolean;
+  pending_rebuild_count?: number;
 }
 
 export interface ProductionRepairDecision {
@@ -128,6 +138,7 @@ export interface EditionRepairItem {
   resolution_reason: string | null;
   rebuild_required: boolean;
   recommended_stage: string | null;
+  repair_state?: SupplementalSourceRepairState | null;
   is_publication_ioc: boolean;
   /** False when the analyst excluded the article from the deliverable. */
   in_publication_scope?: boolean;
@@ -176,7 +187,18 @@ export interface EditionRepairDetail {
   body?: string | null;
   collection_id?: string | null;
   collection_state?: string | null;
+  repair_state?: SupplementalSourceRepairState | null;
+  rebuild_required?: boolean;
+  recommended_action?: string | null;
   effective_decision?: ProductionRepairDecision | null;
+}
+
+export interface EditionRepairSourcePreparation {
+  repair_key: string;
+  subject_id: string;
+  collection_id: string;
+  collection_state: string;
+  source_url: string;
 }
 
 export interface EditionRepairDecisionResponse {
@@ -315,6 +337,17 @@ export function decideEditionRepair(
       observed_pipeline_generation: input.observedPipelineGeneration,
       ...(input.reason?.trim() ? { reason: input.reason.trim() } : {}),
     }),
+  );
+}
+
+/** Create or return the SourceCollection matching one raw Q1 proposal. */
+export function prepareEditionRepairSource(
+  editionId: string,
+  repairKey: string,
+): Promise<EditionRepairSourcePreparation> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/review/repairs/${encodeURIComponent(repairKey)}/source`,
+    { method: "POST" },
   );
 }
 

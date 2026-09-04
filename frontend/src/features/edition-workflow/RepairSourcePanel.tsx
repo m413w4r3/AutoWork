@@ -1,25 +1,31 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import {
   archiveManualSourceContent,
   getSubjectWorkbench,
 } from "../../api/collection";
-import type { EditionRepairDetail } from "../../api/publication";
+import {
+  prepareEditionRepairSource,
+  type EditionRepairDetail,
+} from "../../api/publication";
 
 export function RepairSourcePanel({
+  editionId,
   subjectId,
   detail,
   readOnly,
   resolved,
   onArchived,
 }: {
+  editionId: string;
   subjectId: string;
   detail: EditionRepairDetail;
   readOnly: boolean;
   resolved: boolean;
   onArchived: () => void;
 }) {
+  const queryClient = useQueryClient();
   const [file, setFile] = useState<File | null>(null);
   const [content, setContent] = useState("");
   const [mimeType, setMimeType] = useState("text/html");
@@ -32,6 +38,29 @@ export function RepairSourcePanel({
   const source = sourceQuery.data?.sources.find(
     (candidate) => candidate.id === detail.collection_id,
   );
+  // The backend owns the state: `archived_pending_references` means the
+  // content exists and only the deterministic REFERENCES rebuild is missing.
+  const repairState = detail.repair_state ?? null;
+  const pendingReferences = repairState === "archived_pending_references";
+  const collectionMissing =
+    repairState === "collection_missing" || !detail.collection_id;
+
+  const prepare = useMutation({
+    mutationFn: () => prepareEditionRepairSource(editionId, detail.repair_key),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: ["edition-repair-detail", editionId, detail.repair_key],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["edition-repair", editionId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["subject-workbench", subjectId],
+      });
+    },
+  });
+
   const archive = useMutation({
     mutationFn: () => {
       if (!detail.collection_id) {
@@ -64,6 +93,7 @@ export function RepairSourcePanel({
   const publisher = detail.publisher ?? source?.publisher ?? null;
   const title = detail.source_title ?? source?.title ?? "Source proposée";
   const url = detail.source_url ?? source?.requested_url ?? null;
+  const canUpload = !readOnly && !resolved && !collectionMissing;
 
   return (
     <section
@@ -94,9 +124,50 @@ export function RepairSourcePanel({
             )}
           </dd>
         </div>
+        <div>
+          <dt>État</dt>
+          <dd>
+            {collectionMissing
+              ? "source non attachée"
+              : pendingReferences
+                ? "archivée — références à reconstruire"
+                : "non archivée"}
+          </dd>
+        </div>
       </dl>
-      <p>Le collecteur n&apos;a pas pu l&apos;archiver.</p>
-      {!readOnly && !resolved ? (
+
+      {collectionMissing ? (
+        <>
+          <p>
+            Cette source proposée par Q1 n&apos;a jamais reçu de collecte. Elle
+            doit être attachée avant de pouvoir recevoir un contenu.
+          </p>
+          {!readOnly ? (
+            <button
+              className="button"
+              type="button"
+              disabled={prepare.isPending}
+              onClick={() => prepare.mutate()}
+            >
+              {prepare.isPending ? "Préparation…" : "Préparer cette source"}
+            </button>
+          ) : null}
+          {prepare.error ? (
+            <p className="error-message" role="alert">
+              La source n&apos;a pas pu être préparée : {prepare.error.message}
+            </p>
+          ) : null}
+        </>
+      ) : pendingReferences ? (
+        <p className="repair-source-panel__success" role="status">
+          Contenu archivé. Reconstruisez cet article pour réintégrer la source
+          dans les références.
+        </p>
+      ) : (
+        <p>Le collecteur n&apos;a pas pu l&apos;archiver.</p>
+      )}
+
+      {canUpload ? (
         <form
           className="repair-source-panel__form"
           onSubmit={(event) => {

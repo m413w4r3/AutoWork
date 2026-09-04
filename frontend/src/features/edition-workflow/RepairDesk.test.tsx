@@ -526,9 +526,7 @@ describe("Repair Desk", () => {
     expect(bodyNodes).toHaveLength(1);
     expect(bodyNodes[0]?.closest(".repair-rule-panel__body")).not.toBeNull();
     expect(screen.getByText("Extrait")).toBeInTheDocument();
-    expect(
-      screen.getByText("Corps intégral ci-dessous."),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Corps intégral ci-dessous.")).toBeInTheDocument();
   });
 
   it("permet d’atteindre la page suivante", async () => {

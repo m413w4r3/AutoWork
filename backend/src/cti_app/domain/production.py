@@ -41,6 +41,20 @@ class ProductionRepairIssueKind(StrEnum):
     SUPPLEMENTAL_SOURCE_UNARCHIVED = "supplemental_source_unarchived"
 
 
+class SupplementalSourceRepairState(StrEnum):
+    """Durable state of a Q1 proposal absent from the current REFERENCES.
+
+    The state is derived, never stored: it answers "what is still missing for
+    this proposal to be back in the canonical report?".  ``ARCHIVED`` alone is
+    not a terminal situation -- the content exists but the deterministic
+    reconciliation has not run yet, so the debt must survive a page reload.
+    """
+
+    UNARCHIVED = "unarchived"
+    COLLECTION_MISSING = "collection_missing"
+    ARCHIVED_PENDING_REFERENCES = "archived_pending_references"
+
+
 class ProductionRepairAction(StrEnum):
     """Append-only actions available for a production repair issue."""
 

@@ -214,6 +214,7 @@ export function RepairIssueInspector({
 
       {item.kind === "supplemental_source_unarchived" && currentDetail ? (
         <RepairSourcePanel
+          editionId={editionId}
           subjectId={item.subject_id}
           detail={currentDetail}
           readOnly={readOnly}

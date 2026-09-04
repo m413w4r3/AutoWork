@@ -4,7 +4,7 @@ import hashlib
 import logging
 import time
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -290,6 +290,42 @@ class SubjectCollectionService:
                     added.append(collection)
             await uow.commit()
         return added
+
+    async def ensure_supplemental_source(
+        self, subject_id: UUID, source: SupplementalSource
+    ) -> SourceCollection:
+        """Return the collection for one Q1 proposal, creating it if needed.
+
+        Q1 can propose a publication the collection pass never registered, which
+        leaves the Repair Desk with a source it cannot attach any content to.
+        This is the idempotent command that closes that gap: it reuses
+        ``add_supplemental_sources`` for the creation, so a prepared source is
+        indistinguishable from one the reference research attached itself, and
+        it contacts no model and no network.
+        """
+        try:
+            canonical = canonicalize_http_url(source.url)
+        except ValueError as exc:
+            raise CollectionNotAllowedError("Source URL cannot be canonicalized") from exc
+
+        async with self._uow_factory() as uow:
+            existing = await uow.source_collections.get_by_canonical_url(
+                subject_id, canonical
+            )
+        if existing is not None:
+            return existing
+
+        await self.add_supplemental_sources(
+            subject_id, [replace(source, url=canonical)]
+        )
+
+        async with self._uow_factory() as uow:
+            created = await uow.source_collections.get_by_canonical_url(
+                subject_id, canonical
+            )
+        if created is None:
+            raise CollectionNotAllowedError("The proposed source could not be attached")
+        return created
 
     async def add_referenced_evidence(
         self,

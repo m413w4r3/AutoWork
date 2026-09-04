@@ -50,6 +50,7 @@ from cti_app.domain.production import (
     ProductionRepairDecision,
     ProductionRepairIssueKind,
     SubjectProductionStatus,
+    SupplementalSourceRepairState,
 )
 from cti_app.domain.publication import ArtifactType, is_publication_ioc_artifact_type
 
@@ -486,7 +487,15 @@ class ProductionRepairIssueDetail:
 
 @dataclass(frozen=True, slots=True)
 class SupplementalSourceRepairIssue:
-    """A Q1 source proposal that still lacks an archived collection."""
+    """A Q1 source proposal absent from the CURRENT canonical ReferenceReport.
+
+    The issue lives until one of two terminal situations is true: the analyst
+    waived the source with ``continue_without_source`` while it stays
+    unarchived, or a new REFERENCES version actually put its URL back in the
+    canonical report.  Archiving alone only moves it to
+    ``ARCHIVED_PENDING_REFERENCES`` -- a rebuild debt that no longer needs an
+    arbitration but must never be forgotten.
+    """
 
     repair_key: str
     kind: ProductionRepairIssueKind
@@ -494,14 +503,18 @@ class SupplementalSourceRepairIssue:
     source_title: str
     source_url: str
     publisher: str | None
-    collection_id: UUID
-    collection_state: str
+    collection_id: UUID | None
+    collection_state: str | None
     error_reason: str | None
     attempt_count: int
     production_run_id: UUID
     observed_artifact_id: UUID
     observed_artifact_version: int
     observed_pipeline_generation: int
+    repair_state: SupplementalSourceRepairState = (
+        SupplementalSourceRepairState.UNARCHIVED
+    )
+    rebuild_required: bool = False
     effective_decision: ProductionRepairDecision | None = None
     recommended_action: str = "archive_manual_content"
     subject_id: UUID | None = None
@@ -661,14 +674,15 @@ class ProductionRepairIssueService:
                 if not source_url or source_url in canonical_urls:
                     continue
                 collection = collections_by_url.get(source_url)
-                if collection is None or _is_archived_collection(collection):
-                    continue
                 repair_key = repair_key_for_supplemental_source(
                     edition_id=edition_id,
                     subject_id=run.subject_id,
                     source_url=source_url,
                 )
                 decision = decisions_by_key.get((run.subject_id, repair_key))
+                repair_state, recommended_action = _supplemental_repair_state(
+                    collection, decision
+                )
                 issues.append(
                     SupplementalSourceRepairIssue(
                         repair_key=repair_key,
@@ -681,21 +695,29 @@ class ProductionRepairIssueService:
                             if source.get("publisher") is not None
                             else None
                         ),
-                        collection_id=collection.id,
-                        collection_state=_enum_value(getattr(collection, "state", "")),
+                        collection_id=(
+                            getattr(collection, "id", None)
+                            if collection is not None
+                            else None
+                        ),
+                        collection_state=(
+                            _enum_value(getattr(collection, "state", None))
+                            if collection is not None
+                            else None
+                        ),
                         error_reason=getattr(collection, "error_reason", None),
-                        attempt_count=int(getattr(collection, "attempt_count", 0)),
+                        attempt_count=int(getattr(collection, "attempt_count", 0) or 0),
                         production_run_id=run.id,
                         observed_artifact_id=artifact.id,
                         observed_artifact_version=artifact.version,
                         observed_pipeline_generation=run.pipeline_generation,
-                        effective_decision=decision,
-                        recommended_action=(
-                            "continue_without_source"
-                            if decision is not None
-                            and decision.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
-                            else "archive_manual_content"
+                        repair_state=repair_state,
+                        rebuild_required=(
+                            repair_state
+                            is SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES
                         ),
+                        effective_decision=decision,
+                        recommended_action=recommended_action,
                         subject_id=run.subject_id,
                     )
                 )
@@ -1461,6 +1483,31 @@ def _effective_from_history(
 
 def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
+
+
+def _supplemental_repair_state(
+    collection: Any, decision: ProductionRepairDecision | None
+) -> tuple[SupplementalSourceRepairState, str]:
+    """Derive the durable state of a Q1 proposal missing from the canonical.
+
+    Archiving wins over an older waiver on purpose: the analyst supplying the
+    content is a newer fact than the decision to publish without it, and the
+    reconciliation must be allowed to put the source back.  The waiver itself
+    is never rewritten; it stays in the append-only audit.
+    """
+    if collection is None:
+        return SupplementalSourceRepairState.COLLECTION_MISSING, "prepare_source"
+    if _is_archived_collection(collection):
+        return (
+            SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES,
+            "rebuild_references",
+        )
+    if (
+        decision is not None
+        and decision.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
+    ):
+        return SupplementalSourceRepairState.UNARCHIVED, "continue_without_source"
+    return SupplementalSourceRepairState.UNARCHIVED, "archive_manual_content"
 
 
 def _is_archived_collection(collection: Any) -> bool:

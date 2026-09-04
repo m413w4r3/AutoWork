@@ -23,6 +23,8 @@ export function repairKindLabel(item: EditionRepairItem): string {
 export function repairStatusLabel(item: EditionRepairItem): string {
   if (item.rebuild_required && item.resolved) return "À reconstruire";
   if (!item.resolved) {
+    if (item.repair_state === "collection_missing")
+      return "Source non attachée";
     return item.kind === "supplemental_source_unarchived"
       ? "Source à fournir"
       : "À arbitrer";

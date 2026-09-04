@@ -16,6 +16,7 @@ from cti_app.domain.production import (
     ProductionSubmissionReconciliation,
     SubjectProductionStage,
     SubjectProductionStatus,
+    SupplementalSourceRepairState,
     requires_submission_reconciliation,
 )
 from cti_app.domain.publication_review import (
@@ -122,6 +123,7 @@ class EditionReviewItem:
     published_rule_count: int = 0
     active_repair_count: int = 0
     unresolved_repair_count: int = 0
+    pending_rebuild_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +133,10 @@ class EditionReview:
     can_accept: bool
     unresolved_repair_count: int = 0
     repair_review_complete: bool = True
+    # Repairs whose content exists but whose article was not rebuilt yet.
+    # Sign-off is refused while this is non-zero, so no manifest can be frozen
+    # between a manual archive and the REFERENCES version that reintegrates it.
+    pending_rebuild_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +168,8 @@ class EditionRepairItem:
     resolution_reason: str | None
     rebuild_required: bool
     recommended_stage: str | None
+    # Only carried by supplemental-source issues; ``None`` for Q2 rejections.
+    repair_state: str | None = None
     is_publication_ioc: bool = False
     # False when the analyst excluded this article from the deliverable: the
     # issue stays visible and arbitrable, but it is not a loss for the
@@ -337,8 +345,11 @@ class EditionRepairReadService:
             return None
         kind = _issue_kind(issue)
         decision = getattr(issue, "effective_decision", None)
-        resolved = decision is not None
         is_source = kind == ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value
+        pending_references = _issue_pending_references(issue)
+        # An archived source no longer needs an arbitration: what it owes the
+        # edition is a REFERENCES reconciliation, tracked as a rebuild debt.
+        resolved = decision is not None or pending_references
         is_ioc = bool(getattr(issue, "is_publication_ioc", False))
         repair_key = str(issue.repair_key)
         source_id = getattr(issue, "source_id", None)
@@ -350,7 +361,13 @@ class EditionRepairReadService:
         artifact_id = getattr(issue, "observed_artifact_id", None)
         artifact_version = getattr(issue, "observed_artifact_version", None)
         projection_applied = bool(getattr(issue, "projection_applied", False))
-        if is_source:
+        if is_source and pending_references:
+            # The content exists; only the deterministic REFERENCES rebuild is
+            # missing. This debt is served by the backend, so a page reload
+            # cannot lose it.
+            rebuild_required = True
+            recommended_stage = "rebuild_references"
+        elif is_source:
             rebuild_required = False
             # The source still needs an explicit archive/waive decision before
             # the deterministic REFERENCES reconciliation can run.
@@ -412,8 +429,15 @@ class EditionRepairReadService:
                 else None
             ),
             effective_decision_id=getattr(decision, "id", None),
+            repair_state=_issue_repair_state(issue),
             resolved=resolved,
-            resolution_reason=(getattr(decision, "reason", None) if decision else None),
+            resolution_reason=(
+                getattr(decision, "reason", None)
+                if decision is not None
+                else "source_archived_pending_references"
+                if pending_references
+                else None
+            ),
             rebuild_required=rebuild_required,
             recommended_stage=recommended_stage,
             is_publication_ioc=is_ioc,
@@ -424,6 +448,26 @@ class EditionRepairReadService:
 def _issue_kind(issue: Any) -> str:
     value = getattr(issue, "kind", "")
     return str(getattr(value, "value", value))
+
+
+def _issue_repair_state(issue: Any) -> str | None:
+    value = getattr(issue, "repair_state", None)
+    if value is None:
+        return None
+    return str(getattr(value, "value", value))
+
+
+def _issue_pending_references(issue: Any) -> bool:
+    """True when the source is archived but REFERENCES has not caught up.
+
+    This is the single backend definition of the rebuild debt: the Repair Desk
+    read model, the review sign-off rule and the publication freeze all use it,
+    so no client-side state can make the debt disappear.
+    """
+    return (
+        _issue_repair_state(issue)
+        == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES.value
+    )
 
 
 def _issue_subject(issue: Any) -> UUID | None:
@@ -602,15 +646,22 @@ class EditionReviewService:
             for item in items
             if item.effective_decision is not PublicationDecision.EXCLUDE
         )
+        pending_rebuild_count = sum(
+            item.pending_rebuild_count
+            for item in items
+            if item.effective_decision is not PublicationDecision.EXCLUDE
+        )
         return EditionReview(
             edition_id=edition_id,
             items=items,
             can_accept=bool(items)
             and any(item.included for item in items)
             and all(not item.blocking for item in items)
-            and unresolved_repair_count == 0,
+            and unresolved_repair_count == 0
+            and pending_rebuild_count == 0,
             unresolved_repair_count=unresolved_repair_count,
             repair_review_complete=unresolved_repair_count == 0,
+            pending_rebuild_count=pending_rebuild_count,
         )
 
     async def _repair_issues(self, edition_id: UUID) -> tuple[Any, ...]:
@@ -787,6 +838,9 @@ def _build_item(row: EditionReviewReadItem, repair_issues: Sequence[Any] = ()) -
         _repair_issue_is_actionable(issue) and not _repair_issue_resolved(issue)
         for issue in repair_issues
     )
+    pending_rebuild_count = sum(
+        _issue_pending_references(issue) for issue in repair_issues
+    )
     return EditionReviewItem(
         position=row.position,
         subject_id=row.subject_id,
@@ -817,6 +871,7 @@ def _build_item(row: EditionReviewReadItem, repair_issues: Sequence[Any] = ()) -
         published_rule_count=row.published_rule_count,
         active_repair_count=active_repair_count,
         unresolved_repair_count=unresolved_repair_count,
+        pending_rebuild_count=pending_rebuild_count,
     )
 
 
@@ -832,7 +887,12 @@ def _repair_issue_is_actionable(issue: Any) -> bool:
 
 
 def _repair_issue_resolved(issue: Any) -> bool:
-    return getattr(issue, "effective_decision", None) is not None
+    # An archived source has nothing left to arbitrate; its remaining debt is
+    # counted by ``pending_rebuild_count`` instead.
+    return (
+        getattr(issue, "effective_decision", None) is not None
+        or _issue_pending_references(issue)
+    )
 
 
 def _validate_document_identity(

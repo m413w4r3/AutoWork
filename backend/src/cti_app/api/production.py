@@ -413,8 +413,14 @@ def _supplemental_repair_issue_view(issue: Any) -> dict[str, Any]:
         "source_title": issue.source_title,
         "source_url": issue.source_url,
         "publisher": issue.publisher,
-        "collection_id": str(issue.collection_id),
+        "collection_id": (
+            str(issue.collection_id) if issue.collection_id is not None else None
+        ),
         "collection_state": issue.collection_state,
+        "repair_state": getattr(
+            getattr(issue, "repair_state", None), "value", getattr(issue, "repair_state", None)
+        ),
+        "rebuild_required": bool(getattr(issue, "rebuild_required", False)),
         "error_reason": issue.error_reason,
         "attempt_count": issue.attempt_count,
         "production_run_id": str(issue.production_run_id),

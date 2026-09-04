@@ -77,6 +77,12 @@ export function ReviewConsole({
   const currentReview = review.data;
   const unresolvedRepairCount =
     currentReview.unresolved_repair_count ?? repairSummary.unresolved_total;
+  // The backend owns the rebuild debt (LOT 24): an archived source waiting for
+  // its REFERENCES reconciliation keeps blocking sign-off across a refresh.
+  const pendingRebuildCount = Math.max(
+    currentReview.pending_rebuild_count ?? 0,
+    repairSummary.articles_needing_rebuild,
+  );
   const repairSummaryEntries: ReadonlyArray<readonly [number, string, string]> =
     [
       [repairSummary.rejected_iocs_to_review, "IOC", "IOC"],
@@ -98,7 +104,7 @@ export function ReviewConsole({
     (readOnly || repairSummaryLoaded) &&
     currentReview.can_accept &&
     unresolvedRepairCount === 0 &&
-    repairSummary.articles_needing_rebuild === 0;
+    pendingRebuildCount === 0;
 
   return (
     <section
@@ -131,8 +137,8 @@ export function ReviewConsole({
                 ? "Chargement du résumé de réparation…"
                 : unresolvedRepairCount > 0
                   ? `La revue technique n’est pas terminée : ${unresolvedMessage}`
-                  : repairSummary.articles_needing_rebuild > 0
-                    ? `${repairSummary.articles_needing_rebuild} article${repairSummary.articles_needing_rebuild > 1 ? "s" : ""} ${repairSummary.articles_needing_rebuild > 1 ? "doivent" : "doit"} être reconstruit${repairSummary.articles_needing_rebuild > 1 ? "s" : ""} avant finalisation.`
+                  : pendingRebuildCount > 0
+                    ? `${pendingRebuildCount} article${pendingRebuildCount > 1 ? "s" : ""} ${pendingRebuildCount > 1 ? "doivent" : "doit"} être reconstruit${pendingRebuildCount > 1 ? "s" : ""} avant finalisation.`
                     : canAccept
                       ? "L’assemblage final sera activé à l’étape de publication."
                       : "Résolvez ou excluez les articles bloquants."}

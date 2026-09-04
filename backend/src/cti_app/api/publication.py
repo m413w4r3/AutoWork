@@ -14,6 +14,8 @@ from cti_app.api.production import (
     _retry_production_run,
     reconciliation_view,
 )
+from cti_app.application.collection import SupplementalSource
+from cti_app.application.collection_errors import CollectionNotAllowedError
 from cti_app.application.edition_publication import (
     EditionPublicationService,
     EditionReleaseStatus,
@@ -124,6 +126,7 @@ class ReviewItemView(BaseModel):
     published_rule_count: int = 0
     active_repair_count: int = 0
     unresolved_repair_count: int = 0
+    pending_rebuild_count: int = 0
     # The frontend must never infer the retry policy from an error message:
     # ``can_retry`` and ``requires_reconciliation`` are mutually exclusive and
     # each names exactly one operator action.
@@ -139,6 +142,7 @@ class EditionReviewView(BaseModel):
     can_accept: bool
     unresolved_repair_count: int = 0
     repair_review_complete: bool = True
+    pending_rebuild_count: int = 0
 
 
 class EditionRepairDecisionRequest(BaseModel):
@@ -204,6 +208,7 @@ class EditionRepairItemView(BaseModel):
     resolution_reason: str | None
     rebuild_required: bool
     recommended_stage: str | None
+    repair_state: str | None = None
     is_publication_ioc: bool
     in_publication_scope: bool = True
 
@@ -552,8 +557,24 @@ async def get_edition_review_repair_detail(
             "source_url": getattr(source_detail, "source_url", None)
             if source_detail
             else None,
-            "collection_id": str(source_detail.collection_id) if source_detail else None,
+            "publisher": getattr(source_detail, "publisher", None)
+            if source_detail
+            else None,
+            "collection_id": (
+                str(source_detail.collection_id)
+                if source_detail is not None and source_detail.collection_id is not None
+                else None
+            ),
             "collection_state": getattr(source_detail, "collection_state", None)
+            if source_detail
+            else None,
+            "repair_state": _repair_state_value(source_detail),
+            "rebuild_required": bool(
+                getattr(source_detail, "rebuild_required", False)
+                if source_detail
+                else False
+            ),
+            "recommended_action": getattr(source_detail, "recommended_action", None)
             if source_detail
             else None,
             "effective_decision": _production_repair_decision_view(
@@ -736,6 +757,69 @@ async def decide_edition_review_repairs(
     }
 
 
+def _repair_state_value(issue: Any) -> str | None:
+    value = getattr(issue, "repair_state", None)
+    if value is None:
+        return None
+    return str(getattr(value, "value", value))
+
+
+@router.post("/editions/{edition_id}/review/repairs/{repair_key}/source")
+async def prepare_edition_review_repair_source(
+    edition_id: UUID, repair_key: str, request: Request
+) -> dict[str, Any]:
+    """Attach the SourceCollection a Q1 proposal never received.
+
+    Q1 can name a publication the collection pass never registered. Without a
+    collection there is nothing to upload content to, so the Repair Desk would
+    show a dead end. This idempotent command creates -- or returns -- exactly
+    the collection matching the raw Q1 source, through the same application
+    primitive reference research uses. No model is contacted.
+    """
+    issue = await _find_edition_repair_issue(request, edition_id, repair_key)
+    if issue is None or (
+        _repair_issue_kind(issue)
+        is not ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "production_repair_issue_not_found"},
+        )
+    subject_id = _repair_issue_subject(issue)
+    if subject_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "production_repair_stale"},
+        )
+    service = getattr(request.app.state, "collection_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "collection_service_unavailable"},
+        )
+    try:
+        collection = await service.ensure_supplemental_source(
+            subject_id,
+            SupplementalSource(
+                url=str(issue.source_url),
+                title=(str(issue.source_title) or None),
+                publisher=getattr(issue, "publisher", None),
+            ),
+        )
+    except CollectionNotAllowedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "supplemental_source_not_attachable", "message": str(exc)},
+        ) from exc
+    return {
+        "repair_key": repair_key,
+        "subject_id": str(subject_id),
+        "collection_id": str(collection.id),
+        "collection_state": getattr(collection.state, "value", collection.state),
+        "source_url": collection.canonical_url,
+    }
+
+
 def _reference_repair_service(request: Request) -> ProductionReferenceRepairService:
     configured = getattr(request.app.state, "production_reference_repair_service", None)
     return configured or ProductionReferenceRepairService(
@@ -905,8 +989,16 @@ async def rebuild_edition_review_item(
             ProductionRepairIssueKind.REJECTED_RULE.value,
         }
     ]
+    # A source whose content was supplied owes a REFERENCES reconciliation.
+    # That rebuild stales EXTRACTION anyway, so projecting the Q2 decisions
+    # first would only produce an artifact the next stage discards.
+    references_pending = any(
+        item.kind == ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value
+        and item.rebuild_required
+        for item in repair_items
+    )
     try:
-        if q2_resolved and any(
+        if not references_pending and q2_resolved and any(
             item.recommended_stage == "apply_projection" for item in q2_resolved
         ):
             projection = await _repair_projection_service(request).project_effective_extraction(
@@ -1241,6 +1333,7 @@ def _review_view(review: EditionReview) -> EditionReviewView:
                 published_rule_count=item.published_rule_count,
                 active_repair_count=item.active_repair_count,
                 unresolved_repair_count=item.unresolved_repair_count,
+                pending_rebuild_count=item.pending_rebuild_count,
                 can_retry=item.can_retry,
                 retry_stage=item.retry_stage,
                 requires_reconciliation=item.requires_reconciliation,
@@ -1255,6 +1348,7 @@ def _review_view(review: EditionReview) -> EditionReviewView:
         can_accept=review.can_accept,
         unresolved_repair_count=review.unresolved_repair_count,
         repair_review_complete=review.repair_review_complete,
+        pending_rebuild_count=review.pending_rebuild_count,
     )
 
 
@@ -1285,6 +1379,7 @@ def _repair_item_view(item: EditionRepairItem) -> dict[str, Any]:
         "resolution_reason": item.resolution_reason,
         "rebuild_required": item.rebuild_required,
         "recommended_stage": item.recommended_stage,
+        "repair_state": item.repair_state,
         "is_publication_ioc": item.is_publication_ioc,
         "in_publication_scope": item.in_publication_scope,
     }
