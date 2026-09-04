@@ -2250,6 +2250,32 @@ h1 {
   font-weight: 700;
 }
 
+/* An arbitrated issue stays actionable: the current answer sits next to the
+   button that opens the alternatives. */
+.repair-inspector__current-decision {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.repair-inspector__audit-list {
+  display: grid;
+  gap: 0.7rem;
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.repair-inspector__audit-list > li {
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid #d4ded7;
+}
+
+.repair-inspector__audit-list > li:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
 .repair-decision-badge,
 .repair-source-panel__success {
   margin: 0;

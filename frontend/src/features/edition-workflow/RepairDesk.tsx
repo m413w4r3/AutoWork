@@ -255,6 +255,8 @@ export function RepairDesk({
           observedRunId: item.run_id,
           observedArtifactId: item.artifact_id as string,
           observedPipelineGeneration: item.pipeline_generation,
+          // The backend fence: the batch must revise exactly what was listed.
+          expectedEffectiveDecisionId: item.effective_decision_id,
         })),
       ),
     retry: false,
@@ -270,7 +272,8 @@ export function RepairDesk({
       setBulkAction(null);
       if (
         error instanceof ApiError &&
-        error.code === "production_repair_stale"
+        (error.code === "production_repair_stale" ||
+          error.code === "production_repair_decision_changed")
       ) {
         setMessage("Certains éléments ont changé. La file a été rechargée.");
         invalidateRepairDesk(queryClient, editionId);

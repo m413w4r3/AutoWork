@@ -63,6 +63,26 @@ class ProductionRepairAction(StrEnum):
     CONTINUE_WITHOUT_SOURCE = "continue_without_source"
 
 
+class RepairDecisionApplicationState(StrEnum):
+    """Whether the effective decision is really materialized downstream.
+
+    Decisions are revisable, so "resolved" no longer implies "applied": an
+    INCLUDE later revised to EXCLUDE owes a new projection that removes the
+    value, exactly as the first INCLUDE owed one that added it.  This state is
+    derived by comparing the effective decision with what the current
+    projection marker proves was materialized -- never from the action alone.
+    """
+
+    #: The current projection already matches the effective decision.
+    ALREADY_EFFECTIVE = "already_effective"
+    #: A new projection must be built before the decision is real.
+    PROJECTION_REQUIRED = "projection_required"
+    #: An honoured INCLUDE the deterministic pipeline cannot rebuild.
+    UNBUILDABLE = "unbuildable"
+    #: No effective decision yet.
+    UNRESOLVED = "unresolved"
+
+
 PRODUCTION_RECONCILIATION_ERROR_CODE = "model_submission_reconciliation_required"
 
 # Bridge review reasons that all describe the same situation: the prompt was

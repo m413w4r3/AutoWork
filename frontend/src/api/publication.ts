@@ -191,6 +191,11 @@ export interface EditionRepairDetail {
   rebuild_required?: boolean;
   recommended_action?: string | null;
   effective_decision?: ProductionRepairDecision | null;
+  /**
+   * Complete append-only audit, oldest first. A decision is revisable, so the
+   * last entry is the effective one and the earlier ones explain the change.
+   */
+  decision_history?: ProductionRepairDecision[];
 }
 
 export interface EditionRepairSourcePreparation {
@@ -324,6 +329,11 @@ export function decideEditionRepair(
     observedRunId: string;
     observedArtifactId: string;
     observedPipelineGeneration: number;
+    /**
+     * Optimistic fence: null for a first decision, the id of the effective
+     * decision currently displayed when the analyst revises it.
+     */
+    expectedEffectiveDecisionId: string | null;
     reason?: string | null;
   },
 ): Promise<EditionRepairDecisionResponse> {
@@ -335,6 +345,7 @@ export function decideEditionRepair(
       observed_run_id: input.observedRunId,
       observed_artifact_id: input.observedArtifactId,
       observed_pipeline_generation: input.observedPipelineGeneration,
+      expected_effective_decision_id: input.expectedEffectiveDecisionId,
       ...(input.reason?.trim() ? { reason: input.reason.trim() } : {}),
     }),
   );
@@ -360,6 +371,7 @@ export function decideEditionRepairsBulk(
     observedRunId: string;
     observedArtifactId: string;
     observedPipelineGeneration: number;
+    expectedEffectiveDecisionId: string | null;
   }>,
   reason?: string | null,
 ): Promise<EditionRepairBulkDecisionResponse> {
@@ -373,6 +385,7 @@ export function decideEditionRepairsBulk(
         observed_run_id: decision.observedRunId,
         observed_artifact_id: decision.observedArtifactId,
         observed_pipeline_generation: decision.observedPipelineGeneration,
+        expected_effective_decision_id: decision.expectedEffectiveDecisionId,
       })),
       ...(reason?.trim() ? { reason: reason.trim() } : {}),
     }),

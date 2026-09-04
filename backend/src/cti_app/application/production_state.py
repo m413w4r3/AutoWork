@@ -31,6 +31,7 @@ from cti_app.application.production_parsers import (
     technical_extraction_from_json,
     validate_synthesis,
 )
+from cti_app.application.production_repairs import repair_projection_decision_ids
 from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.production import (
@@ -408,9 +409,9 @@ async def _repair_decisions_for_projection(
     marker = metadata.get("repair_projection") if isinstance(metadata, Mapping) else None
     if not isinstance(marker, Mapping):
         return {}
-    wanted = {
-        str(value) for value in marker.get("decision_ids", []) if isinstance(value, str | UUID)
-    }
+    # The marker names what the projection really did with each decision, so
+    # the export carries the applied ones and the unbuildable ones alike.
+    wanted = repair_projection_decision_ids(marker)
     if not wanted:
         return {}
     repository = getattr(uow, "production_repair_decisions", None)

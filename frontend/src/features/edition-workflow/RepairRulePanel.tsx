@@ -2,18 +2,26 @@ import type {
   EditionRepairDetail,
   ProductionRepairAction,
 } from "../../api/publication";
+import { alternativeRepairActions, repairActionLabel } from "./RepairQueue";
+
+const RULE_ACTION_LABELS: Record<string, string> = {
+  include: "Inclure la règle dans le livrable",
+  exclude: "Exclure la règle",
+};
 
 export function RepairRulePanel({
   detail,
-  resolved,
+  currentAction,
   onDecision,
   disabled,
 }: {
   detail: EditionRepairDetail;
-  resolved: boolean;
+  /** Effective action, or null while the rule is not arbitrated yet. */
+  currentAction: ProductionRepairAction | null;
   onDecision: (action: ProductionRepairAction) => void;
   disabled: boolean;
 }) {
+  const alternatives = alternativeRepairActions("rejected_rule", currentAction);
   return (
     <section
       className="repair-rule-panel"
@@ -32,26 +40,28 @@ export function RepairRulePanel({
           pack d&apos;évidence chargé.
         </p>
       )}
-      {resolved ? null : (
+      {currentAction ? (
+        <p className="repair-decision-badge" role="status">
+          Décision actuelle : {repairActionLabel(currentAction)}
+        </p>
+      ) : null}
+      {alternatives.length > 0 ? (
         <div className="repair-inspector__actions">
-          <button
-            className="button"
-            type="button"
-            disabled={disabled}
-            onClick={() => onDecision("include")}
-          >
-            Inclure la règle dans le livrable
-          </button>
-          <button
-            className="button button--danger"
-            type="button"
-            disabled={disabled}
-            onClick={() => onDecision("exclude")}
-          >
-            Exclure la règle
-          </button>
+          {alternatives.map((action) => (
+            <button
+              key={action}
+              className={
+                action === "exclude" ? "button button--danger" : "button"
+              }
+              type="button"
+              disabled={disabled}
+              onClick={() => onDecision(action)}
+            >
+              {RULE_ACTION_LABELS[action] ?? repairActionLabel(action)}
+            </button>
+          ))}
         </div>
-      )}
+      ) : null}
     </section>
   );
 }

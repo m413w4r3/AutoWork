@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { ApiError } from "../../api/editions";
 import {
@@ -11,6 +11,8 @@ import {
 import { RepairRulePanel } from "./RepairRulePanel";
 import { RepairSourcePanel } from "./RepairSourcePanel";
 import {
+  alternativeRepairActions,
+  repairActionLabel,
   repairKindLabel,
   repairReasonLabel,
   repairStatusLabel,
@@ -18,11 +20,14 @@ import {
 
 const STALE_REPAIR_MESSAGE =
   "Cet élément a changé depuis son ouverture. La file de réparation a été rechargée.";
+const CHANGED_REPAIR_MESSAGE =
+  "La décision a changé depuis son affichage. La décision courante a été rechargée.";
 
-function decisionLabel(action: ProductionRepairAction): string {
-  if (action === "continue_without_source") return "Continué sans source";
-  return action === "include" ? "Inclus" : "Exclu";
-}
+const DECISION_ACTION_LABELS: Record<string, string> = {
+  include: "Inclure dans la fiche",
+  exclude: "Exclure",
+  continue_without_source: "Continuer sans cette source",
+};
 
 export function RepairIssueInspector({
   editionId,
@@ -40,11 +45,29 @@ export function RepairIssueInspector({
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [reason, setReason] = useState("");
+  // Purely presentational: whether the alternative actions are unfolded. The
+  // decision itself is never held locally -- the query is the authority.
+  const [revising, setRevising] = useState(false);
   const detail = useQuery({
     queryKey: ["edition-repair-detail", editionId, item?.repair_key],
     queryFn: () => getEditionRepairDetail(editionId, item?.repair_key ?? ""),
     enabled: Boolean(item),
   });
+  const repairKey = item?.repair_key;
+  useEffect(() => {
+    setRevising(false);
+    setError(null);
+    setReason("");
+  }, [repairKey]);
+
+  const currentDetail = detail.data;
+  const effectiveDecision = currentDetail?.effective_decision ?? null;
+  const effectiveAction: ProductionRepairAction | null =
+    effectiveDecision?.action ?? item?.effective_action ?? null;
+  const expectedEffectiveDecisionId =
+    effectiveDecision?.id ?? item?.effective_decision_id ?? null;
+  const decisionHistory = currentDetail?.decision_history ?? [];
+
   const decide = useMutation({
     mutationFn: (action: ProductionRepairAction) => {
       if (!item?.artifact_id) {
@@ -58,6 +81,7 @@ export function RepairIssueInspector({
         observedRunId: item.run_id,
         observedArtifactId: item.artifact_id,
         observedPipelineGeneration: item.pipeline_generation,
+        expectedEffectiveDecisionId,
         reason: reason || null,
       });
     },
@@ -65,18 +89,25 @@ export function RepairIssueInspector({
     onSuccess: () => {
       setError(null);
       setReason("");
+      setRevising(false);
       void queryClient.invalidateQueries({
         queryKey: ["edition-repair-detail", editionId, item?.repair_key],
       });
       onChanged();
     },
     onError: (mutationError: unknown) => {
+      const code =
+        mutationError instanceof ApiError ? mutationError.code : null;
       if (
-        mutationError instanceof ApiError &&
-        (mutationError.code === "production_repair_stale" ||
-          mutationError.code === "production_repair_resolved")
+        code === "production_repair_stale" ||
+        code === "production_repair_decision_changed"
       ) {
-        setError(STALE_REPAIR_MESSAGE);
+        setError(
+          code === "production_repair_decision_changed"
+            ? CHANGED_REPAIR_MESSAGE
+            : STALE_REPAIR_MESSAGE,
+        );
+        setRevising(false);
         void queryClient.invalidateQueries({
           queryKey: ["edition-repair-detail", editionId, item?.repair_key],
         });
@@ -106,10 +137,15 @@ export function RepairIssueInspector({
     );
   }
 
-  const currentDetail = detail.data;
-  const action =
-    currentDetail?.effective_decision?.action ?? item.effective_action;
-  const resolved = item.resolved || Boolean(currentDetail?.effective_decision);
+  const resolved = item.resolved || Boolean(effectiveDecision);
+  const alternatives = alternativeRepairActions(
+    item.kind,
+    effectiveAction,
+    item.resolved,
+  );
+  // An arbitrated issue is no longer inert: it shows what was decided and
+  // offers the answers it does not currently hold.
+  const showActions = !effectiveAction || revising;
   const reasonCode = currentDetail?.reason_code ?? item.reason_code;
   const sourceTitle = currentDetail?.source_title ?? item.source_title;
   const sourceUrl = currentDetail?.source_url ?? item.source_url;
@@ -229,15 +265,33 @@ export function RepairIssueInspector({
       {item.kind === "rejected_rule" && currentDetail ? (
         <RepairRulePanel
           detail={currentDetail}
-          resolved={resolved}
+          currentAction={showActions ? null : effectiveAction}
           disabled={readOnly || decide.isPending}
           onDecision={(nextAction) => decide.mutate(nextAction)}
         />
       ) : null}
 
-      {item.kind !== "supplemental_source_unarchived" &&
-      item.kind !== "rejected_rule" &&
-      !resolved ? (
+      {effectiveAction ? (
+        <div className="repair-inspector__current-decision">
+          <p className="repair-decision-badge" role="status">
+            Décision actuelle : {repairActionLabel(effectiveAction)}
+          </p>
+          {!revising && alternatives.length > 0 ? (
+            <button
+              className="button button--secondary"
+              type="button"
+              disabled={readOnly || decide.isPending}
+              onClick={() => setRevising(true)}
+            >
+              Modifier la décision
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {item.kind !== "rejected_rule" &&
+      showActions &&
+      alternatives.length > 0 ? (
         <div className="repair-inspector__decision-panel">
           <label htmlFor="repair-decision-reason">
             Raison de la décision (facultatif)
@@ -250,66 +304,70 @@ export function RepairIssueInspector({
             disabled={readOnly || decide.isPending}
           />
           <div className="repair-inspector__actions">
-            <button
-              className="button"
-              type="button"
-              disabled={readOnly || decide.isPending}
-              onClick={() => decide.mutate("include")}
-            >
-              Inclure dans la fiche
-            </button>
-            <button
-              className="button button--danger"
-              type="button"
-              disabled={readOnly || decide.isPending}
-              onClick={() => decide.mutate("exclude")}
-            >
-              Exclure
-            </button>
+            {alternatives.map((nextAction) => (
+              <button
+                key={nextAction}
+                className={
+                  nextAction === "exclude"
+                    ? "button button--danger"
+                    : nextAction === "continue_without_source"
+                      ? "button button--secondary"
+                      : "button"
+                }
+                type="button"
+                disabled={
+                  readOnly ||
+                  decide.isPending ||
+                  (nextAction === "continue_without_source" &&
+                    !item.artifact_id)
+                }
+                onClick={() => decide.mutate(nextAction)}
+              >
+                {decide.isPending
+                  ? "Enregistrement…"
+                  : DECISION_ACTION_LABELS[nextAction]}
+              </button>
+            ))}
+            {revising ? (
+              <button
+                className="button button--secondary"
+                type="button"
+                onClick={() => setRevising(false)}
+              >
+                Annuler
+              </button>
+            ) : null}
           </div>
         </div>
       ) : null}
 
-      {item.kind === "supplemental_source_unarchived" && !resolved ? (
-        <div className="repair-inspector__decision-panel">
-          <button
-            className="button button--secondary"
-            type="button"
-            disabled={readOnly || decide.isPending || !item.artifact_id}
-            onClick={() => decide.mutate("continue_without_source")}
-          >
-            {decide.isPending
-              ? "Enregistrement…"
-              : "Continuer sans cette source"}
-          </button>
-        </div>
-      ) : null}
-
-      {resolved && action ? (
-        <p className="repair-decision-badge" role="status">
-          {action === "include"
-            ? "Inclus par décision analyste"
-            : decisionLabel(action)}
-        </p>
-      ) : null}
-
-      {currentDetail?.effective_decision ? (
+      {decisionHistory.length > 0 ? (
         <details className="repair-inspector__audit">
-          <summary>Audit de la dernière décision</summary>
-          <dl>
-            <div>
-              <dt>Identité</dt>
-              <dd>{currentDetail.effective_decision.actor_id}</dd>
-            </div>
-            <div>
-              <dt>Raison</dt>
-              <dd>{currentDetail.effective_decision.reason ?? "—"}</dd>
-            </div>
-            <div>
-              <dt>Date</dt>
-              <dd>{currentDetail.effective_decision.created_at}</dd>
-            </div>
-          </dl>
+          <summary>Audit des décisions ({decisionHistory.length})</summary>
+          <ol className="repair-inspector__audit-list">
+            {decisionHistory.map((entry) => (
+              <li key={entry.id}>
+                <dl>
+                  <div>
+                    <dt>Décision</dt>
+                    <dd>{repairActionLabel(entry.action)}</dd>
+                  </div>
+                  <div>
+                    <dt>Identité</dt>
+                    <dd>{entry.actor_id}</dd>
+                  </div>
+                  <div>
+                    <dt>Raison</dt>
+                    <dd>{entry.reason ?? "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Date</dt>
+                    <dd>{entry.created_at}</dd>
+                  </div>
+                </dl>
+              </li>
+            ))}
+          </ol>
         </details>
       ) : null}
 

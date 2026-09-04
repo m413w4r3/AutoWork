@@ -229,6 +229,16 @@ class _DecisionRepository:
     async def append(self, decision: ProductionRepairDecision) -> None:
         self.items.append(decision)
 
+    async def list_for_edition(
+        self, edition_id: UUID, subject_id: UUID | None = None
+    ) -> tuple[ProductionRepairDecision, ...]:
+        return tuple(
+            decision
+            for decision in sorted(self.items, key=lambda item: (item.created_at, item.id))
+            if decision.edition_id == edition_id
+            and (subject_id is None or decision.subject_id == subject_id)
+        )
+
     async def effective_decisions(
         self, edition_id: UUID, subject_id: UUID | None = None
     ) -> tuple[ProductionRepairDecision, ...]:

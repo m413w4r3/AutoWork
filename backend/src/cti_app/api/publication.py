@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Annotated, Any, Literal, NoReturn, cast
 from uuid import UUID
 
@@ -41,16 +42,17 @@ from cti_app.application.identity import IdentityProvider
 from cti_app.application.production_repairs import (
     ProductionReferenceRepairError,
     ProductionReferenceRepairService,
-    ProductionRepairDecisionInput,
-    ProductionRepairDecisionService,
+    ProductionRepairActionInvalidError,
+    ProductionRepairAdjudicationRequest,
+    ProductionRepairAdjudicationService,
+    ProductionRepairDecisionChangedError,
+    ProductionRepairIssueNotFoundError,
     ProductionRepairIssueService,
     ProductionRepairProjectionError,
     ProductionRepairProjectionService,
-    ProductionRepairResolvedError,
     ProductionRepairStaleError,
     ProductionRepairStatusError,
     ProductionRepairValueNotVerifiableError,
-    repair_include_is_buildable,
 )
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import (
@@ -153,6 +155,9 @@ class EditionRepairDecisionRequest(BaseModel):
     observed_run_id: UUID
     observed_artifact_id: UUID
     observed_pipeline_generation: Annotated[int, Field(ge=0)]
+    # Optimistic fence: null for a first decision, the displayed decision id
+    # when the analyst revises an existing one.
+    expected_effective_decision_id: UUID | None = None
     reason: str | None = Field(default=None, max_length=500)
 
 
@@ -165,6 +170,7 @@ class EditionRepairBulkDecision(BaseModel):
     observed_run_id: UUID
     observed_artifact_id: UUID
     observed_pipeline_generation: Annotated[int, Field(ge=0)]
+    expected_effective_decision_id: UUID | None = None
 
 
 class EditionRepairBulkRequest(BaseModel):
@@ -424,18 +430,6 @@ def _repair_issue_kind(issue: Any) -> ProductionRepairIssueKind:
     return ProductionRepairIssueKind(normalized)
 
 
-def _repair_issue_observed_artifact(issue: Any) -> UUID:
-    return cast(UUID, issue.observed_artifact_id)
-
-
-def _repair_issue_run(issue: Any) -> UUID:
-    return cast(UUID, issue.production_run_id)
-
-
-def _repair_issue_generation(issue: Any) -> int:
-    return int(issue.observed_pipeline_generation)
-
-
 async def _find_edition_repair_issue(
     request: Request, edition_id: UUID, repair_key: str
 ) -> Any | None:
@@ -445,65 +439,35 @@ async def _find_edition_repair_issue(
     return None
 
 
-async def _require_buildable_include(
-    request: Request,
-    edition_id: UUID,
-    repair_key: str,
-    issue: Any,
-    action: ProductionRepairAction,
-) -> None:
-    """Refuse an INCLUDE the deterministic projection could never rebuild.
-
-    The decision log is append-only, so honouring such an include would leave
-    the article permanently unbuildable with no way to change the answer.
-    """
-    if action is not ProductionRepairAction.INCLUDE:
-        return
-    kind = _repair_issue_kind(issue)
-    if kind not in {
-        ProductionRepairIssueKind.REJECTED_INDICATOR,
-        ProductionRepairIssueKind.REJECTED_RULE,
-    }:
-        return
-    detail = await _repair_issue_service(request).get_issue(
-        edition_id, repair_key, _repair_issue_subject(issue)
-    )
-    if detail is None or not detail.payload_available:
-        # Without the inert payload the projection has nothing to rebuild.
+def _edition_repair_error(exc: Exception, repair_key: str | None = None) -> NoReturn:
+    # A batch failure must name the item that refused, not just the batch.
+    repair_key = repair_key or getattr(exc, "repair_key", None)
+    if isinstance(exc, ProductionRepairIssueNotFoundError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=_repair_detail(ProductionRepairIssueNotFoundError.code, repair_key),
+        ) from exc
+    if isinstance(exc, ProductionRepairValueNotVerifiableError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": ProductionRepairValueNotVerifiableError.code,
-                "repair_key": repair_key,
-            },
-        )
-    entry = {
-        "repair_key": repair_key,
-        "source_id": detail.issue.source_id,
-        "source_url": detail.issue.source_url,
-        "artifact_type": detail.issue.artifact_type,
-        "model_run_id": detail.issue.model_run_id,
-    }
-    if not repair_include_is_buildable(kind, entry, detail.value):
+            detail=_repair_detail(
+                ProductionRepairValueNotVerifiableError.code, repair_key
+            ),
+        ) from exc
+    if isinstance(exc, ProductionRepairDecisionChangedError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": ProductionRepairValueNotVerifiableError.code,
-                "repair_key": repair_key,
-            },
-        )
-
-
-def _edition_repair_error(exc: Exception) -> NoReturn:
-    if isinstance(exc, ProductionRepairResolvedError):
+            detail=_repair_detail(ProductionRepairDecisionChangedError.code, repair_key),
+        ) from exc
+    if isinstance(exc, ProductionRepairActionInvalidError):
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": ProductionRepairResolvedError.code},
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=_repair_detail(ProductionRepairActionInvalidError.code, repair_key),
         ) from exc
     if isinstance(exc, ProductionRepairStaleError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={"code": ProductionRepairStaleError.code},
+            detail=_repair_detail(ProductionRepairStaleError.code, repair_key),
         ) from exc
     if isinstance(exc, ProductionRepairStatusError):
         raise HTTPException(
@@ -527,6 +491,21 @@ def _edition_repair_error(exc: Exception) -> NoReturn:
             },
         ) from exc
     raise exc
+
+
+def _repair_detail(code: str, repair_key: str | None) -> dict[str, str]:
+    return {"code": code} | ({"repair_key": repair_key} if repair_key else {})
+
+
+def _production_repair_decision_history_view(
+    history: Sequence[Any],
+) -> list[dict[str, Any]]:
+    """Expose the complete append-only audit in chronological order."""
+    return [
+        view
+        for view in (_production_repair_decision_view(item) for item in history)
+        if view is not None
+    ]
 
 
 @router.get("/editions/{edition_id}/review/repairs/{repair_key}")
@@ -582,6 +561,11 @@ async def get_edition_review_repair_detail(
                 if source_detail
                 else None
             ),
+            "decision_history": _production_repair_decision_history_view(
+                await _repair_adjudication_service(request).decision_history(
+                    edition_id, repair_key, subject_id
+                )
+            ),
         }
         return result
 
@@ -613,6 +597,9 @@ async def get_edition_review_repair_detail(
         "effective_decision": _production_repair_decision_view(
             issue_detail.issue.effective_decision
         ),
+        "decision_history": _production_repair_decision_history_view(
+            issue_detail.decision_history
+        ),
     }
     return result
 
@@ -624,49 +611,27 @@ async def decide_edition_review_repair(
     payload: EditionRepairDecisionRequest,
     request: Request,
 ) -> dict[str, Any]:
-    issue = await _find_edition_repair_issue(request, edition_id, repair_key)
-    if issue is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "production_repair_issue_not_found"},
-        )
-    if _repair_issue_subject(issue) != payload.observed_subject_id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "production_repair_stale"},
-        )
-    if getattr(issue, "effective_decision", None) is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "production_repair_resolved"},
-        )
-    if (
-        _repair_issue_run(issue) != payload.observed_run_id
-        or _repair_issue_observed_artifact(issue) != payload.observed_artifact_id
-        or _repair_issue_generation(issue) != payload.observed_pipeline_generation
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "production_repair_stale"},
-        )
-    await _require_buildable_include(
-        request, edition_id, repair_key, issue, ProductionRepairAction(payload.action)
-    )
+    """Arbitrate one issue through the single adjudication policy.
+
+    The router no longer owns any business rule: resolving the CURRENT issue,
+    refusing an unbuildable INCLUDE and holding the optimistic fence all live
+    in the service the subject-scoped endpoint calls too.
+    """
     try:
-        decision = await _repair_decision_service(request).decide(
+        decision = await _repair_adjudication_service(request).decide_current_issue(
             edition_id=edition_id,
             subject_id=payload.observed_subject_id,
-            production_run_id=payload.observed_run_id,
+            repair_key=repair_key,
+            action=ProductionRepairAction(payload.action),
+            observed_run_id=payload.observed_run_id,
             observed_artifact_id=payload.observed_artifact_id,
             observed_pipeline_generation=payload.observed_pipeline_generation,
-            repair_key=repair_key,
-            issue_kind=_repair_issue_kind(issue),
-            action=ProductionRepairAction(payload.action),
+            expected_effective_decision_id=payload.expected_effective_decision_id,
             actor_id=await _actor_id(request),
             reason=payload.reason,
         )
     except Exception as exc:
-        _edition_repair_error(exc)
+        _edition_repair_error(exc, repair_key)
     return {
         "repair_key": repair_key,
         "decision_id": str(decision.id),
@@ -675,9 +640,19 @@ async def decide_edition_review_repair(
     }
 
 
-def _repair_decision_service(request: Request) -> ProductionRepairDecisionService:
-    configured = getattr(request.app.state, "production_repair_decision_service", None)
-    return configured or ProductionRepairDecisionService(request.app.state.uow_factory)
+def _repair_adjudication_service(
+    request: Request,
+) -> ProductionRepairAdjudicationService:
+    configured = getattr(
+        request.app.state, "production_repair_adjudication_service", None
+    )
+    if configured is not None:
+        return cast(ProductionRepairAdjudicationService, configured)
+    return ProductionRepairAdjudicationService(
+        request.app.state.uow_factory,
+        _repair_issue_service(request),
+        getattr(request.app.state, "production_repair_decision_service", None),
+    )
 
 
 @router.post("/editions/{edition_id}/review/repairs/decisions")
@@ -686,59 +661,25 @@ async def decide_edition_review_repairs(
     payload: EditionRepairBulkRequest,
     request: Request,
 ) -> dict[str, Any]:
-    issues = {
-        _repair_issue_key(issue): issue
-        for issue in await _edition_repair_issues(request, edition_id)
-    }
-    inputs: list[ProductionRepairDecisionInput] = []
-    for requested in payload.decisions:
-        issue = issues.get(requested.repair_key)
-        if issue is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "production_repair_stale", "repair_key": requested.repair_key},
-            )
-        if getattr(issue, "effective_decision", None) is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "production_repair_resolved", "repair_key": requested.repair_key},
-            )
-        if (
-            _repair_issue_subject(issue) != requested.observed_subject_id
-            or _repair_issue_run(issue) != requested.observed_run_id
-            or _repair_issue_observed_artifact(issue) != requested.observed_artifact_id
-            or _repair_issue_generation(issue) != requested.observed_pipeline_generation
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "production_repair_stale", "repair_key": requested.repair_key},
-            )
-        try:
-            action = ProductionRepairAction(requested.action)
-            issue_kind = _repair_issue_kind(issue)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail={"code": "production_repair_action_invalid"},
-            ) from exc
-        await _require_buildable_include(
-            request, edition_id, requested.repair_key, issue, action
+    # The batch carries no route-only prevalidation: the very same invariant
+    # decides each item, and every append lands in one transaction, so a
+    # single impossible INCLUDE leaves zero decisions behind.
+    requests = [
+        ProductionRepairAdjudicationRequest(
+            subject_id=requested.observed_subject_id,
+            repair_key=requested.repair_key,
+            action=ProductionRepairAction(requested.action),
+            observed_artifact_id=requested.observed_artifact_id,
+            observed_pipeline_generation=requested.observed_pipeline_generation,
+            expected_effective_decision_id=requested.expected_effective_decision_id,
+            observed_run_id=requested.observed_run_id,
         )
-        inputs.append(
-            ProductionRepairDecisionInput(
-                subject_id=requested.observed_subject_id,
-                production_run_id=requested.observed_run_id,
-                observed_artifact_id=requested.observed_artifact_id,
-                observed_pipeline_generation=requested.observed_pipeline_generation,
-                repair_key=requested.repair_key,
-                issue_kind=issue_kind,
-                action=action,
-            )
-        )
+        for requested in payload.decisions
+    ]
     try:
-        events = await _repair_decision_service(request).decide_bulk(
+        events = await _repair_adjudication_service(request).decide_current_issues(
             edition_id=edition_id,
-            decisions=inputs,
+            requests=requests,
             actor_id=await _actor_id(request),
             reason=payload.reason,
         )

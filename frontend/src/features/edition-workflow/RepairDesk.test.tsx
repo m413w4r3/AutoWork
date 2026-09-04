@@ -14,6 +14,7 @@ import type {
   EditionRepairItem,
   EditionRepairPage,
   EditionReview,
+  ProductionRepairDecision,
   ReviewItem,
 } from "../../api/publication";
 import { ReviewConsole } from "./ReviewConsole";
@@ -175,6 +176,9 @@ function renderReview(
   nextPage?: EditionRepairPage,
 ) {
   const currentPage = { value: repairPage };
+  // Append-only server log, so the detail endpoint can answer with the real
+  // effective decision and the audit that led to it.
+  const decisionLog = new Map<string, ProductionRepairDecision[]>();
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url =
       typeof input === "string"
@@ -187,14 +191,38 @@ function renderReview(
         const body = jsonObject(init);
         const action = repairAction(body["action"]);
         const repairKey = url.split("/repairs/")[1]?.split("/")[0];
+        const history = repairKey ? (decisionLog.get(repairKey) ?? []) : [];
+        const expected = body["expected_effective_decision_id"] ?? null;
+        const current = history.at(-1)?.id ?? null;
+        if (expected !== current) {
+          return Promise.resolve(
+            Response.json(
+              { detail: { code: "production_repair_decision_changed" } },
+              { status: 409 },
+            ),
+          );
+        }
+        const decisionId = `decision-${history.length + 1}`;
         if (repairKey) {
+          decisionLog.set(repairKey, [
+            ...history,
+            {
+              id: decisionId,
+              action,
+              actor_id: "analyst",
+              reason: null,
+              created_at: `2026-09-0${history.length + 1}T00:00:00+00:00`,
+              observed_artifact_id: "artifact-ioc-1",
+              observed_pipeline_generation: 4,
+            },
+          ]);
           const updated = currentPage.value.items.map((item) =>
             item.repair_key === repairKey
               ? {
                   ...item,
                   resolved: true,
                   effective_action: action,
-                  effective_decision_id: "decision-1",
+                  effective_decision_id: decisionId,
                 }
               : item,
           );
@@ -205,7 +233,7 @@ function renderReview(
         return Promise.resolve(
           Response.json({
             repair_key: repairKey,
-            decision_id: "decision-1",
+            decision_id: decisionId,
             action,
             resolved: true,
           }),
@@ -246,9 +274,17 @@ function renderReview(
     }
     if (url.includes("/review/repairs/")) {
       const key = url.split("/repairs/")[1] ?? "";
+      const base = details.get(key) ?? detailFor(currentPage.value.items[0]!);
+      const history = decisionLog.get(key) ?? [];
       return Promise.resolve(
         Response.json(
-          details.get(key) ?? detailFor(currentPage.value.items[0]!),
+          history.length > 0
+            ? {
+                ...base,
+                effective_decision: history.at(-1),
+                decision_history: history,
+              }
+            : base,
         ),
       );
     }
@@ -376,12 +412,70 @@ describe("Repair Desk", () => {
       observed_run_id: "run-1",
       observed_artifact_id: "artifact-ioc-1",
       observed_pipeline_generation: 4,
+      // First decision: the fence names no previous answer.
+      expected_effective_decision_id: null,
     });
     if (action === "include") {
       expect(
-        await screen.findByText("Inclus par décision analyste"),
+        await screen.findByText("Décision actuelle : Inclus"),
       ).toBeInTheDocument();
     }
+  });
+
+  it("révise une décision et transmet la décision effective observée", async () => {
+    const { fetchMock } = renderReview(page([repairItem()]));
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: /evil\.example/ }),
+    );
+    const inspector = await screen.findByRole("region", {
+      name: "Article audit",
+    });
+    await user.click(
+      within(inspector).getByRole("button", { name: "Inclure dans la fiche" }),
+    );
+
+    // The issue is arbitrated but no longer inert.
+    await user.click(
+      await within(inspector).findByRole("button", {
+        name: "Modifier la décision",
+      }),
+    );
+    // Only the answer it does not hold is offered.
+    expect(
+      within(inspector).queryByRole("button", {
+        name: "Inclure dans la fiche",
+      }),
+    ).not.toBeInTheDocument();
+    await user.click(
+      within(inspector).getByRole("button", { name: "Exclure" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(
+          ([input, init]) =>
+            urlOf(input).includes("/review/repairs/repair-ioc-1/decision") &&
+            init?.method === "POST",
+        ),
+      ).toHaveLength(2),
+    );
+    const posts = fetchMock.mock.calls.filter(
+      ([input, init]) =>
+        urlOf(input).includes("/review/repairs/repair-ioc-1/decision") &&
+        init?.method === "POST",
+    );
+    expect(jsonObject(posts[1]?.[1])).toMatchObject({
+      action: "exclude",
+      expected_effective_decision_id: "decision-1",
+    });
+    expect(
+      await within(inspector).findByText("Décision actuelle : Exclu"),
+    ).toBeInTheDocument();
+    // The audit keeps both events, never only the last one.
+    expect(
+      await within(inspector).findByText("Audit des décisions (2)"),
+    ).toBeInTheDocument();
   });
 
   it("confirme une action groupée avec le nombre d’éléments", async () => {

@@ -49,6 +49,7 @@ from cti_app.domain.production import (
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
+    RepairDecisionApplicationState,
     SubjectProductionStatus,
     SupplementalSourceRepairState,
 )
@@ -171,14 +172,28 @@ class ProductionRepairStaleError(ValueError):
     code = "production_repair_stale"
 
 
-class ProductionRepairResolvedError(ValueError):
-    """The requested issue already has an effective append-only decision."""
+class ProductionRepairDecisionChangedError(ValueError):
+    """The effective decision moved under the caller's optimistic fence.
 
-    code = "production_repair_resolved"
+    Decisions are revisable, so "already decided" is not a refusal.  What must
+    be refused is writing over an answer the caller never saw: the request
+    carries the decision id it observed, and a mismatch means someone else
+    (or a retried request) already appended a newer one.
+    """
+
+    code = "production_repair_decision_changed"
+
+
+class ProductionRepairActionInvalidError(ValueError):
+    """The requested action does not exist for this issue kind."""
+
+    code = "production_repair_action_invalid"
 
 
 class ProductionRepairIssueNotFoundError(ValueError):
     """A requested repair issue is not present in the current extraction."""
+
+    code = "production_repair_issue_not_found"
 
 
 class ProductionRepairValueNotVerifiableError(ValueError):
@@ -218,6 +233,9 @@ class ProductionRepairDecisionInput:
     repair_key: str
     issue_kind: ProductionRepairIssueKind
     action: ProductionRepairAction
+    # Optimistic fence: the effective decision the caller was looking at, or
+    # ``None`` for a first decision.  Recomputed under the transaction.
+    expected_effective_decision_id: UUID | None = None
 
 
 class ProductionRepairDecisionService:
@@ -239,6 +257,7 @@ class ProductionRepairDecisionService:
         action: ProductionRepairAction,
         actor_id: str,
         reason: str | None = None,
+        expected_effective_decision_id: UUID | None = None,
     ) -> ProductionRepairDecision:
         # Construct first so pure invariants fail before opening a transaction.
         decision = ProductionRepairDecision(
@@ -270,8 +289,12 @@ class ProductionRepairDecisionService:
             effective = await _effective_decisions_for_reader(
                 uow, edition_id, subject_id
             )
-            if any(item.repair_key == repair_key for item in effective):
-                raise ProductionRepairResolvedError(ProductionRepairResolvedError.code)
+            _require_decision_fence(
+                effective,
+                subject_id=subject_id,
+                repair_key=repair_key,
+                expected_effective_decision_id=expected_effective_decision_id,
+            )
 
             run_repository = uow.subject_production_runs
             run = await _get_for_update(run_repository, production_run_id)
@@ -358,6 +381,7 @@ class ProductionRepairDecisionService:
             for item in decisions
         )
 
+
         async with self._uow_factory() as uow:
             edition = await _get_for_update(uow.editions, edition_id)
             if edition is None or _enum_value(edition.status) not in {
@@ -379,11 +403,14 @@ class ProductionRepairDecisionService:
                 if callable(effective_getter)
                 else _effective_from_history(await repository.list_for_edition(edition_id))
             )
-            effective_keys = {(item.subject_id, item.repair_key) for item in effective}
 
             for item, _event in zip(decisions, events, strict=True):
-                if (item.subject_id, item.repair_key) in effective_keys:
-                    raise ProductionRepairResolvedError(ProductionRepairResolvedError.code)
+                _require_decision_fence(
+                    effective,
+                    subject_id=item.subject_id,
+                    repair_key=item.repair_key,
+                    expected_effective_decision_id=item.expected_effective_decision_id,
+                )
                 run = await _get_for_update(uow.subject_production_runs, item.production_run_id)
                 if (
                     run is None
@@ -446,6 +473,56 @@ class ProductionRepairDecisionService:
             history = await repository.list_for_edition(edition_id, subject_id)
             return _effective_from_history(history)
 
+    async def decision_history(
+        self, edition_id: UUID, repair_key: str, subject_id: UUID | None = None
+    ) -> tuple[ProductionRepairDecision, ...]:
+        """Return every decision ever appended for one repair identity."""
+        async with self._uow_factory() as uow:
+            history = await uow.production_repair_decisions.list_for_edition(
+                edition_id, subject_id
+            )
+        return decision_history_for_key(history, repair_key)
+
+
+def decision_history_for_key(
+    history: Sequence[ProductionRepairDecision], repair_key: str
+) -> tuple[ProductionRepairDecision, ...]:
+    """Order one identity's audit deterministically, oldest first."""
+    return tuple(
+        sorted(
+            (decision for decision in history if decision.repair_key == repair_key),
+            key=lambda item: (item.created_at, str(item.id)),
+        )
+    )
+
+
+def _require_decision_fence(
+    effective: Sequence[ProductionRepairDecision],
+    *,
+    subject_id: UUID,
+    repair_key: str,
+    expected_effective_decision_id: UUID | None,
+) -> None:
+    """Refuse a revision written over an answer the caller never observed.
+
+    A first decision passes ``None``; a revision passes the id it displayed.
+    A retried HTTP request therefore fails unambiguously after its first
+    append instead of silently appending the same event twice.
+    """
+    current = next(
+        (
+            decision
+            for decision in effective
+            if decision.subject_id == subject_id and decision.repair_key == repair_key
+        ),
+        None,
+    )
+    current_id = current.id if current is not None else None
+    if current_id != expected_effective_decision_id:
+        raise ProductionRepairDecisionChangedError(
+            ProductionRepairDecisionChangedError.code
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ProductionRepairIssueView:
@@ -469,7 +546,12 @@ class ProductionRepairIssueView:
     model_run_id: str | None = None
     batch_id: str | None = None
     effective_decision: ProductionRepairDecision | None = None
+    # True only when the effective decision's content is proven materialized
+    # by the current projection marker -- never inferred from its action.
     projection_applied: bool = False
+    application_state: RepairDecisionApplicationState = (
+        RepairDecisionApplicationState.UNRESOLVED
+    )
     subject_id: UUID | None = None
 
 
@@ -479,6 +561,7 @@ class ProductionRepairIssueDetail:
 
     issue: ProductionRepairIssueView
     value: str | None
+    decision_history: tuple[ProductionRepairDecision, ...] = ()
 
     @property
     def payload_available(self) -> bool:
@@ -573,8 +656,25 @@ class ProductionRepairIssueService:
     ) -> ProductionRepairIssueDetail | None:
         for view, value in await self._records(edition_id, subject_id=subject_id):
             if view.repair_key == repair_key:
-                return ProductionRepairIssueDetail(issue=view, value=value)
+                return ProductionRepairIssueDetail(
+                    issue=view,
+                    value=value,
+                    decision_history=await self.decision_history(
+                        edition_id, repair_key, subject_id
+                    ),
+                )
         return None
+
+    async def decision_history(
+        self, edition_id: UUID, repair_key: str, subject_id: UUID | None = None
+    ) -> tuple[ProductionRepairDecision, ...]:
+        """Expose the complete append-only audit of one repair identity."""
+        async with self._uow_factory() as uow:
+            repository = getattr(uow, "production_repair_decisions", None)
+            if repository is None:
+                return ()
+            history = await repository.list_for_edition(edition_id, subject_id)
+        return decision_history_for_key(history, repair_key)
 
     async def resolve_issue(
         self, edition_id: UUID, repair_key: str, subject_id: UUID | None = None
@@ -784,6 +884,7 @@ class ProductionRepairIssueService:
             entries, payload_available = await self._entries(
                 context.artifact, load_payload=load_payload
             )
+            marker = _repair_projection_marker(context.artifact)
             for entry in entries:
                 record = _issue_record(
                     context,
@@ -794,12 +895,19 @@ class ProductionRepairIssueService:
                 )
                 if record is not None:
                     view, value = record
+                    decision = decisions_by_key.get(
+                        (context.run.subject_id, view.repair_key)
+                    )
+                    view = replace(view, effective_decision=decision)
                     records.append(
                         (
                             replace(
                                 view,
-                                effective_decision=decisions_by_key.get(
-                                    (context.run.subject_id, view.repair_key)
+                                application_state=repair_decision_application_state(
+                                    view, decision, marker
+                                ),
+                                projection_applied=repair_decision_is_materialized(
+                                    marker, view.repair_key, decision
                                 ),
                             ),
                             value,
@@ -813,6 +921,201 @@ class ProductionRepairIssueService:
         if load_payload:
             return await _repair_entries_for_artifact(artifact, self._artifact_store)
         return _repair_index_entries_for_artifact(artifact)
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionRepairAdjudicationRequest:
+    """One arbitration expressed against what the analyst actually saw."""
+
+    subject_id: UUID
+    repair_key: str
+    action: ProductionRepairAction
+    observed_artifact_id: UUID
+    observed_pipeline_generation: int
+    #: ``None`` for a first decision, the displayed decision id for a revision.
+    expected_effective_decision_id: UUID | None = None
+    observed_run_id: UUID | None = None
+
+
+class ProductionRepairAdjudicationService:
+    """The single business policy for arbitrating a Repair Desk issue.
+
+    Every endpoint -- subject-scoped, edition-scoped and bulk -- goes through
+    this service, so an INCLUDE the deterministic projection could never
+    rebuild is refused everywhere and not only where a router remembered to
+    check it.  The low-level append service stays responsible for the locks,
+    the freeze rules and the optimistic fence.
+    """
+
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        issue_service: ProductionRepairIssueService | None = None,
+        decision_service: ProductionRepairDecisionService | None = None,
+        artifact_store: ProductionArtifactStore | None = None,
+    ) -> None:
+        self._uow_factory = uow_factory
+        self._issues = issue_service or ProductionRepairIssueService(
+            uow_factory, artifact_store
+        )
+        self._decisions = decision_service or ProductionRepairDecisionService(uow_factory)
+
+    async def decide_current_issue(
+        self,
+        *,
+        edition_id: UUID,
+        subject_id: UUID,
+        repair_key: str,
+        action: ProductionRepairAction,
+        observed_artifact_id: UUID,
+        observed_pipeline_generation: int,
+        expected_effective_decision_id: UUID | None,
+        actor_id: str,
+        reason: str | None = None,
+        observed_run_id: UUID | None = None,
+    ) -> ProductionRepairDecision:
+        """Resolve, validate and append one decision for the CURRENT issue."""
+        prepared = await self._prepare(
+            edition_id,
+            ProductionRepairAdjudicationRequest(
+                subject_id=subject_id,
+                repair_key=repair_key,
+                action=action,
+                observed_artifact_id=observed_artifact_id,
+                observed_pipeline_generation=observed_pipeline_generation,
+                expected_effective_decision_id=expected_effective_decision_id,
+                observed_run_id=observed_run_id,
+            ),
+        )
+        return await self._decisions.decide(
+            edition_id=edition_id,
+            subject_id=prepared.subject_id,
+            production_run_id=prepared.production_run_id,
+            observed_artifact_id=prepared.observed_artifact_id,
+            observed_pipeline_generation=prepared.observed_pipeline_generation,
+            repair_key=prepared.repair_key,
+            issue_kind=prepared.issue_kind,
+            action=prepared.action,
+            actor_id=actor_id,
+            reason=reason,
+            expected_effective_decision_id=prepared.expected_effective_decision_id,
+        )
+
+    async def decide_current_issues(
+        self,
+        *,
+        edition_id: UUID,
+        requests: Sequence[ProductionRepairAdjudicationRequest],
+        actor_id: str,
+        reason: str | None = None,
+    ) -> tuple[ProductionRepairDecision, ...]:
+        """Apply the same invariant to a batch, appended in one transaction."""
+        prepared: list[ProductionRepairDecisionInput] = []
+        for item in requests:
+            try:
+                prepared.append(await self._prepare(edition_id, item))
+            except ValueError as exc:
+                # Name the offending item so a batch refusal stays actionable.
+                exc.repair_key = item.repair_key  # type: ignore[attr-defined]
+                raise
+        return await self._decisions.decide_bulk(
+            edition_id=edition_id,
+            decisions=prepared,
+            actor_id=actor_id,
+            reason=reason,
+        )
+
+    async def decision_history(
+        self, edition_id: UUID, repair_key: str, subject_id: UUID | None = None
+    ) -> tuple[ProductionRepairDecision, ...]:
+        return await self._decisions.decision_history(edition_id, repair_key, subject_id)
+
+    async def _prepare(
+        self, edition_id: UUID, request: ProductionRepairAdjudicationRequest
+    ) -> ProductionRepairDecisionInput:
+        detail: ProductionRepairIssueDetail | None = None
+        source: SupplementalSourceRepairIssue | None = None
+        if request.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE:
+            source = await self._issues.get_supplemental_source_issue(
+                edition_id, request.repair_key, request.subject_id
+            )
+            issue: Any = source
+        else:
+            detail = await self._issues.get_issue(
+                edition_id, request.repair_key, request.subject_id
+            )
+            issue = detail.issue if detail is not None else None
+        if issue is None:
+            raise ProductionRepairIssueNotFoundError(
+                ProductionRepairIssueNotFoundError.code
+            )
+
+        kind = _repair_kind(_enum_value(issue.kind))
+        if not _repair_action_is_compatible(kind, request.action):
+            raise ProductionRepairActionInvalidError(
+                ProductionRepairActionInvalidError.code
+            )
+        if (
+            issue.observed_artifact_id != request.observed_artifact_id
+            or issue.observed_pipeline_generation != request.observed_pipeline_generation
+            or (
+                request.observed_run_id is not None
+                and issue.production_run_id != request.observed_run_id
+            )
+            or (
+                getattr(issue, "subject_id", request.subject_id) != request.subject_id
+            )
+        ):
+            raise ProductionRepairStaleError(ProductionRepairStaleError.code)
+
+        if request.action is ProductionRepairAction.INCLUDE:
+            self._require_buildable_include(request.repair_key, detail)
+
+        return ProductionRepairDecisionInput(
+            subject_id=request.subject_id,
+            production_run_id=issue.production_run_id,
+            observed_artifact_id=issue.observed_artifact_id,
+            observed_pipeline_generation=issue.observed_pipeline_generation,
+            repair_key=request.repair_key,
+            issue_kind=kind,
+            action=request.action,
+            expected_effective_decision_id=request.expected_effective_decision_id,
+        )
+
+    @staticmethod
+    def _require_buildable_include(
+        repair_key: str, detail: ProductionRepairIssueDetail | None
+    ) -> None:
+        """Refuse, before any append, an INCLUDE nothing could ever rebuild.
+
+        The log is append-only, so an impossible include would otherwise stay
+        an unmaterializable debt; refusing here leaves ``exclude`` available
+        while the analyst is still looking at the value.
+        """
+        if detail is None or not detail.payload_available:
+            raise ProductionRepairValueNotVerifiableError(
+                ProductionRepairValueNotVerifiableError.code
+            )
+        entry = {
+            "repair_key": repair_key,
+            "source_id": detail.issue.source_id,
+            "source_url": detail.issue.source_url,
+            "artifact_type": detail.issue.artifact_type,
+            "model_run_id": detail.issue.model_run_id,
+        }
+        if not repair_include_is_buildable(detail.issue.kind, entry, detail.value):
+            raise ProductionRepairValueNotVerifiableError(
+                ProductionRepairValueNotVerifiableError.code
+            )
+
+
+def _repair_action_is_compatible(
+    kind: ProductionRepairIssueKind, action: ProductionRepairAction
+) -> bool:
+    """Mirror the domain compatibility rule before a decision is built."""
+    if kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED:
+        return action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
+    return action in {ProductionRepairAction.INCLUDE, ProductionRepairAction.EXCLUDE}
 
 
 @dataclass(frozen=True, slots=True)
@@ -966,6 +1269,9 @@ class ProductionRepairProjectionService:
             excluded: list[str] = []
             unresolved: list[str] = []
             unbuildable: list[str] = []
+            # The honest record of what this projection really materializes.
+            applied_decisions: list[dict[str, str]] = []
+            unbuildable_decisions: list[dict[str, str]] = []
             accepted_indicator_count = 0
             accepted_rule_count = 0
             additions: list[ExtractionItem] = []
@@ -981,6 +1287,16 @@ class ProductionRepairProjectionService:
                 action = _enum_value(decision.action)
                 if action == ProductionRepairAction.EXCLUDE.value:
                     excluded.append(repair_key)
+                    # An exclusion is materialized by this very projection: the
+                    # value is absent from it, whether or not a previous
+                    # projection had put it in.
+                    applied_decisions.append(
+                        {
+                            "repair_key": repair_key,
+                            "decision_id": str(decision.id),
+                            "action": ProductionRepairAction.EXCLUDE.value,
+                        }
+                    )
                     continue
                 if action != ProductionRepairAction.INCLUDE.value:
                     unresolved.append(repair_key)
@@ -1009,8 +1325,18 @@ class ProductionRepairProjectionService:
                     # honoured-but-unbuildable include and keep projecting; the
                     # decision endpoint refuses such an include up front.
                     unbuildable.append(repair_key)
+                    unbuildable_decisions.append(
+                        {"repair_key": repair_key, "decision_id": str(decision.id)}
+                    )
                     continue
                 included.append(repair_key)
+                applied_decisions.append(
+                    {
+                        "repair_key": repair_key,
+                        "decision_id": str(decision.id),
+                        "action": ProductionRepairAction.INCLUDE.value,
+                    }
+                )
 
             projected = TechnicalExtraction(
                 items=_merge_projection_items(items, additions),
@@ -1026,7 +1352,21 @@ class ProductionRepairProjectionService:
                 except Exception:
                     current_extraction = base_extraction
 
-            if projected == current_extraction:
+            # An unbuildable INCLUDE changes nothing in the content, but the
+            # article owes the record that it was honoured and not applied.
+            # Without a new version that debt would be invisible forever.
+            unbuildable_already_recorded = {
+                (str(entry.get("repair_key")), str(entry.get("decision_id")))
+                for entry in _marker_entries(
+                    _repair_projection_marker(current), "unbuildable_decisions"
+                )
+            }
+            unbuildable_is_recorded = all(
+                (entry["repair_key"], entry["decision_id"])
+                in unbuildable_already_recorded
+                for entry in unbuildable_decisions
+            )
+            if projected == current_extraction and unbuildable_is_recorded:
                 await uow.commit()
                 return ProductionRepairProjectionResult(
                     artifact=current,
@@ -1064,7 +1404,17 @@ class ProductionRepairProjectionService:
             projection_metadata = {
                 "version": self._PROJECTION_VERSION,
                 "base_extraction_artifact_id": str(base.id),
-                "decision_ids": [str(item.id) for item in effective_for_base],
+                # ``applied_decisions`` is the only proof that a decision is
+                # materialized here; a decision merely considered but not
+                # rebuildable lands in ``unbuildable_decisions`` instead.
+                "applied_decisions": sorted(
+                    applied_decisions,
+                    key=lambda entry: (entry["repair_key"], entry["decision_id"]),
+                ),
+                "unbuildable_decisions": sorted(
+                    unbuildable_decisions,
+                    key=lambda entry: (entry["repair_key"], entry["decision_id"]),
+                ),
                 "included_repair_keys": sorted(included),
                 "excluded_repair_keys": sorted(excluded),
                 "unresolved_repair_keys": sorted(unresolved),
@@ -1357,6 +1707,105 @@ def repair_include_is_buildable(
     return True
 
 
+def _repair_projection_marker(artifact: Any) -> Mapping[str, Any] | None:
+    """Read the ``repair_projection`` marker of one extraction artifact."""
+    metadata = getattr(artifact, "metadata", None)
+    marker = metadata.get("repair_projection") if isinstance(metadata, dict) else None
+    return marker if isinstance(marker, Mapping) else None
+
+
+def _marker_entries(
+    marker: Mapping[str, Any] | None, field: str
+) -> list[Mapping[str, Any]]:
+    values = marker.get(field) if marker is not None else None
+    return [value for value in values if isinstance(value, Mapping)] if isinstance(
+        values, list
+    ) else []
+
+
+def repair_decision_is_materialized(
+    marker: Mapping[str, Any] | None,
+    repair_key: str,
+    decision: ProductionRepairDecision | None,
+) -> bool:
+    """Report whether this exact decision's content is really projected.
+
+    "Applied" must mean materialized, not merely considered: only a decision
+    listed in ``applied_decisions`` of the current projection is applied.
+    """
+    if decision is None:
+        return False
+    decision_id = str(decision.id)
+    return any(
+        str(entry.get("repair_key")) == repair_key
+        and str(entry.get("decision_id")) == decision_id
+        for entry in _marker_entries(marker, "applied_decisions")
+    )
+
+
+def repair_projection_decision_ids(marker: Mapping[str, Any] | None) -> set[str]:
+    """Every decision the projection took into account, applied or not."""
+    return {
+        str(entry["decision_id"])
+        for field in ("applied_decisions", "unbuildable_decisions")
+        for entry in _marker_entries(marker, field)
+        if entry.get("decision_id") is not None
+    }
+
+
+def _marker_applied_action(
+    marker: Mapping[str, Any] | None, repair_key: str
+) -> str | None:
+    for entry in _marker_entries(marker, "applied_decisions"):
+        if str(entry.get("repair_key")) == repair_key:
+            return str(entry.get("action"))
+    return None
+
+
+def repair_decision_application_state(
+    issue: Any,
+    effective_decision: ProductionRepairDecision | None,
+    current_projection_marker: Mapping[str, Any] | None,
+) -> RepairDecisionApplicationState:
+    """Compare the effective decision with what is really applied.
+
+    The current action alone cannot answer this.  A first EXCLUDE needs no
+    projection because the deterministic pipeline already rejected the value,
+    but an EXCLUDE that revises an applied INCLUDE must produce a projection
+    that removes it -- and symmetrically for INCLUDE after EXCLUDE.
+    """
+    if effective_decision is None:
+        return RepairDecisionApplicationState.UNRESOLVED
+    kind_value = _enum_value(getattr(issue, "kind", None))
+    if kind_value == ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value:
+        # A waived source owes a REFERENCES reconciliation, never an
+        # extraction projection; that debt is tracked by its repair state.
+        return RepairDecisionApplicationState.ALREADY_EFFECTIVE
+    repair_key = str(getattr(issue, "repair_key", ""))
+    decision_id = str(effective_decision.id)
+    if any(
+        str(entry.get("repair_key")) == repair_key
+        and str(entry.get("decision_id")) == decision_id
+        for entry in _marker_entries(current_projection_marker, "unbuildable_decisions")
+    ):
+        return RepairDecisionApplicationState.UNBUILDABLE
+    if repair_decision_is_materialized(
+        current_projection_marker, repair_key, effective_decision
+    ):
+        return RepairDecisionApplicationState.ALREADY_EFFECTIVE
+    action = _enum_value(effective_decision.action)
+    if action == ProductionRepairAction.EXCLUDE.value:
+        applied_action = _marker_applied_action(current_projection_marker, repair_key)
+        return (
+            RepairDecisionApplicationState.PROJECTION_REQUIRED
+            if applied_action == ProductionRepairAction.INCLUDE.value
+            else RepairDecisionApplicationState.ALREADY_EFFECTIVE
+        )
+    if action == ProductionRepairAction.INCLUDE.value:
+        return RepairDecisionApplicationState.PROJECTION_REQUIRED
+    return RepairDecisionApplicationState.ALREADY_EFFECTIVE
+
+
 def _item_projection_key(item: ExtractionItem) -> tuple[str, str]:
     if item.artifact_type is None:
         return item.category, item.value.casefold()
@@ -1624,20 +2073,6 @@ def _issue_record(
 
     preview_source = raw_value if isinstance(raw_value, str) else str(entry.get("preview", ""))
     preview = preview_source[:MAX_REPAIR_PREVIEW_CHARS]
-    projection_marker = (
-        context.artifact.metadata.get("repair_projection")
-        if isinstance(getattr(context.artifact, "metadata", None), dict)
-        else None
-    )
-    projection_decision_ids = (
-        {
-            str(value)
-            for value in projection_marker.get("decision_ids", [])
-        }
-        if isinstance(projection_marker, dict)
-        and isinstance(projection_marker.get("decision_ids"), list)
-        else set()
-    )
     view = ProductionRepairIssueView(
         repair_key=repair_key,
         kind=kind,
@@ -1661,10 +2096,6 @@ def _issue_record(
         ),
         batch_id=str(entry["batch_id"]) if entry.get("batch_id") is not None else None,
         effective_decision=effective_decision,
-        projection_applied=(
-            effective_decision is not None
-            and str(effective_decision.id) in projection_decision_ids
-        ),
         subject_id=context.run.subject_id,
     )
     return view, value

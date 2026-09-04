@@ -1,4 +1,8 @@
-import type { EditionRepairItem } from "../../api/publication";
+import type {
+  EditionRepairItem,
+  ProductionRepairAction,
+  ProductionRepairIssueKind,
+} from "../../api/publication";
 
 export type RepairQueueFilter =
   "all" | "sources" | "ioc" | "rules" | "other" | "resolved" | "blocking";
@@ -20,7 +24,35 @@ export function repairKindLabel(item: EditionRepairItem): string {
   return item.is_publication_ioc ? "IOC" : "Autre perte";
 }
 
+export function repairActionLabel(action: ProductionRepairAction): string {
+  if (action === "continue_without_source") return "Continué sans source";
+  return action === "include" ? "Inclus" : "Exclu";
+}
+
+/**
+ * Decisions are revisable, so an arbitrated issue still offers the answers it
+ * does not currently hold. The backend remains the authority: it refuses a
+ * revision whose fence is stale.
+ */
+export function alternativeRepairActions(
+  kind: ProductionRepairIssueKind,
+  currentAction: ProductionRepairAction | null,
+  resolved = false,
+): ProductionRepairAction[] {
+  if (kind === "supplemental_source_unarchived") {
+    // A source is either still missing — and then waivable — or already
+    // settled: an archived source owes a rebuild, never a new arbitration.
+    return currentAction || resolved ? [] : ["continue_without_source"];
+  }
+  return (["include", "exclude"] as const).filter(
+    (action) => action !== currentAction,
+  );
+}
+
 export function repairStatusLabel(item: EditionRepairItem): string {
+  if (item.recommended_stage === "revise_decision") {
+    return "Décision inapplicable";
+  }
   if (item.rebuild_required && item.resolved) return "À reconstruire";
   if (!item.resolved) {
     if (item.repair_state === "collection_missing")
@@ -29,10 +61,9 @@ export function repairStatusLabel(item: EditionRepairItem): string {
       ? "Source à fournir"
       : "À arbitrer";
   }
-  if (item.effective_action === "continue_without_source") {
-    return "Continué sans source";
-  }
-  return item.effective_action === "include" ? "Inclus" : "Exclu";
+  return item.effective_action
+    ? repairActionLabel(item.effective_action)
+    : "Arbitré";
 }
 
 export function repairReasonLabel(reasonCode: string): string {

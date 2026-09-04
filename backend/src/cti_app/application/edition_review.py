@@ -9,11 +9,13 @@ from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
+from cti_app.application.production_repairs import repair_decision_application_state
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionRepairIssueKind,
     ProductionSubmissionReconciliation,
+    RepairDecisionApplicationState,
     SubjectProductionStage,
     SubjectProductionStatus,
     SupplementalSourceRepairState,
@@ -360,7 +362,7 @@ class EditionRepairReadService:
         artifact_type = getattr(issue, "artifact_type", None)
         artifact_id = getattr(issue, "observed_artifact_id", None)
         artifact_version = getattr(issue, "observed_artifact_version", None)
-        projection_applied = bool(getattr(issue, "projection_applied", False))
+        state = _issue_application_state(issue, decision)
         if is_source and pending_references:
             # The content exists; only the deterministic REFERENCES rebuild is
             # missing. This debt is served by the backend, so a page reload
@@ -372,20 +374,22 @@ class EditionRepairReadService:
             # The source still needs an explicit archive/waive decision before
             # the deterministic REFERENCES reconciliation can run.
             recommended_stage = "none" if resolved else "rebuild_references"
-        elif not resolved:
+        elif state is RepairDecisionApplicationState.UNRESOLVED:
             rebuild_required = False
             recommended_stage = None
-        elif getattr(getattr(decision, "action", None), "value", None) == "exclude":
-            # Rejected values are absent from the base projection already. An
-            # explicit exclusion therefore needs no derived artifact or retry.
-            rebuild_required = False
-            recommended_stage = "none"
-        elif projection_applied:
-            rebuild_required = row.document_artifact_id is None
-            recommended_stage = "synthesis" if rebuild_required else "none"
-        else:
+        elif state is RepairDecisionApplicationState.UNBUILDABLE:
+            # The decision is recorded but nothing materialized it. It stays a
+            # blocking debt the analyst clears by revising it to EXCLUDE.
+            rebuild_required = True
+            recommended_stage = "revise_decision"
+        elif state is RepairDecisionApplicationState.PROJECTION_REQUIRED:
+            # Covers the first INCLUDE as well as every revision that makes the
+            # applied projection disagree with the effective decision.
             rebuild_required = True
             recommended_stage = "apply_projection"
+        else:
+            rebuild_required = row.document_artifact_id is None
+            recommended_stage = "synthesis" if rebuild_required else "none"
 
         return EditionRepairItem(
             repair_key=repair_key,
@@ -448,6 +452,43 @@ class EditionRepairReadService:
 def _issue_kind(issue: Any) -> str:
     value = getattr(issue, "kind", "")
     return str(getattr(value, "value", value))
+
+
+def _issue_application_state(
+    issue: Any, decision: Any
+) -> RepairDecisionApplicationState:
+    """Read the state the issue reader computed, or derive it for plain DTOs."""
+    value = getattr(issue, "application_state", None)
+    if value is not None:
+        return RepairDecisionApplicationState(getattr(value, "value", value))
+    if decision is None:
+        return RepairDecisionApplicationState.UNRESOLVED
+    # Legacy readers only carry the boolean. Rebuild the marker it stands for
+    # so the single pure rule still decides, rather than a second policy here.
+    marker = (
+        {
+            "applied_decisions": [
+                {
+                    "repair_key": str(getattr(issue, "repair_key", "")),
+                    "decision_id": str(getattr(decision, "id", "")),
+                    "action": str(
+                        getattr(getattr(decision, "action", None), "value", "")
+                    ),
+                }
+            ]
+        }
+        if bool(getattr(issue, "projection_applied", False))
+        else None
+    )
+    return repair_decision_application_state(issue, decision, marker)
+
+
+def _issue_is_unbuildable(issue: Any) -> bool:
+    """An honoured INCLUDE nothing could materialize is a blocking debt."""
+    return (
+        _issue_application_state(issue, getattr(issue, "effective_decision", None))
+        is RepairDecisionApplicationState.UNBUILDABLE
+    )
 
 
 def _issue_repair_state(issue: Any) -> str | None:
@@ -526,9 +567,12 @@ def _repair_articles(items: Sequence[EditionRepairItem]) -> tuple[EditionRepairA
         "rebuild_references": 0,
         "references": 1,
         "extraction": 2,
-        "apply_projection": 3,
-        "synthesis": 4,
-        "none": 5,
+        # A decision nothing could materialize must be revised before any
+        # rebuild stage can make the article true again.
+        "revise_decision": 3,
+        "apply_projection": 4,
+        "synthesis": 5,
+        "none": 6,
     }
     articles: list[tuple[int, EditionRepairArticle]] = []
     for subject_id, subject_items in by_subject.items():
@@ -839,7 +883,8 @@ def _build_item(row: EditionReviewReadItem, repair_issues: Sequence[Any] = ()) -
         for issue in repair_issues
     )
     pending_rebuild_count = sum(
-        _issue_pending_references(issue) for issue in repair_issues
+        _issue_pending_references(issue) or _issue_is_unbuildable(issue)
+        for issue in repair_issues
     )
     return EditionReviewItem(
         position=row.position,
