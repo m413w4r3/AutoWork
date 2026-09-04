@@ -7,7 +7,10 @@ import {
   getEditionRepairDetail,
   type EditionRepairItem,
   type ProductionRepairAction,
+  type RepairDecisionApplicationState,
+  type ReviewItem,
 } from "../../api/publication";
+import { Link } from "../../routing";
 import { RepairRulePanel } from "./RepairRulePanel";
 import { RepairSourcePanel } from "./RepairSourcePanel";
 import {
@@ -29,15 +32,46 @@ const DECISION_ACTION_LABELS: Record<string, string> = {
   continue_without_source: "Continuer sans cette source",
 };
 
+/**
+ * "L’analyste a décidé INCLURE" et "le livrable contient la valeur" sont deux
+ * faits distincts. L’application est donnée par le backend, qui compare la
+ * décision effective au marqueur de la projection réellement en place.
+ */
+const APPLICATION_LABELS: Record<RepairDecisionApplicationState, string> = {
+  already_effective: "matérialisée",
+  projection_required: "en attente de rebuild",
+  unbuildable: "non projetable",
+  unresolved: "aucune décision à appliquer",
+};
+
+const SUPERSEDED_LABEL = "remplacée par une décision ultérieure";
+
+const DECISION_DATE_FORMAT = new Intl.DateTimeFormat("fr-FR", {
+  day: "2-digit",
+  month: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+});
+
+function decisionTimestamp(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : DECISION_DATE_FORMAT.format(date);
+}
+
 export function RepairIssueInspector({
   editionId,
   item,
+  article,
   readOnly,
   onChanged,
   onArchived,
 }: {
   editionId: string;
   item: EditionRepairItem | null;
+  /** The reviewed article, for the provenance of the final deliverable. */
+  article: ReviewItem | null;
   readOnly: boolean;
   onChanged: () => void;
   onArchived: (item: EditionRepairItem) => void;
@@ -67,6 +101,12 @@ export function RepairIssueInspector({
   const expectedEffectiveDecisionId =
     effectiveDecision?.id ?? item?.effective_decision_id ?? null;
   const decisionHistory = currentDetail?.decision_history ?? [];
+  // Never inferred from the action: an unknown state stays unknown.
+  const applicationState: RepairDecisionApplicationState | null =
+    currentDetail?.application_state ?? item?.application_state ?? null;
+  const applicationLabel = applicationState
+    ? APPLICATION_LABELS[applicationState]
+    : "non projetable (donnée héritée)";
 
   const decide = useMutation({
     mutationFn: (action: ProductionRepairAction) => {
@@ -154,6 +194,9 @@ export function RepairIssueInspector({
   // scrollable block. Repeating it unbounded in the facts list pushes every
   // action off-screen for a large YARA rule, so the summary stays short here.
   const value = isRule ? item.preview : (currentDetail?.value ?? item.preview);
+  const projectionArtifactId = currentDetail?.artifact_id ?? item.artifact_id;
+  const projectionArtifactVersion =
+    currentDetail?.artifact_version ?? item.artifact_version;
 
   return (
     <section
@@ -228,18 +271,60 @@ export function RepairIssueInspector({
               <code>{currentDetail?.value_sha256 ?? item.value_sha256}</code>
             </dd>
           </div>
+        </dl>
+      </details>
+
+      <section
+        className="repair-inspector__provenance"
+        aria-labelledby="repair-provenance-heading"
+      >
+        <h4 id="repair-provenance-heading">Provenance</h4>
+        <dl>
           <div>
-            <dt>run_id</dt>
+            <dt>Exécution</dt>
             <dd>
-              <code>{item.run_id}</code>
+              <code>{item.run_id}</code> — génération {item.pipeline_generation}
             </dd>
           </div>
           <div>
-            <dt>pipeline_generation</dt>
-            <dd>{item.pipeline_generation}</dd>
+            <dt>Projection d&apos;extraction</dt>
+            <dd>
+              {projectionArtifactId ? (
+                <>
+                  <code>{projectionArtifactId}</code>
+                  {projectionArtifactVersion !== null &&
+                  projectionArtifactVersion !== undefined
+                    ? ` v.${projectionArtifactVersion}`
+                    : ""}
+                </>
+              ) : (
+                "—"
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt>Livrable final</dt>
+            <dd>
+              {article?.document_artifact_id ? (
+                <>
+                  <code>{article.document_artifact_id}</code>
+                  {article.document_artifact_version !== null
+                    ? ` v.${article.document_artifact_version}`
+                    : ""}
+                </>
+              ) : (
+                "aucun document publiable"
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt>Empreinte du livrable</dt>
+            <dd>
+              <code>{article?.document_input_hash ?? "—"}</code>
+            </dd>
           </div>
         </dl>
-      </details>
+      </section>
 
       {detail.isPending ? <p role="status">Chargement du détail…</p> : null}
       {detail.isError ? (
@@ -266,7 +351,8 @@ export function RepairIssueInspector({
         <RepairRulePanel
           detail={currentDetail}
           currentAction={showActions ? null : effectiveAction}
-          disabled={readOnly || decide.isPending}
+          readOnly={readOnly}
+          disabled={decide.isPending}
           onDecision={(nextAction) => decide.mutate(nextAction)}
         />
       ) : null}
@@ -276,7 +362,7 @@ export function RepairIssueInspector({
           <p className="repair-decision-badge" role="status">
             Décision actuelle : {repairActionLabel(effectiveAction)}
           </p>
-          {!revising && alternatives.length > 0 ? (
+          {!readOnly && !revising && alternatives.length > 0 ? (
             <button
               className="button button--secondary"
               type="button"
@@ -289,7 +375,8 @@ export function RepairIssueInspector({
         </div>
       ) : null}
 
-      {item.kind !== "rejected_rule" &&
+      {!readOnly &&
+      item.kind !== "rejected_rule" &&
       showActions &&
       alternatives.length > 0 ? (
         <div className="repair-inspector__decision-panel">
@@ -341,48 +428,117 @@ export function RepairIssueInspector({
         </div>
       ) : null}
 
-      {decisionHistory.length > 0 ? (
-        <details className="repair-inspector__audit">
-          <summary>Audit des décisions ({decisionHistory.length})</summary>
-          <ol className="repair-inspector__audit-list">
-            {decisionHistory.map((entry) => (
-              <li key={entry.id}>
-                <dl>
-                  <div>
-                    <dt>Décision</dt>
-                    <dd>{repairActionLabel(entry.action)}</dd>
-                  </div>
-                  <div>
-                    <dt>Identité</dt>
-                    <dd>{entry.actor_id}</dd>
-                  </div>
-                  <div>
-                    <dt>Raison</dt>
-                    <dd>{entry.reason ?? "—"}</dd>
-                  </div>
-                  <div>
-                    <dt>Date</dt>
-                    <dd>{entry.created_at}</dd>
-                  </div>
-                </dl>
-              </li>
-            ))}
+      <section
+        className="repair-inspector__effective-decision"
+        aria-labelledby="repair-effective-decision-heading"
+      >
+        <h4 id="repair-effective-decision-heading">Décision effective</h4>
+        {effectiveAction ? (
+          <dl>
+            <div>
+              <dt>Décision</dt>
+              <dd>{repairActionLabel(effectiveAction)}</dd>
+            </div>
+            <div>
+              <dt>Identité</dt>
+              <dd>{effectiveDecision?.actor_id ?? "—"}</dd>
+            </div>
+            <div>
+              <dt>Date</dt>
+              <dd>
+                {effectiveDecision ? (
+                  <time dateTime={effectiveDecision.created_at}>
+                    {decisionTimestamp(effectiveDecision.created_at)}
+                  </time>
+                ) : (
+                  "—"
+                )}
+              </dd>
+            </div>
+            <div>
+              <dt>Application</dt>
+              <dd>{applicationLabel}</dd>
+            </div>
+          </dl>
+        ) : (
+          <p>Aucune décision n’a encore été prise sur cet élément.</p>
+        )}
+      </section>
+
+      <section
+        className="repair-inspector__audit"
+        aria-labelledby="repair-audit-heading"
+      >
+        <h4 id="repair-audit-heading">
+          Historique des décisions ({decisionHistory.length})
+        </h4>
+        {decisionHistory.length > 0 ? (
+          <ol
+            className="repair-inspector__audit-list"
+            aria-label="Historique des décisions"
+          >
+            {decisionHistory.map((entry) => {
+              const isEffective = entry.id === expectedEffectiveDecisionId;
+              return (
+                <li
+                  key={entry.id}
+                  className={
+                    isEffective
+                      ? "repair-audit-entry is-effective"
+                      : "repair-audit-entry"
+                  }
+                >
+                  <p className="repair-audit-entry__line">
+                    <time dateTime={entry.created_at}>
+                      {decisionTimestamp(entry.created_at)}
+                    </time>{" "}
+                    <span>{entry.actor_id}</span>{" "}
+                    <strong>{repairActionLabel(entry.action)}</strong>{" "}
+                    <span className="repair-audit-entry__application">
+                      {isEffective
+                        ? `décision effective — application : ${applicationLabel}`
+                        : SUPERSEDED_LABEL}
+                    </span>
+                  </p>
+                  <dl>
+                    <div>
+                      <dt>Artefact observé</dt>
+                      <dd>
+                        <code>{entry.observed_artifact_id}</code>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Génération observée</dt>
+                      <dd>{entry.observed_pipeline_generation}</dd>
+                    </div>
+                    <div>
+                      <dt>Raison</dt>
+                      <dd>{entry.reason ?? "—"}</dd>
+                    </div>
+                  </dl>
+                </li>
+              );
+            })}
           </ol>
-        </details>
-      ) : null}
+        ) : (
+          <p>Aucune décision enregistrée pour cet élément.</p>
+        )}
+      </section>
 
       {error ? (
         <p className="error-message" role="alert">
           {error}
         </p>
       ) : null}
-      <details className="repair-inspector__pipeline-link">
-        <summary>Voir le diagnostic pipeline</summary>
-        <p>
+      <p className="repair-inspector__pipeline-link">
+        <Link to={`/subjects/${item.subject_id}#production-rejections-heading`}>
+          Voir le diagnostic pipeline de cet article
+        </Link>{" "}
+        <span>
           Le tableau Pipeline conserve les diagnostics techniques détaillés de
           cet article. Les décisions de publication se prennent ici.
-        </p>
-      </details>
+        </span>
+      </p>
     </section>
   );
 }

@@ -26,6 +26,19 @@ from cti_app.domain.publication_review import (
     PublicationReviewDecision,
 )
 
+#: Statuses whose review and Repair Desk stay readable. Reading is separate
+#: from writing: an edition frozen for publication keeps its audit trail
+#: visible while every mutation policy keeps refusing it.
+READABLE_REVIEW_STATUSES = frozenset(
+    {
+        EditionStatus.PRODUCTION.value,
+        EditionStatus.REVIEW.value,
+        EditionStatus.ASSEMBLING.value,
+        EditionStatus.PUBLISHED.value,
+        EditionStatus.ARCHIVED.value,
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class EditionReviewReadItem:
@@ -177,6 +190,9 @@ class EditionRepairItem:
     # issue stays visible and arbitrable, but it is not a loss for the
     # publication scope and must not gate the edition.
     in_publication_scope: bool = True
+    # What the current projection really materializes, so an audit never reads
+    # "the analyst decided INCLUDE" as "the deliverable contains the value".
+    application_state: str = RepairDecisionApplicationState.UNRESOLVED.value
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,7 +286,7 @@ class EditionRepairReadService:
 
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
-            EditionReviewService._require_repair_desk(edition, edition_id)
+            EditionReviewService._require_readable(edition, edition_id)
             rows = await uow.edition_review_read_model.list_for_edition(edition_id)
 
         rows_by_subject = {row.subject_id: row for row in rows}
@@ -362,7 +378,7 @@ class EditionRepairReadService:
         artifact_type = getattr(issue, "artifact_type", None)
         artifact_id = getattr(issue, "observed_artifact_id", None)
         artifact_version = getattr(issue, "observed_artifact_version", None)
-        state = _issue_application_state(issue, decision)
+        state = issue_application_state(issue, decision)
         if is_source and pending_references:
             # The content exists; only the deterministic REFERENCES rebuild is
             # missing. This debt is served by the backend, so a page reload
@@ -446,6 +462,7 @@ class EditionRepairReadService:
             recommended_stage=recommended_stage,
             is_publication_ioc=is_ioc,
             in_publication_scope=_row_in_publication_scope(row),
+            application_state=state.value,
         )
 
 
@@ -454,7 +471,7 @@ def _issue_kind(issue: Any) -> str:
     return str(getattr(value, "value", value))
 
 
-def _issue_application_state(
+def issue_application_state(
     issue: Any, decision: Any
 ) -> RepairDecisionApplicationState:
     """Read the state the issue reader computed, or derive it for plain DTOs."""
@@ -486,7 +503,7 @@ def _issue_application_state(
 def _issue_is_unbuildable(issue: Any) -> bool:
     """An honoured INCLUDE nothing could materialize is a blocking debt."""
     return (
-        _issue_application_state(issue, getattr(issue, "effective_decision", None))
+        issue_application_state(issue, getattr(issue, "effective_decision", None))
         is RepairDecisionApplicationState.UNBUILDABLE
     )
 
@@ -655,7 +672,7 @@ class EditionReviewService:
     async def get(self, edition_id: UUID) -> EditionReview:
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
-            self._require_review(edition, edition_id)
+            self._require_readable(edition, edition_id)
             rows = await uow.edition_review_read_model.list_for_edition(edition_id)
         repairs = await self._repair_issues(edition_id) if self._repair_issue_reader else ()
         return self.from_rows(edition_id, rows, repair_issues=repairs)
@@ -826,16 +843,20 @@ class EditionReviewService:
             raise EditionReviewStatusError("edition_must_be_in_review")
 
     @staticmethod
-    def _require_repair_desk(edition: object, edition_id: UUID) -> None:
+    def _require_readable(edition: object, edition_id: UUID) -> None:
+        """Read policy: the audit trail survives the freeze.
+
+        Reading a historical review is not editing it. Every state from
+        PRODUCTION onwards -- the freeze and the publication included -- keeps
+        its Repair Desk legible; the write policies above stay unchanged, so a
+        frozen edition still refuses every mutation.
+        """
         if edition is None:
             raise EditionReviewNotFoundError(str(edition_id))
         edition_status = getattr(edition, "status", None)
         status_value = getattr(edition_status, "value", edition_status)
-        if status_value not in {
-            EditionStatus.REVIEW.value,
-            EditionStatus.PRODUCTION.value,
-        }:
-            raise EditionReviewStatusError("edition_must_be_in_review_or_production")
+        if status_value not in READABLE_REVIEW_STATUSES:
+            raise EditionReviewStatusError("edition_has_no_review")
 
 
 async def _get_edition_for_update(uow: object, edition_id: UUID) -> object:

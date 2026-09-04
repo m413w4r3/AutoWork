@@ -13,12 +13,15 @@ export function RepairRulePanel({
   detail,
   currentAction,
   onDecision,
+  readOnly,
   disabled,
 }: {
   detail: EditionRepairDetail;
   /** Effective action, or null while the rule is not arbitrated yet. */
   currentAction: ProductionRepairAction | null;
   onDecision: (action: ProductionRepairAction) => void;
+  /** A historical review keeps the rule body readable and offers no action. */
+  readOnly: boolean;
   disabled: boolean;
 }) {
   const alternatives = alternativeRepairActions("rejected_rule", currentAction);
@@ -45,7 +48,7 @@ export function RepairRulePanel({
           Décision actuelle : {repairActionLabel(currentAction)}
         </p>
       ) : null}
-      {alternatives.length > 0 ? (
+      {!readOnly && alternatives.length > 0 ? (
         <div className="repair-inspector__actions">
           {alternatives.map((action) => (
             <button

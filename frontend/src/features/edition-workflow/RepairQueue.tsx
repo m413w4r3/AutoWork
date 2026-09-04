@@ -116,6 +116,7 @@ export function RepairQueue({
   onSearchChange,
   onSelect,
   onToggleSelection,
+  selectable = true,
 }: {
   items: EditionRepairItem[];
   filter: RepairQueueFilter;
@@ -127,6 +128,11 @@ export function RepairQueue({
   onSearchChange: (value: string) => void;
   onSelect: (item: EditionRepairItem) => void;
   onToggleSelection: (item: EditionRepairItem, selected: boolean) => void;
+  /**
+   * False in a historical review: the queue stays fully readable but offers no
+   * bulk selection, since no arbitration can follow it.
+   */
+  selectable?: boolean;
 }) {
   const normalizedSearch = search.trim().toLocaleLowerCase("fr-FR");
   const visibleItems = items.filter((item) => {
@@ -209,14 +215,16 @@ export function RepairQueue({
                     <div
                       className={`repair-issue-row${selectedKey === item.repair_key ? " is-selected" : ""}`}
                     >
-                      <input
-                        type="checkbox"
-                        aria-label={`Sélectionner ${repairKindLabel(item)} ${item.preview || item.repair_key}`}
-                        checked={selectedKeys.has(item.repair_key)}
-                        onChange={(event) =>
-                          onToggleSelection(item, event.target.checked)
-                        }
-                      />
+                      {selectable ? (
+                        <input
+                          type="checkbox"
+                          aria-label={`Sélectionner ${repairKindLabel(item)} ${item.preview || item.repair_key}`}
+                          checked={selectedKeys.has(item.repair_key)}
+                          onChange={(event) =>
+                            onToggleSelection(item, event.target.checked)
+                          }
+                        />
+                      ) : null}
                       <button
                         className="repair-issue-row__button"
                         type="button"

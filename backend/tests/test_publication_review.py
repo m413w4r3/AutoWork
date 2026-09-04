@@ -336,11 +336,43 @@ async def test_stale_generation_does_not_append() -> None:
 
 
 @pytest.mark.asyncio
-async def test_wrong_edition_status_is_rejected() -> None:
+async def test_status_without_review_is_rejected() -> None:
     row = _row(SubjectProductionStatus.READY)
-    uow = _Uow(_edition(EditionStatus.PRODUCTION), row)
-    with pytest.raises(ValueError, match="edition_must_be_in_review"):
+    uow = _Uow(_edition(EditionStatus.SELECTION), row)
+    with pytest.raises(ValueError, match="edition_has_no_review"):
         await EditionReviewService(cast(Any, _Factory(uow))).get(EDITION_ID)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "edition_status",
+    [EditionStatus.PRODUCTION, EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED],
+)
+async def test_frozen_edition_stays_readable(edition_status: EditionStatus) -> None:
+    """Reading a historical review is not editing it (read/write split)."""
+    row = _row(SubjectProductionStatus.READY)
+    uow = _Uow(_edition(edition_status), row)
+    review = await EditionReviewService(cast(Any, _Factory(uow))).get(EDITION_ID)
+    assert [item.subject_id for item in review.items] == [SUBJECT_ID]
+
+
+@pytest.mark.asyncio
+async def test_published_edition_still_refuses_a_decision() -> None:
+    row = _row(SubjectProductionStatus.READY)
+    uow = _Uow(_edition(EditionStatus.PUBLISHED), row)
+    with pytest.raises(ValueError, match="edition_must_be_in_review"):
+        await EditionReviewService(cast(Any, _Factory(uow))).decide(
+            EDITION_ID,
+            SUBJECT_ID,
+            decision=PublicationDecision.INCLUDE,
+            production_run_id=RUN_ID,
+            pipeline_generation=2,
+            document_artifact_id=ARTIFACT_ID,
+            document_artifact_version=1,
+            document_input_hash=INPUT_HASH,
+            actor_id="analyst-1",
+        )
+    assert uow.publication_review_decisions.items == []
 
 
 def _api(uow: _Uow) -> FastAPI:

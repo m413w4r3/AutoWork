@@ -174,6 +174,7 @@ function renderReview(
     can_accept: true,
   },
   nextPage?: EditionRepairPage,
+  options: { readOnly?: boolean } = {},
 ) {
   const currentPage = { value: repairPage };
   // Append-only server log, so the detail endpoint can answer with the real
@@ -314,7 +315,7 @@ function renderReview(
   });
   render(
     <QueryClientProvider client={client}>
-      <ReviewConsole editionId={EDITION_ID} />
+      <ReviewConsole editionId={EDITION_ID} readOnly={options.readOnly} />
     </QueryClientProvider>,
   );
   return { client, fetchMock };
@@ -474,8 +475,18 @@ describe("Repair Desk", () => {
     ).toBeInTheDocument();
     // The audit keeps both events, never only the last one.
     expect(
-      await within(inspector).findByText("Audit des décisions (2)"),
+      await within(inspector).findByText("Historique des décisions (2)"),
     ).toBeInTheDocument();
+    const history = within(inspector).getByRole("list", {
+      name: "Historique des décisions",
+    });
+    const entries = within(history).getAllByRole("listitem");
+    expect(entries).toHaveLength(2);
+    // Oldest first: the superseded INCLUDE, then the effective EXCLUDE.
+    expect(entries[0]).toHaveTextContent(
+      /Inclus.*remplacée par une décision ultérieure/,
+    );
+    expect(entries[1]).toHaveTextContent(/Exclu.*décision effective/);
   });
 
   it("confirme une action groupée avec le nombre d’éléments", async () => {
@@ -768,5 +779,228 @@ describe("Repair Desk", () => {
         "Cet élément a changé depuis son ouverture. La file de réparation a été rechargée.",
       ),
     ).toBeInTheDocument();
+  });
+});
+
+describe("Repair Desk en revue historique (lecture seule)", () => {
+  it("charge et pagine 250 éléments sans offrir la moindre mutation", async () => {
+    const first = Array.from({ length: 200 }, (_, index) =>
+      repairItem({
+        repair_key: `repair-ioc-${index + 1}`,
+        preview: `value-${index + 1}.example`,
+      }),
+    );
+    const second = Array.from({ length: 50 }, (_, index) =>
+      repairItem({
+        repair_key: `repair-ioc-${index + 201}`,
+        preview: `value-${index + 201}.example`,
+      }),
+    );
+    const { fetchMock } = renderReview(
+      page(
+        first,
+        { unresolved_total: 250, rejected_iocs_to_review: 250 },
+        [],
+        "cursor-2",
+      ),
+      new Map(),
+      undefined,
+      page(second, { unresolved_total: 250, rejected_iocs_to_review: 250 }),
+      { readOnly: true },
+    );
+    const user = userEvent.setup();
+
+    // Read-only never disables reading: the queue really loads.
+    expect(await screen.findByText("200 affichés")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /IOC à arbitrer/ }),
+    ).toHaveTextContent("250");
+
+    await user.click(screen.getByRole("button", { name: "Charger la suite" }));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([input]) =>
+          urlOf(input).includes("cursor=cursor-2"),
+        ),
+      ).toBe(true),
+    );
+    expect(await screen.findByText("250 affichés")).toBeInTheDocument();
+
+    // No mutation control anywhere: no bulk selection, no decision, no rebuild.
+    expect(screen.queryAllByRole("checkbox")).toHaveLength(0);
+    expect(
+      screen.queryByRole("button", { name: /^Inclure/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^Exclure/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Reconstruire/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Accepter la production" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("rend lisibles le corps d’une règle et le détail d’une source", async () => {
+    const rule = repairItem({
+      repair_key: "repair-rule-1",
+      kind: "rejected_rule",
+      artifact_type: "yara",
+      preview: "rule Historique",
+      is_publication_ioc: false,
+    });
+    const source = repairItem({
+      repair_key: "source-1",
+      kind: "supplemental_source_unarchived",
+      source_id: "Q1",
+      source_title: "Source proposée",
+      preview: "https://source.example/blocked",
+      reason_code: "supplemental_source_unarchived",
+      collection_id: "collection-1",
+      collection_state: "unavailable",
+      is_publication_ioc: false,
+    });
+    const details = new Map<string, EditionRepairDetail>([
+      [
+        rule.repair_key,
+        { ...detailFor(rule), body: "rule Historique { condition: true }" },
+      ],
+      [source.repair_key, detailFor(source)],
+    ]);
+    renderReview(page([rule, source]), details, undefined, undefined, {
+      readOnly: true,
+    });
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", { name: /rule Historique/ }),
+    );
+    expect(
+      await screen.findByText("rule Historique { condition: true }"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", {
+        name: "Inclure la règle dans le livrable",
+      }),
+    ).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: /source\.example\/blocked/ }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: /Source proposée par Q1/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Déposer un fichier"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Archiver cette source" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("expose l’historique, l’application de la décision et le lien pipeline", async () => {
+    const item = repairItem({
+      resolved: true,
+      effective_action: "include",
+      effective_decision_id: "decision-3",
+      application_state: "projection_required",
+    });
+    const history: ProductionRepairDecision[] = [
+      {
+        id: "decision-1",
+        action: "include",
+        actor_id: "alice",
+        reason: null,
+        created_at: "2026-09-04T18:02:00+00:00",
+        observed_artifact_id: "artifact-ioc-1",
+        observed_pipeline_generation: 3,
+      },
+      {
+        id: "decision-2",
+        action: "exclude",
+        actor_id: "alice",
+        reason: "doublon",
+        created_at: "2026-09-04T18:07:00+00:00",
+        observed_artifact_id: "artifact-ioc-1",
+        observed_pipeline_generation: 3,
+      },
+      {
+        id: "decision-3",
+        action: "include",
+        actor_id: "bob",
+        reason: null,
+        created_at: "2026-09-04T18:10:00+00:00",
+        observed_artifact_id: "artifact-ioc-1",
+        observed_pipeline_generation: 4,
+      },
+    ];
+    const details = new Map<string, EditionRepairDetail>([
+      [
+        item.repair_key,
+        {
+          ...detailFor(item),
+          effective_decision: history[2]!,
+          decision_history: history,
+          application_state: "projection_required",
+        },
+      ],
+    ]);
+    renderReview(page([item]), details, undefined, undefined, {
+      readOnly: true,
+    });
+    const user = userEvent.setup();
+    // An arbitrated issue stays reachable through the "Résolus" filter.
+    await user.click(await screen.findByRole("button", { name: "Résolus" }));
+    await user.click(
+      await screen.findByRole("button", { name: /evil\.example/ }),
+    );
+    const inspector = await screen.findByRole("region", {
+      name: "Article audit",
+    });
+
+    // The decision and its materialization are two separate statements.
+    const effective = within(inspector).getByRole("region", {
+      name: "Décision effective",
+    });
+    expect(effective).toHaveTextContent("Inclus");
+    expect(effective).toHaveTextContent("bob");
+    expect(effective).toHaveTextContent("en attente de rebuild");
+
+    const entries = within(
+      await within(inspector).findByRole("list", {
+        name: "Historique des décisions",
+      }),
+    ).getAllByRole("listitem");
+    expect(entries).toHaveLength(3);
+    expect(entries[0]).toHaveTextContent(
+      /alice.*Inclus.*remplacée par une décision ultérieure/,
+    );
+    expect(entries[1]).toHaveTextContent(
+      /alice.*Exclu.*remplacée par une décision ultérieure/,
+    );
+    expect(entries[2]).toHaveTextContent(
+      /bob.*Inclus.*décision effective — application : en attente de rebuild/,
+    );
+
+    // The deliverable that resulted from the pipeline stays identified.
+    const provenance = within(inspector).getByRole("region", {
+      name: "Provenance",
+    });
+    expect(provenance).toHaveTextContent("document-1");
+
+    expect(
+      within(inspector).getByRole("link", {
+        name: "Voir le diagnostic pipeline de cet article",
+      }),
+    ).toHaveAttribute(
+      "href",
+      "/subjects/subject-1#production-rejections-heading",
+    );
+
+    // A read-only audit still refuses every revision.
+    expect(
+      within(inspector).queryByRole("button", { name: "Modifier la décision" }),
+    ).not.toBeInTheDocument();
   });
 });

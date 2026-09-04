@@ -37,6 +37,7 @@ from cti_app.application.edition_review import (
     InvalidReviewDocumentError,
     InvalidReviewReasonError,
     ReviewItemStaleError,
+    issue_application_state,
 )
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.production_repairs import (
@@ -60,6 +61,7 @@ from cti_app.domain.production import (
     ProductionReconciliationRequiredError,
     ProductionRepairAction,
     ProductionRepairIssueKind,
+    RepairDecisionApplicationState,
     SubjectProductionStage,
     SubjectProductionStatus,
 )
@@ -217,6 +219,7 @@ class EditionRepairItemView(BaseModel):
     repair_state: str | None = None
     is_publication_ioc: bool
     in_publication_scope: bool = True
+    application_state: str = RepairDecisionApplicationState.UNRESOLVED.value
 
 
 class EditionRepairSummaryView(BaseModel):
@@ -497,6 +500,19 @@ def _repair_detail(code: str, repair_key: str | None) -> dict[str, str]:
     return {"code": code} | ({"repair_key": repair_key} if repair_key else {})
 
 
+def _repair_application_state(issue: Any | None) -> str:
+    """Say what the current projection materializes, never what was decided.
+
+    An arbitration and a deliverable are two different facts: the audit must
+    never read "the analyst decided INCLUDE" as "the artifact contains it".
+    """
+    if issue is None:
+        return RepairDecisionApplicationState.UNRESOLVED.value
+    return issue_application_state(
+        issue, getattr(issue, "effective_decision", None)
+    ).value
+
+
 def _production_repair_decision_history_view(
     history: Sequence[Any],
 ) -> list[dict[str, Any]]:
@@ -561,6 +577,7 @@ async def get_edition_review_repair_detail(
                 if source_detail
                 else None
             ),
+            "application_state": _repair_application_state(source_detail),
             "decision_history": _production_repair_decision_history_view(
                 await _repair_adjudication_service(request).decision_history(
                     edition_id, repair_key, subject_id
@@ -597,6 +614,7 @@ async def get_edition_review_repair_detail(
         "effective_decision": _production_repair_decision_view(
             issue_detail.issue.effective_decision
         ),
+        "application_state": _repair_application_state(issue_detail.issue),
         "decision_history": _production_repair_decision_history_view(
             issue_detail.decision_history
         ),
@@ -1323,6 +1341,7 @@ def _repair_item_view(item: EditionRepairItem) -> dict[str, Any]:
         "repair_state": item.repair_state,
         "is_publication_ioc": item.is_publication_ioc,
         "in_publication_scope": item.in_publication_scope,
+        "application_state": item.application_state,
     }
 
 

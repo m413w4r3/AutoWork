@@ -2238,15 +2238,70 @@ h1 {
 
 .repair-inspector__technical,
 .repair-inspector__audit,
+.repair-inspector__provenance,
+.repair-inspector__effective-decision,
 .repair-inspector__pipeline-link {
   color: #55665c;
   font-size: 0.85rem;
 }
 
-.repair-inspector__technical summary,
-.repair-inspector__audit summary,
-.repair-inspector__pipeline-link summary {
+.repair-inspector__technical summary {
   cursor: pointer;
+  font-weight: 700;
+}
+
+/* The audit separates two facts that must never be read as one: what was
+   decided, and what the current projection really materializes. */
+.repair-inspector__audit,
+.repair-inspector__provenance,
+.repair-inspector__effective-decision {
+  display: grid;
+  gap: 0.5rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid #d4ded7;
+}
+
+.repair-inspector__audit h4,
+.repair-inspector__provenance h4,
+.repair-inspector__effective-decision h4 {
+  margin: 0;
+  color: #1f2d24;
+  font-size: 0.9rem;
+}
+
+.repair-inspector__provenance dl,
+.repair-inspector__effective-decision dl {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+}
+
+.repair-inspector__provenance dl > div,
+.repair-inspector__effective-decision dl > div {
+  display: grid;
+  gap: 0.12rem;
+}
+
+.repair-inspector__provenance dt,
+.repair-inspector__effective-decision dt {
+  color: #55665c;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.repair-inspector__provenance dd,
+.repair-inspector__effective-decision dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.repair-audit-entry__line {
+  margin: 0 0 0.35rem;
+}
+
+.repair-audit-entry.is-effective .repair-audit-entry__application {
+  color: #1f6042;
   font-weight: 700;
 }
 

@@ -127,8 +127,9 @@ export function RepairDesk({
       }),
     initialPageParam: null as string | null,
     getNextPageParam: (lastPage) => lastPage.next_cursor,
-    enabled: !readOnly,
-    refetchInterval: hasActiveReviewRun ? 2_000 : false,
+    // Read-only never disables reading: a historical review must show the same
+    // queue, counters and evidence. Only the mutations below are withdrawn.
+    refetchInterval: hasActiveReviewRun && !readOnly ? 2_000 : false,
   });
 
   const pages = repairs.data?.pages ?? EMPTY_REPAIR_PAGES;
@@ -181,6 +182,8 @@ export function RepairDesk({
     () => new Map(reviewItems.map((item) => [item.subject_id, item.title])),
     [reviewItems],
   );
+  const selectedItem =
+    items.find((item) => item.repair_key === selectedKey) ?? null;
   const selectedBulkItems = items.filter(
     (item) =>
       selectedKeys.has(item.repair_key) &&
@@ -421,124 +424,129 @@ export function RepairDesk({
         </p>
       ) : null}
 
-      {!readOnly ? (
-        <div className="repair-desk__workspace">
-          <div>
-            <RepairQueue
-              items={visibleItems}
-              filter={filter}
-              search={search}
-              selectedKey={selectedKey}
-              selectedKeys={selectedKeys}
-              blockingSubjectIds={blockingSubjectIds}
-              onFilterChange={handleFilterChange}
-              onSearchChange={setSearch}
-              onSelect={(item) => {
-                setSelectedKey(item.repair_key);
-                setMessage(null);
-              }}
-              onToggleSelection={(item, selected) => {
-                setSelectedKeys((current) => {
-                  const next = new Set(current);
-                  if (selected) next.add(item.repair_key);
-                  else next.delete(item.repair_key);
-                  return next;
-                });
-              }}
-            />
-            {selectedKeys.size > 0 ? (
-              <div
-                className="repair-bulk-actions"
-                aria-label="Actions groupées"
-              >
-                <p>
-                  {selectedKeys.size} élément{selectedKeys.size > 1 ? "s" : ""}{" "}
-                  sélectionné
-                  {selectedKeys.size > 1 ? "s" : ""}.
-                </p>
-                {selectedBulkItems.length !== selectedKeys.size ? (
-                  <p>
-                    Les sources ne peuvent pas être incluses ou exclues en
-                    action groupée.
-                  </p>
-                ) : null}
-                {bulkAction ? (
-                  <div className="repair-bulk-actions__confirmation">
-                    <p>
-                      Confirmer l&apos;{actionLabel(bulkAction)} de{" "}
-                      {selectedBulkItems.length} élément
-                      {selectedBulkItems.length > 1 ? "s" : ""} ?
-                    </p>
-                    <button
-                      className="button"
-                      type="button"
-                      disabled={
-                        decideBulk.isPending || selectedBulkItems.length === 0
-                      }
-                      onClick={() => decideBulk.mutate(bulkAction)}
-                    >
-                      Confirmer l&apos;{actionLabel(bulkAction)} de{" "}
-                      {selectedBulkItems.length} élément
-                      {selectedBulkItems.length > 1 ? "s" : ""}
-                    </button>
-                    <button
-                      className="button button--secondary"
-                      type="button"
-                      onClick={() => setBulkAction(null)}
-                    >
-                      Annuler
-                    </button>
-                  </div>
-                ) : (
-                  <div className="repair-desk__actions">
-                    <button
-                      className="button"
-                      type="button"
-                      disabled={selectedBulkItems.length !== selectedKeys.size}
-                      onClick={() => setBulkAction("include")}
-                    >
-                      Inclure {selectedBulkItems.length} éléments
-                    </button>
-                    <button
-                      className="button button--danger"
-                      type="button"
-                      disabled={selectedBulkItems.length !== selectedKeys.size}
-                      onClick={() => setBulkAction("exclude")}
-                    >
-                      Exclure {selectedBulkItems.length} éléments
-                    </button>
-                  </div>
-                )}
-              </div>
-            ) : null}
-          </div>
-          <RepairIssueInspector
-            editionId={editionId}
-            item={items.find((item) => item.repair_key === selectedKey) ?? null}
-            readOnly={readOnly}
-            onChanged={changeRepair}
-            onArchived={(item) => {
-              const recommendedStage = item.recommended_stage;
-              if (recommendedStage) {
-                setForcedRebuilds((current) => {
-                  const next = new Map(current);
-                  next.set(item.subject_id, recommendedStage);
-                  return next;
-                });
-              }
-              setMessage(
-                "Source archivée — reconstruction des références nécessaire.",
-              );
+      {readOnly ? (
+        <p className="workflow-read-only-note">
+          Cette revue historique est disponible en lecture seule : la file, les
+          preuves et l’audit des décisions restent consultables, aucune
+          modification n’est possible.
+        </p>
+      ) : null}
+
+      <div className="repair-desk__workspace">
+        <div>
+          <RepairQueue
+            selectable={!readOnly}
+            items={visibleItems}
+            filter={filter}
+            search={search}
+            selectedKey={selectedKey}
+            selectedKeys={selectedKeys}
+            blockingSubjectIds={blockingSubjectIds}
+            onFilterChange={handleFilterChange}
+            onSearchChange={setSearch}
+            onSelect={(item) => {
+              setSelectedKey(item.repair_key);
+              setMessage(null);
+            }}
+            onToggleSelection={(item, selected) => {
+              setSelectedKeys((current) => {
+                const next = new Set(current);
+                if (selected) next.add(item.repair_key);
+                else next.delete(item.repair_key);
+                return next;
+              });
             }}
           />
+          {!readOnly && selectedKeys.size > 0 ? (
+            <div className="repair-bulk-actions" aria-label="Actions groupées">
+              <p>
+                {selectedKeys.size} élément{selectedKeys.size > 1 ? "s" : ""}{" "}
+                sélectionné
+                {selectedKeys.size > 1 ? "s" : ""}.
+              </p>
+              {selectedBulkItems.length !== selectedKeys.size ? (
+                <p>
+                  Les sources ne peuvent pas être incluses ou exclues en action
+                  groupée.
+                </p>
+              ) : null}
+              {bulkAction ? (
+                <div className="repair-bulk-actions__confirmation">
+                  <p>
+                    Confirmer l&apos;{actionLabel(bulkAction)} de{" "}
+                    {selectedBulkItems.length} élément
+                    {selectedBulkItems.length > 1 ? "s" : ""} ?
+                  </p>
+                  <button
+                    className="button"
+                    type="button"
+                    disabled={
+                      decideBulk.isPending || selectedBulkItems.length === 0
+                    }
+                    onClick={() => decideBulk.mutate(bulkAction)}
+                  >
+                    Confirmer l&apos;{actionLabel(bulkAction)} de{" "}
+                    {selectedBulkItems.length} élément
+                    {selectedBulkItems.length > 1 ? "s" : ""}
+                  </button>
+                  <button
+                    className="button button--secondary"
+                    type="button"
+                    onClick={() => setBulkAction(null)}
+                  >
+                    Annuler
+                  </button>
+                </div>
+              ) : (
+                <div className="repair-desk__actions">
+                  <button
+                    className="button"
+                    type="button"
+                    disabled={selectedBulkItems.length !== selectedKeys.size}
+                    onClick={() => setBulkAction("include")}
+                  >
+                    Inclure {selectedBulkItems.length} éléments
+                  </button>
+                  <button
+                    className="button button--danger"
+                    type="button"
+                    disabled={selectedBulkItems.length !== selectedKeys.size}
+                    onClick={() => setBulkAction("exclude")}
+                  >
+                    Exclure {selectedBulkItems.length} éléments
+                  </button>
+                </div>
+              )}
+            </div>
+          ) : null}
         </div>
-      ) : (
-        <p className="workflow-read-only-note">
-          Cette revue historique est disponible en lecture seule.
-        </p>
-      )}
+        <RepairIssueInspector
+          editionId={editionId}
+          item={selectedItem}
+          article={
+            reviewItems.find(
+              (candidate) => candidate.subject_id === selectedItem?.subject_id,
+            ) ?? null
+          }
+          readOnly={readOnly}
+          onChanged={changeRepair}
+          onArchived={(item) => {
+            const recommendedStage = item.recommended_stage;
+            if (recommendedStage) {
+              setForcedRebuilds((current) => {
+                const next = new Map(current);
+                next.set(item.subject_id, recommendedStage);
+                return next;
+              });
+            }
+            setMessage(
+              "Source archivée — reconstruction des références nécessaire.",
+            );
+          }}
+        />
+      </div>
 
-      {!readOnly && repairs.hasNextPage ? (
+      {repairs.hasNextPage ? (
         <button
           className="button button--secondary repair-desk__load-more"
           type="button"

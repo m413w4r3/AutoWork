@@ -18,6 +18,15 @@ export type ProductionRepairAction =
   "include" | "exclude" | "continue_without_source";
 
 /**
+ * What the current projection really materializes. Deciding and materializing
+ * are two distinct facts: an INCLUDE stays `projection_required` until a
+ * rebuild puts the value in the artifact, and `unbuildable` marks an honoured
+ * INCLUDE the deterministic pipeline can never project.
+ */
+export type RepairDecisionApplicationState =
+  "already_effective" | "projection_required" | "unbuildable" | "unresolved";
+
+/**
  * Durable state of a Q1 proposal missing from the current canonical
  * ReferenceReport. `archived_pending_references` means the analyst already
  * supplied the content and only the deterministic rebuild is missing: the
@@ -142,6 +151,7 @@ export interface EditionRepairItem {
   is_publication_ioc: boolean;
   /** False when the analyst excluded the article from the deliverable. */
   in_publication_scope?: boolean;
+  application_state?: RepairDecisionApplicationState;
 }
 
 export interface EditionRepairSummary {
@@ -191,6 +201,12 @@ export interface EditionRepairDetail {
   rebuild_required?: boolean;
   recommended_action?: string | null;
   effective_decision?: ProductionRepairDecision | null;
+  /**
+   * What the current projection materializes for the effective decision. Never
+   * inferred from the action: the backend compares the decision with the
+   * projection marker of the artifact that is really in place.
+   */
+  application_state?: RepairDecisionApplicationState;
   /**
    * Complete append-only audit, oldest first. A decision is revisable, so the
    * last entry is the effective one and the earlier ones explain the change.

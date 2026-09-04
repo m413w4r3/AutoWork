@@ -40,7 +40,7 @@ SUBJECT_A = UUID("22222222-2222-4222-8222-222222222222")
 SUBJECT_B = UUID("33333333-3333-4333-8333-333333333333")
 
 
-def _edition() -> Edition:
+def _edition(status: EditionStatus = EditionStatus.REVIEW) -> Edition:
     return Edition(
         id=EDITION_ID,
         country="France",
@@ -51,7 +51,7 @@ def _edition() -> Edition:
         languages=("fr",),
         target_articles=2,
         source_profile="test",
-        status=EditionStatus.REVIEW,
+        status=status,
     )
 
 
@@ -75,9 +75,15 @@ def _row(subject_id: UUID, position: int) -> EditionReviewReadItem:
 
 
 class _ReadModelUow:
-    def __init__(self, rows: list[EditionReviewReadItem]) -> None:
+    def __init__(
+        self,
+        rows: list[EditionReviewReadItem],
+        edition_status: EditionStatus = EditionStatus.REVIEW,
+    ) -> None:
         self.rows = rows
-        self.editions = SimpleNamespace(get=lambda _edition_id: _async_value(_edition()))
+        self.editions = SimpleNamespace(
+            get=lambda _edition_id: _async_value(_edition(edition_status))
+        )
         self.edition_review_read_model = SimpleNamespace(
             list_for_edition=lambda _edition_id: _async_value(self.rows)
         )
@@ -509,10 +515,11 @@ class _BulkUow:
         self,
         runs: dict[UUID, SubjectProductionRun],
         artifacts: dict[UUID, ProductionArtifact],
+        edition_status: EditionStatus = EditionStatus.REVIEW,
     ) -> None:
         self.editions = SimpleNamespace(
             get_for_update=lambda _edition_id: _async_value(
-                SimpleNamespace(status=EditionStatus.REVIEW)
+                SimpleNamespace(status=edition_status)
             )
         )
         self.subject_production_runs = SimpleNamespace(
@@ -534,6 +541,7 @@ class _BulkUow:
 
 def _bulk_case(
     status_b: ProductionArtifactStatus = ProductionArtifactStatus.VERIFIED,
+    edition_status: EditionStatus = EditionStatus.REVIEW,
 ) -> tuple[_BulkUow, list[ProductionRepairDecisionInput]]:
     runs: dict[UUID, SubjectProductionRun] = {}
     artifacts: dict[UUID, ProductionArtifact] = {}
@@ -570,7 +578,7 @@ def _bulk_case(
                 action=ProductionRepairAction.EXCLUDE,
             )
         )
-    return _BulkUow(runs, artifacts), inputs
+    return _BulkUow(runs, artifacts, edition_status), inputs
 
 
 @pytest.mark.asyncio
@@ -595,3 +603,89 @@ async def test_bulk_repair_decision_is_single_commit_and_rolls_back_on_stale_ite
         )
     assert stale_uow.production_repair_decisions.items == []
     assert stale_uow.commits == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "edition_status",
+    [EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED, EditionStatus.ARCHIVED],
+)
+async def test_frozen_edition_repair_desk_stays_readable(
+    edition_status: EditionStatus,
+) -> None:
+    """A historical review shows its real queue; only writes are frozen."""
+    row = _row(SUBJECT_A, 1)
+    service = EditionRepairReadService(
+        _ReadModelFactory(_ReadModelUow([row], edition_status)),  # type: ignore[arg-type]
+        _IssueReader([_issue(index, row) for index in range(250)]),
+    )
+
+    collected = []
+    page = await service.list(EDITION_ID, status="all", limit=100)
+    collected.extend(page.items)
+    while page.next_cursor is not None:
+        page = await service.list(
+            EDITION_ID, status="all", cursor=page.next_cursor, limit=100
+        )
+        collected.extend(page.items)
+
+    assert len(collected) == 250
+    assert page.summary.rejected_iocs_to_review == 250
+
+
+@pytest.mark.asyncio
+async def test_frozen_edition_still_refuses_a_repair_decision() -> None:
+    """Read policy and write policy are separate: the freeze only blocks writes."""
+    uow, inputs = _bulk_case(edition_status=EditionStatus.PUBLISHED)
+
+    with pytest.raises(ValueError, match="edition_frozen_for_publication"):
+        await ProductionRepairDecisionService(lambda: uow).decide_bulk(
+            edition_id=EDITION_ID,
+            decisions=inputs,
+            actor_id="analyst",
+        )
+
+    assert uow.production_repair_decisions.items == []
+    assert uow.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_repair_items_expose_the_application_state_of_their_decision() -> None:
+    """"Decided" and "materialized" are two different facts for the audit."""
+    row = _row(SUBJECT_A, 1)
+    issues = [
+        _issue(1, row),
+        _issue(
+            2,
+            row,
+            resolved=True,
+            action=ProductionRepairAction.INCLUDE,
+        ),
+        _issue(
+            3,
+            row,
+            resolved=True,
+            action=ProductionRepairAction.INCLUDE,
+            projection_applied=True,
+        ),
+    ]
+    read_service = EditionRepairReadService(
+        _ReadModelFactory(_ReadModelUow([row])), _IssueReader(issues)  # type: ignore[arg-type]
+    )
+    application = FastAPI()
+    application.include_router(router)
+    application.state.edition_repair_read_service = read_service
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/api/editions/{EDITION_ID}/review/repairs", params={"status": "all"}
+        )
+
+    assert response.status_code == 200
+    assert [item["application_state"] for item in response.json()["items"]] == [
+        "unresolved",
+        "projection_required",
+        "already_effective",
+    ]
