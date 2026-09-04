@@ -12,6 +12,7 @@ import hashlib
 import json
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -22,9 +23,11 @@ from httpx import ASGITransport, AsyncClient
 
 from cti_app.api import production as production_api
 from cti_app.api.production import router
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.production_parsers import technical_extraction_from_json
 from cti_app.application.production_read_model import BatchStatusItem
+from cti_app.application.production_reconciliation_resolver import ReconciliationOutcome
 from cti_app.application.production_state import (
     ProductionStateSnapshotV1,
     compute_production_state_checksum,
@@ -58,6 +61,7 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
+from cti_app.integrations.models import BridgeTransportError
 from cti_app.logging import CorrelationIdMiddleware
 
 
@@ -522,6 +526,14 @@ class _FailingModel:
 
     def __getattr__(self, name: str) -> object:
         raise AssertionError(f"model must not be called during state import: {name}")
+
+
+class _Bridge404:
+    async def retrieve(self, response_id: str) -> dict[str, Any]:
+        del response_id
+        raise BridgeTransportError(
+            "bridge_protocol_error", "not found", retryable=False, status_code=404
+        )
 
 
 class _ArtifactStore:
@@ -2027,6 +2039,99 @@ async def test_retry_by_subject_is_refused_while_reconciliation_is_pending(
         artifact.status is ProductionArtifactStatus.VERIFIED
         for artifact in uow.production_artifacts.items
     )
+
+
+async def test_reconciliation_probe_rejects_a_run_without_reconciliation(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    run = _terminal_run(uuid4(), uuid4(), status=SubjectProductionStatus.NEEDS_REVIEW)
+    await uow.subject_production_runs.add(run)
+
+    response = await api.post(f"/api/production/runs/{run.id}/reconciliation/probe")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "production_reconciliation_not_required"
+
+
+async def test_reconciliation_probe_404_releases_the_run(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    run = _reconciliation_run(uuid4(), uuid4())
+    await uow.subject_production_runs.add(run)
+    production_app.state.bridge_capabilities_provider = _Bridge404()
+
+    response = await api.post(f"/api/production/runs/{run.id}/reconciliation/probe")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"outcome": "released", "bridge_status": "not_found"}
+    assert uow.subject_production_runs.items[run.id].requires_reconciliation is False
+
+
+async def test_declare_lost_returns_resumed_without_releasing_when_probe_finds_answer(
+    api: AsyncClient, uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _reconciliation_run(uuid4(), uuid4())
+    await uow.subject_production_runs.add(run)
+
+    class _ResumedProbe:
+        _last_bridge_status = "completed"
+
+        async def resolve(self, run_id: UUID) -> ReconciliationOutcome:
+            assert run_id == run.id
+            return ReconciliationOutcome.RESUMED
+
+    monkeypatch.setattr(
+        production_api,
+        "_production_reconciliation_resolver",
+        lambda request: _ResumedProbe(),
+    )
+
+    response = await api.post(
+        f"/api/production/runs/{run.id}/reconciliation/declare-lost",
+        json={"confirm": True, "reason": "Ne pas jeter la réponse retrouvée"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"outcome": "resumed", "bridge_status": "completed"}
+    assert uow.subject_production_runs.items[run.id].requires_reconciliation is True
+
+
+async def test_declare_lost_requires_explicit_confirmation(api: AsyncClient) -> None:
+    response = await api.post(
+        f"/api/production/runs/{uuid4()}/reconciliation/declare-lost",
+        json={"confirm": False},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == (
+        "production_reconciliation_confirmation_required"
+    )
+
+
+async def test_declare_lost_releases_and_audits_the_run(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI, tmp_path: Path
+) -> None:
+    run = _reconciliation_run(uuid4(), uuid4())
+    await uow.subject_production_runs.add(run)
+    production_app.state.identity_provider = LocalIdentityProvider("analyst-1")
+    production_app.state.production_diagnostics = DiagnosticsLog.from_env(tmp_path)
+
+    response = await api.post(
+        f"/api/production/runs/{run.id}/reconciliation/declare-lost",
+        json={"confirm": True, "reason": "Conversation recherchée dans l'historique"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"outcome": "released", "declared_lost": True}
+    assert uow.subject_production_runs.items[run.id].requires_reconciliation is False
+    event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
+    assert event["event"] == "production.reconciliation_declared_lost"
+    assert event["run_id"] == str(run.id)
+    assert event["subject_id"] == str(run.subject_id)
+    assert event["stage"] == run.current_stage.value
+    assert event["bridge_run_id"] == "bridge-1"
+    assert event["actor_id"] == "analyst-1"
+    assert event["reason"] == "Conversation recherchée dans l'historique"
 
 
 async def test_retry_by_run_is_refused_while_reconciliation_is_pending(

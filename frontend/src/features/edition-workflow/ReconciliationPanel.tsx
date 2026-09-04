@@ -4,6 +4,8 @@ import { useState } from "react";
 import {
   adoptProductionReconciliationManual,
   adoptProductionReconciliationVisible,
+  declareProductionReconciliationLost,
+  probeProductionReconciliation,
   previewProductionReconciliationManual,
   previewProductionReconciliationVisible,
   type ProductionReconciliation,
@@ -34,6 +36,10 @@ export function ReconciliationPanel({
   );
   const [manual, setManual] = useState("");
   const [showManual, setShowManual] = useState(false);
+  const [reason, setReason] = useState("");
+  const [probeResult, setProbeResult] = useState<Awaited<
+    ReturnType<typeof probeProductionReconciliation>
+  > | null>(null);
   const visiblePreview = useMutation({
     mutationFn: () => previewProductionReconciliationVisible(runId),
     retry: false,
@@ -57,12 +63,29 @@ export function ReconciliationPanel({
     retry: false,
     onSuccess: onRecovered,
   });
+  const probe = useMutation({
+    mutationFn: () => probeProductionReconciliation(runId),
+    retry: false,
+    onSuccess: (result) => {
+      setProbeResult(result);
+      if (result.outcome === "resumed" || result.outcome === "released") {
+        onRecovered();
+      }
+    },
+  });
+  const declareLost = useMutation({
+    mutationFn: () => declareProductionReconciliationLost(runId, reason),
+    retry: false,
+    onSuccess: onRecovered,
+  });
 
   const error =
     visiblePreview.error ||
     visibleAdopt.error ||
     manualPreview.error ||
-    manualAdopt.error;
+    manualAdopt.error ||
+    probe.error ||
+    declareLost.error;
   const isManualPreview = preview?.metadata.source === "manual_import";
   return (
     <div
@@ -156,6 +179,50 @@ export function ReconciliationPanel({
           </button>
         </div>
       ) : null}
+      <button
+        className="button button--secondary"
+        type="button"
+        disabled={probe.isPending}
+        onClick={() => probe.mutate()}
+      >
+        {probe.isPending ? "Vérification…" : "Vérifier auprès du bridge"}
+      </button>
+      {probeResult ? (
+        <p role="status">
+          {probeResult.outcome === "resumed"
+            ? "La réponse a été retrouvée et adoptée."
+            : probeResult.outcome === "released"
+              ? "Le bridge ne connaît plus cette soumission. L’étape peut être relancée."
+              : "Le bridge n’a pas pu trancher. Réessayez plus tard, ou déclarez la réponse perdue."}
+        </p>
+      ) : null}
+      <details>
+        <summary>La réponse ChatGPT est définitivement perdue</summary>
+        <p>
+          Cette action autorise une nouvelle soumission du même prompt. Si le
+          modèle avait déjà répondu, cette réponse sera perdue et le coût sera
+          payé deux fois. Ne l’utilisez qu’après avoir vérifié auprès du bridge
+          et cherché la conversation dans l’historique ChatGPT.
+        </p>
+        <label>
+          Raison (facultatif)
+          <textarea
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+            rows={3}
+          />
+        </label>
+        <button
+          className="button button--danger"
+          type="button"
+          disabled={declareLost.isPending}
+          onClick={() => declareLost.mutate()}
+        >
+          {declareLost.isPending
+            ? "Déblocage…"
+            : "Déclarer perdue et débloquer"}
+        </button>
+      </details>
       {error ? (
         <p className="error-message" role="alert">
           {error instanceof Error

@@ -306,6 +306,37 @@ async def test_in_progress_bridge_run_stays_undecided() -> None:
     assert conversations.calls == []
 
 
+@pytest.mark.asyncio
+async def test_declared_lost_releases_and_records_the_analyst_claim(tmp_path: Path) -> None:
+    resolver, run, _, _, conversations, gateway = _fixture(
+        BridgeTransportError("bridge_timeout", "timeout", retryable=True)
+    )
+    resolver._diagnostics = DiagnosticsLog.from_env(tmp_path)
+
+    assert (
+        await resolver.release_declared_lost(
+            run.id, "Chrome a été fermé et la conversation est introuvable", actor_id="analyst-1"
+        )
+        is ReconciliationOutcome.RELEASED
+    )
+    assert run.requires_reconciliation is False
+    assert run.error_code == "production_reconciliation_declared_lost"
+    assert conversations.calls == [(run.references_conversation_id, False, run.subject_id)]
+    assert gateway.calls == []
+    event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
+    assert event == {
+        "at": event["at"],
+        "event": "production.reconciliation_declared_lost",
+        "run_id": str(run.id),
+        "pid": event["pid"],
+        "subject_id": str(run.subject_id),
+        "stage": "references",
+        "bridge_run_id": "bridge-request:a1",
+        "actor_id": "analyst-1",
+        "reason": "Chrome a été fermé et la conversation est introuvable",
+    }
+
+
 class _Jobs:
     def __init__(self) -> None:
         self.submitted: list[SimpleNamespace] = []

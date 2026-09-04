@@ -173,8 +173,15 @@ class ProductionReconciliationResolver:
         return ReconciliationOutcome.RESUMED
 
     async def _release(
-        self, run_id: UUID, original: SubjectProductionRun
+        self,
+        run_id: UUID,
+        original: SubjectProductionRun,
+        *,
+        reason: str = "bridge_run_unavailable",
+        audit_reason: str | None = None,
+        actor_id: str | None = None,
     ) -> ReconciliationOutcome:
+        bridge_run_id = _bridge_run_id(original)
         await self._reconcile_conversation(original, available=False)
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_for_update(run_id)
@@ -182,10 +189,35 @@ class ProductionReconciliationResolver:
                 return ReconciliationOutcome.UNDECIDED
             if run.reconciliation is None or run.current_stage is not original.current_stage:
                 return ReconciliationOutcome.UNDECIDED
-            run.release_reconciliation(expected_stage=run.current_stage)
+            run.release_reconciliation(expected_stage=run.current_stage, reason=reason)
             await uow.subject_production_runs.save(run)
             await uow.commit()
+        if audit_reason is not None:
+            self._diagnostics.record(
+                event="production.reconciliation_declared_lost",
+                run_id=run_id,
+                subject_id=original.subject_id,
+                stage=original.current_stage.value,
+                bridge_run_id=bridge_run_id,
+                actor_id=actor_id or "unknown",
+                reason=audit_reason,
+            )
         return ReconciliationOutcome.RELEASED
+
+    async def release_declared_lost(
+        self, run_id: UUID, reason: str, *, actor_id: str = "unknown"
+    ) -> ReconciliationOutcome:
+        """Release a still-ambiguous submission after an explicit analyst claim."""
+        run = await self._get_run(run_id)
+        if run is None or not run.requires_reconciliation:
+            return ReconciliationOutcome.UNDECIDED
+        return await self._release(
+            run_id,
+            run,
+            reason="production_reconciliation_declared_lost",
+            audit_reason=reason,
+            actor_id=actor_id,
+        )
 
     async def _reconcile_conversation(
         self, run: SubjectProductionRun, *, available: bool

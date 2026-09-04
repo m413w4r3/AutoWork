@@ -31,6 +31,10 @@ from cti_app.application.production_reconciliation import (
     ProductionReconciliationError,
     ProductionReconciliationService,
 )
+from cti_app.application.production_reconciliation_resolver import (
+    ProductionReconciliationResolver,
+    ReconciliationOutcome,
+)
 from cti_app.application.production_recovery import (
     ProductionRecoveryDisposition,
     ProductionRecoveryPolicyV1,
@@ -106,6 +110,13 @@ class ManualReconciliationPreviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     markdown: str = Field(..., min_length=1, max_length=10_000_000)
+
+
+class DeclareReconciliationLostRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: bool
+    reason: str = ""
 
 
 class StageStatus(BaseModel):
@@ -268,6 +279,51 @@ def _production_reconciliation_service(request: Request) -> ProductionReconcilia
         request.app.state.job_dispatcher,
         getattr(request.app.state, "bridge_capabilities_provider", None),
     )
+
+
+def _production_reconciliation_resolver(request: Request) -> ProductionReconciliationResolver:
+    return ProductionReconciliationResolver(
+        request.app.state.uow_factory,
+        transport=getattr(request.app.state, "bridge_capabilities_provider", None),
+        model_gateway=getattr(request.app.state, "model_gateway", None),
+        model_conversation_service=getattr(
+            request.app.state, "model_conversation_service", None
+        ),
+        diagnostics=getattr(request.app.state, "production_diagnostics", None),
+    )
+
+
+async def _ensure_reconciliation_required(request: Request, run_id: UUID) -> None:
+    async with request.app.state.uow_factory() as uow:
+        run = await uow.subject_production_runs.get(run_id)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "production_run_not_found",
+                "message": "Le run de production est introuvable.",
+            },
+        )
+    if not run.requires_reconciliation:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "production_reconciliation_not_required",
+                "message": "Ce run n'attend pas de réconciliation.",
+            },
+        )
+
+
+async def _probe_production_reconciliation(
+    request: Request, run_id: UUID
+) -> tuple[ProductionReconciliationResolver, dict[str, object]]:
+    await _ensure_reconciliation_required(request, run_id)
+    resolver = _production_reconciliation_resolver(request)
+    outcome = await resolver.resolve(run_id)
+    return resolver, {
+        "outcome": outcome.value,
+        "bridge_status": getattr(resolver, "_last_bridge_status", None),
+    }
 
 
 def _reconciliation_error(exc: ProductionReconciliationError) -> HTTPException:
@@ -1012,6 +1068,54 @@ async def preview_visible_production_reconciliation(
     except ProductionReconciliationError as exc:
         raise _reconciliation_error(exc) from exc
     return preview.as_dict()
+
+
+@router.post("/production/runs/{run_id}/reconciliation/probe")
+async def probe_production_reconciliation(
+    run_id: UUID,
+    request: Request,
+) -> dict[str, object]:
+    _, result = await _probe_production_reconciliation(request, run_id)
+    return result
+
+
+@router.post("/production/runs/{run_id}/reconciliation/declare-lost")
+async def declare_lost_production_reconciliation(
+    run_id: UUID,
+    payload: DeclareReconciliationLostRequest,
+    request: Request,
+) -> dict[str, object]:
+    if payload.confirm is not True:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "production_reconciliation_confirmation_required",
+                "message": "La confirmation explicite est requise.",
+            },
+        )
+
+    resolver, probe = await _probe_production_reconciliation(request, run_id)
+    if probe["outcome"] == ReconciliationOutcome.RESUMED.value:
+        # A response was found: never discard it in favor of a new submission.
+        return probe
+    if probe["outcome"] == ReconciliationOutcome.RELEASED.value:
+        # The probe already made the terminal negative decision.
+        return probe
+
+    outcome = await resolver.release_declared_lost(
+        run_id,
+        payload.reason,
+        actor_id=await _actor_id(request),
+    )
+    if outcome is not ReconciliationOutcome.RELEASED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "production_reconciliation_not_required",
+                "message": "Ce run n'attend plus de réconciliation.",
+            },
+        )
+    return {"outcome": ReconciliationOutcome.RELEASED.value, "declared_lost": True}
 
 
 @router.post("/production/runs/{run_id}/reconciliation/visible/adopt")

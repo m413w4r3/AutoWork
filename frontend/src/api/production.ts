@@ -152,6 +152,14 @@ export interface ProductionRecoveryPreview {
   visible_available: boolean;
 }
 
+export type ProductionReconciliationOutcome =
+  "resumed" | "released" | "undecided";
+
+export interface ProductionReconciliationProbeResult {
+  outcome: ProductionReconciliationOutcome;
+  bridge_status: string | null;
+}
+
 export function shouldPollProduction(
   status: ProductionStatus["status"] | undefined,
 ): boolean {
@@ -424,6 +432,25 @@ export async function previewProductionReconciliationVisible(
       method: "POST",
     },
   );
+}
+
+export async function probeProductionReconciliation(
+  runId: string,
+): Promise<ProductionReconciliationProbeResult> {
+  return request(`/api/production/runs/${runId}/reconciliation/probe`, {
+    method: "POST",
+  });
+}
+
+export async function declareProductionReconciliationLost(
+  runId: string,
+  reason: string,
+): Promise<{ outcome: "released"; declared_lost: true }> {
+  return request(`/api/production/runs/${runId}/reconciliation/declare-lost`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: true, reason }),
+  });
 }
 
 export async function adoptProductionReconciliationVisible(
