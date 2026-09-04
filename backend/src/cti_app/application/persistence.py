@@ -66,6 +66,7 @@ from cti_app.domain.production import (
     EditionProductionBatchItem,
     ProductionArtifact,
     ProductionInputSnapshot,
+    ProductionRepairDecision,
     ProductionReuseInvalidation,
     SampleAcquisitionAttempt,
     SourceExtraction,
@@ -638,6 +639,7 @@ class UnitOfWork(Protocol):
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_reuse_invalidations: ProductionReuseInvalidationRepository
+    production_repair_decisions: ProductionRepairDecisionRepository
     source_extractions: SourceExtractionRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
@@ -813,6 +815,20 @@ class ProductionReuseInvalidationRepository(Protocol):
     ) -> Sequence[ProductionReuseInvalidation]: ...
 
 
+class ProductionRepairDecisionRepository(Protocol):
+    """Append-only persistence port for production repair decisions."""
+
+    async def append(self, decision: ProductionRepairDecision) -> None: ...
+
+    async def list_for_edition(
+        self, edition_id: UUID, subject_id: UUID | None = None
+    ) -> Sequence[ProductionRepairDecision]: ...
+
+    async def effective_decisions(
+        self, edition_id: UUID, subject_id: UUID | None = None
+    ) -> Sequence[ProductionRepairDecision]: ...
+
+
 class AnalystInvestigationRepository(Protocol):
     async def get(self, investigation_id: UUID) -> AnalystInvestigation | None: ...
     async def get_for_run(self, run_id: UUID) -> AnalystInvestigation | None: ...
@@ -864,6 +880,7 @@ class ProductionUnitOfWork(Protocol):
     production_artifacts: ProductionArtifactRepository
     source_extractions: SourceExtractionRepository
     production_reuse_invalidations: ProductionReuseInvalidationRepository
+    production_repair_decisions: ProductionRepairDecisionRepository
     analyst_investigations: AnalystInvestigationRepository
     analyst_decisions: AnalystDecisionRepository
     analyst_input_packs: AnalystInputPackRepository

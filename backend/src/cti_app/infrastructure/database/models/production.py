@@ -26,6 +26,10 @@ PRODUCTION_REUSE_STAGE_VALUES_SQL = "'references', 'extraction', 'synthesis'"
 PRODUCTION_ARTIFACT_STATUS_VALUES_SQL = "'verified', 'stale', 'needs_review'"
 SOURCE_EXTRACTION_STATUS_VALUES_SQL = "'running', 'verified', 'needs_review', 'failed'"
 EXTRACTION_PROFILE_VALUES_SQL = "'full', 'ioc_rules'"
+PRODUCTION_REPAIR_ISSUE_KIND_VALUES_SQL = (
+    "'rejected_indicator', 'rejected_rule', 'supplemental_source_unarchived'"
+)
+PRODUCTION_REPAIR_ACTION_VALUES_SQL = "'include', 'exclude', 'continue_without_source'"
 PRODUCTION_BATCH_STATUS_VALUES_SQL = (
     "'queued', 'running', 'completed', 'completed_with_issues', 'cancelled'"
 )
@@ -550,3 +554,81 @@ class ProductionReuseInvalidationRow(Base):
     actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
     correlation_id: Mapped[str] = mapped_column(String(128), nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ProductionRepairDecisionRow(Base):
+    """Append-only human decisions for stable production repair issues."""
+
+    __tablename__ = "production_repair_decisions"
+    __table_args__ = (
+        CheckConstraint(
+            f"issue_kind IN ({PRODUCTION_REPAIR_ISSUE_KIND_VALUES_SQL})",
+            name="ck_production_repair_issue_kind",
+        ),
+        CheckConstraint(
+            f"action IN ({PRODUCTION_REPAIR_ACTION_VALUES_SQL})",
+            name="ck_production_repair_action",
+        ),
+        CheckConstraint(
+            "((issue_kind IN ('rejected_indicator', 'rejected_rule') "
+            "AND action IN ('include', 'exclude')) OR "
+            "(issue_kind = 'supplemental_source_unarchived' "
+            "AND action = 'continue_without_source'))",
+            name="ck_production_repair_action_compatibility",
+        ),
+        CheckConstraint(
+            "char_length(repair_key) = 64 AND repair_key ~ '^[0-9a-f]{64}$'",
+            name="ck_production_repair_key",
+        ),
+        CheckConstraint(
+            "observed_pipeline_generation >= 0",
+            name="ck_production_repair_generation",
+        ),
+        CheckConstraint(
+            "char_length(btrim(actor_id)) > 0",
+            name="ck_production_repair_actor",
+        ),
+        CheckConstraint(
+            "reason IS NULL OR char_length(reason) <= 500",
+            name="ck_production_repair_reason_length",
+        ),
+        Index(
+            "ix_production_repair_edition_key_created",
+            "edition_id",
+            "repair_key",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_production_repair_subject_key_created",
+            "subject_id",
+            "repair_key",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    edition_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
+    )
+    subject_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
+    )
+    production_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("subject_production_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    observed_artifact_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("production_artifacts.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    repair_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    issue_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    observed_pipeline_generation: Mapped[int] = mapped_column(nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -23,6 +23,9 @@ from cti_app.domain.production import (
     ProductionBatchStatus,
     ProductionInputSnapshot,
     ProductionInputSource,
+    ProductionRepairAction,
+    ProductionRepairDecision,
+    ProductionRepairIssueKind,
     ProductionReuseInvalidation,
     ProductionSubmissionReconciliation,
     SampleAcquisitionAttempt,
@@ -43,6 +46,7 @@ from cti_app.infrastructure.database.models.production import (
     EditionProductionBatchRow,
     ProductionArtifactRow,
     ProductionInputSnapshotRow,
+    ProductionRepairDecisionRow,
     ProductionReuseInvalidationRow,
     SampleAcquisitionAttemptRow,
     SourceExtractionRow,
@@ -698,6 +702,70 @@ class SqlAlchemyProductionReuseInvalidationRepository:
         return [_production_reuse_invalidation_from_row(row) for row in result.scalars()]
 
 
+class SqlAlchemyProductionRepairDecisionRepository:
+    """Append-only repository for production repair decisions."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def append(self, decision: ProductionRepairDecision) -> None:
+        self._session.add(
+            ProductionRepairDecisionRow(
+                id=decision.id,
+                edition_id=decision.edition_id,
+                subject_id=decision.subject_id,
+                production_run_id=decision.production_run_id,
+                observed_artifact_id=decision.observed_artifact_id,
+                repair_key=decision.repair_key,
+                issue_kind=decision.issue_kind.value,
+                action=decision.action.value,
+                observed_pipeline_generation=decision.observed_pipeline_generation,
+                actor_id=decision.actor_id,
+                reason=decision.reason,
+                created_at=decision.created_at,
+            )
+        )
+        await self._session.flush()
+
+    async def list_for_edition(
+        self, edition_id: UUID, subject_id: UUID | None = None
+    ) -> Sequence[ProductionRepairDecision]:
+        filters = [ProductionRepairDecisionRow.edition_id == edition_id]
+        if subject_id is not None:
+            filters.append(ProductionRepairDecisionRow.subject_id == subject_id)
+        rows = await self._session.scalars(
+            select(ProductionRepairDecisionRow)
+            .where(*filters)
+            .order_by(
+                ProductionRepairDecisionRow.created_at,
+                ProductionRepairDecisionRow.id,
+            )
+        )
+        return [_production_repair_decision_from_row(row) for row in rows]
+
+    async def effective_decisions(
+        self, edition_id: UUID, subject_id: UUID | None = None
+    ) -> Sequence[ProductionRepairDecision]:
+        filters = [ProductionRepairDecisionRow.edition_id == edition_id]
+        if subject_id is not None:
+            filters.append(ProductionRepairDecisionRow.subject_id == subject_id)
+        rows = await self._session.scalars(
+            select(ProductionRepairDecisionRow)
+            .where(*filters)
+            .order_by(
+                ProductionRepairDecisionRow.subject_id,
+                ProductionRepairDecisionRow.repair_key,
+                ProductionRepairDecisionRow.created_at,
+                ProductionRepairDecisionRow.id,
+            )
+        )
+        latest: dict[tuple[UUID, str], ProductionRepairDecision] = {}
+        for row in rows:
+            decision = _production_repair_decision_from_row(row)
+            latest[(decision.subject_id, decision.repair_key)] = decision
+        return tuple(latest.values())
+
+
 class SqlAlchemyEditionProductionBatchRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -1222,4 +1290,23 @@ def _production_reuse_invalidation_from_row(
         actor_id=row.actor_id,
         correlation_id=row.correlation_id,
         occurred_at=row.occurred_at,
+    )
+
+
+def _production_repair_decision_from_row(
+    row: ProductionRepairDecisionRow,
+) -> ProductionRepairDecision:
+    return ProductionRepairDecision(
+        id=row.id,
+        edition_id=row.edition_id,
+        subject_id=row.subject_id,
+        production_run_id=row.production_run_id,
+        observed_artifact_id=row.observed_artifact_id,
+        observed_pipeline_generation=row.observed_pipeline_generation,
+        repair_key=row.repair_key,
+        issue_kind=ProductionRepairIssueKind(row.issue_kind),
+        action=ProductionRepairAction(row.action),
+        actor_id=row.actor_id,
+        reason=row.reason,
+        created_at=row.created_at,
     )

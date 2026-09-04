@@ -33,6 +33,22 @@ class SubjectProductionStage(StrEnum):
     ASSEMBLY = "assembly"
 
 
+class ProductionRepairIssueKind(StrEnum):
+    """Kinds of production issues that can be arbitrated by a human."""
+
+    REJECTED_INDICATOR = "rejected_indicator"
+    REJECTED_RULE = "rejected_rule"
+    SUPPLEMENTAL_SOURCE_UNARCHIVED = "supplemental_source_unarchived"
+
+
+class ProductionRepairAction(StrEnum):
+    """Append-only actions available for a production repair issue."""
+
+    INCLUDE = "include"
+    EXCLUDE = "exclude"
+    CONTINUE_WITHOUT_SOURCE = "continue_without_source"
+
+
 PRODUCTION_RECONCILIATION_ERROR_CODE = "model_submission_reconciliation_required"
 
 # Bridge review reasons that all describe the same situation: the prompt was
@@ -747,6 +763,70 @@ class ProductionArtifact:
             raise ValueError("version must be >= 1")
         if len(self.input_hash) != 64 or any(c not in "0123456789abcdef" for c in self.input_hash):
             raise ValueError("input_hash must be lowercase SHA-256")
+
+
+_PRODUCTION_REPAIR_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_PRODUCTION_REPAIR_REASON_LENGTH = 500
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ProductionRepairDecision:
+    """One immutable human decision attached to a stable repair identity."""
+
+    edition_id: UUID
+    subject_id: UUID
+    production_run_id: UUID
+    observed_artifact_id: UUID
+    observed_pipeline_generation: int
+    repair_key: str
+    issue_kind: ProductionRepairIssueKind
+    action: ProductionRepairAction
+    actor_id: str
+    reason: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    id: UUID = field(default_factory=uuid4)
+
+    def __post_init__(self) -> None:
+        try:
+            issue_kind = ProductionRepairIssueKind(self.issue_kind)
+            action = ProductionRepairAction(self.action)
+        except ValueError as exc:
+            raise ValueError("Unknown production repair issue kind or action") from exc
+        object.__setattr__(self, "issue_kind", issue_kind)
+        object.__setattr__(self, "action", action)
+
+        if self.observed_pipeline_generation < 0:
+            raise ValueError("observed_pipeline_generation must be >= 0")
+        if not _PRODUCTION_REPAIR_KEY_RE.fullmatch(self.repair_key):
+            raise ValueError("repair_key must be a lowercase SHA-256")
+        actor_id = self.actor_id.strip()
+        if not actor_id:
+            raise ValueError("actor_id must not be empty")
+        object.__setattr__(self, "actor_id", actor_id)
+
+        normalized_reason = self.reason.strip() if self.reason is not None else None
+        if normalized_reason == "":
+            normalized_reason = None
+        if normalized_reason is not None and len(normalized_reason) > (
+            MAX_PRODUCTION_REPAIR_REASON_LENGTH
+        ):
+            raise ValueError("reason is too long")
+        object.__setattr__(self, "reason", normalized_reason)
+
+        compatible = (
+            issue_kind in {
+                ProductionRepairIssueKind.REJECTED_INDICATOR,
+                ProductionRepairIssueKind.REJECTED_RULE,
+            }
+            and action in {ProductionRepairAction.INCLUDE, ProductionRepairAction.EXCLUDE}
+        ) or (
+            issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
+            and action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
+        )
+        if not compatible:
+            raise ValueError("Production repair action is incompatible with issue kind")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

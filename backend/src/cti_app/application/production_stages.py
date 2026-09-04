@@ -135,6 +135,8 @@ class ExtractionService(_ArtifactPayloadMixin):
         conversation_turn_id: UUID | None = None,
         warnings: list[str] | None = None,
         verification_diagnostics: dict[str, Any] | None = None,
+        repair_evidence_blob_id: UUID | None = None,
+        repair_evidence_entry_count: int | None = None,
     ) -> ProductionArtifact:
         async with self._uow_factory() as uow:
             prior_versions = [
@@ -153,6 +155,17 @@ class ExtractionService(_ArtifactPayloadMixin):
             raw_id, canonical_id, _ = await self._store_payloads(
                 raw=raw_result, canonical=canonical_json
             )
+            repair_evidence_metadata = None
+            if repair_evidence_blob_id is not None:
+                entry_count = repair_evidence_entry_count or 0
+                if entry_count < 0:
+                    raise ValueError("repair_evidence_entry_count must be >= 0")
+                repair_evidence_metadata = {
+                    "schema_version": "1",
+                    "blob_id": str(repair_evidence_blob_id),
+                    "entry_count": entry_count,
+                }
+
             artifact = ProductionArtifact(
                 production_run_id=run_id,
                 subject_id=subject_id,
@@ -170,6 +183,11 @@ class ExtractionService(_ArtifactPayloadMixin):
                     "parser_version": canonical_json.get("parser_version"),
                     "generated_at": datetime.now(UTC).isoformat(),
                     "deterministic_verification": verification_diagnostics or {},
+                    **(
+                        {"repair_evidence": repair_evidence_metadata}
+                        if repair_evidence_metadata is not None
+                        else {}
+                    ),
                 },
             )
             await uow.production_artifacts.append(artifact)

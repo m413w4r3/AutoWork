@@ -22,12 +22,15 @@ from cti_app.application.blobs import BlobCatalogService
 # Production payloads are text; a publication or a reference report never approaches
 # this, so it is a guard against reading a corrupted blob into memory.
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
+MAX_REPAIR_EVIDENCE_BYTES = 12 * 1024 * 1024
 
 _RAW_BUCKET = "production-artifacts-raw"
 _CANONICAL_BUCKET = "production-artifacts-canonical"
 _RENDERED_BUCKET = "production-artifacts-rendered"
 _SOURCE_EXTRACTION_RAW_BUCKET = "source-extractions-raw"
 _SOURCE_EXTRACTION_CANONICAL_BUCKET = "source-extractions-canonical"
+_REPAIR_EVIDENCE_BUCKET = "production-repair-evidence"
+REPAIR_EVIDENCE_BUCKET = _REPAIR_EVIDENCE_BUCKET
 
 
 class ProductionReuseStorageUnavailableError(RuntimeError):
@@ -94,6 +97,33 @@ class ProductionArtifactStore:
         payload = json.loads(await self.read_text(blob_id))
         if not isinstance(payload, dict):
             raise ValueError("Artifact payload is not a JSON object")
+        return payload
+
+    async def put_repair_evidence(self, payload: dict[str, Any]) -> UUID:
+        """Store the complete, inert Q2 rejection pack under its own limit."""
+        encoded = self.canonical_json_bytes(payload)
+        if len(encoded) > MAX_REPAIR_EVIDENCE_BYTES:
+            raise ValueError(
+                f"Repair evidence pack exceeds {MAX_REPAIR_EVIDENCE_BYTES} bytes"
+            )
+        record = await self._catalog.ingest(
+            BytesIO(encoded),
+            logical_bucket=_REPAIR_EVIDENCE_BUCKET,
+            mime_type="application/json",
+        )
+        return record.id
+
+    async def read_repair_evidence(self, blob_id: UUID) -> dict[str, Any]:
+        """Read and validate one complete repair evidence pack."""
+        payload = json.loads(
+            (await self.read_bytes(blob_id, max_bytes=MAX_REPAIR_EVIDENCE_BYTES)).decode("utf-8")
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("Repair evidence payload is not a JSON object")
+        if payload.get("schema_version") != "1" or not isinstance(
+            payload.get("entries"), list
+        ):
+            raise ValueError("Unsupported repair evidence pack")
         return payload
 
     async def store_stage_payloads(

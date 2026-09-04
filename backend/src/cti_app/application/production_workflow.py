@@ -88,6 +88,10 @@ from cti_app.application.production_q2_batch import (
     q2_batch_model_run_id,
 )
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
+from cti_app.application.production_repairs import (
+    build_repair_evidence_pack,
+    repair_key_for_rejection,
+)
 from cti_app.application.production_source_evidence import (
     SOURCE_EVIDENCE_VERSION,
     SourceEvidenceDocument,
@@ -1805,6 +1809,7 @@ class ProductionWorkflowOrchestrator:
         failures: dict[str, dict[str, Any]] = {}
         source_skips: dict[str, dict[str, Any]] = {}
         source_evidence_rejections: list[dict[str, Any]] = []
+        repair_evidence_entries: list[dict[str, Any]] = []
         source_evidence_rejection_counts: dict[tuple[str, str | None, str, str], int] = {}
         plans_by_url = {plan.canonical_url: plan for plan in source_plans}
         full_calls = 0
@@ -1955,6 +1960,35 @@ class ProductionWorkflowOrchestrator:
             )
             warnings.extend(evidence.warnings)
             for rejection in evidence.rejections:
+                issue_kind = (
+                    "rejected_rule"
+                    if rejection.proposal_kind == "rule"
+                    else "rejected_indicator"
+                )
+                value_sha256 = hashlib.sha256(rejection.value.encode("utf-8")).hexdigest()
+                repair_key = repair_key_for_rejection(
+                    edition_id=run.edition_id,
+                    subject_id=run.subject_id,
+                    kind=issue_kind,
+                    source_url=work.source.canonical_url,
+                    artifact_type=rejection.artifact_type,
+                    value=rejection.value,
+                )
+                repair_evidence_entries.append(
+                    {
+                        "repair_key": repair_key,
+                        "source_id": work.source.local_id,
+                        "source_url": work.source.canonical_url,
+                        "batch_id": batch_id,
+                        "model_run_id": str(model_run_id),
+                        "proposal_index": rejection.proposal_index,
+                        "proposal_kind": rejection.proposal_kind,
+                        "artifact_type": rejection.artifact_type,
+                        "reason_code": rejection.reason_code,
+                        "value": rejection.value,
+                        "value_sha256": value_sha256,
+                    }
+                )
                 # La valeur rejetée vient de la sortie du modèle, déjà archivée
                 # en clair dans le blob de résultat brut : la conserver ici
                 # n'expose rien de neuf et c'est la seule façon pour
@@ -1971,7 +2005,7 @@ class ProductionWorkflowOrchestrator:
                         "artifact_type": rejection.artifact_type,
                         "reason_code": rejection.reason_code,
                         "value": rejection.value[:512],
-                        "value_hash": hashlib.sha256(rejection.value.encode()).hexdigest(),
+                        "value_hash": value_sha256,
                     }
                 )
                 group_key = (
@@ -3531,6 +3565,12 @@ class ProductionWorkflowOrchestrator:
                 f"q2_detection_rules_lost:count={len(rejected_rules)}",
             )
         await self._check_cancellation(run.id, context)
+        repair_evidence_blob_id = None
+        put_repair_evidence = getattr(self._artifact_store, "put_repair_evidence", None)
+        if callable(put_repair_evidence):
+            repair_evidence_blob_id = await put_repair_evidence(
+                build_repair_evidence_pack(repair_evidence_entries)
+            )
         artifact = await self._extraction.store_extraction_result(
             run_id=run.id,
             subject_id=run.subject_id,
@@ -3588,6 +3628,8 @@ class ProductionWorkflowOrchestrator:
                     for item in verification.semantic_status_conflicts
                 ],
             },
+            repair_evidence_blob_id=repair_evidence_blob_id,
+            repair_evidence_entry_count=len(repair_evidence_entries),
         )
         await self._persist_extraction_progress(run.id, progress)
         return {

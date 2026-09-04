@@ -54,6 +54,10 @@ from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.production_repairs import (
+    ProductionRepairDecisionService,
+    ProductionRepairIssueService,
+)
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subject_production import (
     EditionProductionService,
@@ -286,6 +290,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.subject_production_service = subject_production_service
     app.state.edition_production_service = edition_production_service
     app.state.edition_review_service = EditionReviewService(uow_factory)
+    app.state.production_repair_decision_service = ProductionRepairDecisionService(uow_factory)
+    app.state.production_repair_issue_service = ProductionRepairIssueService(
+        uow_factory, production_artifact_store
+    )
     app.state.edition_publication_service = EditionPublicationService(
         uow_factory,
         production_artifact_store,
