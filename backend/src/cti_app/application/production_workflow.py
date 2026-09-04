@@ -123,10 +123,12 @@ from cti_app.domain.production import (
     ExtractionProfile,
     ProductionArtifactStage,
     ProductionInputSnapshot,
+    ProductionRepairIssueKind,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
 )
+from cti_app.domain.publication import is_publication_ioc_artifact_type
 
 if TYPE_CHECKING:
     from cti_app.application.collection import SubjectCollectionService
@@ -1970,6 +1972,7 @@ class ProductionWorkflowOrchestrator:
                     {
                         "repair_key": repair_key,
                         "source_id": work.source.local_id,
+                        "source_title": work.source.title,
                         "source_url": work.source.canonical_url,
                         "batch_id": batch_id,
                         "model_run_id": str(model_run_id),
@@ -3509,6 +3512,83 @@ class ProductionWorkflowOrchestrator:
         )
         verification = verify_q2_proposals(submissions)
         extraction = verification.canonical
+        # Source-gate rejections have already been captured while each Q2
+        # response was framed. Capture the second rejection boundary too:
+        # malformed/placeholder artifacts must be arbitrable with their exact
+        # model value, not only with a diagnostic hash.
+        source_by_id = {source.local_id: source for source in report.sources}
+        diagnostic_offset = 0
+        for submission in submissions:
+            proposals = [
+                *submission.output.facts,
+                *submission.output.artifacts,
+                *submission.output.rules,
+            ]
+            submission_diagnostics = verification.diagnostics[
+                diagnostic_offset : diagnostic_offset + len(proposals)
+            ]
+            diagnostic_offset += len(proposals)
+            submission_source_id = submission.source_ids[0] if submission.source_ids else None
+            submission_source = (
+                source_by_id.get(submission_source_id)
+                if submission_source_id is not None
+                else None
+            )
+            if submission_source is None:
+                continue
+            for diagnostic, proposal in zip(submission_diagnostics, proposals, strict=True):
+                if diagnostic.status.value != "rejected" or diagnostic.proposal_kind not in {
+                    "artifact",
+                    "rule",
+                }:
+                    continue
+                value = getattr(proposal, "body", None) or getattr(proposal, "value", None)
+                if not isinstance(value, str):
+                    continue
+                issue_kind = (
+                    ProductionRepairIssueKind.REJECTED_RULE.value
+                    if diagnostic.proposal_kind == "rule"
+                    else ProductionRepairIssueKind.REJECTED_INDICATOR.value
+                )
+                value_sha256 = hashlib.sha256(value.encode("utf-8")).hexdigest()
+                repair_key = repair_key_for_rejection(
+                    edition_id=run.edition_id,
+                    subject_id=run.subject_id,
+                    kind=issue_kind,
+                    source_url=submission_source.canonical_url,
+                    artifact_type=diagnostic.artifact_type,
+                    value=value,
+                )
+                repair_evidence_entries.append(
+                    {
+                        "repair_key": repair_key,
+                        "source_id": submission_source.local_id,
+                        "source_title": submission_source.title,
+                        "source_url": submission_source.canonical_url,
+                        "batch_id": None,
+                        "model_run_id": submission.model_run_id,
+                        "proposal_index": diagnostic.proposal_index,
+                        "proposal_kind": diagnostic.proposal_kind,
+                        "artifact_type": diagnostic.artifact_type,
+                        "reason_code": diagnostic.reason_code or "rejected",
+                        "value": value,
+                        "value_sha256": value_sha256,
+                    }
+                )
+                source_evidence_rejections.append(
+                    {
+                        "source_id": submission_source.local_id,
+                        "source_url": submission_source.canonical_url,
+                        "batch_id": None,
+                        "model_run_id": submission.model_run_id,
+                        "proposal_index": diagnostic.proposal_index,
+                        "proposal_kind": diagnostic.proposal_kind,
+                        "artifact_type": diagnostic.artifact_type,
+                        "reason_code": diagnostic.reason_code or "rejected",
+                        "value": value[:512],
+                        "value_hash": value_sha256,
+                    }
+                )
         progress.update(_canonical_extraction_progress_counts(extraction))
         progress["active_source_id"] = None
         progress["active_source_title"] = None
@@ -3537,6 +3617,11 @@ class ProductionWorkflowOrchestrator:
             for rejection in source_evidence_rejections
             if rejection["proposal_kind"] == "rule"
         ]
+        rejected_ioc_count = sum(
+            is_publication_ioc_artifact_type(rejection.get("artifact_type"))
+            for rejection in source_evidence_rejections
+            if rejection.get("proposal_kind") == "artifact"
+        )
         source_evidence_warnings = [
             (
                 f"q2_batch_source_evidence_rejected:{batch_id}:{source_id}:"
@@ -3608,6 +3693,7 @@ class ProductionWorkflowOrchestrator:
                 "q2_source_evidence_rejection_groups": source_evidence_rejection_groups,
                 "q2_rejected_rules": rejected_rules,
                 "q2_rejected_rule_count": len(rejected_rules),
+                "q2_rejected_ioc_count": rejected_ioc_count,
                 "q2_rejected_artifact_count": len(source_evidence_rejections)
                 - len(rejected_rules),
                 "semantic_status_conflicts": [

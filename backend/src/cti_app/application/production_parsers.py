@@ -26,7 +26,12 @@ from cti_app.application.production_normalization import (
     normalize_indicator_value,
 )
 from cti_app.domain.discovery import SourceRole
-from cti_app.domain.production import DetectionRule, DetectionRuleType, ExtractionProfile
+from cti_app.domain.production import (
+    DetectionRule,
+    DetectionRuleType,
+    ExtractionProfile,
+    ProductionEvidenceBasis,
+)
 from cti_app.domain.publication import ArtifactType
 
 PARSER_VERSION = "production-markdown-v4"
@@ -265,6 +270,7 @@ class ExtractionItem:
     normalized_value: str | None = None
     evidence_quote: str = ""
     model_run_ids: tuple[str, ...] = ()
+    evidence_basis: ProductionEvidenceBasis = ProductionEvidenceBasis.SOURCE_VERIFIED
 
 
 @dataclass(frozen=True)
@@ -1482,7 +1488,7 @@ def reference_report_from_json(payload: dict[str, Any]) -> ReferenceReport:
 def technical_extraction_to_json(extraction: TechnicalExtraction) -> dict[str, Any]:
     return {
         "parser_version": PARSER_VERSION,
-        "schema_version": "3",
+        "schema_version": "4",
         "items": [
             {
                 "id": item.local_id,
@@ -1501,6 +1507,7 @@ def technical_extraction_to_json(extraction: TechnicalExtraction) -> dict[str, A
                 "reference_ids": list(item.reference_ids),
                 "source_ids": list(item.source_ids),
                 "supported": item.supported,
+                "evidence_basis": item.evidence_basis.value,
             }
             for item in extraction.items
         ],
@@ -1515,6 +1522,7 @@ def technical_extraction_to_json(extraction: TechnicalExtraction) -> dict[str, A
                 "supported": rule.supported,
                 "model_run_ids": list(rule.model_run_ids),
                 "sha256": rule.sha256,
+                "evidence_basis": rule.evidence_basis.value,
             }
             for rule in extraction.rules
         ],
@@ -1560,6 +1568,12 @@ def technical_extraction_from_json(payload: dict[str, Any]) -> TechnicalExtracti
             normalized_value=normalized,
             evidence_quote=item.get("evidence_quote", ""),
             model_run_ids=tuple(item.get("model_run_ids", [])),
+            evidence_basis=_enum_value(
+                item.get("evidence_basis"),
+                ProductionEvidenceBasis,
+                ProductionEvidenceBasis.SOURCE_VERIFIED,
+            )
+            or ProductionEvidenceBasis.SOURCE_VERIFIED,
         )
 
     def read_rule(item: dict[str, Any]) -> DetectionRule:
@@ -1586,6 +1600,12 @@ def technical_extraction_from_json(payload: dict[str, Any]) -> TechnicalExtracti
             supported=bool(item.get("supported", False)),
             model_run_ids=tuple(str(run_id) for run_id in item.get("model_run_ids", [])),
             sha256=sha256,
+            evidence_basis=_enum_value(
+                item.get("evidence_basis"),
+                ProductionEvidenceBasis,
+                ProductionEvidenceBasis.SOURCE_VERIFIED,
+            )
+            or ProductionEvidenceBasis.SOURCE_VERIFIED,
         )
 
     return TechnicalExtraction(

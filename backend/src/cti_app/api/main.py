@@ -58,6 +58,7 @@ from cti_app.application.production_repairs import (
     ProductionReferenceRepairService,
     ProductionRepairDecisionService,
     ProductionRepairIssueService,
+    ProductionRepairProjectionService,
 )
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subject_production import (
@@ -296,6 +297,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory, production_artifact_store
     )
     app.state.production_reference_repair_service = ProductionReferenceRepairService(
+        uow_factory, production_artifact_store
+    )
+    app.state.production_repair_projection_service = ProductionRepairProjectionService(
         uow_factory, production_artifact_store
     )
     app.state.edition_publication_service = EditionPublicationService(

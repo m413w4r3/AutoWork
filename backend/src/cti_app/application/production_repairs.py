@@ -13,26 +13,45 @@ from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_verification import (
+    Q2ProposalSubmission,
+    verify_q2_proposals,
+)
+from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
+    DisplayPolicy,
+    ExtractionItem,
+    IndicatorProvenance,
+    IndicatorStatus,
+    Q2ArtifactProposal,
+    Q2RuleProposal,
+    Q2SourceOutput,
+    TechnicalExtraction,
     parse_reference_report,
     reconcile_reference_report_with_archives,
     reference_report_from_json,
     reference_report_to_json,
+    technical_extraction_from_json,
+    technical_extraction_to_json,
 )
-from cti_app.application.production_stages import compute_input_hash
+from cti_app.application.production_stages import ExtractionService, compute_input_hash
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import canonicalize_http_url
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
+    DetectionRule,
+    DetectionRuleType,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionEvidenceBasis,
     ProductionReconciliationRequiredError,
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
     SubjectProductionStatus,
 )
+from cti_app.domain.publication import ArtifactType, is_publication_ioc_artifact_type
 
 REPAIR_EVIDENCE_SCHEMA_VERSION = "1"
 MAX_REPAIR_PREVIEW_CHARS = 512
@@ -155,6 +174,10 @@ class ProductionRepairIssueNotFoundError(ValueError):
     """A requested repair issue is not present in the current extraction."""
 
 
+class ProductionRepairProjectionError(ValueError):
+    """The effective extraction cannot be safely projected."""
+
+
 class ProductionReferenceRepairError(ValueError):
     """The archived Q1 evidence cannot be safely reconstructed."""
 
@@ -270,6 +293,8 @@ class ProductionRepairIssueView:
     kind: ProductionRepairIssueKind
     artifact_type: str | None
     source_id: str
+    source_title: str
+    is_publication_ioc: bool
     source_url: str
     reason_code: str
     value_sha256: str
@@ -327,6 +352,7 @@ SupplementalSourceRepairIssueView = SupplementalSourceRepairIssue
 class _RepairContext:
     run: Any
     artifact: Any
+    source_titles: Mapping[str, str]
 
 
 class ProductionRepairIssueService:
@@ -488,7 +514,34 @@ class ProductionRepairIssueService:
                 if artifact is not None and (
                     _enum_value(artifact.status) != ProductionArtifactStatus.STALE.value
                 ):
-                    contexts.append(_RepairContext(run=run, artifact=artifact))
+                    source_titles: dict[str, str] = {}
+                    if self._artifact_store is not None:
+                        references = await uow.production_artifacts.get_current(
+                            run.id, ProductionArtifactStage.REFERENCES.value
+                        )
+                        if (
+                            references is not None
+                            and getattr(references, "canonical_blob_id", None) is not None
+                        ):
+                            try:
+                                canonical_blob_id = getattr(
+                                    references, "canonical_blob_id", None
+                                )
+                                report = reference_report_from_json(
+                                    await self._artifact_store.read_json(
+                                        cast(UUID, canonical_blob_id)
+                                    )
+                                )
+                                source_titles = {
+                                    source.local_id: source.title for source in report.sources
+                                }
+                            except Exception:
+                                source_titles = {}
+                    contexts.append(
+                        _RepairContext(
+                            run=run, artifact=artifact, source_titles=source_titles
+                        )
+                    )
             decisions = await _effective_decisions_for_reader(
                 uow, edition_id, subject_id
             )
@@ -523,30 +576,559 @@ class ProductionRepairIssueService:
         return records
 
     async def _entries(self, artifact: Any) -> tuple[list[dict[str, Any]], bool]:
-        metadata = getattr(artifact, "metadata", {}) or {}
-        marker = metadata.get("repair_evidence") if isinstance(metadata, dict) else None
-        blob_id = marker.get("blob_id") if isinstance(marker, dict) else None
-        if self._artifact_store is not None and blob_id:
-            try:
-                pack = await self._artifact_store.read_repair_evidence(UUID(str(blob_id)))
-            except Exception:
-                pack = None
-            if isinstance(pack, dict):
-                entries = pack.get("entries")
-                if isinstance(entries, list):
-                    return [entry for entry in entries if isinstance(entry, dict)], True
+        return await _repair_entries_for_artifact(artifact, self._artifact_store)
 
-        verification = (
-            metadata.get("deterministic_verification", {})
-            if isinstance(metadata, dict)
-            else {}
+
+@dataclass(frozen=True, slots=True)
+class ProductionRepairProjectionResult:
+    """Result of materializing the effective extraction projection."""
+
+    artifact: ProductionArtifact
+    changed: bool
+    accepted_indicator_count: int = 0
+    accepted_rule_count: int = 0
+    unresolved_count: int = 0
+    included_repair_keys: tuple[str, ...] = ()
+    excluded_repair_keys: tuple[str, ...] = ()
+    unresolved_repair_keys: tuple[str, ...] = ()
+
+
+class ProductionRepairProjectionService:
+    """Build an immutable effective extraction from Q2 plus append-only decisions."""
+
+    _PROJECTION_VERSION = "1"
+    _CANONICAL_BUCKET = "production-artifacts-canonical"
+
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        artifact_store: ProductionArtifactStore | None = None,
+        extraction_service: ExtractionService | None = None,
+    ) -> None:
+        self._uow_factory = uow_factory
+        self._artifact_store = artifact_store
+        self._extraction = extraction_service or ExtractionService(
+            uow_factory, artifact_store
         )
-        if not isinstance(verification, dict):
-            return [], False
-        legacy_entries = verification.get("q2_source_evidence_rejections")
-        if not isinstance(legacy_entries, list):
-            legacy_entries = verification.get("q2_rejected_rules", [])
-        return [entry for entry in legacy_entries if isinstance(entry, dict)], False
+
+    async def project_effective_extraction(
+        self,
+        run_id: UUID,
+        *,
+        actor_id: str,
+    ) -> ProductionRepairProjectionResult:
+        actor_id = actor_id.strip()
+        if not actor_id:
+            raise ProductionRepairProjectionError("production_repair_actor_required")
+        if self._artifact_store is None:
+            raise ProductionRepairProjectionError("production_repair_storage_unavailable")
+
+        async with self._uow_factory() as uow:
+            # Discover the owner first, then acquire Edition and Run locks in
+            # the same order as the other production repair services.
+            initial_run = await uow.subject_production_runs.get(run_id)
+            if initial_run is None:
+                raise ProductionRepairProjectionError("production_run_not_found")
+
+            editions = getattr(uow, "editions", None)
+            if editions is not None:
+                edition = await _get_for_update(editions, initial_run.edition_id)
+                if edition is None:
+                    raise ProductionRepairProjectionError("edition_not_found")
+                if _enum_value(edition.status) not in {
+                    EditionStatus.PRODUCTION.value,
+                    EditionStatus.REVIEW.value,
+                }:
+                    raise ProductionRepairProjectionError("edition_frozen_for_publication")
+                manifests = getattr(uow, "publication_manifests", None)
+                if (
+                    manifests is not None
+                    and await manifests.get_latest_for_edition(initial_run.edition_id) is not None
+                ):
+                    raise ProductionRepairProjectionError("edition_frozen_for_publication")
+
+            run = await _get_for_update(uow.subject_production_runs, run_id)
+            if run is None:
+                raise ProductionRepairProjectionError("production_run_not_found")
+            if run.edition_id != initial_run.edition_id:
+                raise ProductionRepairProjectionError("production_run_edition_changed")
+            if _enum_value(run.status) in {
+                SubjectProductionStatus.QUEUED.value,
+                SubjectProductionStatus.RUNNING.value,
+                SubjectProductionStatus.CANCELLED.value,
+            }:
+                raise ProductionRepairProjectionError("production_repair_run_not_reviewable")
+            if _enum_value(run.status) not in {
+                SubjectProductionStatus.READY.value,
+                SubjectProductionStatus.NEEDS_REVIEW.value,
+                SubjectProductionStatus.FAILED.value,
+            }:
+                raise ProductionRepairProjectionError("production_repair_run_not_reviewable")
+            if getattr(run, "requires_reconciliation", False):
+                raise ProductionReconciliationRequiredError
+
+            current = await uow.production_artifacts.get_current(
+                run.id, ProductionArtifactStage.EXTRACTION.value
+            )
+            if current is None or current.canonical_blob_id is None:
+                raise ProductionRepairProjectionError("extraction_artifact_not_found")
+
+            base: Any = current
+            marker = (
+                current.metadata.get("repair_projection")
+                if isinstance(getattr(current, "metadata", None), dict)
+                else None
+            )
+            if isinstance(marker, dict):
+                base_id = marker.get("base_extraction_artifact_id")
+                try:
+                    base = await uow.production_artifacts.get(UUID(str(base_id)))
+                except (TypeError, ValueError):
+                    base = None
+                if base is None:
+                    raise ProductionRepairProjectionError("repair_projection_base_not_found")
+            if base.canonical_blob_id is None:
+                raise ProductionRepairProjectionError("extraction_payload_missing")
+
+            try:
+                base_extraction = technical_extraction_from_json(
+                    await self._artifact_store.read_json(base.canonical_blob_id)
+                )
+            except Exception as exc:
+                raise ProductionRepairProjectionError(
+                    "extraction_payload_unavailable"
+                ) from exc
+            entries, payload_available = await _repair_entries_for_artifact(
+                base, self._artifact_store
+            )
+            decisions = await _effective_decisions_for_reader(
+                uow, run.edition_id, run.subject_id
+            )
+            decisions_by_key = {
+                decision.repair_key: decision
+                for decision in decisions
+                if decision.subject_id == run.subject_id
+            }
+
+            active_entries: list[tuple[str, ProductionRepairIssueKind, dict[str, Any]]] = []
+            for entry in entries:
+                identity = _repair_entry_identity(
+                    entry,
+                    edition_id=run.edition_id,
+                    subject_id=run.subject_id,
+                    payload_available=payload_available,
+                )
+                if identity is not None:
+                    active_entries.append((identity[0], identity[1], entry))
+
+            items = list(base_extraction.items)
+            rules = list(base_extraction.rules)
+            included: list[str] = []
+            excluded: list[str] = []
+            unresolved: list[str] = []
+            accepted_indicator_count = 0
+            accepted_rule_count = 0
+            additions: list[ExtractionItem] = []
+            rule_additions: list[DetectionRule] = []
+
+            for repair_key, kind, entry in sorted(
+                active_entries, key=lambda value: (value[1].value, value[0])
+            ):
+                decision = decisions_by_key.get(repair_key)
+                if decision is None:
+                    unresolved.append(repair_key)
+                    continue
+                action = _enum_value(decision.action)
+                if action == ProductionRepairAction.EXCLUDE.value:
+                    excluded.append(repair_key)
+                    continue
+                if action != ProductionRepairAction.INCLUDE.value:
+                    unresolved.append(repair_key)
+                    continue
+                value = entry.get("value")
+                if not payload_available or not isinstance(value, str):
+                    raise ProductionRepairProjectionError("repair_payload_unavailable")
+                value_sha256 = str(
+                    entry.get("value_sha256") or entry.get("value_hash") or ""
+                ).casefold()
+                if value_sha256 != _sha256(value):
+                    raise ProductionRepairProjectionError("repair_payload_hash_mismatch")
+                try:
+                    if kind is ProductionRepairIssueKind.REJECTED_RULE:
+                        rule_additions.append(
+                            _build_override_rule(entry, value, repair_key)
+                        )
+                        accepted_rule_count += 1
+                    else:
+                        additions.append(_build_override_item(entry, value, repair_key))
+                        if is_publication_ioc_artifact_type(entry.get("artifact_type")):
+                            accepted_indicator_count += 1
+                except (TypeError, ValueError) as exc:
+                    raise ProductionRepairProjectionError(
+                        "repair_payload_invalid"
+                    ) from exc
+                included.append(repair_key)
+
+            projected = TechnicalExtraction(
+                items=_merge_projection_items(items, additions),
+                uncertainties=base_extraction.uncertainties,
+                rules=_merge_projection_rules(rules, rule_additions),
+            )
+            current_extraction = base_extraction
+            if current.id != base.id:
+                try:
+                    current_extraction = technical_extraction_from_json(
+                        await self._artifact_store.read_json(current.canonical_blob_id)
+                    )
+                except Exception:
+                    current_extraction = base_extraction
+
+            if projected == current_extraction:
+                await uow.commit()
+                return ProductionRepairProjectionResult(
+                    artifact=current,
+                    changed=False,
+                    accepted_indicator_count=accepted_indicator_count,
+                    accepted_rule_count=accepted_rule_count,
+                    unresolved_count=len(unresolved),
+                    included_repair_keys=tuple(sorted(included)),
+                    excluded_repair_keys=tuple(sorted(excluded)),
+                    unresolved_repair_keys=tuple(sorted(unresolved)),
+                )
+
+            effective_for_base = [
+                decision
+                for repair_key, _kind, _entry in active_entries
+                if (decision := decisions_by_key.get(repair_key)) is not None
+            ]
+            effective_for_base.sort(key=lambda item: (item.repair_key, item.id))
+            effective_decision_payload = [
+                [item.repair_key, _enum_value(item.action), str(item.id)]
+                for item in effective_for_base
+            ]
+            input_hash = compute_input_hash(
+                {
+                    "repair_projection_version": self._PROJECTION_VERSION,
+                    "base_extraction_artifact_id": str(base.id),
+                    "base_input_hash": base.input_hash,
+                    "effective_decisions": effective_decision_payload,
+                }
+            )
+            canonical_json = technical_extraction_to_json(projected)
+            base_metadata = dict(getattr(base, "metadata", {}) or {})
+            base_diagnostics = base_metadata.get("deterministic_verification", {})
+            projection_metadata = {
+                "version": self._PROJECTION_VERSION,
+                "base_extraction_artifact_id": str(base.id),
+                "decision_ids": [str(item.id) for item in effective_for_base],
+                "included_repair_keys": sorted(included),
+                "excluded_repair_keys": sorted(excluded),
+                "unresolved_repair_keys": sorted(unresolved),
+                "actor_id": actor_id,
+            }
+            metadata: dict[str, Any] = {
+                "element_counts": {
+                    category: len(value)
+                    for category, value in canonical_json.items()
+                    if isinstance(value, list)
+                },
+                "warnings": list(base_metadata.get("warnings", []))
+                if isinstance(base_metadata.get("warnings", []), list)
+                else [],
+                "parser_version": canonical_json.get("parser_version"),
+                "generated_at": datetime.now(UTC).isoformat(),
+                # These diagnostics describe BASE, never a fresh model call.
+                "deterministic_verification": dict(base_diagnostics)
+                if isinstance(base_diagnostics, dict)
+                else {},
+                "repair_projection": projection_metadata,
+                "projection_diagnostics_basis": "base_extraction",
+            }
+            if isinstance(base_metadata.get("repair_evidence"), dict):
+                metadata["repair_evidence"] = dict(base_metadata["repair_evidence"])
+
+            artifact = await self._extraction._store_repair_projection_in_uow(
+                uow,
+                run_id=run.id,
+                subject_id=run.subject_id,
+                input_hash=input_hash,
+                canonical_json=canonical_json,
+                metadata=metadata,
+            )
+            await uow.commit()
+            return ProductionRepairProjectionResult(
+                artifact=artifact,
+                changed=True,
+                accepted_indicator_count=accepted_indicator_count,
+                accepted_rule_count=accepted_rule_count,
+                unresolved_count=len(unresolved),
+                included_repair_keys=tuple(sorted(included)),
+                excluded_repair_keys=tuple(sorted(excluded)),
+                unresolved_repair_keys=tuple(sorted(unresolved)),
+            )
+
+
+async def _repair_entries_for_artifact(
+    artifact: Any, artifact_store: ProductionArtifactStore | None
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read the complete pack, falling back to bounded legacy diagnostics."""
+    metadata = getattr(artifact, "metadata", {}) or {}
+    marker = metadata.get("repair_evidence") if isinstance(metadata, dict) else None
+    blob_id = marker.get("blob_id") if isinstance(marker, dict) else None
+    if artifact_store is not None and blob_id:
+        try:
+            pack = await artifact_store.read_repair_evidence(UUID(str(blob_id)))
+        except Exception:
+            pack = None
+        if isinstance(pack, dict) and isinstance(pack.get("entries"), list):
+            return [entry for entry in pack["entries"] if isinstance(entry, dict)], True
+
+    verification = (
+        metadata.get("deterministic_verification", {}) if isinstance(metadata, dict) else {}
+    )
+    if not isinstance(verification, dict):
+        return [], False
+    legacy_entries = verification.get("q2_source_evidence_rejections")
+    if not isinstance(legacy_entries, list):
+        legacy_entries = verification.get("q2_rejected_rules", [])
+    return [entry for entry in legacy_entries if isinstance(entry, dict)], False
+
+
+def _repair_entry_identity(
+    entry: Mapping[str, Any],
+    *,
+    edition_id: UUID,
+    subject_id: UUID,
+    payload_available: bool = True,
+) -> tuple[str, ProductionRepairIssueKind, str] | None:
+    """Derive the active issue key from immutable evidence, never its position."""
+    proposal_kind = str(entry.get("proposal_kind", ""))
+    kind_value = entry.get("kind") or (
+        ProductionRepairIssueKind.REJECTED_RULE.value
+        if proposal_kind == "rule"
+        else ProductionRepairIssueKind.REJECTED_INDICATOR.value
+    )
+    try:
+        kind = ProductionRepairIssueKind(str(kind_value))
+    except ValueError:
+        return None
+    if kind not in {
+        ProductionRepairIssueKind.REJECTED_INDICATOR,
+        ProductionRepairIssueKind.REJECTED_RULE,
+    }:
+        return None
+    source_url = str(entry.get("source_url", ""))
+    source_id = str(entry.get("source_id", ""))
+    if not source_url or not source_id:
+        return None
+    try:
+        canonical_url = canonicalize_http_url(source_url)
+    except ValueError:
+        canonical_url = source_url
+    value = entry.get("value")
+    value_sha256 = entry.get("value_sha256") or entry.get("value_hash")
+    if payload_available and isinstance(value, str):
+        # The complete evidence pack is authoritative for the identity. This
+        # makes a changed value a new repair key even if a stale copied hash
+        # or repair_key is present in an old diagnostic.
+        value_sha256 = _sha256(value)
+    elif isinstance(value, str) and (
+        not isinstance(value_sha256, str) or not _SHA256_RE.fullmatch(value_sha256.casefold())
+    ):
+        value_sha256 = _sha256(value)
+    if not isinstance(value_sha256, str) or not _SHA256_RE.fullmatch(value_sha256.casefold()):
+        return None
+    value_sha256 = value_sha256.casefold()
+    try:
+        key = repair_key_for_rejection_hash(
+            edition_id=edition_id,
+            subject_id=subject_id,
+            kind=kind,
+            source_url=canonical_url,
+            artifact_type=(
+                str(entry.get("artifact_type"))
+                if entry.get("artifact_type") is not None
+                else None
+            ),
+            value_sha256=value_sha256,
+        )
+    except ValueError:
+        return None
+    return key, kind, source_id
+
+
+def _entry_artifact_type(value: object) -> ArtifactType:
+    token = str(value or "").casefold()
+    if token in {"md5", "sha1", "sha256", "sha512", "hash"}:
+        return ArtifactType.HASH
+    return ArtifactType(token)
+
+
+def _entry_rule_type(value: object) -> DetectionRuleType:
+    token = str(value or "").casefold()
+    if token.endswith("_rule"):
+        token = token[:-5]
+    return DetectionRuleType(token)
+
+
+def _entry_model_run_ids(entry: Mapping[str, Any]) -> tuple[str, ...]:
+    value = entry.get("model_run_ids")
+    if isinstance(value, list | tuple):
+        return tuple(str(item) for item in value)
+    model_run_id = entry.get("model_run_id")
+    return (str(model_run_id),) if model_run_id is not None else ()
+
+
+def _build_override_item(
+    entry: Mapping[str, Any], value: str, repair_key: str
+) -> ExtractionItem:
+    artifact_type = _entry_artifact_type(entry.get("artifact_type"))
+    if artifact_type in {
+        ArtifactType.YARA_RULE,
+        ArtifactType.SIGMA_RULE,
+        ArtifactType.SURICATA_RULE,
+    } or artifact_type is ArtifactType.OTHER:
+        raise ValueError("Unsupported repair artifact type")
+    source_id = str(entry["source_id"])
+    proposal = Q2ArtifactProposal(
+        value=value,
+        artifact_type=artifact_type.value,
+        indicator_status="confirmed_ioc",
+        context="",
+        evidence_quote="",
+    )
+    verified = verify_q2_proposals(
+        [
+            Q2ProposalSubmission(
+                output=Q2SourceOutput(artifacts=[proposal]),
+                source_ids=(source_id,),
+                model_run_id=(str(entry["model_run_id"]) if entry.get("model_run_id") else None),
+            )
+        ]
+    ).canonical
+    if len(verified.items) != 1:
+        raise ValueError("Repair artifact failed deterministic validation")
+    item = verified.items[0]
+    publication_ioc = is_publication_ioc_artifact_type(artifact_type)
+    return replace(
+        item,
+        local_id=f"RPA-{repair_key[:16]}",
+        category=("network_artifacts" if publication_ioc else item.category),
+        source_ids=(source_id,),
+        supported=True,
+        indicator_status=(
+            IndicatorStatus.CONFIRMED_IOC if publication_ioc else IndicatorStatus.CONTEXTUAL
+        ),
+        provenance=IndicatorProvenance.ANALYST,
+        display_policy=(DisplayPolicy.IOC_SECTION if publication_ioc else DisplayPolicy.BODY_ONLY),
+        evidence_quote="",
+        model_run_ids=_entry_model_run_ids(entry),
+        evidence_basis=ProductionEvidenceBasis.ANALYST_OVERRIDE,
+    )
+
+
+def _build_override_rule(
+    entry: Mapping[str, Any], value: str, repair_key: str
+) -> DetectionRule:
+    source_id = str(entry["source_id"])
+    rule_type = _entry_rule_type(entry.get("artifact_type"))
+    name = entry.get("name")
+    proposal = Q2RuleProposal(
+        rule_type=rule_type,
+        name=name if isinstance(name, str) else None,
+        body=value,
+        context="",
+        evidence_quote="",
+    )
+    verified = verify_q2_proposals(
+        [
+            Q2ProposalSubmission(
+                output=Q2SourceOutput(rules=[proposal]),
+                source_ids=(source_id,),
+                model_run_id=(str(entry["model_run_id"]) if entry.get("model_run_id") else None),
+            )
+        ]
+    ).canonical
+    if len(verified.rules) != 1:
+        raise ValueError("Repair rule failed deterministic validation")
+    return replace(
+        verified.rules[0],
+        source_ids=(source_id,),
+        supported=True,
+        model_run_ids=_entry_model_run_ids(entry),
+        evidence_basis=ProductionEvidenceBasis.ANALYST_OVERRIDE,
+    )
+
+
+def _item_projection_key(item: ExtractionItem) -> tuple[str, str]:
+    if item.artifact_type is None:
+        return item.category, item.value.casefold()
+    artifact_type = ArtifactType(item.artifact_type)
+    normalized = item.normalized_value or canonical_indicator_key(item.value, artifact_type)
+    return artifact_type.value, normalized
+
+
+def _prefer_projection_object[T](
+    previous: T, candidate: T, *, previous_basis: ProductionEvidenceBasis,
+    candidate_basis: ProductionEvidenceBasis,
+) -> T:
+    if (
+        previous_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+        and candidate_basis is ProductionEvidenceBasis.SOURCE_VERIFIED
+    ):
+        return candidate
+    return previous
+
+
+def _merge_projection_items(
+    base: Sequence[ExtractionItem], additions: Sequence[ExtractionItem]
+) -> tuple[ExtractionItem, ...]:
+    merged: dict[tuple[str, str], ExtractionItem] = {}
+    for item in (*base, *sorted(additions, key=lambda value: _item_projection_key(value))):
+        key = _item_projection_key(item)
+        previous = merged.get(key)
+        if previous is None:
+            merged[key] = item
+            continue
+        chosen = _prefer_projection_object(
+            previous,
+            item,
+            previous_basis=previous.evidence_basis,
+            candidate_basis=item.evidence_basis,
+        )
+        merged[key] = replace(
+            chosen,
+            source_ids=tuple(sorted(set(previous.source_ids + item.source_ids))),
+            model_run_ids=tuple(sorted(set(previous.model_run_ids + item.model_run_ids))),
+        )
+    return tuple(merged.values())
+
+
+def _merge_projection_rules(
+    base: Sequence[DetectionRule], additions: Sequence[DetectionRule]
+) -> tuple[DetectionRule, ...]:
+    merged: dict[tuple[DetectionRuleType, str], DetectionRule] = {}
+    values = (*base, *sorted(additions, key=lambda value: (value.rule_type.value, value.sha256)))
+    for rule in values:
+        key = (rule.rule_type, rule.sha256)
+        previous = merged.get(key)
+        if previous is None:
+            merged[key] = rule
+            continue
+        chosen = _prefer_projection_object(
+            previous,
+            rule,
+            previous_basis=previous.evidence_basis,
+            candidate_basis=rule.evidence_basis,
+        )
+        merged[key] = replace(
+            chosen,
+            source_ids=tuple(sorted(set(previous.source_ids + rule.source_ids))),
+            model_run_ids=tuple(sorted(set(previous.model_run_ids + rule.model_run_ids))),
+        )
+    return tuple(
+        merged[key] for key in sorted(merged, key=lambda value: (value[0].value, value[1]))
+    )
 
 
 async def _get_for_update(repository: Any, entity_id: UUID) -> Any | None:
@@ -628,32 +1210,41 @@ def _issue_record(
     if not isinstance(value_sha256, str) or not _SHA256_RE.fullmatch(value_sha256):
         value_sha256 = _sha256(raw_value) if isinstance(raw_value, str) else _sha256("")
     if value is not None and _sha256(value) != value_sha256:
+        value_sha256 = _sha256(value)
         value = None
         payload_available = False
 
     artifact_type = entry.get("artifact_type")
     artifact_type = str(artifact_type) if artifact_type is not None else None
-    repair_key = entry.get("repair_key")
-    if not isinstance(repair_key, str) or not _SHA256_RE.fullmatch(repair_key):
-        try:
-            repair_key = (
-                repair_key_for_supplemental_source(
-                    edition_id=edition_id,
-                    subject_id=context.run.subject_id,
-                    source_url=source_url,
-                )
-                if kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
-                else repair_key_for_rejection_hash(
-                    edition_id=edition_id,
-                    subject_id=context.run.subject_id,
-                    kind=kind,
-                    source_url=source_url,
-                    artifact_type=artifact_type,
-                    value_sha256=value_sha256,
-                )
+    supplied_repair_key = entry.get("repair_key")
+    try:
+        expected_repair_key = (
+            repair_key_for_supplemental_source(
+                edition_id=edition_id,
+                subject_id=context.run.subject_id,
+                source_url=source_url,
             )
-        except ValueError:
-            return None
+            if kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
+            else repair_key_for_rejection_hash(
+                edition_id=edition_id,
+                subject_id=context.run.subject_id,
+                kind=kind,
+                source_url=source_url,
+                artifact_type=artifact_type,
+                value_sha256=value_sha256,
+            )
+        )
+    except ValueError:
+        return None
+    # Recompute the identity from the persisted content. A stale/corrupt
+    # supplied key must never make a decision for an old value adopt a new one.
+    repair_key = (
+        supplied_repair_key
+        if isinstance(supplied_repair_key, str)
+        and _SHA256_RE.fullmatch(supplied_repair_key)
+        and supplied_repair_key == expected_repair_key
+        else expected_repair_key
+    )
 
     preview_source = raw_value if isinstance(raw_value, str) else str(entry.get("preview", ""))
     preview = preview_source[:MAX_REPAIR_PREVIEW_CHARS]
@@ -662,6 +1253,10 @@ def _issue_record(
         kind=kind,
         artifact_type=artifact_type,
         source_id=source_id,
+        source_title=str(
+            entry.get("source_title") or context.source_titles.get(source_id, "")
+        ),
+        is_publication_ioc=is_publication_ioc_artifact_type(artifact_type),
         source_url=source_url,
         reason_code=str(entry.get("reason_code", "")),
         value_sha256=value_sha256,

@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from cti_app.application.discovery_report_parser import extract_http_urls
@@ -26,6 +26,7 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionEvidenceBasis,
 )
 from cti_app.domain.publication import PUBLICATION_SCHEMA_VERSION
 
@@ -199,6 +200,90 @@ class ExtractionService(_ArtifactPayloadMixin):
             await uow.commit()
             return artifact
 
+    async def store_repair_projection(
+        self,
+        *,
+        run_id: UUID,
+        subject_id: UUID,
+        input_hash: str,
+        canonical_json: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> ProductionArtifact:
+        """Persist an effective extraction produced by analyst decisions.
+
+        This path deliberately has no raw/model payload: a repair projection
+        is a deterministic derivative of an existing extraction and decision
+        log, not a new Q2 submission.
+        """
+        if self._artifact_store is None:
+            raise ValueError("Repair projection requires an artifact store")
+        async with self._uow_factory() as uow:
+            artifact = await self._store_repair_projection_in_uow(
+                uow,
+                run_id=run_id,
+                subject_id=subject_id,
+                input_hash=input_hash,
+                canonical_json=canonical_json,
+                metadata=metadata,
+            )
+            await uow.commit()
+            return artifact
+
+    async def _store_repair_projection_in_uow(
+        self,
+        uow: Any,
+        *,
+        run_id: UUID,
+        subject_id: UUID,
+        input_hash: str,
+        canonical_json: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> ProductionArtifact:
+        """Transaction-local variant used while Edition/Run locks are held."""
+        get_current = getattr(uow.production_artifacts, "get_current", None)
+        current = (
+            await get_current(run_id, ProductionArtifactStage.EXTRACTION.value)
+            if callable(get_current)
+            else None
+        )
+        if (
+            current is not None
+            and current.input_hash == input_hash
+            and isinstance(current.metadata, dict)
+            and isinstance(current.metadata.get("repair_projection"), dict)
+        ):
+            return cast(ProductionArtifact, current)
+
+        canonical_id = await self._artifact_store.put_json(
+            canonical_json, bucket="production-artifacts-canonical"
+        ) if self._artifact_store is not None else None
+        if canonical_id is None:
+            raise ValueError("Repair projection canonical payload was not stored")
+
+        prior_versions = [
+            artifact.version
+            for artifact in await uow.production_artifacts.list_for_run(run_id)
+            if artifact.stage is ProductionArtifactStage.EXTRACTION
+        ]
+        artifact = ProductionArtifact(
+            production_run_id=run_id,
+            subject_id=subject_id,
+            stage=ProductionArtifactStage.EXTRACTION,
+            version=max(prior_versions, default=0) + 1,
+            input_hash=input_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            raw_blob_id=None,
+            canonical_blob_id=canonical_id,
+            model_run_id=None,
+            conversation_turn_id=None,
+            metadata=dict(metadata),
+        )
+        await uow.production_artifacts.append(artifact)
+        await uow.production_artifacts.mark_downstream_stale(
+            run_id, ProductionArtifactStage.EXTRACTION.value
+        )
+        return artifact
+
 
 class SynthesisService(_ArtifactPayloadMixin):
     def __init__(
@@ -348,6 +433,14 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
                     "word_count": len(publication_markdown.split()),
                     "reference_count": len(document.sources),
                     "indicator_count": len(collect_indicators(extraction)),
+                    "analyst_override_indicator_count": sum(
+                        item.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+                        for item in extraction.items
+                    ),
+                    "analyst_override_rule_count": sum(
+                        rule.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+                        for rule in extraction.rules
+                    ),
                     "publication_schema_version": PUBLICATION_SCHEMA_VERSION,
                     "semantic_annotator_version": SEMANTIC_ANNOTATOR_VERSION,
                     "pandoc_renderer_version": PANDOC_RENDERER_VERSION,
@@ -470,6 +563,18 @@ class ProductionQAService:
                 )
 
         if extraction is not None:
+            analyst_override_count = sum(
+                item.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+                for item in extraction.items
+            ) + sum(
+                rule.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+                for rule in extraction.rules
+            )
+            if analyst_override_count:
+                warnings.append(
+                    "analyst_override_not_source_proof:"
+                    f"count={analyst_override_count}"
+                )
             require(
                 "no_unknown_reference_in_items",
                 all(

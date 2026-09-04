@@ -14,19 +14,29 @@ from cti_app.application.production_artifact_store import (
     MAX_REPAIR_EVIDENCE_BYTES,
     ProductionArtifactStore,
 )
+from cti_app.application.production_parsers import (
+    TechnicalExtraction,
+    technical_extraction_from_json,
+    technical_extraction_to_json,
+)
 from cti_app.application.production_repairs import (
     ProductionRepairDecisionService,
     ProductionRepairIssueService,
+    ProductionRepairProjectionService,
     build_repair_evidence_pack,
     repair_key_for_rejection,
 )
 from cti_app.application.production_stages import ExtractionService
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionEvidenceBasis,
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
+    SubjectProductionStatus,
 )
 
 EDITION_ID = uuid4()
@@ -440,3 +450,216 @@ async def test_issue_reader_returns_all_entries_and_detail_loads_one_body() -> N
     assert all(len(issue.preview) <= 512 for issue in issues)
     assert detail is not None
     assert detail.value == body
+
+
+class _ProjectionArtifacts:
+    def __init__(self) -> None:
+        self.items: list[ProductionArtifact] = []
+
+    async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        values = [
+            item
+            for item in self.items
+            if item.production_run_id == run_id
+            and item.stage.value == stage
+            and item.status is not ProductionArtifactStatus.STALE
+        ]
+        return max(values, key=lambda item: (item.version, str(item.id))) if values else None
+
+    async def get(self, artifact_id: UUID) -> ProductionArtifact | None:
+        return next((item for item in self.items if item.id == artifact_id), None)
+
+    async def list_for_run(self, run_id: UUID) -> list[ProductionArtifact]:
+        return [item for item in self.items if item.production_run_id == run_id]
+
+    async def append(self, artifact: ProductionArtifact) -> None:
+        self.items.append(artifact)
+
+    async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
+        del run_id, stage
+
+
+class _ProjectionDecisionRepository:
+    def __init__(self, decisions: list[ProductionRepairDecision]) -> None:
+        self.decisions = decisions
+
+    async def effective_decisions(
+        self, edition_id: UUID, subject_id: UUID | None = None
+    ) -> tuple[ProductionRepairDecision, ...]:
+        latest: dict[str, ProductionRepairDecision] = {}
+        for decision in sorted(self.decisions, key=lambda item: (item.created_at, item.id)):
+            if decision.edition_id != edition_id:
+                continue
+            if subject_id is not None and decision.subject_id != subject_id:
+                continue
+            latest[decision.repair_key] = decision
+        return tuple(latest.values())
+
+
+class _ProjectionUow:
+    def __init__(
+        self,
+        run: object,
+        artifact: ProductionArtifact,
+        decisions: list[ProductionRepairDecision],
+    ) -> None:
+        self.subject_production_runs = SimpleNamespace(
+            get=lambda _run_id: _async_value(run),
+            get_for_update=lambda _run_id: _async_value(run),
+        )
+        self.production_artifacts = _ProjectionArtifacts()
+        self.production_artifacts.items.append(artifact)
+        self.production_repair_decisions = _ProjectionDecisionRepository(decisions)
+        self.editions = SimpleNamespace(
+            get_for_update=lambda _edition_id: _async_value(
+                SimpleNamespace(status=EditionStatus.REVIEW)
+            )
+        )
+
+    async def __aenter__(self) -> _ProjectionUow:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def commit(self) -> None:
+        return None
+
+
+async def _async_value(value: object) -> object:
+    return value
+
+
+class _ProjectionFactory:
+    def __init__(self, uow: _ProjectionUow) -> None:
+        self.uow = uow
+
+    def __call__(self) -> _ProjectionUow:
+        return self.uow
+
+
+@pytest.mark.asyncio
+async def test_repair_projection_includes_ioc_and_rule_from_base_without_mutating_q2() -> None:
+    catalog = _BlobCatalog()
+    store = ProductionArtifactStore(catalog)  # type: ignore[arg-type]
+    domain = "override.security-lab.io"
+    rule_body = "rule Override { strings: $a = \"marker\" condition: $a }"
+    domain_key = repair_key_for_rejection(
+        edition_id=EDITION_ID,
+        subject_id=SUBJECT_ID,
+        kind=ProductionRepairIssueKind.REJECTED_INDICATOR,
+        source_url=SOURCE_URL,
+        artifact_type="domain",
+        value=domain,
+    )
+    rule_key = repair_key_for_rejection(
+        edition_id=EDITION_ID,
+        subject_id=SUBJECT_ID,
+        kind=ProductionRepairIssueKind.REJECTED_RULE,
+        source_url=SOURCE_URL,
+        artifact_type="yara",
+        value=rule_body,
+    )
+    pack = build_repair_evidence_pack(
+        [
+            {
+                "repair_key": domain_key,
+                "source_id": "S1",
+                "source_title": "Source title",
+                "source_url": SOURCE_URL,
+                "proposal_kind": "artifact",
+                "artifact_type": "domain",
+                "reason_code": "source_evidence_missing",
+                "value": domain,
+                "value_sha256": hashlib.sha256(domain.encode()).hexdigest(),
+            },
+            {
+                "repair_key": rule_key,
+                "source_id": "S1",
+                "source_title": "Source title",
+                "source_url": SOURCE_URL,
+                "proposal_kind": "rule",
+                "artifact_type": "yara",
+                "reason_code": "source_rule_evidence_missing",
+                "value": rule_body,
+                "value_sha256": hashlib.sha256(rule_body.encode()).hexdigest(),
+            },
+        ]
+    )
+    evidence_id = await store.put_repair_evidence(pack)
+    base_extraction = TechnicalExtraction(items=(), rules=())
+    canonical_id = await store.put_json(
+        technical_extraction_to_json(base_extraction), bucket="production-artifacts-canonical"
+    )
+    base = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="a" * 64,
+        canonical_blob_id=canonical_id,
+        metadata={
+            "repair_evidence": {
+                "schema_version": "1",
+                "blob_id": str(evidence_id),
+                "entry_count": 2,
+            },
+            "deterministic_verification": {"q2_rejected_ioc_count": 1},
+        },
+    )
+    run = SimpleNamespace(
+        id=RUN_ID,
+        edition_id=EDITION_ID,
+        subject_id=SUBJECT_ID,
+        status=SubjectProductionStatus.READY,
+        requires_reconciliation=False,
+        pipeline_generation=2,
+    )
+    decisions = [
+        ProductionRepairDecision(
+            edition_id=EDITION_ID,
+            subject_id=SUBJECT_ID,
+            production_run_id=RUN_ID,
+            observed_artifact_id=base.id,
+            observed_pipeline_generation=2,
+            repair_key=domain_key,
+            issue_kind=ProductionRepairIssueKind.REJECTED_INDICATOR,
+            action=ProductionRepairAction.INCLUDE,
+            actor_id="analyst",
+        ),
+        ProductionRepairDecision(
+            edition_id=EDITION_ID,
+            subject_id=SUBJECT_ID,
+            production_run_id=RUN_ID,
+            observed_artifact_id=base.id,
+            observed_pipeline_generation=2,
+            repair_key=rule_key,
+            issue_kind=ProductionRepairIssueKind.REJECTED_RULE,
+            action=ProductionRepairAction.INCLUDE,
+            actor_id="analyst",
+        ),
+    ]
+    uow = _ProjectionUow(run, base, decisions)
+    result = await ProductionRepairProjectionService(
+        _ProjectionFactory(uow), store  # type: ignore[arg-type]
+    ).project_effective_extraction(RUN_ID, actor_id="analyst")
+
+    assert result.changed
+    assert result.accepted_indicator_count == 1
+    assert result.accepted_rule_count == 1
+    assert result.unresolved_count == 0
+    assert result.artifact.id != base.id
+    assert technical_extraction_from_json(
+        await store.read_json(result.artifact.canonical_blob_id)  # type: ignore[arg-type]
+    ).items[0].evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+    projected = technical_extraction_from_json(
+        await store.read_json(result.artifact.canonical_blob_id)  # type: ignore[arg-type]
+    )
+    assert projected.items[0].value == domain
+    assert projected.items[0].source_ids == ("S1",)
+    assert projected.items[0].normalized_value == domain
+    assert projected.rules[0].body == rule_body
+    assert projected.rules[0].evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+    assert base_extraction == technical_extraction_from_json(
+        await store.read_json(base.canonical_blob_id)  # type: ignore[arg-type]
+    )

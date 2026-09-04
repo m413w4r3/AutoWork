@@ -32,6 +32,28 @@ class ArtifactType(StrEnum):
     OTHER = "other"
 
 
+# These are the only artifact types rendered in the publication IOC section.
+# The enum is the vocabulary; this set is the single classification used by
+# extraction, repair and review projections.
+PUBLICATION_IOC_ARTIFACT_TYPES = frozenset(
+    {
+        ArtifactType.IP,
+        ArtifactType.DOMAIN,
+        ArtifactType.URL,
+        ArtifactType.EMAIL,
+        ArtifactType.HASH,
+    }
+)
+
+
+def is_publication_ioc_artifact_type(value: ArtifactType | str | None) -> bool:
+    """Return whether an artifact belongs to the final IOC section."""
+    try:
+        return ArtifactType(value) in PUBLICATION_IOC_ARTIFACT_TYPES if value is not None else False
+    except ValueError:
+        return False
+
+
 class RichSpanKind(StrEnum):
     TEXT = "text"
     EMPHASIS = "emphasis"

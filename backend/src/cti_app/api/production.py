@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.identity import IdentityProvider
@@ -44,6 +46,8 @@ from cti_app.application.production_repairs import (
     ProductionReferenceRepairService,
     ProductionRepairDecisionService,
     ProductionRepairIssueService,
+    ProductionRepairProjectionError,
+    ProductionRepairProjectionService,
     ProductionRepairStaleError,
     ProductionRepairStatusError,
 )
@@ -80,6 +84,7 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
+from cti_app.domain.publication import is_publication_ioc_artifact_type
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api", tags=["production"])
@@ -145,6 +150,21 @@ class SupplementalRepairDecisionRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=500)
 
 
+class ProductionRepairDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["include", "exclude", "continue_without_source"]
+    observed_artifact_id: UUID
+    observed_pipeline_generation: int = Field(ge=0)
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class ApplyProductionRepairsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resume: bool = False
+
+
 class StageStatus(BaseModel):
     status: str  # pending, running, succeeded, needs_review, failed
     version: int | None = None
@@ -160,6 +180,7 @@ class ExtractionRejections(BaseModel):
     q2_rejected_rules: list[dict[str, Any]] = Field(default_factory=list)
     q2_rejected_rule_count: int = 0
     q2_rejected_artifact_count: int = 0
+    q2_rejected_ioc_count: int = 0
     q2_source_evidence_rejections: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -356,6 +377,18 @@ def _production_repair_decision_service(request: Request) -> ProductionRepairDec
     return service
 
 
+def _production_repair_projection_service(
+    request: Request,
+) -> ProductionRepairProjectionService:
+    service = getattr(request.app.state, "production_repair_projection_service", None)
+    if service is None:
+        service = ProductionRepairProjectionService(
+            request.app.state.uow_factory,
+            getattr(request.app.state, "production_artifact_store", None),
+        )
+    return service
+
+
 def _repair_decision_view(decision: Any | None) -> dict[str, Any] | None:
     if decision is None:
         return None
@@ -397,6 +430,8 @@ def _repair_issue_view(issue: Any) -> dict[str, Any]:
         "kind": issue.kind.value,
         "artifact_type": issue.artifact_type,
         "source_id": issue.source_id,
+        "source_title": issue.source_title,
+        "is_publication_ioc": issue.is_publication_ioc,
         "source_url": issue.source_url,
         "reason_code": issue.reason_code,
         "value_sha256": issue.value_sha256,
@@ -410,6 +445,30 @@ def _repair_issue_view(issue: Any) -> dict[str, Any]:
         "batch_id": issue.batch_id,
         "effective_decision": _repair_decision_view(issue.effective_decision),
     }
+
+
+def _repair_cursor(offset: int) -> str:
+    raw = str(offset).encode("ascii")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _repair_cursor_offset(cursor: str | None) -> int:
+    if not cursor:
+        return 0
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        offset = int(base64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii"))
+    except (ValueError, UnicodeError, binascii.Error) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_repair_cursor"},
+        ) from exc
+    if offset < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_repair_cursor"},
+        )
+    return offset
 
 
 async def _ensure_reconciliation_required(request: Request, run_id: UUID) -> None:
@@ -512,11 +571,19 @@ def _extraction_rejections(artifact: Any | None) -> ExtractionRejections:
     artifact_count = verification.get("q2_rejected_artifact_count")
     if not isinstance(artifact_count, int):
         artifact_count = len(rejections) - len(rules)
+    ioc_count = verification.get("q2_rejected_ioc_count")
+    if not isinstance(ioc_count, int):
+        ioc_count = sum(
+            is_publication_ioc_artifact_type(entry.get("artifact_type"))
+            for entry in rejections
+            if entry.get("proposal_kind") == "artifact"
+        )
 
     return ExtractionRejections(
         q2_rejected_rules=rules,
         q2_rejected_rule_count=rule_count,
         q2_rejected_artifact_count=artifact_count,
+        q2_rejected_ioc_count=ioc_count,
         q2_source_evidence_rejections=rejections[:200],
     )
 
@@ -1202,9 +1269,13 @@ async def get_subject_investigation(subject_id: UUID, request: Request) -> dict[
 
 @router.get("/subjects/{subject_id}/production/repairs")
 async def get_subject_production_repairs(
-    subject_id: UUID, request: Request
+    subject_id: UUID,
+    request: Request,
+    kind: ProductionRepairIssueKind | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=100),
 ) -> dict[str, Any]:
-    """List current Q2 and supplemental-source issues for Repair Desk."""
+    """List current Repair Desk issues with cursor pagination."""
     uow_factory = request.app.state.uow_factory
     async with uow_factory() as uow:
         run = await uow.subject_production_runs.get_current_for_subject(subject_id)
@@ -1220,20 +1291,74 @@ async def get_subject_production_repairs(
         edition_id, subject_id
     )
     extraction_issues = await issue_service.list_issues(edition_id, subject_id)
+    if kind is ProductionRepairIssueKind.REJECTED_INDICATOR:
+        supplemental = ()
+        extraction_issues = tuple(
+            issue for issue in extraction_issues if issue.kind is kind
+        )
+    elif kind is ProductionRepairIssueKind.REJECTED_RULE:
+        supplemental = ()
+        extraction_issues = tuple(issue for issue in extraction_issues if issue.kind is kind)
+    elif kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED:
+        extraction_issues = ()
+
+    all_issues = [
+        *[_repair_issue_view(issue) for issue in extraction_issues],
+        *[_supplemental_repair_issue_view(issue) for issue in supplemental],
+    ]
+    all_issues.sort(key=lambda item: (item.get("kind", ""), item.get("repair_key", "")))
+    offset = _repair_cursor_offset(cursor)
+    page = all_issues[offset : offset + limit]
+    next_offset = offset + len(page)
+    next_cursor = _repair_cursor(next_offset) if next_offset < len(all_issues) else None
     return {
         "subject_id": str(subject_id),
         "edition_id": str(edition_id),
         "production_run_id": str(run.id),
-        "issues": [
-            *[_repair_issue_view(issue) for issue in extraction_issues],
-            *[_supplemental_repair_issue_view(issue) for issue in supplemental],
-        ],
+        "issues": page,
         "supplemental_source_issues": [
-            _supplemental_repair_issue_view(issue) for issue in supplemental
+            item
+            for item in page
+            if item.get("kind")
+            == ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value
         ],
-        "has_more": False,
-        "next_cursor": None,
+        "has_more": next_cursor is not None,
+        "next_cursor": next_cursor,
     }
+
+
+@router.get("/subjects/{subject_id}/production/repairs/{repair_key}")
+async def get_subject_production_repair_detail(
+    subject_id: UUID, repair_key: str, request: Request
+) -> dict[str, Any]:
+    """Return the complete inert value for one rejected Q2 object."""
+    uow_factory = request.app.state.uow_factory
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if run is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No production run found for subject {subject_id}",
+            )
+        edition_id = run.edition_id
+    detail = await _production_repair_issue_service(request).get_issue(
+        edition_id, repair_key, subject_id
+    )
+    if detail is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "production_repair_issue_not_found"},
+        )
+    result = _repair_issue_view(detail.issue)
+    result["value"] = detail.value
+    result["body"] = (
+        detail.value
+        if detail.issue.kind is ProductionRepairIssueKind.REJECTED_RULE
+        else None
+    )
+    result["provenance_model_run_id"] = detail.issue.model_run_id
+    result["effective_decision"] = _repair_decision_view(detail.issue.effective_decision)
+    return result
 
 
 @router.post("/subjects/{subject_id}/production/repairs/rebuild-references")
@@ -1308,10 +1433,10 @@ async def rebuild_subject_references(
 async def decide_subject_production_repair(
     subject_id: UUID,
     repair_key: str,
-    payload: SupplementalRepairDecisionRequest,
+    payload: ProductionRepairDecisionRequest,
     request: Request,
 ) -> dict[str, Any]:
-    """Resolve a supplemental-source issue without inventing an archive."""
+    """Append a new decision for a rejected Q2 object or Q1 source issue."""
     uow_factory, _, _ = _runtime(request)
     async with uow_factory() as uow:
         run = await uow.subject_production_runs.get_current_for_subject(subject_id)
@@ -1321,48 +1446,56 @@ async def decide_subject_production_repair(
                 detail="No production run found",
             )
         edition_id = run.edition_id
-        current_references = await uow.production_artifacts.get_current(
-            run.id, ProductionArtifactStage.REFERENCES.value
+    issue_service = _production_repair_issue_service(request)
+    issue: Any
+    expected_kind: ProductionRepairIssueKind | None
+    if payload.action == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value:
+        issue = await issue_service.get_supplemental_source_issue(
+            edition_id, repair_key, subject_id
         )
-        if (
-            payload.observed_pipeline_generation != run.pipeline_generation
-            or (
-                current_references is not None
-                and current_references.id != payload.observed_artifact_id
-            )
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "production_repair_stale"},
-            )
-
-    issue = await _production_repair_issue_service(request).get_supplemental_source_issue(
-        edition_id, repair_key, subject_id
-    )
+        expected_kind = ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
+    else:
+        issue = await issue_service.get_issue(edition_id, repair_key, subject_id)
+        expected_kind = issue.issue.kind if issue is not None else None
     if issue is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "production_repair_issue_not_found"},
         )
+    if payload.action == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value:
+        issue_artifact_id = issue.observed_artifact_id
+        issue_generation = issue.observed_pipeline_generation
+    else:
+        issue_artifact_id = issue.issue.observed_artifact_id
+        issue_generation = issue.issue.observed_pipeline_generation
     if (
-        issue.observed_artifact_id != payload.observed_artifact_id
-        or issue.observed_pipeline_generation != payload.observed_pipeline_generation
+        issue_artifact_id != payload.observed_artifact_id
+        or issue_generation != payload.observed_pipeline_generation
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "production_repair_stale"},
         )
+    if expected_kind is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "production_repair_issue_kind_missing"},
+        )
+    if payload.action == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value:
+        production_run_id = issue.production_run_id
+    else:
+        production_run_id = issue.issue.production_run_id
 
     try:
         decision = await _production_repair_decision_service(request).decide(
             edition_id=edition_id,
             subject_id=subject_id,
-            production_run_id=issue.production_run_id,
+            production_run_id=production_run_id,
             observed_artifact_id=payload.observed_artifact_id,
             observed_pipeline_generation=payload.observed_pipeline_generation,
             repair_key=repair_key,
-            issue_kind=ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
-            action=ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+            issue_kind=expected_kind,
+            action=ProductionRepairAction(payload.action),
             actor_id=await _actor_id(request),
             reason=payload.reason,
         )
@@ -1383,8 +1516,79 @@ async def decide_subject_production_repair(
         "decision_id": str(decision.id),
         "resolved": True,
         "archive_created": False,
-        "retry_required": False,
+        "retry_required": expected_kind
+        in {
+            ProductionRepairIssueKind.REJECTED_INDICATOR,
+            ProductionRepairIssueKind.REJECTED_RULE,
+        },
     }
+
+
+@router.post("/subjects/{subject_id}/production/repairs/apply")
+async def apply_subject_production_repairs(
+    subject_id: UUID,
+    request: Request,
+    payload: ApplyProductionRepairsRequest | None = None,
+) -> dict[str, Any]:
+    """Persist the effective extraction, then optionally resume SYNTHESIS."""
+    uow_factory = request.app.state.uow_factory
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if run is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No production run found for subject {subject_id}",
+            )
+        run_id = run.id
+
+    try:
+        result = await _production_repair_projection_service(request).project_effective_extraction(
+            run_id,
+            actor_id=await _actor_id(request),
+        )
+    except ProductionReconciliationRequiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "production_reconciliation_required"},
+        ) from exc
+    except ProductionRepairProjectionError as exc:
+        code = str(exc)
+        not_found = {"production_run_not_found", "extraction_artifact_not_found"}
+        raise HTTPException(
+            status_code=(
+                status.HTTP_404_NOT_FOUND
+                if code in not_found
+                else status.HTTP_409_CONFLICT
+            ),
+            detail={"code": code, "message": code},
+        ) from exc
+
+    response: dict[str, Any] = {
+        "changed": result.changed,
+        "extraction_artifact_id": str(result.artifact.id),
+        "accepted_indicator_count": result.accepted_indicator_count,
+        "accepted_rule_count": result.accepted_rule_count,
+        "unresolved_count": result.unresolved_count,
+        "recommended_retry_stage": SubjectProductionStage.SYNTHESIS.value,
+        "resumed": False,
+    }
+    if (payload or ApplyProductionRepairsRequest()).resume:
+        try:
+            await _retry_production_run(
+                request,
+                run_id,
+                RetryProductionStageRequest(stage=SubjectProductionStage.SYNTHESIS),
+                await _actor_id(request),
+            )
+            response["resumed"] = True
+        except Exception as exc:
+            # Projection persistence is committed independently. A dispatcher
+            # failure must not make the analyst believe the projection vanished.
+            response["resume_error"] = {
+                "code": str(getattr(exc, "code", None) or type(exc).__name__),
+                "message": str(exc),
+            }
+    return response
 
 
 @router.post("/subjects/{subject_id}/production/retry")

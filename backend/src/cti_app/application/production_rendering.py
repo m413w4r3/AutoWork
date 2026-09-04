@@ -18,7 +18,7 @@ from cti_app.application.production_parsers import (
     ReferenceReport,
     TechnicalExtraction,
 )
-from cti_app.domain.publication import ArtifactType
+from cti_app.domain.publication import ArtifactType, is_publication_ioc_artifact_type
 
 _MARKER = re.compile(r"\[(S\d{1,3})\]", re.IGNORECASE)
 
@@ -93,6 +93,8 @@ def collect_indicators(extraction: TechnicalExtraction) -> list[ExtractionItem]:
             ArtifactType.SIGMA_RULE,
             ArtifactType.SURICATA_RULE,
         }:
+            continue
+        if not is_publication_ioc_artifact_type(artifact_type):
             continue
         try:
             key = (artifact_type.value, canonical_indicator_key(item.value, artifact_type))

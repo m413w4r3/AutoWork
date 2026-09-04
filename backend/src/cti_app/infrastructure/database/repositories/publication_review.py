@@ -118,6 +118,12 @@ class SqlAlchemyEditionReviewReadRepository:
                 ProductionArtifactRow.production_run_id.label("run_id"),
                 func.coalesce(
                     ProductionArtifactRow.artifact_metadata[
+                        "q2_rejected_ioc_count"
+                    ].as_integer(),
+                    ProductionArtifactRow.artifact_metadata["deterministic_verification"][
+                        "q2_rejected_ioc_count"
+                    ].as_integer(),
+                    ProductionArtifactRow.artifact_metadata[
                         "q2_rejected_artifact_count"
                     ].as_integer(),
                     ProductionArtifactRow.artifact_metadata["deterministic_verification"][

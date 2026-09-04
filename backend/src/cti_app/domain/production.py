@@ -146,6 +146,13 @@ class DetectionRuleType(StrEnum):
     SNORT = "snort"
 
 
+class ProductionEvidenceBasis(StrEnum):
+    """Why a production object is eligible for publication."""
+
+    SOURCE_VERIFIED = "source_verified"
+    ANALYST_OVERRIDE = "analyst_override"
+
+
 @dataclass(frozen=True)
 class DetectionRule:
     """A published detection rule kept as canonical, inert source data."""
@@ -159,6 +166,7 @@ class DetectionRule:
     supported: bool
     model_run_ids: tuple[str, ...]
     sha256: str
+    evidence_basis: ProductionEvidenceBasis = ProductionEvidenceBasis.SOURCE_VERIFIED
 
 
 class SourceExtractionStatus(StrEnum):
