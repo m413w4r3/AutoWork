@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -39,6 +39,14 @@ from cti_app.application.production_recovery import (
     ProductionRecoveryDisposition,
     ProductionRecoveryPolicyV1,
 )
+from cti_app.application.production_repairs import (
+    ProductionReferenceRepairError,
+    ProductionReferenceRepairService,
+    ProductionRepairDecisionService,
+    ProductionRepairIssueService,
+    ProductionRepairStaleError,
+    ProductionRepairStatusError,
+)
 from cti_app.application.production_stage_status import (
     build_stage_statuses,
     completed_stage_count,
@@ -63,6 +71,9 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionBatchCancellationConflictError,
     ProductionBatchStatus,
+    ProductionReconciliationRequiredError,
+    ProductionRepairAction,
+    ProductionRepairIssueKind,
     ProductionReuseInvalidation,
     ProductionSubmissionReconciliation,
     SubjectProductionRun,
@@ -117,6 +128,21 @@ class DeclareReconciliationLostRequest(BaseModel):
 
     confirm: bool
     reason: str = ""
+
+
+class RebuildReferencesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resume: bool = False
+
+
+class SupplementalRepairDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["continue_without_source"]
+    observed_artifact_id: UUID
+    observed_pipeline_generation: int = Field(ge=0)
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class StageStatus(BaseModel):
@@ -299,6 +325,91 @@ def _production_reconciliation_resolver(request: Request) -> ProductionReconcili
         ),
         diagnostics=getattr(request.app.state, "production_diagnostics", None),
     )
+
+
+def _production_repair_issue_service(request: Request) -> ProductionRepairIssueService:
+    service = getattr(request.app.state, "production_repair_issue_service", None)
+    if service is None:
+        service = ProductionRepairIssueService(
+            request.app.state.uow_factory,
+            getattr(request.app.state, "production_artifact_store", None),
+        )
+    return service
+
+
+def _production_reference_repair_service(
+    request: Request,
+) -> ProductionReferenceRepairService:
+    service = getattr(request.app.state, "production_reference_repair_service", None)
+    if service is None:
+        service = ProductionReferenceRepairService(
+            request.app.state.uow_factory,
+            getattr(request.app.state, "production_artifact_store", None),
+        )
+    return service
+
+
+def _production_repair_decision_service(request: Request) -> ProductionRepairDecisionService:
+    service = getattr(request.app.state, "production_repair_decision_service", None)
+    if service is None:
+        service = ProductionRepairDecisionService(request.app.state.uow_factory)
+    return service
+
+
+def _repair_decision_view(decision: Any | None) -> dict[str, Any] | None:
+    if decision is None:
+        return None
+    return {
+        "id": str(decision.id),
+        "action": decision.action.value,
+        "actor_id": decision.actor_id,
+        "reason": decision.reason,
+        "created_at": decision.created_at.isoformat(),
+        "observed_artifact_id": str(decision.observed_artifact_id),
+        "observed_pipeline_generation": decision.observed_pipeline_generation,
+    }
+
+
+def _supplemental_repair_issue_view(issue: Any) -> dict[str, Any]:
+    return {
+        "repair_key": issue.repair_key,
+        "kind": issue.kind.value,
+        "source_id": issue.source_id,
+        "source_title": issue.source_title,
+        "source_url": issue.source_url,
+        "publisher": issue.publisher,
+        "collection_id": str(issue.collection_id),
+        "collection_state": issue.collection_state,
+        "error_reason": issue.error_reason,
+        "attempt_count": issue.attempt_count,
+        "production_run_id": str(issue.production_run_id),
+        "observed_artifact_id": str(issue.observed_artifact_id),
+        "observed_artifact_version": issue.observed_artifact_version,
+        "observed_pipeline_generation": issue.observed_pipeline_generation,
+        "effective_decision": _repair_decision_view(issue.effective_decision),
+        "recommended_action": issue.recommended_action,
+    }
+
+
+def _repair_issue_view(issue: Any) -> dict[str, Any]:
+    return {
+        "repair_key": issue.repair_key,
+        "kind": issue.kind.value,
+        "artifact_type": issue.artifact_type,
+        "source_id": issue.source_id,
+        "source_url": issue.source_url,
+        "reason_code": issue.reason_code,
+        "value_sha256": issue.value_sha256,
+        "preview": issue.preview,
+        "payload_available": issue.payload_available,
+        "production_run_id": str(issue.production_run_id),
+        "observed_artifact_id": str(issue.observed_artifact_id),
+        "observed_artifact_version": issue.observed_artifact_version,
+        "observed_pipeline_generation": issue.observed_pipeline_generation,
+        "model_run_id": issue.model_run_id,
+        "batch_id": issue.batch_id,
+        "effective_decision": _repair_decision_view(issue.effective_decision),
+    }
 
 
 async def _ensure_reconciliation_required(request: Request, run_id: UUID) -> None:
@@ -1087,6 +1198,193 @@ async def get_subject_investigation(subject_id: UUID, request: Request) -> dict[
                 await store.read_json(investigation.input_pack_blob_id)
             ).get("file_indicators", [])
         return result
+
+
+@router.get("/subjects/{subject_id}/production/repairs")
+async def get_subject_production_repairs(
+    subject_id: UUID, request: Request
+) -> dict[str, Any]:
+    """List current Q2 and supplemental-source issues for Repair Desk."""
+    uow_factory = request.app.state.uow_factory
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if run is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No production run found for subject {subject_id}",
+            )
+        edition_id = run.edition_id
+
+    issue_service = _production_repair_issue_service(request)
+    supplemental = await issue_service.list_supplemental_source_issues(
+        edition_id, subject_id
+    )
+    extraction_issues = await issue_service.list_issues(edition_id, subject_id)
+    return {
+        "subject_id": str(subject_id),
+        "edition_id": str(edition_id),
+        "production_run_id": str(run.id),
+        "issues": [
+            *[_repair_issue_view(issue) for issue in extraction_issues],
+            *[_supplemental_repair_issue_view(issue) for issue in supplemental],
+        ],
+        "supplemental_source_issues": [
+            _supplemental_repair_issue_view(issue) for issue in supplemental
+        ],
+        "has_more": False,
+        "next_cursor": None,
+    }
+
+
+@router.post("/subjects/{subject_id}/production/repairs/rebuild-references")
+async def rebuild_subject_references(
+    subject_id: UUID,
+    request: Request,
+    payload: RebuildReferencesRequest | None = None,
+) -> dict[str, Any]:
+    """Rebuild Q1's canonical report from its already archived raw answer."""
+    uow_factory = request.app.state.uow_factory
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if run is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No production run found for subject {subject_id}",
+            )
+        run_id = run.id
+
+    try:
+        result = await _production_reference_repair_service(request).rebuild_from_archived_q1(
+            run_id,
+            actor_id=await _actor_id(request),
+        )
+    except ProductionReconciliationRequiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "production_reconciliation_required",
+                "message": "La réconciliation ChatGPT doit être résolue avant réparation.",
+            },
+        ) from exc
+    except ProductionReferenceRepairError as exc:
+        not_found = {"production_run_not_found", "references_artifact_not_found"}
+        code = exc.code
+        raise HTTPException(
+            status_code=(
+                status.HTTP_404_NOT_FOUND if code in not_found else status.HTTP_409_CONFLICT
+            ),
+            detail={"code": code, "message": str(exc)},
+        ) from exc
+
+    response: dict[str, Any] = {
+        "references_artifact_id": str(result.artifact.id),
+        "changed": result.changed,
+        "restored_source_count": len(result.restored_source_ids),
+        "restored_event_count": len(result.restored_event_ids),
+        "recommended_retry_stage": SubjectProductionStage.EXTRACTION.value,
+    }
+    if (payload or RebuildReferencesRequest()).resume:
+        try:
+            response["resume"] = await _retry_production_run(
+                request,
+                run_id,
+                RetryProductionStageRequest(stage=SubjectProductionStage.EXTRACTION),
+                await _actor_id(request),
+            )
+        except Exception as exc:
+            # The rebuild transaction has already committed.  A queue or
+            # dispatcher failure is reported without turning durable repair
+            # state back into an apparent upload failure.
+            response["resume_error"] = {
+                "code": str(getattr(exc, "code", None) or type(exc).__name__),
+                "message": str(exc),
+            }
+    return response
+
+
+@router.post(
+    "/subjects/{subject_id}/production/repairs/{repair_key}/decision"
+)
+async def decide_subject_production_repair(
+    subject_id: UUID,
+    repair_key: str,
+    payload: SupplementalRepairDecisionRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Resolve a supplemental-source issue without inventing an archive."""
+    uow_factory, _, _ = _runtime(request)
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if run is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No production run found",
+            )
+        edition_id = run.edition_id
+        current_references = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.REFERENCES.value
+        )
+        if (
+            payload.observed_pipeline_generation != run.pipeline_generation
+            or (
+                current_references is not None
+                and current_references.id != payload.observed_artifact_id
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "production_repair_stale"},
+            )
+
+    issue = await _production_repair_issue_service(request).get_supplemental_source_issue(
+        edition_id, repair_key, subject_id
+    )
+    if issue is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "production_repair_issue_not_found"},
+        )
+    if (
+        issue.observed_artifact_id != payload.observed_artifact_id
+        or issue.observed_pipeline_generation != payload.observed_pipeline_generation
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "production_repair_stale"},
+        )
+
+    try:
+        decision = await _production_repair_decision_service(request).decide(
+            edition_id=edition_id,
+            subject_id=subject_id,
+            production_run_id=issue.production_run_id,
+            observed_artifact_id=payload.observed_artifact_id,
+            observed_pipeline_generation=payload.observed_pipeline_generation,
+            repair_key=repair_key,
+            issue_kind=ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
+            action=ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+            actor_id=await _actor_id(request),
+            reason=payload.reason,
+        )
+    except ProductionRepairStaleError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": ProductionRepairStaleError.code},
+        ) from exc
+    except ProductionRepairStatusError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": str(exc)},
+        ) from exc
+
+    return {
+        "repair_key": repair_key,
+        "action": decision.action.value,
+        "decision_id": str(decision.id),
+        "resolved": True,
+        "archive_created": False,
+        "retry_required": False,
+    }
 
 
 @router.post("/subjects/{subject_id}/production/retry")

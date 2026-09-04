@@ -91,6 +91,113 @@ class ReferenceReport:
         return {source.local_id for source in self.sources}
 
 
+@dataclass(frozen=True, slots=True)
+class ReferenceIntegrationResult:
+    """Deterministic projection of a Q1 proposal onto archived URLs.
+
+    The parser produces a proposal, while this projection is the only rule
+    that decides which part of that proposal can become canonical production
+    state.  The optional counters and diagnostics are populated by the live
+    collection workflow; the reconciliation itself never performs I/O.
+    """
+
+    report: ReferenceReport
+    dropped_source_ids: tuple[str, ...] = ()
+    dropped_event_ids: tuple[str, ...] = ()
+    restored_source_ids: tuple[str, ...] = ()
+    restored_event_ids: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    new_sources: int = 0
+    archived_sources: int = 0
+    supplemental_collection_failures: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def kept_events(self) -> tuple[ParsedEvent, ...]:
+        return self.report.events
+
+    def __getitem__(self, key: str) -> Any:
+        """Keep the pre-LOT-19 mapping shape for internal/test callers."""
+        if key == "kept_events":
+            return list(self.kept_events)
+        if key == "supplemental_collection_failures":
+            return list(self.supplemental_collection_failures)
+        return getattr(self, key)
+
+
+def reconcile_reference_report_with_archives(
+    proposed_report: ReferenceReport,
+    archived_urls: set[str],
+    *,
+    previous_canonical_report: ReferenceReport | None = None,
+) -> ReferenceIntegrationResult:
+    """Keep only Q1 sources and events backed by currently archived URLs.
+
+    This function is intentionally pure.  In particular, it does not inspect
+    collections, read blobs, or attempt to fetch a missing source.  Its stable
+    ordering is inherited from the already parsed Q1 report, which makes the
+    result suitable for both the initial workflow and a human repair.
+    """
+    archived_source_ids = {
+        source.local_id
+        for source in proposed_report.sources
+        if source.canonical_url in archived_urls
+    }
+    kept_sources = tuple(
+        source for source in proposed_report.sources if source.local_id in archived_source_ids
+    )
+    dropped_source_ids = tuple(
+        source.local_id
+        for source in proposed_report.sources
+        if source.local_id not in archived_source_ids
+    )
+
+    kept_events: list[ParsedEvent] = []
+    dropped_event_ids: list[str] = []
+    for event in proposed_report.events:
+        backed_source_ids = tuple(
+            source_id for source_id in event.source_ids if source_id in archived_source_ids
+        )
+        if not backed_source_ids:
+            dropped_event_ids.append(event.local_id)
+            continue
+        kept_events.append(
+            ParsedEvent(
+                local_id=event.local_id,
+                event_date=event.event_date,
+                source_ids=backed_source_ids,
+                text=event.text,
+            )
+        )
+
+    previous_source_ids = (
+        previous_canonical_report.source_ids() if previous_canonical_report is not None else set()
+    )
+    previous_event_ids = (
+        {event.local_id for event in previous_canonical_report.events}
+        if previous_canonical_report is not None
+        else set()
+    )
+    restored_source_ids = tuple(
+        source.local_id for source in kept_sources if source.local_id not in previous_source_ids
+    )
+    restored_event_ids = tuple(
+        event.local_id for event in kept_events if event.local_id not in previous_event_ids
+    )
+
+    return ReferenceIntegrationResult(
+        report=ReferenceReport(
+            sources=kept_sources,
+            events=tuple(kept_events),
+            uncertainties=proposed_report.uncertainties,
+            editorial_title=proposed_report.editorial_title,
+        ),
+        dropped_source_ids=dropped_source_ids,
+        dropped_event_ids=tuple(dropped_event_ids),
+        restored_source_ids=restored_source_ids,
+        restored_event_ids=restored_event_ids,
+    )
+
+
 @dataclass(frozen=True)
 class _SourceCandidate:
     """A parsed publication before canonical source IDs are assigned."""

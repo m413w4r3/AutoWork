@@ -52,13 +52,14 @@ from cti_app.application.production_parsers import (
     Q2_EXTRACTION_CONTRACT_VERSION,
     Q2_MARKDOWN_PARSER_VERSION,
     IndicatorStatus,
-    ParsedEvent,
     ParsedSource,
     ParseResult,
     Q2SourceOutput,
+    ReferenceIntegrationResult,
     ReferenceReport,
     parse_q2_proposals_markdown,
     parse_reference_report,
+    reconcile_reference_report_with_archives,
     reference_report_from_json,
     reference_report_to_json,
     technical_extraction_from_json,
@@ -1184,7 +1185,7 @@ class ProductionWorkflowOrchestrator:
         report: ReferenceReport,
         context: JobExecutionContext | None,
         snapshot: ProductionInputSnapshot | None = None,
-    ) -> dict[str, Any]:
+    ) -> ReferenceIntegrationResult:
         """Attach, collect and archive the publications Q1 proposed.
 
         An event survives if at least one of its sources ended up archived; a
@@ -1291,38 +1292,22 @@ class ProductionWorkflowOrchestrator:
                 if item.state.value in _ARCHIVED_STATES:
                     archived_urls.add(item.canonical_url)
 
-        archived_ids = {
-            source.local_id for source in report.sources if source.canonical_url in archived_urls
-        }
-        kept_events = []
-        for event in report.events:
-            backed = tuple(sid for sid in event.source_ids if sid in archived_ids)
-            if not backed:
-                warnings.append(f"event_without_archived_source_dropped:{event.local_id}")
-                continue
-            kept_events.append(
-                ParsedEvent(
-                    local_id=event.local_id,
-                    event_date=event.event_date,
-                    source_ids=backed,
-                    text=event.text,
-                )
-            )
-
-        kept_sources = tuple(source for source in report.sources if source.local_id in archived_ids)
-        return {
-            "report": ReferenceReport(
-                sources=kept_sources,
-                events=tuple(kept_events),
-                uncertainties=report.uncertainties,
-                editorial_title=report.editorial_title,
-            ),
-            "kept_events": kept_events,
-            "warnings": warnings,
-            "new_sources": new_sources,
-            "archived_sources": len(archived_ids),
-            "supplemental_collection_failures": supplemental_failures,
-        }
+        reconciled = reconcile_reference_report_with_archives(report, archived_urls)
+        warnings.extend(
+            f"event_without_archived_source_dropped:{event_id}"
+            for event_id in reconciled.dropped_event_ids
+        )
+        return ReferenceIntegrationResult(
+            report=reconciled.report,
+            dropped_source_ids=reconciled.dropped_source_ids,
+            dropped_event_ids=reconciled.dropped_event_ids,
+            restored_source_ids=reconciled.restored_source_ids,
+            restored_event_ids=reconciled.restored_event_ids,
+            warnings=tuple(warnings),
+            new_sources=new_sources,
+            archived_sources=len(reconciled.report.sources),
+            supplemental_collection_failures=tuple(supplemental_failures),
+        )
 
     async def _load_qa_inputs(
         self,
@@ -1609,16 +1594,8 @@ class ProductionWorkflowOrchestrator:
             # events backed by a source we actually hold.
             await self._check_cancellation(run.id, context)
             integration = await self._integrate_reference_sources(run, report, context, snapshot)
-            parsed.warnings.extend(integration["warnings"])
-            if not integration["kept_events"]:
-                return {
-                    "stage": "references",
-                    "status": "needs_review",
-                    "error_code": "no_event_with_archived_source",
-                    "error": "No chronological event is backed by an archived source",
-                    "warnings": parsed.warnings,
-                }
-            report = integration["report"]
+            parsed.warnings.extend(integration.warnings)
+            report = integration.report
 
             await self._check_cancellation(run.id, context)
             artifact = await self._references.store_references_result(
@@ -1631,14 +1608,29 @@ class ProductionWorkflowOrchestrator:
                 warnings=parsed.warnings,
             )
 
+            # Keep raw Q1 and the empty canonical projection available even
+            # when collection failures left no usable event.  This is what
+            # lets the Repair Desk archive one of those proposed sources and
+            # deterministically rebuild REFERENCES later, without asking the
+            # model the same Q1 question again.
+            if not integration.kept_events:
+                return {
+                    "stage": "references",
+                    "status": "needs_review",
+                    "artifact_id": str(artifact.id),
+                    "error_code": "no_event_with_archived_source",
+                    "error": "No chronological event is backed by an archived source",
+                    "warnings": parsed.warnings,
+                }
+
             return {
                 "stage": "references",
                 "status": "success",
                 "artifact_id": str(artifact.id),
                 "sources_count": len(report.sources),
                 "events_count": len(report.events),
-                "new_sources": integration["new_sources"],
-                "archived_sources": integration["archived_sources"],
+                "new_sources": integration.new_sources,
+                "archived_sources": integration.archived_sources,
                 "warnings": parsed.warnings,
                 "repair_actions": parsed.repair_actions,
             }
