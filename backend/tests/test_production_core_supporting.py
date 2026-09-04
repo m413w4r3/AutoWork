@@ -107,7 +107,7 @@ text: Event
         },
     )
 
-    assert pack["version"] == "6"
+    assert pack["version"] == "7"
     assert [source["tier"] for source in pack["reference_report"]["sources"]] == [
         "core",
         "supporting",
@@ -298,7 +298,7 @@ def test_synthesis_pack_excludes_detection_rules_and_preserves_extraction() -> N
         _minimal_report(), extraction, {"https://core.example/report": "core"}
     )
 
-    assert pack["version"] == "6"
+    assert pack["version"] == "7"
     assert "detection_rules" not in pack["technical_extraction"]
     assert extraction.rules == (rule, unsupported)
     serialized = json.dumps(pack, ensure_ascii=False)
@@ -403,7 +403,7 @@ def test_synthesis_pack_keeps_all_visible_supported_items() -> None:
     )
 
     items = pack["technical_extraction"]["items"]
-    assert pack["version"] == "6"
+    assert pack["version"] == "7"
 
     assert len(items) == len(extraction.items)
 
@@ -441,6 +441,26 @@ def test_synthesis_pack_keeps_ioc_section_rows_that_still_carry_context() -> Non
     assert len(items) == 1
     assert items[0]["value"] == "c2.example"
     assert items[0]["context"] == "serveur de C2"
+
+
+def test_synthesis_pack_merges_typed_and_contextual_duplicate_values() -> None:
+    value = r"%LOCALAPPDATA%\...\burn.exe"
+    extraction = TechnicalExtraction(
+        items=(
+            _artifact_item("F1", value, ArtifactType.FILEPATH, category="files"),
+            _item("files", value, "GhostFetch persistence copy"),
+        ),
+        uncertainties=(),
+    )
+
+    pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
+        _minimal_report(), extraction, {"https://core.example/report": "core"}
+    )
+
+    items = pack["technical_extraction"]["items"]
+    assert len(items) == 1
+    assert items[0]["artifact_type"] == "filepath"
+    assert items[0]["context"] == "GhostFetch persistence copy"
 
 
 # --- Q4 pack: visible canonical values reach the model ----------------------

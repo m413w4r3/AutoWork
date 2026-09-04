@@ -548,6 +548,25 @@ async def test_bridge_archive_accepts_only_explicit_archived_true() -> None:
         await transport.archive_conversation(conversation_id)
 
 
+async def test_bridge_archive_read_timeout_is_not_retried() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("read timeout", request=request)
+
+    conversation_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.archive_conversation(conversation_id)
+
+    assert caught.value.code == "bridge_timeout"
+    assert caught.value.attempts == 1
+    assert calls == 1
+
+
 async def test_bridge_connect_error_is_typed_and_post_without_key_is_not_retried() -> None:
     calls = 0
 

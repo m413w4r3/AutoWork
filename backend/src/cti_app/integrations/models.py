@@ -536,18 +536,17 @@ class ChatGPTBridgeTransport(HttpResponsesTransport):
         )
 
     async def archive_conversation(self, conversation_id: UUID) -> None:
-        # Fermer l'onglet passe par l'extension Chrome : ce budget n'a rien à
-        # voir avec celui d'une sonde de capacités. La requête est idempotente
-        # côté bridge (fermer un onglet déjà fermé est un succès), elle peut
-        # donc être rejouée.
+        # Une seule tentative de transport. La reprise est pilotée plus haut,
+        # par l'orchestrateur, qui attend cinq secondes entre les deux essais :
+        # c'est ce délai qui couvre une éviction du service worker MV3, pas un
+        # rejeu immédiat dans la même fenêtre d'indisponibilité. Deux filets
+        # cumulés porteraient le pire cas à plus de six minutes par étape.
         response = await self._request(
             "DELETE",
             f"/bridge/conversations/{conversation_id}",
             phase="conversation_archive",
             timeout_seconds=self._archive_timeout,
             idempotency_key=f"conversation-archive-{conversation_id}",
-            retry=True,
-            retry_status_codes=frozenset({429, 502, 503, 504}),
         )
         if response.get("archived") is not True:
             raise _archive_response_error(response, conversation_id)

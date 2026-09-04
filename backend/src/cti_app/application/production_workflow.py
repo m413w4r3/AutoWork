@@ -150,7 +150,7 @@ _CONVERSATION_CLOSE_RETRY_DELAY_SECONDS = 5.0
 
 # Functional content of the Q4 evidence pack. Bumped whenever what Q4 can read
 # changes, so a cached synthesis built on an older pack is never reused.
-SYNTHESIS_EVIDENCE_PACK_VERSION = "6"
+SYNTHESIS_EVIDENCE_PACK_VERSION = "7"
 
 # Keep archive reads within the same decoded-document limit as collection and
 # deterministic source processing. This is a local proof read, never prompt
@@ -3591,8 +3591,16 @@ class ProductionWorkflowOrchestrator:
         material. In particular, never expose source URLs or model IDs, or
         items explicitly kept out of publication.
         """
-        items: list[dict[str, Any]] = []
-        seen_items: set[tuple[str, str, str]] = set()
+        # Le pack Q4 ne transporte jamais les libellés internes
+        # (`indicator_status`, `display_policy`) : le modèle les recopiait dans
+        # la prose, ce que la validation rejette ensuite.
+        #
+        # L'extraction émet souvent deux entrées pour une même valeur : l'une
+        # typée sans contexte, l'autre non typée avec le contexte utile. Elles
+        # sont fusionnées ici sur (catégorie, valeur), en gardant le plus
+        # informatif de chaque attribut.
+        merged: dict[tuple[str, str], dict[str, Any]] = {}
+        order: list[tuple[str, str]] = []
         for item in extraction.items:
             if (
                 not item.supported
@@ -3600,28 +3608,32 @@ class ProductionWorkflowOrchestrator:
                 or item.display_policy.value == "hidden"
             ):
                 continue
-            # Le pack Q4 ne transporte jamais les libellés internes
-            # (`indicator_status`, `display_policy`) : le modèle les recopiait
-            # dans la prose, ce que la validation rejette ensuite.
-            dedup_key = (
-                item.category or "",
-                item.value.strip().casefold(),
-                item.artifact_type.value if item.artifact_type else "",
-            )
-            if dedup_key in seen_items:
+            dedup_key = (item.category or "", item.value.strip().casefold())
+            artifact_type = item.artifact_type.value if item.artifact_type else None
+            confirmed = item.indicator_status is IndicatorStatus.CONFIRMED_IOC
+            existing = merged.get(dedup_key)
+            if existing is None:
+                merged[dedup_key] = {
+                    "category": item.category,
+                    "value": item.value,
+                    "context": item.context,
+                    "source_ids": sorted(item.source_ids),
+                    "is_confirmed_indicator": confirmed,
+                    "artifact_type": artifact_type,
+                }
+                order.append(dedup_key)
                 continue
-            seen_items.add(dedup_key)
-            published: dict[str, Any] = {
-                "category": item.category,
-                "value": item.value,
-                "context": item.context,
-                "source_ids": sorted(item.source_ids),
-                "is_confirmed_indicator": (
-                    item.indicator_status is IndicatorStatus.CONFIRMED_IOC
-                ),
-                "artifact_type": item.artifact_type.value if item.artifact_type else None,
-            }
-            items.append(published)
+            if len(item.context or "") > len(existing["context"] or ""):
+                existing["context"] = item.context
+            if existing["artifact_type"] is None and artifact_type is not None:
+                existing["artifact_type"] = artifact_type
+            if confirmed:
+                existing["is_confirmed_indicator"] = True
+            existing["source_ids"] = sorted(
+                set(existing["source_ids"]) | set(item.source_ids)
+            )
+
+        items: list[dict[str, Any]] = [merged[key] for key in order]
 
         return {
             "version": SYNTHESIS_EVIDENCE_PACK_VERSION,
