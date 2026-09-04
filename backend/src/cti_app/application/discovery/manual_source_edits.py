@@ -167,14 +167,10 @@ class ManualSourceEditService:
             parsing_warnings=(*replaced.parsing_warnings, "url_replaced_manually"),
             markdown_block=replaced.markdown_block,
         )
-        candidate.sources = [
-            source for source in candidate.sources if source.id != replaced.id
-        ]
+        candidate.sources = [source for source in candidate.sources if source.id != replaced.id]
         # Fold against an existing near-duplicate rather than adding a second
         # row for the same article — the same rule used everywhere else.
-        merged_sources, source_id_remap = deduplicate_sources(
-            [*candidate.sources, replacement]
-        )
+        merged_sources, source_id_remap = deduplicate_sources([*candidate.sources, replacement])
         replacement_id = source_id_remap.get(replacement.id, replacement.id)
         # The replaced source is no longer present, so its IOC relations must
         # follow the replacement (or the surviving near-duplicate).
@@ -373,8 +369,7 @@ class ManualSourceEditService:
             for reference in group.candidate_references:
                 candidate = candidate_by_reference.get(reference)
                 if candidate is not None and any(
-                    source.canonical_url == replaced_canonical_url
-                    for source in candidate.sources
+                    source.canonical_url == replaced_canonical_url for source in candidate.sources
                 ):
                     replacements[reference] = replacement_reference
             group.replace_candidate_references(replacements)

@@ -79,10 +79,7 @@ from tests.collection_support import InMemoryCollectionUnitOfWorkFactory
 
 SOURCE_ONE = "https://one.example/report"
 SOURCE_TWO = "https://two.example/report"
-S2_HTML = (
-    b"<!doctype html><html><body>Second report: ExampleRAT and evil[.]example."
-    b"</body></html>"
-)
+S2_HTML = b"<!doctype html><html><body>Second report: ExampleRAT and evil[.]example.</body></html>"
 
 RAW_Q1 = """# REFERENCES
 ## SOURCE S1
@@ -209,9 +206,7 @@ class _Artifacts:
                 and item.stage.value in affected
                 and item.status is not ProductionArtifactStatus.STALE
             ):
-                self.items[index] = dataclass_replace(
-                    item, status=ProductionArtifactStatus.STALE
-                )
+                self.items[index] = dataclass_replace(item, status=ProductionArtifactStatus.STALE)
                 staled.append(item.stage.value)
         return staled
 
@@ -267,9 +262,7 @@ class _ProductionUow:
             get_for_update=world.get_edition,
             update=world.update_edition,
         )
-        self.edition_review_read_model = SimpleNamespace(
-            list_for_edition=world.review_rows
-        )
+        self.edition_review_read_model = SimpleNamespace(list_for_edition=world.review_rows)
         self.edition_production_batches = SimpleNamespace(
             get_latest_for_edition=world.get_batch,
             get=world.get_batch_by_id,
@@ -282,12 +275,8 @@ class _ProductionUow:
             save=world.save_batch_item,
             list_for_batch=world.list_batch_items,
         )
-        self.publication_manifest_entries = SimpleNamespace(
-            append_many=_noop_many
-        )
-        self.publication_manifest_exclusions = SimpleNamespace(
-            append_many=_noop_many
-        )
+        self.publication_manifest_entries = SimpleNamespace(append_many=_noop_many)
+        self.publication_manifest_exclusions = SimpleNamespace(append_many=_noop_many)
         self.edition_audit = SimpleNamespace(append=_noop_one)
 
     async def __aenter__(self) -> _ProductionUow:
@@ -382,15 +371,11 @@ class _World:
         return True
 
     async def list_collections(self, subject_id: UUID) -> list[Any]:
-        return [
-            item for item in self._collections.values() if item.subject_id == subject_id
-        ]
+        return [item for item in self._collections.values() if item.subject_id == subject_id]
 
     async def list_collections_bulk(self, subject_ids: Any) -> list[Any]:
         wanted = set(subject_ids)
-        return [
-            item for item in self._collections.values() if item.subject_id in wanted
-        ]
+        return [item for item in self._collections.values() if item.subject_id in wanted]
 
     async def list_documents(self, subject_id: UUID) -> list[Any]:
         del subject_id
@@ -538,9 +523,7 @@ def _stage_artifact(
         input_hash=input_hash,
         status=ProductionArtifactStatus.VERIFIED,
         # The freeze refuses a publication artifact without a canonical body.
-        canonical_blob_id=(
-            uuid4() if stage is ProductionArtifactStage.PUBLICATION else None
-        ),
+        canonical_blob_id=(uuid4() if stage is ProductionArtifactStage.PUBLICATION else None),
     )
 
 
@@ -577,9 +560,7 @@ def _application(world: _World, collection_service: SubjectCollectionService) ->
 
 
 def _client(application: FastAPI) -> AsyncClient:
-    return AsyncClient(
-        transport=ASGITransport(app=application), base_url="http://test"
-    )
+    return AsyncClient(transport=ASGITransport(app=application), base_url="http://test")
 
 
 @pytest.mark.asyncio
@@ -630,9 +611,7 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
 
     parsed = parse_reference_report(RAW_Q1, date(2026, 8, 15))
     assert parsed.value is not None
-    canonical_v1 = reconcile_reference_report_with_archives(
-        parsed.value, {SOURCE_ONE}
-    ).report
+    canonical_v1 = reconcile_reference_report_with_archives(parsed.value, {SOURCE_ONE}).report
     assert {item.local_id for item in canonical_v1.sources} == {"S1"}
     raw_id, canonical_id, _ = await store.store_stage_payloads(
         raw=RAW_Q1, canonical=reference_report_to_json(canonical_v1)
@@ -663,9 +642,7 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
         (ProductionArtifactStage.SYNTHESIS, "c"),
         (ProductionArtifactStage.PUBLICATION, "d"),
     ):
-        await world.artifacts.append(
-            _stage_artifact(run, stage, 1, input_hash=digest * 64)
-        )
+        await world.artifacts.append(_stage_artifact(run, stage, 1, input_hash=digest * 64))
 
     # --- 1. The desk shows S2 as an unarchived Q1 proposal. -----------------
     application = _application(world, collection_service)
@@ -701,10 +678,7 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
     assert len(body["items"]) == 1
     item = body["items"][0]
     assert item["source_id"] == "S2"
-    assert (
-        item["repair_state"]
-        == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES
-    )
+    assert item["repair_state"] == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES
     assert item["rebuild_required"] is True
     assert item["recommended_stage"] == "rebuild_references"
     assert body["summary"]["sources_to_supply"] == 0
@@ -725,9 +699,7 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
 
     # --- 6. The rebuild reparses the archived Q1 with no model call. --------
     async with _client(fresh) as client:
-        rebuilt = await client.post(
-            f"/api/editions/{edition.id}/review/items/{subject.id}/rebuild"
-        )
+        rebuilt = await client.post(f"/api/editions/{edition.id}/review/items/{subject.id}/rebuild")
     assert rebuilt.status_code == 200, rebuilt.text
     assert rebuilt.json()["action"] == "rebuild_references_and_retry"
     assert rebuilt.json()["stage"] == SubjectProductionStage.EXTRACTION.value
@@ -770,9 +742,7 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
         (ProductionArtifactStage.SYNTHESIS, "f"),
         (ProductionArtifactStage.PUBLICATION, "0"),
     ):
-        await world.artifacts.append(
-            _stage_artifact(replayed, stage, 2, input_hash=digest * 64)
-        )
+        await world.artifacts.append(_stage_artifact(replayed, stage, 2, input_hash=digest * 64))
     assert replayed.status is SubjectProductionStatus.RUNNING
     replayed.mark_ready()
 
@@ -861,24 +831,18 @@ async def test_audit4_source_without_collection_is_visible_and_preparable(
     async with _client(application) as client:
         listed = await client.get(f"/api/editions/{edition.id}/review/repairs")
         repair_key = listed.json()["items"][0]["repair_key"]
-        detail = await client.get(
-            f"/api/editions/{edition.id}/review/repairs/{repair_key}"
-        )
+        detail = await client.get(f"/api/editions/{edition.id}/review/repairs/{repair_key}")
         prepared = await client.post(
             f"/api/editions/{edition.id}/review/repairs/{repair_key}/source"
         )
         # The command is idempotent: a second call returns the same collection.
-        again = await client.post(
-            f"/api/editions/{edition.id}/review/repairs/{repair_key}/source"
-        )
+        again = await client.post(f"/api/editions/{edition.id}/review/repairs/{repair_key}/source")
 
     assert listed.json()["items"][0]["repair_state"] == (
         SupplementalSourceRepairState.COLLECTION_MISSING
     )
     assert listed.json()["items"][0]["collection_id"] is None
-    assert detail.json()["repair_state"] == (
-        SupplementalSourceRepairState.COLLECTION_MISSING
-    )
+    assert detail.json()["repair_state"] == (SupplementalSourceRepairState.COLLECTION_MISSING)
     assert prepared.status_code == 200, prepared.text
     collection_id = prepared.json()["collection_id"]
     assert again.json()["collection_id"] == collection_id

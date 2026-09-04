@@ -66,9 +66,7 @@ pytestmark = pytest.mark.integration
 
 ScenarioFactory = Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario]
 _PRINCE_ARCHIVE = (
-    "domain,first_seen\n"
-    "reserve-one.example,2026-08-13\n"
-    "reserve-two.example,2026-08-13\n"
+    "domain,first_seen\nreserve-one.example,2026-08-13\nreserve-two.example,2026-08-13\n"
 )
 _PRINCE_FALLBACK = (
     "IOC confirmed domain\n"
@@ -241,9 +239,7 @@ def _q2_calls(scenario: ProductionScenario) -> list[Any]:
 
 def _q2_calls_for_source(scenario: ProductionScenario, url: str) -> list[Any]:
     return [
-        call
-        for call in _q2_calls(scenario)
-        if url in call.source_urls or call.source_url == url
+        call for call in _q2_calls(scenario) if url in call.source_urls or call.source_url == url
     ]
 
 
@@ -294,9 +290,11 @@ async def _assert_no_automatic_recovery(
 
 def _assert_prince_profiles(progress: dict[str, Any]) -> dict[str, dict[str, Any]]:
     sources = {item["source_id"]: item for item in progress["sources"]}
-    assert {
-        source_id for source_id, source in sources.items() if source["profile"] == "full"
-    } == {"S10", "S11", "S12"}
+    assert {source_id for source_id, source in sources.items() if source["profile"] == "full"} == {
+        "S10",
+        "S11",
+        "S12",
+    }
     assert {
         source_id for source_id, source in sources.items() if source["profile"] == "ioc_rules"
     } == {
@@ -478,11 +476,7 @@ async def test_archived_source_unavailable_live_does_not_block_publication(
         collections = tuple(await uow.source_collections.list_for_subject(scenario.subject.id))
         documents = tuple(await uow.source_documents.list_for_subject(scenario.subject.id))
         live_model_run = await uow.model_runs.get(
-            next(
-                call.model_run_id
-                for call in _q2_calls(scenario)
-                if urls[-1] in call.source_urls
-            )
+            next(call.model_run_id for call in _q2_calls(scenario) if urls[-1] in call.source_urls)
         )
     assert snapshot is not None
     assert {source.canonical_url for source in snapshot.core_sources} == set(urls[9:12])
@@ -497,9 +491,7 @@ async def test_archived_source_unavailable_live_does_not_block_publication(
     live_batch_response = await scenario.model.read_output(live_model_run.output_references[0])
     assert "UNAVAILABLE" in live_batch_response.decode("utf-8")
     s14_document = next(
-        document
-        for document in documents
-        if document.source_collection_id == s14_collection.id
+        document for document in documents if document.source_collection_id == s14_collection.id
     )
     assert s14_document.decoded_blob_id == s14_collection.decoded_blob_id
     assert s14_document.decoded_blob_id is not None
@@ -675,17 +667,23 @@ async def test_unavailable_source_without_archive_is_warning_not_pipeline_failur
     assert "q2_source_coverage_failed" not in str(subject_view["error_details"])
     subject_progress = subject_view["extraction_progress"]
     assert subject_progress["source_skips"]["S14"]["blocking"] is False
-    assert next(
-        source for source in subject_progress["sources"] if source["source_id"] == "S14"
-    )["status"] == "skipped"
+    assert (
+        next(source for source in subject_progress["sources"] if source["source_id"] == "S14")[
+            "status"
+        ]
+        == "skipped"
+    )
     assert batch_view["completed"] == 1
     assert batch_view["needs_review"] == 0
     assert batch_view["failed"] == 0
     batch_progress = batch_view["item_details"][0]["extraction_progress"]
     assert batch_progress["source_skips"]["S14"]["blocking"] is False
-    assert next(
-        source for source in batch_progress["sources"] if source["source_id"] == "S14"
-    )["status"] == "skipped"
+    assert (
+        next(source for source in batch_progress["sources"] if source["source_id"] == "S14")[
+            "status"
+        ]
+        == "skipped"
+    )
     assert batch_view["item_details"][0]["error_code"] is None
 
 

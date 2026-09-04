@@ -8,7 +8,7 @@ import zipfile
 from datetime import date
 from io import BytesIO
 from pathlib import Path
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -23,8 +23,9 @@ from cti_app.application.edition_publication import (
     PublicationAcceptanceError,
     PublicationAssemblyError,
 )
-from cti_app.application.edition_review import EditionReviewReadItem
+from cti_app.application.edition_review import EditionReviewReadItem, EditionReviewService
 from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
+from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import DuplicateJobError
 from cti_app.domain.classification import TLP
 from cti_app.domain.edition_publication import (
@@ -41,6 +42,9 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchPhase,
+    ProductionRepairAction,
+    ProductionRepairIssueKind,
+    RepairDecisionApplicationState,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -259,6 +263,21 @@ class _ReadModel:
     async def list_for_edition(self, edition_id: UUID) -> list[EditionReviewReadItem]:
         del edition_id
         return self.rows
+
+
+class _RepairIssueReader:
+    def __init__(self, issue: object) -> None:
+        self.issue = issue
+
+    async def list_issue_views(
+        self, _edition_id: UUID, _subject_id: UUID | None = None
+    ) -> tuple[object, ...]:
+        return (self.issue,)
+
+    async def list_supplemental_source_issues(
+        self, _edition_id: UUID, _subject_id: UUID | None = None
+    ) -> tuple[object, ...]:
+        return ()
 
 
 class _Audit:
@@ -495,6 +514,61 @@ async def test_accept_freezes_order_exclusion_and_same_manifest_on_retry() -> No
     assert first.manifest.exclusions[0].review_decision_id == DECISION_B
     assert len(jobs.jobs) == 1
     assert len(dispatcher.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_accept_refuses_an_include_until_its_projection_is_materialized() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=SubjectProductionStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
+    decision = SimpleNamespace(id=uuid4(), action=ProductionRepairAction.INCLUDE)
+    issue = SimpleNamespace(
+        repair_key="1" * 64,
+        kind=ProductionRepairIssueKind.REJECTED_INDICATOR,
+        production_run_id=RUN_A,
+        subject_id=SUBJECT_A,
+        effective_decision=decision,
+        application_state=RepairDecisionApplicationState.PROJECTION_REQUIRED,
+        is_publication_ioc=True,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    service = EditionPublicationService(
+        lambda: uow,
+        blobs,
+        repair_issue_reader=_RepairIssueReader(issue),
+    )  # type: ignore[arg-type]
+    review = EditionReviewService.from_rows(EDITION_ID, [row], repair_issues=[issue])
+
+    assert review.items[0].pending_rebuild_count == 1
+    assert review.pending_rebuild_count == 1
+    assert review.can_accept is False
+
+    application = FastAPI()
+    application.include_router(publication_router)
+    application.state.edition_publication_service = service
+    application.state.identity_provider = LocalIdentityProvider("analyst")
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.post(f"/api/editions/{EDITION_ID}/publication/accept")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "review_cannot_be_accepted"
+    assert uow.publication_manifests.manifest is None
+    assert uow.editions.edition.status is EditionStatus.REVIEW
 
 
 @pytest.mark.parametrize(

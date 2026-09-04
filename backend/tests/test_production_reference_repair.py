@@ -142,9 +142,7 @@ class _Uow:
         self.collections = collections
         self.source_collections = SimpleNamespace(list_for_subject=self._list_collections)
         self.source_documents = SimpleNamespace(list_for_subject=self._list_documents)
-        self.editions = SimpleNamespace(
-            get_for_update=lambda _edition_id: self._edition()
-        )
+        self.editions = SimpleNamespace(get_for_update=lambda _edition_id: self._edition())
         self.committed = False
 
     async def _edition(self) -> SimpleNamespace:
@@ -223,9 +221,7 @@ async def test_rebuilds_q1_from_raw_without_model_and_is_idempotent() -> None:
     store = _BlobStore()
     parsed = parse_reference_report(RAW_Q1, date(2026, 8, 10))
     assert parsed.value is not None
-    initial = reconcile_reference_report_with_archives(
-        parsed.value, {first.canonical_url}
-    ).report
+    initial = reconcile_reference_report_with_archives(parsed.value, {first.canonical_url}).report
     raw_id, canonical_id, _ = await store.store_stage_payloads(
         raw=RAW_Q1, canonical=reference_report_to_json(initial)
     )
@@ -293,10 +289,13 @@ async def test_rebuilds_q1_from_raw_without_model_and_is_idempotent() -> None:
     second_result = await repair.rebuild_from_archived_q1(run.id, actor_id="analyst")
     assert second_result.changed is False
     assert second_result.artifact.id == result.artifact.id
-    assert len(
-        [
-            item
-            for item in uow.production_artifacts.items
-            if item.stage is ProductionArtifactStage.REFERENCES
-        ]
-    ) == 2
+    assert (
+        len(
+            [
+                item
+                for item in uow.production_artifacts.items
+                if item.stage is ProductionArtifactStage.REFERENCES
+            ]
+        )
+        == 2
+    )

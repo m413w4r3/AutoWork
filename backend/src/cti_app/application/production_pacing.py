@@ -111,9 +111,7 @@ class ProductionPacingPolicy:
         ):
             return max(
                 0,
-                round(
-                    self._sample(self.cooldown_min_seconds, self.cooldown_max_seconds) * 1000
-                ),
+                round(self._sample(self.cooldown_min_seconds, self.cooldown_max_seconds) * 1000),
             )
         return max(0, round(self.subject_delay_seconds() * 1000))
 

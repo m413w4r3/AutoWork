@@ -44,9 +44,7 @@ from .support import DeterministicProductionJobRunner, ProductionScenario
 
 pytestmark = pytest.mark.integration
 
-ScenarioFactory = Callable[
-    [Mapping[str, Mapping[str, object]]], ProductionScenario
-]
+ScenarioFactory = Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario]
 
 
 def _urls(count: int) -> tuple[str, ...]:
@@ -258,9 +256,7 @@ async def test_retryable_source_recovery_reuses_thirteen_checkpoints(
 
     q2_calls = [call for call in scenario.model.calls if call.stage == "extraction"]
     first_model_ids = {
-        call.source_url: call.model_run_id
-        for call in q2_calls
-        if call.source_url != urls[-1]
+        call.source_url: call.model_run_id for call in q2_calls if call.source_url != urls[-1]
     }
     assert len(first_model_ids) == 13
     s14_calls = [call for call in q2_calls if call.source_url == urls[-1]]
@@ -284,9 +280,7 @@ async def test_retryable_source_recovery_reuses_thirteen_checkpoints(
     for index, url in enumerate(urls[:-1], start=1):
         assert str(first_model_ids[url]) in ids_by_source[f"S{index}"]
         source_item = next(
-            item
-            for item in payload["items"]
-            if item["value"] == f"source-{index}.security-lab.io"
+            item for item in payload["items"] if item["value"] == f"source-{index}.security-lab.io"
         )
         assert set(source_item["model_run_ids"]) == {str(first_model_ids[url])}
     s14_item = next(
@@ -298,9 +292,7 @@ async def test_retryable_source_recovery_reuses_thirteen_checkpoints(
     assert diagnostics["cache_hits"] == 13
     assert diagnostics["model_calls_avoided"] == 13
     reused = [
-        event
-        for event in _diagnostic_events(scenario)
-        if event.get("event") == "q2.source.reused"
+        event for event in _diagnostic_events(scenario) if event.get("event") == "q2.source.reused"
     ]
     assert {event["source_id"] for event in reused} >= {f"S{index}" for index in range(1, 14)}
 
@@ -344,9 +336,7 @@ async def test_terminal_source_failure_does_not_schedule_a_next_generation(
     assert failures["S14"]["retryable"] is False
     jobs = await _jobs_for_run(scenario)
     assert all(job.input_parameters["pipeline_generation"] == 0 for job in jobs)
-    assert not any(
-        job.input_parameters["pipeline_generation"] > 0 for job in jobs
-    )
+    assert not any(job.input_parameters["pipeline_generation"] > 0 for job in jobs)
     assert not any(call.stage == "synthesis" for call in scenario.model.calls)
 
 
@@ -436,11 +426,14 @@ async def test_operator_retry_is_distinct_and_stales_only_downstream_artifacts(
         ProductionArtifactStage.SYNTHESIS,
         ProductionArtifactStage.PUBLICATION,
     }
-    assert next(
-        artifact
-        for artifact in stale_artifacts
-        if artifact.stage is ProductionArtifactStage.REFERENCES
-    ).status is ProductionArtifactStatus.VERIFIED
+    assert (
+        next(
+            artifact
+            for artifact in stale_artifacts
+            if artifact.stage is ProductionArtifactStage.REFERENCES
+        ).status
+        is ProductionArtifactStatus.VERIFIED
+    )
 
     await _dispatch_stage(scenario, retry.run, SubjectProductionStage.EXTRACTION)
     await scenario.runner.run_until_idle()
@@ -538,8 +531,7 @@ async def test_duplicate_job_delivery_has_one_business_effect(
     assert after.status is SubjectProductionStatus.READY
     assert after.pipeline_generation == before.pipeline_generation
     assert [(artifact.id, artifact.version, artifact.status) for artifact in artifacts] == [
-        (artifact.id, artifact.version, artifact.status)
-        for artifact in before_artifacts[1]
+        (artifact.id, artifact.version, artifact.status) for artifact in before_artifacts[1]
     ]
     assert scenario.model.calls == before_model_calls
     jobs = await _jobs_for_run(scenario)
@@ -777,8 +769,7 @@ async def test_post_submission_ambiguity_reconciles_exact_model_run_without_resu
     assert model_run.submission_attempt == 1
     assert len(resume_jobs) == 1
     assert (
-        len({call.model_run_id for call in scenario.model.calls if call.stage == "extraction"})
-        == 1
+        len({call.model_run_id for call in scenario.model.calls if call.stage == "extraction"}) == 1
     )
     await _assert_artifact_invariants(scenario, artifacts)
 

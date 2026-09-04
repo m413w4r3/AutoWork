@@ -96,9 +96,7 @@ class SqlAlchemySourceCollectionRepository:
         )
         return [_source_collection_from_row(row) for row in rows]
 
-    async def list_for_subjects(
-        self, subject_ids: Sequence[UUID]
-    ) -> Sequence[SourceCollection]:
+    async def list_for_subjects(self, subject_ids: Sequence[UUID]) -> Sequence[SourceCollection]:
         if not subject_ids:
             return ()
         rows = await self._session.scalars(

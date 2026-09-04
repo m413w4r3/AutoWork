@@ -320,22 +320,26 @@ def _bridge_http_error(
                     diagnostics[field] = value
     except ValueError:
         pass
-    if server_code in {
-        "bridge_auth_failed",
-        "bridge_rate_limited",
-        "bridge_extension_disconnected",
-        "bridge_ui_timeout",
-        "bridge_idle_timeout",
-        "bridge_total_timeout",
-        "bridge_timeout",
-        "bridge_unreachable",
-        "bridge_payload_conflict",
-        "bridge_protocol_error",
-        "bridge_server_error",
-        "conversation_busy",
-        "conversation_unavailable",
-        "conversation_profile_mismatch",
-    } | _ARCHIVE_ERROR_CODES:
+    if (
+        server_code
+        in {
+            "bridge_auth_failed",
+            "bridge_rate_limited",
+            "bridge_extension_disconnected",
+            "bridge_ui_timeout",
+            "bridge_idle_timeout",
+            "bridge_total_timeout",
+            "bridge_timeout",
+            "bridge_unreachable",
+            "bridge_payload_conflict",
+            "bridge_protocol_error",
+            "bridge_server_error",
+            "conversation_busy",
+            "conversation_unavailable",
+            "conversation_profile_mismatch",
+        }
+        | _ARCHIVE_ERROR_CODES
+    ):
         code = server_code
     elif status in {401, 403}:
         code = "bridge_auth_failed"
@@ -440,9 +444,7 @@ def _archive_response_error(
     """Turn a 2xx archive response without `archived: true` into a typed error."""
     raw_code = response.get("code")
     code = (
-        raw_code[:64]
-        if isinstance(raw_code, str) and raw_code.strip()
-        else "bridge_protocol_error"
+        raw_code[:64] if isinstance(raw_code, str) and raw_code.strip() else "bridge_protocol_error"
     )
     raw_message = response.get("message") or response.get("reason") or response.get("error")
     message = (

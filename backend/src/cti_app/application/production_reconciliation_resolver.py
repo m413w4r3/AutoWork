@@ -219,9 +219,7 @@ class ProductionReconciliationResolver:
             actor_id=actor_id,
         )
 
-    async def _reconcile_conversation(
-        self, run: SubjectProductionRun, *, available: bool
-    ) -> None:
+    async def _reconcile_conversation(self, run: SubjectProductionRun, *, available: bool) -> None:
         if self._model_conversation_service is None:
             return
         conversation_id = _conversation_id(run)

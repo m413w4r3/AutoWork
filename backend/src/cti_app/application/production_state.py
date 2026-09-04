@@ -360,9 +360,11 @@ def _exported_repair_block(
 
     def _keys(name: str) -> tuple[str, ...]:
         value = marker.get(name)
-        return tuple(sorted(item for item in value if isinstance(item, str))) if isinstance(
-            value, list
-        ) else ()
+        return (
+            tuple(sorted(item for item in value if isinstance(item, str)))
+            if isinstance(value, list)
+            else ()
+        )
 
     exported_decisions = tuple(
         ProductionStateRepairDecision(
@@ -421,9 +423,7 @@ async def _repair_decisions_for_projection(
     if not callable(lister):
         return {}
     history = await lister(run.edition_id, run.subject_id)
-    return {
-        str(decision.id): decision for decision in history if str(decision.id) in wanted
-    }
+    return {str(decision.id): decision for decision in history if str(decision.id) in wanted}
 
 
 class ProductionStateService:

@@ -280,9 +280,7 @@ async def test_manual_content_rejects_empty_and_oversized_content(tmp_path: Path
     subject = selected_subject(factory, ("https://blocked.example/report",))
     app = SubjectCollectionService(
         factory,
-        SafeHttpCollector(
-            Transport([]), Resolver(), CollectionPolicy(max_download_bytes=32)
-        ),
+        SafeHttpCollector(Transport([]), Resolver(), CollectionPolicy(max_download_bytes=32)),
         FilesystemBlobStore(tmp_path / "blobs"),
     )
     source = (await app.initialize(subject.id))[0]

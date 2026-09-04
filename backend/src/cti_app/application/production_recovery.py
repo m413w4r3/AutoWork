@@ -79,11 +79,7 @@ class ProductionRecoveryPolicyV1:
         if run.error_code == cls.Q2_SOURCE_COVERAGE_ERROR_CODE:
             if run.reconciliation is not None:
                 return cls.MANUAL_ONLY
-            return (
-                cls.AUTO
-                if cls._all_q2_blocking_failures_retryable(run)
-                else cls.MANUAL_ONLY
-            )
+            return cls.AUTO if cls._all_q2_blocking_failures_retryable(run) else cls.MANUAL_ONLY
         # A transient transport error can be the aggregate code after a Q2
         # batch/attempt stopped early.  In that shape the aggregate code alone
         # would incorrectly hide a terminal source failure from the policy.
@@ -97,17 +93,11 @@ class ProductionRecoveryPolicyV1:
             for failure in source_failures.values()
         )
         if has_blocking_failure:
-            return (
-                cls.AUTO
-                if cls._all_q2_blocking_failures_retryable(run)
-                else cls.MANUAL_ONLY
-            )
+            return cls.AUTO if cls._all_q2_blocking_failures_retryable(run) else cls.MANUAL_ONLY
         return cls.disposition(run.error_code)
 
     @classmethod
-    def current_stage_retry_recommended(
-        cls, run: SubjectProductionRun
-    ) -> bool:
+    def current_stage_retry_recommended(cls, run: SubjectProductionRun) -> bool:
         """Whether replaying the stage that stopped the run is recommended."""
         return (
             run.status

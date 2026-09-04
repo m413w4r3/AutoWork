@@ -177,7 +177,7 @@ def test_validate_docx_rejects_a_raw_citation_in_the_body(tmp_path: Path) -> Non
 
 
 def test_validate_docx_rejects_missing_footnotes(tmp_path: Path) -> None:
-    body = "<w:p><w:r><w:footnoteReference w:id=\"2\"/></w:r></w:p>"
+    body = '<w:p><w:r><w:footnoteReference w:id="2"/></w:r></w:p>'
     path = _write_docx(
         tmp_path / "footnotes.docx",
         {"word/document.xml": f"{DOCUMENT_HEAD}{body}{DOCUMENT_TAIL}"},

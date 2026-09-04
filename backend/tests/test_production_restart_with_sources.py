@@ -277,9 +277,7 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
     group = EditorialGroup(
         edition_id=edition_id,
         title="Blocked report",
-        candidate_references=(
-            CandidateReference(replacement_batch.id, new_candidate.id),
-        ),
+        candidate_references=(CandidateReference(replacement_batch.id, new_candidate.id),),
         outcome=GroupingOutcome.NEW_SUBJECT,
         score=_score(),
         source_relationship_status=SourceRelationshipStatus.PROVISIONAL,

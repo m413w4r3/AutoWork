@@ -527,11 +527,7 @@ def plan_q2_extraction_profiles(
                 if source.canonical_url in core_urls
                 else ExtractionProfile.IOC_RULES
             ),
-            reason=(
-                "core_source"
-                if source.canonical_url in core_urls
-                else "supporting_source"
-            ),
+            reason=("core_source" if source.canonical_url in core_urls else "supporting_source"),
         )
         for source in report.sources
     )
@@ -738,8 +734,7 @@ def _mark_extraction_source_skipped(
     if isinstance(source_skips, dict) and source_id not in source_skips:
         source_skips[source_id] = details
     progress["skipped_sources"] = sum(
-        item["status"] == "skipped"
-        for item in cast(list[dict[str, Any]], progress["sources"])
+        item["status"] == "skipped" for item in cast(list[dict[str, Any]], progress["sources"])
     )
 
 
@@ -1859,9 +1854,7 @@ class ProductionWorkflowOrchestrator:
                 "model_calls_avoided": model_calls_avoided,
             }
 
-        reuse_max_age_days = float(
-            getattr(self, "_q2_reuse_max_age_days", 14.0)
-        )
+        reuse_max_age_days = float(getattr(self, "_q2_reuse_max_age_days", 14.0))
         q2_reuse_not_before = (
             datetime.now(UTC) - timedelta(days=reuse_max_age_days)
             if reuse_max_age_days > 0
@@ -1974,9 +1967,7 @@ class ProductionWorkflowOrchestrator:
             warnings.extend(evidence.warnings)
             for rejection in evidence.rejections:
                 issue_kind = (
-                    "rejected_rule"
-                    if rejection.proposal_kind == "rule"
-                    else "rejected_indicator"
+                    "rejected_rule" if rejection.proposal_kind == "rule" else "rejected_indicator"
                 )
                 value_sha256 = hashlib.sha256(rejection.value.encode("utf-8")).hexdigest()
                 repair_key = repair_key_for_rejection(
@@ -2428,9 +2419,7 @@ class ProductionWorkflowOrchestrator:
                     live_error_code=live_failure_code,
                     archive_error_code=exc.code,
                     archive_reason=(
-                        str(details["reason"])
-                        if isinstance(details.get("reason"), str)
-                        else None
+                        str(details["reason"]) if isinstance(details.get("reason"), str) else None
                     ),
                     profile=plan.profile,
                     live_model_run_id=live_model_run_id,
@@ -2575,9 +2564,7 @@ class ProductionWorkflowOrchestrator:
                     raise _Q2SourceContentFailure(
                         "; ".join(parsed.errors) or "archive_fallback_output_invalid"
                     )
-                filtered_output, profile_warnings = _enforce_q2_profile(
-                    parsed.value, plan.profile
-                )
+                filtered_output, profile_warnings = _enforce_q2_profile(parsed.value, plan.profile)
                 filtered_output = await gate_source_output(
                     work,
                     filtered_output,
@@ -3480,9 +3467,7 @@ class ProductionWorkflowOrchestrator:
                 progress,
                 pending[duplicate_id].source,
                 status="cached",
-                counts=_source_progress_counts(
-                    primary_submission.output, duplicate_id
-                ),
+                counts=_source_progress_counts(primary_submission.output, duplicate_id),
                 cache_hit=True,
             )
             cache_hits += 1
@@ -3549,9 +3534,7 @@ class ProductionWorkflowOrchestrator:
             diagnostic_offset += len(proposals)
             submission_source_id = submission.source_ids[0] if submission.source_ids else None
             submission_source = (
-                source_by_id.get(submission_source_id)
-                if submission_source_id is not None
-                else None
+                source_by_id.get(submission_source_id) if submission_source_id is not None else None
             )
             if submission_source is None:
                 continue
@@ -3668,11 +3651,7 @@ class ProductionWorkflowOrchestrator:
                 build_repair_evidence_pack(repair_evidence_entries)
             )
         repair_evidence_index = [
-            {
-                key: value
-                for key, value in entry.items()
-                if key != "value"
-            }
+            {key: value for key, value in entry.items() if key != "value"}
             | {
                 "preview": str(entry.get("value", ""))[:512],
             }
@@ -3724,13 +3703,10 @@ class ProductionWorkflowOrchestrator:
                 "q2_rejected_rules": rejected_rules,
                 "q2_rejected_rule_count": len(rejected_rules),
                 "q2_rejected_ioc_count": rejected_ioc_count,
-                "q2_rejected_artifact_count": len(source_evidence_rejections)
-                - len(rejected_rules),
+                "q2_rejected_artifact_count": len(source_evidence_rejections) - len(rejected_rules),
                 "q2_rejected_other_artifact_count": max(
                     0,
-                    len(source_evidence_rejections)
-                    - len(rejected_rules)
-                    - rejected_ioc_count,
+                    len(source_evidence_rejections) - len(rejected_rules) - rejected_ioc_count,
                 ),
                 "semantic_status_conflicts": [
                     {
@@ -3818,9 +3794,7 @@ class ProductionWorkflowOrchestrator:
                 existing["artifact_type"] = artifact_type
             if confirmed:
                 existing["is_confirmed_indicator"] = True
-            existing["source_ids"] = sorted(
-                set(existing["source_ids"]) | set(item.source_ids)
-            )
+            existing["source_ids"] = sorted(set(existing["source_ids"]) | set(item.source_ids))
 
         items: list[dict[str, Any]] = [merged[key] for key in order]
 

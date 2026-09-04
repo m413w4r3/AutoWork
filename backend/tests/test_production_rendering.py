@@ -280,9 +280,7 @@ async def test_qa_fails_on_a_stale_artifact() -> None:
 
 
 async def test_qa_allows_numeric_semantic_annotation() -> None:
-    result = await _qa(
-        publication_markdown='# T\n\nTexte avec [201]{custom-style="technical"}.\n'
-    )
+    result = await _qa(publication_markdown='# T\n\nTexte avec [201]{custom-style="technical"}.\n')
 
     assert result["checks"]["no_empty_footnote"] is True
     assert result["passed"] is True

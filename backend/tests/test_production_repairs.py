@@ -217,9 +217,7 @@ async def test_extraction_metadata_keeps_only_bounded_repair_pointer() -> None:
         "blob_id": "00000000-0000-0000-0000-000000000099",
         "entry_count": 201,
     }
-    assert artifact.metadata["deterministic_verification"] == {
-        "q2_rejected_rule_count": 201
-    }
+    assert artifact.metadata["deterministic_verification"] == {"q2_rejected_rule_count": 201}
 
 
 class _DecisionRepository:
@@ -278,9 +276,7 @@ class _DecisionUow:
             )
 
         self.editions = SimpleNamespace(get_for_update=get_edition)
-        self.subject_production_runs = SimpleNamespace(
-            get_for_update=get_run
-        )
+        self.subject_production_runs = SimpleNamespace(get_for_update=get_run)
         self.production_artifacts = SimpleNamespace(get=get_artifact)
         self.production_repair_decisions = _DecisionRepository()
         self.committed = False
@@ -398,9 +394,7 @@ class _IssueUow:
                 )
             ]
 
-        self.subject_production_runs = SimpleNamespace(
-            list_for_edition=list_runs
-        )
+        self.subject_production_runs = SimpleNamespace(list_for_edition=list_runs)
         self.production_artifacts = _IssueArtifacts()
         self.production_repair_decisions = _DecisionRepository()
         self.pack = pack
@@ -450,7 +444,8 @@ async def test_issue_reader_returns_all_entries_and_detail_loads_one_body() -> N
     pack = build_repair_evidence_pack(entries)
     uow = _IssueUow(pack)
     service = ProductionRepairIssueService(
-        _IssueFactory(uow), _IssueStore(pack)  # type: ignore[arg-type]
+        _IssueFactory(uow),
+        _IssueStore(pack),  # type: ignore[arg-type]
     )
 
     issues = await service.list_issues(EDITION_ID, SUBJECT_ID)
@@ -553,7 +548,7 @@ async def test_repair_projection_includes_ioc_and_rule_from_base_without_mutatin
     catalog = _BlobCatalog()
     store = ProductionArtifactStore(catalog)  # type: ignore[arg-type]
     domain = "override.security-lab.io"
-    rule_body = "rule Override { strings: $a = \"marker\" condition: $a }"
+    rule_body = 'rule Override { strings: $a = "marker" condition: $a }'
     domain_key = repair_key_for_rejection(
         edition_id=EDITION_ID,
         subject_id=SUBJECT_ID,
@@ -651,7 +646,8 @@ async def test_repair_projection_includes_ioc_and_rule_from_base_without_mutatin
     ]
     uow = _ProjectionUow(run, base, decisions)
     result = await ProductionRepairProjectionService(
-        _ProjectionFactory(uow), store  # type: ignore[arg-type]
+        _ProjectionFactory(uow),
+        store,  # type: ignore[arg-type]
     ).project_effective_extraction(RUN_ID, actor_id="analyst")
 
     assert result.changed
@@ -659,9 +655,14 @@ async def test_repair_projection_includes_ioc_and_rule_from_base_without_mutatin
     assert result.accepted_rule_count == 1
     assert result.unresolved_count == 0
     assert result.artifact.id != base.id
-    assert technical_extraction_from_json(
-        await store.read_json(result.artifact.canonical_blob_id)  # type: ignore[arg-type]
-    ).items[0].evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+    assert (
+        technical_extraction_from_json(
+            await store.read_json(result.artifact.canonical_blob_id)  # type: ignore[arg-type]
+        )
+        .items[0]
+        .evidence_basis
+        is ProductionEvidenceBasis.ANALYST_OVERRIDE
+    )
     projected = technical_extraction_from_json(
         await store.read_json(result.artifact.canonical_blob_id)  # type: ignore[arg-type]
     )

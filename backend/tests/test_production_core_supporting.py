@@ -351,8 +351,7 @@ def _artifact_item(
 
 def _dust_specter_pack_extraction() -> TechnicalExtraction:
     hashes = tuple(
-        _artifact_item(f"H{index}", f"{index:064x}", ArtifactType.HASH)
-        for index in range(40)
+        _artifact_item(f"H{index}", f"{index:064x}", ArtifactType.HASH) for index in range(40)
     )
     domains = tuple(
         _artifact_item(f"D{index}", f"c2-{index}.example", ArtifactType.DOMAIN)
@@ -427,9 +426,7 @@ def test_synthesis_pack_keeps_all_visible_supported_items() -> None:
 
 def test_synthesis_pack_keeps_ioc_section_rows_that_still_carry_context() -> None:
     extraction = TechnicalExtraction(
-        items=(
-            _artifact_item("D1", "c2.example", ArtifactType.DOMAIN, context="serveur de C2"),
-        ),
+        items=(_artifact_item("D1", "c2.example", ArtifactType.DOMAIN, context="serveur de C2"),),
         uncertainties=(),
     )
 
@@ -503,7 +500,8 @@ def test_synthesis_pack_exposes_canonical_indicator_values() -> None:
     synthesis = (
         "Le second étage est récupéré depuis meetingapp.site ; l'implant communique "
         "avec 203.0.113.9 et l'échantillon a pour SHA-256 "
-        + "a" * 64
+        + "a"
+        * 64
         + ". L'opérateur utilise operator@example.com ; VLC.exe charge libvlc.dll "
         "depuis C:\\Users\\Public\\payload.dll [S1]."
     )
@@ -515,9 +513,7 @@ def test_synthesis_pack_filters_unsupported_excluded_and_hidden_items() -> None:
     extraction = TechnicalExtraction(
         items=(
             _artifact_item("V1", "visible.example", ArtifactType.DOMAIN),
-            _artifact_item(
-                "U1", "unsupported.example", ArtifactType.DOMAIN, supported=False
-            ),
+            _artifact_item("U1", "unsupported.example", ArtifactType.DOMAIN, supported=False),
             _artifact_item(
                 "E1",
                 "excluded.example",
@@ -535,9 +531,7 @@ def test_synthesis_pack_filters_unsupported_excluded_and_hidden_items() -> None:
         _minimal_report(), extraction, {"https://core.example/report": "core"}
     )
 
-    assert [item["value"] for item in pack["technical_extraction"]["items"]] == [
-        "visible.example"
-    ]
+    assert [item["value"] for item in pack["technical_extraction"]["items"]] == ["visible.example"]
 
 
 def test_dust_specter_exact_values_are_not_rejected_or_enumerated() -> None:

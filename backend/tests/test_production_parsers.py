@@ -120,6 +120,8 @@ def test_heading_and_field_variants_are_tolerated(variant: str) -> None:
     result = parse_reference_report(variant, RESEARCH_DATE)
 
     assert result.usable, result.errors
+
+
 def test_multiline_field_is_joined() -> None:
     text = PERFECT_Q1.replace(
         "text: Premiere observation de la campagne.",
@@ -582,9 +584,7 @@ DUST_SPECTER_SYNTHESIS = (
 
 def test_body_only_file_artifacts_are_not_ioc_repetition() -> None:
     """A confirmed filename kept out of the IOC section is behavioral detail."""
-    result = validate_synthesis(
-        DUST_SPECTER_SYNTHESIS, _corpus(), _dust_specter_extraction()
-    )
+    result = validate_synthesis(DUST_SPECTER_SYNTHESIS, _corpus(), _dust_specter_extraction())
 
     assert result.usable, result.errors
 
@@ -608,8 +608,7 @@ def test_body_only_filepath_and_cve_values_are_allowed() -> None:
     )
 
     result = validate_synthesis(
-        "Le chargeur écrit C:\\Users\\Public\\twintask\\in.txt et exploite "
-        "CVE-2026-1234 [S1].",
+        "Le chargeur écrit C:\\Users\\Public\\twintask\\in.txt et exploite CVE-2026-1234 [S1].",
         _corpus(),
         extraction,
     )
@@ -660,8 +659,6 @@ def test_both_policy_domain_remains_publishable() -> None:
         )
     )
 
-    result = validate_synthesis(
-        "Le C2 public.example reste actif [S1].", _corpus(), extraction
-    )
+    result = validate_synthesis("Le C2 public.example reste actif [S1].", _corpus(), extraction)
 
     assert result.usable, result.errors

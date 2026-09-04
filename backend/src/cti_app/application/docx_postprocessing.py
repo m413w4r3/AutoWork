@@ -148,15 +148,16 @@ def apply_template_metadata(docx_path: Path, values: Mapping[str, str]) -> None:
     ) as temporary:
         temp_path = Path(temporary.name)
     try:
-        with zipfile.ZipFile(docx_path) as incoming, zipfile.ZipFile(
-            temp_path, "w", compression=zipfile.ZIP_DEFLATED
-        ) as outgoing:
+        with (
+            zipfile.ZipFile(docx_path) as incoming,
+            zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED) as outgoing,
+        ):
             for info in incoming.infolist():
                 payload = incoming.read(info.filename)
                 if TEMPLATE_PART_PATTERN.match(info.filename):
-                    payload = substitute_placeholders(
-                        payload.decode("utf-8"), values
-                    ).encode("utf-8")
+                    payload = substitute_placeholders(payload.decode("utf-8"), values).encode(
+                        "utf-8"
+                    )
                 outgoing.writestr(info, payload)
         shutil.move(str(temp_path), str(docx_path))
     finally:

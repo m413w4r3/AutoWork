@@ -94,7 +94,17 @@ function detailFor(item: EditionRepairItem): EditionRepairDetail {
     collection_state: item.collection_state,
     repair_state: item.repair_state,
     rebuild_required: item.rebuild_required,
-    effective_decision: null,
+    effective_decision: item.effective_action
+      ? {
+          id: item.effective_decision_id ?? "decision-waive",
+          action: item.effective_action,
+          actor_id: "analyst",
+          reason: "continuer sans cette source",
+          created_at: "2026-09-04T10:00:00Z",
+          observed_artifact_id: item.artifact_id ?? "artifact-references-1",
+          observed_pipeline_generation: item.pipeline_generation,
+        }
+      : null,
   };
 }
 
@@ -253,6 +263,51 @@ describe("Repair Desk — dette de reconstruction durable", () => {
     expect(prepared).toHaveLength(1);
     expect(prepared[0]).toContain(
       `/api/editions/${EDITION_ID}/review/repairs/source-s2/source`,
+    );
+  });
+
+  it("réaffiche l’upload après un waiver et signale la reconstruction", async () => {
+    const waived = sourceItem({
+      collection_state: "failed_terminal",
+      repair_state: "unarchived",
+      resolved: true,
+      effective_action: "continue_without_source",
+      effective_decision_id: "decision-waive",
+      rebuild_required: false,
+      recommended_stage: "none",
+    });
+    const { fetchMock } = stubServer(waived);
+
+    mountConsole();
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Résolus" }));
+    await user.click(
+      await screen.findByRole("button", { name: /two\.example\/report/ }),
+    );
+
+    expect(
+      screen.getByText(
+        /Vous aviez choisi de continuer sans cette source.*réintégrée après reconstruction/i,
+      ),
+    ).toBeInTheDocument();
+    await user.type(
+      screen.getByLabelText("Coller le contenu"),
+      "Contenu fourni finalement",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Archiver cette source" }),
+    );
+
+    expect(
+      await screen.findByText(
+        /Source archivée — reconstruction des références nécessaire/,
+      ),
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining(
+        `/api/subjects/subject-1/sources/collection-s2/content`,
+      ),
+      expect.objectContaining({ method: "POST" }),
     );
   });
 });

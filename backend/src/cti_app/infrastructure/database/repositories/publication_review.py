@@ -117,9 +117,7 @@ class SqlAlchemyEditionReviewReadRepository:
             select(
                 ProductionArtifactRow.production_run_id.label("run_id"),
                 func.coalesce(
-                    ProductionArtifactRow.artifact_metadata[
-                        "q2_rejected_ioc_count"
-                    ].as_integer(),
+                    ProductionArtifactRow.artifact_metadata["q2_rejected_ioc_count"].as_integer(),
                     ProductionArtifactRow.artifact_metadata["deterministic_verification"][
                         "q2_rejected_ioc_count"
                     ].as_integer(),
@@ -131,9 +129,7 @@ class SqlAlchemyEditionReviewReadRepository:
                     ].as_integer(),
                 ).label("rejected_indicator_count"),
                 func.coalesce(
-                    ProductionArtifactRow.artifact_metadata[
-                        "q2_rejected_ioc_count"
-                    ].as_integer(),
+                    ProductionArtifactRow.artifact_metadata["q2_rejected_ioc_count"].as_integer(),
                     ProductionArtifactRow.artifact_metadata["deterministic_verification"][
                         "q2_rejected_ioc_count"
                     ].as_integer(),
@@ -220,9 +216,9 @@ class SqlAlchemyEditionReviewReadRepository:
                 func.coalesce(current_extraction.c.rejected_ioc_count, 0).label(
                     "rejected_ioc_count"
                 ),
-                func.coalesce(
-                    current_extraction.c.rejected_other_artifact_count, 0
-                ).label("rejected_other_artifact_count"),
+                func.coalesce(current_extraction.c.rejected_other_artifact_count, 0).label(
+                    "rejected_other_artifact_count"
+                ),
                 func.coalesce(current_extraction.c.rejected_rule_count, 0).label(
                     "rejected_rule_count"
                 ),

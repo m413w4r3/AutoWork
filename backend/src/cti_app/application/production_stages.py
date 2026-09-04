@@ -265,9 +265,13 @@ class ExtractionService(_ArtifactPayloadMixin):
         ):
             return cast(ProductionArtifact, current)
 
-        canonical_id = await self._artifact_store.put_json(
-            canonical_json, bucket="production-artifacts-canonical"
-        ) if self._artifact_store is not None else None
+        canonical_id = (
+            await self._artifact_store.put_json(
+                canonical_json, bucket="production-artifacts-canonical"
+            )
+            if self._artifact_store is not None
+            else None
+        )
         if canonical_id is None:
             raise ValueError("Repair projection canonical payload was not stored")
 
@@ -582,10 +586,7 @@ class ProductionQAService:
                 for rule in extraction.rules
             )
             if analyst_override_count:
-                warnings.append(
-                    "analyst_override_not_source_proof:"
-                    f"count={analyst_override_count}"
-                )
+                warnings.append(f"analyst_override_not_source_proof:count={analyst_override_count}")
             require(
                 "no_unknown_reference_in_items",
                 all(

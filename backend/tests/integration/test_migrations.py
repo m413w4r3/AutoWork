@@ -869,9 +869,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     repair_triggers = {
         key: function for key, function in triggers.items() if key[0] == _REPAIR_TABLE
     }
-    assert repair_triggers == {
-        (_REPAIR_TABLE, _REPAIR_TRIGGER): "reject_evidence_mutation"
-    }
+    assert repair_triggers == {(_REPAIR_TABLE, _REPAIR_TRIGGER): "reject_evidence_mutation"}
     trigger_definitions = asyncio.run(_trigger_definitions(temporary_postgres_url))
 
     # 0002 must observe the table and trigger made by 0001 and perform no DDL

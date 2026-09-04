@@ -2167,9 +2167,7 @@ async def test_declare_lost_requires_explicit_confirmation(api: AsyncClient) -> 
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["code"] == (
-        "production_reconciliation_confirmation_required"
-    )
+    assert response.json()["detail"]["code"] == ("production_reconciliation_confirmation_required")
 
 
 async def test_declare_lost_releases_and_audits_the_run(

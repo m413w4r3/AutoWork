@@ -882,9 +882,7 @@ class EditionProductionService:
                     batch.schedule_next_dispatch(
                         started_at
                         + timedelta(
-                            milliseconds=self._pacing.subject_delay_ms(
-                                sequence_index=item.position
-                            )
+                            milliseconds=self._pacing.subject_delay_ms(sequence_index=item.position)
                         )
                     )
                 if batch.status is ProductionBatchStatus.RUNNING:

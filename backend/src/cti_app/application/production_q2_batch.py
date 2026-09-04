@@ -140,9 +140,7 @@ def make_q2_batch(candidates: Sequence[Q2BatchCandidate]) -> Q2Batch:
     """Assign deterministic local B1..Bn identifiers to one batch."""
 
     if not 2 <= len(candidates) <= MAX_Q2_BATCH_SOURCES:
-        raise ValueError(
-            f"A Q2 batch must contain between 2 and {MAX_Q2_BATCH_SOURCES} sources"
-        )
+        raise ValueError(f"A Q2 batch must contain between 2 and {MAX_Q2_BATCH_SOURCES} sources")
     return Q2Batch(
         sources=tuple(
             Q2BatchSource(batch_id=f"B{index}", candidate=candidate)

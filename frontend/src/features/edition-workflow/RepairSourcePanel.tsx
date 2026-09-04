@@ -15,14 +15,12 @@ export function RepairSourcePanel({
   subjectId,
   detail,
   readOnly,
-  resolved,
   onArchived,
 }: {
   editionId: string;
   subjectId: string;
   detail: EditionRepairDetail;
   readOnly: boolean;
-  resolved: boolean;
   onArchived: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -44,6 +42,8 @@ export function RepairSourcePanel({
   const pendingReferences = repairState === "archived_pending_references";
   const collectionMissing =
     repairState === "collection_missing" || !detail.collection_id;
+  const sourceWasWaived =
+    detail.effective_decision?.action === "continue_without_source";
 
   const prepare = useMutation({
     mutationFn: () => prepareEditionRepairSource(editionId, detail.repair_key),
@@ -86,6 +86,12 @@ export function RepairSourcePanel({
     retry: false,
     onSuccess: () => {
       setArchived(true);
+      void queryClient.invalidateQueries({
+        queryKey: ["edition-repair-detail", editionId, detail.repair_key],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["edition-repair", editionId],
+      });
       onArchived();
     },
   });
@@ -93,7 +99,7 @@ export function RepairSourcePanel({
   const publisher = detail.publisher ?? source?.publisher ?? null;
   const title = detail.source_title ?? source?.title ?? "Source proposée";
   const url = detail.source_url ?? source?.requested_url ?? null;
-  const canUpload = !readOnly && !resolved && !collectionMissing;
+  const canUpload = !readOnly && !collectionMissing && !pendingReferences;
 
   return (
     <section
@@ -166,6 +172,14 @@ export function RepairSourcePanel({
       ) : (
         <p>Le collecteur n&apos;a pas pu l&apos;archiver.</p>
       )}
+
+      {sourceWasWaived && !pendingReferences ? (
+        <p role="status">
+          Vous aviez choisi de continuer sans cette source. Si vous fournissez
+          finalement son contenu, cette décision restera dans l&apos;audit mais
+          la source sera réintégrée après reconstruction.
+        </p>
+      ) : null}
 
       {canUpload ? (
         <form

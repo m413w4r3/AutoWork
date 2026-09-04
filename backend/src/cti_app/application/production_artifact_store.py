@@ -103,9 +103,7 @@ class ProductionArtifactStore:
         """Store the complete, inert Q2 rejection pack under its own limit."""
         encoded = self.canonical_json_bytes(payload)
         if len(encoded) > MAX_REPAIR_EVIDENCE_BYTES:
-            raise ValueError(
-                f"Repair evidence pack exceeds {MAX_REPAIR_EVIDENCE_BYTES} bytes"
-            )
+            raise ValueError(f"Repair evidence pack exceeds {MAX_REPAIR_EVIDENCE_BYTES} bytes")
         record = await self._catalog.ingest(
             BytesIO(encoded),
             logical_bucket=_REPAIR_EVIDENCE_BUCKET,
@@ -120,9 +118,7 @@ class ProductionArtifactStore:
         )
         if not isinstance(payload, dict):
             raise ValueError("Repair evidence payload is not a JSON object")
-        if payload.get("schema_version") != "1" or not isinstance(
-            payload.get("entries"), list
-        ):
+        if payload.get("schema_version") != "1" or not isinstance(payload.get("entries"), list):
             raise ValueError("Unsupported repair evidence pack")
         return payload
 

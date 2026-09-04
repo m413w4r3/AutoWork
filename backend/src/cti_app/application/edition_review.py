@@ -9,7 +9,10 @@ from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
-from cti_app.application.production_repairs import repair_decision_application_state
+from cti_app.application.production_repairs import (
+    repair_issue_application_state,
+    repair_issue_blocks_signoff,
+)
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
     ProductionArtifactStatus,
@@ -298,11 +301,7 @@ class EditionRepairReadService:
             row = rows_by_subject.get(issue_subject) if issue_subject is not None else None
             if row is None:
                 issue_run_id = getattr(issue, "production_run_id", None)
-                row = (
-                    rows_by_run.get(issue_run_id)
-                    if isinstance(issue_run_id, UUID)
-                    else None
-                )
+                row = rows_by_run.get(issue_run_id) if isinstance(issue_run_id, UUID) else None
             item = self._item_from_issue(issue, row)
             if item is not None:
                 records.append(item)
@@ -313,10 +312,7 @@ class EditionRepairReadService:
             for item in records
             if (kind is None or item.kind == kind.value)
             and (subject_id is None or item.subject_id == subject_id)
-            and (
-                artifact_type is None
-                or item.artifact_type == artifact_type
-            )
+            and (artifact_type is None or item.artifact_type == artifact_type)
         ]
         page_records = [
             item
@@ -339,17 +335,13 @@ class EditionRepairReadService:
             next_cursor=next_cursor,
         )
 
-    async def _issue_views(
-        self, edition_id: UUID, subject_id: UUID | None
-    ) -> tuple[Any, ...]:
+    async def _issue_views(self, edition_id: UUID, subject_id: UUID | None) -> tuple[Any, ...]:
         getter = getattr(self._issue_reader, "list_issue_views", None)
         if callable(getter):
             extraction = await getter(edition_id, subject_id)
         else:
             extraction = await self._issue_reader.list_issues(edition_id, subject_id)  # type: ignore[attr-defined]
-        supplemental_getter = getattr(
-            self._issue_reader, "list_supplemental_source_issues", None
-        )
+        supplemental_getter = getattr(self._issue_reader, "list_supplemental_source_issues", None)
         supplemental = (
             await supplemental_getter(edition_id, subject_id)
             if callable(supplemental_getter)
@@ -383,7 +375,7 @@ class EditionRepairReadService:
             # The content exists; only the deterministic REFERENCES rebuild is
             # missing. This debt is served by the backend, so a page reload
             # cannot lose it.
-            rebuild_required = True
+            rebuild_required = repair_issue_blocks_signoff(issue)
             recommended_stage = "rebuild_references"
         elif is_source:
             rebuild_required = False
@@ -396,12 +388,12 @@ class EditionRepairReadService:
         elif state is RepairDecisionApplicationState.UNBUILDABLE:
             # The decision is recorded but nothing materialized it. It stays a
             # blocking debt the analyst clears by revising it to EXCLUDE.
-            rebuild_required = True
+            rebuild_required = repair_issue_blocks_signoff(issue)
             recommended_stage = "revise_decision"
         elif state is RepairDecisionApplicationState.PROJECTION_REQUIRED:
             # Covers the first INCLUDE as well as every revision that makes the
             # applied projection disagree with the effective decision.
-            rebuild_required = True
+            rebuild_required = repair_issue_blocks_signoff(issue)
             recommended_stage = "apply_projection"
         else:
             rebuild_required = row.document_artifact_id is None
@@ -418,23 +410,11 @@ class EditionRepairReadService:
             artifact_id=artifact_id,
             artifact_version=artifact_version,
             source_id=(str(source_id) if source_id else None),
-            source_title=(
-                str(source_title) if source_title else None
-            ),
-            source_url=(
-                str(source_url) if source_url else None
-            ),
+            source_title=(str(source_title) if source_title else None),
+            source_url=(str(source_url) if source_url else None),
             collection_id=collection_id,
-            collection_state=(
-                str(collection_state)
-                if collection_state is not None
-                else None
-            ),
-            artifact_type=(
-                str(artifact_type)
-                if artifact_type is not None
-                else None
-            ),
+            collection_state=(str(collection_state) if collection_state is not None else None),
+            artifact_type=(str(artifact_type) if artifact_type is not None else None),
             preview=str(getattr(issue, "preview", "")),
             reason_code=str(
                 getattr(issue, "reason_code", None)
@@ -471,41 +451,9 @@ def _issue_kind(issue: Any) -> str:
     return str(getattr(value, "value", value))
 
 
-def issue_application_state(
-    issue: Any, decision: Any
-) -> RepairDecisionApplicationState:
+def issue_application_state(issue: Any, decision: Any) -> RepairDecisionApplicationState:
     """Read the state the issue reader computed, or derive it for plain DTOs."""
-    value = getattr(issue, "application_state", None)
-    if value is not None:
-        return RepairDecisionApplicationState(getattr(value, "value", value))
-    if decision is None:
-        return RepairDecisionApplicationState.UNRESOLVED
-    # Legacy readers only carry the boolean. Rebuild the marker it stands for
-    # so the single pure rule still decides, rather than a second policy here.
-    marker = (
-        {
-            "applied_decisions": [
-                {
-                    "repair_key": str(getattr(issue, "repair_key", "")),
-                    "decision_id": str(getattr(decision, "id", "")),
-                    "action": str(
-                        getattr(getattr(decision, "action", None), "value", "")
-                    ),
-                }
-            ]
-        }
-        if bool(getattr(issue, "projection_applied", False))
-        else None
-    )
-    return repair_decision_application_state(issue, decision, marker)
-
-
-def _issue_is_unbuildable(issue: Any) -> bool:
-    """An honoured INCLUDE nothing could materialize is a blocking debt."""
-    return (
-        issue_application_state(issue, getattr(issue, "effective_decision", None))
-        is RepairDecisionApplicationState.UNBUILDABLE
-    )
+    return repair_issue_application_state(issue, decision)
 
 
 def _issue_repair_state(issue: Any) -> str | None:
@@ -603,8 +551,7 @@ def _repair_articles(items: Sequence[EditionRepairItem]) -> tuple[EditionRepairA
                 EditionRepairArticle(
                     subject_id=subject_id,
                     has_pending_projection=any(
-                        item.recommended_stage == "apply_projection"
-                        for item in subject_items
+                        item.recommended_stage == "apply_projection" for item in subject_items
                     ),
                     recommended_stage=recommended,
                     active_repair_count=sum(not item.resolved for item in subject_items),
@@ -629,9 +576,7 @@ def _repair_cursor_encode(position: int, repair_key: str) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
 
 
-def _repair_cursor_position(
-    cursor: str | None, items: Sequence[EditionRepairItem]
-) -> int:
+def _repair_cursor_position(cursor: str | None, items: Sequence[EditionRepairItem]) -> int:
     if not cursor:
         return 0
     import base64
@@ -695,9 +640,7 @@ class EditionReviewService:
                 subject_id = row.subject_id if row is not None else None
             if subject_id is not None:
                 repair_by_subject.setdefault(subject_id, []).append(issue)
-        items = tuple(
-            _build_item(row, repair_by_subject.get(row.subject_id, ())) for row in rows
-        )
+        items = tuple(_build_item(row, repair_by_subject.get(row.subject_id, ())) for row in rows)
         # LOT 21 business rule: the publication scope is what will be delivered.
         # An article the analyst deliberately excluded carries no loss for that
         # scope, so its open repairs must not hold the whole edition hostage.
@@ -737,9 +680,7 @@ class EditionReviewService:
             self._repair_issue_reader, "list_supplemental_source_issues", None
         )
         supplemental = (
-            await supplemental_getter(edition_id)
-            if callable(supplemental_getter)
-            else ()
+            await supplemental_getter(edition_id) if callable(supplemental_getter) else ()
         )
         return tuple([*extraction, *supplemental])
 
@@ -903,10 +844,7 @@ def _build_item(row: EditionReviewReadItem, repair_issues: Sequence[Any] = ()) -
         _repair_issue_is_actionable(issue) and not _repair_issue_resolved(issue)
         for issue in repair_issues
     )
-    pending_rebuild_count = sum(
-        _issue_pending_references(issue) or _issue_is_unbuildable(issue)
-        for issue in repair_issues
-    )
+    pending_rebuild_count = sum(repair_issue_blocks_signoff(issue) for issue in repair_issues)
     return EditionReviewItem(
         position=row.position,
         subject_id=row.subject_id,
@@ -955,9 +893,8 @@ def _repair_issue_is_actionable(issue: Any) -> bool:
 def _repair_issue_resolved(issue: Any) -> bool:
     # An archived source has nothing left to arbitrate; its remaining debt is
     # counted by ``pending_rebuild_count`` instead.
-    return (
-        getattr(issue, "effective_decision", None) is not None
-        or _issue_pending_references(issue)
+    return getattr(issue, "effective_decision", None) is not None or _issue_pending_references(
+        issue
     )
 
 

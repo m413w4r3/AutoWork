@@ -165,9 +165,7 @@ def test_confirmed_status_wins_contextual_status_conflict_without_hiding_diagnos
                 source_ids=("S1",),
             ),
             Q2ProposalSubmission(
-                output=Q2SourceOutput(
-                    artifacts=[_artifact(value, "domain", status="contextual")]
-                ),
+                output=Q2SourceOutput(artifacts=[_artifact(value, "domain", status="contextual")]),
                 source_ids=("S2",),
             ),
         )
@@ -179,9 +177,10 @@ def test_confirmed_status_wins_contextual_status_conflict_without_hiding_diagnos
     assert len(collect_indicators(verification.canonical)) == 1
     assert "semantic_status_conflict" in verification.warnings
     assert verification.semantic_status_conflicts[0].artifact_type == "domain"
-    assert verification.semantic_status_conflicts[0].value_hash == hashlib.sha256(
-        value.encode()
-    ).hexdigest()
+    assert (
+        verification.semantic_status_conflicts[0].value_hash
+        == hashlib.sha256(value.encode()).hexdigest()
+    )
     assert verification.semantic_status_conflicts[0].statuses == ("confirmed_ioc", "contextual")
     assert verification.semantic_status_conflicts[0].source_ids == ("S1", "S2")
 

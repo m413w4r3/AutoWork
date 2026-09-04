@@ -111,9 +111,7 @@ async def _configured_scenario(
 
 @pytest.mark.asyncio
 async def test_complete_production_pipeline_reaches_ready(
-    production_scenario_factory: Callable[
-        [Mapping[str, Mapping[str, object]]], ProductionScenario
-    ],
+    production_scenario_factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
 ) -> None:
     scenario = await _configured_scenario(production_scenario_factory)
     initial = await scenario.start()
@@ -189,8 +187,9 @@ async def test_complete_production_pipeline_reaches_ready(
     assert by_stage[ProductionArtifactStage.REFERENCES].metadata["warnings"] == []
     assert by_stage[ProductionArtifactStage.EXTRACTION].metadata["warnings"] == []
     assert (
-        by_stage[ProductionArtifactStage.SYNTHESIS].metadata["diagnostics"]
-        ["unknown_citation_count"]
+        by_stage[ProductionArtifactStage.SYNTHESIS].metadata["diagnostics"][
+            "unknown_citation_count"
+        ]
         == 0
     )
     verification = by_stage[ProductionArtifactStage.EXTRACTION].metadata[
@@ -268,15 +267,12 @@ async def test_complete_production_pipeline_reaches_ready(
         extraction_items
     )
     assert any(
-        item["value"] == "secondary-c2.security-lab.io"
-        and item["indicator_status"] == "contextual"
+        item["value"] == "secondary-c2.security-lab.io" and item["indicator_status"] == "contextual"
         for item in extraction_items
     )
     q2_model_run_ids = {str(call.model_run_id) for call in q2_calls}
     assert {
-        model_run_id
-        for item in extraction_items
-        for model_run_id in item["model_run_ids"]
+        model_run_id for item in extraction_items for model_run_id in item["model_run_ids"]
     } == q2_model_run_ids
     assert "core-c2.security-lab.io" in synthesis_text
     assert "secondary-c2.security-lab.io" in synthesis_text
@@ -293,9 +289,7 @@ async def test_complete_production_pipeline_reaches_ready(
         and item["display_policy"] in {"ioc_section", "both"}
     }
     publication_indicator_values = {
-        value["value"]
-        for group in publication_payload["indicators"]
-        for value in group["values"]
+        value["value"] for group in publication_payload["indicators"] for value in group["values"]
     }
     assert publication_indicator_values == extraction_indicator_values
     assert all(source_id in model_calls[-1].request.text for source_id in reference_source_ids)
@@ -312,9 +306,7 @@ async def test_complete_production_pipeline_reaches_ready(
 
 @pytest.mark.asyncio
 async def test_invalid_q2_response_cannot_reach_ready(
-    production_scenario_factory: Callable[
-        [Mapping[str, Mapping[str, object]]], ProductionScenario
-    ],
+    production_scenario_factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
 ) -> None:
     scenario = production_scenario_factory(_sources())
     scenario.model.script.references(Q1_RESPONSE)

@@ -103,9 +103,7 @@ def test_policy_assigns_full_only_to_frozen_core_sources() -> None:
     plans = plan_q2_extraction_profiles(report, snapshot=snapshot)
 
     assert all(
-        plan.profile is ExtractionProfile.FULL
-        for plan in plans
-        if plan.canonical_url in core_urls
+        plan.profile is ExtractionProfile.FULL for plan in plans if plan.canonical_url in core_urls
     )
     assert all(
         plan.profile is ExtractionProfile.IOC_RULES

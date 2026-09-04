@@ -86,9 +86,7 @@ class ArtifactVerificationResult:
 # are legitimate labels of real indicators (`none.locat.sbs`), and treating
 # them as redactions drops published IOCs under a misleading reason code.
 _PLACEHOLDER_STRUCTURED = re.compile(r"<[^>]+>")
-_PLACEHOLDER_VALUE = re.compile(
-    r"(?:unknown|inconnu(?:e)?|n/?a|none|null|redacted|fuzz)\.?"
-)
+_PLACEHOLDER_VALUE = re.compile(r"(?:unknown|inconnu(?:e)?|n/?a|none|null|redacted|fuzz)\.?")
 _EXAMPLE_TLDS = frozenset({"com", "org", "net"})
 
 _HEX = re.compile(r"^[0-9a-fA-F]+$")

@@ -419,9 +419,7 @@ class ProductionScenario:
     run_id: UUID | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
-        canonical_sources = {
-            _canonical_url(url): dict(spec) for url, spec in self.sources.items()
-        }
+        canonical_sources = {_canonical_url(url): dict(spec) for url, spec in self.sources.items()}
         self.sources = canonical_sources
         country_code = reserve_edition_code()
         self.edition = Edition(
@@ -533,9 +531,7 @@ class ProductionScenario:
             self.model,
             blob_store,
         )
-        allowed_domains = frozenset(
-            urlsplit(url).hostname or "" for url in canonical_sources
-        )
+        allowed_domains = frozenset(urlsplit(url).hostname or "" for url in canonical_sources)
         policy = CollectionPolicy(allowed_domains=allowed_domains)
         self.collection_transport = DeterministicSourceTransport(canonical_sources)
         collector = SafeHttpCollector(
@@ -640,9 +636,7 @@ class ProductionScenario:
             kind=stage_job_kind(SubjectProductionStage.SOURCES),
             aggregate_type="subject",
             aggregate_id=first.subject_id,
-            idempotency_key=production_stage_idempotency_key(
-                first, SubjectProductionStage.SOURCES
-            ),
+            idempotency_key=production_stage_idempotency_key(first, SubjectProductionStage.SOURCES),
             correlation_id="business-test",
             input_parameters=parameters.model_dump(mode="json"),
             max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,

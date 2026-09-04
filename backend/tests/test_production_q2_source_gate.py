@@ -161,9 +161,7 @@ async def test_batch_gate_uses_the_archive_of_the_framed_source(
         in warning
         for warning in sink.calls[-1]["warnings"]
     )
-    verification_diagnostics = cast(
-        dict[str, object], sink.calls[-1]["verification_diagnostics"]
-    )
+    verification_diagnostics = cast(dict[str, object], sink.calls[-1]["verification_diagnostics"])
     groups = verification_diagnostics["q2_source_evidence_rejection_groups"]
     assert groups == [
         {
@@ -195,8 +193,7 @@ async def test_batch_gate_uses_the_archive_of_the_framed_source(
     assert verification_diagnostics["q2_rejected_rule_count"] == 0
     assert verification_diagnostics["q2_rejected_artifact_count"] == 1
     assert not any(
-        warning.startswith("q2_detection_rules_lost:")
-        for warning in sink.calls[-1]["warnings"]
+        warning.startswith("q2_detection_rules_lost:") for warning in sink.calls[-1]["warnings"]
     )
     evidence_events = [
         event
@@ -253,9 +250,7 @@ async def test_batch_gate_records_rejected_artifact_and_rule_values(
     )
 
     assert result["status"] == "success", result
-    verification_diagnostics = cast(
-        dict[str, object], sink.calls[-1]["verification_diagnostics"]
-    )
+    verification_diagnostics = cast(dict[str, object], sink.calls[-1]["verification_diagnostics"])
     rejections = cast(
         list[dict[str, object]], verification_diagnostics["q2_source_evidence_rejections"]
     )
@@ -265,9 +260,7 @@ async def test_batch_gate_records_rejected_artifact_and_rule_values(
     }
     assert verification_diagnostics["q2_rejected_rule_count"] == 1
     assert verification_diagnostics["q2_rejected_artifact_count"] == 1
-    rejected_rules = cast(
-        list[dict[str, object]], verification_diagnostics["q2_rejected_rules"]
-    )
+    rejected_rules = cast(list[dict[str, object]], verification_diagnostics["q2_rejected_rules"])
     assert [rejection["value"] for rejection in rejected_rules] == [rejected_rule]
     warnings = cast(list[str], sink.calls[-1]["warnings"])
     assert "q2_detection_rules_lost:count=1" in warnings
@@ -323,12 +316,8 @@ async def test_batch_gate_applies_literal_rule_matching_per_source(
     rules = sink.calls[-1]["canonical_json"]["rules"]
     assert [rule["body"] for rule in rules] == [body_two]
     assert rules[0]["source_ids"] == ["S2"]
-    verification_diagnostics = cast(
-        dict[str, object], sink.calls[-1]["verification_diagnostics"]
-    )
-    rejected_rules = cast(
-        list[dict[str, object]], verification_diagnostics["q2_rejected_rules"]
-    )
+    verification_diagnostics = cast(dict[str, object], sink.calls[-1]["verification_diagnostics"])
+    rejected_rules = cast(list[dict[str, object]], verification_diagnostics["q2_rejected_rules"])
     assert rejected_rules == [
         {
             "source_id": "S1",
@@ -346,8 +335,7 @@ async def test_batch_gate_applies_literal_rule_matching_per_source(
     assert verification_diagnostics["q2_rejected_rule_count"] == 1
     assert verification_diagnostics["q2_rejected_artifact_count"] == 0
     assert any(
-        warning == "q2_detection_rules_lost:count=1"
-        for warning in sink.calls[-1]["warnings"]
+        warning == "q2_detection_rules_lost:count=1" for warning in sink.calls[-1]["warnings"]
     )
 
 
@@ -562,12 +550,9 @@ def test_hatching_article_cannot_borrow_triage_iocs() -> None:
 
     assert hatching_gate.output.artifacts == []
     assert all(
-        rejection.reason_code == "source_evidence_missing"
-        for rejection in hatching_gate.rejections
+        rejection.reason_code == "source_evidence_missing" for rejection in hatching_gate.rejections
     )
     verification = verify_q2_proposals(
-        (
-            Q2ProposalSubmission(output=triage_gate.output, source_ids=("S8",)),
-        )
+        (Q2ProposalSubmission(output=triage_gate.output, source_ids=("S8",)),)
     )
     assert {item.source_ids for item in verification.canonical.items} == {("S8",)}

@@ -309,20 +309,14 @@ class SubjectCollectionService:
             raise CollectionNotAllowedError("Source URL cannot be canonicalized") from exc
 
         async with self._uow_factory() as uow:
-            existing = await uow.source_collections.get_by_canonical_url(
-                subject_id, canonical
-            )
+            existing = await uow.source_collections.get_by_canonical_url(subject_id, canonical)
         if existing is not None:
             return existing
 
-        await self.add_supplemental_sources(
-            subject_id, [replace(source, url=canonical)]
-        )
+        await self.add_supplemental_sources(subject_id, [replace(source, url=canonical)])
 
         async with self._uow_factory() as uow:
-            created = await uow.source_collections.get_by_canonical_url(
-                subject_id, canonical
-            )
+            created = await uow.source_collections.get_by_canonical_url(subject_id, canonical)
         if created is None:
             raise CollectionNotAllowedError("The proposed source could not be attached")
         return created

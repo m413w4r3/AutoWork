@@ -47,6 +47,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairAdjudicationRequest,
     ProductionRepairAdjudicationService,
     ProductionRepairDecisionChangedError,
+    ProductionRepairDecisionNoopError,
     ProductionRepairIssueNotFoundError,
     ProductionRepairIssueService,
     ProductionRepairProjectionError,
@@ -401,15 +402,11 @@ async def get_edition_review_repairs(
     )
 
 
-async def _edition_repair_issues(
-    request: Request, edition_id: UUID
-) -> tuple[Any, ...]:
+async def _edition_repair_issues(request: Request, edition_id: UUID) -> tuple[Any, ...]:
     service = _repair_issue_service(request)
     getter = getattr(service, "list_issue_views", None)
     extraction = (
-        await getter(edition_id)
-        if callable(getter)
-        else await service.list_issues(edition_id)
+        await getter(edition_id) if callable(getter) else await service.list_issues(edition_id)
     )
     supplemental_getter = getattr(service, "list_supplemental_source_issues", None)
     supplemental = await supplemental_getter(edition_id) if callable(supplemental_getter) else ()
@@ -453,14 +450,17 @@ def _edition_repair_error(exc: Exception, repair_key: str | None = None) -> NoRe
     if isinstance(exc, ProductionRepairValueNotVerifiableError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=_repair_detail(
-                ProductionRepairValueNotVerifiableError.code, repair_key
-            ),
+            detail=_repair_detail(ProductionRepairValueNotVerifiableError.code, repair_key),
         ) from exc
     if isinstance(exc, ProductionRepairDecisionChangedError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=_repair_detail(ProductionRepairDecisionChangedError.code, repair_key),
+        ) from exc
+    if isinstance(exc, ProductionRepairDecisionNoopError):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_repair_detail(ProductionRepairDecisionNoopError.code, repair_key),
         ) from exc
     if isinstance(exc, ProductionRepairActionInvalidError):
         raise HTTPException(
@@ -487,9 +487,7 @@ def _edition_repair_error(exc: Exception, repair_key: str | None = None) -> NoRe
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={
                 "code": (
-                    "production_repair_action_invalid"
-                    if "incompatible" in str(exc)
-                    else str(exc)
+                    "production_repair_action_invalid" if "incompatible" in str(exc) else str(exc)
                 )
             },
         ) from exc
@@ -508,9 +506,7 @@ def _repair_application_state(issue: Any | None) -> str:
     """
     if issue is None:
         return RepairDecisionApplicationState.UNRESOLVED.value
-    return issue_application_state(
-        issue, getattr(issue, "effective_decision", None)
-    ).value
+    return issue_application_state(issue, getattr(issue, "effective_decision", None)).value
 
 
 def _production_repair_decision_history_view(
@@ -543,18 +539,10 @@ async def get_edition_review_repair_detail(
         result = {
             "repair_key": repair_key,
             "kind": _repair_issue_kind(issue).value,
-            "source_id": getattr(source_detail, "source_id", None)
-            if source_detail
-            else None,
-            "source_title": getattr(source_detail, "source_title", None)
-            if source_detail
-            else None,
-            "source_url": getattr(source_detail, "source_url", None)
-            if source_detail
-            else None,
-            "publisher": getattr(source_detail, "publisher", None)
-            if source_detail
-            else None,
+            "source_id": getattr(source_detail, "source_id", None) if source_detail else None,
+            "source_title": getattr(source_detail, "source_title", None) if source_detail else None,
+            "source_url": getattr(source_detail, "source_url", None) if source_detail else None,
+            "publisher": getattr(source_detail, "publisher", None) if source_detail else None,
             "collection_id": (
                 str(source_detail.collection_id)
                 if source_detail is not None and source_detail.collection_id is not None
@@ -565,17 +553,13 @@ async def get_edition_review_repair_detail(
             else None,
             "repair_state": _repair_state_value(source_detail),
             "rebuild_required": bool(
-                getattr(source_detail, "rebuild_required", False)
-                if source_detail
-                else False
+                getattr(source_detail, "rebuild_required", False) if source_detail else False
             ),
             "recommended_action": getattr(source_detail, "recommended_action", None)
             if source_detail
             else None,
             "effective_decision": _production_repair_decision_view(
-                getattr(source_detail, "effective_decision", None)
-                if source_detail
-                else None
+                getattr(source_detail, "effective_decision", None) if source_detail else None
             ),
             "application_state": _repair_application_state(source_detail),
             "decision_history": _production_repair_decision_history_view(
@@ -615,9 +599,7 @@ async def get_edition_review_repair_detail(
             issue_detail.issue.effective_decision
         ),
         "application_state": _repair_application_state(issue_detail.issue),
-        "decision_history": _production_repair_decision_history_view(
-            issue_detail.decision_history
-        ),
+        "decision_history": _production_repair_decision_history_view(issue_detail.decision_history),
     }
     return result
 
@@ -661,9 +643,7 @@ async def decide_edition_review_repair(
 def _repair_adjudication_service(
     request: Request,
 ) -> ProductionRepairAdjudicationService:
-    configured = getattr(
-        request.app.state, "production_repair_adjudication_service", None
-    )
+    configured = getattr(request.app.state, "production_repair_adjudication_service", None)
     if configured is not None:
         return cast(ProductionRepairAdjudicationService, configured)
     return ProductionRepairAdjudicationService(
@@ -737,8 +717,7 @@ async def prepare_edition_review_repair_source(
     """
     issue = await _find_edition_repair_issue(request, edition_id, repair_key)
     if issue is None or (
-        _repair_issue_kind(issue)
-        is not ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
+        _repair_issue_kind(issue) is not ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
     ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -827,10 +806,8 @@ async def _edition_subject_production_state(
                     (
                         item
                         for item in artifacts
-                        if getattr(getattr(item, "stage", None), "value", item.stage)
-                        == stage.value
-                        and getattr(getattr(item, "status", None), "value", item.status)
-                        != "stale"
+                        if getattr(getattr(item, "stage", None), "value", item.stage) == stage.value
+                        and getattr(getattr(item, "status", None), "value", item.status) != "stale"
                     ),
                     None,
                 )
@@ -878,18 +855,14 @@ async def rebuild_edition_review_item(
         request, edition_id, subject_id
     )
     if payload is not None and (
-        (
-            payload.observed_run_id is not None
-            and payload.observed_run_id != run.id
-        )
+        (payload.observed_run_id is not None and payload.observed_run_id != run.id)
         or (
             payload.observed_pipeline_generation is not None
             and payload.observed_pipeline_generation != run.pipeline_generation
         )
         or (
             payload.observed_artifact_id is not None
-            and payload.observed_artifact_id
-            not in {artifact.id for artifact in current.values()}
+            and payload.observed_artifact_id not in {artifact.id for artifact in current.values()}
         )
     ):
         raise HTTPException(
@@ -957,8 +930,10 @@ async def rebuild_edition_review_item(
         for item in repair_items
     )
     try:
-        if not references_pending and q2_resolved and any(
-            item.recommended_stage == "apply_projection" for item in q2_resolved
+        if (
+            not references_pending
+            and q2_resolved
+            and any(item.recommended_stage == "apply_projection" for item in q2_resolved)
         ):
             projection = await _repair_projection_service(request).project_effective_extraction(
                 run.id, actor_id=actor_id
@@ -1035,10 +1010,7 @@ async def rebuild_edition_review_item(
                 and bool(archived_source_urls - indexed_canonical_urls)
             )
         )
-        if (
-            references is not None
-            and references_need_repair
-        ):
+        if references is not None and references_need_repair:
             result = await _reference_repair_service(request).rebuild_from_archived_q1(
                 run.id, actor_id=actor_id
             )

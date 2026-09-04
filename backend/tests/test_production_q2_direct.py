@@ -666,9 +666,7 @@ async def test_q2_content_duplicates_share_one_model_call_and_complete_both_sour
         source_contents={"S1": b"ExampleRAT", "S2": b"ExampleRAT"},
     )
 
-    result = await orchestrator._execute_direct_url_extraction(
-        run, snapshot=_q2_snapshot()
-    )
+    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
 
     assert result["status"] == "success", result
     assert gateway.calls == ["S1"]
@@ -676,16 +674,12 @@ async def test_q2_content_duplicates_share_one_model_call_and_complete_both_sour
     assert result["model_calls"] == 1
     assert result["model_calls_avoided"] == 1
     duplicate_events = [
-        event
-        for event in diagnostics.events
-        if event.get("event") == "q2.source.content_duplicate"
+        event for event in diagnostics.events if event.get("event") == "q2.source.content_duplicate"
     ]
     assert len(duplicate_events) == 1
     assert duplicate_events[0]["source_id"] == "S2"
     assert duplicate_events[0]["primary_source_id"] == "S1"
-    assert duplicate_events[0]["source_content_sha256"] == hashlib.sha256(
-        b"ExampleRAT"
-    ).hexdigest()
+    assert duplicate_events[0]["source_content_sha256"] == hashlib.sha256(b"ExampleRAT").hexdigest()
 
 
 @pytest.mark.parametrize("error_code", ["bridge_ui_timeout", "transport_glitch"])
@@ -858,9 +852,7 @@ async def test_manual_extraction_retry_reuses_successful_batch_members_only(
         gateway,
         _q2_report(4),
         model_run_state=model_uow.state,
-        source_contents={
-            f"S{index}": f"archive-{index}".encode() for index in range(1, 5)
-        },
+        source_contents={f"S{index}": f"archive-{index}".encode() for index in range(1, 5)},
     )
     snapshot = replace(_q2_snapshot(), core_sources=(), reuse_basis_hash="", input_hash="")
 
@@ -938,9 +930,7 @@ async def test_q2_checkpoint_is_reused_by_another_production_run(
         report,
         model_run_state=model_uow.state,
     )
-    first = await first_orchestrator._execute_direct_url_extraction(
-        first_run, snapshot=snapshot
-    )
+    first = await first_orchestrator._execute_direct_url_extraction(first_run, snapshot=snapshot)
 
     second_orchestrator, second_run, _ = _q2_orchestrator(
         monkeypatch,
@@ -948,9 +938,7 @@ async def test_q2_checkpoint_is_reused_by_another_production_run(
         report,
         model_run_state=model_uow.state,
     )
-    second = await second_orchestrator._execute_direct_url_extraction(
-        second_run, snapshot=snapshot
-    )
+    second = await second_orchestrator._execute_direct_url_extraction(second_run, snapshot=snapshot)
 
     assert first["status"] == "success", first
     assert second["status"] == "success", second
@@ -974,9 +962,7 @@ async def test_q2_checkpoint_reuse_excludes_stale_checkpoint(
         report,
         model_run_state=model_uow.state,
     )
-    first = await first_orchestrator._execute_direct_url_extraction(
-        first_run, snapshot=snapshot
-    )
+    first = await first_orchestrator._execute_direct_url_extraction(first_run, snapshot=snapshot)
     assert first["status"] == "success", first
 
     stored_run = next(iter(model_uow.state.values()))
@@ -988,9 +974,7 @@ async def test_q2_checkpoint_reuse_excludes_stale_checkpoint(
         report,
         model_run_state=model_uow.state,
     )
-    second = await second_orchestrator._execute_direct_url_extraction(
-        second_run, snapshot=snapshot
-    )
+    second = await second_orchestrator._execute_direct_url_extraction(second_run, snapshot=snapshot)
 
     assert second["status"] == "success", second
     assert second["cache_hits"] == 0
@@ -1090,18 +1074,14 @@ async def test_archive_fallback_skips_short_archived_text_without_model_call(
         source_contents={"S1": b"x" * 200},
     )
 
-    result = await orchestrator._execute_direct_url_extraction(
-        run, snapshot=_q2_snapshot()
-    )
+    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
 
     assert result["status"] == "success", result
     assert result["skipped_source_ids"] == ["S1"]
     assert len(adapter.calls) == 1
     assert adapter.calls[0].web_search is True
     skipped_event = next(
-        event
-        for event in diagnostics.events
-        if event.get("event") == "q2.source.skipped"
+        event for event in diagnostics.events if event.get("event") == "q2.source.skipped"
     )
     assert skipped_event["archive_error_code"] == "archive_source_not_substantive"
 

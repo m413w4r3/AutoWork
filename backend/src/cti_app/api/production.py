@@ -47,6 +47,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairActionInvalidError,
     ProductionRepairAdjudicationService,
     ProductionRepairDecisionChangedError,
+    ProductionRepairDecisionNoopError,
     ProductionRepairIssueNotFoundError,
     ProductionRepairIssueService,
     ProductionRepairProjectionError,
@@ -349,9 +350,7 @@ def _production_reconciliation_resolver(request: Request) -> ProductionReconcili
         request.app.state.uow_factory,
         transport=getattr(request.app.state, "bridge_capabilities_provider", None),
         model_gateway=getattr(request.app.state, "model_gateway", None),
-        model_conversation_service=getattr(
-            request.app.state, "model_conversation_service", None
-        ),
+        model_conversation_service=getattr(request.app.state, "model_conversation_service", None),
         diagnostics=getattr(request.app.state, "production_diagnostics", None),
     )
 
@@ -381,9 +380,7 @@ def _production_reference_repair_service(
 def _production_repair_adjudication_service(
     request: Request,
 ) -> ProductionRepairAdjudicationService:
-    service = getattr(
-        request.app.state, "production_repair_adjudication_service", None
-    )
+    service = getattr(request.app.state, "production_repair_adjudication_service", None)
     if service is None:
         service = ProductionRepairAdjudicationService(
             request.app.state.uow_factory,
@@ -427,9 +424,7 @@ def _supplemental_repair_issue_view(issue: Any) -> dict[str, Any]:
         "source_title": issue.source_title,
         "source_url": issue.source_url,
         "publisher": issue.publisher,
-        "collection_id": (
-            str(issue.collection_id) if issue.collection_id is not None else None
-        ),
+        "collection_id": (str(issue.collection_id) if issue.collection_id is not None else None),
         "collection_state": issue.collection_state,
         "repair_state": getattr(
             getattr(issue, "repair_state", None), "value", getattr(issue, "repair_state", None)
@@ -575,9 +570,7 @@ def _extraction_rejections(artifact: Any | None) -> ExtractionRejections:
 
     metadata = getattr(artifact, "metadata", {})
     verification = (
-        metadata.get("deterministic_verification", {})
-        if isinstance(metadata, dict)
-        else {}
+        metadata.get("deterministic_verification", {}) if isinstance(metadata, dict) else {}
     )
     if not isinstance(verification, dict):
         return ExtractionRejections()
@@ -1313,9 +1306,7 @@ async def get_subject_production_repairs(
         edition_id = run.edition_id
 
     issue_service = _production_repair_issue_service(request)
-    supplemental = await issue_service.list_supplemental_source_issues(
-        edition_id, subject_id
-    )
+    supplemental = await issue_service.list_supplemental_source_issues(edition_id, subject_id)
     light_getter = getattr(issue_service, "list_issue_views", None)
     extraction_issues = (
         await light_getter(edition_id, subject_id)
@@ -1324,9 +1315,7 @@ async def get_subject_production_repairs(
     )
     if kind is ProductionRepairIssueKind.REJECTED_INDICATOR:
         supplemental = ()
-        extraction_issues = tuple(
-            issue for issue in extraction_issues if issue.kind is kind
-        )
+        extraction_issues = tuple(issue for issue in extraction_issues if issue.kind is kind)
     elif kind is ProductionRepairIssueKind.REJECTED_RULE:
         supplemental = ()
         extraction_issues = tuple(issue for issue in extraction_issues if issue.kind is kind)
@@ -1350,8 +1339,7 @@ async def get_subject_production_repairs(
         "supplemental_source_issues": [
             item
             for item in page
-            if item.get("kind")
-            == ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value
+            if item.get("kind") == ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value
         ],
         "has_more": next_cursor is not None,
         "next_cursor": next_cursor,
@@ -1383,9 +1371,7 @@ async def get_subject_production_repair_detail(
     result = _repair_issue_view(detail.issue)
     result["value"] = detail.value
     result["body"] = (
-        detail.value
-        if detail.issue.kind is ProductionRepairIssueKind.REJECTED_RULE
-        else None
+        detail.value if detail.issue.kind is ProductionRepairIssueKind.REJECTED_RULE else None
     )
     result["provenance_model_run_id"] = detail.issue.model_run_id
     result["effective_decision"] = _repair_decision_view(detail.issue.effective_decision)
@@ -1463,9 +1449,7 @@ async def rebuild_subject_references(
     return response
 
 
-@router.post(
-    "/subjects/{subject_id}/production/repairs/{repair_key}/decision"
-)
+@router.post("/subjects/{subject_id}/production/repairs/{repair_key}/decision")
 async def decide_subject_production_repair(
     subject_id: UUID,
     repair_key: str,
@@ -1489,9 +1473,7 @@ async def decide_subject_production_repair(
         edition_id = run.edition_id
 
     try:
-        decision = await _production_repair_adjudication_service(
-            request
-        ).decide_current_issue(
+        decision = await _production_repair_adjudication_service(request).decide_current_issue(
             edition_id=edition_id,
             subject_id=subject_id,
             repair_key=repair_key,
@@ -1545,6 +1527,14 @@ def _production_repair_decision_error(exc: Exception, repair_key: str) -> NoRetu
                 "repair_key": repair_key,
             },
         ) from exc
+    if isinstance(exc, ProductionRepairDecisionNoopError):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": ProductionRepairDecisionNoopError.code,
+                "repair_key": repair_key,
+            },
+        ) from exc
     if isinstance(exc, ProductionRepairActionInvalidError):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -1595,9 +1585,7 @@ async def apply_subject_production_repairs(
         not_found = {"production_run_not_found", "extraction_artifact_not_found"}
         raise HTTPException(
             status_code=(
-                status.HTTP_404_NOT_FOUND
-                if code in not_found
-                else status.HTTP_409_CONFLICT
+                status.HTTP_404_NOT_FOUND if code in not_found else status.HTTP_409_CONFLICT
             ),
             detail={"code": code, "message": code},
         ) from exc

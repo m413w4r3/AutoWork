@@ -177,7 +177,6 @@ export function RepairIssueInspector({
     );
   }
 
-  const resolved = item.resolved || Boolean(effectiveDecision);
   const alternatives = alternativeRepairActions(
     item.kind,
     effectiveAction,
@@ -339,7 +338,6 @@ export function RepairIssueInspector({
           subjectId={item.subject_id}
           detail={currentDetail}
           readOnly={readOnly}
-          resolved={resolved}
           onArchived={() => {
             onArchived(item);
             onChanged();

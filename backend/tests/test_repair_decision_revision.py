@@ -35,6 +35,8 @@ from cti_app.application.production_repairs import (
     ProductionRepairAdjudicationRequest,
     ProductionRepairAdjudicationService,
     ProductionRepairDecisionChangedError,
+    ProductionRepairDecisionNoopError,
+    ProductionRepairDecisionService,
     ProductionRepairIssueService,
     ProductionRepairProjectionService,
     ProductionRepairValueNotVerifiableError,
@@ -192,9 +194,7 @@ class _Uow:
             list_for_edition=self._runs_for_edition,
         )
         self.editions = SimpleNamespace(get=self._edition, get_for_update=self._edition)
-        self.publication_manifests = SimpleNamespace(
-            get_latest_for_edition=self._no_manifest
-        )
+        self.publication_manifests = SimpleNamespace(get_latest_for_edition=self._no_manifest)
         self.edition_review_read_model = SimpleNamespace(
             list_for_edition=self._rows,
         )
@@ -370,12 +370,8 @@ def _application(state: _State, store: ProductionArtifactStore) -> FastAPI:
     application.state.uow_factory = factory
     application.state.production_artifact_store = store
     application.state.production_repair_issue_service = issue_service
-    application.state.edition_repair_read_service = EditionRepairReadService(
-        factory, issue_service
-    )
-    application.state.edition_review_service = EditionReviewService(
-        factory, issue_service
-    )
+    application.state.edition_repair_read_service = EditionRepairReadService(factory, issue_service)
+    application.state.edition_review_service = EditionReviewService(factory, issue_service)
     application.state.identity_provider = SimpleNamespace(
         current=lambda: _value(SimpleNamespace(actor_id="analyst"))
     )
@@ -389,9 +385,7 @@ async def _value(value: Any) -> Any:
 
 
 def _client(application: FastAPI) -> AsyncClient:
-    return AsyncClient(
-        transport=ASGITransport(app=application), base_url="http://test"
-    )
+    return AsyncClient(transport=ASGITransport(app=application), base_url="http://test")
 
 
 def _adjudication(
@@ -427,9 +421,7 @@ async def test_a_subject_route_refuses_an_include_the_projection_cannot_rebuild(
         )
 
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == (
-        ProductionRepairValueNotVerifiableError.code
-    )
+    assert response.json()["detail"]["code"] == (ProductionRepairValueNotVerifiableError.code)
     assert state.decisions.history == []
 
 
@@ -450,9 +442,7 @@ async def test_b_edition_route_refuses_the_same_include_identically() -> None:
         )
 
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == (
-        ProductionRepairValueNotVerifiableError.code
-    )
+    assert response.json()["detail"]["code"] == (ProductionRepairValueNotVerifiableError.code)
     assert state.decisions.history == []
 
 
@@ -550,9 +540,7 @@ async def test_d_include_can_be_revised_to_exclude_with_a_two_entry_audit() -> N
         second = await _decide(client, state, action="exclude", expected=include_id)
         assert second.status_code == 200
 
-        detail = await client.get(
-            f"/api/editions/{EDITION_ID}/review/repairs/{GOOD_KEY}"
-        )
+        detail = await client.get(f"/api/editions/{EDITION_ID}/review/repairs/{GOOD_KEY}")
 
     body = detail.json()
     assert [item["action"] for item in body["decision_history"]] == [
@@ -572,9 +560,7 @@ async def test_e_exclude_can_be_revised_back_to_include() -> None:
         second = await _decide(
             client, state, action="include", expected=first.json()["decision_id"]
         )
-        detail = await client.get(
-            f"/api/editions/{EDITION_ID}/review/repairs/{GOOD_KEY}"
-        )
+        detail = await client.get(f"/api/editions/{EDITION_ID}/review/repairs/{GOOD_KEY}")
 
     assert second.status_code == 200
     body = detail.json()
@@ -598,9 +584,7 @@ async def test_f_optimistic_fence_refuses_the_second_writer() -> None:
 
     assert client_a.status_code == 200
     assert client_b.status_code == 409
-    assert client_b.json()["detail"]["code"] == (
-        ProductionRepairDecisionChangedError.code
-    )
+    assert client_b.json()["detail"]["code"] == (ProductionRepairDecisionChangedError.code)
     assert len(state.decisions.history) == 2
     assert state.decisions.history[-1].id == UUID(client_a.json()["decision_id"])
 
@@ -614,8 +598,66 @@ async def test_j_replaying_the_same_request_never_appends_twice() -> None:
 
     assert first.status_code == 200
     assert retry.status_code == 409
-    assert retry.json()["detail"]["code"] == ProductionRepairDecisionChangedError.code
+    assert retry.json()["detail"]["code"] == ProductionRepairDecisionNoopError.code
     assert len(state.decisions.history) == 1
+
+
+@pytest.mark.asyncio
+async def test_j_subject_route_rejects_a_same_action_revision_without_appending() -> None:
+    state, store = await _desk([_entry(GOOD_VALUE)])
+    async with _client(_application(state, store)) as client:
+        first = await client.post(
+            f"/api/subjects/{SUBJECT_ID}/production/repairs/{GOOD_KEY}/decision",
+            json={
+                "action": "include",
+                "observed_artifact_id": str(_artifact_id(state)),
+                "observed_pipeline_generation": 0,
+                "expected_effective_decision_id": None,
+            },
+        )
+        retry = await client.post(
+            f"/api/subjects/{SUBJECT_ID}/production/repairs/{GOOD_KEY}/decision",
+            json={
+                "action": "include",
+                "observed_artifact_id": str(_artifact_id(state)),
+                "observed_pipeline_generation": 0,
+                "expected_effective_decision_id": first.json()["decision_id"],
+            },
+        )
+
+    assert first.status_code == 200
+    assert retry.status_code == 409
+    assert retry.json()["detail"]["code"] == ProductionRepairDecisionNoopError.code
+    assert len(state.decisions.history) == 1
+
+
+@pytest.mark.asyncio
+async def test_decision_service_rejects_same_action_under_the_decision_lock() -> None:
+    state, _store = await _desk([_entry(GOOD_VALUE)])
+    existing = _decision(
+        GOOD_KEY,
+        ProductionRepairAction.INCLUDE,
+        artifact_id=_artifact_id(state),
+        when=datetime.now(UTC),
+    )
+    await state.decisions.append(existing)
+    service = ProductionRepairDecisionService(state.factory())
+
+    with pytest.raises(ProductionRepairDecisionNoopError):
+        await service.decide(
+            edition_id=EDITION_ID,
+            subject_id=SUBJECT_ID,
+            production_run_id=RUN_ID,
+            observed_artifact_id=_artifact_id(state),
+            observed_pipeline_generation=0,
+            repair_key=GOOD_KEY,
+            issue_kind=ProductionRepairIssueKind.REJECTED_INDICATOR,
+            action=ProductionRepairAction.INCLUDE,
+            actor_id="analyst",
+            expected_effective_decision_id=existing.id,
+        )
+
+    assert state.decisions.history == [existing]
 
 
 @pytest.mark.asyncio
@@ -668,9 +710,7 @@ async def test_g_exclude_after_include_builds_a_projection_without_the_value() -
     projection = ProductionRepairProjectionService(state.factory(), store)
     now = datetime.now(UTC)
 
-    include = _decision(
-        GOOD_KEY, ProductionRepairAction.INCLUDE, artifact_id=base_id, when=now
-    )
+    include = _decision(GOOD_KEY, ProductionRepairAction.INCLUDE, artifact_id=base_id, when=now)
     await state.decisions.append(include)
     first = await projection.project_effective_extraction(RUN_ID, actor_id="analyst")
     projected = technical_extraction_from_json(
@@ -739,10 +779,22 @@ async def test_h_the_revision_is_reported_as_a_rebuild_debt_then_cleared() -> No
     )
     owed = (await read_service.list(EDITION_ID, status="all")).items[0]
     assert (owed.rebuild_required, owed.recommended_stage) == (True, "apply_projection")
+    owed_review = EditionReviewService.from_rows(
+        EDITION_ID,
+        [state.row],
+        repair_issues=[(await issues.list_issue_views(EDITION_ID, SUBJECT_ID))[0]],
+    )
+    assert (owed_review.pending_rebuild_count, owed_review.can_accept) == (1, False)
 
     await projection.project_effective_extraction(RUN_ID, actor_id="analyst")
     cleared = (await read_service.list(EDITION_ID, status="all")).items[0]
     assert (cleared.rebuild_required, cleared.recommended_stage) == (False, "none")
+    cleared_review = EditionReviewService.from_rows(
+        EDITION_ID,
+        [state.row],
+        repair_issues=[(await issues.list_issue_views(EDITION_ID, SUBJECT_ID))[0]],
+    )
+    assert (cleared_review.pending_rebuild_count, cleared_review.can_accept) == (0, True)
 
 
 # ---------------------------------------------------------------------------
@@ -751,9 +803,7 @@ async def test_h_the_revision_is_reported_as_a_rebuild_debt_then_cleared() -> No
 
 
 def _issue(repair_key: str = GOOD_KEY) -> SimpleNamespace:
-    return SimpleNamespace(
-        repair_key=repair_key, kind=ProductionRepairIssueKind.REJECTED_INDICATOR
-    )
+    return SimpleNamespace(repair_key=repair_key, kind=ProductionRepairIssueKind.REJECTED_INDICATOR)
 
 
 def _marker(action: str, decision_id: str) -> dict[str, Any]:
@@ -772,25 +822,15 @@ def _marker(action: str, decision_id: str) -> dict[str, Any]:
 def test_application_state_covers_every_indispensable_case() -> None:
     artifact_id = uuid4()
     now = datetime.now(UTC)
-    include = _decision(
-        GOOD_KEY, ProductionRepairAction.INCLUDE, artifact_id=artifact_id, when=now
-    )
-    exclude = _decision(
-        GOOD_KEY, ProductionRepairAction.EXCLUDE, artifact_id=artifact_id, when=now
-    )
+    include = _decision(GOOD_KEY, ProductionRepairAction.INCLUDE, artifact_id=artifact_id, when=now)
+    exclude = _decision(GOOD_KEY, ProductionRepairAction.EXCLUDE, artifact_id=artifact_id, when=now)
     state = repair_decision_application_state
 
     # No decision at all.
     assert state(_issue(), None, None) is RepairDecisionApplicationState.UNRESOLVED
     # Base rejected the value and nothing was projected.
-    assert (
-        state(_issue(), exclude, None)
-        is RepairDecisionApplicationState.ALREADY_EFFECTIVE
-    )
-    assert (
-        state(_issue(), include, None)
-        is RepairDecisionApplicationState.PROJECTION_REQUIRED
-    )
+    assert state(_issue(), exclude, None) is RepairDecisionApplicationState.ALREADY_EFFECTIVE
+    assert state(_issue(), include, None) is RepairDecisionApplicationState.PROJECTION_REQUIRED
     # A previous projection included it: the new EXCLUDE owes a projection.
     assert (
         state(_issue(), exclude, _marker("include", str(uuid4())))
@@ -809,14 +849,9 @@ def test_application_state_covers_every_indispensable_case() -> None:
     # Recorded but impossible to rebuild.
     unbuildable = {
         "applied_decisions": [],
-        "unbuildable_decisions": [
-            {"repair_key": GOOD_KEY, "decision_id": str(include.id)}
-        ],
+        "unbuildable_decisions": [{"repair_key": GOOD_KEY, "decision_id": str(include.id)}],
     }
-    assert (
-        state(_issue(), include, unbuildable)
-        is RepairDecisionApplicationState.UNBUILDABLE
-    )
+    assert state(_issue(), include, unbuildable) is RepairDecisionApplicationState.UNBUILDABLE
 
 
 # ---------------------------------------------------------------------------
@@ -826,9 +861,7 @@ def test_application_state_covers_every_indispensable_case() -> None:
 
 @pytest.mark.asyncio
 async def test_i_legacy_unbuildable_include_never_counts_as_applied() -> None:
-    state, store = await _desk(
-        [_entry(MALFORMED_VALUE, reason_code="normalization_error")]
-    )
+    state, store = await _desk([_entry(MALFORMED_VALUE, reason_code="normalization_error")])
     base_id = _artifact_id(state)
     factory = state.factory()
     issues = ProductionRepairIssueService(factory, store)
@@ -837,14 +870,12 @@ async def test_i_legacy_unbuildable_include_never_counts_as_applied() -> None:
 
     # Injected the way corrupted/legacy data would exist: the endpoints refuse
     # to create this, but the desk must still be able to clean it up.
-    legacy = _decision(
-        MALFORMED_KEY, ProductionRepairAction.INCLUDE, artifact_id=base_id, when=now
-    )
+    legacy = _decision(MALFORMED_KEY, ProductionRepairAction.INCLUDE, artifact_id=base_id, when=now)
     await state.decisions.append(legacy)
 
-    result = await ProductionRepairProjectionService(
-        factory, store
-    ).project_effective_extraction(RUN_ID, actor_id="analyst")
+    result = await ProductionRepairProjectionService(factory, store).project_effective_extraction(
+        RUN_ID, actor_id="analyst"
+    )
 
     marker = result.artifact.metadata["repair_projection"]
     assert result.included_repair_keys == ()
@@ -866,9 +897,7 @@ async def test_i_legacy_unbuildable_include_never_counts_as_applied() -> None:
     assert view.application_state is RepairDecisionApplicationState.UNBUILDABLE
 
     # The edition cannot be signed off while that debt exists.
-    review = EditionReviewService.from_rows(
-        EDITION_ID, [state.row], repair_issues=[view]
-    )
+    review = EditionReviewService.from_rows(EDITION_ID, [state.row], repair_issues=[view])
     assert review.pending_rebuild_count == 1
     assert not review.can_accept
 
@@ -887,12 +916,13 @@ async def test_i_legacy_unbuildable_include_never_counts_as_applied() -> None:
     assert revision.action is ProductionRepairAction.EXCLUDE
     assert len(state.decisions.history) == 2
     cleared = (await issues.list_issue_views(EDITION_ID, SUBJECT_ID))[0]
-    assert cleared.application_state is (
-        RepairDecisionApplicationState.ALREADY_EFFECTIVE
+    assert cleared.application_state is (RepairDecisionApplicationState.ALREADY_EFFECTIVE)
+    assert (
+        EditionReviewService.from_rows(
+            EDITION_ID, [state.row], repair_issues=[cleared]
+        ).pending_rebuild_count
+        == 0
     )
-    assert EditionReviewService.from_rows(
-        EDITION_ID, [state.row], repair_issues=[cleared]
-    ).pending_rebuild_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1003,7 +1033,7 @@ async def test_bulk_revision_uses_the_same_fence_as_the_single_route() -> None:
         edition_id=EDITION_ID, requests=[request], actor_id="analyst"
     )
 
-    with pytest.raises(ProductionRepairDecisionChangedError):
+    with pytest.raises(ProductionRepairDecisionNoopError):
         await service.decide_current_issues(
             edition_id=EDITION_ID, requests=[request], actor_id="analyst"
         )

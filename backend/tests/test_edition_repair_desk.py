@@ -113,9 +113,7 @@ class _IssueReader:
     ) -> tuple[object, ...]:
         self.light_calls += 1
         return tuple(
-            issue
-            for issue in self.issues
-            if subject_id is None or issue.subject_id == subject_id
+            issue for issue in self.issues if subject_id is None or issue.subject_id == subject_id
         )
 
     async def list_supplemental_source_issues(
@@ -181,7 +179,8 @@ async def test_repair_read_model_orders_filters_and_reaches_201_issues() -> None
     issues.extend(_issue(index, row_b) for index in range(100, 201))
     reader = _IssueReader(issues)
     service = EditionRepairReadService(
-        _ReadModelFactory(_ReadModelUow([row_a, row_b])), reader  # type: ignore[arg-type]
+        _ReadModelFactory(_ReadModelUow([row_a, row_b])),
+        reader,  # type: ignore[arg-type]
     )
 
     page = await service.list(EDITION_ID, limit=100)
@@ -214,7 +213,8 @@ async def test_edition_repair_http_list_exposes_summary_items_and_cursor() -> No
     row = _row(SUBJECT_A, 1)
     issue = _issue(1, row)
     read_service = EditionRepairReadService(
-        _ReadModelFactory(_ReadModelUow([row])), _IssueReader([issue])  # type: ignore[arg-type]
+        _ReadModelFactory(_ReadModelUow([row])),
+        _IssueReader([issue]),  # type: ignore[arg-type]
     )
     application = FastAPI()
     application.include_router(router)
@@ -250,7 +250,8 @@ async def test_repair_summary_separates_ioc_rule_other_and_resolved() -> None:
         _issue(4, row, resolved=True, projection_applied=True),
     ]
     page = await EditionRepairReadService(
-        _ReadModelFactory(_ReadModelUow([row])), _IssueReader(issues)  # type: ignore[arg-type]
+        _ReadModelFactory(_ReadModelUow([row])),
+        _IssueReader(issues),  # type: ignore[arg-type]
     ).list(EDITION_ID, limit=20)
 
     assert page.summary == page.summary.__class__(
@@ -263,7 +264,8 @@ async def test_repair_summary_separates_ioc_rule_other_and_resolved() -> None:
         articles_needing_rebuild=0,
     )
     resolved = await EditionRepairReadService(
-        _ReadModelFactory(_ReadModelUow([row])), _IssueReader(issues)  # type: ignore[arg-type]
+        _ReadModelFactory(_ReadModelUow([row])),
+        _IssueReader(issues),  # type: ignore[arg-type]
     ).list(EDITION_ID, status="resolved", limit=20)
     assert len(resolved.items) == 1
     assert resolved.items[0].resolved
@@ -295,6 +297,8 @@ def test_signoff_requires_actionable_repairs_to_be_arbitrated() -> None:
             ),
             reason="explicitly reviewed",
         )
+        if issue.kind is not ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED:
+            issue.projection_applied = True
     accepted = EditionReviewService.from_rows(EDITION_ID, [row], repair_issues=issues)
     assert accepted.can_accept
     assert accepted.repair_review_complete
@@ -348,6 +352,7 @@ def test_repair_items_expose_backend_rebuild_stages() -> None:
     assert published_item is not None
     assert source_item.recommended_stage == "rebuild_references"
     assert projection_item.recommended_stage == "apply_projection"
+    assert projection_item.rebuild_required
     assert synthesis_item.recommended_stage == "synthesis"
     assert published_item.recommended_stage == "none"
 
@@ -403,7 +408,8 @@ async def test_light_issue_listing_uses_compact_index_without_blob_read() -> Non
     )
     uow = _LightIssueUow(artifact, run)
     service = ProductionRepairIssueService(
-        lambda: uow, _NoBlobReadStore()  # type: ignore[arg-type]
+        lambda: uow,
+        _NoBlobReadStore(),  # type: ignore[arg-type]
     )
 
     issues = await service.list_issue_views(EDITION_ID, SUBJECT_A)
@@ -470,7 +476,8 @@ async def test_source_issue_listing_uses_compact_reference_index_without_blob_re
             return None
 
     issues = await ProductionRepairIssueService(
-        lambda: _SourceUow(), _NoBlobReadStore()  # type: ignore[arg-type]
+        lambda: _SourceUow(),
+        _NoBlobReadStore(),  # type: ignore[arg-type]
     ).list_supplemental_source_issues(EDITION_ID, SUBJECT_A)
 
     assert len(issues) == 1
@@ -518,9 +525,7 @@ class _BulkUow:
         edition_status: EditionStatus = EditionStatus.REVIEW,
     ) -> None:
         self.editions = SimpleNamespace(
-            get_for_update=lambda _edition_id: _async_value(
-                SimpleNamespace(status=edition_status)
-            )
+            get_for_update=lambda _edition_id: _async_value(SimpleNamespace(status=edition_status))
         )
         self.subject_production_runs = SimpleNamespace(
             get_for_update=lambda run_id: _async_value(runs.get(run_id))
@@ -624,9 +629,7 @@ async def test_frozen_edition_repair_desk_stays_readable(
     page = await service.list(EDITION_ID, status="all", limit=100)
     collected.extend(page.items)
     while page.next_cursor is not None:
-        page = await service.list(
-            EDITION_ID, status="all", cursor=page.next_cursor, limit=100
-        )
+        page = await service.list(EDITION_ID, status="all", cursor=page.next_cursor, limit=100)
         collected.extend(page.items)
 
     assert len(collected) == 250
@@ -651,7 +654,7 @@ async def test_frozen_edition_still_refuses_a_repair_decision() -> None:
 
 @pytest.mark.asyncio
 async def test_repair_items_expose_the_application_state_of_their_decision() -> None:
-    """"Decided" and "materialized" are two different facts for the audit."""
+    """ "Decided" and "materialized" are two different facts for the audit."""
     row = _row(SUBJECT_A, 1)
     issues = [
         _issue(1, row),
@@ -670,7 +673,8 @@ async def test_repair_items_expose_the_application_state_of_their_decision() -> 
         ),
     ]
     read_service = EditionRepairReadService(
-        _ReadModelFactory(_ReadModelUow([row])), _IssueReader(issues)  # type: ignore[arg-type]
+        _ReadModelFactory(_ReadModelUow([row])),
+        _IssueReader(issues),  # type: ignore[arg-type]
     )
     application = FastAPI()
     application.include_router(router)

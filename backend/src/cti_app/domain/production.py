@@ -856,7 +856,8 @@ class ProductionRepairDecision:
         object.__setattr__(self, "reason", normalized_reason)
 
         compatible = (
-            issue_kind in {
+            issue_kind
+            in {
                 ProductionRepairIssueKind.REJECTED_INDICATOR,
                 ProductionRepairIssueKind.REJECTED_RULE,
             }

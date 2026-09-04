@@ -115,9 +115,7 @@ async def test_every_core_source_unreachable_stops_before_any_model_call(
     assert artifacts == []
     assert [request.url for request in scenario.collection_transport.requests] == [S1]
     assert collections
-    assert all(
-        collection.state is not CollectionState.ARCHIVED for collection in collections
-    )
+    assert all(collection.state is not CollectionState.ARCHIVED for collection in collections)
 
 
 @pytest.mark.asyncio
@@ -211,9 +209,7 @@ async def test_retryable_collection_failure_is_attempted_once_and_left_recoverab
     persisted, _, collections = await _state(scenario)
 
     assert run.status is SubjectProductionStatus.READY
-    failed = next(
-        collection for collection in collections if collection.canonical_url == S2
-    )
+    failed = next(collection for collection in collections if collection.canonical_url == S2)
     assert failed.state is CollectionState.FAILED_RETRYABLE
     s2_requests = [
         request for request in scenario.collection_transport.requests if request.url == S2

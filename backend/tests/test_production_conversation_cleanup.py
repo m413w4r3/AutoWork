@@ -221,17 +221,19 @@ async def test_cleanup_failure_recovered_on_second_attempt_is_not_diagnosed(
     assert model_service.archive_calls == 2
     assert model_service.archived == [run.synthesis_conversation_id]
     assert not any(
-        event.get("event") == "production.conversation_close_failed"
-        for event in diagnostics.events
+        event.get("event") == "production.conversation_close_failed" for event in diagnostics.events
     )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", [
-    SubjectProductionStage.SOURCES,
-    SubjectProductionStage.EXTRACTION,
-    SubjectProductionStage.ASSEMBLY,
-])
+@pytest.mark.parametrize(
+    "stage",
+    [
+        SubjectProductionStage.SOURCES,
+        SubjectProductionStage.EXTRACTION,
+        SubjectProductionStage.ASSEMBLY,
+    ],
+)
 async def test_stage_without_conversation_does_not_archive(stage: SubjectProductionStage) -> None:
     run = _run(stage)
     model_service = _ModelService()

@@ -143,8 +143,7 @@ async def test_production_repair_decisions_are_fk_backed_append_only_and_effecti
                 with pytest.raises(DBAPIError, match="append-only"):
                     await session.execute(
                         text(
-                            "DELETE FROM production_repair_decisions "
-                            "WHERE edition_id = :edition_id"
+                            "DELETE FROM production_repair_decisions WHERE edition_id = :edition_id"
                         ),
                         {"edition_id": edition.id},
                     )

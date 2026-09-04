@@ -276,9 +276,7 @@ class ProductionStageChain:
                 kind=production_reconciliation_probe_job_kind(),
                 aggregate_type="subject",
                 aggregate_id=run.subject_id,
-                idempotency_key=production_reconciliation_probe_idempotency_key(
-                    run.id, attempt
-                ),
+                idempotency_key=production_reconciliation_probe_idempotency_key(run.id, attempt),
                 correlation_id=correlation_id,
                 input_parameters=parameters.model_dump(mode="json"),
                 max_attempts=1,

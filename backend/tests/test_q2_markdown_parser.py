@@ -160,13 +160,9 @@ def test_q2_prompt_states_the_multi_actor_relevance_contract(profile: Extraction
         "Exhaustiveness applies after relevance filtering: find every subject-relevant"
         " IOC, not every IOC in the publication." in one_line
     )
+    assert "Use `confirmed` when the publication explicitly presents a value as an IOC" in one_line
     assert (
-        "Use `confirmed` when the publication explicitly presents a value as an IOC"
-        in one_line
-    )
-    assert (
-        "the exact operational role is unknown, or the purpose of the host is uncertain"
-        in one_line
+        "the exact operational role is unknown, or the purpose of the host is uncertain" in one_line
     )
     assert "Use `contextual` only when the technical value is relevant" in one_line
     assert "Do not promote every value appearing in the publication to `confirmed`." in one_line

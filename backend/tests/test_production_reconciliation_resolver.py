@@ -408,9 +408,7 @@ async def test_probe_404_restarts_the_same_production_stage_without_posting() ->
     assert result.endswith("#released")
     assert run.status is SubjectProductionStatus.RUNNING
     assert run.pipeline_generation == 1
-    assert [job.kind for job in jobs.submitted] == [
-        stage_job_kind(SubjectProductionStage.SOURCES)
-    ]
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(SubjectProductionStage.SOURCES)]
     assert bridge.calls == ["bridge-request:a1"]
 
 

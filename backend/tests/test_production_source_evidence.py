@@ -70,7 +70,7 @@ def test_html_safe_fallback_keeps_visible_alt_text_but_not_tracking_or_scripts()
         b'<article><img alt="visual-ioc.security-lab.io" '
         b'src="https://tracking.example/pixel?id=visual-ioc.security-lab.io">'
         b'<a href="https://linked.example/linked-ioc.example">linked</a>'
-        b'<script>script-ioc.example</script>'
+        b"<script>script-ioc.example</script>"
         b'<meta name="description" content="metadata-ioc.example"></article>'
     )
     parsed = parse_document(html, DetectedMimeType.HTML)

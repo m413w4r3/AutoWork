@@ -27,9 +27,7 @@ def _raise_api_error(exc: Exception) -> NoReturn:
             status_code=404, detail={"code": "incomplete_source_candidate_not_found"}
         ) from exc
     if isinstance(exc, ManualSourceCandidateNotFoundError):
-        raise HTTPException(
-            status_code=404, detail={"code": "source_candidate_not_found"}
-        ) from exc
+        raise HTTPException(status_code=404, detail={"code": "source_candidate_not_found"}) from exc
     if isinstance(exc, ReportParsingError):
         status_code = 404 if exc.code == "report_unavailable" else 422
         raise HTTPException(

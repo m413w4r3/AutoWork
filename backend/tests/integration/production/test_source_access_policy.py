@@ -63,8 +63,7 @@ def _source_specs(
     bodies: Mapping[str, str],
 ) -> dict[str, dict[str, object]]:
     return {
-        url: {"status": 200, "mime": "text/plain", "body": body}
-        for url, body in bodies.items()
+        url: {"status": 200, "mime": "text/plain", "body": body} for url, body in bodies.items()
     }
 
 
@@ -200,9 +199,7 @@ async def _assert_common(
             assert document.decoded_sha256 == hashlib.sha256(content).hexdigest()
 
     progress = state.progress
-    progress_sources = {
-        item["source_id"]: item for item in progress["sources"]
-    }
+    progress_sources = {item["source_id"]: item for item in progress["sources"]}
     assert set(progress_sources) == set(report_source_ids)
     assert progress["completed_sources"] == sum(
         item["status"] in {"cached", "succeeded"} for item in progress_sources.values()
@@ -234,10 +231,7 @@ def _assert_extraction_stages(
     expected: set[str],
 ) -> None:
     assert set(state.artifacts_by_stage) == expected
-    assert all(
-        artifact.status is ProductionArtifactStatus.VERIFIED
-        for artifact in state.artifacts
-    )
+    assert all(artifact.status is ProductionArtifactStatus.VERIFIED for artifact in state.artifacts)
 
 
 def _assert_progress_statuses(
@@ -268,8 +262,7 @@ async def test_live_success_is_live_first_and_never_inlines_archive(
         source_url=S1,
         access_mode="live_url",
         response=(
-            "FACT malware\n- ExampleRAT\n"
-            "IOC confirmed domain\n- live-success.security-lab.io"
+            "FACT malware\n- ExampleRAT\nIOC confirmed domain\n- live-success.security-lab.io"
         ),
     )
 
@@ -348,9 +341,10 @@ async def test_live_unavailable_uses_one_verified_archive_fallback(
     assert fallback_call.request.metadata["access_mode"] == "archive_fallback"
     assert ARCHIVE_S1 in fallback_call.request.text
     assert ARCHIVE_S1 not in live_call.request.text
-    assert fallback_call.request.metadata["source_content_sha256"] == hashlib.sha256(
-        ARCHIVE_S1.encode()
-    ).hexdigest()
+    assert (
+        fallback_call.request.metadata["source_content_sha256"]
+        == hashlib.sha256(ARCHIVE_S1.encode()).hexdigest()
+    )
 
     extraction = await scenario.artifact_store.read_json(
         state.artifacts_by_stage[ProductionArtifactStage.EXTRACTION.value].canonical_blob_id
@@ -366,9 +360,10 @@ async def test_live_unavailable_uses_one_verified_archive_fallback(
         if event.get("event") == "q2.source.archive_fallback_completed"
     ]
     assert len(fallback_events) == 1
-    assert fallback_events[0]["source_content_sha256"] == hashlib.sha256(
-        ARCHIVE_S1.encode()
-    ).hexdigest()
+    assert (
+        fallback_events[0]["source_content_sha256"]
+        == hashlib.sha256(ARCHIVE_S1.encode()).hexdigest()
+    )
 
 
 @pytest.mark.asyncio
@@ -531,9 +526,7 @@ async def test_partial_ioc_rules_batch_falls_back_only_for_unavailable_source(
     assert fallback_call.request.metadata["access_mode"] == "archive_fallback"
     assert ARCHIVE_S2 in fallback_call.request.text
     assert all(
-        call.source_url not in {S1, S3}
-        for call in q2_calls[1:]
-        if call.source_url is not None
+        call.source_url not in {S1, S3} for call in q2_calls[1:] if call.source_url is not None
     )
     assert state.model_runs[batch_call.model_run_id].parameters["q2_execution_kind"] == "batch"
     assert state.model_runs[fallback_call.model_run_id].parameters["q2_access_mode"] == (
@@ -590,8 +583,7 @@ async def test_partial_ioc_rules_batch_without_archive_skips_only_that_source(
     assert _verification_diagnostics(state)["source_skips"]["S2"]["blocking"] is False
     assert state.run.error_code is None
     assert not any(
-        call.request.metadata.get("access_mode") == "archive_fallback"
-        for call in q2_calls
+        call.request.metadata.get("access_mode") == "archive_fallback" for call in q2_calls
     )
 
 

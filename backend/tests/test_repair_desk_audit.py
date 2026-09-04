@@ -440,8 +440,11 @@ def _decision(
 async def test_audit1_every_rejection_stays_reachable_with_intact_bodies() -> None:
     store = ProductionArtifactStore(_BlobCatalog())  # type: ignore[arg-type]
     ioc_entries = [
-        _ioc_entry(index, source_url=(SOURCE_ONE if index % 2 else SOURCE_TWO),
-                   source_id=("S1" if index % 2 else "S2"))
+        _ioc_entry(
+            index,
+            source_url=(SOURCE_ONE if index % 2 else SOURCE_TWO),
+            source_id=("S1" if index % 2 else "S2"),
+        )
         for index in range(210)
     ]
     entries = [
@@ -515,9 +518,7 @@ async def test_audit1_every_rejection_stays_reachable_with_intact_bodies() -> No
     page = await read_service.list(EDITION_ID, status="all", limit=100)
     collected.extend(item.repair_key for item in page.items)
     while page.next_cursor is not None:
-        page = await read_service.list(
-            EDITION_ID, status="all", limit=100, cursor=page.next_cursor
-        )
+        page = await read_service.list(EDITION_ID, status="all", limit=100, cursor=page.next_cursor)
         collected.extend(item.repair_key for item in page.items)
     assert len(collected) == 213
     assert len(set(collected)) == 213
@@ -563,12 +564,14 @@ async def test_audit2_projection_adds_a_version_and_never_touches_the_base() -> 
         ],
     )
     base_before = json.dumps(
-        await store.read_json(base.canonical_blob_id), sort_keys=True  # type: ignore[arg-type]
+        await store.read_json(base.canonical_blob_id),
+        sort_keys=True,  # type: ignore[arg-type]
     )
     base_metadata_before = json.dumps(base.metadata, sort_keys=True)
 
     result = await ProductionRepairProjectionService(
-        _factory(uow), store  # type: ignore[arg-type]
+        _factory(uow),
+        store,  # type: ignore[arg-type]
     ).project_effective_extraction(RUN_A, actor_id="analyst")
 
     assert result.changed
@@ -578,17 +581,24 @@ async def test_audit2_projection_adds_a_version_and_never_touches_the_base() -> 
     stored_base = await uow.production_artifacts.get(base.id)
     assert stored_base is not None
     assert stored_base.status is not ProductionArtifactStatus.STALE
-    assert json.dumps(
-        await store.read_json(stored_base.canonical_blob_id), sort_keys=True  # type: ignore[arg-type]
-    ) == base_before
+    assert (
+        json.dumps(
+            await store.read_json(stored_base.canonical_blob_id),
+            sort_keys=True,  # type: ignore[arg-type]
+        )
+        == base_before
+    )
     assert json.dumps(stored_base.metadata, sort_keys=True) == base_metadata_before
     # Downstream artifacts are staled, upstream ones are not.
     assert (RUN_A, "extraction") in uow.production_artifacts.stale_calls
     staled = await uow.production_artifacts.get(synthesis.id)
     assert staled is not None and staled.status is ProductionArtifactStatus.STALE
     # And the old artifact remains auditable as a distinct version.
-    versions = {item.version for item in await uow.production_artifacts.list_for_run(RUN_A)
-                if item.stage is ProductionArtifactStage.EXTRACTION}
+    versions = {
+        item.version
+        for item in await uow.production_artifacts.list_for_run(RUN_A)
+        if item.stage is ProductionArtifactStage.EXTRACTION
+    }
     assert versions == {1, 2}
 
 
@@ -596,9 +606,7 @@ async def test_audit2_projection_adds_a_version_and_never_touches_the_base() -> 
 async def test_audit2_decision_log_is_append_only_and_last_write_wins() -> None:
     decisions = _Decisions()
     key = "e" * 64
-    first = _decision(
-        key, ProductionRepairIssueKind.REJECTED_RULE, ProductionRepairAction.EXCLUDE
-    )
+    first = _decision(key, ProductionRepairIssueKind.REJECTED_RULE, ProductionRepairAction.EXCLUDE)
     second = ProductionRepairDecision(
         edition_id=EDITION_ID,
         subject_id=SUBJECT_A,
@@ -704,7 +712,8 @@ async def test_audit3_include_stays_effective_after_a_replay() -> None:
     uow = _Uow(runs=[_run(generation=1)], artifacts=[base], decisions=[decision])
 
     result = await ProductionRepairProjectionService(
-        _factory(uow), store  # type: ignore[arg-type]
+        _factory(uow),
+        store,  # type: ignore[arg-type]
     ).project_effective_extraction(RUN_A, actor_id="analyst")
 
     assert result.included_repair_keys == (key,)
@@ -718,7 +727,8 @@ async def test_audit3_include_stays_effective_after_a_replay() -> None:
     uow_two = _Uow(runs=[run_two], artifacts=[base_two], decisions=[decision])
 
     result_two = await ProductionRepairProjectionService(
-        _factory(uow_two), store  # type: ignore[arg-type]
+        _factory(uow_two),
+        store,  # type: ignore[arg-type]
     ).project_effective_extraction(run_two.id, actor_id="analyst")
 
     assert result_two.included_repair_keys == ()
@@ -739,7 +749,8 @@ async def _projected(
     base = await _extraction_artifact(store, entries)
     uow = _Uow(runs=[_run()], artifacts=[base], decisions=decisions)
     result = await ProductionRepairProjectionService(
-        _factory(uow), store  # type: ignore[arg-type]
+        _factory(uow),
+        store,  # type: ignore[arg-type]
     ).project_effective_extraction(RUN_A, actor_id="analyst")
     return technical_extraction_from_json(
         await store.read_json(result.artifact.canonical_blob_id)  # type: ignore[arg-type]
@@ -823,9 +834,7 @@ async def test_audit6_included_rule_materializes_byte_for_byte(tmp_path: Path) -
     sidecars = [path for path in materialization.files if path.suffix == ".yar"]
     assert len(sidecars) == 1
     assert sidecars[0].read_bytes() == YARA_BODY.encode("utf-8")
-    manifest = json.loads(
-        (sidecars[0].parent / "manifest.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((sidecars[0].parent / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["rules"][0]["sha256"] == _sha256(YARA_BODY)
     assert manifest["rules"][0]["filename"] == sidecars[0].name
 
@@ -869,7 +878,8 @@ async def test_audit7_exclude_keeps_the_value_out_and_writes_no_sidecar(tmp_path
         ],
     )
     result = await ProductionRepairProjectionService(
-        _factory(uow), store  # type: ignore[arg-type]
+        _factory(uow),
+        store,  # type: ignore[arg-type]
     ).project_effective_extraction(RUN_A, actor_id="analyst")
 
     # Nothing changed: rejections were already absent from the base extraction.
@@ -955,9 +965,7 @@ async def test_audit7_waived_source_stays_unarchived_but_signed_off() -> None:
     canonical_index = references.metadata["repair_source_index"]["canonical"]
     assert canonical_index == [{"source_id": "S1", "source_url": SOURCE_ONE}]
 
-    review = EditionReviewService.from_rows(
-        EDITION_ID, [_row()], repair_issues=list(sources)
-    )
+    review = EditionReviewService.from_rows(EDITION_ID, [_row()], repair_issues=list(sources))
     assert review.unresolved_repair_count == 0
     assert review.repair_review_complete
     assert review.can_accept
@@ -1033,7 +1041,8 @@ async def test_audit9_repaired_state_round_trips_with_its_decision_audit(
     )
     uow = _Uow(runs=[_run()], artifacts=[base], decisions=[decision])
     projection = await ProductionRepairProjectionService(
-        _factory(uow), store  # type: ignore[arg-type]
+        _factory(uow),
+        store,  # type: ignore[arg-type]
     ).project_effective_extraction(RUN_A, actor_id="analyst")
     assert projection.changed
 
@@ -1175,18 +1184,19 @@ def test_audit10_indicator_counters_ignore_non_ioc_artifact_types() -> None:
 async def test_audit10_excluded_article_does_not_gate_the_edition() -> None:
     included = _row(SUBJECT_A, RUN_A, position=1, decision=PublicationDecision.INCLUDE)
     excluded_run = uuid4()
-    excluded = _row(
-        SUBJECT_B, excluded_run, position=2, decision=PublicationDecision.EXCLUDE
-    )
+    excluded = _row(SUBJECT_B, excluded_run, position=2, decision=PublicationDecision.EXCLUDE)
     issues = [
         _issue("4" * 64, excluded, is_ioc=True),
-        _issue("5" * 64, excluded, kind=ProductionRepairIssueKind.REJECTED_RULE,
-               is_ioc=False, artifact_type="yara"),
+        _issue(
+            "5" * 64,
+            excluded,
+            kind=ProductionRepairIssueKind.REJECTED_RULE,
+            is_ioc=False,
+            artifact_type="yara",
+        ),
     ]
 
-    review = EditionReviewService.from_rows(
-        EDITION_ID, [included, excluded], repair_issues=issues
-    )
+    review = EditionReviewService.from_rows(EDITION_ID, [included, excluded], repair_issues=issues)
 
     # The item keeps a truthful count for the desk...
     assert review.items[1].unresolved_repair_count == 2
@@ -1200,9 +1210,7 @@ async def test_audit10_excluded_article_does_not_gate_the_edition() -> None:
             self, _edition_id: UUID, subject_id: UUID | None = None
         ) -> tuple[Any, ...]:
             return tuple(
-                issue
-                for issue in issues
-                if subject_id is None or issue.subject_id == subject_id
+                issue for issue in issues if subject_id is None or issue.subject_id == subject_id
             )
 
         async def list_supplemental_source_issues(
@@ -1235,6 +1243,7 @@ def test_audit10_can_accept_matches_the_backend_policy() -> None:
     open_issue.effective_decision = SimpleNamespace(
         id=uuid4(), action=ProductionRepairAction.INCLUDE, reason="arbitré"
     )
+    open_issue.projection_applied = True
     resolved = EditionReviewService.from_rows(EDITION_ID, [row], repair_issues=[open_issue])
     assert (resolved.can_accept, resolved.repair_review_complete) == (True, True)
     assert resolved.unresolved_repair_count == 0
@@ -1332,7 +1341,8 @@ async def test_audit8_recorded_unbuildable_include_never_freezes_the_article() -
     )
 
     result = await ProductionRepairProjectionService(
-        _factory(uow), store  # type: ignore[arg-type]
+        _factory(uow),
+        store,  # type: ignore[arg-type]
     ).project_effective_extraction(RUN_A, actor_id="analyst")
 
     # The article still builds, the good include still lands, and the

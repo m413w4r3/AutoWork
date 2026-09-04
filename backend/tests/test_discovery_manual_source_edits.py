@@ -111,9 +111,7 @@ class _GroupRepository:
 
 
 class _Uow:
-    def __init__(
-        self, batches: _BatchRepository, groups: _GroupRepository
-    ) -> None:
+    def __init__(self, batches: _BatchRepository, groups: _GroupRepository) -> None:
         self.discovery_batches = batches
         self.editorial_groups = groups
 
@@ -319,9 +317,7 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
             DiscoverySubject(
                 subject_id=other_subject_id,
                 candidate=other_candidate,
-                member_references=(
-                    DiscoveryMemberReference(old_batch.id, other_candidate.id),
-                ),
+                member_references=(DiscoveryMemberReference(old_batch.id, other_candidate.id),),
                 created_at=datetime.now(UTC),
             ),
         ),
@@ -352,9 +348,7 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
     ]
     assert manual_candidate.local_ref == "manual-url-replace"
     assert old.canonical_url not in {source.canonical_url for source in manual_candidate.sources}
-    assert group.candidate_references == (
-        CandidateReference(manual_batch.id, manual_candidate.id),
-    )
+    assert group.candidate_references == (CandidateReference(manual_batch.id, manual_candidate.id),)
     assert other_group.candidate_references == (
         CandidateReference(old_batch.id, other_candidate.id),
     )

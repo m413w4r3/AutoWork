@@ -66,9 +66,7 @@ def _sha256(value: str) -> str:
 
 def _repair_kind(value: ProductionRepairIssueKind | str) -> ProductionRepairIssueKind:
     return (
-        value
-        if isinstance(value, ProductionRepairIssueKind)
-        else ProductionRepairIssueKind(value)
+        value if isinstance(value, ProductionRepairIssueKind) else ProductionRepairIssueKind(value)
     )
 
 
@@ -184,6 +182,16 @@ class ProductionRepairDecisionChangedError(ValueError):
     code = "production_repair_decision_changed"
 
 
+class ProductionRepairDecisionNoopError(ValueError):
+    """The requested revision would leave the effective action unchanged."""
+
+    code = "production_repair_decision_noop"
+
+    def __init__(self, repair_key: str | None = None) -> None:
+        self.repair_key = repair_key
+        super().__init__(self.code)
+
+
 class ProductionRepairActionInvalidError(ValueError):
     """The requested action does not exist for this issue kind."""
 
@@ -286,9 +294,10 @@ class ProductionRepairDecisionService:
                 and await manifests.get_latest_for_edition(edition_id) is not None
             ):
                 raise ProductionRepairStatusError("edition_frozen_for_publication")
-            effective = await _effective_decisions_for_reader(
-                uow, edition_id, subject_id
-            )
+            effective = await _effective_decisions_for_reader(uow, edition_id, subject_id)
+            current = _effective_decision_for_key(effective, subject_id, repair_key)
+            if current is not None and _enum_value(current.action) == _enum_value(action):
+                raise ProductionRepairDecisionNoopError(repair_key)
             _require_decision_fence(
                 effective,
                 subject_id=subject_id,
@@ -338,9 +347,7 @@ class ProductionRepairDecisionService:
                 raise ProductionRepairStaleError(ProductionRepairStaleError.code)
             get_current = getattr(uow.production_artifacts, "get_current", None)
             if callable(get_current):
-                current_artifact = await get_current(
-                    production_run_id, _enum_value(artifact.stage)
-                )
+                current_artifact = await get_current(production_run_id, _enum_value(artifact.stage))
                 if current_artifact is None or current_artifact.id != artifact.id:
                     raise ProductionRepairStaleError(ProductionRepairStaleError.code)
 
@@ -381,7 +388,6 @@ class ProductionRepairDecisionService:
             for item in decisions
         )
 
-
         async with self._uow_factory() as uow:
             edition = await _get_for_update(uow.editions, edition_id)
             if edition is None or _enum_value(edition.status) not in {
@@ -405,6 +411,9 @@ class ProductionRepairDecisionService:
             )
 
             for item, _event in zip(decisions, events, strict=True):
+                current = _effective_decision_for_key(effective, item.subject_id, item.repair_key)
+                if current is not None and _enum_value(current.action) == _enum_value(item.action):
+                    raise ProductionRepairDecisionNoopError(item.repair_key)
                 _require_decision_fence(
                     effective,
                     subject_id=item.subject_id,
@@ -478,9 +487,7 @@ class ProductionRepairDecisionService:
     ) -> tuple[ProductionRepairDecision, ...]:
         """Return every decision ever appended for one repair identity."""
         async with self._uow_factory() as uow:
-            history = await uow.production_repair_decisions.list_for_edition(
-                edition_id, subject_id
-            )
+            history = await uow.production_repair_decisions.list_for_edition(edition_id, subject_id)
         return decision_history_for_key(history, repair_key)
 
 
@@ -509,7 +516,16 @@ def _require_decision_fence(
     A retried HTTP request therefore fails unambiguously after its first
     append instead of silently appending the same event twice.
     """
-    current = next(
+    current = _effective_decision_for_key(effective, subject_id, repair_key)
+    current_id = current.id if current is not None else None
+    if current_id != expected_effective_decision_id:
+        raise ProductionRepairDecisionChangedError(ProductionRepairDecisionChangedError.code)
+
+
+def _effective_decision_for_key(
+    effective: Sequence[ProductionRepairDecision], subject_id: UUID, repair_key: str
+) -> ProductionRepairDecision | None:
+    return next(
         (
             decision
             for decision in effective
@@ -517,11 +533,6 @@ def _require_decision_fence(
         ),
         None,
     )
-    current_id = current.id if current is not None else None
-    if current_id != expected_effective_decision_id:
-        raise ProductionRepairDecisionChangedError(
-            ProductionRepairDecisionChangedError.code
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -549,9 +560,7 @@ class ProductionRepairIssueView:
     # True only when the effective decision's content is proven materialized
     # by the current projection marker -- never inferred from its action.
     projection_applied: bool = False
-    application_state: RepairDecisionApplicationState = (
-        RepairDecisionApplicationState.UNRESOLVED
-    )
+    application_state: RepairDecisionApplicationState = RepairDecisionApplicationState.UNRESOLVED
     subject_id: UUID | None = None
 
 
@@ -594,9 +603,7 @@ class SupplementalSourceRepairIssue:
     observed_artifact_id: UUID
     observed_artifact_version: int
     observed_pipeline_generation: int
-    repair_state: SupplementalSourceRepairState = (
-        SupplementalSourceRepairState.UNARCHIVED
-    )
+    repair_state: SupplementalSourceRepairState = SupplementalSourceRepairState.UNARCHIVED
     rebuild_required: bool = False
     effective_decision: ProductionRepairDecision | None = None
     recommended_action: str = "archive_manual_content"
@@ -630,8 +637,7 @@ class ProductionRepairIssueService:
         self, edition_id: UUID, subject_id: UUID | None = None
     ) -> tuple[ProductionRepairIssueView, ...]:
         return tuple(
-            view
-            for view, _value in await self._records(edition_id, subject_id=subject_id)
+            view for view, _value in await self._records(edition_id, subject_id=subject_id)
         )
 
     async def list_issue_views(
@@ -704,14 +710,12 @@ class ProductionRepairIssueService:
             if callable(bulk_collections):
                 collections = await bulk_collections(subject_ids)
                 for collection in collections:
-                    collections_by_subject.setdefault(collection.subject_id, []).append(
-                        collection
-                    )
+                    collections_by_subject.setdefault(collection.subject_id, []).append(collection)
             elif collection_repository is not None:
                 for current_subject_id in subject_ids:
-                    collections_by_subject[current_subject_id] = (
-                        await collection_repository.list_for_subject(current_subject_id)
-                    )
+                    collections_by_subject[
+                        current_subject_id
+                    ] = await collection_repository.list_for_subject(current_subject_id)
             contexts: list[
                 tuple[Any, Any, Sequence[Any], tuple[list[dict[str, Any]], set[str]] | None]
             ] = []
@@ -724,9 +728,7 @@ class ProductionRepairIssueService:
                 ):
                     continue
                 collections = collections_by_subject.get(run.subject_id, ())
-                contexts.append(
-                    (run, artifact, collections, _reference_source_index(artifact))
-                )
+                contexts.append((run, artifact, collections, _reference_source_index(artifact)))
             decisions = await _effective_decisions_for_reader(uow, edition_id, subject_id)
 
         decisions_by_key = {
@@ -780,9 +782,7 @@ class ProductionRepairIssueService:
                     source_url=source_url,
                 )
                 decision = decisions_by_key.get((run.subject_id, repair_key))
-                repair_state, recommended_action = _supplemental_repair_state(
-                    collection, decision
-                )
+                repair_state, recommended_action = _supplemental_repair_state(collection, decision)
                 issues.append(
                     SupplementalSourceRepairIssue(
                         repair_key=repair_key,
@@ -796,9 +796,7 @@ class ProductionRepairIssueService:
                             else None
                         ),
                         collection_id=(
-                            getattr(collection, "id", None)
-                            if collection is not None
-                            else None
+                            getattr(collection, "id", None) if collection is not None else None
                         ),
                         collection_state=(
                             _enum_value(getattr(collection, "state", None))
@@ -869,12 +867,8 @@ class ProductionRepairIssueService:
                 if artifact is not None and (
                     _enum_value(artifact.status) != ProductionArtifactStatus.STALE.value
                 ):
-                    contexts.append(
-                        _RepairContext(run=run, artifact=artifact, source_titles={})
-                    )
-            decisions = await _effective_decisions_for_reader(
-                uow, edition_id, subject_id
-            )
+                    contexts.append(_RepairContext(run=run, artifact=artifact, source_titles={}))
+            decisions = await _effective_decisions_for_reader(uow, edition_id, subject_id)
 
         decisions_by_key = {
             (decision.subject_id, decision.repair_key): decision for decision in decisions
@@ -895,9 +889,7 @@ class ProductionRepairIssueService:
                 )
                 if record is not None:
                     view, value = record
-                    decision = decisions_by_key.get(
-                        (context.run.subject_id, view.repair_key)
-                    )
+                    decision = decisions_by_key.get((context.run.subject_id, view.repair_key))
                     view = replace(view, effective_decision=decision)
                     records.append(
                         (
@@ -955,9 +947,7 @@ class ProductionRepairAdjudicationService:
         artifact_store: ProductionArtifactStore | None = None,
     ) -> None:
         self._uow_factory = uow_factory
-        self._issues = issue_service or ProductionRepairIssueService(
-            uow_factory, artifact_store
-        )
+        self._issues = issue_service or ProductionRepairIssueService(uow_factory, artifact_store)
         self._decisions = decision_service or ProductionRepairDecisionService(uow_factory)
 
     async def decide_current_issue(
@@ -1046,15 +1036,11 @@ class ProductionRepairAdjudicationService:
             )
             issue = detail.issue if detail is not None else None
         if issue is None:
-            raise ProductionRepairIssueNotFoundError(
-                ProductionRepairIssueNotFoundError.code
-            )
+            raise ProductionRepairIssueNotFoundError(ProductionRepairIssueNotFoundError.code)
 
         kind = _repair_kind(_enum_value(issue.kind))
         if not _repair_action_is_compatible(kind, request.action):
-            raise ProductionRepairActionInvalidError(
-                ProductionRepairActionInvalidError.code
-            )
+            raise ProductionRepairActionInvalidError(ProductionRepairActionInvalidError.code)
         if (
             issue.observed_artifact_id != request.observed_artifact_id
             or issue.observed_pipeline_generation != request.observed_pipeline_generation
@@ -1062,9 +1048,7 @@ class ProductionRepairAdjudicationService:
                 request.observed_run_id is not None
                 and issue.production_run_id != request.observed_run_id
             )
-            or (
-                getattr(issue, "subject_id", request.subject_id) != request.subject_id
-            )
+            or (getattr(issue, "subject_id", request.subject_id) != request.subject_id)
         ):
             raise ProductionRepairStaleError(ProductionRepairStaleError.code)
 
@@ -1149,9 +1133,7 @@ class ProductionRepairProjectionService:
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
-        self._extraction = extraction_service or ExtractionService(
-            uow_factory, artifact_store
-        )
+        self._extraction = extraction_service or ExtractionService(uow_factory, artifact_store)
 
     async def project_effective_extraction(
         self,
@@ -1237,15 +1219,11 @@ class ProductionRepairProjectionService:
                     await self._artifact_store.read_json(base.canonical_blob_id)
                 )
             except Exception as exc:
-                raise ProductionRepairProjectionError(
-                    "extraction_payload_unavailable"
-                ) from exc
+                raise ProductionRepairProjectionError("extraction_payload_unavailable") from exc
             entries, payload_available = await _repair_entries_for_artifact(
                 base, self._artifact_store
             )
-            decisions = await _effective_decisions_for_reader(
-                uow, run.edition_id, run.subject_id
-            )
+            decisions = await _effective_decisions_for_reader(uow, run.edition_id, run.subject_id)
             decisions_by_key = {
                 decision.repair_key: decision
                 for decision in decisions
@@ -1311,9 +1289,7 @@ class ProductionRepairProjectionService:
                     raise ProductionRepairProjectionError("repair_payload_hash_mismatch")
                 try:
                     if kind is ProductionRepairIssueKind.REJECTED_RULE:
-                        rule_additions.append(
-                            _build_override_rule(entry, value, repair_key)
-                        )
+                        rule_additions.append(_build_override_rule(entry, value, repair_key))
                         accepted_rule_count += 1
                     else:
                         additions.append(_build_override_item(entry, value, repair_key))
@@ -1362,8 +1338,7 @@ class ProductionRepairProjectionService:
                 )
             }
             unbuildable_is_recorded = all(
-                (entry["repair_key"], entry["decision_id"])
-                in unbuildable_already_recorded
+                (entry["repair_key"], entry["decision_id"]) in unbuildable_already_recorded
                 for entry in unbuildable_decisions
             )
             if projected == current_extraction and unbuildable_is_recorded:
@@ -1566,9 +1541,7 @@ def _repair_entry_identity(
             kind=kind,
             source_url=canonical_url,
             artifact_type=(
-                str(entry.get("artifact_type"))
-                if entry.get("artifact_type") is not None
-                else None
+                str(entry.get("artifact_type")) if entry.get("artifact_type") is not None else None
             ),
             value_sha256=value_sha256,
         )
@@ -1599,15 +1572,17 @@ def _entry_model_run_ids(entry: Mapping[str, Any]) -> tuple[str, ...]:
     return (str(model_run_id),) if model_run_id is not None else ()
 
 
-def _build_override_item(
-    entry: Mapping[str, Any], value: str, repair_key: str
-) -> ExtractionItem:
+def _build_override_item(entry: Mapping[str, Any], value: str, repair_key: str) -> ExtractionItem:
     artifact_type = _entry_artifact_type(entry.get("artifact_type"))
-    if artifact_type in {
-        ArtifactType.YARA_RULE,
-        ArtifactType.SIGMA_RULE,
-        ArtifactType.SURICATA_RULE,
-    } or artifact_type is ArtifactType.OTHER:
+    if (
+        artifact_type
+        in {
+            ArtifactType.YARA_RULE,
+            ArtifactType.SIGMA_RULE,
+            ArtifactType.SURICATA_RULE,
+        }
+        or artifact_type is ArtifactType.OTHER
+    ):
         raise ValueError("Unsupported repair artifact type")
     source_id = str(entry["source_id"])
     proposal = Q2ArtifactProposal(
@@ -1647,9 +1622,7 @@ def _build_override_item(
     )
 
 
-def _build_override_rule(
-    entry: Mapping[str, Any], value: str, repair_key: str
-) -> DetectionRule:
+def _build_override_rule(entry: Mapping[str, Any], value: str, repair_key: str) -> DetectionRule:
     source_id = str(entry["source_id"])
     rule_type = _entry_rule_type(entry.get("artifact_type"))
     name = entry.get("name")
@@ -1714,13 +1687,13 @@ def _repair_projection_marker(artifact: Any) -> Mapping[str, Any] | None:
     return marker if isinstance(marker, Mapping) else None
 
 
-def _marker_entries(
-    marker: Mapping[str, Any] | None, field: str
-) -> list[Mapping[str, Any]]:
+def _marker_entries(marker: Mapping[str, Any] | None, field: str) -> list[Mapping[str, Any]]:
     values = marker.get(field) if marker is not None else None
-    return [value for value in values if isinstance(value, Mapping)] if isinstance(
-        values, list
-    ) else []
+    return (
+        [value for value in values if isinstance(value, Mapping)]
+        if isinstance(values, list)
+        else []
+    )
 
 
 def repair_decision_is_materialized(
@@ -1737,8 +1710,7 @@ def repair_decision_is_materialized(
         return False
     decision_id = str(decision.id)
     return any(
-        str(entry.get("repair_key")) == repair_key
-        and str(entry.get("decision_id")) == decision_id
+        str(entry.get("repair_key")) == repair_key and str(entry.get("decision_id")) == decision_id
         for entry in _marker_entries(marker, "applied_decisions")
     )
 
@@ -1753,9 +1725,7 @@ def repair_projection_decision_ids(marker: Mapping[str, Any] | None) -> set[str]
     }
 
 
-def _marker_applied_action(
-    marker: Mapping[str, Any] | None, repair_key: str
-) -> str | None:
+def _marker_applied_action(marker: Mapping[str, Any] | None, repair_key: str) -> str | None:
     for entry in _marker_entries(marker, "applied_decisions"):
         if str(entry.get("repair_key")) == repair_key:
             return str(entry.get("action"))
@@ -1784,14 +1754,11 @@ def repair_decision_application_state(
     repair_key = str(getattr(issue, "repair_key", ""))
     decision_id = str(effective_decision.id)
     if any(
-        str(entry.get("repair_key")) == repair_key
-        and str(entry.get("decision_id")) == decision_id
+        str(entry.get("repair_key")) == repair_key and str(entry.get("decision_id")) == decision_id
         for entry in _marker_entries(current_projection_marker, "unbuildable_decisions")
     ):
         return RepairDecisionApplicationState.UNBUILDABLE
-    if repair_decision_is_materialized(
-        current_projection_marker, repair_key, effective_decision
-    ):
+    if repair_decision_is_materialized(current_projection_marker, repair_key, effective_decision):
         return RepairDecisionApplicationState.ALREADY_EFFECTIVE
     action = _enum_value(effective_decision.action)
     if action == ProductionRepairAction.EXCLUDE.value:
@@ -1806,6 +1773,49 @@ def repair_decision_application_state(
     return RepairDecisionApplicationState.ALREADY_EFFECTIVE
 
 
+def repair_issue_application_state(
+    issue: Any, effective_decision: ProductionRepairDecision | None = None
+) -> RepairDecisionApplicationState:
+    """Read or derive the application state carried by a repair issue DTO."""
+    decision = (
+        effective_decision
+        if effective_decision is not None
+        else getattr(issue, "effective_decision", None)
+    )
+    value = getattr(issue, "application_state", None)
+    if value is not None:
+        state = RepairDecisionApplicationState(_enum_value(value))
+        if state is not RepairDecisionApplicationState.UNRESOLVED or decision is None:
+            return state
+    marker = (
+        {
+            "applied_decisions": [
+                {
+                    "repair_key": str(getattr(issue, "repair_key", "")),
+                    "decision_id": str(getattr(decision, "id", "")),
+                    "action": str(_enum_value(getattr(decision, "action", ""))),
+                }
+            ]
+        }
+        if bool(getattr(issue, "projection_applied", False))
+        else None
+    )
+    return repair_decision_application_state(issue, decision, marker)
+
+
+def repair_issue_blocks_signoff(issue: Any) -> bool:
+    """Return whether a repair issue still changes the deliverable before freeze."""
+    if (
+        _enum_value(getattr(issue, "repair_state", None))
+        == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES.value
+    ):
+        return True
+    return repair_issue_application_state(issue) in {
+        RepairDecisionApplicationState.PROJECTION_REQUIRED,
+        RepairDecisionApplicationState.UNBUILDABLE,
+    }
+
+
 def _item_projection_key(item: ExtractionItem) -> tuple[str, str]:
     if item.artifact_type is None:
         return item.category, item.value.casefold()
@@ -1815,7 +1825,10 @@ def _item_projection_key(item: ExtractionItem) -> tuple[str, str]:
 
 
 def _prefer_projection_object[T](
-    previous: T, candidate: T, *, previous_basis: ProductionEvidenceBasis,
+    previous: T,
+    candidate: T,
+    *,
+    previous_basis: ProductionEvidenceBasis,
     candidate_basis: ProductionEvidenceBasis,
 ) -> T:
     if (
@@ -1915,9 +1928,7 @@ async def _current_artifacts_by_run(
     return {
         run.id: artifact
         for run in runs
-        if (
-            artifact := await repository.get_current(run.id, stage)
-        ) is not None
+        if (artifact := await repository.get_current(run.id, stage)) is not None
     }
 
 
@@ -1951,10 +1962,7 @@ def _supplemental_repair_state(
             SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES,
             "rebuild_references",
         )
-    if (
-        decision is not None
-        and decision.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
-    ):
+    if decision is not None and decision.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE:
         return SupplementalSourceRepairState.UNARCHIVED, "continue_without_source"
     return SupplementalSourceRepairState.UNARCHIVED, "archive_manual_content"
 
@@ -1992,9 +2000,7 @@ def _reference_source_index(
 
     canonical_urls: set[str] = set()
     for value in canonical_raw:
-        source_url = (
-            value.get("source_url") if isinstance(value, dict) else value
-        )
+        source_url = value.get("source_url") if isinstance(value, dict) else value
         if isinstance(source_url, str) and source_url:
             canonical_urls.add(source_url)
     return proposed, canonical_urls
@@ -2078,9 +2084,7 @@ def _issue_record(
         kind=kind,
         artifact_type=artifact_type,
         source_id=source_id,
-        source_title=str(
-            entry.get("source_title") or context.source_titles.get(source_id, "")
-        ),
+        source_title=str(entry.get("source_title") or context.source_titles.get(source_id, "")),
         is_publication_ioc=is_publication_ioc_artifact_type(artifact_type),
         source_url=source_url,
         reason_code=str(entry.get("reason_code", "")),
@@ -2320,9 +2324,7 @@ class ProductionReferenceRepairService:
             )
 
 
-async def _archived_source_projection(
-    uow: Any, subject_id: UUID
-) -> tuple[tuple[str, str], ...]:
+async def _archived_source_projection(uow: Any, subject_id: UUID) -> tuple[tuple[str, str], ...]:
     """Return ``(canonical_url, decoded_sha256)`` in stable URL order."""
     collections = await uow.source_collections.list_for_subject(subject_id)
     documents_repository = getattr(uow, "source_documents", None)
