@@ -11,11 +11,10 @@ import {
 } from "../../api/publication";
 import { Link } from "../../routing";
 import { ReconciliationPanel } from "./ReconciliationPanel";
+import type { RepairQueueFilter } from "./RepairQueue";
 
 const STALE_MESSAGE =
   "Cet article a changé depuis son ouverture. La revue a été rechargée.";
-const REJECTION_ANCHOR = "production-rejections-heading";
-
 function isStaleReviewError(error: unknown): boolean {
   return error instanceof ApiError && error.code === "review_item_stale";
 }
@@ -51,6 +50,9 @@ function invalidateReview(
   void queryClient.invalidateQueries({
     queryKey: ["edition-review", editionId],
   });
+  void queryClient.invalidateQueries({
+    queryKey: ["edition-repair", editionId],
+  });
 }
 
 function invalidateAfterRetry(
@@ -60,6 +62,9 @@ function invalidateAfterRetry(
 ) {
   void queryClient.invalidateQueries({
     queryKey: ["edition-review", editionId],
+  });
+  void queryClient.invalidateQueries({
+    queryKey: ["edition-repair", editionId],
   });
   void queryClient.invalidateQueries({ queryKey: ["batch", editionId] });
   void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
@@ -84,6 +89,9 @@ function invalidateAfterCancel(
   void queryClient.invalidateQueries({
     queryKey: ["edition-review", editionId],
   });
+  void queryClient.invalidateQueries({
+    queryKey: ["edition-repair", editionId],
+  });
   void queryClient.invalidateQueries({ queryKey: ["batch", editionId] });
   void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
   if (queryClient.getQueryState(["subject-production", subjectId])) {
@@ -103,10 +111,12 @@ export function ReviewItemCard({
   editionId,
   item,
   readOnly = false,
+  onRepairFilter,
 }: {
   editionId: string;
   item: ReviewItem;
   readOnly?: boolean;
+  onRepairFilter?: (filter: RepairQueueFilter, subjectId: string) => void;
 }) {
   const queryClient = useQueryClient();
   const [excludeOpen, setExcludeOpen] = useState(false);
@@ -193,8 +203,6 @@ export function ReviewItemCard({
     cancel.isPending;
   const mutationError =
     include.error ?? exclude.error ?? retry.error ?? cancel.error;
-  const pipelineRejectionLink =
-    "/subjects/" + item.subject_id + "#" + REJECTION_ANCHOR;
   const hasLossSignals =
     item.rejected_indicator_count > 0 ||
     item.rejected_rule_count > 0 ||
@@ -232,25 +240,29 @@ export function ReviewItemCard({
           aria-label="Signalement des pertes"
         >
           {item.rejected_rule_count > 0 ? (
-            <Link to={pipelineRejectionLink}>
-              <span className="review-loss-badge review-loss-badge--alert">
-                {item.rejected_rule_count} règle(s) de détection perdue(s)
-              </span>
-            </Link>
+            <button
+              className="review-loss-badge review-loss-badge--alert"
+              type="button"
+              onClick={() => onRepairFilter?.("rules", item.subject_id)}
+              disabled={!onRepairFilter}
+            >
+              {item.rejected_rule_count} règle(s) de détection à arbitrer
+            </button>
           ) : null}
           {item.rejected_indicator_count > 0 ? (
-            <Link to={pipelineRejectionLink}>
-              <span className="review-loss-badge review-loss-badge--warning">
-                {item.rejected_indicator_count} indicateur(s) écarté(s)
-              </span>
-            </Link>
+            <button
+              className="review-loss-badge review-loss-badge--warning"
+              type="button"
+              onClick={() => onRepairFilter?.("ioc", item.subject_id)}
+              disabled={!onRepairFilter}
+            >
+              {item.rejected_indicator_count} indicateur(s) à arbitrer
+            </button>
           ) : null}
           {item.published_rule_count > 0 ? (
-            <Link to={pipelineRejectionLink}>
-              <span className="review-loss-badge review-loss-badge--neutral">
-                {item.published_rule_count} règle(s) de détection publiée(s)
-              </span>
-            </Link>
+            <span className="review-loss-badge review-loss-badge--neutral">
+              {item.published_rule_count} règle(s) de détection publiée(s)
+            </span>
           ) : null}
         </p>
       ) : null}

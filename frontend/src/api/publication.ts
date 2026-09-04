@@ -11,6 +11,12 @@ export type ReviewRunStatus =
 export type ReviewRetryStage =
   "sources" | "references" | "extraction" | "synthesis" | "assembly";
 
+export type ProductionRepairIssueKind =
+  "rejected_indicator" | "rejected_rule" | "supplemental_source_unarchived";
+
+export type ProductionRepairAction =
+  "include" | "exclude" | "continue_without_source";
+
 export type AssemblyJobStatus =
   "queued" | "running" | "waiting_human" | "succeeded" | "failed" | "cancelled";
 
@@ -57,8 +63,12 @@ export interface ReviewItem {
   included: boolean;
   blocking: boolean;
   rejected_indicator_count: number;
+  rejected_ioc_count?: number;
+  rejected_other_artifact_count?: number;
   rejected_rule_count: number;
   published_rule_count: number;
+  active_repair_count?: number;
+  unresolved_repair_count?: number;
   /**
    * The backend owns the Review action policy. `can_retry` and
    * `requires_reconciliation` are mutually exclusive, so the UI never has to
@@ -78,6 +88,118 @@ export interface EditionReview {
   edition_id: string;
   items: ReviewItem[];
   can_accept: boolean;
+  unresolved_repair_count?: number;
+  repair_review_complete?: boolean;
+}
+
+export interface ProductionRepairDecision {
+  id: string;
+  action: ProductionRepairAction;
+  actor_id: string;
+  reason: string | null;
+  created_at: string;
+  observed_artifact_id: string;
+  observed_pipeline_generation: number;
+}
+
+export interface EditionRepairItem {
+  repair_key: string;
+  kind: ProductionRepairIssueKind;
+  position: number;
+  subject_id: string;
+  article_title: string;
+  run_id: string;
+  pipeline_generation: number;
+  artifact_id: string | null;
+  artifact_version: number | null;
+  source_id: string | null;
+  source_title: string | null;
+  source_url: string | null;
+  collection_id: string | null;
+  collection_state: string | null;
+  artifact_type: string | null;
+  preview: string;
+  reason_code: string;
+  value_sha256: string;
+  payload_available: boolean;
+  effective_action: ProductionRepairAction | null;
+  effective_decision_id: string | null;
+  resolved: boolean;
+  resolution_reason: string | null;
+  rebuild_required: boolean;
+  recommended_stage: string | null;
+  is_publication_ioc: boolean;
+}
+
+export interface EditionRepairSummary {
+  unresolved_total: number;
+  sources_to_supply: number;
+  rejected_iocs_to_review: number;
+  rejected_rules_to_review: number;
+  rejected_other_artifacts: number;
+  articles_with_repairs: number;
+  articles_needing_rebuild: number;
+}
+
+export interface EditionRepairArticle {
+  subject_id: string;
+  has_pending_projection: boolean;
+  recommended_stage: string;
+  active_repair_count: number;
+  resolved_since_last_build_count: number;
+}
+
+export interface EditionRepairPage {
+  summary: EditionRepairSummary;
+  items: EditionRepairItem[];
+  articles: EditionRepairArticle[];
+  next_cursor: string | null;
+}
+
+export interface EditionRepairDetail {
+  repair_key: string;
+  kind: ProductionRepairIssueKind;
+  artifact_id?: string | null;
+  artifact_version?: number | null;
+  source_id: string | null;
+  source_title: string | null;
+  source_url: string | null;
+  publisher?: string | null;
+  artifact_type?: string | null;
+  reason_code?: string | null;
+  value_sha256?: string | null;
+  preview?: string | null;
+  payload_available?: boolean;
+  value?: string | null;
+  body?: string | null;
+  collection_id?: string | null;
+  collection_state?: string | null;
+  effective_decision?: ProductionRepairDecision | null;
+}
+
+export interface EditionRepairDecisionResponse {
+  repair_key: string;
+  decision_id: string;
+  action: ProductionRepairAction;
+  resolved: true;
+}
+
+export interface EditionRepairBulkDecisionResponse {
+  decision_ids: string[];
+  decisions: Array<{
+    repair_key: string;
+    decision_id: string;
+    action: ProductionRepairAction;
+  }>;
+}
+
+export interface EditionRepairRebuildResponse {
+  action: string;
+  stage: string | null;
+  run_id: string;
+  batch_id: string | null;
+  changed: boolean;
+  job_id: string | null;
 }
 
 export interface ReviewDecision {
@@ -133,6 +255,119 @@ export async function getEditionReview(
   editionId: string,
 ): Promise<EditionReview> {
   return request(`/api/editions/${editionId}/review`);
+}
+
+export async function getEditionRepairPage(
+  editionId: string,
+  options: {
+    status?: "open" | "resolved" | "all";
+    kind?: ProductionRepairIssueKind;
+    subjectId?: string;
+    artifactType?: string;
+    cursor?: string | null;
+    limit?: number;
+  } = {},
+): Promise<EditionRepairPage> {
+  const params = new URLSearchParams({
+    status: options.status ?? "all",
+    limit: String(options.limit ?? 100),
+  });
+  if (options.kind) params.set("kind", options.kind);
+  if (options.subjectId) params.set("subject_id", options.subjectId);
+  if (options.artifactType) params.set("artifact_type", options.artifactType);
+  if (options.cursor) params.set("cursor", options.cursor);
+  const payload = await request<unknown>(
+    `/api/editions/${encodeURIComponent(editionId)}/review/repairs?${params.toString()}`,
+  );
+  return isEditionRepairPage(payload) ? payload : emptyEditionRepairPage();
+}
+
+export function getEditionRepairDetail(
+  editionId: string,
+  repairKey: string,
+): Promise<EditionRepairDetail> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/review/repairs/${encodeURIComponent(repairKey)}`,
+  );
+}
+
+export function decideEditionRepair(
+  editionId: string,
+  repairKey: string,
+  input: {
+    action: ProductionRepairAction;
+    observedSubjectId: string;
+    observedRunId: string;
+    observedArtifactId: string;
+    observedPipelineGeneration: number;
+    reason?: string | null;
+  },
+): Promise<EditionRepairDecisionResponse> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/review/repairs/${encodeURIComponent(repairKey)}/decision`,
+    jsonRequest({
+      action: input.action,
+      observed_subject_id: input.observedSubjectId,
+      observed_run_id: input.observedRunId,
+      observed_artifact_id: input.observedArtifactId,
+      observed_pipeline_generation: input.observedPipelineGeneration,
+      ...(input.reason?.trim() ? { reason: input.reason.trim() } : {}),
+    }),
+  );
+}
+
+export function decideEditionRepairsBulk(
+  editionId: string,
+  decisions: ReadonlyArray<{
+    repairKey: string;
+    action: ProductionRepairAction;
+    observedSubjectId: string;
+    observedRunId: string;
+    observedArtifactId: string;
+    observedPipelineGeneration: number;
+  }>,
+  reason?: string | null,
+): Promise<EditionRepairBulkDecisionResponse> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/review/repairs/decisions`,
+    jsonRequest({
+      decisions: decisions.map((decision) => ({
+        repair_key: decision.repairKey,
+        action: decision.action,
+        observed_subject_id: decision.observedSubjectId,
+        observed_run_id: decision.observedRunId,
+        observed_artifact_id: decision.observedArtifactId,
+        observed_pipeline_generation: decision.observedPipelineGeneration,
+      })),
+      ...(reason?.trim() ? { reason: reason.trim() } : {}),
+    }),
+  );
+}
+
+export function rebuildEditionReviewItem(
+  editionId: string,
+  subjectId: string,
+  observed?: {
+    runId?: string;
+    pipelineGeneration?: number;
+    artifactId?: string;
+  },
+): Promise<EditionRepairRebuildResponse> {
+  const body = observed
+    ? {
+        ...(observed.runId ? { observed_run_id: observed.runId } : {}),
+        ...(observed.pipelineGeneration !== undefined
+          ? { observed_pipeline_generation: observed.pipelineGeneration }
+          : {}),
+        ...(observed.artifactId
+          ? { observed_artifact_id: observed.artifactId }
+          : {}),
+      }
+    : undefined;
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/review/items/${encodeURIComponent(subjectId)}/rebuild`,
+    body ? jsonRequest(body) : { method: "POST" },
+  );
 }
 
 export function acceptEditionPublication(
@@ -223,6 +458,42 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (response.ok) return (await response.json()) as T;
   throw await apiError(response);
+}
+
+function jsonRequest(body: object): RequestInit {
+  return {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  };
+}
+
+function isEditionRepairPage(value: unknown): value is EditionRepairPage {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    Array.isArray(record.items) &&
+    Array.isArray(record.articles) &&
+    typeof record.summary === "object" &&
+    record.summary !== null
+  );
+}
+
+function emptyEditionRepairPage(): EditionRepairPage {
+  return {
+    summary: {
+      unresolved_total: 0,
+      sources_to_supply: 0,
+      rejected_iocs_to_review: 0,
+      rejected_rules_to_review: 0,
+      rejected_other_artifacts: 0,
+      articles_with_repairs: 0,
+      articles_needing_rebuild: 0,
+    },
+    items: [],
+    articles: [],
+    next_cursor: null,
+  };
 }
 
 async function apiError(response: Response): Promise<ApiError> {

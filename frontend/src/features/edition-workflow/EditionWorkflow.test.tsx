@@ -352,10 +352,13 @@ describe("rendu strict des états Edition", () => {
     expect(
       await screen.findByRole("heading", { name: "Revue de publication" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("1 inclus")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Accepter la production" }),
-    ).toBeEnabled();
+      screen.getByRole("button", { name: /Articles bloquants/ }),
+    ).toHaveTextContent("0");
+    const acceptButton = screen.getByRole("button", {
+      name: "Accepter la production",
+    });
+    await waitFor(() => expect(acceptButton).toBeEnabled());
     expect(screen.queryByText("Sujets candidats")).not.toBeInTheDocument();
     expect(screen.queryByText("Campagne A")).not.toBeInTheDocument();
   });

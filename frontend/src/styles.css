@@ -1820,11 +1820,18 @@ h1 {
 
 .review-loss-badge {
   display: inline-flex;
+  cursor: pointer;
+  font: inherit;
   padding: 0.3rem 0.6rem;
   border: 1px solid;
   border-radius: 999px;
   font-size: 0.85rem;
   font-weight: 700;
+}
+
+.review-loss-badge:disabled {
+  cursor: default;
+  opacity: 0.75;
 }
 
 .review-loss-badge--alert {
@@ -1918,6 +1925,444 @@ h1 {
 .review-acceptance p {
   margin-top: 0.35rem;
   color: #55665c;
+}
+
+/* Repair Desk ------------------------------------------------------------- */
+
+.repair-desk {
+  display: grid;
+  gap: 1rem;
+}
+
+.repair-desk__summary {
+  display: grid;
+  grid-template-columns: minmax(12rem, 0.7fr) minmax(0, 1.8fr);
+  gap: 1rem;
+  padding: 1rem;
+  border: 1px solid #b9cfc0;
+  border-radius: 0.75rem;
+  background: #f8fbf9;
+}
+
+.repair-desk__summary h3,
+.repair-desk__summary p {
+  margin: 0;
+}
+
+.repair-desk__summary p:last-child {
+  margin-top: 0.45rem;
+  color: #55665c;
+}
+
+.repair-summary-counters {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(7rem, 1fr));
+  gap: 0.5rem;
+}
+
+.repair-summary-counters button {
+  display: grid;
+  gap: 0.25rem;
+  min-height: 5rem;
+  padding: 0.65rem;
+  border: 1px solid #cfdbd3;
+  border-radius: 0.65rem;
+  color: #17211d;
+  background: #fff;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.repair-summary-counters button:hover,
+.repair-summary-counters button:focus-visible {
+  border-color: #1f6042;
+}
+
+.repair-summary-counters strong {
+  font-size: 1.4rem;
+}
+
+.repair-summary-counters span {
+  color: #55665c;
+  font-size: 0.82rem;
+}
+
+.repair-desk__message {
+  margin: 0;
+  padding: 0.7rem 0.9rem;
+  border-left: 4px solid #1f6042;
+  background: #f2f8f3;
+}
+
+.repair-desk__workspace {
+  display: grid;
+  grid-template-columns: minmax(18rem, 0.9fr) minmax(24rem, 1.1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.repair-queue,
+.repair-inspector,
+.review-articles {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.75rem;
+  background: #fff;
+}
+
+.repair-queue__heading,
+.repair-inspector__heading,
+.review-articles__heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.repair-queue__heading h3,
+.repair-inspector__heading h3,
+.review-articles__heading h3 {
+  margin: 0;
+}
+
+.repair-queue__heading p,
+.review-articles__heading p {
+  margin: 0 0 0.2rem;
+}
+
+.repair-queue__count,
+.review-articles__heading > span {
+  color: #55665c;
+  font-size: 0.85rem;
+}
+
+.repair-queue__filters,
+.repair-desk__actions,
+.repair-inspector__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.repair-queue__filters {
+  margin: 1rem 0 0.75rem;
+}
+
+.repair-queue__filters .button {
+  min-height: 2.3rem;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+}
+
+.repair-queue__filters .button[aria-pressed="true"] {
+  color: #fff;
+  background: #1f6042;
+}
+
+.repair-queue__search,
+.repair-source-panel__form,
+.repair-inspector__decision-panel {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.repair-queue__search {
+  margin-bottom: 1rem;
+  color: #55665c;
+  font-size: 0.9rem;
+}
+
+.repair-queue__search input {
+  width: 100%;
+}
+
+.repair-queue__articles,
+.repair-queue__issues,
+.repair-rebuild-bar ul {
+  display: grid;
+  gap: 0.6rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.repair-queue__article > h4 {
+  margin: 0 0 0.45rem;
+  color: #294137;
+}
+
+.repair-queue__issues {
+  padding-left: 0.5rem;
+}
+
+.repair-issue-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.55rem;
+  padding: 0.55rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.6rem;
+  background: #fbfcfa;
+}
+
+.repair-issue-row.is-selected {
+  border-color: #1f6042;
+  box-shadow: 0 0 0 2px rgb(31 96 66 / 12%);
+}
+
+.repair-issue-row > input {
+  margin-top: 0.25rem;
+}
+
+.repair-issue-row__button {
+  display: grid;
+  min-width: 0;
+  gap: 0.25rem;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.repair-issue-row__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.6rem;
+  color: #55665c;
+  font-size: 0.82rem;
+}
+
+.repair-issue-row__meta strong {
+  color: #17211d;
+}
+
+.repair-issue-row__status {
+  font-weight: 700;
+}
+
+.repair-issue-row__preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repair-issue-row__reason {
+  overflow-wrap: anywhere;
+  color: #55665c;
+  font-size: 0.82rem;
+}
+
+.repair-desk__load-more {
+  justify-self: start;
+}
+
+.repair-inspector {
+  position: sticky;
+  top: 1rem;
+  display: grid;
+  gap: 0.9rem;
+}
+
+.repair-inspector--empty {
+  min-height: 14rem;
+  align-content: center;
+}
+
+.repair-inspector--empty p {
+  margin: 0;
+  color: #55665c;
+}
+
+.repair-inspector__facts,
+.repair-source-panel dl,
+.repair-inspector__technical dl,
+.repair-inspector__audit dl {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+}
+
+.repair-inspector__facts > div,
+.repair-source-panel dl > div,
+.repair-inspector__technical dl > div,
+.repair-inspector__audit dl > div {
+  display: grid;
+  gap: 0.12rem;
+}
+
+.repair-inspector__facts dt,
+.repair-source-panel dt,
+.repair-inspector__technical dt,
+.repair-inspector__audit dt {
+  color: #55665c;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.repair-inspector__facts dd,
+.repair-source-panel dd,
+.repair-inspector__technical dd,
+.repair-inspector__audit dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.repair-inspector__facts dd {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.repair-inspector__facts a,
+.repair-source-panel a {
+  overflow-wrap: anywhere;
+}
+
+.repair-inspector__technical,
+.repair-inspector__audit,
+.repair-inspector__pipeline-link {
+  color: #55665c;
+  font-size: 0.85rem;
+}
+
+.repair-inspector__technical summary,
+.repair-inspector__audit summary,
+.repair-inspector__pipeline-link summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.repair-decision-badge,
+.repair-source-panel__success {
+  margin: 0;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid #7ea98d;
+  border-radius: 0.55rem;
+  color: #1f6042;
+  background: #f2f8f3;
+  font-weight: 700;
+}
+
+.repair-rule-panel,
+.repair-source-panel {
+  display: grid;
+  gap: 0.7rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid #d4ded7;
+}
+
+.repair-rule-panel h4,
+.repair-source-panel h4,
+.repair-source-panel p {
+  margin: 0;
+}
+
+.repair-rule-panel__body {
+  max-height: 25rem;
+  margin: 0;
+  overflow: auto;
+  padding: 0.8rem;
+  border: 1px solid #cfdbd3;
+  border-radius: 0.55rem;
+  background: #17211d;
+  color: #f4f7f4;
+  white-space: pre;
+}
+
+.repair-source-panel__form input[type="file"] {
+  max-width: 100%;
+}
+
+.repair-source-panel__form textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.repair-bulk-actions {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid #cfdbd3;
+  border-radius: 0.6rem;
+  background: #f8fbf9;
+}
+
+.repair-bulk-actions p {
+  margin: 0;
+  color: #55665c;
+}
+
+.repair-bulk-actions__confirmation {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.repair-rebuild-bar {
+  position: sticky;
+  bottom: 1rem;
+  z-index: 1;
+  display: grid;
+  gap: 0.7rem;
+  padding: 1rem;
+  border: 2px solid #1f6042;
+  border-radius: 0.75rem;
+  background: #f2f8f3;
+  box-shadow: 0 0.4rem 1rem rgb(23 33 29 / 12%);
+}
+
+.repair-rebuild-bar strong,
+.repair-rebuild-bar p {
+  margin: 0;
+}
+
+.repair-rebuild-bar li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.repair-rebuild-bar li > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.review-articles {
+  display: grid;
+  gap: 0.8rem;
+}
+
+@media (max-width: 900px) {
+  .repair-desk__summary,
+  .repair-desk__workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .repair-summary-counters {
+    grid-template-columns: repeat(3, minmax(7rem, 1fr));
+  }
+
+  .repair-inspector {
+    position: static;
+  }
+}
+
+@media (max-width: 560px) {
+  .repair-summary-counters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .repair-rebuild-bar li {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
 
 .publication-console {

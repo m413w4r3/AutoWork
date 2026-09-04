@@ -3,7 +3,11 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { EditionReview, ReviewItem } from "../../api/publication";
+import type {
+  EditionRepairPage,
+  EditionReview,
+  ReviewItem,
+} from "../../api/publication";
 import { ReviewConsole } from "./ReviewConsole";
 import { reviewPollingInterval } from "./reviewPolling";
 
@@ -111,15 +115,33 @@ function decisionResponse() {
   });
 }
 
+const emptyRepairPage: EditionRepairPage = {
+  summary: {
+    unresolved_total: 0,
+    sources_to_supply: 0,
+    rejected_iocs_to_review: 0,
+    rejected_rules_to_review: 0,
+    rejected_other_artifacts: 0,
+    articles_with_repairs: 0,
+    articles_needing_rebuild: 0,
+  },
+  items: [],
+  articles: [],
+  next_cursor: null,
+};
+
 function renderReview(
   review: EditionReview,
   postResponse: () => Response | Promise<Response> = decisionResponse,
 ) {
-  const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
-    init?.method === "POST"
-      ? Promise.resolve(postResponse())
-      : Promise.resolve(Response.json(review)),
-  );
+  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === "POST") return Promise.resolve(postResponse());
+    return Promise.resolve(
+      Response.json(
+        urlOf(input).includes("/review/repairs") ? emptyRepairPage : review,
+      ),
+    );
+  });
   vi.stubGlobal("fetch", fetchMock);
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -246,7 +268,7 @@ describe("ReviewConsole", () => {
     );
     await user.click(confirm);
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(postCalls(fetchMock)).toHaveLength(1));
     const [, init] = postCall(fetchMock);
     expect(JSON.parse(bodyOf(init))).toEqual({
       production_run_id: "run-failed",
@@ -272,7 +294,7 @@ describe("ReviewConsole", () => {
     const user = userEvent.setup();
 
     await user.click(await screen.findByRole("button", { name: "Réinclure" }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(postCalls(fetchMock)).toHaveLength(1));
     const [, init] = postCall(fetchMock);
     expect(
       fetchMock.mock.calls.find(
@@ -352,7 +374,7 @@ describe("ReviewConsole", () => {
     const user = userEvent.setup();
 
     await user.click(await screen.findByRole("button", { name: "Réessayer" }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(postCalls(fetchMock)).toHaveLength(1));
     const [url, init] = postCall(fetchMock);
     expect(url).toBe("/api/production/runs/run-retry/retry");
     expect(JSON.parse(bodyOf(init))).toEqual({ stage: "synthesis" });
@@ -507,9 +529,12 @@ describe("ReviewConsole", () => {
     const cards = screen.getAllByRole("listitem");
     expect(cards[0]).toHaveTextContent("Deuxième");
     expect(cards[1]).toHaveTextContent("Premier");
-    expect(screen.getByText("1 inclus")).toBeInTheDocument();
-    expect(screen.getByText("1 à corriger")).toBeInTheDocument();
-    expect(screen.getByText("0 exclus")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Articles bloquants/ }),
+    ).toHaveTextContent("1");
+    expect(
+      screen.getByRole("button", { name: /Sources à fournir/ }),
+    ).toHaveTextContent("0");
     expect(
       screen.getByText("Résolvez ou excluez les articles bloquants."),
     ).toBeInTheDocument();
@@ -518,7 +543,7 @@ describe("ReviewConsole", () => {
     ).toBeDisabled();
   });
 
-  it("signale les trois compteurs non nuls par des liens vers les pertes du Pipeline", async () => {
+  it("signale les pertes par des filtres locaux dans le Repair Desk", async () => {
     const signalled = makeItem({
       rejected_indicator_count: 7,
       rejected_rule_count: 2,
@@ -532,34 +557,29 @@ describe("ReviewConsole", () => {
 
     const signalledCard = (await screen.findAllByRole("listitem"))[0]!;
     expect(
-      within(signalledCard).getByRole("link", {
-        name: "2 règle(s) de détection perdue(s)",
-      }),
-    ).toHaveAttribute(
-      "href",
-      "/subjects/subject-1#production-rejections-heading",
-    );
-    expect(
-      within(signalledCard).getByRole("link", {
-        name: "7 indicateur(s) écarté(s)",
+      within(signalledCard).getByRole("button", {
+        name: "2 règle(s) de détection à arbitrer",
       }),
     ).toBeInTheDocument();
     expect(
-      within(signalledCard).getByRole("link", {
-        name: "5 règle(s) de détection publiée(s)",
+      within(signalledCard).getByRole("button", {
+        name: "7 indicateur(s) à arbitrer",
       }),
+    ).toBeInTheDocument();
+    expect(
+      within(signalledCard).getByText("5 règle(s) de détection publiée(s)"),
     ).toBeInTheDocument();
 
     const silentCard = (await screen.findAllByRole("listitem"))[1]!;
     expect(
-      within(silentCard).queryByRole("link", {
+      within(silentCard).queryByRole("button", {
         name: /règle\(s\) de détection|indicateur\(s\) écarté\(s\)/,
       }),
     ).not.toBeInTheDocument();
   });
 
-  it("somme les pertes du périmètre de publication en excluant les articles exclus", async () => {
-    // Choix éditorial : un article déjà exclu ne fait plus partie de l’édition publiée.
+  it("affiche les compteurs de réparation fournis par le Repair Desk", async () => {
+    // Le calcul des pertes appartient désormais au contrat de réparation du backend.
     const excluded = makeItem({
       subject_id: "subject-excluded",
       title: "Article exclu",
@@ -580,11 +600,10 @@ describe("ReviewConsole", () => {
       ]),
     );
 
+    expect(await screen.findByText("Autres pertes")).toBeInTheDocument();
     expect(
-      await screen.findByText(
-        "Sur l’ensemble de l’édition : 3 indicateurs écartés, 2 règles de détection perdues, 4 règles publiées.",
-      ),
-    ).toBeInTheDocument();
+      screen.queryByText(/Sur l’ensemble de l’édition/),
+    ).not.toBeInTheDocument();
   });
 
   it("active Accept sans body métier et invalide la publication et l’édition", async () => {
@@ -592,9 +611,11 @@ describe("ReviewConsole", () => {
     const invalidate = vi.spyOn(client, "invalidateQueries");
     const user = userEvent.setup();
 
-    await user.click(
-      await screen.findByRole("button", { name: "Accepter la production" }),
-    );
+    const acceptButton = await screen.findByRole("button", {
+      name: "Accepter la production",
+    });
+    await waitFor(() => expect(acceptButton).toBeEnabled());
+    await user.click(acceptButton);
 
     await waitFor(() =>
       expect(
@@ -623,9 +644,11 @@ describe("ReviewConsole", () => {
     const invalidate = vi.spyOn(client, "invalidateQueries");
     const user = userEvent.setup();
 
-    await user.click(
-      await screen.findByRole("button", { name: "Accepter la production" }),
-    );
+    const acceptButton = await screen.findByRole("button", {
+      name: "Accepter la production",
+    });
+    await waitFor(() => expect(acceptButton).toBeEnabled());
+    await user.click(acceptButton);
 
     expect(
       await screen.findByText(

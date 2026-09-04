@@ -1,12 +1,24 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useState } from "react";
 
 import {
   acceptEditionPublication,
   getEditionReview,
+  type EditionRepairSummary,
 } from "../../api/publication";
 import { ApiError } from "../../api/editions";
-import { ReviewItemCard } from "./ReviewItemCard";
+import { RepairDesk } from "./RepairDesk";
 import { reviewPollingInterval } from "./reviewPolling";
+
+const EMPTY_REPAIR_SUMMARY: EditionRepairSummary = {
+  unresolved_total: 0,
+  sources_to_supply: 0,
+  rejected_iocs_to_review: 0,
+  rejected_rules_to_review: 0,
+  rejected_other_artifacts: 0,
+  articles_with_repairs: 0,
+  articles_needing_rebuild: 0,
+};
 
 export function ReviewConsole({
   editionId,
@@ -16,6 +28,15 @@ export function ReviewConsole({
   readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
+  const [repairSummary, setRepairSummary] = useState(EMPTY_REPAIR_SUMMARY);
+  const [repairSummaryLoaded, setRepairSummaryLoaded] = useState(readOnly);
+  const handleRepairSummaryChange = useCallback(
+    (summary: EditionRepairSummary) => {
+      setRepairSummary(summary);
+      setRepairSummaryLoaded(true);
+    },
+    [],
+  );
   const review = useQuery({
     queryKey: ["edition-review", editionId],
     queryFn: () => getEditionReview(editionId),
@@ -54,32 +75,30 @@ export function ReviewConsole({
   if (!review.data) return null;
 
   const currentReview = review.data;
-  const includedCount = currentReview.items.filter(
-    (item) => item.included,
-  ).length;
-  const blockingCount = currentReview.items.filter(
-    (item) => item.blocking,
-  ).length;
-  const excludedCount = currentReview.items.filter(
-    (item) => item.effective_decision === "exclude",
-  ).length;
-  // Excluded articles are intentionally omitted: this guardrail describes
-  // what remains in the edition's publication scope.
-  const publicationScopeItems = currentReview.items.filter(
-    (item) => item.effective_decision !== "exclude",
-  );
-  const rejectedIndicatorCount = publicationScopeItems.reduce(
-    (total, item) => total + item.rejected_indicator_count,
-    0,
-  );
-  const rejectedRuleCount = publicationScopeItems.reduce(
-    (total, item) => total + item.rejected_rule_count,
-    0,
-  );
-  const publishedRuleCount = publicationScopeItems.reduce(
-    (total, item) => total + item.published_rule_count,
-    0,
-  );
+  const unresolvedRepairCount =
+    currentReview.unresolved_repair_count ?? repairSummary.unresolved_total;
+  const repairSummaryEntries: ReadonlyArray<readonly [number, string, string]> =
+    [
+      [repairSummary.rejected_iocs_to_review, "IOC", "IOC"],
+      [repairSummary.rejected_rules_to_review, "règle", "règles"],
+      [repairSummary.sources_to_supply, "source", "sources"],
+      [repairSummary.rejected_other_artifacts, "autre perte", "autres pertes"],
+    ];
+  const repairSummaryParts = repairSummaryEntries
+    .filter(([count]) => count > 0)
+    .map(
+      ([count, singular, plural]) =>
+        `${count} ${count === 1 ? singular : plural}`,
+    );
+  const unresolvedMessage =
+    repairSummaryParts.length > 0
+      ? `${repairSummaryParts.join(", ")} restent à arbitrer.`
+      : `${unresolvedRepairCount} élément${unresolvedRepairCount > 1 ? "s" : ""} reste${unresolvedRepairCount > 1 ? "nt" : ""} à arbitrer.`;
+  const canAccept =
+    (readOnly || repairSummaryLoaded) &&
+    currentReview.can_accept &&
+    unresolvedRepairCount === 0 &&
+    repairSummary.articles_needing_rebuild === 0;
 
   return (
     <section
@@ -93,31 +112,12 @@ export function ReviewConsole({
         </div>
       </div>
 
-      <div className="review-summary" aria-label="Résumé de la revue">
-        <strong>{includedCount} inclus</strong>
-        <strong>{blockingCount} à corriger</strong>
-        <strong>{excludedCount} exclus</strong>
-      </div>
-      <p className="review-summary__losses">
-        Sur l’ensemble de l’édition : {rejectedIndicatorCount} indicateurs
-        écartés, {rejectedRuleCount} règles de détection perdues,{" "}
-        {publishedRuleCount} règles publiées.
-      </p>
-
-      {currentReview.items.length > 0 ? (
-        <ol className="review-item-list" aria-label="Articles à revoir">
-          {currentReview.items.map((item) => (
-            <ReviewItemCard
-              key={`${item.subject_id}-${item.position}`}
-              editionId={editionId}
-              item={item}
-              readOnly={readOnly}
-            />
-          ))}
-        </ol>
-      ) : (
-        <p className="empty-state">Aucun article à revoir.</p>
-      )}
+      <RepairDesk
+        editionId={editionId}
+        reviewItems={currentReview.items}
+        readOnly={readOnly}
+        onSummaryChange={handleRepairSummaryChange}
+      />
 
       <section className="review-acceptance" aria-labelledby="accept-heading">
         <div>
@@ -127,9 +127,15 @@ export function ReviewConsole({
           <p>
             {readOnly
               ? "Cette revue historique est disponible en lecture seule."
-              : currentReview.can_accept
-                ? "L’assemblage final sera activé à l’étape de publication."
-                : "Résolvez ou excluez les articles bloquants."}
+              : !repairSummaryLoaded
+                ? "Chargement du résumé de réparation…"
+                : unresolvedRepairCount > 0
+                  ? `La revue technique n’est pas terminée : ${unresolvedMessage}`
+                  : repairSummary.articles_needing_rebuild > 0
+                    ? `${repairSummary.articles_needing_rebuild} article${repairSummary.articles_needing_rebuild > 1 ? "s" : ""} ${repairSummary.articles_needing_rebuild > 1 ? "doivent" : "doit"} être reconstruit${repairSummary.articles_needing_rebuild > 1 ? "s" : ""} avant finalisation.`
+                    : canAccept
+                      ? "L’assemblage final sera activé à l’étape de publication."
+                      : "Résolvez ou excluez les articles bloquants."}
           </p>
         </div>
         {!readOnly && accept.error ? (
@@ -146,7 +152,7 @@ export function ReviewConsole({
           <button
             className="button"
             type="button"
-            disabled={!currentReview.can_accept || accept.isPending}
+            disabled={!canAccept || accept.isPending}
             onClick={() => accept.mutate()}
           >
             {accept.isPending ? "Acceptation…" : "Accepter la production"}
