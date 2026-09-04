@@ -196,6 +196,43 @@ class SourceCollection:
         self._touch(timestamp)
         return True
 
+    def claim_manual_upload(
+        self,
+        job_id: UUID,
+        *,
+        lease_duration: timedelta,
+        policy_snapshot_id: str,
+        now: datetime | None = None,
+    ) -> bool:
+        """Open an archiving lease for content supplied by the analyst.
+
+        Unlike `claim_fetch`, this accepts BLOCKED and FAILED_TERMINAL: those
+        are exactly the states an analyst supplies content for. An already
+        archived source is refused — replacing archived evidence would break
+        the immutability the whole pipeline relies on.
+        """
+        timestamp = now or datetime.now(UTC)
+        if lease_duration <= timedelta(0):
+            raise ValueError("A positive fetch lease is required")
+        if self.state in {
+            CollectionState.ARCHIVED,
+            CollectionState.EXTRACTED,
+            CollectionState.COMPLETED,
+        }:
+            return False
+        if self.state is CollectionState.FETCHING:
+            if self.fetch_lease_expires_at and self.fetch_lease_expires_at > timestamp:
+                return False
+        self.state = CollectionState.FETCHING
+        self.fetch_job_id = job_id
+        self.fetch_policy_snapshot_id = policy_snapshot_id
+        self.fetch_started_at = timestamp
+        self.fetch_lease_expires_at = timestamp + lease_duration
+        self.error_reason = None
+        self.attempt_count += 1
+        self._touch(timestamp)
+        return True
+
     def archive(
         self,
         *,

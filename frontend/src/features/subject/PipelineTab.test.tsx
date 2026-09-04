@@ -73,8 +73,8 @@ function renderPipeline() {
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe("PipelineTab source replacement", () => {
-  it("affiche les états, remplace une source puis propose la relance", async () => {
+describe("PipelineTab manual source content", () => {
+  it("affiche les états, archive un contenu puis propose la relance", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url =
         typeof input === "string"
@@ -85,12 +85,9 @@ describe("PipelineTab source replacement", () => {
       if (url.includes("/workbench")) {
         return Promise.resolve(Response.json(workbench));
       }
-      if (init?.method === "PATCH") {
+      if (url.includes(`/sources/${SOURCE_ID}/content`)) {
         return Promise.resolve(
-          Response.json({
-            source: { url: "https://mirror.example/report" },
-            updated_subject_ids: [SUBJECT_ID],
-          }),
+          Response.json({ ...workbench.sources[0], state: "archived" }),
         );
       }
       if (init?.method === "POST") {
@@ -106,42 +103,47 @@ describe("PipelineTab source replacement", () => {
 
     expect(
       await screen.findByRole("heading", {
-        name: "Remplacer une source inaccessible",
+        name: "Fournir le contenu d'une source",
       }),
     ).toBeInTheDocument();
     expect(await screen.findByText("Rapport bloqué")).toBeInTheDocument();
     expect(screen.getByText("État : blocked")).toBeInTheDocument();
-    expect(screen.getByText("État : completed")).toBeInTheDocument();
 
     await user.type(
-      screen.getByLabelText("Nouvelle URL"),
-      "https://mirror.example/report",
+      screen.getByLabelText("Ou coller le contenu"),
+      "<html><body>ExampleRAT evidence</body></html>",
     );
-    await user.click(screen.getByRole("button", { name: "Remplacer" }));
+    await user.click(
+      screen.getByRole("button", { name: "Archiver ce contenu" }),
+    );
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        `/api/editions/${EDITION_ID}/discovery/candidates/${SUBJECT_ID}/sources/replacement`,
+        `/api/subjects/${SUBJECT_ID}/sources/${SOURCE_ID}/content`,
         expect.objectContaining({
-          method: "PATCH",
+          method: "POST",
           body: JSON.stringify({
-            replaced_canonical_url: BLOCKED_URL,
-            url: "https://mirror.example/report",
+            content: "<html><body>ExampleRAT evidence</body></html>",
+            declared_mime_type: "text/html",
+            final_url: null,
           }),
         }),
       ),
     );
     expect(
-      await screen.findByRole("button", { name: "Relancer la production" }),
+      await screen.findByRole("button", { name: "Relancer depuis Sources" }),
     ).toBeInTheDocument();
 
     await user.click(
-      screen.getByRole("button", { name: "Relancer la production" }),
+      screen.getByRole("button", { name: "Relancer depuis Sources" }),
     );
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        `/api/production/subjects/${SUBJECT_ID}/production/restart-with-new-sources`,
-        expect.objectContaining({ method: "POST" }),
+        `/api/subjects/${SUBJECT_ID}/production/retry`,
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ stage: "sources" }),
+        }),
       ),
     );
   });
@@ -167,7 +169,7 @@ describe("PipelineTab source replacement", () => {
     await screen.findByRole("heading", { name: "Sujet bloqué" });
     expect(
       screen.queryByRole("heading", {
-        name: "Remplacer une source inaccessible",
+        name: "Fournir le contenu d'une source",
       }),
     ).not.toBeInTheDocument();
   });

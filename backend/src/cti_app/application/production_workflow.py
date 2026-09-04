@@ -1457,12 +1457,20 @@ class ProductionWorkflowOrchestrator:
         except JobCancelledError:
             raise
         except Exception as e:
+            details = getattr(e, "details", None)
+            # Le job dispatcher n'accorde ses trois tentatives qu'à un
+            # `transient_error`. Un échec de collecte dont au moins une source
+            # est elle-même retryable doit rester retryable, sinon le sujet
+            # meurt sur un aléa réseau.
+            retryable = bool(
+                isinstance(details, dict) and int(details.get("failed_retryable", 0) or 0) > 0
+            )
             return {
                 "stage": "sources",
-                "status": "error",
+                "status": "transient_error" if retryable else "error",
                 "error_code": str(getattr(e, "code", "") or "sources_error"),
                 "error": str(e),
-                "details": getattr(e, "details", None),
+                "details": details,
             }
 
         archived = sum(1 for source in sources if source.state in _ARCHIVED_STATES)

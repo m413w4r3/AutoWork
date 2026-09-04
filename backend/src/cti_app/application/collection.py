@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Sequence
@@ -7,7 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import ConfigDict, Field
 
@@ -22,6 +23,8 @@ from cti_app.application.http_collection import (
     CollectionError,
     DownloadTooLargeError,
     SafeHttpCollector,
+    UnsupportedContentError,
+    _detect_mime,
 )
 from cti_app.application.jobs import (
     JobCancelledError,
@@ -38,6 +41,7 @@ from cti_app.domain.collection import (
     CollectionAttempt,
     CollectionPolicySnapshot,
     CollectionState,
+    DetectedMimeType,
     SourceCollection,
     SourceOriginKind,
 )
@@ -58,6 +62,22 @@ _COLLECTED_STATES = {
 def _snapshot_source_urls(snapshot: ProductionInputSnapshot) -> frozenset[str]:
     """Return the frozen source URL set in deterministic order-independent form."""
     return frozenset(source.canonical_url for source in snapshot.core_sources)
+
+
+class ManualContentTypeError(CollectionNotAllowedError):
+    """The supplied bytes do not contain a supported source document."""
+
+
+class ManualContentEmptyError(CollectionNotAllowedError):
+    """The supplied source document has no content."""
+
+
+class ManualContentTooLargeError(CollectionNotAllowedError):
+    """The supplied source document exceeds the collection policy limit."""
+
+
+class ManualContentAlreadyArchivedError(CollectionNotAllowedError):
+    """The immutable archived source cannot be replaced."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +157,7 @@ class SubjectCollectionService:
         self._collector = collector
         self._blob_store = blob_store
         self._catalog = BlobCatalogService(blob_store, uow_factory)
+        self._policy = self._collector.policy
         self._workspace_materializer = workspace_materializer
         self._workspace_root = workspace_root
         self._fetch_lease = timedelta(
@@ -619,6 +640,100 @@ class SubjectCollectionService:
             size=response.decoded_size,
         )
         return CollectionState.ARCHIVED
+
+    async def archive_manual_content(
+        self,
+        collection_id: UUID,
+        *,
+        content: bytes,
+        declared_mime_type: str,
+        final_url: str | None = None,
+        actor_id: str,
+    ) -> SourceCollection:
+        """Archive analyst-supplied bytes as if they had been fetched.
+
+        An anti-bot page, a 403 or a JavaScript-rendered article cannot be
+        collected, yet the analyst holds the exact publication. The evidence
+        gate only ever compares proposals to the archived text, so supplying
+        that text restores the whole downstream chain — extraction, evidence
+        verification, publication — with no special case anywhere else.
+        """
+        if not content:
+            raise ManualContentEmptyError("Manual source content is empty")
+        if len(content) > self._policy.max_download_bytes:
+            raise ManualContentTooLargeError("Manual source content exceeds the download limit")
+        try:
+            detected_content_type = _detect_mime(content)
+        except UnsupportedContentError as exc:
+            raise ManualContentTypeError("Detected content type is not supported") from exc
+        if not isinstance(detected_content_type, DetectedMimeType):
+            raise ManualContentTypeError("Detected content type is not supported")
+
+        job_id = uuid4()
+        started_at = datetime.now(UTC)
+        async with self._uow_factory() as uow:
+            collection = await _require_collection(uow, collection_id)
+            if collection.state in _COLLECTED_STATES:
+                raise ManualContentAlreadyArchivedError("source_already_archived")
+            claimed = collection.claim_manual_upload(
+                job_id,
+                lease_duration=self._fetch_lease,
+                policy_snapshot_id=self._policy_snapshot.id,
+                now=started_at,
+            )
+            if not claimed:
+                raise CollectionNotAllowedError(
+                    "Manual source content cannot be archived in the current state"
+                )
+            await uow.collection_policy_snapshots.add_if_absent(self._policy_snapshot)
+            await uow.source_collections.save(collection)
+            await uow.commit()
+
+        response = CollectedResponse(
+            requested_url=collection.canonical_url,
+            final_url=final_url or collection.canonical_url,
+            redirect_chain=(),
+            status=200,
+            headers={},
+            declared_content_type=declared_mime_type,
+            detected_content_type=detected_content_type,
+            encoded_body=content,
+            decoded_body=content,
+            encoded_size=len(content),
+            encoded_sha256=hashlib.sha256(content).hexdigest(),
+            decoded_size=len(content),
+            decoded_sha256=hashlib.sha256(content).hexdigest(),
+            content_encoding="identity",
+            acquired_at=datetime.now(UTC),
+        )
+        await self._archive(collection_id, job_id, started_at, response)
+
+        async with self._uow_factory() as uow:
+            collection = await _require_collection(uow, collection_id)
+            subject = await uow.subjects.get(collection.subject_id)
+            if subject is None:
+                raise CollectionNotAllowedError("Collection source lost its canonical context")
+            if collection.origin_kind is not SourceOriginKind.MANUAL:
+                collection.origin_kind = SourceOriginKind.MANUAL
+                await uow.source_collections.save(collection)
+            await uow.provenance.append(
+                ProvenanceEvent(
+                    subject_id=collection.subject_id,
+                    aggregate_type="source_collection",
+                    aggregate_id=collection.id,
+                    event_type="source.archived_manually",
+                    payload={
+                        "actor_id": actor_id,
+                        "declared_mime_type": declared_mime_type,
+                        "size": response.decoded_size,
+                        "decoded_sha256": response.decoded_sha256,
+                    },
+                    tlp=subject.tlp,
+                    actor_id=actor_id,
+                )
+            )
+            await uow.commit()
+            return collection
 
     async def _candidate_for(
         self,

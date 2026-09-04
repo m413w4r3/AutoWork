@@ -13,6 +13,10 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.collection import (
+    ManualContentAlreadyArchivedError,
+    ManualContentEmptyError,
+    ManualContentTooLargeError,
+    ManualContentTypeError,
     ReferencedEvidence,
     SubjectCollectionService,
     collection_idempotency_key,
@@ -233,6 +237,94 @@ async def test_same_content_from_two_urls_reuses_blob_but_preserves_observations
         "https://one.example/report",
         "https://two.example/report",
     }
+
+
+async def test_manual_content_archives_blocked_source_and_records_provenance(
+    tmp_path: Path,
+) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://blocked.example/report",))
+    app = service(factory, Transport([]), tmp_path / "blobs")
+    source = (await app.initialize(subject.id))[0]
+    factory.collections[source.id].state = CollectionState.BLOCKED
+    content = b"<html><body>Analyst supplied evidence with ExampleRAT.</body></html>"
+
+    archived = await app.archive_manual_content(
+        source.id,
+        content=content,
+        declared_mime_type="text/html",
+        actor_id="analyst-1",
+    )
+
+    assert archived.state is CollectionState.ARCHIVED
+    assert archived.origin_kind is SourceOriginKind.MANUAL
+    assert archived.source_document_id is not None
+    document = factory.documents[archived.source_document_id]
+    assert document.decoded_size == len(content)
+    assert document.detected_mime_type == "text/html"
+    manual_events = [
+        event for event in factory.provenance if event.event_type == "source.archived_manually"
+    ]
+    assert len(manual_events) == 1
+    assert manual_events[0].actor_id == "analyst-1"
+    assert manual_events[0].payload == {
+        "actor_id": "analyst-1",
+        "declared_mime_type": "text/html",
+        "size": len(content),
+        "decoded_sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+async def test_manual_content_rejects_empty_and_oversized_content(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://blocked.example/report",))
+    app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(
+            Transport([]), Resolver(), CollectionPolicy(max_download_bytes=32)
+        ),
+        FilesystemBlobStore(tmp_path / "blobs"),
+    )
+    source = (await app.initialize(subject.id))[0]
+
+    with pytest.raises(ManualContentEmptyError):
+        await app.archive_manual_content(
+            source.id,
+            content=b"",
+            declared_mime_type="text/html",
+            actor_id="analyst-1",
+        )
+    with pytest.raises(ManualContentTooLargeError):
+        await app.archive_manual_content(
+            source.id,
+            content=b"<html>" + b"x" * 32,
+            declared_mime_type="text/html",
+            actor_id="analyst-1",
+        )
+    with pytest.raises(ManualContentTypeError):
+        await app.archive_manual_content(
+            source.id,
+            content=b"\x00",
+            declared_mime_type="application/octet-stream",
+            actor_id="analyst-1",
+        )
+
+
+async def test_manual_content_refuses_an_already_archived_source(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://one.example/report",))
+    app = service(factory, Transport([]), tmp_path / "blobs")
+    source = (await app.initialize(subject.id))[0]
+    source.state = CollectionState.ARCHIVED
+    factory.collections[source.id] = source
+
+    with pytest.raises(ManualContentAlreadyArchivedError, match="source_already_archived"):
+        await app.archive_manual_content(
+            source.id,
+            content=HTML,
+            declared_mime_type="text/html",
+            actor_id="analyst-1",
+        )
 
 
 async def test_completed_source_relaunch_is_idempotent(tmp_path: Path) -> None:

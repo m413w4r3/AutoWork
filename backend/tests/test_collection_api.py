@@ -20,6 +20,7 @@ from cti_app.application.jobs import (
     JobService,
     SynchronousJobDispatcher,
 )
+from cti_app.domain.collection import CollectionState
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.collection_support import InMemoryCollectionUnitOfWorkFactory
 from tests.job_support import InMemoryJobUnitOfWorkFactory
@@ -100,6 +101,56 @@ async def test_api_and_synchronous_worker_collect_selected_subject(tmp_path: Pat
     assert "filename*=UTF-8''" in download.headers["content-disposition"]
     assert download.headers["x-content-type-options"] == "nosniff"
     assert wrong_subject.status_code == 404
+
+
+async def test_manual_content_endpoint_accepts_multipart_and_refuses_replacement(
+    tmp_path: Path,
+) -> None:
+    collection_uow = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(collection_uow, ("https://blocked.example/report",))
+    blob_store = FilesystemBlobStore(tmp_path / "blobs")
+    service = SubjectCollectionService(
+        collection_uow,
+        SafeHttpCollector(Transport(), Resolver()),
+        blob_store,
+    )
+    source = (await service.initialize(subject.id))[0]
+    collection_uow.collections[source.id].state = source.state = CollectionState.BLOCKED
+    review_service = CollectionReviewService(collection_uow, blob_store)
+    jobs_uow = InMemoryJobUnitOfWorkFactory()
+    registry = JobRegistry()
+    register_collection_jobs(registry, service)
+    job_service = JobService(jobs_uow, registry)
+    app = FastAPI()
+    app.include_router(router)
+    app.state.collection_service = service
+    app.state.collection_review_service = review_service
+    app.state.job_service = job_service
+    app.state.job_dispatcher = SynchronousJobDispatcher(JobExecutor(jobs_uow, registry))
+    app.state.identity_provider = LocalIdentityProvider("analyst-1")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        path = f"/api/subjects/{subject.id}/sources/{source.id}/content"
+        archived = await client.post(
+            path,
+            files={"file": ("capture.html", HTML, "text/html")},
+            data={"declared_mime_type": "text/html"},
+        )
+        replacement = await client.post(
+            path,
+            json={"content": HTML.decode(), "declared_mime_type": "text/html"},
+        )
+
+    assert archived.status_code == 200
+    assert archived.json()["state"] == "archived"
+    assert replacement.status_code == 409
+    assert replacement.json()["detail"] == "source_already_archived"
+    assert any(
+        event.event_type == "source.archived_manually" and event.actor_id == "analyst-1"
+        for event in collection_uow.provenance
+    )
 
 
 async def test_retry_endpoint_processes_only_requested_source(tmp_path: Path) -> None:

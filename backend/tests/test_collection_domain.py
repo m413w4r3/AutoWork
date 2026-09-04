@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -50,3 +51,47 @@ def test_blocked_source_cannot_be_forced_for_retry() -> None:
 
     with pytest.raises(ValueError, match="cannot bypass"):
         source.prepare_explicit_retry(policy_changed=True)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        CollectionState.BLOCKED,
+        CollectionState.FAILED_TERMINAL,
+        CollectionState.UNAVAILABLE,
+        CollectionState.PENDING,
+    ],
+)
+def test_manual_upload_can_claim_failed_or_pending_source(state: CollectionState) -> None:
+    source = collection()
+    source.state = state
+    now = datetime(2026, 9, 4, tzinfo=UTC)
+
+    claimed = source.claim_manual_upload(
+        uuid4(),
+        lease_duration=timedelta(minutes=2),
+        policy_snapshot_id="policy-snapshot",
+        now=now,
+    )
+
+    assert claimed is True
+    assert source.state is CollectionState.FETCHING
+    assert source.fetch_started_at == now
+
+
+@pytest.mark.parametrize(
+    "state",
+    [CollectionState.ARCHIVED, CollectionState.EXTRACTED, CollectionState.COMPLETED],
+)
+def test_manual_upload_refuses_archived_evidence_states(state: CollectionState) -> None:
+    source = collection()
+    source.state = state
+
+    assert (
+        source.claim_manual_upload(
+            uuid4(),
+            lease_duration=timedelta(minutes=2),
+            policy_snapshot_id="policy-snapshot",
+        )
+        is False
+    )

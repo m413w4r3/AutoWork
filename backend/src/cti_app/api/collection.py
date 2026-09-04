@@ -6,9 +6,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.datastructures import UploadFile
 
 from cti_app.application.collection import (
+    ManualContentAlreadyArchivedError,
+    ManualContentEmptyError,
+    ManualContentTooLargeError,
+    ManualContentTypeError,
     SubjectCollectionService,
     collection_idempotency_key,
 )
@@ -24,6 +29,7 @@ from cti_app.application.source_filenames import ascii_download_filename, valida
 from cti_app.domain.collection import (
     Claim,
     CollectionAttempt,
+    CollectionState,
     Indicator,
     ReviewStatus,
     SourceCollection,
@@ -123,6 +129,14 @@ class RelationshipRequest(BaseModel):
     role: SourceRole
 
 
+class ManualContentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str
+    declared_mime_type: str = Field(min_length=1, max_length=255)
+    final_url: str | None = None
+
+
 @router.post(
     "/{subject_id}/collection",
     response_model=CollectionLaunchView,
@@ -208,6 +222,52 @@ async def retry_source(
         job = await jobs.get(exc.existing_job_id)
         duplicate = True
     return CollectionLaunchView(job_id=job.id, duplicate=duplicate)
+
+
+@router.post(
+    "/{subject_id}/sources/{collection_id}/content",
+    response_model=SourceView,
+)
+async def archive_manual_source_content(
+    subject_id: UUID, collection_id: UUID, request: Request
+) -> SourceView:
+    service, _review, _, _ = _runtime(request)
+    source_for_subject = next(
+        (item for item in await service.list_sources(subject_id) if item.id == collection_id),
+        None,
+    )
+    if source_for_subject is None:
+        raise HTTPException(status_code=404, detail="Source collection not found")
+    if source_for_subject.state in {
+        CollectionState.ARCHIVED,
+        CollectionState.EXTRACTED,
+        CollectionState.COMPLETED,
+    }:
+        raise HTTPException(status_code=409, detail="source_already_archived")
+
+    content, declared_mime_type, final_url = await _manual_content_payload(request)
+    try:
+        source = await service.archive_manual_content(
+            collection_id,
+            content=content,
+            declared_mime_type=declared_mime_type,
+            final_url=final_url,
+            actor_id=await _actor_id(request),
+        )
+    except CollectionItemNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Source collection not found") from exc
+    except ManualContentAlreadyArchivedError as exc:
+        raise HTTPException(status_code=409, detail="source_already_archived") from exc
+    except ManualContentTypeError as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
+    except (ManualContentEmptyError, ManualContentTooLargeError) as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except CollectionNotAllowedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    attempts = await service.attempts(source.id)
+    candidate, document = await service.source_context(source)
+    return _source_view(source, attempts[-1] if attempts else None, candidate, document)
 
 
 @router.get("/{subject_id}/workbench", response_model=WorkbenchView)
@@ -362,6 +422,32 @@ def _runtime(
 async def _actor_id(request: Request) -> str:
     provider: IdentityProvider = request.app.state.identity_provider
     return (await provider.current()).actor_id
+
+
+async def _manual_content_payload(request: Request) -> tuple[bytes, str, str | None]:
+    content_type = request.headers.get("content-type", "").casefold()
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        uploaded = form.get("file")
+        if isinstance(uploaded, UploadFile):
+            content = await uploaded.read()
+            declared = form.get("declared_mime_type") or uploaded.content_type
+            declared_mime_type = str(declared or "application/octet-stream")
+        else:
+            raw_content = form.get("content", "")
+            content = str(raw_content).encode("utf-8")
+            declared_mime_type = str(form.get("declared_mime_type") or "text/html")
+        raw_final_url = form.get("final_url")
+        final_url = str(raw_final_url) if raw_final_url else None
+        return content, declared_mime_type, final_url
+
+    try:
+        payload = ManualContentRequest.model_validate(await request.json())
+    except (ValueError, ValidationError) as exc:
+        raise HTTPException(
+            status_code=422, detail="Invalid manual source content payload"
+        ) from exc
+    return payload.content.encode("utf-8"), payload.declared_mime_type, payload.final_url
 
 
 def _source_view(

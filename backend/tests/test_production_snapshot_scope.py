@@ -256,6 +256,33 @@ async def test_sources_stage_counts_only_snapshot_sources() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sources_stage_preserves_retryable_collection_failure() -> None:
+    subject_id = uuid4()
+
+    class CollectionService:
+        async def collect_subject(
+            self, subject_id: UUID, job_id: UUID, context: object, **kwargs: object
+        ) -> str:
+            del subject_id, job_id, context, kwargs
+            raise JobHandlerError(
+                "source_collection_no_success",
+                "Aucune publication n'a pu être archivée.",
+                transient=False,
+                details={"failed_retryable": 1},
+            )
+
+    orchestrator = ProductionWorkflowOrchestrator.__new__(ProductionWorkflowOrchestrator)
+    orchestrator._collection_service = cast(Any, CollectionService())
+    run = SubjectProductionRun(subject_id=subject_id, edition_id=uuid4())
+
+    result = await orchestrator._execute_sources_stage(run, cast(Any, _Context()))
+
+    assert result["status"] == "transient_error"
+    assert result["error_code"] == "source_collection_no_success"
+    assert result["details"] == {"failed_retryable": 1}
+
+
+@pytest.mark.asyncio
 async def test_archived_source_outside_snapshot_cannot_make_sources_succeed() -> None:
     subject_id = uuid4()
     snapshot = _snapshot(subject_id, "https://example.test/core")

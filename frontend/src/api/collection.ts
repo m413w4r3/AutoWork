@@ -108,6 +108,33 @@ export function retryCollectedSource(
   );
 }
 
+export function archiveManualSourceContent(
+  subjectId: string,
+  sourceId: string,
+  input: {
+    content: File | string;
+    declaredMimeType: string;
+    finalUrl?: string | null;
+  },
+): Promise<CollectedSource> {
+  const url = `/api/subjects/${encodeURIComponent(subjectId)}/sources/${encodeURIComponent(sourceId)}/content`;
+  if (typeof input.content !== "string") {
+    const form = new FormData();
+    form.append("file", input.content);
+    form.append("declared_mime_type", input.declaredMimeType);
+    if (input.finalUrl) form.append("final_url", input.finalUrl);
+    return request(url, { method: "POST", body: form });
+  }
+  return request(
+    url,
+    jsonRequest({
+      content: input.content,
+      declared_mime_type: input.declaredMimeType,
+      final_url: input.finalUrl ?? null,
+    }),
+  );
+}
+
 export function collectedSourceDownloadUrl(
   subjectId: string,
   sourceId: string,

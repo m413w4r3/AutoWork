@@ -302,6 +302,7 @@ dependencies = [
     { name = "minio" },
     { name = "pydantic-settings" },
     { name = "pypdf" },
+    { name = "python-multipart" },
     { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "uvicorn", extra = ["standard"] },
@@ -334,6 +335,7 @@ requires-dist = [
     { name = "minio", specifier = ">=7.2,<8" },
     { name = "pydantic-settings", specifier = ">=2.10,<3" },
     { name = "pypdf", specifier = ">=5.9,<7" },
+    { name = "python-multipart", specifier = ">=0.0.20,<1" },
     { name = "redis", specifier = ">=6.4,<7" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.35,<1" },
@@ -1508,6 +1510,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/45/a5/a604144cf41036c0b11de75a2765bced88a5c980c7143ea2937a37b3087f/python_flirt-0.10.0-cp314-cp314-win32.whl", hash = "sha256:4503be271f245d671725e5390ae211c73c127a491ef08366199c5da8ebf547ff", size = 205542, upload-time = "2026-07-09T21:28:25.008Z" },
     { url = "https://files.pythonhosted.org/packages/da/ab/bf2fe17a60576a441240443981044cb9740c6fff1d488ef3be7145e28c16/python_flirt-0.10.0-cp314-cp314-win_amd64.whl", hash = "sha256:afb0e4570372d2fabe836cd76d221ec293b96a4d65632aac1460ea765b4b00a9", size = 213799, upload-time = "2026-07-09T21:28:26.298Z" },
     { url = "https://files.pythonhosted.org/packages/bd/12/b5302dfeff42df6946821811cc3df46eee784585fe2f87b8dfa784628ef4/python_flirt-0.10.0-cp314-cp314-win_arm64.whl", hash = "sha256:127262926b3dfd4beaef57bc8cab3a5d6fcb09f979caf3554db1291bd9ea950c", size = 203543, upload-time = "2026-07-09T21:28:27.634Z" },
+]
+
+[[package]]
+name = "python-multipart"
+version = "0.0.32"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5b/42/55c32bb9b12693c092ad250a0e82edb5b31ddeda6eb772de5f308b3804ad/python_multipart-0.0.32.tar.gz", hash = "sha256:be54b7f3fa167bb83e4fcd936b887b708f4e57fe75911c02aebf53efaf8d938e", size = 46881, upload-time = "2026-06-04T16:18:58.647Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e1/04/e8135ebd1ad02c56ec633277529b2602ff99ff634be76cdba5744cf554fd/python_multipart-0.0.32-py3-none-any.whl", hash = "sha256:ff6d3f776f16878c894e52e107296ffc890e913c611b1a4ec6c44e2821fe2e23", size = 30042, upload-time = "2026-06-04T16:18:57.319Z" },
 ]
 
 [[package]]
