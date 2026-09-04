@@ -7,7 +7,7 @@ from datetime import date, datetime
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -19,6 +19,9 @@ from cti_app.application.discovery.contracts import (
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
+from cti_app.application.discovery.manual_source_edits import (
+    SourceCandidateNotFoundError as ManualSourceCandidateNotFoundError,
+)
 from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.editions import EditionService
 from cti_app.application.identity import IdentityProvider
@@ -250,6 +253,13 @@ class IncompleteSourceUrlAttachment(BaseModel):
     url: str = Field(min_length=1, max_length=4000)
 
 
+class SourceUrlReplacement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    replaced_canonical_url: str
+    url: str
+
+
 class IncompleteSourceAttachmentView(BaseModel):
     source: SourceView
     updated_subject_ids: list[UUID]
@@ -467,6 +477,47 @@ async def attach_incomplete_source_url(
             source=_source_view(result.promoted_source),
             updated_subject_ids=list(result.updated_subject_ids),
         )
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.patch(
+    "/candidates/{subject_id}/sources/replacement",
+    response_model=IncompleteSourceAttachmentView,
+)
+async def attach_replacement_source_url(
+    edition_id: UUID,
+    subject_id: UUID,
+    payload: SourceUrlReplacement,
+    request: Request,
+) -> IncompleteSourceAttachmentView:
+    service: ManualSourceEditService = request.app.state.manual_source_edit_service
+    provider: IdentityProvider = request.app.state.identity_provider
+    try:
+        identity = await provider.current()
+        result = await service.attach_replacement_source_url(
+            edition_id,
+            subject_id,
+            payload.replaced_canonical_url,
+            payload.url,
+            actor_id=identity.actor_id,
+        )
+        return IncompleteSourceAttachmentView(
+            source=_source_view(result.promoted_source),
+            updated_subject_ids=list(result.updated_subject_ids),
+        )
+    except ManualSourceCandidateNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "source_candidate_not_found"},
+        ) from exc
+    except ValueError as exc:
+        # canonicalize_http_url rejects malformed replacement URLs at the
+        # service boundary; malformed request data is a client error.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_source_url", "message": str(exc)},
+        ) from exc
     except Exception as exc:
         _raise_api_error(exc)
 

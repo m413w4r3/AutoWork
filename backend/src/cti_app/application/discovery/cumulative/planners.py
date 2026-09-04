@@ -179,7 +179,8 @@ class HumanMergePlanner:
 
 class TargetedMergePlanner:
     """Deterministically merges one known incoming candidate into one known
-    existing subject — no identity-matching, no ambiguity possible.
+    existing subject — no identity-matching, no ambiguity possible. It is
+    shared by manual URL attachments and replacements.
 
     Used for edits where the caller already knows exactly which subject an
     incoming candidate belongs to (e.g. attaching a URL to an incomplete
@@ -193,9 +194,19 @@ class TargetedMergePlanner:
     kind = DiscoveryPlannerKind.HUMAN
     policy_version = "targeted-attach-v1"
 
-    def __init__(self, target_subject_id: UUID, incoming_candidate_key: UUID) -> None:
+    def __init__(
+        self,
+        target_subject_id: UUID,
+        incoming_candidate_key: UUID,
+        *,
+        operation: str = "attach",
+    ) -> None:
+        if operation not in {"attach", "replace"}:
+            raise ValueError("Targeted manual operation must be attach or replace")
         self._target_subject_id = target_subject_id
         self._incoming_candidate_key = incoming_candidate_key
+        self._operation = operation
+        self.policy_version = f"targeted-{operation}-v1"
 
     async def plan(
         self,
@@ -241,7 +252,7 @@ class TargetedMergePlanner:
                     incoming_candidate_handles=[incoming_handle],
                     confidence=MergeConfidence.HIGH,
                     disposition=MergeDisposition.APPLY,
-                    rationale="manual URL attachment",
+                    rationale=f"manual URL {self._operation}",
                     evidence=MergeEvidence(semantic_basis=["manual edit"]),
                 )
             ]

@@ -22,6 +22,7 @@ from cti_app.application.production_artifact_store import (
     MAX_ARTIFACT_BYTES,
     ProductionArtifactStore,
 )
+from cti_app.application.production_batch_repointing import _repoint_batch_item
 from cti_app.application.production_parsers import (
     ParseResult,
     ReferenceReport,
@@ -290,40 +291,6 @@ def _portable_extraction_content(content: dict[str, Any]) -> dict[str, Any]:
                 for item in collection
             ]
     return portable
-
-
-async def _repoint_batch_item(
-    uow: Any,
-    replaced_run_id: UUID | None,
-    imported_run_id: UUID,
-) -> None:
-    """Point the edition batch item at the run that replaces the old one.
-
-    The Review read model joins on ``production_run_id``. A newly imported run
-    that no batch item references is invisible to Review, so the article can
-    never be accepted nor excluded — it simply disappears from the edition.
-
-    A subject produced outside an edition batch has no item; that is a normal
-    case and not an error.
-    """
-    if replaced_run_id is None:
-        return
-    items = getattr(uow, "edition_production_batch_items", None)
-    if items is None:
-        return
-    get_by_run = getattr(items, "get_by_run", None)
-    save = getattr(items, "save", None)
-    if get_by_run is None or save is None:
-        return
-    item = await get_by_run(replaced_run_id)
-    if item is None:
-        return
-    item.production_run_id = imported_run_id
-    # An imported state is an analyst repair, not an automatic recovery: it
-    # must not consume the single automatic retry the batch still owes this
-    # subject.
-    item.auto_recovery_count = 0
-    await save(item)
 
 
 class ProductionStateService:

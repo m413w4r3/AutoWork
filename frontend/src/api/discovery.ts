@@ -496,6 +496,26 @@ export function attachIncompleteSourceUrl(
   );
 }
 
+export function attachReplacementSourceUrl(
+  editionId: string,
+  subjectId: string,
+  replacedCanonicalUrl: string,
+  url: string,
+): Promise<IncompleteSourceAttachmentResult> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/candidates/` +
+      `${encodeURIComponent(subjectId)}/sources/replacement`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replaced_canonical_url: replacedCanonicalUrl,
+        url,
+      }),
+    },
+  );
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (response.ok) return (await response.json()) as T;

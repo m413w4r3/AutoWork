@@ -57,4 +57,5 @@ class ModelOutputArchive(Protocol):
         *,
         evidence_pack_hash: str,
         actor_id: str,
+        operation: str = "manual_import",
     ) -> ModelRun: ...

@@ -1307,6 +1307,55 @@ h1 {
   height: 0.6rem;
 }
 
+.source-replacement-panel {
+  display: grid;
+  gap: 0.8rem;
+  margin-bottom: 2rem;
+  padding: 1.5rem;
+  border: 1px solid #d4ded7;
+  border-radius: 1rem;
+  background: #fffaf0;
+}
+
+.source-replacement-panel h2,
+.source-replacement-panel p {
+  margin: 0;
+}
+
+.source-replacement-list {
+  display: grid;
+  gap: 0.7rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.source-replacement-list > li {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.8rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.65rem;
+  background: #fff;
+}
+
+.source-replacement-list > li.is-source-failure {
+  border-color: #b87a32;
+  box-shadow: inset 0.25rem 0 #b87a32;
+}
+
+.source-replacement-form {
+  display: grid;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+}
+
+.source-replacement-restart {
+  display: grid;
+  gap: 0.5rem;
+  padding-top: 0.5rem;
+}
+
 .production-stage-list,
 .production-item-list {
   display: grid;

@@ -94,6 +94,7 @@ export interface StageStatus {
 
 export interface ProductionStatus {
   subject_id: string;
+  edition_id: string;
   title: string;
   status: SubjectProductionStatus;
   current_stage: SubjectProductionStage;
@@ -357,6 +358,15 @@ export async function startSubjectProduction(
   return request(`/api/subjects/${subjectId}/production`, {
     method: "POST",
   });
+}
+
+export async function restartProductionWithNewSources(
+  subjectId: string,
+): Promise<{ run_id: string; replaced_run_id: string }> {
+  return request(
+    `/api/production/subjects/${encodeURIComponent(subjectId)}/production/restart-with-new-sources`,
+    { method: "POST" },
+  );
 }
 
 /**

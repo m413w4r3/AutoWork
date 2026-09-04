@@ -13,6 +13,7 @@ from cti_app.application.discovery.cumulative.types import MergeHandleLabel
 from cti_app.application.discovery.manual_source_edits import (
     IncompleteSourceCandidateNotFoundError,
     ManualSourceEditResult,
+    SourceCandidateNotFoundError,
 )
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.domain.classification import TLP
@@ -146,6 +147,7 @@ class FakeManualSourceEditService:
         self.result = result
         self.error = error
         self.calls: list[tuple[UUID, UUID, UUID, str, str]] = []
+        self.replacement_calls: list[tuple[UUID, UUID, str, str, str]] = []
 
     async def attach_incomplete_source_url(
         self,
@@ -157,6 +159,23 @@ class FakeManualSourceEditService:
         actor_id: str,
     ) -> ManualSourceEditResult:
         self.calls.append((edition_id, subject_id, incomplete_source_id, url, actor_id))
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+    async def attach_replacement_source_url(
+        self,
+        edition_id: UUID,
+        subject_id: UUID,
+        replaced_canonical_url: str,
+        url: str,
+        *,
+        actor_id: str,
+    ) -> ManualSourceEditResult:
+        self.replacement_calls.append(
+            (edition_id, subject_id, replaced_canonical_url, url, actor_id)
+        )
         if self.error is not None:
             raise self.error
         assert self.result is not None
@@ -239,3 +258,86 @@ async def test_attach_incomplete_source_url_reports_not_found_as_404() -> None:
 
     assert response.status_code == 404
     assert response.json()["detail"]["code"] == "incomplete_source_candidate_not_found"
+
+
+@pytest.mark.asyncio
+async def test_attach_replacement_source_url_uses_canonical_url_and_reports_result() -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    replaced_url = "https://blocked.example/report"
+    replacement_url = "https://mirror.example/report"
+    promoted = _promoted_source(replacement_url)
+    service = FakeManualSourceEditService(
+        ManualSourceEditResult(promoted_source=promoted, updated_subject_ids=(subject_id,))
+    )
+    application = FastAPI()
+    application.include_router(router)
+    application.state.manual_source_edit_service = service
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.patch(
+            f"/api/editions/{edition_id}/discovery/candidates/{subject_id}/sources/replacement",
+            json={
+                "replaced_canonical_url": replaced_url,
+                "url": replacement_url,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["source"]["url"] == replacement_url
+    assert service.replacement_calls == [
+        (edition_id, subject_id, replaced_url, replacement_url, "dev-analyst")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_attach_replacement_source_url_reports_not_found_as_404() -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    service = FakeManualSourceEditService(
+        None, error=SourceCandidateNotFoundError("https://blocked.example/report")
+    )
+    application = FastAPI()
+    application.include_router(router)
+    application.state.manual_source_edit_service = service
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.patch(
+            f"/api/editions/{edition_id}/discovery/candidates/{subject_id}/sources/replacement",
+            json={
+                "replaced_canonical_url": "https://blocked.example/report",
+                "url": "https://mirror.example/report",
+            },
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "source_candidate_not_found"
+
+
+@pytest.mark.asyncio
+async def test_attach_replacement_source_url_reports_malformed_url_as_400() -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    service = FakeManualSourceEditService(None, error=ValueError("Source URL must use HTTP"))
+    application = FastAPI()
+    application.include_router(router)
+    application.state.manual_source_edit_service = service
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.patch(
+            f"/api/editions/{edition_id}/discovery/candidates/{subject_id}/sources/replacement",
+            json={
+                "replaced_canonical_url": "https://blocked.example/report",
+                "url": "ftp://not-supported.example/report",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "invalid_source_url"

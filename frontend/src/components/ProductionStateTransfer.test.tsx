@@ -53,6 +53,7 @@ function productionStatus(
 ): ProductionStatus {
   return {
     subject_id: SUBJECT_ID,
+    edition_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     title,
     status,
     current_stage: "assembly",

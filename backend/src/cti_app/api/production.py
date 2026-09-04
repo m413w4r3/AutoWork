@@ -17,6 +17,7 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
+from cti_app.application.production_batch_repointing import _repoint_batch_item
 from cti_app.application.production_jobs import (
     PRODUCTION_STAGE_MAX_ATTEMPTS,
     ProductionStageChain,
@@ -120,6 +121,7 @@ class StageStatus(BaseModel):
 
 class ProductionStatus(BaseModel):
     subject_id: str
+    edition_id: str
     title: str
     status: str  # queued, running, ready, needs_review, failed, cancelled
     current_stage: str
@@ -405,35 +407,24 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
     )
 
 
-async def _create_and_start_run(
+async def _start_production_run(
     uow_factory: UnitOfWorkFactory,
     jobs: JobService,
     dispatcher: JobDispatcher,
     *,
-    subject_id: UUID,
-    edition_id: UUID,
+    run: SubjectProductionRun,
     actor_id: str,
 ) -> tuple[SubjectProductionRun, UUID | None]:
-    """Creates (or reuses an in-flight) run and submits its SOURCES job.
-
-    Shared by "start production" and "retry references": both must go through
-    `SubjectProductionService.create_run`'s idempotency so a duplicate POST
-    never creates a second run nor submits a second job.
-    """
+    """Start one queued run and submit exactly its SOURCES job."""
     service = SubjectProductionService(uow_factory)
-    run, created = await service.create_run(
-        subject_id=subject_id,
-        edition_id=edition_id,
-    )
-
-    if run.status is SubjectProductionStatus.RUNNING and not created:
-        # Already in flight: never start it again, never re-prompt.
+    if run.status is SubjectProductionStatus.RUNNING:
+        return run, None
+    if run.status is not SubjectProductionStatus.QUEUED:
         return run, None
 
-    if created or run.status is SubjectProductionStatus.QUEUED:
-        # start_run persists and returns the RUNNING run; keep that object,
-        # not the stale QUEUED one create_run returned.
-        run = await service.start_run(run.id)
+    # start_run persists and returns the RUNNING run; keep that object, not
+    # the stale QUEUED one returned by create_run.
+    run = await service.start_run(run.id)
 
     if not await _production_run_can_dispatch(uow_factory, run.id):
         return run, None
@@ -466,6 +457,37 @@ async def _create_and_start_run(
         return run, job.id
     await dispatcher.dispatch(job.id)
     return run, job.id
+
+
+async def _create_and_start_run(
+    uow_factory: UnitOfWorkFactory,
+    jobs: JobService,
+    dispatcher: JobDispatcher,
+    *,
+    subject_id: UUID,
+    edition_id: UUID,
+    actor_id: str,
+) -> tuple[SubjectProductionRun, UUID | None]:
+    """Creates (or reuses an in-flight) run and submits its SOURCES job.
+
+    Shared by "start production" and "retry references": both must go through
+    `SubjectProductionService.create_run`'s idempotency so a duplicate POST
+    never creates a second run nor submits a second job.
+    """
+    service = SubjectProductionService(uow_factory)
+    run, created = await service.create_run(
+        subject_id=subject_id,
+        edition_id=edition_id,
+    )
+
+    del created
+    return await _start_production_run(
+        uow_factory,
+        jobs,
+        dispatcher,
+        run=run,
+        actor_id=actor_id,
+    )
 
 
 async def _production_run_can_dispatch(
@@ -738,6 +760,75 @@ async def start_subject_production(
     return _run_view(run, edition_id, job_id=job_id)
 
 
+@router.post("/production/subjects/{subject_id}/production/restart-with-new-sources")
+async def restart_subject_with_new_sources(
+    subject_id: UUID,
+    request: Request,
+) -> dict[str, str]:
+    """Create a fresh-input run after an analyst replaced a discovery URL."""
+    uow_factory, jobs, dispatcher = _runtime(request)
+    async with uow_factory() as uow:
+        current = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if current is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No production run found for subject {subject_id}",
+            )
+        if current.status in {
+            SubjectProductionStatus.QUEUED,
+            SubjectProductionStatus.RUNNING,
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "production_run_active",
+                    "message": "Cette tentative de production est encore en cours.",
+                },
+            )
+        replaced_run_id = current.id
+        edition_id = current.edition_id
+
+    actor_id = await _actor_id(request)
+    service = SubjectProductionService(uow_factory)
+    try:
+        run, created = await service.create_run(
+            subject_id=subject_id,
+            edition_id=edition_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    # A concurrent restart may have won after the initial read; never attach a
+    # second request to an active run or submit its SOURCES job twice.
+    if not created and run.status in {
+        SubjectProductionStatus.QUEUED,
+        SubjectProductionStatus.RUNNING,
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "production_run_active",
+                "message": "Cette tentative de production est encore en cours.",
+            },
+        )
+
+    async with uow_factory() as uow:
+        await _repoint_batch_item(uow, replaced_run_id, run.id)
+        await uow.commit()
+
+    await _start_production_run(
+        uow_factory,
+        jobs,
+        dispatcher,
+        run=run,
+        actor_id=actor_id,
+    )
+    return {"run_id": str(run.id), "replaced_run_id": str(replaced_run_id)}
+
+
 @router.get("/subjects/{subject_id}/production/state/export")
 async def export_subject_production_state(
     subject_id: UUID,
@@ -811,6 +902,7 @@ async def get_subject_production(
 
         return ProductionStatus(
             subject_id=str(run.subject_id),
+            edition_id=str(run.edition_id),
             title=(
                 snapshot.subject_title
                 if snapshot.subject_title

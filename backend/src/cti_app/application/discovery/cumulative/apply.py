@@ -310,6 +310,14 @@ def _merge_sources(
             if existing is None:
                 merged.append(deepcopy(incoming))
                 continue
+            if "url_replaced_manually" in incoming.parsing_warnings:
+                # A manual replacement is an explicit correction of the
+                # publication identity. Keep the incoming URL even though
+                # same_publication deliberately recognizes the old metadata
+                # as the same article, and remap IOC relations to its id.
+                merged[merged.index(existing)] = deepcopy(incoming)
+                remap[existing.id] = incoming.id
+                continue
             remap[incoming.id] = existing.id
             if existing.publisher.casefold() in {"", "unknown"}:
                 existing.publisher = incoming.publisher

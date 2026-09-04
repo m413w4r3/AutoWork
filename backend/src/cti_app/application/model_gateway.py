@@ -515,6 +515,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         *,
         evidence_pack_hash: str,
         actor_id: str,
+        operation: str = "manual_import",
     ) -> ModelRun:
         """Record user Markdown as a ModelRun marked manual_import; no API call."""
         digest = hashlib.sha256(content).hexdigest()
@@ -548,7 +549,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 # No prompt was submitted: hash of the empty string.
                 authorized_input_hash=hashlib.sha256(b"").hexdigest(),
                 evidence_pack_hash=evidence_pack_hash,
-                parameters={},
+                parameters={"operation": operation},
             )
             run.succeed_manual_import(
                 output_reference=reference,
