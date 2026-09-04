@@ -945,6 +945,68 @@ async def test_subject_and_batch_status_expose_extraction_progress(
     assert batch_response.json()["item_details"][0]["extraction_progress"] == progress
 
 
+async def test_subject_status_exposes_extraction_rejections_with_a_200_entry_limit(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert started.status_code == 200, started.text
+
+    run = uow.subject_production_runs.items[next(iter(uow.subject_production_runs.items))]
+    rejections: list[dict[str, Any]] = [
+        {
+            "source_id": "S3",
+            "source_url": "https://example.test/source-3",
+            "batch_id": "B1",
+            "model_run_id": "model-1",
+            "proposal_index": index + 1,
+            "proposal_kind": "artifact",
+            "artifact_type": "domain",
+            "reason_code": "source_evidence_missing",
+            "value": f"lost-{index}.example",
+            "value_hash": "a" * 64,
+        }
+        for index in range(201)
+    ]
+    rejections[0]["proposal_kind"] = "rule"
+    rejections[0]["artifact_type"] = "yara"
+    rejections[0]["reason_code"] = "source_rule_evidence_missing"
+    rejections[0]["value"] = "rule Lost { condition: true }"
+    await uow.production_artifacts.append(
+        ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=subject_id,
+            stage=ProductionArtifactStage.EXTRACTION,
+            version=1,
+            input_hash="b" * 64,
+            metadata={
+                "deterministic_verification": {
+                    "q2_rejected_rules": [rejections[0]],
+                    "q2_rejected_rule_count": 1,
+                    "q2_rejected_artifact_count": 200,
+                    "q2_source_evidence_rejections": rejections,
+                }
+            },
+        )
+    )
+
+    response = await api.get(f"/api/subjects/{subject_id}/production")
+
+    assert response.status_code == 200, response.text
+    extraction_rejections = response.json()["extraction_rejections"]
+    assert extraction_rejections["q2_rejected_rule_count"] == 1
+    assert extraction_rejections["q2_rejected_artifact_count"] == 200
+    assert extraction_rejections["q2_rejected_rules"][0]["value"] == (
+        "rule Lost { condition: true }"
+    )
+    assert len(extraction_rejections["q2_source_evidence_rejections"]) == 200
+    assert extraction_rejections["q2_source_evidence_rejections"][0]["value"] == (
+        "rule Lost { condition: true }"
+    )
+
+
 async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_titles(
     api: AsyncClient, uow: _Uow
 ) -> None:

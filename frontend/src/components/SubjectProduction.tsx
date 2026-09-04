@@ -6,7 +6,11 @@ import {
   shouldPollProduction,
 } from "../api/production";
 import { cancelProductionRun } from "../api/publication";
-import type { StageStatus } from "../api/production";
+import type {
+  ExtractionRejection,
+  ExtractionRejections,
+  StageStatus,
+} from "../api/production";
 import {
   formatProductionWarning,
   getBlockingSources,
@@ -86,6 +90,37 @@ function stageDetail(
 function stageArtifactHref(subjectId: string, stage: string): string {
   const artifactStage = stage === "assembly" ? "publication" : stage;
   return `/subjects/${subjectId}/production/artifacts/${artifactStage}`;
+}
+
+function orderedRejectedItems(
+  rejections: ExtractionRejections | null | undefined,
+): ExtractionRejection[] {
+  const sourceEntries = rejections?.q2_source_evidence_rejections ?? [];
+  const ruleEntries =
+    rejections?.q2_rejected_rules && rejections.q2_rejected_rules.length > 0
+      ? rejections.q2_rejected_rules
+      : sourceEntries.filter((entry) => entry.proposal_kind === "rule");
+  return [
+    ...ruleEntries,
+    ...sourceEntries.filter((entry) => entry.proposal_kind !== "rule"),
+  ];
+}
+
+function groupRejectedItems(
+  entries: ExtractionRejection[],
+): Array<[string, ExtractionRejection[]]> {
+  const groups = new Map<string, ExtractionRejection[]>();
+  for (const entry of entries) {
+    const sourceId = entry.source_id || "Source inconnue";
+    const group = groups.get(sourceId);
+    if (group) group.push(entry);
+    else groups.set(sourceId, [entry]);
+  }
+  return [...groups.entries()].sort(([, left], [, right]) => {
+    const leftHasRule = left.some((entry) => entry.proposal_kind === "rule");
+    const rightHasRule = right.some((entry) => entry.proposal_kind === "rule");
+    return Number(rightHasRule) - Number(leftHasRule);
+  });
 }
 
 function issueCopy(
@@ -249,6 +284,14 @@ export function SubjectProduction({
         raw: "",
       })),
     );
+  const rejectedItems = orderedRejectedItems(status.extraction_rejections);
+  const rejectedGroups = groupRejectedItems(rejectedItems);
+  const rejectedRuleCount =
+    status.extraction_rejections?.q2_rejected_rule_count ??
+    rejectedItems.filter((entry) => entry.proposal_kind === "rule").length;
+  const rejectedArtifactCount =
+    status.extraction_rejections?.q2_rejected_artifact_count ??
+    rejectedItems.filter((entry) => entry.proposal_kind !== "rule").length;
   const issueIsConversation =
     issueCode !== null && CONVERSATION_ERROR_CODES.has(issueCode);
   const completedStages = stageList.filter(
@@ -524,6 +567,67 @@ export function SubjectProduction({
               </li>
             ))}
           </ul>
+        </section>
+      )}
+
+      {rejectedGroups.length > 0 && (
+        <section
+          aria-labelledby="production-rejections-heading"
+          className="production-rejections"
+        >
+          <h3 id="production-rejections-heading">
+            Éléments écartés de la publication
+          </h3>
+          <p>
+            {rejectedRuleCount} règle(s) de détection et {rejectedArtifactCount}{" "}
+            artefact(s) écarté(s).
+          </p>
+          <table aria-label="Éléments écartés de la publication">
+            <thead>
+              <tr>
+                <th scope="col">Source</th>
+                <th scope="col">Type</th>
+                <th scope="col">Valeur</th>
+                <th scope="col">Raison</th>
+              </tr>
+            </thead>
+            {rejectedGroups.map(([sourceId, entries]) => (
+              <tbody key={sourceId}>
+                <tr>
+                  <th colSpan={4} scope="rowgroup">
+                    Source {sourceId}
+                  </th>
+                </tr>
+                {entries.map((entry, index) => {
+                  const isRule = entry.proposal_kind === "rule";
+                  return (
+                    <tr
+                      className={isRule ? "verification-warning" : undefined}
+                      key={`${sourceId}-${entry.proposal_index}-${index}`}
+                    >
+                      <td>{sourceId}</td>
+                      <td>
+                        {isRule ? (
+                          <strong>
+                            Règle de détection — non publiée
+                            {entry.artifact_type
+                              ? ` (${entry.artifact_type})`
+                              : ""}
+                          </strong>
+                        ) : (
+                          (entry.artifact_type ?? "inconnu")
+                        )}
+                      </td>
+                      <td>
+                        <code>{entry.value || "Valeur non conservée"}</code>
+                      </td>
+                      <td>{entry.reason_code || "raison inconnue"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            ))}
+          </table>
         </section>
       )}
 

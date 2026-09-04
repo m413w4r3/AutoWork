@@ -68,6 +68,26 @@ export interface ExtractionProgress {
   source_skips?: Record<string, ExtractionProgressSourceSkip>;
 }
 
+export interface ExtractionRejection {
+  source_id: string;
+  source_url: string;
+  batch_id: string | null;
+  model_run_id: string;
+  proposal_index: number;
+  proposal_kind: string;
+  artifact_type: string | null;
+  reason_code: string;
+  value: string;
+  value_hash: string;
+}
+
+export interface ExtractionRejections {
+  q2_rejected_rules: ExtractionRejection[];
+  q2_rejected_rule_count: number;
+  q2_rejected_artifact_count: number;
+  q2_source_evidence_rejections: ExtractionRejection[];
+}
+
 type ProductionBatchStatus =
   "queued" | "running" | "completed" | "completed_with_issues" | "cancelled";
 
@@ -112,6 +132,7 @@ export interface ProductionStatus {
   error_details: Record<string, unknown> | null;
   recovery_disposition: ProductionRecoveryDisposition;
   extraction_progress?: ExtractionProgress | null;
+  extraction_rejections?: ExtractionRejections | null;
   reconciliation?: ProductionReconciliation | null;
   /**
    * Set when the run belongs to an edition production batch. Such a run is

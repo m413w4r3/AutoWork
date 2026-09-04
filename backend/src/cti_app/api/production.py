@@ -130,6 +130,13 @@ class StageStatus(BaseModel):
     research_date: str | None = None
 
 
+class ExtractionRejections(BaseModel):
+    q2_rejected_rules: list[dict[str, Any]] = Field(default_factory=list)
+    q2_rejected_rule_count: int = 0
+    q2_rejected_artifact_count: int = 0
+    q2_source_evidence_rejections: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class ProductionStatus(BaseModel):
     subject_id: str
     edition_id: str
@@ -150,6 +157,7 @@ class ProductionStatus(BaseModel):
     error_details: dict[str, Any] | None = None
     recovery_disposition: ProductionRecoveryDisposition
     extraction_progress: dict[str, Any] | None = None
+    extraction_rejections: ExtractionRejections = Field(default_factory=ExtractionRejections)
     reconciliation: ProductionReconciliationView | None = None
     # Set when this run belongs to an edition production batch: such a run is
     # only ever resumed through the batch, never restarted standalone.
@@ -361,6 +369,45 @@ def _collect_warnings(artifacts: Sequence[Any]) -> list[str]:
             if warning not in out:
                 out.append(str(warning))
     return out
+
+
+def _rejection_entries(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [cast(dict[str, Any], entry) for entry in value if isinstance(entry, dict)]
+
+
+def _extraction_rejections(artifact: Any | None) -> ExtractionRejections:
+    if artifact is None:
+        return ExtractionRejections()
+
+    metadata = getattr(artifact, "metadata", {})
+    verification = (
+        metadata.get("deterministic_verification", {})
+        if isinstance(metadata, dict)
+        else {}
+    )
+    if not isinstance(verification, dict):
+        return ExtractionRejections()
+
+    rejections = _rejection_entries(verification.get("q2_source_evidence_rejections"))
+    rules = _rejection_entries(verification.get("q2_rejected_rules"))
+    if not rules:
+        rules = [entry for entry in rejections if entry.get("proposal_kind") == "rule"]
+
+    rule_count = verification.get("q2_rejected_rule_count")
+    if not isinstance(rule_count, int):
+        rule_count = len(rules)
+    artifact_count = verification.get("q2_rejected_artifact_count")
+    if not isinstance(artifact_count, int):
+        artifact_count = len(rejections) - len(rules)
+
+    return ExtractionRejections(
+        q2_rejected_rules=rules,
+        q2_rejected_rule_count=rule_count,
+        q2_rejected_artifact_count=artifact_count,
+        q2_source_evidence_rejections=rejections[:200],
+    )
 
 
 def _run_view(
@@ -944,6 +991,9 @@ async def get_subject_production(
 
         # Artifacts evidence the stages that produce one; SOURCES does not.
         artifacts = await uow.production_artifacts.list_for_run(run.id)
+        extraction_artifact = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.EXTRACTION.value
+        )
         artifacts_by_stage = {a.stage.value: a for a in artifacts}
         collections = await uow.source_collections.list_for_subject(subject_id)
         archived_sources = sum(1 for c in collections if c.state in _ARCHIVED_STATES)
@@ -986,6 +1036,7 @@ async def get_subject_production(
             error_details=run.error_details,
             recovery_disposition=ProductionRecoveryPolicyV1.disposition_for_run(run),
             extraction_progress=run.extraction_progress,
+            extraction_rejections=_extraction_rejections(extraction_artifact),
             reconciliation=(
                 reconciliation_view(
                     run.id,

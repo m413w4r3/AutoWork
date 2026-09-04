@@ -239,6 +239,63 @@ export function formatProductionWarning(
     };
   }
 
+  if (parsed.code === "q2_detection_rules_lost") {
+    const count = stringValue(parsed.fields.count) ?? "?";
+    return {
+      code: parsed.code,
+      title: "Règles de détection perdues",
+      source,
+      url,
+      message:
+        `${count} règle(s) YARA ou Sigma n’ont pas pu être prouvées dans leur ` +
+        `source et n’apparaîtront pas dans la publication. Consultez ` +
+        `l’extraction avant de publier.`,
+      raw,
+    };
+  }
+
+  if (parsed.code === "q2_source_evidence_rejected") {
+    const count = stringValue(parsed.fields.count) ?? "?";
+    const reason = stringValue(parsed.fields.reason);
+    const segments = raw.split(":");
+    const sourceId = segments.length >= 2 ? (segments[1] ?? null) : null;
+    const artifactType = segments.length >= 3 ? (segments[2] ?? null) : null;
+    return {
+      code: parsed.code,
+      title: "Indicateurs écartés",
+      source: source ?? sourceId,
+      url,
+      message:
+        `${count} valeur(s) de type ${artifactType ?? "inconnu"} proposées ` +
+        `pour ${sourceId ?? "cette source"} n’ont pas pu être retrouvées dans ` +
+        `le texte archivé` +
+        (reason ? ` (${reason})` : "") +
+        `. Elles ne seront pas publiées.`,
+      raw,
+    };
+  }
+
+  if (parsed.code === "q2_batch_source_evidence_rejected") {
+    const count = stringValue(parsed.fields.count) ?? "?";
+    const reason = stringValue(parsed.fields.reason);
+    const segments = raw.split(":");
+    const sourceId = segments.length >= 3 ? (segments[2] ?? null) : null;
+    const artifactType = segments.length >= 4 ? (segments[3] ?? null) : null;
+    return {
+      code: parsed.code,
+      title: "Indicateurs écartés",
+      source: source ?? sourceId,
+      url,
+      message:
+        `${count} valeur(s) de type ${artifactType ?? "inconnu"} proposées ` +
+        `pour ${sourceId ?? "cette source"} n’ont pas pu être retrouvées dans ` +
+        `le texte archivé` +
+        (reason ? ` (${reason})` : "") +
+        `. Elles ne seront pas publiées.`,
+      raw,
+    };
+  }
+
   return {
     code: parsed.code,
     title: "Avertissement non bloquant",

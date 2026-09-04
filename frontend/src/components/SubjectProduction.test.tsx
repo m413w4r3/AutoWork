@@ -306,6 +306,69 @@ describe("SubjectProduction retry from stage", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("affiche les règles rejetées avant les autres artefacts", async () => {
+    const rejectedRule = {
+      source_id: "S3",
+      source_url: "https://example.test/source-3",
+      batch_id: "B1",
+      model_run_id: "model-1",
+      proposal_index: 2,
+      proposal_kind: "rule",
+      artifact_type: "yara",
+      reason_code: "source_rule_evidence_missing",
+      value: "rule Lost { condition: true }",
+      value_hash: "a".repeat(64),
+    };
+    const rejectedArtifact = {
+      ...rejectedRule,
+      proposal_index: 1,
+      proposal_kind: "artifact",
+      artifact_type: "domain",
+      reason_code: "source_evidence_missing",
+      value: "evil.example",
+      value_hash: "b".repeat(64),
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("ready"),
+          extraction_rejections: {
+            q2_rejected_rules: [rejectedRule],
+            q2_rejected_rule_count: 1,
+            q2_rejected_artifact_count: 1,
+            q2_source_evidence_rejections: [rejectedArtifact, rejectedRule],
+          },
+        }),
+      ),
+    );
+    renderProduction();
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Éléments écartés de la publication",
+      }),
+    ).toBeInTheDocument();
+    const ruleRow = screen
+      .getByText(/Règle de détection — non publiée/)
+      .closest("tr");
+    const artifactRow = screen.getByText("evil.example").closest("tr");
+    expect(ruleRow).toHaveClass("verification-warning");
+    expect(ruleRow).not.toBeNull();
+    expect(artifactRow).not.toBeNull();
+    if (!ruleRow || !artifactRow) throw new Error("Rejected rows not found");
+    expect(
+      ruleRow.compareDocumentPosition(artifactRow) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getByRole("table")).toHaveTextContent(
+      "source_rule_evidence_missing",
+    );
+    expect(screen.getByRole("table")).toHaveTextContent(
+      "source_evidence_missing",
+    );
+  });
+
   it("présente un succès avec le label d’archive de secours", async () => {
     const progress = extractionProgress([
       {

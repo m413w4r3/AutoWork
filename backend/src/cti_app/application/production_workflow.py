@@ -1947,6 +1947,11 @@ class ProductionWorkflowOrchestrator:
             )
             warnings.extend(evidence.warnings)
             for rejection in evidence.rejections:
+                # La valeur rejetée vient de la sortie du modèle, déjà archivée
+                # en clair dans le blob de résultat brut : la conserver ici
+                # n'expose rien de neuf et c'est la seule façon pour
+                # l'analyste de savoir quel IOC a été écarté avant de
+                # publier. L'empreinte reste, elle sert au recoupement.
                 source_evidence_rejections.append(
                     {
                         "source_id": work.source.local_id,
@@ -1957,6 +1962,7 @@ class ProductionWorkflowOrchestrator:
                         "proposal_kind": rejection.proposal_kind,
                         "artifact_type": rejection.artifact_type,
                         "reason_code": rejection.reason_code,
+                        "value": rejection.value[:512],
                         "value_hash": hashlib.sha256(rejection.value.encode()).hexdigest(),
                     }
                 )
@@ -1985,6 +1991,7 @@ class ProductionWorkflowOrchestrator:
                     proposal_kind=rejection.proposal_kind,
                     artifact_type=rejection.artifact_type,
                     reason_code=rejection.reason_code,
+                    value=rejection.value[:512],
                 )
             return evidence.filtered_output
 
@@ -3488,6 +3495,14 @@ class ProductionWorkflowOrchestrator:
                 source_evidence_rejection_counts.items()
             )
         ]
+        # Une règle de détection perdue est un incident éditorial, pas un
+        # avertissement de plus : elle ne se retrouve pas, contrairement à un
+        # IOC qu'une autre source republiera.
+        rejected_rules = [
+            rejection
+            for rejection in source_evidence_rejections
+            if rejection["proposal_kind"] == "rule"
+        ]
         source_evidence_warnings = [
             (
                 f"q2_batch_source_evidence_rejected:{batch_id}:{source_id}:"
@@ -3502,6 +3517,11 @@ class ProductionWorkflowOrchestrator:
                 source_evidence_rejection_counts.items()
             )
         ]
+        if rejected_rules:
+            source_evidence_warnings.insert(
+                0,
+                f"q2_detection_rules_lost:count={len(rejected_rules)}",
+            )
         await self._check_cancellation(run.id, context)
         artifact = await self._extraction.store_extraction_result(
             run_id=run.id,
@@ -3546,6 +3566,10 @@ class ProductionWorkflowOrchestrator:
                 ],
                 "q2_source_evidence_rejections": source_evidence_rejections,
                 "q2_source_evidence_rejection_groups": source_evidence_rejection_groups,
+                "q2_rejected_rules": rejected_rules,
+                "q2_rejected_rule_count": len(rejected_rules),
+                "q2_rejected_artifact_count": len(source_evidence_rejections)
+                - len(rejected_rules),
                 "semantic_status_conflicts": [
                     {
                         "artifact_type": item.artifact_type,

@@ -174,6 +174,36 @@ async def test_batch_gate_uses_the_archive_of_the_framed_source(
             "reason_code": "source_evidence_missing",
         }
     ]
+    rejections = cast(
+        list[dict[str, object]], verification_diagnostics["q2_source_evidence_rejections"]
+    )
+    assert rejections == [
+        {
+            "source_id": "S1",
+            "source_url": "https://example.test/source-1",
+            "batch_id": "B1",
+            "model_run_id": rejections[0]["model_run_id"],
+            "proposal_index": 1,
+            "proposal_kind": "artifact",
+            "artifact_type": "domain",
+            "reason_code": "source_evidence_missing",
+            "value": "b2.security-lab.io",
+            "value_hash": hashlib.sha256(b"b2.security-lab.io").hexdigest(),
+        }
+    ]
+    assert verification_diagnostics["q2_rejected_rules"] == []
+    assert verification_diagnostics["q2_rejected_rule_count"] == 0
+    assert verification_diagnostics["q2_rejected_artifact_count"] == 1
+    assert not any(
+        warning.startswith("q2_detection_rules_lost:")
+        for warning in sink.calls[-1]["warnings"]
+    )
+    evidence_events = [
+        event
+        for event in orchestrator._diagnostics.events  # type: ignore[attr-defined]
+        if event.get("event") == "q2.source.evidence_rejected"
+    ]
+    assert evidence_events[0]["value"] == "b2.security-lab.io"
 
 
 @pytest.mark.asyncio
@@ -197,6 +227,50 @@ async def test_shared_ioc_keeps_both_real_source_provenances(
     assert result["status"] == "success", result
     item = sink.calls[-1]["canonical_json"]["items"][0]
     assert item["source_ids"] == ["S1", "S2"]
+
+
+@pytest.mark.asyncio
+async def test_batch_gate_records_rejected_artifact_and_rule_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rejected_artifact = "foreign.security-lab.io"
+    rejected_rule = "rule Lost { condition: true }"
+    orchestrator, run, _state, sink, _reader = _workflow(
+        monkeypatch,
+        [b"present.security-lab.io", b"b2.security-lab.io"],
+        _batch_response(
+            "IOC confirmed domain\n"
+            f"- {rejected_artifact}\n"
+            "RULE yara: Lost\n"
+            f"```yara\n{rejected_rule}\n```",
+            "IOC confirmed domain\n- b2.security-lab.io",
+        ),
+    )
+
+    result = await orchestrator._execute_direct_url_extraction(
+        run,
+        snapshot=_snapshot((_input_source("https://example.test/core", None),)),
+    )
+
+    assert result["status"] == "success", result
+    verification_diagnostics = cast(
+        dict[str, object], sink.calls[-1]["verification_diagnostics"]
+    )
+    rejections = cast(
+        list[dict[str, object]], verification_diagnostics["q2_source_evidence_rejections"]
+    )
+    assert {rejection["value"] for rejection in rejections} == {
+        rejected_artifact,
+        rejected_rule,
+    }
+    assert verification_diagnostics["q2_rejected_rule_count"] == 1
+    assert verification_diagnostics["q2_rejected_artifact_count"] == 1
+    rejected_rules = cast(
+        list[dict[str, object]], verification_diagnostics["q2_rejected_rules"]
+    )
+    assert [rejection["value"] for rejection in rejected_rules] == [rejected_rule]
+    warnings = cast(list[str], sink.calls[-1]["warnings"])
+    assert "q2_detection_rules_lost:count=1" in warnings
 
 
 @pytest.mark.asyncio
@@ -249,6 +323,32 @@ async def test_batch_gate_applies_literal_rule_matching_per_source(
     rules = sink.calls[-1]["canonical_json"]["rules"]
     assert [rule["body"] for rule in rules] == [body_two]
     assert rules[0]["source_ids"] == ["S2"]
+    verification_diagnostics = cast(
+        dict[str, object], sink.calls[-1]["verification_diagnostics"]
+    )
+    rejected_rules = cast(
+        list[dict[str, object]], verification_diagnostics["q2_rejected_rules"]
+    )
+    assert rejected_rules == [
+        {
+            "source_id": "S1",
+            "source_url": "https://example.test/source-1",
+            "batch_id": "B1",
+            "model_run_id": rejected_rules[0]["model_run_id"],
+            "proposal_index": 1,
+            "proposal_kind": "rule",
+            "artifact_type": "yara",
+            "reason_code": "source_rule_evidence_missing",
+            "value": body_two,
+            "value_hash": hashlib.sha256(body_two.encode()).hexdigest(),
+        }
+    ]
+    assert verification_diagnostics["q2_rejected_rule_count"] == 1
+    assert verification_diagnostics["q2_rejected_artifact_count"] == 0
+    assert any(
+        warning == "q2_detection_rules_lost:count=1"
+        for warning in sink.calls[-1]["warnings"]
+    )
 
 
 @pytest.mark.asyncio
