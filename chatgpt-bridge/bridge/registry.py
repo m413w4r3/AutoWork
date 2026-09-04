@@ -184,6 +184,14 @@ class RunRegistry:
             ).fetchone()
         return dict(row) if row else None
 
+    def get_by_idempotency_key(self, key: str) -> dict[str, Any] | None:
+        """Resolve the exact request key used when a caller lost the POST response."""
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM bridge_runs WHERE idempotency_key=?", (key,)
+            ).fetchone()
+        return dict(row) if row else None
+
     def cleanup(self) -> int:
         cutoff = time.time() - RUN_RETENTION_SECONDS
         with self._lock, self._connect() as db:

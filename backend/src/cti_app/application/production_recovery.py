@@ -52,6 +52,7 @@ class ProductionRecoveryPolicyV1:
             "no_model_response",
             "references_format_unusable",
             "synthesis_validation_failed",
+            "bridge_run_unavailable",
         }
     )
 

@@ -77,6 +77,15 @@ class TestFreshSchema:
         RunRegistry(temp_db)
         RunRegistry(temp_db)  # must not raise
 
+    def test_exact_idempotency_key_resolves_the_opaque_bridge_run(self, temp_db):
+        registry = RunRegistry(temp_db)
+        record, created = registry.claim("model-run:a1", "request-hash")
+
+        assert created is True
+        resolved = registry.get_by_idempotency_key("model-run:a1")
+        assert resolved is not None
+        assert resolved["bridge_run_id"] == record["bridge_run_id"]
+
     def test_incompatible_existing_schema_fails_clearly(self, temp_db):
         """An old, incompatible bridge_runs table must fail loudly, not migrate."""
         temp_db.parent.mkdir(parents=True, exist_ok=True)

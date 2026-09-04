@@ -217,10 +217,15 @@ async def test_background_bridge_run_returns_immediately_and_is_polled_to_comple
     replay = await create_bridge_run(request, request_with_key("durable-background"))
     await generation_started.wait()
     running = await runtime.bridge_routes.retrieve_bridge_run(accepted["id"])
+    running_by_request_key = await runtime.bridge_routes.retrieve_bridge_run(
+        "durable-background"
+    )
 
     assert accepted["status"] in {"queued", "running"}
     assert replay["id"] == accepted["id"]
     assert running["status"] == "running"
+    assert running_by_request_key["id"] == accepted["id"]
+    assert running_by_request_key["status"] == "running"
     assert extension.prompt_count == 1
 
     release_generation.set()

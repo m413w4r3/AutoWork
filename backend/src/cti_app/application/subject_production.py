@@ -226,8 +226,13 @@ async def capture_snapshot_for_new_run(
 
 
 class SubjectProductionService:
-    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        pacing: ProductionPacingPolicy | None = None,
+    ) -> None:
         self._uow_factory = uow_factory
+        self._pacing = pacing or ProductionPacingPolicy.zero()
 
     async def create_run(
         self,
@@ -382,7 +387,12 @@ class SubjectProductionService:
             )
 
     async def retry_from_stage(
-        self, run_id: UUID, stage: SubjectProductionStage
+        self,
+        run_id: UUID,
+        stage: SubjectProductionStage,
+        *,
+        force_recompute: bool = True,
+        automatic: bool = False,
     ) -> SubjectProductionRetryResult:
         async with self._uow_factory() as uow:
             # A user retry must acquire locks in the same order as publication
@@ -423,6 +433,12 @@ class SubjectProductionService:
                 if initial_run.requires_reconciliation:
                     raise ProductionReconciliationRequiredError
 
+                item = await uow.edition_production_batch_items.get_by_run(run_id)
+                if automatic and (
+                    item is None or not ProductionRecoveryPolicyV1.eligible(item, initial_run)
+                ):
+                    raise ValueError("automatic_recovery_not_allowed")
+
                 # A manifest is immutable evidence of a freeze.  Keep this
                 # check under the Edition lock so a retry cannot race with the
                 # transaction that creates the manifest.
@@ -441,20 +457,39 @@ class SubjectProductionService:
                 # running its initial pass is no exception: one subject at a
                 # time is the batch's serialization invariant, and a manual
                 # retry must not be the one gesture that breaks it.
-                await prepare_batch_for_recovery(uow, initial_run, reopen=True)
-
+                recovery_batch = await prepare_batch_for_recovery(uow, initial_run, reopen=True)
                 result = await self._retry_from_stage_in_uow(
                     uow,
                     run_id,
                     stage,
                     expected_edition_id=initial_run.edition_id,
+                    force_recompute=force_recompute,
                 )
+                if automatic and item is not None:
+                    item.auto_recovery_count += 1
+                    save_item = getattr(uow.edition_production_batch_items, "save", None)
+                    if save_item is not None:
+                        await save_item(item)
+                    if recovery_batch is not None:
+                        if recovery_batch.phase is ProductionBatchPhase.INITIAL:
+                            recovery_batch.enter_recovery()
+                        recovery_batch.schedule_next_dispatch(
+                            datetime.now(UTC)
+                            + timedelta(
+                                milliseconds=self._pacing.subject_delay_ms(
+                                    sequence_index=self._pacing.cooldown_every_n_subjects
+                                )
+                            )
+                        )
+                        await uow.edition_production_batches.save(recovery_batch)
             else:
                 # Lightweight non-database callers predating the Edition port
                 # still use the shared transaction core.  The real production
                 # UoW always exposes ``editions`` and therefore takes the
                 # protected path above.
-                result = await self._retry_from_stage_in_uow(uow, run_id, stage)
+                result = await self._retry_from_stage_in_uow(
+                    uow, run_id, stage, force_recompute=force_recompute
+                )
             await uow.commit()
             return result
 

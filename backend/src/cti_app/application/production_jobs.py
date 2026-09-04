@@ -27,8 +27,17 @@ from cti_app.application.model_gateway import ModelGateway
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.production_reconciliation_resolver import (
+    ProductionReconciliationResolver,
+    ReconciliationOutcome,
+    ReconciliationTransport,
+)
+from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
-from cti_app.application.subject_production import EditionProductionService
+from cti_app.application.subject_production import (
+    EditionProductionService,
+    SubjectProductionService,
+)
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionBatchStatus,
@@ -46,6 +55,7 @@ from cti_app.domain.production import (
 PRODUCTION_STAGE_MAX_ATTEMPTS = 3
 PRODUCTION_RECONCILIATION_RESUME_MAX_ATTEMPTS = 3
 PRODUCTION_RECONCILIATION_RESUME_JOB_KIND = "production.subject.reconciliation_resume"
+PRODUCTION_RECONCILIATION_PROBE_JOB_KIND = "production.subject.reconciliation_probe"
 
 _TERMINAL_STATUSES = {
     SubjectProductionStatus.READY,
@@ -76,6 +86,15 @@ class ProductionReconciliationResumeParameters(ProductionStageParameters):
     reconciled_output_sha256: str = Field(..., min_length=64, max_length=64)
 
 
+class ProductionReconciliationProbeParameters(JobParameters):
+    """Parameters for one read-only bridge reconciliation attempt."""
+
+    model_config = ConfigDict(extra="forbid", strict=False)
+
+    run_id: UUID = Field(..., description="Production run ID")
+    attempt: int = Field(0, ge=0, description="Reconciliation probe attempt")
+
+
 def stage_job_kind(stage: SubjectProductionStage) -> str:
     if stage is SubjectProductionStage.ASSEMBLY:
         return "production.subject.assemble"
@@ -92,6 +111,10 @@ def production_reconciliation_resume_job_kind() -> str:
     return PRODUCTION_RECONCILIATION_RESUME_JOB_KIND
 
 
+def production_reconciliation_probe_job_kind() -> str:
+    return PRODUCTION_RECONCILIATION_PROBE_JOB_KIND
+
+
 def production_reconciliation_resume_idempotency_key(
     run_id: UUID,
     stage: SubjectProductionStage,
@@ -103,6 +126,10 @@ def production_reconciliation_resume_idempotency_key(
         f"production-reconciliation-{run_id}-{stage.value}-g{pipeline_generation}"
         f"-m{model_run_id}-h{output_sha256}"
     )
+
+
+def production_reconciliation_probe_idempotency_key(run_id: UUID, attempt: int) -> str:
+    return f"production-reconciliation-probe-{run_id}-a{attempt}"
 
 
 def _reconciliation_model_run_id(value: object, inherited_exact: bool = False) -> UUID | None:
@@ -229,6 +256,94 @@ class ProductionStageChain:
         )
         return job.id
 
+    async def submit_reconciliation_probe(
+        self,
+        *,
+        run: SubjectProductionRun,
+        attempt: int,
+        correlation_id: str,
+        delay_ms: int = 0,
+        actor_id: str = "system",
+    ) -> UUID | None:
+        if self._jobs is None or self._dispatcher is None:
+            return None
+        parameters = ProductionReconciliationProbeParameters(
+            run_id=run.id,
+            attempt=attempt,
+        )
+        try:
+            job = await self._jobs.submit(
+                kind=production_reconciliation_probe_job_kind(),
+                aggregate_type="subject",
+                aggregate_id=run.subject_id,
+                idempotency_key=production_reconciliation_probe_idempotency_key(
+                    run.id, attempt
+                ),
+                correlation_id=correlation_id,
+                input_parameters=parameters.model_dump(mode="json"),
+                max_attempts=1,
+                actor_id=actor_id,
+            )
+        except DuplicateJobError as exc:
+            job = await self._jobs.get(exc.existing_job_id)
+        await self._dispatcher.dispatch(job.id, delay_ms=max(0, delay_ms))
+        return job.id
+
+    async def submit_reconciliation_resume(
+        self,
+        *,
+        run: SubjectProductionRun,
+        correlation_id: str,
+        delay_ms: int | None = None,
+        actor_id: str = "system",
+        before_dispatch: Callable[[], Awaitable[bool]] | None = None,
+    ) -> UUID | None:
+        if self._jobs is None or self._dispatcher is None:
+            return None
+        identity = run.reconciliation
+        if identity is None or identity.output_sha256 is None:
+            return None
+        parameters = ProductionReconciliationResumeParameters(
+            run_id=run.id,
+            expected_stage=identity.stage.value,
+            pipeline_generation=run.pipeline_generation,
+            reconciliation_model_run_id=identity.model_run_id,
+            reconciled_output_sha256=identity.output_sha256,
+        )
+        try:
+            job = await self._jobs.submit(
+                kind=production_reconciliation_resume_job_kind(),
+                aggregate_type="subject",
+                aggregate_id=run.subject_id,
+                idempotency_key=production_reconciliation_resume_idempotency_key(
+                    run.id,
+                    identity.stage,
+                    run.pipeline_generation,
+                    identity.model_run_id,
+                    identity.output_sha256,
+                ),
+                correlation_id=correlation_id,
+                input_parameters=parameters.model_dump(mode="json"),
+                max_attempts=PRODUCTION_RECONCILIATION_RESUME_MAX_ATTEMPTS,
+                actor_id=actor_id,
+            )
+        except DuplicateJobError as exc:
+            job = await self._jobs.get(exc.existing_job_id)
+        if before_dispatch is not None and not await before_dispatch():
+            cancel = getattr(self._jobs, "cancel", None)
+            if cancel is not None:
+                await cancel(job.id, actor_id=actor_id)
+            raise JobCancelledError
+        await self._dispatcher.dispatch(
+            job.id,
+            delay_ms=(
+                self._pacing.model_delay_ms(identity.stage)
+                if delay_ms is None
+                else max(0, delay_ms)
+            ),
+        )
+        return job.id
+
 
 def register_production_jobs(
     registry: JobRegistry,
@@ -243,11 +358,128 @@ def register_production_jobs(
     seed_enrichment: VirusTotalSeedEnrichmentService | None = None,
     pacing: ProductionPacingPolicy | None = None,
     checkpoint: EditionProductionCheckpointService | None = None,
+    bridge_transport: ReconciliationTransport | None = None,
+    reconciliation_resolver: ProductionReconciliationResolver | None = None,
     q2_reuse_max_age_days: float = 14.0,
 ) -> None:
     """Register the five production stage jobs."""
     stage_chain = chain or ProductionStageChain()
     production_pacing = pacing or stage_chain.pacing
+    resolver = reconciliation_resolver or ProductionReconciliationResolver(
+        uow_factory,
+        transport=bridge_transport,
+        model_gateway=model_gateway,
+        model_conversation_service=model_service,
+        diagnostics=diagnostics,
+    )
+
+    async def schedule_reconciliation_probe(
+        run_id: UUID, context: JobExecutionContext, *, attempt: int = 0
+    ) -> None:
+        if bridge_transport is None and reconciliation_resolver is None:
+            return
+        await context.check_cancelled()
+        async with uow_factory() as uow:
+            run = await uow.subject_production_runs.get(run_id)
+        if run is None or not run.requires_reconciliation:
+            return
+        await stage_chain.submit_reconciliation_probe(
+            run=run,
+            attempt=attempt,
+            correlation_id=await context.correlation_id(),
+            delay_ms=production_pacing.subject_delay_ms(
+                sequence_index=production_pacing.cooldown_every_n_subjects
+            ),
+        )
+
+    async def dispatch_reconciled_stage(
+        run: SubjectProductionRun,
+        context: JobExecutionContext,
+        *,
+        resume: bool,
+    ) -> None:
+        await context.check_cancelled()
+        batch_delay = 0
+        async with uow_factory() as uow:
+            item = await uow.edition_production_batch_items.get_by_run(run.id)
+            if item is not None:
+                batch_delay = await EditionProductionService(uow_factory).next_dispatch_delay_ms(
+                    item.batch_id
+                )
+        stage = run.current_stage
+        batch_delay += production_pacing.model_delay_ms(stage)
+        try:
+            if resume:
+                await stage_chain.submit_reconciliation_resume(
+                    run=run,
+                    correlation_id=await context.correlation_id(),
+                    delay_ms=batch_delay,
+                    before_dispatch=lambda: can_dispatch(run.id, context),
+                )
+            else:
+                await stage_chain.submit(
+                    run=run,
+                    stage=stage,
+                    correlation_id=await context.correlation_id(),
+                    delay_ms=batch_delay,
+                    before_dispatch=lambda: can_dispatch(run.id, context),
+                )
+        except (DuplicateJobError, JobCancelledError):
+            return
+
+    async def handle_reconciliation_probe(
+        parameters: JobParameters,
+        context: JobExecutionContext,
+    ) -> str:
+        if not isinstance(parameters, ProductionReconciliationProbeParameters):
+            raise TypeError("Invalid production reconciliation probe parameters")
+        await context.check_cancelled()
+        outcome = await resolver.resolve(parameters.run_id)
+        async with uow_factory() as uow:
+            run = await uow.subject_production_runs.get(parameters.run_id)
+        diagnostics_to_use = diagnostics
+        if diagnostics_to_use is not None:
+            diagnostics_to_use.record(
+                event="production.reconciliation_probe",
+                run_id=parameters.run_id,
+                subject_id=run.subject_id if run is not None else None,
+                bridge_run_id=getattr(resolver, "_last_bridge_run_id", None),
+                attempt=parameters.attempt,
+                outcome=outcome.value,
+                bridge_status=getattr(resolver, "_last_bridge_status", None),
+            )
+        if run is None or run.status is SubjectProductionStatus.CANCELLED:
+            return f"production-reconciliation://{parameters.run_id}#superseded"
+        if outcome is ReconciliationOutcome.RESUMED:
+            await dispatch_reconciled_stage(run, context, resume=True)
+            return f"production-reconciliation://{parameters.run_id}#resumed"
+        if outcome is ReconciliationOutcome.RELEASED:
+            if not ProductionRecoveryPolicyV1.current_stage_retry_recommended(run):
+                return f"production-reconciliation://{parameters.run_id}#needs_review"
+            try:
+                retry = await SubjectProductionService(
+                    uow_factory, production_pacing
+                ).retry_from_stage(
+                    parameters.run_id,
+                    run.current_stage,
+                    force_recompute=False,
+                    automatic=True,
+                )
+            except ValueError:
+                # The negative bridge decision is durable, but a batch/edition
+                # fence may still prevent this automatic retry. Leave the run
+                # reviewable instead of bypassing that fence.
+                return f"production-reconciliation://{parameters.run_id}#needs_review"
+            await dispatch_reconciled_stage(retry.run, context, resume=False)
+            return f"production-reconciliation://{parameters.run_id}#released"
+        if run.requires_reconciliation and (
+            parameters.attempt + 1 < PRODUCTION_RECONCILIATION_RESUME_MAX_ATTEMPTS
+        ):
+            await schedule_reconciliation_probe(
+                parameters.run_id, context, attempt=parameters.attempt + 1
+            )
+            return f"production-reconciliation://{parameters.run_id}#retry"
+        return f"production-reconciliation://{parameters.run_id}#needs_review"
 
     async def can_dispatch(run_id: UUID, context: JobExecutionContext) -> bool:
         """Re-read the run and its batch immediately before dispatch."""
@@ -467,6 +699,7 @@ def register_production_jobs(
                         )
                         await uow.subject_production_runs.save(ending)
                         await uow.commit()
+                await schedule_reconciliation_probe(parameters.run_id, context)
                 await advance_batch(parameters.run_id, correlation_id, context)
                 return f"production-stage://{parameters.run_id}/{stage.value}#needs_review"
             raise JobHandlerError(
@@ -497,6 +730,8 @@ def register_production_jobs(
                         )
                     await uow.subject_production_runs.save(ending)
                     await uow.commit()
+            if outcome == "needs_review" and error_code == PRODUCTION_RECONCILIATION_ERROR_CODE:
+                await schedule_reconciliation_probe(parameters.run_id, context)
             await advance_batch(parameters.run_id, correlation_id, context)
             if outcome == "needs_review":
                 return f"production-stage://{parameters.run_id}/{stage.value}#needs_review"
@@ -554,14 +789,24 @@ def register_production_jobs(
         handle_stage,
         resume_after_worker_loss=True,
     )
+    registry.register(
+        production_reconciliation_probe_job_kind(),
+        ProductionReconciliationProbeParameters,
+        handle_reconciliation_probe,
+        resume_after_worker_loss=True,
+    )
 
 
 __all__ = [
+    "PRODUCTION_RECONCILIATION_PROBE_JOB_KIND",
     "PRODUCTION_RECONCILIATION_RESUME_JOB_KIND",
     "PRODUCTION_RECONCILIATION_RESUME_MAX_ATTEMPTS",
+    "ProductionReconciliationProbeParameters",
     "ProductionReconciliationResumeParameters",
     "ProductionStageChain",
     "ProductionStageParameters",
+    "production_reconciliation_probe_idempotency_key",
+    "production_reconciliation_probe_job_kind",
     "production_reconciliation_resume_idempotency_key",
     "production_reconciliation_resume_job_kind",
     "production_stage_idempotency_key",

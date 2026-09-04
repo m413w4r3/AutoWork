@@ -203,6 +203,7 @@ class BridgeTransportError(ModelGatewayError):
         attempts: int = 1,
         retry_after: float | None = None,
         phase: str = "generation",
+        status_code: int | None = None,
         bridge_run_id: str | None = None,
         bridge_status: str | None = None,
         submission_state: str | None = None,
@@ -216,6 +217,7 @@ class BridgeTransportError(ModelGatewayError):
         self.attempts = attempts
         self.retry_after = retry_after
         self.phase = phase
+        self.status_code = status_code
         self.bridge_run_id = bridge_run_id
         self.bridge_status = bridge_status
         self.submission_state = submission_state
@@ -394,6 +396,7 @@ def _bridge_http_error(
         attempts=attempts,
         retry_after=_retry_after_seconds(response.headers.get("Retry-After")),
         phase=phase,
+        status_code=status,
         bridge_run_id=bridge_run_id,
         bridge_status=bridge_status,
         submission_state=submission_state,

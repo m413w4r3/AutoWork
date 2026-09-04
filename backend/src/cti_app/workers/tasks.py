@@ -306,6 +306,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             seed_enrichment=seed_enrichment,
             production_checkpoint=production_checkpoint,
             publication_assembly=publication_assembly,
+            bridge_transport=bridge_provider,
             production_q2_reuse_max_age_days=settings.production_q2_reuse_max_age_days,
         )
         job_service = JobService(uow_factory, registry)

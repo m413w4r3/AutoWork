@@ -13,13 +13,18 @@ from uuid import UUID
 import pytest
 
 from cti_app.api.production import _create_and_start_run
-from cti_app.application.jobs import JobStatus
+from cti_app.application.jobs import JobRegistry, JobService, JobStatus
 from cti_app.application.production_jobs import (
     PRODUCTION_STAGE_MAX_ATTEMPTS,
+    ProductionReconciliationProbeParameters,
     ProductionStageChain,
+    production_reconciliation_probe_idempotency_key,
+    production_reconciliation_probe_job_kind,
     production_stage_idempotency_key,
+    register_production_jobs,
     stage_job_kind,
 )
+from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_reconciliation import ProductionReconciliationService
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.subject_production import SubjectProductionService
@@ -35,7 +40,7 @@ from cti_app.domain.production import (
 )
 from cti_app.integrations.models import BridgeTransportError
 
-from .support import ProductionScenario
+from .support import DeterministicProductionJobRunner, ProductionScenario
 
 pytestmark = pytest.mark.integration
 
@@ -614,6 +619,96 @@ class _VisibleRecoveryBridge:
         assert bridge_run_id == "bridge-post-submission-8"
         self.releases += 1
         return {"released": True}
+
+
+class _MissingBridgeRun:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def retrieve(self, bridge_run_id: str) -> dict[str, Any]:
+        self.calls.append(bridge_run_id)
+        raise BridgeTransportError(
+            "bridge_protocol_error",
+            "run not found",
+            retryable=False,
+            status_code=404,
+        )
+
+
+@pytest.mark.asyncio
+async def test_automatic_probe_404_restarts_production_without_resubmitting_probe(
+    production_scenario_factory: ScenarioFactory,
+) -> None:
+    scenario, urls = _configured(production_scenario_factory, count=1)
+    scenario.model.script.q2(
+        source_url=urls[0],
+        access_mode="live_url",
+        response=BridgeTransportError(
+            "bridge_timeout",
+            "the provider may already have received the prompt",
+            retryable=True,
+            phase="generation",
+            submission_state="post_submission",
+        ),
+    )
+
+    await scenario.start()
+    review = await scenario.run_until_terminal()
+    assert review.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert review.reconciliation is not None
+
+    # The next production generation has a deterministic provider answer. The
+    # probe itself only calls GET on the bridge and never invokes the model.
+    scenario.model.script.q2(
+        source_url=urls[0],
+        access_mode="live_url",
+        response=_q2_response(1),
+    )
+    registry = JobRegistry()
+    jobs = JobService(scenario.uow_factory, registry)
+    runner = DeterministicProductionJobRunner(scenario.uow_factory, registry)
+    chain = ProductionStageChain(ProductionPacingPolicy.zero())
+    chain.bind(jobs, runner)
+    bridge = _MissingBridgeRun()
+    register_production_jobs(
+        registry,
+        scenario.uow_factory,
+        chain=chain,
+        model_service=scenario.model_service,
+        model_gateway=scenario.model,
+        collection_service=scenario.collection_service,
+        artifact_store=scenario.artifact_store,
+        diagnostics=scenario.diagnostics,
+        pacing=ProductionPacingPolicy.zero(),
+        bridge_transport=bridge,
+    )
+    probe = await jobs.submit(
+        kind=production_reconciliation_probe_job_kind(),
+        aggregate_type="subject",
+        aggregate_id=scenario.subject.id,
+        idempotency_key=production_reconciliation_probe_idempotency_key(review.id, 0),
+        correlation_id="integration-reconciliation",
+        input_parameters=ProductionReconciliationProbeParameters(
+            run_id=review.id,
+            attempt=0,
+        ).model_dump(mode="json"),
+        max_attempts=1,
+        actor_id="integration-test",
+    )
+    await runner.dispatch(probe.id)
+    await runner.run_until_idle()
+
+    final, _, item, batch = await _state(scenario)
+    assert final.status is SubjectProductionStatus.READY
+    assert final.error_code is None
+    assert final.reconciliation is None
+    assert final.pipeline_generation == 1
+    assert item is not None and item.auto_recovery_count == 1
+    assert batch is not None and batch.status is ProductionBatchStatus.COMPLETED
+    assert bridge.calls == [f"{review.reconciliation.model_run_id}:a1"]
+    extraction_calls = [call for call in scenario.model.calls if call.stage == "extraction"]
+    assert len(extraction_calls) >= 2
+    assert len({call.model_run_id for call in extraction_calls}) >= 2
 
 
 @pytest.mark.asyncio

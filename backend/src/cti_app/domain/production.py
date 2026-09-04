@@ -691,6 +691,36 @@ class SubjectProductionRun:
         self.updated_at = datetime.now(UTC)
         self.version += 1
 
+    def release_reconciliation(
+        self,
+        *,
+        expected_stage: SubjectProductionStage,
+        reason: str = "bridge_run_unavailable",
+        message: str = "Le bridge n'a produit aucune réponse récupérable.",
+        now: datetime | None = None,
+    ) -> None:
+        """Close an unavailable provider submission before opening a retry.
+
+        This is deliberately distinct from ``retry_from_stage``: the retry
+        fence remains intact until the bridge has made a terminal, negative
+        decision.  Callers must invoke this transition first, then use the
+        ordinary retry path to allocate the next pipeline generation.
+        """
+        if self.status is SubjectProductionStatus.CANCELLED:
+            raise ValueError("production_run_cancelled")
+        if self.current_stage is not expected_stage:
+            raise ValueError("production_reconciliation_stage_changed")
+        if not self.requires_reconciliation:
+            return
+        self.status = SubjectProductionStatus.NEEDS_REVIEW
+        self.error_code = reason[:64]
+        self.error_message = " ".join(message.replace("\x00", "").split())[:500]
+        self.error_details = None
+        self.reconciliation = None
+        self.finished_at = now or datetime.now(UTC)
+        self.updated_at = self.finished_at
+        self.version += 1
+
 
 @dataclass(slots=True, kw_only=True)
 class ProductionArtifact:

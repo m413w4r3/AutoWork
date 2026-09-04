@@ -621,6 +621,7 @@ def create_job_registry(
     production_checkpoint: object | None = None,
     publication_assembly: object | None = None,
     production_q2_reuse_max_age_days: float = 14.0,
+    bridge_transport: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
@@ -699,6 +700,7 @@ def create_job_registry(
             diagnostics=production_diagnostics,
             seed_enrichment=cast(Any, seed_enrichment),
             checkpoint=production_checkpoint,
+            bridge_transport=cast(Any, bridge_transport),
             q2_reuse_max_age_days=production_q2_reuse_max_age_days,
         )
     if publication_assembly is not None:

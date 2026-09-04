@@ -554,7 +554,13 @@ class BridgeRoutes:
     async def retrieve_bridge_run(self, response_id: str):
         record = self.registry.get_by_run_id(response_id)
         if record is None:
+            # A caller that lost the POST response only has the exact
+            # idempotency key (`<model-run-uuid>:aN`). Resolve that key in the
+            # same durable registry; never infer a run from UI state.
+            record = self.registry.get_by_idempotency_key(response_id)
+        if record is None:
             raise HTTPException(status_code=404, detail="Run bridge inconnu ou expiré")
+        bridge_run_id = str(record["bridge_run_id"])
         if record["state"] == "completed" and record["response_json"]:
             return json.loads(record["response_json"])
         if record["state"] == "needs_review" and record["error_json"]:
@@ -563,11 +569,11 @@ class BridgeRoutes:
             stored = json.loads(record["error_json"])
             return JSONResponse(status_code=stored["status_code"], content=stored["body"])
         return {
-            "id": response_id,
+            "id": bridge_run_id,
             "object": "response",
             "status": record["state"],
             "metadata": {
-                "bridge_progress": generation_progress(response_id),
+                "bridge_progress": generation_progress(bridge_run_id),
             },
         }
 
