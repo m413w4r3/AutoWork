@@ -92,9 +92,29 @@ function requestUrl(input: RequestInfo | URL): string {
   return input.url;
 }
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  window.history.replaceState({}, "", "/subjects/" + subjectId);
+});
 
 describe("SubjectWorkbench", () => {
+  it("ouvre directement Pipeline quand le lien de perte porte son ancre", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/subjects/" + subjectId + "#production-rejections-heading",
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(withProductionNotStarted(() => Response.json(workbench))),
+    );
+    renderWorkbench();
+
+    expect(
+      await screen.findByRole("button", { name: "Pipeline" }),
+    ).toHaveAttribute("aria-pressed", "true");
+  });
+
   it("affiche les détails archivés et conserve la relation LLM provisoire", async () => {
     vi.stubGlobal(
       "fetch",

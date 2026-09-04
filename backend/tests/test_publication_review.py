@@ -92,6 +92,9 @@ def _row(
     retry_stage: SubjectProductionStage | None = None,
     error_code: str | None = None,
     reconciliation: ProductionSubmissionReconciliation | None = None,
+    rejected_indicator_count: int = 0,
+    rejected_rule_count: int = 0,
+    published_rule_count: int = 0,
 ) -> EditionReviewReadItem:
     return EditionReviewReadItem(
         position=position,
@@ -110,6 +113,9 @@ def _row(
         effective_decision_id=effective_decision_id,
         retry_stage=retry_stage,
         reconciliation=reconciliation,
+        rejected_indicator_count=rejected_indicator_count,
+        rejected_rule_count=rejected_rule_count,
+        published_rule_count=published_rule_count,
     )
 
 
@@ -255,6 +261,27 @@ async def test_review_rules_and_exact_acceptance() -> None:
     for status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
         item, _ = await _review(status, artifact_status=None)
         assert item.blocking is True
+
+
+def test_loss_counters_are_editorial_signals_only() -> None:
+    ordinary = _row(SubjectProductionStatus.READY)
+    signalled = _row(
+        SubjectProductionStatus.READY,
+        rejected_indicator_count=7,
+        rejected_rule_count=2,
+        published_rule_count=3,
+    )
+
+    ordinary_review = EditionReviewService.from_rows(EDITION_ID, [ordinary])
+    signalled_review = EditionReviewService.from_rows(EDITION_ID, [signalled])
+
+    assert signalled_review.items[0].rejected_indicator_count == 7
+    assert signalled_review.items[0].rejected_rule_count == 2
+    assert signalled_review.items[0].published_rule_count == 3
+    assert (signalled_review.items[0].blocking, signalled_review.can_accept) == (
+        ordinary_review.items[0].blocking,
+        ordinary_review.can_accept,
+    )
 
 
 @pytest.mark.asyncio

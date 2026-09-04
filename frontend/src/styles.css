@@ -1747,6 +1747,12 @@ h1 {
   background: #f8fbf9;
 }
 
+.review-summary__losses {
+  margin: 0;
+  color: #55665c;
+  font-size: 0.95rem;
+}
+
 .review-item-list {
   display: grid;
   gap: 0.75rem;
@@ -1799,6 +1805,44 @@ h1 {
 .review-item-card__message,
 .review-item-card__progress {
   margin: 0;
+}
+
+.review-item-card__loss-signals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0;
+}
+
+.review-item-card__loss-signals a {
+  text-decoration: none;
+}
+
+.review-loss-badge {
+  display: inline-flex;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.review-loss-badge--alert {
+  border-color: #c98077;
+  color: #752e27;
+  background: #fff8f7;
+}
+
+.review-loss-badge--warning {
+  border-color: #c49b57;
+  color: #70501b;
+  background: #fffaf0;
+}
+
+.review-loss-badge--neutral {
+  border-color: #aebdb3;
+  color: #55665c;
+  background: #f8fbf9;
 }
 
 .review-item-card__message {

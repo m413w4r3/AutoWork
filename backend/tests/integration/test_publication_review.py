@@ -42,6 +42,7 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
     subject_id = uuid4()
     run_id = uuid4()
     artifact_id = uuid4()
+    extraction_artifact_id = uuid4()
     decision_id = uuid4()
     no_document_subject_id = uuid4()
     no_document_run_id = uuid4()
@@ -90,6 +91,25 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
                 )
             )
             await session.flush()
+            session.add(
+                ProductionArtifactRow(
+                    id=extraction_artifact_id,
+                    production_run_id=run_id,
+                    subject_id=subject_id,
+                    stage="extraction",
+                    version=1,
+                    input_hash="b" * 64,
+                    status="verified",
+                    artifact_metadata={
+                        "element_counts": {"rules": 3},
+                        "deterministic_verification": {
+                            "q2_rejected_rule_count": 2,
+                            "q2_rejected_artifact_count": 7,
+                        },
+                    },
+                    created_at=now,
+                )
+            )
             session.add(
                 ProductionArtifactRow(
                     id=artifact_id,
@@ -225,6 +245,9 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
             assert with_document.effective_decision.value == "exclude"
             assert with_document.effective_decision_id == decision_id
             assert with_document.document_artifact_id == artifact_id
+            assert with_document.rejected_indicator_count == 7
+            assert with_document.rejected_rule_count == 2
+            assert with_document.published_rule_count == 3
             without_document = next(row for row in review_rows if row.run_id == no_document_run_id)
             assert without_document.effective_decision is not None
             assert without_document.effective_decision.value == "exclude"
@@ -232,6 +255,9 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
             assert without_document.document_artifact_id is None
             assert without_document.document_artifact_version is None
             assert without_document.document_input_hash is None
+            assert without_document.rejected_indicator_count == 0
+            assert without_document.rejected_rule_count == 0
+            assert without_document.published_rule_count == 0
             assert without_document.retry_stage is not None
             assert without_document.retry_stage.value == "synthesis"
 

@@ -7,6 +7,7 @@ import { PipelineTab } from "../features/subject/PipelineTab";
 import { Link } from "../routing";
 
 type SubjectTab = "article" | "indicators" | "assets" | "pipeline";
+const REJECTION_ANCHOR = "production-rejections-heading";
 
 const TABS: ReadonlyArray<readonly [SubjectTab, string]> = [
   ["article", "Article"],
@@ -16,7 +17,9 @@ const TABS: ReadonlyArray<readonly [SubjectTab, string]> = [
 ];
 
 export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
-  const [tab, setTab] = useState<SubjectTab>("article");
+  const [tab, setTab] = useState<SubjectTab>(() =>
+    window.location.hash === "#" + REJECTION_ANCHOR ? "pipeline" : "article",
+  );
 
   return (
     <section className="subject-workbench">

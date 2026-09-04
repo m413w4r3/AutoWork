@@ -14,6 +14,7 @@ import { ReconciliationPanel } from "./ReconciliationPanel";
 
 const STALE_MESSAGE =
   "Cet article a changé depuis son ouverture. La revue a été rechargée.";
+const REJECTION_ANCHOR = "production-rejections-heading";
 
 function isStaleReviewError(error: unknown): boolean {
   return error instanceof ApiError && error.code === "review_item_stale";
@@ -192,6 +193,12 @@ export function ReviewItemCard({
     cancel.isPending;
   const mutationError =
     include.error ?? exclude.error ?? retry.error ?? cancel.error;
+  const pipelineRejectionLink =
+    "/subjects/" + item.subject_id + "#" + REJECTION_ANCHOR;
+  const hasLossSignals =
+    item.rejected_indicator_count > 0 ||
+    item.rejected_rule_count > 0 ||
+    item.published_rule_count > 0;
 
   const confirmExclude = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -216,6 +223,35 @@ export function ReviewItemCard({
         <p className="review-item-card__decision">
           Décision finale :{" "}
           {item.effective_decision === "include" ? "inclure" : "exclure"}
+        </p>
+      ) : null}
+
+      {hasLossSignals ? (
+        <p
+          className="review-item-card__loss-signals"
+          aria-label="Signalement des pertes"
+        >
+          {item.rejected_rule_count > 0 ? (
+            <Link to={pipelineRejectionLink}>
+              <span className="review-loss-badge review-loss-badge--alert">
+                {item.rejected_rule_count} règle(s) de détection perdue(s)
+              </span>
+            </Link>
+          ) : null}
+          {item.rejected_indicator_count > 0 ? (
+            <Link to={pipelineRejectionLink}>
+              <span className="review-loss-badge review-loss-badge--warning">
+                {item.rejected_indicator_count} indicateur(s) écarté(s)
+              </span>
+            </Link>
+          ) : null}
+          {item.published_rule_count > 0 ? (
+            <Link to={pipelineRejectionLink}>
+              <span className="review-loss-badge review-loss-badge--neutral">
+                {item.published_rule_count} règle(s) de détection publiée(s)
+              </span>
+            </Link>
+          ) : null}
         </p>
       ) : null}
 

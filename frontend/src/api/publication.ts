@@ -56,6 +56,9 @@ export interface ReviewItem {
   effective_decision: PublicationDecision | null;
   included: boolean;
   blocking: boolean;
+  rejected_indicator_count: number;
+  rejected_rule_count: number;
+  published_rule_count: number;
   /**
    * The backend owns the Review action policy. `can_retry` and
    * `requires_reconciliation` are mutually exclusive, so the UI never has to

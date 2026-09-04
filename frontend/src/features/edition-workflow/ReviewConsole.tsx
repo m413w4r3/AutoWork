@@ -63,6 +63,23 @@ export function ReviewConsole({
   const excludedCount = currentReview.items.filter(
     (item) => item.effective_decision === "exclude",
   ).length;
+  // Excluded articles are intentionally omitted: this guardrail describes
+  // what remains in the edition's publication scope.
+  const publicationScopeItems = currentReview.items.filter(
+    (item) => item.effective_decision !== "exclude",
+  );
+  const rejectedIndicatorCount = publicationScopeItems.reduce(
+    (total, item) => total + item.rejected_indicator_count,
+    0,
+  );
+  const rejectedRuleCount = publicationScopeItems.reduce(
+    (total, item) => total + item.rejected_rule_count,
+    0,
+  );
+  const publishedRuleCount = publicationScopeItems.reduce(
+    (total, item) => total + item.published_rule_count,
+    0,
+  );
 
   return (
     <section
@@ -81,6 +98,11 @@ export function ReviewConsole({
         <strong>{blockingCount} à corriger</strong>
         <strong>{excludedCount} exclus</strong>
       </div>
+      <p className="review-summary__losses">
+        Sur l’ensemble de l’édition : {rejectedIndicatorCount} indicateurs
+        écartés, {rejectedRuleCount} règles de détection perdues,{" "}
+        {publishedRuleCount} règles publiées.
+      </p>
 
       {currentReview.items.length > 0 ? (
         <ol className="review-item-list" aria-label="Articles à revoir">

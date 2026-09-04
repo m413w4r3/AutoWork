@@ -43,6 +43,9 @@ class EditionReviewReadItem:
     effective_decision_id: UUID | None = None
     retry_stage: SubjectProductionStage | None = None
     reconciliation: ProductionSubmissionReconciliation | None = None
+    rejected_indicator_count: int = 0
+    rejected_rule_count: int = 0
+    published_rule_count: int = 0
 
 
 class EditionReviewReadRepository(Protocol):
@@ -109,6 +112,9 @@ class EditionReviewItem:
     retry_stage: SubjectProductionStage | None = None
     requires_reconciliation: bool = False
     reconciliation: ProductionSubmissionReconciliation | None = None
+    rejected_indicator_count: int = 0
+    rejected_rule_count: int = 0
+    published_rule_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +332,12 @@ def _build_item(row: EditionReviewReadItem) -> EditionReviewItem:
         retry_stage=retry_stage,
         requires_reconciliation=reconciliation_required,
         reconciliation=row.reconciliation if reconciliation_required else None,
+        # Une perte d'indicateurs ou de règles n'est jamais bloquante : c'est un
+        # signal éditorial. Bloquer automatiquement empêcherait de publier un
+        # article dont la source ne fournit tout simplement pas de règle.
+        rejected_indicator_count=row.rejected_indicator_count,
+        rejected_rule_count=row.rejected_rule_count,
+        published_rule_count=row.published_rule_count,
     )
 
 

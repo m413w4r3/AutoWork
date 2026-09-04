@@ -89,6 +89,9 @@ class ReviewItemView(BaseModel):
     effective_decision_id: UUID | None
     included: bool
     blocking: bool
+    rejected_indicator_count: int = 0
+    rejected_rule_count: int = 0
+    published_rule_count: int = 0
     # The frontend must never infer the retry policy from an error message:
     # ``can_retry`` and ``requires_reconciliation`` are mutually exclusive and
     # each names exactly one operator action.
@@ -347,6 +350,9 @@ def _review_view(review: EditionReview) -> EditionReviewView:
                 effective_decision_id=item.effective_decision_id,
                 included=item.included,
                 blocking=item.blocking,
+                rejected_indicator_count=item.rejected_indicator_count,
+                rejected_rule_count=item.rejected_rule_count,
+                published_rule_count=item.published_rule_count,
                 can_retry=item.can_retry,
                 retry_stage=item.retry_stage,
                 requires_reconciliation=item.requires_reconciliation,

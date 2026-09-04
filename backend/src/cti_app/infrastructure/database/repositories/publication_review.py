@@ -113,6 +113,54 @@ class SqlAlchemyEditionReviewReadRepository:
             )
             .subquery("current_review_artifacts")
         )
+        current_extraction = (
+            select(
+                ProductionArtifactRow.production_run_id.label("run_id"),
+                func.coalesce(
+                    ProductionArtifactRow.artifact_metadata[
+                        "q2_rejected_artifact_count"
+                    ].as_integer(),
+                    ProductionArtifactRow.artifact_metadata["deterministic_verification"][
+                        "q2_rejected_artifact_count"
+                    ].as_integer(),
+                ).label("rejected_indicator_count"),
+                func.coalesce(
+                    ProductionArtifactRow.artifact_metadata["q2_rejected_rule_count"].as_integer(),
+                    ProductionArtifactRow.artifact_metadata["deterministic_verification"][
+                        "q2_rejected_rule_count"
+                    ].as_integer(),
+                ).label("rejected_rule_count"),
+                func.coalesce(
+                    ProductionArtifactRow.artifact_metadata["rules_count"].as_integer(),
+                    ProductionArtifactRow.artifact_metadata["deterministic_verification"][
+                        "rules_count"
+                    ].as_integer(),
+                    ProductionArtifactRow.artifact_metadata["element_counts"]["rules"].as_integer(),
+                ).label("published_rule_count"),
+                func.row_number()
+                .over(
+                    partition_by=ProductionArtifactRow.production_run_id,
+                    order_by=(
+                        case(
+                            (
+                                ProductionArtifactRow.stage
+                                == ProductionArtifactStage.EXTRACTION.value,
+                                1,
+                            ),
+                            else_=0,
+                        ).desc(),
+                        ProductionArtifactRow.version.desc(),
+                        ProductionArtifactRow.id.desc(),
+                    ),
+                )
+                .label("artifact_rank"),
+            )
+            .where(
+                ProductionArtifactRow.stage == ProductionArtifactStage.EXTRACTION.value,
+                ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value,
+            )
+            .subquery("current_review_extraction")
+        )
         group_title = (
             select(EditorialGroupRow.title)
             .where(
@@ -142,6 +190,15 @@ class SqlAlchemyEditionReviewReadRepository:
                 current_artifacts.c.artifact_version,
                 current_artifacts.c.artifact_hash,
                 current_artifacts.c.artifact_status,
+                func.coalesce(current_extraction.c.rejected_indicator_count, 0).label(
+                    "rejected_indicator_count"
+                ),
+                func.coalesce(current_extraction.c.rejected_rule_count, 0).label(
+                    "rejected_rule_count"
+                ),
+                func.coalesce(current_extraction.c.published_rule_count, 0).label(
+                    "published_rule_count"
+                ),
                 SubjectProductionRunRow.error_code.label("error_code"),
                 SubjectProductionRunRow.error_message.label("error_message"),
                 SubjectProductionRunRow.reconciliation_model_run_id.label(
@@ -188,6 +245,13 @@ class SqlAlchemyEditionReviewReadRepository:
                 and_(
                     current_artifacts.c.run_id == EditionProductionBatchItemRow.production_run_id,
                     current_artifacts.c.artifact_rank == 1,
+                ),
+            )
+            .outerjoin(
+                current_extraction,
+                and_(
+                    current_extraction.c.run_id == EditionProductionBatchItemRow.production_run_id,
+                    current_extraction.c.artifact_rank == 1,
                 ),
             )
             .outerjoin(
@@ -297,4 +361,7 @@ def _read_item_from_row(row: Any) -> EditionReviewReadItem:
         ),
         retry_stage=SubjectProductionStage(row["current_stage"]) if can_retry else None,
         reconciliation=reconciliation,
+        rejected_indicator_count=row["rejected_indicator_count"] or 0,
+        rejected_rule_count=row["rejected_rule_count"] or 0,
+        published_rule_count=row["published_rule_count"] or 0,
     )

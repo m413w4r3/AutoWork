@@ -41,6 +41,9 @@ const baseItem: ReviewItem = {
   effective_decision: "include",
   included: true,
   blocking: false,
+  rejected_indicator_count: 0,
+  rejected_rule_count: 0,
+  published_rule_count: 0,
   can_retry: false,
   retry_stage: null,
   requires_reconciliation: false,
@@ -513,6 +516,75 @@ describe("ReviewConsole", () => {
     expect(
       screen.getByRole("button", { name: "Accepter la production" }),
     ).toBeDisabled();
+  });
+
+  it("signale les trois compteurs non nuls par des liens vers les pertes du Pipeline", async () => {
+    const signalled = makeItem({
+      rejected_indicator_count: 7,
+      rejected_rule_count: 2,
+      published_rule_count: 5,
+    });
+    const silent = makeItem({
+      subject_id: "subject-silent",
+      title: "Article sans perte",
+    });
+    renderReview(makeReview([signalled, silent]));
+
+    const signalledCard = (await screen.findAllByRole("listitem"))[0]!;
+    expect(
+      within(signalledCard).getByRole("link", {
+        name: "2 règle(s) de détection perdue(s)",
+      }),
+    ).toHaveAttribute(
+      "href",
+      "/subjects/subject-1#production-rejections-heading",
+    );
+    expect(
+      within(signalledCard).getByRole("link", {
+        name: "7 indicateur(s) écarté(s)",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(signalledCard).getByRole("link", {
+        name: "5 règle(s) de détection publiée(s)",
+      }),
+    ).toBeInTheDocument();
+
+    const silentCard = (await screen.findAllByRole("listitem"))[1]!;
+    expect(
+      within(silentCard).queryByRole("link", {
+        name: /règle\(s\) de détection|indicateur\(s\) écarté\(s\)/,
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("somme les pertes du périmètre de publication en excluant les articles exclus", async () => {
+    // Choix éditorial : un article déjà exclu ne fait plus partie de l’édition publiée.
+    const excluded = makeItem({
+      subject_id: "subject-excluded",
+      title: "Article exclu",
+      effective_decision: "exclude",
+      included: false,
+      rejected_indicator_count: 100,
+      rejected_rule_count: 100,
+      published_rule_count: 100,
+    });
+    renderReview(
+      makeReview([
+        makeItem({
+          rejected_indicator_count: 3,
+          rejected_rule_count: 2,
+          published_rule_count: 4,
+        }),
+        excluded,
+      ]),
+    );
+
+    expect(
+      await screen.findByText(
+        "Sur l’ensemble de l’édition : 3 indicateurs écartés, 2 règles de détection perdues, 4 règles publiées.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("active Accept sans body métier et invalide la publication et l’édition", async () => {
