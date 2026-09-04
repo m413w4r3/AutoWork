@@ -292,6 +292,40 @@ def _portable_extraction_content(content: dict[str, Any]) -> dict[str, Any]:
     return portable
 
 
+async def _repoint_batch_item(
+    uow: Any,
+    replaced_run_id: UUID | None,
+    imported_run_id: UUID,
+) -> None:
+    """Point the edition batch item at the run that replaces the old one.
+
+    The Review read model joins on ``production_run_id``. A newly imported run
+    that no batch item references is invisible to Review, so the article can
+    never be accepted nor excluded — it simply disappears from the edition.
+
+    A subject produced outside an edition batch has no item; that is a normal
+    case and not an error.
+    """
+    if replaced_run_id is None:
+        return
+    items = getattr(uow, "edition_production_batch_items", None)
+    if items is None:
+        return
+    get_by_run = getattr(items, "get_by_run", None)
+    save = getattr(items, "save", None)
+    if get_by_run is None or save is None:
+        return
+    item = await get_by_run(replaced_run_id)
+    if item is None:
+        return
+    item.production_run_id = imported_run_id
+    # An imported state is an analyst repair, not an automatic recovery: it
+    # must not consume the single automatic retry the batch still owes this
+    # subject.
+    item.auto_recovery_count = 0
+    await save(item)
+
+
 class ProductionStateService:
     def __init__(
         self,
@@ -453,6 +487,10 @@ class ProductionStateService:
                 raise ProductionStateError(
                     code="production_state_active_run", message="Production run is active"
                 )
+            # L'item de lot d'édition pointe vers le run remplacé. Sans
+            # repointage, la revue de publication continue d'afficher l'ancien
+            # run en échec et l'état importé reste invisible.
+            replaced_run_id = current.id if current is not None else None
             allocator = getattr(uow.subject_production_runs, "allocate_next_run_number", None)
             if allocator is not None:
                 next_run_number = await allocator(subject_id)
@@ -478,6 +516,9 @@ class ProductionStateService:
                 version=1,
             )
             await uow.subject_production_runs.add(run)
+            # La décision de publication reste attachée au run remplacé : un
+            # état corrigé à la main doit être revu, pas hérité.
+            await _repoint_batch_item(uow, replaced_run_id, run.id)
             editorial_group = await uow.editorial_groups.get_by_subject(subject_id)
             if editorial_group is not None:
                 assert run.research_date is not None

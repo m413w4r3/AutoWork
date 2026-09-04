@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, cast
-from uuid import uuid4
+from unittest.mock import AsyncMock
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -10,8 +12,15 @@ from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateService,
     ProductionStateSnapshotV1,
+    _validate_snapshot,
     compute_production_state_checksum,
 )
+from cti_app.domain.production import (
+    EditionProductionBatchItem,
+    SubjectProductionRun,
+    SubjectProductionStatus,
+)
+from tools.production_state_checksum import canonical_checksum
 
 
 def _payload() -> dict[str, Any]:
@@ -53,6 +62,110 @@ def _payload() -> dict[str, Any]:
 class _FailingFactory:
     def __call__(self) -> Any:
         raise AssertionError("UoW must not be opened for invalid input")
+
+
+class _ImportUow:
+    def __init__(self, current: SubjectProductionRun, item: Any | None) -> None:
+        self.subject_production_runs = SimpleNamespace(
+            lock_creation_for_subject=AsyncMock(),
+            get_current_for_subject=AsyncMock(return_value=current),
+            allocate_next_run_number=AsyncMock(return_value=current.run_number + 1),
+            add=AsyncMock(),
+        )
+        self.edition_production_batch_items = SimpleNamespace(
+            get_by_run=AsyncMock(return_value=item),
+            save=AsyncMock(),
+        )
+        self.editorial_groups = SimpleNamespace(get_by_subject=AsyncMock(return_value=None))
+        self.production_artifacts = SimpleNamespace(append=AsyncMock())
+        self.production_input_snapshots = SimpleNamespace(add=AsyncMock())
+        self.commit = AsyncMock()
+
+    async def __aenter__(self) -> "_ImportUow":
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        return None
+
+
+class _ImportFactory:
+    def __init__(self, uow: _ImportUow) -> None:
+        self.uow = uow
+
+    def __call__(self) -> _ImportUow:
+        return self.uow
+
+
+class _ImportArtifactStore:
+    async def store_stage_payloads(
+        self,
+        *,
+        canonical: dict[str, Any] | None = None,
+        rendered: str | None = None,
+    ) -> tuple[Any, Any, Any]:
+        if canonical is not None:
+            return None, uuid4(), None
+        assert rendered is not None
+        return None, None, uuid4()
+
+
+def _import_service(item: Any | None) -> tuple[ProductionStateService, _ImportUow, UUID, UUID]:
+    subject_id = uuid4()
+    edition_id = uuid4()
+    current = SubjectProductionRun(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        status=SubjectProductionStatus.NEEDS_REVIEW,
+    )
+    uow = _ImportUow(current, item)
+    service = ProductionStateService(_ImportFactory(uow), _ImportArtifactStore())
+    return service, uow, subject_id, edition_id
+
+
+@pytest.mark.asyncio
+async def test_import_repoints_existing_batch_item_and_resets_auto_recovery() -> None:
+    service, uow, subject_id, edition_id = _import_service(None)
+    current_run_id = uow.subject_production_runs.get_current_for_subject.return_value.id
+    item = EditionProductionBatchItem(
+        batch_id=uuid4(),
+        subject_id=subject_id,
+        production_run_id=current_run_id,
+        position=1,
+        auto_recovery_count=1,
+    )
+    uow.edition_production_batch_items.get_by_run.return_value = item
+
+    result = await service.import_state(
+        subject_id=subject_id, edition_id=edition_id, payload=_payload()
+    )
+
+    assert item.production_run_id == result.run_id
+    assert item.auto_recovery_count == 0
+    uow.edition_production_batch_items.save.assert_awaited_once_with(item)
+    uow.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_import_without_batch_item_succeeds() -> None:
+    service, uow, subject_id, edition_id = _import_service(None)
+
+    result = await service.import_state(
+        subject_id=subject_id, edition_id=edition_id, payload=_payload()
+    )
+
+    assert result.status == "needs_review"
+    uow.edition_production_batch_items.get_by_run.assert_awaited_once()
+    uow.edition_production_batch_items.save.assert_not_awaited()
+
+
+def test_checksum_tool_repairs_edited_snapshot() -> None:
+    payload = _payload()
+    payload["artifacts"]["synthesis"]["rendered_content"] = "Fait [S1] corrigé par l'analyste"
+    payload["content_sha256"] = canonical_checksum(payload)
+
+    snapshot = _validate_snapshot(payload)
+
+    assert snapshot.content_sha256 == compute_production_state_checksum(snapshot)
 
 
 @pytest.mark.asyncio

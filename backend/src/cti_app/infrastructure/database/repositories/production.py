@@ -819,7 +819,10 @@ class SqlAlchemyEditionProductionBatchItemRepository:
         await self._session.execute(
             update(EditionProductionBatchItemRow)
             .where(EditionProductionBatchItemRow.id == item.id)
-            .values(auto_recovery_count=item.auto_recovery_count)
+            .values(
+                production_run_id=item.production_run_id,
+                auto_recovery_count=item.auto_recovery_count,
+            )
         )
 
 
