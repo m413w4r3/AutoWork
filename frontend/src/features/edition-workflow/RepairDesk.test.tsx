@@ -520,6 +520,15 @@ describe("Repair Desk", () => {
       .click(screen.getByRole("button", { name: /rule EvilExample/ }));
     expect(await screen.findByText(ruleDetail.body)).toBeInTheDocument();
     expect(document.querySelector("script")).toBeNull();
+    // The full body belongs to the bounded, scrollable rule panel only: the
+    // facts list keeps the short preview so the decision buttons stay visible.
+    const bodyNodes = screen.getAllByText(ruleDetail.body);
+    expect(bodyNodes).toHaveLength(1);
+    expect(bodyNodes[0]?.closest(".repair-rule-panel__body")).not.toBeNull();
+    expect(screen.getByText("Extrait")).toBeInTheDocument();
+    expect(
+      screen.getByText("Corps intégral ci-dessous."),
+    ).toBeInTheDocument();
   });
 
   it("permet d’atteindre la page suivante", async () => {

@@ -180,6 +180,20 @@ class ProductionRepairIssueNotFoundError(ValueError):
     """A requested repair issue is not present in the current extraction."""
 
 
+class ProductionRepairValueNotVerifiableError(ValueError):
+    """An INCLUDE was asked for a value the deterministic pipeline rejects.
+
+    Q2 rejects proposals for evidence reasons but also for shape reasons
+    (``normalization_error``, an unsupported artifact type, an oversized rule).
+    Accepting such a value would make every later projection of the article
+    fail, and the append-only decision log would keep it that way, so the
+    gesture is refused at the point where the analyst can still choose
+    ``exclude`` instead.
+    """
+
+    code = "production_repair_value_not_verifiable"
+
+
 class ProductionRepairProjectionError(ValueError):
     """The effective extraction cannot be safely projected."""
 
@@ -791,6 +805,9 @@ class ProductionRepairProjectionResult:
     included_repair_keys: tuple[str, ...] = ()
     excluded_repair_keys: tuple[str, ...] = ()
     unresolved_repair_keys: tuple[str, ...] = ()
+    # INCLUDE decisions the deterministic pipeline cannot rebuild. Recorded,
+    # never fatal: the append-only log would otherwise freeze the article.
+    unbuildable_repair_keys: tuple[str, ...] = ()
 
 
 class ProductionRepairProjectionService:
@@ -926,6 +943,7 @@ class ProductionRepairProjectionService:
             included: list[str] = []
             excluded: list[str] = []
             unresolved: list[str] = []
+            unbuildable: list[str] = []
             accepted_indicator_count = 0
             accepted_rule_count = 0
             additions: list[ExtractionItem] = []
@@ -963,10 +981,13 @@ class ProductionRepairProjectionService:
                         additions.append(_build_override_item(entry, value, repair_key))
                         if is_publication_ioc_artifact_type(entry.get("artifact_type")):
                             accepted_indicator_count += 1
-                except (TypeError, ValueError) as exc:
-                    raise ProductionRepairProjectionError(
-                        "repair_payload_invalid"
-                    ) from exc
+                except (KeyError, TypeError, ValueError):
+                    # The decision log is append-only, so raising here would
+                    # make the article permanently unbuildable. Record the
+                    # honoured-but-unbuildable include and keep projecting; the
+                    # decision endpoint refuses such an include up front.
+                    unbuildable.append(repair_key)
+                    continue
                 included.append(repair_key)
 
             projected = TechnicalExtraction(
@@ -994,6 +1015,7 @@ class ProductionRepairProjectionService:
                     included_repair_keys=tuple(sorted(included)),
                     excluded_repair_keys=tuple(sorted(excluded)),
                     unresolved_repair_keys=tuple(sorted(unresolved)),
+                    unbuildable_repair_keys=tuple(sorted(unbuildable)),
                 )
 
             effective_for_base = [
@@ -1024,6 +1046,7 @@ class ProductionRepairProjectionService:
                 "included_repair_keys": sorted(included),
                 "excluded_repair_keys": sorted(excluded),
                 "unresolved_repair_keys": sorted(unresolved),
+                "unbuildable_repair_keys": sorted(unbuildable),
                 "actor_id": actor_id,
             }
             metadata: dict[str, Any] = {
@@ -1065,6 +1088,7 @@ class ProductionRepairProjectionService:
                 included_repair_keys=tuple(sorted(included)),
                 excluded_repair_keys=tuple(sorted(excluded)),
                 unresolved_repair_keys=tuple(sorted(unresolved)),
+                unbuildable_repair_keys=tuple(sorted(unbuildable)),
             )
 
 
@@ -1282,6 +1306,33 @@ def _build_override_rule(
         model_run_ids=_entry_model_run_ids(entry),
         evidence_basis=ProductionEvidenceBasis.ANALYST_OVERRIDE,
     )
+
+
+def repair_include_is_buildable(
+    kind: ProductionRepairIssueKind | str,
+    entry: Mapping[str, Any],
+    value: str | None,
+) -> bool:
+    """Report whether an INCLUDE could actually be projected later.
+
+    This is the very same construction the projection performs, run ahead of
+    the decision so an unbuildable value is refused while the analyst can
+    still exclude it.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    issue_kind = _repair_kind(kind)
+    repair_key = str(entry.get("repair_key") or _sha256(value))
+    try:
+        if issue_kind is ProductionRepairIssueKind.REJECTED_RULE:
+            _build_override_rule(entry, value, repair_key)
+        elif issue_kind is ProductionRepairIssueKind.REJECTED_INDICATOR:
+            _build_override_item(entry, value, repair_key)
+        else:
+            return True
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _item_projection_key(item: ExtractionItem) -> tuple[str, str]:

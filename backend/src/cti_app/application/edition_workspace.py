@@ -22,8 +22,7 @@ from cti_app.application.production_parsers import technical_extraction_from_jso
 from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateService,
-    ProductionStateSnapshotV1,
-    ProductionStateSnapshotV2,
+    ProductionStateSnapshot,
 )
 from cti_app.domain.production import DetectionRule, DetectionRuleType
 
@@ -74,7 +73,7 @@ class EditionWorkspaceMaterializer:
         position: int,
         subject_id: UUID,
         subject_title: str,
-        production_state: ProductionStateSnapshotV1 | ProductionStateSnapshotV2,
+        production_state: ProductionStateSnapshot,
         publication: Mapping[str, Any] | None = None,
         rendered_content: str | None = None,
         sources: Sequence[Mapping[str, Any]] = (),

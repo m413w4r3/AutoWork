@@ -129,6 +129,8 @@ export interface EditionRepairItem {
   rebuild_required: boolean;
   recommended_stage: string | null;
   is_publication_ioc: boolean;
+  /** False when the analyst excluded the article from the deliverable. */
+  in_publication_scope?: boolean;
 }
 
 export interface EditionRepairSummary {

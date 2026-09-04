@@ -47,6 +47,8 @@ from cti_app.application.production_repairs import (
     ProductionRepairResolvedError,
     ProductionRepairStaleError,
     ProductionRepairStatusError,
+    ProductionRepairValueNotVerifiableError,
+    repair_include_is_buildable,
 )
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import (
@@ -203,6 +205,7 @@ class EditionRepairItemView(BaseModel):
     rebuild_required: bool
     recommended_stage: str | None
     is_publication_ioc: bool
+    in_publication_scope: bool = True
 
 
 class EditionRepairSummaryView(BaseModel):
@@ -437,6 +440,55 @@ async def _find_edition_repair_issue(
     return None
 
 
+async def _require_buildable_include(
+    request: Request,
+    edition_id: UUID,
+    repair_key: str,
+    issue: Any,
+    action: ProductionRepairAction,
+) -> None:
+    """Refuse an INCLUDE the deterministic projection could never rebuild.
+
+    The decision log is append-only, so honouring such an include would leave
+    the article permanently unbuildable with no way to change the answer.
+    """
+    if action is not ProductionRepairAction.INCLUDE:
+        return
+    kind = _repair_issue_kind(issue)
+    if kind not in {
+        ProductionRepairIssueKind.REJECTED_INDICATOR,
+        ProductionRepairIssueKind.REJECTED_RULE,
+    }:
+        return
+    detail = await _repair_issue_service(request).get_issue(
+        edition_id, repair_key, _repair_issue_subject(issue)
+    )
+    if detail is None or not detail.payload_available:
+        # Without the inert payload the projection has nothing to rebuild.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": ProductionRepairValueNotVerifiableError.code,
+                "repair_key": repair_key,
+            },
+        )
+    entry = {
+        "repair_key": repair_key,
+        "source_id": detail.issue.source_id,
+        "source_url": detail.issue.source_url,
+        "artifact_type": detail.issue.artifact_type,
+        "model_run_id": detail.issue.model_run_id,
+    }
+    if not repair_include_is_buildable(kind, entry, detail.value):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": ProductionRepairValueNotVerifiableError.code,
+                "repair_key": repair_key,
+            },
+        )
+
+
 def _edition_repair_error(exc: Exception) -> NoReturn:
     if isinstance(exc, ProductionRepairResolvedError):
         raise HTTPException(
@@ -576,6 +628,9 @@ async def decide_edition_review_repair(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "production_repair_stale"},
         )
+    await _require_buildable_include(
+        request, edition_id, repair_key, issue, ProductionRepairAction(payload.action)
+    )
     try:
         decision = await _repair_decision_service(request).decide(
             edition_id=edition_id,
@@ -645,6 +700,9 @@ async def decide_edition_review_repairs(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail={"code": "production_repair_action_invalid"},
             ) from exc
+        await _require_buildable_include(
+            request, edition_id, requested.repair_key, issue, action
+        )
         inputs.append(
             ProductionRepairDecisionInput(
                 subject_id=requested.observed_subject_id,
@@ -1228,6 +1286,7 @@ def _repair_item_view(item: EditionRepairItem) -> dict[str, Any]:
         "rebuild_required": item.rebuild_required,
         "recommended_stage": item.recommended_stage,
         "is_publication_ioc": item.is_publication_ioc,
+        "in_publication_scope": item.in_publication_scope,
     }
 
 

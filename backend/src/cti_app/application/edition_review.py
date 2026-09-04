@@ -163,6 +163,10 @@ class EditionRepairItem:
     rebuild_required: bool
     recommended_stage: str | None
     is_publication_ioc: bool = False
+    # False when the analyst excluded this article from the deliverable: the
+    # issue stays visible and arbitrable, but it is not a loss for the
+    # publication scope and must not gate the edition.
+    in_publication_scope: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +417,7 @@ class EditionRepairReadService:
             rebuild_required=rebuild_required,
             recommended_stage=recommended_stage,
             is_publication_ioc=is_ioc,
+            in_publication_scope=_row_in_publication_scope(row),
         )
 
 
@@ -430,8 +435,19 @@ def _issue_subject(issue: Any) -> UUID | None:
     return None
 
 
+def _row_in_publication_scope(row: EditionReviewReadItem) -> bool:
+    """Mirror ``_build_item``: READY without a decision is implicitly included."""
+    decision = row.effective_decision
+    if decision is None and row.run_status is SubjectProductionStatus.READY:
+        decision = PublicationDecision.INCLUDE
+    return decision is not PublicationDecision.EXCLUDE
+
+
 def _repair_summary(items: Sequence[EditionRepairItem]) -> EditionRepairSummary:
-    open_items = [item for item in items if not item.resolved]
+    # Counters that gate sign-off only describe the publication scope; an
+    # excluded article keeps its issues listed but adds no edition-level debt.
+    in_scope = [item for item in items if item.in_publication_scope]
+    open_items = [item for item in in_scope if not item.resolved]
     return EditionRepairSummary(
         unresolved_total=len(open_items),
         sources_to_supply=sum(
@@ -453,7 +469,7 @@ def _repair_summary(items: Sequence[EditionRepairItem]) -> EditionRepairSummary:
         ),
         articles_with_repairs=len({item.subject_id for item in items}),
         articles_needing_rebuild=len(
-            {item.subject_id for item in items if item.rebuild_required}
+            {item.subject_id for item in in_scope if item.rebuild_required}
         ),
     )
 
@@ -577,7 +593,15 @@ class EditionReviewService:
         items = tuple(
             _build_item(row, repair_by_subject.get(row.subject_id, ())) for row in rows
         )
-        unresolved_repair_count = sum(item.unresolved_repair_count for item in items)
+        # LOT 21 business rule: the publication scope is what will be delivered.
+        # An article the analyst deliberately excluded carries no loss for that
+        # scope, so its open repairs must not hold the whole edition hostage.
+        # The per-item count stays truthful for the Repair Desk.
+        unresolved_repair_count = sum(
+            item.unresolved_repair_count
+            for item in items
+            if item.effective_decision is not PublicationDecision.EXCLUDE
+        )
         return EditionReview(
             edition_id=edition_id,
             items=items,

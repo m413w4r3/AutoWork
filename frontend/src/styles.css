@@ -2224,6 +2224,18 @@ h1 {
   overflow-wrap: anywhere;
 }
 
+.repair-inspector__value {
+  display: block;
+  max-height: 7rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.repair-inspector__value-hint {
+  color: #55665c;
+  font-size: 0.8rem;
+}
+
 .repair-inspector__technical,
 .repair-inspector__audit,
 .repair-inspector__pipeline-link {

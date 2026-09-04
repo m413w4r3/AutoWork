@@ -60,7 +60,7 @@ from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateImportResult,
     ProductionStateService,
-    ProductionStateSnapshotV2,
+    ProductionStateSnapshotV3,
 )
 from cti_app.application.subject_production import (
     EditionProductionBatchNotFoundError,
@@ -1120,7 +1120,7 @@ async def restart_subject_with_new_sources(
 async def export_subject_production_state(
     subject_id: UUID,
     request: Request,
-) -> ProductionStateSnapshotV2:
+) -> ProductionStateSnapshotV3:
     group = await _selected_article_group(request, subject_id)
     service = _production_state_service(request)
     try:

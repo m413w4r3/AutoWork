@@ -113,7 +113,11 @@ export function RepairIssueInspector({
   const reasonCode = currentDetail?.reason_code ?? item.reason_code;
   const sourceTitle = currentDetail?.source_title ?? item.source_title;
   const sourceUrl = currentDetail?.source_url ?? item.source_url;
-  const value = currentDetail?.value ?? item.preview;
+  const isRule = item.kind === "rejected_rule";
+  // A rule body is rendered in full by RepairRulePanel, inside a bounded,
+  // scrollable block. Repeating it unbounded in the facts list pushes every
+  // action off-screen for a large YARA rule, so the summary stays short here.
+  const value = isRule ? item.preview : (currentDetail?.value ?? item.preview);
 
   return (
     <section
@@ -137,9 +141,16 @@ export function RepairIssueInspector({
           <dd>{item.artifact_type ?? repairKindLabel(item)}</dd>
         </div>
         <div>
-          <dt>Valeur</dt>
+          <dt>{isRule ? "Extrait" : "Valeur"}</dt>
           <dd>
-            <code>{value || "Valeur non conservée"}</code>
+            <code className="repair-inspector__value">
+              {value || "Valeur non conservée"}
+            </code>
+            {isRule ? (
+              <span className="repair-inspector__value-hint">
+                Corps intégral ci-dessous.
+              </span>
+            ) : null}
           </dd>
         </div>
         <div>

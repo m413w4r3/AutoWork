@@ -1295,7 +1295,9 @@ async def test_production_state_export_import_is_transparent(
     assert exported.status_code == 200, exported.text
     snapshot = exported.json()
     assert snapshot["format"] == "autowork.production-state"
-    assert snapshot["schema_version"] == 2
+    assert snapshot["schema_version"] == 3
+    # A run with no repair projection exports an explicitly empty audit block.
+    assert snapshot["repair"] is None
     assert snapshot["content_sha256"]
     assert snapshot["artifacts"]["references"]["canonical_content"]["sources"][0]["id"] == "S1"
     assert (

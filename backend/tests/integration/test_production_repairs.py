@@ -123,10 +123,30 @@ async def test_production_repair_decisions_are_fk_backed_append_only_and_effecti
                         {"id": first.id},
                     )
                 await session.rollback()
+                # Rewriting the arbitration itself is the dangerous edit: an
+                # audit that can be flipped after the fact is not an audit.
+                with pytest.raises(DBAPIError, match="append-only"):
+                    await session.execute(
+                        text(
+                            "UPDATE production_repair_decisions SET action = 'exclude' "
+                            "WHERE id = :id"
+                        ),
+                        {"id": second.id},
+                    )
+                await session.rollback()
                 with pytest.raises(DBAPIError, match="append-only"):
                     await session.execute(
                         text("DELETE FROM production_repair_decisions WHERE id = :id"),
                         {"id": first.id},
+                    )
+                await session.rollback()
+                with pytest.raises(DBAPIError, match="append-only"):
+                    await session.execute(
+                        text(
+                            "DELETE FROM production_repair_decisions "
+                            "WHERE edition_id = :edition_id"
+                        ),
+                        {"edition_id": edition.id},
                     )
                 await session.rollback()
                 with pytest.raises(IntegrityError):

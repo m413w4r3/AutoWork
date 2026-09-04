@@ -12,7 +12,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -44,7 +44,12 @@ from cti_app.domain.production import (
 
 PRODUCTION_STATE_FORMAT = "autowork.production-state"
 PRODUCTION_STATE_V1_SCHEMA_VERSION = 1
-PRODUCTION_STATE_SCHEMA_VERSION = 2
+PRODUCTION_STATE_V2_SCHEMA_VERSION = 2
+# Version 3 adds the repair audit block: the canonical extraction already is
+# the effective (projected) one, and this block carries the human decisions
+# that produced it so an imported state stays auditable, not just reproducible.
+PRODUCTION_STATE_SCHEMA_VERSION = 3
+PRODUCTION_STATE_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 MAX_PRODUCTION_STATE_BYTES = 16 * 1024 * 1024
 IMPORTED_RUN_ERROR_CODE = "imported_production_state"
 
@@ -120,6 +125,40 @@ class ProductionStateArtifacts(BaseModel):
     synthesis: ProductionStateSynthesis
 
 
+class ProductionStateRepairDecision(BaseModel):
+    """One human arbitration that shaped the exported effective extraction."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repair_key: str = Field(pattern=_HASH)
+    issue_kind: str = Field(min_length=1)
+    action: str = Field(min_length=1)
+    actor_id: str = Field(min_length=1)
+    decided_at: datetime
+    reason: str | None = None
+
+    @field_validator("decided_at")
+    @classmethod
+    def decided_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("decided_at must be timezone-aware")
+        return value
+
+
+class ProductionStateRepair(BaseModel):
+    """Audit trail of the repair projection that produced the extraction."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    projection_version: str = Field(min_length=1)
+    base_extraction_artifact_id: str
+    actor_id: str | None = None
+    included_repair_keys: tuple[str, ...] = ()
+    excluded_repair_keys: tuple[str, ...] = ()
+    unresolved_repair_keys: tuple[str, ...] = ()
+    decisions: tuple[ProductionStateRepairDecision, ...] = ()
+
+
 class ProductionStateSnapshotV1(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -156,6 +195,31 @@ class ProductionStateSnapshotV2(BaseModel):
         return value
 
 
+class ProductionStateSnapshotV3(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    format: Literal["autowork.production-state"]
+    schema_version: Literal[3]
+    exported_at: datetime
+    origin: ProductionStateOriginV2
+    artifacts: ProductionStateArtifacts
+    # Absent when the run carries no repair projection at all.
+    repair: ProductionStateRepair | None = None
+    content_sha256: str = Field(pattern=_HASH)
+
+    @field_validator("exported_at")
+    @classmethod
+    def exported_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("exported_at must be timezone-aware")
+        return value
+
+
+ProductionStateSnapshot = (
+    ProductionStateSnapshotV1 | ProductionStateSnapshotV2 | ProductionStateSnapshotV3
+)
+
+
 class ProductionStateImportResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -163,7 +227,7 @@ class ProductionStateImportResult(BaseModel):
     status: Literal["needs_review", "running"]
     current_stage: Literal["assembly"]
     imported_stages: tuple[Literal["references"], Literal["extraction"], Literal["synthesis"]]
-    schema_version: Literal[1, 2]
+    schema_version: Literal[1, 2, 3]
     content_sha256: str = Field(pattern=_HASH)
 
 
@@ -177,9 +241,7 @@ def _canonical_json(payload: Mapping[str, Any]) -> bytes:
 
 
 def compute_production_state_checksum(
-    snapshot_without_checksum: (
-        ProductionStateSnapshotV1 | ProductionStateSnapshotV2 | Mapping[str, Any]
-    ),
+    snapshot_without_checksum: (ProductionStateSnapshot | Mapping[str, Any]),
 ) -> str:
     if isinstance(snapshot_without_checksum, BaseModel):
         payload = snapshot_without_checksum.model_dump(mode="json", exclude={"content_sha256"})
@@ -201,7 +263,7 @@ def _json_size(payload: dict[str, Any]) -> int:
 
 
 def _validate_parsers(
-    snapshot: ProductionStateSnapshotV1 | ProductionStateSnapshotV2,
+    snapshot: ProductionStateSnapshot,
 ) -> tuple[ReferenceReport, TechnicalExtraction]:
     try:
         report = reference_report_from_json(snapshot.artifacts.references.canonical_content)
@@ -216,31 +278,34 @@ def _validate_parsers(
     return report, extraction
 
 
-def _validate_snapshot(
-    payload: dict[str, Any],
-) -> ProductionStateSnapshotV1 | ProductionStateSnapshotV2:
+def _validate_snapshot(payload: dict[str, Any]) -> ProductionStateSnapshot:
     if payload.get("format") != PRODUCTION_STATE_FORMAT:
         raise ProductionStateError(
             code="production_state_invalid_format", message="Unsupported production state format"
         )
     schema_version = payload.get("schema_version")
-    if schema_version not in {PRODUCTION_STATE_V1_SCHEMA_VERSION, PRODUCTION_STATE_SCHEMA_VERSION}:
+    if schema_version not in PRODUCTION_STATE_SUPPORTED_SCHEMA_VERSIONS:
         raise ProductionStateError(
             code="production_state_version_unsupported",
             message="Unsupported production state schema version",
         )
-    if schema_version == PRODUCTION_STATE_SCHEMA_VERSION and (
+    if schema_version != PRODUCTION_STATE_V1_SCHEMA_VERSION and (
         "editorial_type" in payload.get("origin", {}) or "profile" in payload.get("origin", {})
     ):
         raise ProductionStateError(
             code="production_state_version_unsupported",
-            message="Legacy production state origin cannot be labeled as schema version 2",
+            message="Legacy production state origin cannot be labeled as a post-V1 version",
         )
+    snapshot_types: dict[int, type[BaseModel]] = {
+        1: ProductionStateSnapshotV1,
+        2: ProductionStateSnapshotV2,
+        3: ProductionStateSnapshotV3,
+    }
     try:
-        snapshot_type = (
-            ProductionStateSnapshotV1 if schema_version == 1 else ProductionStateSnapshotV2
+        snapshot = cast(
+            ProductionStateSnapshot,
+            snapshot_types[int(cast(int, schema_version))].model_validate(payload),
         )
-        snapshot = snapshot_type.model_validate(payload)
     except ValidationError as exc:
         raise _invalid("Invalid production state") from exc
 
@@ -264,9 +329,7 @@ def _validate_snapshot(
     return snapshot
 
 
-def _snapshot_metadata(
-    snapshot: ProductionStateSnapshotV1 | ProductionStateSnapshotV2, now: datetime
-) -> dict[str, Any]:
+def _snapshot_metadata(snapshot: ProductionStateSnapshot, now: datetime) -> dict[str, Any]:
     return {
         "snapshot_import": {
             "format": PRODUCTION_STATE_FORMAT,
@@ -276,6 +339,51 @@ def _snapshot_metadata(
         },
         "generated_at": now.isoformat(),
     }
+
+
+def _snapshot_repair(snapshot: ProductionStateSnapshot) -> ProductionStateRepair | None:
+    return getattr(snapshot, "repair", None)
+
+
+def _exported_repair_block(
+    metadata: Mapping[str, Any] | None,
+    decisions: Mapping[str, Any],
+) -> ProductionStateRepair | None:
+    """Describe the repair projection that produced the exported extraction."""
+    marker = metadata.get("repair_projection") if isinstance(metadata, Mapping) else None
+    if not isinstance(marker, Mapping):
+        return None
+    base_id = marker.get("base_extraction_artifact_id")
+    if not isinstance(base_id, str):
+        return None
+
+    def _keys(name: str) -> tuple[str, ...]:
+        value = marker.get(name)
+        return tuple(sorted(item for item in value if isinstance(item, str))) if isinstance(
+            value, list
+        ) else ()
+
+    exported_decisions = tuple(
+        ProductionStateRepairDecision(
+            repair_key=str(decision.repair_key),
+            issue_kind=str(getattr(decision.issue_kind, "value", decision.issue_kind)),
+            action=str(getattr(decision.action, "value", decision.action)),
+            actor_id=str(decision.actor_id),
+            decided_at=decision.created_at,
+            reason=decision.reason,
+        )
+        for _decision_id, decision in sorted(decisions.items())
+    )
+    actor_id = marker.get("actor_id")
+    return ProductionStateRepair(
+        projection_version=str(marker.get("version") or "1"),
+        base_extraction_artifact_id=base_id,
+        actor_id=actor_id if isinstance(actor_id, str) else None,
+        included_repair_keys=_keys("included_repair_keys"),
+        excluded_repair_keys=_keys("excluded_repair_keys"),
+        unresolved_repair_keys=_keys("unresolved_repair_keys"),
+        decisions=exported_decisions,
+    )
 
 
 def _portable_extraction_content(content: dict[str, Any]) -> dict[str, Any]:
@@ -293,6 +401,30 @@ def _portable_extraction_content(content: dict[str, Any]) -> dict[str, Any]:
     return portable
 
 
+async def _repair_decisions_for_projection(
+    uow: Any, run: Any, metadata: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Load exactly the decisions a projection marker already names."""
+    marker = metadata.get("repair_projection") if isinstance(metadata, Mapping) else None
+    if not isinstance(marker, Mapping):
+        return {}
+    wanted = {
+        str(value) for value in marker.get("decision_ids", []) if isinstance(value, str | UUID)
+    }
+    if not wanted:
+        return {}
+    repository = getattr(uow, "production_repair_decisions", None)
+    if repository is None:
+        return {}
+    lister = getattr(repository, "list_for_edition", None)
+    if not callable(lister):
+        return {}
+    history = await lister(run.edition_id, run.subject_id)
+    return {
+        str(decision.id): decision for decision in history if str(decision.id) in wanted
+    }
+
+
 class ProductionStateService:
     def __init__(
         self,
@@ -304,7 +436,7 @@ class ProductionStateService:
 
     async def export_state(
         self, *, subject_id: UUID, subject_title: str
-    ) -> ProductionStateSnapshotV2:
+    ) -> ProductionStateSnapshotV3:
         """Export the latest run for a subject in the current V2 format."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get_current_for_subject(subject_id)
@@ -315,7 +447,7 @@ class ProductionStateService:
 
         return await self.export_run_state(run.id, subject_title=subject_title)
 
-    async def export_run_state(self, run_id: UUID, subject_title: str) -> ProductionStateSnapshotV2:
+    async def export_run_state(self, run_id: UUID, subject_title: str) -> ProductionStateSnapshotV3:
         """Export exactly ``run_id`` without resolving another current run."""
         async with self._uow_factory() as uow:
             run = await uow.subject_production_runs.get(run_id)
@@ -330,6 +462,12 @@ class ProductionStateService:
             refs = await uow.production_artifacts.get_current(run.id, "references")
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
             synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
+            # The current extraction already IS the effective projection; the
+            # decisions travel with it so an import stays auditable, not only
+            # byte-identical.
+            repair_decisions = await _repair_decisions_for_projection(
+                uow, run, getattr(extraction, "metadata", None)
+            )
 
         if refs is None or extraction is None or synthesis is None:
             raise ProductionStateError(
@@ -363,11 +501,12 @@ class ProductionStateService:
             subject_title=subject_title,
             research_date=run.research_date,
         )
-        snapshot = ProductionStateSnapshotV2(
+        snapshot = ProductionStateSnapshotV3(
             format=PRODUCTION_STATE_FORMAT,
             schema_version=PRODUCTION_STATE_SCHEMA_VERSION,
             exported_at=datetime.now(UTC),
             origin=origin,
+            repair=_exported_repair_block(extraction.metadata, repair_decisions),
             artifacts=ProductionStateArtifacts(
                 references=ProductionStateReferences(
                     input_hash=refs.input_hash, canonical_content=refs_content
@@ -430,6 +569,7 @@ class ProductionStateService:
             "parser_version": refs_content.get("parser_version"),
             "warnings": [],
         }
+        repair_block = _snapshot_repair(snapshot)
         extraction_meta = {
             **metadata_base,
             "element_counts": {
@@ -437,6 +577,14 @@ class ProductionStateService:
             },
             "parser_version": extraction_content.get("parser_version"),
             "warnings": [],
+            # Deliberately NOT "repair_projection": the exported base artifact
+            # and decision rows do not exist here, so a projection marker would
+            # dangle. This keeps the audit trail without forging local identity.
+            **(
+                {"imported_repair_audit": repair_block.model_dump(mode="json")}
+                if repair_block is not None
+                else {}
+            ),
         }
         synthesis_meta = {
             **metadata_base,
