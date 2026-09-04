@@ -393,7 +393,6 @@ export function SubjectProduction({
 
       {!reconciliationRequired &&
         showIssue &&
-        currentStageRetryRecommended &&
         issueRetryStage &&
         retryStages.includes(issueRetryStage) && (
           <div className="production-retry-primary">
@@ -402,6 +401,17 @@ export function SubjectProduction({
               <br />
               {RETRY_DESCRIPTIONS[issueRetryStage]}
             </p>
+            {!currentStageRetryRecommended && (
+              // Une disposition `manual_only` signifie que la reprise
+              // automatique ne réglerait rien par elle-même — un contrôle
+              // déterministe échoue à l'identique. Elle ne doit pas pour
+              // autant priver l'analyste de la seule relance utile après un
+              // correctif de code ou une correction de données.
+              <p className="production-retry-primary__caveat">
+                Cette étape a échoué sur un contrôle déterministe : la relance
+                ne changera rien si la cause n’a pas été corrigée entre-temps.
+              </p>
+            )}
             <button
               className="button"
               onClick={() => retryStageMutation.mutate(issueRetryStage)}
@@ -447,7 +457,11 @@ export function SubjectProduction({
             <summary>Relancer depuis une étape précédente</summary>
             <div>
               {retryStages
-                .filter((stage) => stage !== issueRetryStage)
+                .filter(
+                  (stage) =>
+                    stage !== issueRetryStage ||
+                    !retryStages.includes(issueRetryStage),
+                )
                 .map((stage) => (
                   <button
                     key={stage}

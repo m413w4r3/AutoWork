@@ -351,7 +351,7 @@ describe("SubjectProduction retry from stage", () => {
     );
   });
 
-  it("failure terminale n’affiche pas le CTA de replay de l’étape courante", async () => {
+  it("failure terminale affiche le CTA avec la réserve de contrôle déterministe", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -365,14 +365,66 @@ describe("SubjectProduction retry from stage", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Extraction");
     expect(
-      screen.queryByRole("button", { name: "Relancer cette étape" }),
-    ).toBeNull();
+      screen.getByRole("button", { name: "Relancer cette étape" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/contrôle déterministe/)).toBeInTheDocument();
     expect(
       screen.getByText("Relancer depuis une étape précédente"),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Relancer depuis Références" }),
     ).toBeInTheDocument();
+  });
+
+  it("permet de relancer l’assemblage en needs_review malgré manual_only", async () => {
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+      init?.method === "POST"
+        ? Promise.resolve(Response.json({ status: "running" }))
+        : Promise.resolve(
+            Response.json({
+              ...status("needs_review", "assembly"),
+              recovery_disposition: "manual_only",
+            }),
+          ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderProduction();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Assemblage");
+    const retryButton = screen.getByRole("button", {
+      name: "Relancer cette étape",
+    });
+    expect(retryButton).toBeInTheDocument();
+    await user.click(retryButton);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/api/subjects/${SUBJECT_ID}/production/retry`,
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ stage: "assembly" }),
+        }),
+      ),
+    );
+  });
+
+  it("n’affiche pas l’étape courante dans le repli en plus du CTA principal", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("needs_review", "assembly"),
+          recovery_disposition: "manual_only",
+        }),
+      ),
+    );
+    renderProduction();
+
+    expect(
+      await screen.findByRole("button", { name: "Relancer cette étape" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("Relancer depuis Assemblage")).toHaveLength(1);
   });
 
   it("propose la récupération explicite sans afficher le retry générique", async () => {
