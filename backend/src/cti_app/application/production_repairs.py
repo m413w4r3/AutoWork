@@ -170,6 +170,12 @@ class ProductionRepairStaleError(ValueError):
     code = "production_repair_stale"
 
 
+class ProductionRepairResolvedError(ValueError):
+    """The requested issue already has an effective append-only decision."""
+
+    code = "production_repair_resolved"
+
+
 class ProductionRepairIssueNotFoundError(ValueError):
     """A requested repair issue is not present in the current extraction."""
 
@@ -184,6 +190,19 @@ class ProductionReferenceRepairError(ValueError):
     def __init__(self, code: str, message: str | None = None) -> None:
         self.code = code
         super().__init__(message or code)
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionRepairDecisionInput:
+    """Validated identity supplied by an edition-scoped bulk decision."""
+
+    subject_id: UUID
+    production_run_id: UUID
+    observed_artifact_id: UUID
+    observed_pipeline_generation: int
+    repair_key: str
+    issue_kind: ProductionRepairIssueKind
+    action: ProductionRepairAction
 
 
 class ProductionRepairDecisionService:
@@ -226,9 +245,18 @@ class ProductionRepairDecisionService:
                 EditionStatus.PRODUCTION.value,
                 EditionStatus.REVIEW.value,
             }:
-                raise ProductionRepairStatusError(
-                    f"Edition {edition_id} is not in production or review"
-                )
+                raise ProductionRepairStatusError("edition_frozen_for_publication")
+            manifests = getattr(uow, "publication_manifests", None)
+            if (
+                manifests is not None
+                and await manifests.get_latest_for_edition(edition_id) is not None
+            ):
+                raise ProductionRepairStatusError("edition_frozen_for_publication")
+            effective = await _effective_decisions_for_reader(
+                uow, edition_id, subject_id
+            )
+            if any(item.repair_key == repair_key for item in effective):
+                raise ProductionRepairResolvedError(ProductionRepairResolvedError.code)
 
             run_repository = uow.subject_production_runs
             run = await _get_for_update(run_repository, production_run_id)
@@ -246,6 +274,8 @@ class ProductionRepairDecisionService:
                 SubjectProductionStatus.CANCELLED.value,
             }:
                 raise ProductionRepairStatusError("production_repair_run_not_reviewable")
+            if getattr(run, "requires_reconciliation", False):
+                raise ProductionRepairStatusError("production_reconciliation_required")
             if run_status is not None and run_status not in {
                 SubjectProductionStatus.READY.value,
                 SubjectProductionStatus.NEEDS_REVIEW.value,
@@ -261,6 +291,13 @@ class ProductionRepairDecisionService:
                 or _enum_value(artifact.status) == ProductionArtifactStatus.STALE.value
             ):
                 raise ProductionRepairStaleError(ProductionRepairStaleError.code)
+            expected_stage = (
+                ProductionArtifactStage.REFERENCES
+                if issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
+                else ProductionArtifactStage.EXTRACTION
+            )
+            if _enum_value(getattr(artifact, "stage", None)) != expected_stage.value:
+                raise ProductionRepairStaleError(ProductionRepairStaleError.code)
             get_current = getattr(uow.production_artifacts, "get_current", None)
             if callable(get_current):
                 current_artifact = await get_current(
@@ -272,6 +309,116 @@ class ProductionRepairDecisionService:
             await uow.production_repair_decisions.append(decision)
             await uow.commit()
             return decision
+
+    async def decide_bulk(
+        self,
+        *,
+        edition_id: UUID,
+        decisions: Sequence[ProductionRepairDecisionInput],
+        actor_id: str,
+        reason: str | None = None,
+    ) -> tuple[ProductionRepairDecision, ...]:
+        """Append a batch of decisions atomically after validating every fence."""
+        if not decisions:
+            raise ValueError("production_repair_bulk_empty")
+        if len(decisions) > 200:
+            raise ValueError("production_repair_bulk_limit_exceeded")
+        identities = [(item.subject_id, item.repair_key) for item in decisions]
+        if len(set(identities)) != len(identities):
+            raise ValueError("production_repair_duplicate")
+
+        events = tuple(
+            ProductionRepairDecision(
+                edition_id=edition_id,
+                subject_id=item.subject_id,
+                production_run_id=item.production_run_id,
+                observed_artifact_id=item.observed_artifact_id,
+                observed_pipeline_generation=item.observed_pipeline_generation,
+                repair_key=item.repair_key,
+                issue_kind=item.issue_kind,
+                action=item.action,
+                actor_id=actor_id,
+                reason=reason,
+            )
+            for item in decisions
+        )
+
+        async with self._uow_factory() as uow:
+            edition = await _get_for_update(uow.editions, edition_id)
+            if edition is None or _enum_value(edition.status) not in {
+                EditionStatus.PRODUCTION.value,
+                EditionStatus.REVIEW.value,
+            }:
+                raise ProductionRepairStatusError("edition_frozen_for_publication")
+            manifests = getattr(uow, "publication_manifests", None)
+            if (
+                manifests is not None
+                and await manifests.get_latest_for_edition(edition_id) is not None
+            ):
+                raise ProductionRepairStatusError("edition_frozen_for_publication")
+
+            repository = uow.production_repair_decisions
+            effective_getter = getattr(repository, "effective_decisions", None)
+            effective = (
+                await effective_getter(edition_id)
+                if callable(effective_getter)
+                else _effective_from_history(await repository.list_for_edition(edition_id))
+            )
+            effective_keys = {(item.subject_id, item.repair_key) for item in effective}
+
+            for item, _event in zip(decisions, events, strict=True):
+                if (item.subject_id, item.repair_key) in effective_keys:
+                    raise ProductionRepairResolvedError(ProductionRepairResolvedError.code)
+                run = await _get_for_update(uow.subject_production_runs, item.production_run_id)
+                if (
+                    run is None
+                    or run.edition_id != edition_id
+                    or run.subject_id != item.subject_id
+                    or run.pipeline_generation != item.observed_pipeline_generation
+                ):
+                    raise ProductionRepairStaleError(ProductionRepairStaleError.code)
+                run_status = _enum_value(getattr(run, "status", None))
+                if run_status in {
+                    SubjectProductionStatus.QUEUED.value,
+                    SubjectProductionStatus.RUNNING.value,
+                    SubjectProductionStatus.CANCELLED.value,
+                }:
+                    raise ProductionRepairStatusError("production_repair_run_not_reviewable")
+                if getattr(run, "requires_reconciliation", False):
+                    raise ProductionRepairStatusError("production_reconciliation_required")
+                if run_status is not None and run_status not in {
+                    SubjectProductionStatus.READY.value,
+                    SubjectProductionStatus.NEEDS_REVIEW.value,
+                    SubjectProductionStatus.FAILED.value,
+                }:
+                    raise ProductionRepairStatusError("production_repair_run_not_reviewable")
+
+                artifact = await uow.production_artifacts.get(item.observed_artifact_id)
+                expected_stage = (
+                    ProductionArtifactStage.REFERENCES
+                    if item.issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
+                    else ProductionArtifactStage.EXTRACTION
+                )
+                get_current = getattr(uow.production_artifacts, "get_current", None)
+                current_artifact = (
+                    await get_current(item.production_run_id, expected_stage.value)
+                    if callable(get_current)
+                    else artifact
+                )
+                if (
+                    artifact is None
+                    or artifact.production_run_id != item.production_run_id
+                    or _enum_value(artifact.status) == ProductionArtifactStatus.STALE.value
+                    or _enum_value(artifact.stage) != expected_stage.value
+                    or current_artifact is None
+                    or current_artifact.id != artifact.id
+                ):
+                    raise ProductionRepairStaleError(ProductionRepairStaleError.code)
+
+            for event in events:
+                await uow.production_repair_decisions.append(event)
+            await uow.commit()
+            return events
 
     async def effective_decisions(
         self, edition_id: UUID, subject_id: UUID | None = None
@@ -307,6 +454,8 @@ class ProductionRepairIssueView:
     model_run_id: str | None = None
     batch_id: str | None = None
     effective_decision: ProductionRepairDecision | None = None
+    projection_applied: bool = False
+    subject_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,6 +490,7 @@ class SupplementalSourceRepairIssue:
     observed_pipeline_generation: int
     effective_decision: ProductionRepairDecision | None = None
     recommended_action: str = "archive_manual_content"
+    subject_id: UUID | None = None
 
 
 # Name used by Repair Desk consumers that distinguish list DTOs from the
@@ -374,6 +524,23 @@ class ProductionRepairIssueService:
             for view, _value in await self._records(edition_id, subject_id=subject_id)
         )
 
+    async def list_issue_views(
+        self, edition_id: UUID, subject_id: UUID | None = None
+    ) -> tuple[ProductionRepairIssueView, ...]:
+        """List bounded issue projections without loading evidence bodies.
+
+        New extraction artifacts carry a compact repair index in metadata.  A
+        legacy artifact without that index falls back to its bounded diagnostic
+        projection; it is intentionally not promoted to an evidence-pack read.
+        The detail endpoint remains the only path that needs the inert value.
+        """
+        return tuple(
+            view
+            for view, _value in await self._records(
+                edition_id, subject_id=subject_id, load_payload=False
+            )
+        )
+
     async def get_issue(
         self, edition_id: UUID, repair_key: str, subject_id: UUID | None = None
     ) -> ProductionRepairIssueDetail | None:
@@ -397,68 +564,109 @@ class ProductionRepairIssueService:
 
         async with self._uow_factory() as uow:
             runs = await uow.subject_production_runs.list_for_edition(edition_id)
-            contexts: list[tuple[Any, Any, Sequence[Any]]] = []
+            references_by_run = await _current_artifacts_by_run(
+                uow,
+                edition_id,
+                ProductionArtifactStage.REFERENCES.value,
+                runs,
+            )
+            subject_ids = {run.subject_id for run in runs}
+            collections_by_subject: dict[UUID, list[Any]] = {}
+            collection_repository = getattr(uow, "source_collections", None)
+            bulk_collections = getattr(collection_repository, "list_for_subjects", None)
+            if callable(bulk_collections):
+                collections = await bulk_collections(subject_ids)
+                for collection in collections:
+                    collections_by_subject.setdefault(collection.subject_id, []).append(
+                        collection
+                    )
+            elif collection_repository is not None:
+                for current_subject_id in subject_ids:
+                    collections_by_subject[current_subject_id] = (
+                        await collection_repository.list_for_subject(current_subject_id)
+                    )
+            contexts: list[
+                tuple[Any, Any, Sequence[Any], tuple[list[dict[str, Any]], set[str]] | None]
+            ] = []
             for run in runs:
                 if subject_id is not None and run.subject_id != subject_id:
                     continue
-                artifact = await uow.production_artifacts.get_current(run.id, "references")
+                artifact = references_by_run.get(run.id)
                 if artifact is None or (
                     _enum_value(artifact.status) == ProductionArtifactStatus.STALE.value
                 ):
                     continue
-                collections = await uow.source_collections.list_for_subject(run.subject_id)
-                contexts.append((run, artifact, collections))
+                collections = collections_by_subject.get(run.subject_id, ())
+                contexts.append(
+                    (run, artifact, collections, _reference_source_index(artifact))
+                )
             decisions = await _effective_decisions_for_reader(uow, edition_id, subject_id)
 
         decisions_by_key = {
             (decision.subject_id, decision.repair_key): decision for decision in decisions
         }
         issues: list[SupplementalSourceRepairIssue] = []
-        for run, artifact, collections in contexts:
-            if artifact.raw_blob_id is None or artifact.canonical_blob_id is None:
-                continue
-            research_date = getattr(run, "research_date", None)
-            if research_date is None:
-                continue
-            try:
-                raw = await self._artifact_store.read_text(artifact.raw_blob_id)
-                proposed_result = parse_reference_report(raw, research_date)
-                if not proposed_result.usable or proposed_result.value is None:
+        for run, artifact, collections, source_index in contexts:
+            if source_index is not None:
+                proposed_sources, canonical_urls = source_index
+            else:
+                if artifact.raw_blob_id is None or artifact.canonical_blob_id is None:
                     continue
-                canonical = reference_report_from_json(
-                    await self._artifact_store.read_json(artifact.canonical_blob_id)
-                )
-            except Exception:
-                # A read endpoint must not turn one corrupt historical payload
-                # into a 500 for every other Repair Desk issue.
-                continue
-
-            canonical_urls = {source.canonical_url for source in canonical.sources}
+                research_date = getattr(run, "research_date", None)
+                if research_date is None:
+                    continue
+                try:
+                    raw = await self._artifact_store.read_text(artifact.raw_blob_id)
+                    proposed_result = parse_reference_report(raw, research_date)
+                    if not proposed_result.usable or proposed_result.value is None:
+                        continue
+                    canonical = reference_report_from_json(
+                        await self._artifact_store.read_json(artifact.canonical_blob_id)
+                    )
+                except Exception:
+                    # A read endpoint must not turn one corrupt historical payload
+                    # into a 500 for every other Repair Desk issue.
+                    continue
+                proposed_sources = [
+                    {
+                        "source_id": source.local_id,
+                        "source_title": source.title,
+                        "source_url": source.canonical_url,
+                        "publisher": source.publisher,
+                    }
+                    for source in proposed_result.value.sources
+                ]
+                canonical_urls = {source.canonical_url for source in canonical.sources}
             collections_by_url = {
                 collection.canonical_url: collection
                 for collection in collections
                 if getattr(collection, "canonical_url", None)
             }
-            for source in proposed_result.value.sources:
-                if source.canonical_url in canonical_urls:
+            for source in proposed_sources:
+                source_url = str(source.get("source_url", ""))
+                if not source_url or source_url in canonical_urls:
                     continue
-                collection = collections_by_url.get(source.canonical_url)
+                collection = collections_by_url.get(source_url)
                 if collection is None or _is_archived_collection(collection):
                     continue
                 repair_key = repair_key_for_supplemental_source(
                     edition_id=edition_id,
                     subject_id=run.subject_id,
-                    source_url=source.canonical_url,
+                    source_url=source_url,
                 )
                 decision = decisions_by_key.get((run.subject_id, repair_key))
                 issues.append(
                     SupplementalSourceRepairIssue(
                         repair_key=repair_key,
                         kind=ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
-                        source_id=source.local_id,
-                        source_title=source.title,
-                        source_url=source.canonical_url,
-                        publisher=source.publisher,
+                        source_id=str(source.get("source_id", "")),
+                        source_title=str(source.get("source_title", "")),
+                        source_url=source_url,
+                        publisher=(
+                            str(source["publisher"])
+                            if source.get("publisher") is not None
+                            else None
+                        ),
                         collection_id=collection.id,
                         collection_state=_enum_value(getattr(collection, "state", "")),
                         error_reason=getattr(collection, "error_reason", None),
@@ -474,6 +682,7 @@ class ProductionRepairIssueService:
                             and decision.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
                             else "archive_manual_content"
                         ),
+                        subject_id=run.subject_id,
                     )
                 )
         return tuple(sorted(issues, key=lambda item: (item.source_url, item.source_id)))
@@ -502,45 +711,30 @@ class ProductionRepairIssueService:
         return await self.get_supplemental_source_issue(edition_id, repair_key, subject_id)
 
     async def _records(
-        self, edition_id: UUID, *, subject_id: UUID | None
+        self,
+        edition_id: UUID,
+        *,
+        subject_id: UUID | None,
+        load_payload: bool = True,
     ) -> list[tuple[ProductionRepairIssueView, str | None]]:
         async with self._uow_factory() as uow:
             runs = await uow.subject_production_runs.list_for_edition(edition_id)
+            artifacts_by_run = await _current_artifacts_by_run(
+                uow,
+                edition_id,
+                ProductionArtifactStage.EXTRACTION.value,
+                runs,
+            )
             contexts: list[_RepairContext] = []
             for run in runs:
                 if subject_id is not None and run.subject_id != subject_id:
                     continue
-                artifact = await uow.production_artifacts.get_current(run.id, "extraction")
+                artifact = artifacts_by_run.get(run.id)
                 if artifact is not None and (
                     _enum_value(artifact.status) != ProductionArtifactStatus.STALE.value
                 ):
-                    source_titles: dict[str, str] = {}
-                    if self._artifact_store is not None:
-                        references = await uow.production_artifacts.get_current(
-                            run.id, ProductionArtifactStage.REFERENCES.value
-                        )
-                        if (
-                            references is not None
-                            and getattr(references, "canonical_blob_id", None) is not None
-                        ):
-                            try:
-                                canonical_blob_id = getattr(
-                                    references, "canonical_blob_id", None
-                                )
-                                report = reference_report_from_json(
-                                    await self._artifact_store.read_json(
-                                        cast(UUID, canonical_blob_id)
-                                    )
-                                )
-                                source_titles = {
-                                    source.local_id: source.title for source in report.sources
-                                }
-                            except Exception:
-                                source_titles = {}
                     contexts.append(
-                        _RepairContext(
-                            run=run, artifact=artifact, source_titles=source_titles
-                        )
+                        _RepairContext(run=run, artifact=artifact, source_titles={})
                     )
             decisions = await _effective_decisions_for_reader(
                 uow, edition_id, subject_id
@@ -551,7 +745,9 @@ class ProductionRepairIssueService:
         }
         records: list[tuple[ProductionRepairIssueView, str | None]] = []
         for context in contexts:
-            entries, payload_available = await self._entries(context.artifact)
+            entries, payload_available = await self._entries(
+                context.artifact, load_payload=load_payload
+            )
             for entry in entries:
                 record = _issue_record(
                     context,
@@ -575,8 +771,12 @@ class ProductionRepairIssueService:
                     )
         return records
 
-    async def _entries(self, artifact: Any) -> tuple[list[dict[str, Any]], bool]:
-        return await _repair_entries_for_artifact(artifact, self._artifact_store)
+    async def _entries(
+        self, artifact: Any, *, load_payload: bool = True
+    ) -> tuple[list[dict[str, Any]], bool]:
+        if load_payload:
+            return await _repair_entries_for_artifact(artifact, self._artifact_store)
+        return _repair_index_entries_for_artifact(artifact)
 
 
 @dataclass(frozen=True, slots=True)
@@ -894,6 +1094,30 @@ async def _repair_entries_for_artifact(
     return [entry for entry in legacy_entries if isinstance(entry, dict)], False
 
 
+def _repair_index_entries_for_artifact(
+    artifact: Any,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Return only the compact JSONB repair index; never read a blob."""
+    metadata = getattr(artifact, "metadata", {}) or {}
+    marker = metadata.get("repair_evidence") if isinstance(metadata, dict) else None
+    index = marker.get("index") if isinstance(marker, dict) else None
+    if not isinstance(index, list) and isinstance(metadata, dict):
+        index = metadata.get("repair_index")
+    if isinstance(index, list):
+        payload_available = bool(marker.get("blob_id")) if isinstance(marker, dict) else False
+        return [entry for entry in index if isinstance(entry, dict)], payload_available
+
+    verification = (
+        metadata.get("deterministic_verification", {}) if isinstance(metadata, dict) else {}
+    )
+    if not isinstance(verification, dict):
+        return [], False
+    legacy_entries = verification.get("q2_source_evidence_rejections")
+    if not isinstance(legacy_entries, list):
+        legacy_entries = verification.get("q2_rejected_rules", [])
+    return [entry for entry in legacy_entries if isinstance(entry, dict)], False
+
+
 def _repair_entry_identity(
     entry: Mapping[str, Any],
     *,
@@ -1154,6 +1378,27 @@ async def _effective_decisions_for_reader(
     return _effective_from_history(history)
 
 
+async def _current_artifacts_by_run(
+    uow: Any,
+    edition_id: UUID,
+    stage: str,
+    runs: Sequence[Any],
+) -> dict[UUID, Any]:
+    """Load one current artifact per run, using the set-based repository port."""
+    repository = uow.production_artifacts
+    bulk_getter = getattr(repository, "list_current_for_edition", None)
+    if callable(bulk_getter):
+        artifacts = await bulk_getter(edition_id, stage)
+        return {artifact.production_run_id: artifact for artifact in artifacts}
+    return {
+        run.id: artifact
+        for run in runs
+        if (
+            artifact := await repository.get_current(run.id, stage)
+        ) is not None
+    }
+
+
 def _effective_from_history(
     history: Sequence[ProductionRepairDecision],
 ) -> tuple[ProductionRepairDecision, ...]:
@@ -1173,6 +1418,39 @@ def _is_archived_collection(collection: Any) -> bool:
         CollectionState.EXTRACTED.value,
         CollectionState.COMPLETED.value,
     }
+
+
+def _reference_source_index(
+    artifact: Any,
+) -> tuple[list[dict[str, Any]], set[str]] | None:
+    """Read the bounded Q1 proposal/canonical index from artifact metadata."""
+    metadata = getattr(artifact, "metadata", {}) or {}
+    index = metadata.get("repair_source_index") if isinstance(metadata, dict) else None
+    if not isinstance(index, dict):
+        return None
+    proposed_raw = index.get("proposed")
+    canonical_raw = index.get("canonical")
+    if not isinstance(proposed_raw, list) or not isinstance(canonical_raw, list):
+        return None
+
+    proposed: list[dict[str, Any]] = []
+    for value in proposed_raw:
+        if not isinstance(value, dict):
+            continue
+        source_url = value.get("source_url")
+        source_id = value.get("source_id")
+        if not isinstance(source_url, str) or not isinstance(source_id, str):
+            continue
+        proposed.append(dict(value))
+
+    canonical_urls: set[str] = set()
+    for value in canonical_raw:
+        source_url = (
+            value.get("source_url") if isinstance(value, dict) else value
+        )
+        if isinstance(source_url, str) and source_url:
+            canonical_urls.add(source_url)
+    return proposed, canonical_urls
 
 
 def _issue_record(
@@ -1248,6 +1526,20 @@ def _issue_record(
 
     preview_source = raw_value if isinstance(raw_value, str) else str(entry.get("preview", ""))
     preview = preview_source[:MAX_REPAIR_PREVIEW_CHARS]
+    projection_marker = (
+        context.artifact.metadata.get("repair_projection")
+        if isinstance(getattr(context.artifact, "metadata", None), dict)
+        else None
+    )
+    projection_decision_ids = (
+        {
+            str(value)
+            for value in projection_marker.get("decision_ids", [])
+        }
+        if isinstance(projection_marker, dict)
+        and isinstance(projection_marker.get("decision_ids"), list)
+        else set()
+    )
     view = ProductionRepairIssueView(
         repair_key=repair_key,
         kind=kind,
@@ -1261,7 +1553,7 @@ def _issue_record(
         reason_code=str(entry.get("reason_code", "")),
         value_sha256=value_sha256,
         preview=preview,
-        payload_available=value is not None,
+        payload_available=payload_available,
         production_run_id=context.run.id,
         observed_artifact_id=context.artifact.id,
         observed_artifact_version=context.artifact.version,
@@ -1271,6 +1563,11 @@ def _issue_record(
         ),
         batch_id=str(entry["batch_id"]) if entry.get("batch_id") is not None else None,
         effective_decision=effective_decision,
+        projection_applied=(
+            effective_decision is not None
+            and str(effective_decision.id) in projection_decision_ids
+        ),
+        subject_id=context.run.subject_id,
     )
     return view, value
 
@@ -1429,6 +1726,25 @@ class ProductionReferenceRepairService:
             base_warnings = base.metadata.get("warnings", [])
             if not isinstance(base_warnings, list):
                 base_warnings = []
+            repair_source_index = None
+            base_source_index = base.metadata.get("repair_source_index")
+            if isinstance(base_source_index, dict) and isinstance(
+                base_source_index.get("proposed"), list
+            ):
+                repair_source_index = {
+                    "proposed": [
+                        dict(item)
+                        for item in base_source_index["proposed"]
+                        if isinstance(item, dict)
+                    ],
+                    "canonical": [
+                        {
+                            "source_id": source.local_id,
+                            "source_url": source.canonical_url,
+                        }
+                        for source in reconciliation.report.sources
+                    ],
+                }
             artifact = ProductionArtifact(
                 production_run_id=run.id,
                 subject_id=run.subject_id,
@@ -1455,6 +1771,11 @@ class ProductionReferenceRepairService:
                     "dropped_source_ids": list(reconciliation.dropped_source_ids),
                     "dropped_event_ids": list(reconciliation.dropped_event_ids),
                     "archived_sources": [list(item) for item in archived_projection],
+                    **(
+                        {"repair_source_index": repair_source_index}
+                        if repair_source_index is not None
+                        else {}
+                    ),
                 },
             )
             await uow.production_artifacts.append(artifact)

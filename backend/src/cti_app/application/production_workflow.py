@@ -1590,6 +1590,15 @@ class ProductionWorkflowOrchestrator:
 
             report = parsed.value
             assert report is not None
+            proposed_source_index = [
+                {
+                    "source_id": source.local_id,
+                    "source_title": source.title,
+                    "source_url": source.canonical_url,
+                    "publisher": source.publisher,
+                }
+                for source in report.sources
+            ]
 
             # Order matters: the new publications must be attached, downloaded
             # and archived before Q1 is recorded, so extraction only ever sees
@@ -1608,6 +1617,16 @@ class ProductionWorkflowOrchestrator:
                 canonical_json=reference_report_to_json(report),
                 conversation_turn_id=turn_id,
                 warnings=parsed.warnings,
+                repair_source_index={
+                    "proposed": proposed_source_index,
+                    "canonical": [
+                        {
+                            "source_id": source.local_id,
+                            "source_url": source.canonical_url,
+                        }
+                        for source in report.sources
+                    ],
+                },
             )
 
             # Keep raw Q1 and the empty canonical projection available even
@@ -3648,6 +3667,17 @@ class ProductionWorkflowOrchestrator:
             repair_evidence_blob_id = await put_repair_evidence(
                 build_repair_evidence_pack(repair_evidence_entries)
             )
+        repair_evidence_index = [
+            {
+                key: value
+                for key, value in entry.items()
+                if key != "value"
+            }
+            | {
+                "preview": str(entry.get("value", ""))[:512],
+            }
+            for entry in repair_evidence_entries
+        ]
         artifact = await self._extraction.store_extraction_result(
             run_id=run.id,
             subject_id=run.subject_id,
@@ -3696,6 +3726,12 @@ class ProductionWorkflowOrchestrator:
                 "q2_rejected_ioc_count": rejected_ioc_count,
                 "q2_rejected_artifact_count": len(source_evidence_rejections)
                 - len(rejected_rules),
+                "q2_rejected_other_artifact_count": max(
+                    0,
+                    len(source_evidence_rejections)
+                    - len(rejected_rules)
+                    - rejected_ioc_count,
+                ),
                 "semantic_status_conflicts": [
                     {
                         "artifact_type": item.artifact_type,
@@ -3708,6 +3744,7 @@ class ProductionWorkflowOrchestrator:
             },
             repair_evidence_blob_id=repair_evidence_blob_id,
             repair_evidence_entry_count=len(repair_evidence_entries),
+            repair_evidence_index=repair_evidence_index,
         )
         await self._persist_extraction_progress(run.id, progress)
         return {

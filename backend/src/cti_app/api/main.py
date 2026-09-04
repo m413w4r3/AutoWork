@@ -34,7 +34,7 @@ from cti_app.application.edition_publication import (
 from cti_app.application.edition_release_materialization import (
     EditionReleaseRematerializationService,
 )
-from cti_app.application.edition_review import EditionReviewService
+from cti_app.application.edition_review import EditionRepairReadService, EditionReviewService
 from cti_app.application.edition_workspace import (
     EditionProductionCheckpointService,
     EditionWorkspaceMaterializer,
@@ -291,11 +291,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.collection_review_service = collection_review_service
     app.state.subject_production_service = subject_production_service
     app.state.edition_production_service = edition_production_service
-    app.state.edition_review_service = EditionReviewService(uow_factory)
-    app.state.production_repair_decision_service = ProductionRepairDecisionService(uow_factory)
-    app.state.production_repair_issue_service = ProductionRepairIssueService(
+    production_repair_issue_service = ProductionRepairIssueService(
         uow_factory, production_artifact_store
     )
+    app.state.production_repair_issue_service = production_repair_issue_service
+    app.state.edition_review_service = EditionReviewService(
+        uow_factory, production_repair_issue_service
+    )
+    app.state.edition_repair_read_service = EditionRepairReadService(
+        uow_factory, production_repair_issue_service
+    )
+    app.state.production_repair_decision_service = ProductionRepairDecisionService(uow_factory)
     app.state.production_reference_repair_service = ProductionReferenceRepairService(
         uow_factory, production_artifact_store
     )
@@ -307,6 +313,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         production_artifact_store,
         job_service=job_service,
         job_dispatcher=job_dispatcher,
+        repair_issue_reader=production_repair_issue_service,
     )
     app.state.edition_release_rematerializer = edition_release_rematerializer
     yield

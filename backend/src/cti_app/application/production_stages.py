@@ -75,6 +75,7 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
         model_run_id: UUID | None = None,
         conversation_turn_id: UUID | None = None,
         warnings: list[str] | None = None,
+        repair_source_index: dict[str, Any] | None = None,
     ) -> ProductionArtifact:
         async with self._uow_factory() as uow:
             prior_versions = [
@@ -104,6 +105,11 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
                     "warnings": warnings or [],
                     "parser_version": canonical_json.get("parser_version"),
                     "generated_at": datetime.now(UTC).isoformat(),
+                    **(
+                        {"repair_source_index": dict(repair_source_index)}
+                        if repair_source_index is not None
+                        else {}
+                    ),
                 },
             )
             await uow.production_artifacts.append(artifact)
@@ -138,6 +144,7 @@ class ExtractionService(_ArtifactPayloadMixin):
         verification_diagnostics: dict[str, Any] | None = None,
         repair_evidence_blob_id: UUID | None = None,
         repair_evidence_entry_count: int | None = None,
+        repair_evidence_index: list[dict[str, Any]] | None = None,
     ) -> ProductionArtifact:
         async with self._uow_factory() as uow:
             prior_versions = [
@@ -166,6 +173,10 @@ class ExtractionService(_ArtifactPayloadMixin):
                     "blob_id": str(repair_evidence_blob_id),
                     "entry_count": entry_count,
                 }
+                if repair_evidence_index is not None:
+                    repair_evidence_metadata["index"] = [
+                        dict(entry) for entry in repair_evidence_index
+                    ]
 
             artifact = ProductionArtifact(
                 production_run_id=run_id,

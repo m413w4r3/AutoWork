@@ -131,6 +131,24 @@ class SqlAlchemyEditionReviewReadRepository:
                     ].as_integer(),
                 ).label("rejected_indicator_count"),
                 func.coalesce(
+                    ProductionArtifactRow.artifact_metadata[
+                        "q2_rejected_ioc_count"
+                    ].as_integer(),
+                    ProductionArtifactRow.artifact_metadata["deterministic_verification"][
+                        "q2_rejected_ioc_count"
+                    ].as_integer(),
+                    0,
+                ).label("rejected_ioc_count"),
+                func.coalesce(
+                    ProductionArtifactRow.artifact_metadata[
+                        "q2_rejected_other_artifact_count"
+                    ].as_integer(),
+                    ProductionArtifactRow.artifact_metadata["deterministic_verification"][
+                        "q2_rejected_other_artifact_count"
+                    ].as_integer(),
+                    0,
+                ).label("rejected_other_artifact_count"),
+                func.coalesce(
                     ProductionArtifactRow.artifact_metadata["q2_rejected_rule_count"].as_integer(),
                     ProductionArtifactRow.artifact_metadata["deterministic_verification"][
                         "q2_rejected_rule_count"
@@ -199,6 +217,12 @@ class SqlAlchemyEditionReviewReadRepository:
                 func.coalesce(current_extraction.c.rejected_indicator_count, 0).label(
                     "rejected_indicator_count"
                 ),
+                func.coalesce(current_extraction.c.rejected_ioc_count, 0).label(
+                    "rejected_ioc_count"
+                ),
+                func.coalesce(
+                    current_extraction.c.rejected_other_artifact_count, 0
+                ).label("rejected_other_artifact_count"),
                 func.coalesce(current_extraction.c.rejected_rule_count, 0).label(
                     "rejected_rule_count"
                 ),
@@ -368,6 +392,8 @@ def _read_item_from_row(row: Any) -> EditionReviewReadItem:
         retry_stage=SubjectProductionStage(row["current_stage"]) if can_retry else None,
         reconciliation=reconciliation,
         rejected_indicator_count=row["rejected_indicator_count"] or 0,
+        rejected_ioc_count=row["rejected_ioc_count"] or 0,
+        rejected_other_artifact_count=row["rejected_other_artifact_count"] or 0,
         rejected_rule_count=row["rejected_rule_count"] or 0,
         published_rule_count=row["published_rule_count"] or 0,
     )

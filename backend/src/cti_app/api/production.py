@@ -48,6 +48,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairIssueService,
     ProductionRepairProjectionError,
     ProductionRepairProjectionService,
+    ProductionRepairResolvedError,
     ProductionRepairStaleError,
     ProductionRepairStatusError,
 )
@@ -181,6 +182,7 @@ class ExtractionRejections(BaseModel):
     q2_rejected_rule_count: int = 0
     q2_rejected_artifact_count: int = 0
     q2_rejected_ioc_count: int = 0
+    q2_rejected_other_artifact_count: int = 0
     q2_source_evidence_rejections: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -578,12 +580,16 @@ def _extraction_rejections(artifact: Any | None) -> ExtractionRejections:
             for entry in rejections
             if entry.get("proposal_kind") == "artifact"
         )
+    other_artifact_count = verification.get("q2_rejected_other_artifact_count")
+    if not isinstance(other_artifact_count, int):
+        other_artifact_count = max(0, artifact_count - ioc_count)
 
     return ExtractionRejections(
         q2_rejected_rules=rules,
         q2_rejected_rule_count=rule_count,
         q2_rejected_artifact_count=artifact_count,
         q2_rejected_ioc_count=ioc_count,
+        q2_rejected_other_artifact_count=other_artifact_count,
         q2_source_evidence_rejections=rejections[:200],
     )
 
@@ -1290,7 +1296,12 @@ async def get_subject_production_repairs(
     supplemental = await issue_service.list_supplemental_source_issues(
         edition_id, subject_id
     )
-    extraction_issues = await issue_service.list_issues(edition_id, subject_id)
+    light_getter = getattr(issue_service, "list_issue_views", None)
+    extraction_issues = (
+        await light_getter(edition_id, subject_id)
+        if callable(light_getter)
+        else await issue_service.list_issues(edition_id, subject_id)
+    )
     if kind is ProductionRepairIssueKind.REJECTED_INDICATOR:
         supplemental = ()
         extraction_issues = tuple(
@@ -1503,6 +1514,11 @@ async def decide_subject_production_repair(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": ProductionRepairStaleError.code},
+        ) from exc
+    except ProductionRepairResolvedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": ProductionRepairResolvedError.code},
         ) from exc
     except ProductionRepairStatusError as exc:
         raise HTTPException(

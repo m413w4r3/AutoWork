@@ -550,6 +550,10 @@ class SourceCollectionRepository(Protocol):
 
     async def list_for_subject(self, subject_id: UUID) -> Sequence[SourceCollection]: ...
 
+    async def list_for_subjects(
+        self, subject_ids: Sequence[UUID]
+    ) -> Sequence[SourceCollection]: ...
+
     async def save(self, collection: SourceCollection) -> None: ...
 
 
@@ -762,6 +766,10 @@ class ProductionArtifactRepository(Protocol):
     async def get(self, artifact_id: UUID) -> ProductionArtifact | None: ...
 
     async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None: ...
+
+    async def list_current_for_edition(
+        self, edition_id: UUID, stage: str
+    ) -> Sequence[ProductionArtifact]: ...
 
     async def find_reusable(
         self,

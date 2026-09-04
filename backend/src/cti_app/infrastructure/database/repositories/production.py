@@ -472,6 +472,41 @@ class SqlAlchemyProductionArtifactRepository:
         row = result.scalar_one_or_none()
         return _production_artifact_from_row(row) if row else None
 
+    async def list_current_for_edition(
+        self, edition_id: UUID, stage: str
+    ) -> Sequence[ProductionArtifact]:
+        ranked = (
+            select(
+                ProductionArtifactRow.id.label("artifact_id"),
+                func.row_number()
+                .over(
+                    partition_by=ProductionArtifactRow.production_run_id,
+                    order_by=(
+                        ProductionArtifactRow.version.desc(),
+                        ProductionArtifactRow.id.desc(),
+                    ),
+                )
+                .label("artifact_rank"),
+            )
+            .join(
+                SubjectProductionRunRow,
+                SubjectProductionRunRow.id == ProductionArtifactRow.production_run_id,
+            )
+            .where(
+                SubjectProductionRunRow.edition_id == edition_id,
+                ProductionArtifactRow.stage == stage,
+                ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value,
+            )
+            .subquery("current_edition_artifacts")
+        )
+        rows = await self._session.scalars(
+            select(ProductionArtifactRow)
+            .join(ranked, ranked.c.artifact_id == ProductionArtifactRow.id)
+            .where(ranked.c.artifact_rank == 1)
+            .order_by(ProductionArtifactRow.production_run_id)
+        )
+        return [_production_artifact_from_row(row) for row in rows]
+
     async def find_reusable(
         self,
         *,

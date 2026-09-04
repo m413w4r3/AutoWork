@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
@@ -12,6 +12,7 @@ from cti_app.application.production_artifact_resolver import current_publication
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
     ProductionArtifactStatus,
+    ProductionRepairIssueKind,
     ProductionSubmissionReconciliation,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -44,6 +45,8 @@ class EditionReviewReadItem:
     retry_stage: SubjectProductionStage | None = None
     reconciliation: ProductionSubmissionReconciliation | None = None
     rejected_indicator_count: int = 0
+    rejected_ioc_count: int = 0
+    rejected_other_artifact_count: int = 0
     rejected_rule_count: int = 0
     published_rule_count: int = 0
 
@@ -113,8 +116,12 @@ class EditionReviewItem:
     requires_reconciliation: bool = False
     reconciliation: ProductionSubmissionReconciliation | None = None
     rejected_indicator_count: int = 0
+    rejected_ioc_count: int = 0
+    rejected_other_artifact_count: int = 0
     rejected_rule_count: int = 0
     published_rule_count: int = 0
+    active_repair_count: int = 0
+    unresolved_repair_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +129,68 @@ class EditionReview:
     edition_id: UUID
     items: tuple[EditionReviewItem, ...]
     can_accept: bool
+    unresolved_repair_count: int = 0
+    repair_review_complete: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class EditionRepairItem:
+    """Cross-subject, bounded Repair Desk representation."""
+
+    repair_key: str
+    kind: str
+    position: int
+    subject_id: UUID
+    article_title: str
+    run_id: UUID
+    pipeline_generation: int
+    artifact_id: UUID | None
+    artifact_version: int | None
+    source_id: str | None
+    source_title: str | None
+    source_url: str | None
+    collection_id: UUID | None
+    collection_state: str | None
+    artifact_type: str | None
+    preview: str
+    reason_code: str
+    value_sha256: str
+    payload_available: bool
+    effective_action: str | None
+    effective_decision_id: UUID | None
+    resolved: bool
+    resolution_reason: str | None
+    rebuild_required: bool
+    recommended_stage: str | None
+    is_publication_ioc: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class EditionRepairSummary:
+    unresolved_total: int
+    sources_to_supply: int
+    rejected_iocs_to_review: int
+    rejected_rules_to_review: int
+    rejected_other_artifacts: int
+    articles_with_repairs: int
+    articles_needing_rebuild: int
+
+
+@dataclass(frozen=True, slots=True)
+class EditionRepairArticle:
+    subject_id: UUID
+    has_pending_projection: bool
+    recommended_stage: str
+    active_repair_count: int
+    resolved_since_last_build_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class EditionRepairPage:
+    summary: EditionRepairSummary
+    items: tuple[EditionRepairItem, ...]
+    articles: tuple[EditionRepairArticle, ...]
+    next_cursor: str | None
 
 
 class EditionReviewNotFoundError(ValueError):
@@ -148,30 +217,395 @@ class InvalidReviewDocumentError(ValueError):
     pass
 
 
+class ProductionRepairIssueReader(Protocol):
+    async def list_issue_views(
+        self, edition_id: UUID, subject_id: UUID | None = None
+    ) -> Sequence[Any]: ...
+
+    async def list_supplemental_source_issues(
+        self, edition_id: UUID, subject_id: UUID | None = None
+    ) -> Sequence[Any]: ...
+
+
+class EditionRepairReadService:
+    """Aggregate current ProductionRepairService issues in edition order."""
+
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        issue_reader: ProductionRepairIssueReader,
+    ) -> None:
+        self._uow_factory = uow_factory
+        self._issue_reader = issue_reader
+
+    async def list(
+        self,
+        edition_id: UUID,
+        *,
+        status: str = "open",
+        kind: ProductionRepairIssueKind | None = None,
+        subject_id: UUID | None = None,
+        artifact_type: str | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> EditionRepairPage:
+        if status not in {"open", "resolved", "all"}:
+            raise ValueError("invalid_repair_status")
+        if limit < 1:
+            raise ValueError("invalid_repair_limit")
+
+        async with self._uow_factory() as uow:
+            edition = await uow.editions.get(edition_id)
+            EditionReviewService._require_repair_desk(edition, edition_id)
+            rows = await uow.edition_review_read_model.list_for_edition(edition_id)
+
+        rows_by_subject = {row.subject_id: row for row in rows}
+        rows_by_run = {row.run_id: row for row in rows}
+        issue_views = await self._issue_views(edition_id, subject_id)
+        records: list[EditionRepairItem] = []
+        for issue in issue_views:
+            issue_subject = _issue_subject(issue)
+            row = rows_by_subject.get(issue_subject) if issue_subject is not None else None
+            if row is None:
+                issue_run_id = getattr(issue, "production_run_id", None)
+                row = (
+                    rows_by_run.get(issue_run_id)
+                    if isinstance(issue_run_id, UUID)
+                    else None
+                )
+            item = self._item_from_issue(issue, row)
+            if item is not None:
+                records.append(item)
+        records.sort(key=lambda item: (item.position, item.repair_key))
+
+        scoped = [
+            item
+            for item in records
+            if (kind is None or item.kind == kind.value)
+            and (subject_id is None or item.subject_id == subject_id)
+            and (
+                artifact_type is None
+                or item.artifact_type == artifact_type
+            )
+        ]
+        page_records = [
+            item
+            for item in scoped
+            if status == "all"
+            or (status == "open" and not item.resolved)
+            or (status == "resolved" and item.resolved)
+        ]
+        start = _repair_cursor_position(cursor, page_records)
+        page = tuple(page_records[start : start + limit])
+        next_cursor = (
+            _repair_cursor_encode(page[-1].position, page[-1].repair_key)
+            if start + len(page) < len(page_records) and page
+            else None
+        )
+        return EditionRepairPage(
+            summary=_repair_summary(scoped),
+            items=page,
+            articles=_repair_articles(scoped),
+            next_cursor=next_cursor,
+        )
+
+    async def _issue_views(
+        self, edition_id: UUID, subject_id: UUID | None
+    ) -> tuple[Any, ...]:
+        getter = getattr(self._issue_reader, "list_issue_views", None)
+        if callable(getter):
+            extraction = await getter(edition_id, subject_id)
+        else:
+            extraction = await self._issue_reader.list_issues(edition_id, subject_id)  # type: ignore[attr-defined]
+        supplemental_getter = getattr(
+            self._issue_reader, "list_supplemental_source_issues", None
+        )
+        supplemental = (
+            await supplemental_getter(edition_id, subject_id)
+            if callable(supplemental_getter)
+            else ()
+        )
+        return tuple([*extraction, *supplemental])
+
+    @staticmethod
+    def _item_from_issue(issue: Any, row: EditionReviewReadItem | None) -> EditionRepairItem | None:
+        if row is None:
+            return None
+        kind = _issue_kind(issue)
+        decision = getattr(issue, "effective_decision", None)
+        resolved = decision is not None
+        is_source = kind == ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value
+        is_ioc = bool(getattr(issue, "is_publication_ioc", False))
+        repair_key = str(issue.repair_key)
+        source_id = getattr(issue, "source_id", None)
+        source_title = getattr(issue, "source_title", None)
+        source_url = getattr(issue, "source_url", None)
+        collection_id = getattr(issue, "collection_id", None)
+        collection_state = getattr(issue, "collection_state", None)
+        artifact_type = getattr(issue, "artifact_type", None)
+        artifact_id = getattr(issue, "observed_artifact_id", None)
+        artifact_version = getattr(issue, "observed_artifact_version", None)
+        projection_applied = bool(getattr(issue, "projection_applied", False))
+        if is_source:
+            rebuild_required = False
+            # The source still needs an explicit archive/waive decision before
+            # the deterministic REFERENCES reconciliation can run.
+            recommended_stage = "none" if resolved else "rebuild_references"
+        elif not resolved:
+            rebuild_required = False
+            recommended_stage = None
+        elif getattr(getattr(decision, "action", None), "value", None) == "exclude":
+            # Rejected values are absent from the base projection already. An
+            # explicit exclusion therefore needs no derived artifact or retry.
+            rebuild_required = False
+            recommended_stage = "none"
+        elif projection_applied:
+            rebuild_required = row.document_artifact_id is None
+            recommended_stage = "synthesis" if rebuild_required else "none"
+        else:
+            rebuild_required = True
+            recommended_stage = "apply_projection"
+
+        return EditionRepairItem(
+            repair_key=repair_key,
+            kind=kind,
+            position=row.position,
+            subject_id=row.subject_id,
+            article_title=row.title,
+            run_id=row.run_id,
+            pipeline_generation=row.pipeline_generation,
+            artifact_id=artifact_id,
+            artifact_version=artifact_version,
+            source_id=(str(source_id) if source_id else None),
+            source_title=(
+                str(source_title) if source_title else None
+            ),
+            source_url=(
+                str(source_url) if source_url else None
+            ),
+            collection_id=collection_id,
+            collection_state=(
+                str(collection_state)
+                if collection_state is not None
+                else None
+            ),
+            artifact_type=(
+                str(artifact_type)
+                if artifact_type is not None
+                else None
+            ),
+            preview=str(getattr(issue, "preview", "")),
+            reason_code=str(
+                getattr(issue, "reason_code", None)
+                or getattr(issue, "error_reason", None)
+                or "supplemental_source_unarchived"
+            ),
+            value_sha256=str(getattr(issue, "value_sha256", "")),
+            payload_available=bool(getattr(issue, "payload_available", False)),
+            effective_action=(
+                getattr(getattr(decision, "action", None), "value", None)
+                if decision is not None
+                else None
+            ),
+            effective_decision_id=getattr(decision, "id", None),
+            resolved=resolved,
+            resolution_reason=(getattr(decision, "reason", None) if decision else None),
+            rebuild_required=rebuild_required,
+            recommended_stage=recommended_stage,
+            is_publication_ioc=is_ioc,
+        )
+
+
+def _issue_kind(issue: Any) -> str:
+    value = getattr(issue, "kind", "")
+    return str(getattr(value, "value", value))
+
+
+def _issue_subject(issue: Any) -> UUID | None:
+    value = getattr(issue, "subject_id", None)
+    if isinstance(value, UUID):
+        return value
+    # Repair issue DTOs carry the run but not the subject for historical
+    # compatibility. The caller can only safely use the explicit identity.
+    return None
+
+
+def _repair_summary(items: Sequence[EditionRepairItem]) -> EditionRepairSummary:
+    open_items = [item for item in items if not item.resolved]
+    return EditionRepairSummary(
+        unresolved_total=len(open_items),
+        sources_to_supply=sum(
+            item.kind == ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value
+            for item in open_items
+        ),
+        rejected_iocs_to_review=sum(
+            item.kind == ProductionRepairIssueKind.REJECTED_INDICATOR.value
+            and item.is_publication_ioc
+            for item in open_items
+        ),
+        rejected_rules_to_review=sum(
+            item.kind == ProductionRepairIssueKind.REJECTED_RULE.value for item in open_items
+        ),
+        rejected_other_artifacts=sum(
+            item.kind == ProductionRepairIssueKind.REJECTED_INDICATOR.value
+            and not item.is_publication_ioc
+            for item in open_items
+        ),
+        articles_with_repairs=len({item.subject_id for item in items}),
+        articles_needing_rebuild=len(
+            {item.subject_id for item in items if item.rebuild_required}
+        ),
+    )
+
+
+def _repair_articles(items: Sequence[EditionRepairItem]) -> tuple[EditionRepairArticle, ...]:
+    by_subject: dict[UUID, list[EditionRepairItem]] = {}
+    for item in items:
+        by_subject.setdefault(item.subject_id, []).append(item)
+    priority = {
+        "rebuild_references": 0,
+        "references": 1,
+        "extraction": 2,
+        "apply_projection": 3,
+        "synthesis": 4,
+        "none": 5,
+    }
+    articles: list[tuple[int, EditionRepairArticle]] = []
+    for subject_id, subject_items in by_subject.items():
+        recommended = min(
+            (item.recommended_stage or "none" for item in subject_items),
+            key=lambda value: priority.get(value, 99),
+        )
+        articles.append(
+            (
+                min(item.position for item in subject_items),
+                EditionRepairArticle(
+                    subject_id=subject_id,
+                    has_pending_projection=any(
+                        item.recommended_stage == "apply_projection"
+                        for item in subject_items
+                    ),
+                    recommended_stage=recommended,
+                    active_repair_count=sum(not item.resolved for item in subject_items),
+                    resolved_since_last_build_count=sum(
+                        item.resolved and item.rebuild_required for item in subject_items
+                    ),
+                ),
+            )
+        )
+    return tuple(item for _position, item in sorted(articles, key=lambda pair: pair[0]))
+
+
+def _repair_cursor_encode(position: int, repair_key: str) -> str:
+    import base64
+    import json
+
+    value = json.dumps(
+        {"position": position, "repair_key": repair_key},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _repair_cursor_position(
+    cursor: str | None, items: Sequence[EditionRepairItem]
+) -> int:
+    if not cursor:
+        return 0
+    import base64
+    import binascii
+    import json
+
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        value = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+        position = int(value["position"])
+        repair_key = str(value["repair_key"])
+    except (
+        ValueError,
+        KeyError,
+        TypeError,
+        UnicodeError,
+        binascii.Error,
+        json.JSONDecodeError,
+    ) as exc:
+        raise ValueError("invalid_repair_cursor") from exc
+    for index, item in enumerate(items):
+        if (item.position, item.repair_key) > (position, repair_key):
+            return index
+    return len(items)
+
+
 class EditionReviewService:
     """Read and append review decisions without mutating production state."""
 
-    def __init__(self, uow_factory: ProductionUnitOfWorkFactory) -> None:
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        repair_issue_reader: ProductionRepairIssueReader | None = None,
+    ) -> None:
         self._uow_factory = uow_factory
+        self._repair_issue_reader = repair_issue_reader
 
     async def get(self, edition_id: UUID) -> EditionReview:
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
             self._require_review(edition, edition_id)
             rows = await uow.edition_review_read_model.list_for_edition(edition_id)
-        return self.from_rows(edition_id, rows)
+        repairs = await self._repair_issues(edition_id) if self._repair_issue_reader else ()
+        return self.from_rows(edition_id, rows, repair_issues=repairs)
 
     @staticmethod
-    def from_rows(edition_id: UUID, rows: Sequence[EditionReviewReadItem]) -> EditionReview:
+    def from_rows(
+        edition_id: UUID,
+        rows: Sequence[EditionReviewReadItem],
+        *,
+        repair_issues: Sequence[Any] = (),
+    ) -> EditionReview:
         """Evaluate the same review rules inside an already open transaction."""
-        items = tuple(_build_item(row) for row in rows)
+        rows_by_run = {row.run_id: row for row in rows}
+        repair_by_subject: dict[UUID, list[Any]] = {}
+        for issue in repair_issues:
+            subject_id = _issue_subject(issue)
+            if subject_id is None:
+                run_id = getattr(issue, "production_run_id", None)
+                row = rows_by_run.get(run_id) if isinstance(run_id, UUID) else None
+                subject_id = row.subject_id if row is not None else None
+            if subject_id is not None:
+                repair_by_subject.setdefault(subject_id, []).append(issue)
+        items = tuple(
+            _build_item(row, repair_by_subject.get(row.subject_id, ())) for row in rows
+        )
+        unresolved_repair_count = sum(item.unresolved_repair_count for item in items)
         return EditionReview(
             edition_id=edition_id,
             items=items,
             can_accept=bool(items)
             and any(item.included for item in items)
-            and all(not item.blocking for item in items),
+            and all(not item.blocking for item in items)
+            and unresolved_repair_count == 0,
+            unresolved_repair_count=unresolved_repair_count,
+            repair_review_complete=unresolved_repair_count == 0,
         )
+
+    async def _repair_issues(self, edition_id: UUID) -> tuple[Any, ...]:
+        assert self._repair_issue_reader is not None
+        getter = getattr(self._repair_issue_reader, "list_issue_views", None)
+        extraction = (
+            await getter(edition_id)
+            if callable(getter)
+            else await self._repair_issue_reader.list_issues(edition_id)  # type: ignore[attr-defined]
+        )
+        supplemental_getter = getattr(
+            self._repair_issue_reader, "list_supplemental_source_issues", None
+        )
+        supplemental = (
+            await supplemental_getter(edition_id)
+            if callable(supplemental_getter)
+            else ()
+        )
+        return tuple([*extraction, *supplemental])
 
     async def decide(
         self,
@@ -272,6 +706,18 @@ class EditionReviewService:
         if getattr(edition, "status", None) is not EditionStatus.REVIEW:
             raise EditionReviewStatusError("edition_must_be_in_review")
 
+    @staticmethod
+    def _require_repair_desk(edition: object, edition_id: UUID) -> None:
+        if edition is None:
+            raise EditionReviewNotFoundError(str(edition_id))
+        edition_status = getattr(edition, "status", None)
+        status_value = getattr(edition_status, "value", edition_status)
+        if status_value not in {
+            EditionStatus.REVIEW.value,
+            EditionStatus.PRODUCTION.value,
+        }:
+            raise EditionReviewStatusError("edition_must_be_in_review_or_production")
+
 
 async def _get_edition_for_update(uow: object, edition_id: UUID) -> object:
     repository = uow.editions  # type: ignore[attr-defined]
@@ -281,7 +727,7 @@ async def _get_edition_for_update(uow: object, edition_id: UUID) -> object:
     return await repository.get(edition_id)
 
 
-def _build_item(row: EditionReviewReadItem) -> EditionReviewItem:
+def _build_item(row: EditionReviewReadItem, repair_issues: Sequence[Any] = ()) -> EditionReviewItem:
     artifact_verified = (
         row.document_artifact_id is not None
         and row.document_artifact_status is ProductionArtifactStatus.VERIFIED
@@ -312,6 +758,11 @@ def _build_item(row: EditionReviewReadItem) -> EditionReviewItem:
         reconciliation_required=reconciliation_required,
     )
     retry_stage = row.retry_stage if can_retry else None
+    active_repair_count = len(repair_issues)
+    unresolved_repair_count = sum(
+        _repair_issue_is_actionable(issue) and not _repair_issue_resolved(issue)
+        for issue in repair_issues
+    )
     return EditionReviewItem(
         position=row.position,
         subject_id=row.subject_id,
@@ -336,9 +787,28 @@ def _build_item(row: EditionReviewReadItem) -> EditionReviewItem:
         # signal éditorial. Bloquer automatiquement empêcherait de publier un
         # article dont la source ne fournit tout simplement pas de règle.
         rejected_indicator_count=row.rejected_indicator_count,
+        rejected_ioc_count=row.rejected_ioc_count,
+        rejected_other_artifact_count=row.rejected_other_artifact_count,
         rejected_rule_count=row.rejected_rule_count,
         published_rule_count=row.published_rule_count,
+        active_repair_count=active_repair_count,
+        unresolved_repair_count=unresolved_repair_count,
     )
+
+
+def _repair_issue_is_actionable(issue: Any) -> bool:
+    kind = _issue_kind(issue)
+    return kind in {
+        ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value,
+        ProductionRepairIssueKind.REJECTED_RULE.value,
+    } or (
+        kind == ProductionRepairIssueKind.REJECTED_INDICATOR.value
+        and bool(getattr(issue, "is_publication_ioc", False))
+    )
+
+
+def _repair_issue_resolved(issue: Any) -> bool:
+    return getattr(issue, "effective_decision", None) is not None
 
 
 def _validate_document_identity(
@@ -352,6 +822,11 @@ def _validate_document_identity(
 
 
 __all__ = [
+    "EditionRepairArticle",
+    "EditionRepairItem",
+    "EditionRepairPage",
+    "EditionRepairReadService",
+    "EditionRepairSummary",
     "EditionReview",
     "EditionReviewItem",
     "EditionReviewItemNotFoundError",
@@ -362,6 +837,7 @@ __all__ = [
     "EditionReviewStatusError",
     "InvalidReviewDocumentError",
     "InvalidReviewReasonError",
+    "ProductionRepairIssueReader",
     "ReviewItemStaleError",
     "requires_reconciliation",
     "review_item_can_retry",

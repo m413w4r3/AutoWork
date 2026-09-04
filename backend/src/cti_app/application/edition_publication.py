@@ -18,7 +18,10 @@ from cti_app.application.docx_postprocessing import edition_template_values
 from cti_app.application.edition_release_materialization import (
     EditionReleaseRematerializationService,
 )
-from cti_app.application.edition_review import EditionReviewService
+from cti_app.application.edition_review import (
+    EditionReviewService,
+    ProductionRepairIssueReader,
+)
 from cti_app.application.jobs import (
     DuplicateJobError,
     JobDispatcher,
@@ -156,11 +159,13 @@ class EditionPublicationService:
         *,
         job_service: JobService | None = None,
         job_dispatcher: JobDispatcher | None = None,
+        repair_issue_reader: ProductionRepairIssueReader | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
         self._job_service = job_service
         self._job_dispatcher = job_dispatcher
+        self._repair_issue_reader = repair_issue_reader
 
     async def accept(
         self,
@@ -206,7 +211,19 @@ class EditionPublicationService:
         if batch is None:
             raise PublicationAcceptanceError("edition_has_no_production_batch")
         rows = await uow.edition_review_read_model.list_for_edition(edition.id)
-        review = EditionReviewService.from_rows(edition.id, rows)
+        repairs: tuple[Any, ...] = ()
+        if self._repair_issue_reader is not None:
+            getter = getattr(self._repair_issue_reader, "list_issue_views", None)
+            extraction = (
+                await getter(edition.id)
+                if callable(getter)
+                else await self._repair_issue_reader.list_issues(edition.id)  # type: ignore[attr-defined]
+            )
+            supplemental = await self._repair_issue_reader.list_supplemental_source_issues(
+                edition.id
+            )
+            repairs = tuple([*extraction, *supplemental])
+        review = EditionReviewService.from_rows(edition.id, rows, repair_issues=repairs)
         if not review.can_accept:
             raise PublicationAcceptanceError("review_cannot_be_accepted")
 

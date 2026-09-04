@@ -96,6 +96,22 @@ class SqlAlchemySourceCollectionRepository:
         )
         return [_source_collection_from_row(row) for row in rows]
 
+    async def list_for_subjects(
+        self, subject_ids: Sequence[UUID]
+    ) -> Sequence[SourceCollection]:
+        if not subject_ids:
+            return ()
+        rows = await self._session.scalars(
+            select(SourceCollectionRow)
+            .where(SourceCollectionRow.subject_id.in_(subject_ids))
+            .order_by(
+                SourceCollectionRow.subject_id,
+                SourceCollectionRow.created_at,
+                SourceCollectionRow.id,
+            )
+        )
+        return [_source_collection_from_row(row) for row in rows]
+
     async def save(self, collection: SourceCollection) -> None:
         row = await self._session.get(SourceCollectionRow, collection.id)
         if row is None:
