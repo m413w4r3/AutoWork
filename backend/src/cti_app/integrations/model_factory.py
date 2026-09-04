@@ -77,13 +77,19 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
 
 
 def create_bridge_capabilities_provider(settings: Settings) -> ChatGPTBridgeTransport:
+    # Cette instance sert deux usages aux budgets opposés : la sonde
+    # `/bridge/capabilities`, qui doit rester quasi instantanée et sans rejeu,
+    # et la fermeture de session, qui pilote le navigateur. Chaque appel porte
+    # désormais son propre budget ; `timeout_seconds` n'est plus qu'un
+    # défaut de sécurité.
     return ChatGPTBridgeTransport(
         settings.openai_bridge_base_url,
         api_key=_secret_value(settings.openai_bridge_api_key),
-        timeout_seconds=settings.openai_bridge_capabilities_timeout_seconds,
+        timeout_seconds=settings.openai_bridge_archive_timeout_seconds,
         connect_timeout_seconds=settings.openai_bridge_connect_timeout_seconds,
         capabilities_timeout_seconds=settings.openai_bridge_capabilities_timeout_seconds,
-        max_attempts=1,
+        archive_timeout_seconds=settings.openai_bridge_archive_timeout_seconds,
+        max_attempts=settings.openai_bridge_max_attempts,
     )
 
 

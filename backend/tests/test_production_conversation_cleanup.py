@@ -52,13 +52,21 @@ class _Diagnostics:
 
 
 class _ModelService:
-    def __init__(self, failure: Exception | None = None) -> None:
+    def __init__(
+        self,
+        failure: Exception | None = None,
+        failures: list[Exception] | None = None,
+    ) -> None:
         self.archived: list[UUID] = []
         self.failure = failure
+        self.failures = list(failures or [])
+        self.archive_calls = 0
 
     async def archive(self, conversation_id: UUID, *, context_subject_id: UUID) -> None:
-        if self.failure is not None:
-            raise self.failure
+        self.archive_calls += 1
+        failure = self.failures.pop(0) if self.failures else self.failure
+        if failure is not None:
+            raise failure
         self.archived.append(conversation_id)
 
 
@@ -128,33 +136,37 @@ async def test_needs_review_keeps_synthesis_conversation_open() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failure_does_not_change_success_and_is_diagnosed() -> None:
+async def test_cleanup_failure_does_not_change_success_and_is_diagnosed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     run = _run(SubjectProductionStage.SYNTHESIS)
     run.synthesis_conversation_id = uuid4()
     diagnostics = _Diagnostics()
-    orchestrator = _orchestrator(
-        run,
-        _ModelService(
-            BridgeTransportError(
-                "bridge_extension_disconnected",
-                "Extension Chrome non connectée.",
-                retryable=True,
-                phase="conversation_archive",
-                conversation_id=str(run.synthesis_conversation_id),
-                diagnostics={"tab_id": 11, "window_id": 12},
-            )
-        ),
-        diagnostics,
+    model_service = _ModelService(
+        BridgeTransportError(
+            "bridge_extension_disconnected",
+            "Extension Chrome non connectée.",
+            retryable=True,
+            phase="conversation_archive",
+            conversation_id=str(run.synthesis_conversation_id),
+            diagnostics={"tab_id": 11, "window_id": 12},
+        )
     )
+    orchestrator = _orchestrator(run, model_service, diagnostics)
 
     async def completed(*args: object, **kwargs: object) -> dict[str, str]:
         return {"stage": "synthesis", "status": "success"}
 
     orchestrator._execute_synthesis_stage = completed  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "cti_app.application.production_workflow.asyncio.sleep",
+        lambda _: _completed_sleep(),
+    )
 
     result = await orchestrator.execute_stage(run.id, SubjectProductionStage.SYNTHESIS)
 
     assert result["status"] == "success"
+    assert model_service.archive_calls == 2
     failures = [
         event
         for event in diagnostics.events
@@ -167,7 +179,51 @@ async def test_cleanup_failure_does_not_change_success_and_is_diagnosed() -> Non
     assert failures[0]["retryable"] is True
     assert failures[0]["phase"] == "conversation_archive"
     assert failures[0]["details"] == {"tab_id": 11, "window_id": 12}
+    assert failures[0]["attempts"] == 2
     assert "Extension Chrome non connectée" in failures[0]["error_message"]
+
+
+async def _completed_sleep() -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_failure_recovered_on_second_attempt_is_not_diagnosed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _run(SubjectProductionStage.SYNTHESIS)
+    run.synthesis_conversation_id = uuid4()
+    diagnostics = _Diagnostics()
+    model_service = _ModelService(
+        failures=[
+            BridgeTransportError(
+                "bridge_extension_disconnected",
+                "Extension Chrome non connectée.",
+                retryable=True,
+                phase="conversation_archive",
+            )
+        ]
+    )
+    orchestrator = _orchestrator(run, model_service, diagnostics)
+
+    async def completed(*args: object, **kwargs: object) -> dict[str, str]:
+        return {"stage": "synthesis", "status": "success"}
+
+    orchestrator._execute_synthesis_stage = completed  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "cti_app.application.production_workflow.asyncio.sleep",
+        lambda _: _completed_sleep(),
+    )
+
+    result = await orchestrator.execute_stage(run.id, SubjectProductionStage.SYNTHESIS)
+
+    assert result["status"] == "success"
+    assert model_service.archive_calls == 2
+    assert model_service.archived == [run.synthesis_conversation_id]
+    assert not any(
+        event.get("event") == "production.conversation_close_failed"
+        for event in diagnostics.events
+    )
 
 
 @pytest.mark.asyncio

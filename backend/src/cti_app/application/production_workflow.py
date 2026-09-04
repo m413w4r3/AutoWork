@@ -87,6 +87,7 @@ from cti_app.application.production_q2_batch import (
     partition_q2_batch_candidates,
     q2_batch_model_run_id,
 )
+from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.production_source_evidence import (
     SOURCE_EVIDENCE_VERSION,
     SourceEvidenceDocument,
@@ -142,6 +143,10 @@ Q2_ROUTING_POLICY_VERSION = "4"
 Q2_MODEL_POLICY_VERSION = "openai-web-research-v1"
 Q2_SUCCESSFUL_CHECKPOINT_VERSION = "q2-cross-run-v2"
 REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
+
+# Une fermeture d'onglet qui tombe pendant une éviction du service worker MV3
+# réussit quelques secondes plus tard.
+_CONVERSATION_CLOSE_RETRY_DELAY_SECONDS = 5.0
 
 # Functional content of the Q4 evidence pack. Bumped whenever what Q4 can read
 # changes, so a cached synthesis built on an older pack is never reused.
@@ -924,25 +929,48 @@ class ProductionWorkflowOrchestrator:
                 conversation_id,
                 context_subject_id=run.subject_id,
             )
-        except Exception as exc:
-            failure = conversation_close_failure_fields(exc)
-            self._diagnostics.record(
-                event="production.conversation_close_failed",
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage=stage.value,
-                correlation_id=self._correlation_id,
-                conversation_id=str(conversation_id),
-                error_type=type(exc).__name__,
-                error_code=failure["error_code"],
-                retryable=failure.get("retryable"),
-                phase=failure.get("phase"),
-                cause_code=failure.get("cause_code"),
-                reason=failure.get("reason"),
-                details=failure["details"],
-                error=str(exc)[:512],
-                error_message=str(exc)[:512],
-            )
+        except Exception as first_failure:
+            first_failure_fields = conversation_close_failure_fields(first_failure)
+            failure_code = first_failure_fields.get("error_code")
+            # ModelConversationService wraps the bridge error to preserve the
+            # durable archive/close boundary; recover from its typed cause.
+            if failure_code == "conversation_session_close_failed":
+                failure_code = first_failure_fields.get("cause_code")
+            retry_allowed = ProductionRecoveryPolicyV1.is_auto_recoverable(failure_code)
+            exc: Exception | None = first_failure
+            if retry_allowed:
+                # Le service worker MV3 de l'extension est évincé environ
+                # toutes les trois minutes : une fermeture qui tombe dans
+                # cette fenêtre réussit à la tentative suivante.
+                await asyncio.sleep(_CONVERSATION_CLOSE_RETRY_DELAY_SECONDS)
+                try:
+                    await model_service.archive(
+                        conversation_id,
+                        context_subject_id=run.subject_id,
+                    )
+                    exc = None
+                except Exception as second_failure:
+                    exc = second_failure
+            if exc is not None:
+                failure = conversation_close_failure_fields(exc)
+                self._diagnostics.record(
+                    event="production.conversation_close_failed",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage=stage.value,
+                    correlation_id=self._correlation_id,
+                    conversation_id=str(conversation_id),
+                    error_type=type(exc).__name__,
+                    error_code=failure["error_code"],
+                    retryable=failure.get("retryable"),
+                    phase=failure.get("phase"),
+                    cause_code=failure.get("cause_code"),
+                    reason=failure.get("reason"),
+                    details=failure["details"],
+                    attempts=2 if retry_allowed else 1,
+                    error=str(exc)[:512],
+                    error_message=str(exc)[:512],
+                )
 
     async def execute_stage(
         self,

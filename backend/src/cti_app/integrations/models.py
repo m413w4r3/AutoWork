@@ -62,6 +62,7 @@ class HttpResponsesTransport:
         timeout_seconds: float = 900,
         connect_timeout_seconds: float = 3,
         capabilities_timeout_seconds: float = 2,
+        archive_timeout_seconds: float = 60,
         max_attempts: int = 3,
         client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -70,6 +71,7 @@ class HttpResponsesTransport:
         self._timeout = timeout_seconds
         self._connect_timeout = connect_timeout_seconds
         self._capabilities_timeout = min(capabilities_timeout_seconds, 2)
+        self._archive_timeout = archive_timeout_seconds
         self._max_attempts = max_attempts
         self._client = client
 
@@ -534,10 +536,18 @@ class ChatGPTBridgeTransport(HttpResponsesTransport):
         )
 
     async def archive_conversation(self, conversation_id: UUID) -> None:
+        # Fermer l'onglet passe par l'extension Chrome : ce budget n'a rien à
+        # voir avec celui d'une sonde de capacités. La requête est idempotente
+        # côté bridge (fermer un onglet déjà fermé est un succès), elle peut
+        # donc être rejouée.
         response = await self._request(
             "DELETE",
             f"/bridge/conversations/{conversation_id}",
             phase="conversation_archive",
+            timeout_seconds=self._archive_timeout,
+            idempotency_key=f"conversation-archive-{conversation_id}",
+            retry=True,
+            retry_status_codes=frozenset({429, 502, 503, 504}),
         )
         if response.get("archived") is not True:
             raise _archive_response_error(response, conversation_id)

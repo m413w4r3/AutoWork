@@ -406,6 +406,38 @@ async def test_chatgpt_bridge_transport_uses_native_capabilities() -> None:
     assert capabilities == {"transport": "chatgpt_web_ui"}
 
 
+async def test_bridge_capabilities_and_archive_use_separate_timeouts() -> None:
+    class _TimeoutClient:
+        def __init__(self) -> None:
+            self.timeouts: list[httpx.Timeout] = []
+
+        async def request(
+            self,
+            method: str,
+            url: str,
+            **kwargs: Any,
+        ) -> httpx.Response:
+            self.timeouts.append(kwargs["timeout"])
+            if url.endswith("/bridge/capabilities"):
+                return httpx.Response(200, json={"transport": "chatgpt_web_ui"})
+            return httpx.Response(200, json={"archived": True})
+
+    client = _TimeoutClient()
+    transport = ChatGPTBridgeTransport(
+        "http://bridge.test/v1",
+        capabilities_timeout_seconds=2,
+        archive_timeout_seconds=60,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    await transport.capabilities()
+    await transport.archive_conversation(UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"))
+
+    assert len(client.timeouts) == 2
+    assert client.timeouts[0].read == 2
+    assert client.timeouts[1].read == 60
+
+
 @pytest.mark.parametrize(
     ("status", "code", "attempts"),
     [(401, "bridge_auth_failed", 1), (500, "bridge_server_error", 1)],
