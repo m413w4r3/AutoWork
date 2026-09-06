@@ -24,7 +24,16 @@ export function RepairRulePanel({
   readOnly: boolean;
   disabled: boolean;
 }) {
-  const alternatives = alternativeRepairActions("rejected_rule", currentAction);
+  // A rule whose full body could not be recovered cannot be included: the
+  // projection would have no body to write into the sidecar.
+  const bodyAvailable =
+    detail.payload_available !== false &&
+    detail.body !== null &&
+    detail.body !== undefined;
+  const alternatives = alternativeRepairActions(
+    "rejected_rule",
+    currentAction,
+  ).filter((action) => bodyAvailable || action !== "include");
   return (
     <section
       className="repair-rule-panel"
@@ -33,15 +42,21 @@ export function RepairRulePanel({
       <h4 id="repair-rule-heading">
         {detail.artifact_type ?? "Règle de détection"}
       </h4>
-      {detail.body !== null && detail.body !== undefined ? (
+      {bodyAvailable ? (
         <pre className="repair-rule-panel__body">
           <code>{detail.body}</code>
         </pre>
       ) : (
-        <p>
-          Le corps intégral de cette règle n&apos;est pas disponible dans le
-          pack d&apos;évidence chargé.
-        </p>
+        <>
+          <p>
+            Corps intégral non récupérable depuis les preuves archivées : cette
+            règle ne peut pas être incluse.
+          </p>
+          <p>
+            Relancez Extraction pour régénérer les preuves si vous souhaitez
+            réexaminer cette règle.
+          </p>
+        </>
       )}
       {currentAction ? (
         <p className="repair-decision-badge" role="status">

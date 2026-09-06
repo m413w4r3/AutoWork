@@ -26,6 +26,7 @@ and models are added instead of silently drifting out of date.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -782,7 +783,7 @@ def test_legacy_0001_database_gets_repair_desk_without_data_loss(
 
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0002_repair_desk_compat"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_manual_source_archival"
     after_tables = asyncio.run(_table_names(temporary_postgres_url))
     assert after_tables == before_tables | {_REPAIR_TABLE}
     repair_table = Base.metadata.tables[_REPAIR_TABLE]
@@ -849,6 +850,129 @@ def test_legacy_0001_database_gets_repair_desk_without_data_loss(
 
 
 # ---------------------------------------------------------------------------
+# 6b: manual source archival on a database that predates the manual lease
+# ---------------------------------------------------------------------------
+
+
+_PRE_MANUAL_LEASE_SQL = (
+    "ALTER TABLE collection_attempts DROP CONSTRAINT ck_collection_attempts_acquisition",
+    "ALTER TABLE source_collections DROP CONSTRAINT ck_source_collections_single_lease",
+    "ALTER TABLE collection_attempts DROP COLUMN manual_lease_id",
+    "ALTER TABLE source_collections DROP COLUMN manual_lease_id",
+    "ALTER TABLE collection_attempts ALTER COLUMN job_id SET NOT NULL",
+)
+
+
+async def _revert_to_pre_manual_lease_schema(database_url: str) -> None:
+    """Model a real database created before the manual acquisition token."""
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            for statement in _PRE_MANUAL_LEASE_SQL:
+                await connection.execute(text(statement))
+    finally:
+        await engine.dispose()
+
+
+def test_existing_database_gains_the_manual_lease_without_data_loss(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "0002_repair_desk_compat")
+    asyncio.run(_revert_to_pre_manual_lease_schema(temporary_postgres_url))
+    preserved = asyncio.run(_seed_legacy_rows(temporary_postgres_url))
+
+    command.upgrade(config, "head")
+
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_manual_source_archival"
+    snapshot = asyncio.run(_database_snapshot(temporary_postgres_url))
+    for table_name in ("source_collections", "collection_attempts"):
+        table = Base.metadata.tables[table_name]
+        assert snapshot[table_name]["columns"] == _expected_columns(table)
+        assert snapshot[table_name]["checks"] == _expected_check_constraint_names(table)
+        assert snapshot[table_name]["fks"] == _expected_foreign_keys(table)
+
+    # Rows written before the new schema are untouched by the upgrade: the
+    # only difference allowed is the new, empty nullable lease column.
+    after = asyncio.run(_legacy_data_snapshot(temporary_postgres_url))
+    assert _without_manual_lease(after) == _without_manual_lease(preserved)
+    assert json.loads(after["source_collections"])["manual_lease_id"] is None
+
+
+def _without_manual_lease(snapshot: dict[str, str]) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for name, row_json in snapshot.items():
+        row = json.loads(row_json)
+        row.pop("manual_lease_id", None)
+        rows[name] = row
+    return rows
+
+
+def test_downgrade_refuses_to_destroy_manual_collection_attempts(
+    temporary_postgres_url: str,
+) -> None:
+    config = _alembic_config(temporary_postgres_url)
+    command.upgrade(config, "head")
+    asyncio.run(_seed_legacy_rows(temporary_postgres_url))
+    asyncio.run(_seed_manual_collection_attempt(temporary_postgres_url))
+
+    with pytest.raises(RuntimeError, match="manual collection attempts"):
+        command.downgrade(config, "0002_repair_desk_compat")
+
+    # The refused downgrade left the audit row and the schema in place.
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_manual_source_archival"
+    assert asyncio.run(_manual_attempt_count(temporary_postgres_url)) == 1
+
+
+async def _seed_manual_collection_attempt(database_url: str) -> None:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO collection_policy_snapshots "
+                    "(id, max_redirects, timeout_seconds, max_download_bytes, "
+                    "max_expanded_bytes, max_decompression_ratio, user_agent, allowed_domains, "
+                    "blocked_domains, collector_version, extraction_limits, created_at) "
+                    "VALUES (:policy_id, 3, 10.0, 1000, 1000, 10.0, 'agent', '[]'::jsonb, "
+                    "'[]'::jsonb, '1', '{}'::jsonb, :created_at)"
+                ),
+                {"policy_id": "f" * 64, "created_at": _LEGACY_CREATED_AT},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO collection_attempts "
+                    "(id, collection_id, job_id, manual_lease_id, policy_snapshot_id, "
+                    "requested_url, redirect_chain, attempted_at, completed_at, "
+                    "allowed_headers, outcome, failure_reason) "
+                    "VALUES (:id, :collection_id, NULL, gen_random_uuid(), :policy_id, "
+                    "'https://legacy.example/source', '[]'::jsonb, :created_at, :created_at, "
+                    "'{}'::jsonb, 'succeeded', NULL)"
+                ),
+                {
+                    "id": "10000000-0000-0000-0000-000000000012",
+                    "collection_id": _LEGACY_ROW_IDS["source_collection"],
+                    "policy_id": "f" * 64,
+                    "created_at": _LEGACY_CREATED_AT,
+                },
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _manual_attempt_count(database_url: str) -> int:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            result = await connection.execute(
+                text("SELECT count(*) FROM collection_attempts WHERE job_id IS NULL")
+            )
+            return int(result.scalar_one())
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
 # 7: fresh install and repeated upgrade
 # ---------------------------------------------------------------------------
 
@@ -860,7 +984,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
 
     command.upgrade(config, "head")
     command.current(config)
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0002_repair_desk_compat"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_manual_source_archival"
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -875,7 +999,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     # 0002 must observe the table and trigger made by 0001 and perform no DDL
     # that conflicts with them.
     command.upgrade(config, "head")
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0002_repair_desk_compat"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_manual_source_archival"
     assert asyncio.run(_table_names(temporary_postgres_url)) == tables
     assert asyncio.run(_trigger_definitions(temporary_postgres_url)) == trigger_definitions
 

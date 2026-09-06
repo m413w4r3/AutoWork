@@ -131,6 +131,9 @@ class SourceCollection:
     latest_attempt_id: UUID | None = None
     derived_artifact_id: UUID | None = None
     fetch_job_id: UUID | None = None
+    # A manual upload is not a collector job, so it holds its own lease token
+    # instead of a `jobs.id`.  Only the operation that opened it may archive.
+    manual_lease_id: UUID | None = None
     fetch_policy_snapshot_id: str | None = None
     fetch_started_at: datetime | None = None
     fetch_lease_expires_at: datetime | None = None
@@ -188,6 +191,7 @@ class SourceCollection:
             return False
         self.state = CollectionState.FETCHING
         self.fetch_job_id = job_id
+        self.manual_lease_id = None
         self.fetch_policy_snapshot_id = policy_snapshot_id
         self.fetch_started_at = timestamp
         self.fetch_lease_expires_at = timestamp + lease_duration
@@ -198,7 +202,7 @@ class SourceCollection:
 
     def claim_manual_upload(
         self,
-        job_id: UUID,
+        manual_lease_id: UUID,
         *,
         lease_duration: timedelta,
         policy_snapshot_id: str,
@@ -210,6 +214,11 @@ class SourceCollection:
         are exactly the states an analyst supplies content for. An already
         archived source is refused — replacing archived evidence would break
         the immutability the whole pipeline relies on.
+
+        The lease token is generated for this one operation and is deliberately
+        NOT a job id: an analyst upload is not a collector download, and no
+        row in ``jobs`` describes it.  A newer upload taking over an expired
+        lease changes the token, so the older request can no longer archive.
         """
         timestamp = now or datetime.now(UTC)
         if lease_duration <= timedelta(0):
@@ -224,7 +233,8 @@ class SourceCollection:
             if self.fetch_lease_expires_at and self.fetch_lease_expires_at > timestamp:
                 return False
         self.state = CollectionState.FETCHING
-        self.fetch_job_id = job_id
+        self.fetch_job_id = None
+        self.manual_lease_id = manual_lease_id
         self.fetch_policy_snapshot_id = policy_snapshot_id
         self.fetch_started_at = timestamp
         self.fetch_lease_expires_at = timestamp + lease_duration
@@ -245,6 +255,30 @@ class SourceCollection:
             raise ValueError("Only a fetching source can be archived")
         if self.fetch_job_id != job_id:
             raise ValueError("Only the current fetch lease owner can archive a source")
+        self._complete_archive(attempt_id, source_document_id, decoded_blob_id)
+
+    def archive_manual(
+        self,
+        *,
+        manual_lease_id: UUID,
+        attempt_id: UUID,
+        source_document_id: UUID,
+        decoded_blob_id: UUID,
+    ) -> None:
+        """Close an analyst upload opened by ``claim_manual_upload``.
+
+        The collector lease and the manual lease are distinct tokens, so this
+        also refuses a collector job that took the source over meanwhile.
+        """
+        if self.state is not CollectionState.FETCHING:
+            raise ValueError("Only a fetching source can be archived")
+        if self.fetch_job_id is not None or self.manual_lease_id != manual_lease_id:
+            raise ValueError("Only the current manual lease owner can archive a source")
+        self._complete_archive(attempt_id, source_document_id, decoded_blob_id)
+
+    def _complete_archive(
+        self, attempt_id: UUID, source_document_id: UUID, decoded_blob_id: UUID
+    ) -> None:
         self.latest_attempt_id = attempt_id
         self.source_document_id = source_document_id
         self.decoded_blob_id = decoded_blob_id
@@ -356,6 +390,7 @@ class SourceCollection:
 
     def _clear_fetch_lease(self) -> None:
         self.fetch_job_id = None
+        self.manual_lease_id = None
         self.fetch_policy_snapshot_id = None
         self.fetch_started_at = None
         self.fetch_lease_expires_at = None
@@ -389,7 +424,9 @@ class CollectionPolicySnapshot:
 @dataclass(frozen=True, slots=True)
 class CollectionAttempt:
     collection_id: UUID
-    job_id: UUID
+    # Exactly one acquisition token: a collector job, or the analyst upload
+    # lease.  An attempt without a job is only ever a manual acquisition.
+    job_id: UUID | None
     policy_snapshot_id: str
     requested_url: str
     final_url: str | None
@@ -407,11 +444,16 @@ class CollectionAttempt:
     allowed_headers: dict[str, str]
     outcome: AttemptOutcome
     failure_reason: str | None
+    manual_lease_id: UUID | None = None
     id: UUID = field(default_factory=uuid4)
 
     def __post_init__(self) -> None:
         if not self.policy_snapshot_id.strip() or not self.requested_url.strip():
             raise ValueError("Collection attempt configuration and URL are required")
+        if (self.job_id is None) == (self.manual_lease_id is None):
+            raise ValueError(
+                "A collection attempt is either a collector job or a manual upload lease"
+            )
         if self.attempted_at.tzinfo is None or self.completed_at.tzinfo is None:
             raise ValueError("Collection attempt timestamps must be timezone-aware")
         if self.outcome is AttemptOutcome.SUCCEEDED:

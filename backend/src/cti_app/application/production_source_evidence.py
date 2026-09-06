@@ -195,6 +195,48 @@ class SourceEvidenceRejection:
 
 
 @dataclass(frozen=True, slots=True)
+class Q2ProposalIdentity:
+    """One numbered Q2 proposal, as the source-evidence gate sees it."""
+
+    proposal_index: int
+    proposal_kind: str
+    artifact_type: str | None
+    value: str
+
+
+def enumerate_q2_proposals(output: Q2SourceOutput) -> tuple[Q2ProposalIdentity, ...]:
+    """Number every artifact and rule exactly as the gate numbers rejections.
+
+    Recovering a historical rejection from an archived Q2 output means finding
+    the proposal the gate rejected, so both must count proposals the same way:
+    facts first, then artifacts, then rules.
+    """
+    identities: list[Q2ProposalIdentity] = []
+    proposal_index = len(output.facts)
+    for artifact in output.artifacts:
+        proposal_index += 1
+        identities.append(
+            Q2ProposalIdentity(
+                proposal_index=proposal_index,
+                proposal_kind="artifact",
+                artifact_type=artifact.artifact_type,
+                value=artifact.value,
+            )
+        )
+    for rule in output.rules:
+        proposal_index += 1
+        identities.append(
+            Q2ProposalIdentity(
+                proposal_index=proposal_index,
+                proposal_kind="rule",
+                artifact_type=rule.rule_type.value,
+                value=rule.body,
+            )
+        )
+    return tuple(identities)
+
+
+@dataclass(frozen=True, slots=True)
 class SourceEvidenceResult:
     """Filtered Q2 output plus deterministic local-gate diagnostics."""
 

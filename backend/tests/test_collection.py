@@ -267,12 +267,23 @@ async def test_manual_content_archives_blocked_source_and_records_provenance(
     ]
     assert len(manual_events) == 1
     assert manual_events[0].actor_id == "analyst-1"
-    assert manual_events[0].payload == {
-        "actor_id": "analyst-1",
-        "declared_mime_type": "text/html",
-        "size": len(content),
-        "decoded_sha256": hashlib.sha256(content).hexdigest(),
-    }
+    # The manual audit carries the same evidence as a collector archive, plus
+    # the analyst identity and the lease that authorized the operation.
+    payload = manual_events[0].payload
+    assert payload["actor_id"] == "analyst-1"
+    assert payload["declared_mime_type"] == "text/html"
+    assert payload["size"] == len(content)
+    assert payload["decoded_sha256"] == hashlib.sha256(content).hexdigest()
+    assert payload["encoded_sha256"] == hashlib.sha256(content).hexdigest()
+    assert payload["source_document_id"] == str(archived.source_document_id)
+    assert payload["decoded_blob_id"] == str(archived.decoded_blob_id)
+    assert payload["requested_url"] == archived.canonical_url
+    assert UUID(payload["manual_lease_id"])
+    # No collector event: the analyst supplied the content, not the collector.
+    assert not [event for event in factory.provenance if event.event_type == "source.archived"]
+    attempts = await app.attempts(archived.id)
+    assert [attempt.job_id for attempt in attempts] == [None]
+    assert attempts[-1].manual_lease_id == UUID(payload["manual_lease_id"])
 
 
 async def test_manual_content_rejects_empty_and_oversized_content(tmp_path: Path) -> None:

@@ -361,6 +361,7 @@ def _production_repair_issue_service(request: Request) -> ProductionRepairIssueS
         service = ProductionRepairIssueService(
             request.app.state.uow_factory,
             getattr(request.app.state, "production_artifact_store", None),
+            getattr(request.app.state, "production_repair_payload_resolver", None),
         )
     return service
 
@@ -398,6 +399,7 @@ def _production_repair_projection_service(
         service = ProductionRepairProjectionService(
             request.app.state.uow_factory,
             getattr(request.app.state, "production_artifact_store", None),
+            payload_resolver=getattr(request.app.state, "production_repair_payload_resolver", None),
         )
     return service
 
@@ -454,6 +456,8 @@ def _repair_issue_view(issue: Any) -> dict[str, Any]:
         "value_sha256": issue.value_sha256,
         "preview": issue.preview,
         "payload_available": issue.payload_available,
+        "payload_origin": issue.payload_origin.value,
+        "legacy_evidence": issue.legacy_evidence,
         "production_run_id": str(issue.production_run_id),
         "observed_artifact_id": str(issue.observed_artifact_id),
         "observed_artifact_version": issue.observed_artifact_version,

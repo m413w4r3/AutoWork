@@ -49,6 +49,16 @@ export function alternativeRepairActions(
   );
 }
 
+/**
+ * The queue is deliberately bounded and never opens an archive, so an empty
+ * preview on a pre-evidence-pack rejection means "not read yet", not "lost".
+ */
+export function repairPreviewFallback(item: EditionRepairItem): string {
+  return item.legacy_evidence
+    ? "Valeur historique — ouvrir pour tentative de récupération"
+    : "Valeur non conservée";
+}
+
 export function repairStatusLabel(item: EditionRepairItem): string {
   if (item.recommended_stage === "revise_decision") {
     return "Décision inapplicable";
@@ -245,7 +255,7 @@ export function RepairQueue({
                           </span>
                         </span>
                         <code className="repair-issue-row__preview">
-                          {item.preview || "Valeur non conservée"}
+                          {item.preview || repairPreviewFallback(item)}
                         </code>
                         <span className="repair-issue-row__reason">
                           {repairReasonLabel(item.reason_code)}

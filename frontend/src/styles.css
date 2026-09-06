@@ -2236,6 +2236,13 @@ h1 {
   font-size: 0.8rem;
 }
 
+/* Une valeur historique perdue est un fait à lire, pas une valeur à décider. */
+.repair-inspector__value-missing {
+  color: #8a4b2a;
+  font-weight: 600;
+  margin: 0;
+}
+
 .repair-inspector__technical,
 .repair-inspector__audit,
 .repair-inspector__provenance,

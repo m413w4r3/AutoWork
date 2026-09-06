@@ -34,6 +34,10 @@ from cti_app.application.production_parsers import (
     technical_extraction_from_json,
     technical_extraction_to_json,
 )
+from cti_app.application.production_repair_payloads import (
+    ProductionRepairPayloadResolver,
+    RepairPayloadOrigin,
+)
 from cti_app.application.production_stages import ExtractionService, compute_input_hash
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import canonicalize_http_url
@@ -556,6 +560,12 @@ class ProductionRepairIssueView:
     observed_pipeline_generation: int
     model_run_id: str | None = None
     batch_id: str | None = None
+    #: Where the displayed value came from. The bounded list never reads an
+    #: archive, so it reports UNAVAILABLE until the detail resolves the issue.
+    payload_origin: RepairPayloadOrigin = RepairPayloadOrigin.UNAVAILABLE
+    #: True when this entry comes from pre-LOT18 diagnostics, whose value the
+    #: detail endpoint may still recover from the archived Q2 output.
+    legacy_evidence: bool = False
     effective_decision: ProductionRepairDecision | None = None
     # True only when the effective decision's content is proven materialized
     # by the current projection marker -- never inferred from its action.
@@ -566,7 +576,7 @@ class ProductionRepairIssueView:
 
 @dataclass(frozen=True, slots=True)
 class ProductionRepairIssueDetail:
-    """One issue plus its full inert value when the evidence pack has it."""
+    """One issue plus the exact value the resolver could prove."""
 
     issue: ProductionRepairIssueView
     value: str | None
@@ -575,6 +585,10 @@ class ProductionRepairIssueDetail:
     @property
     def payload_available(self) -> bool:
         return self.issue.payload_available
+
+    @property
+    def payload_origin(self) -> RepairPayloadOrigin:
+        return self.issue.payload_origin
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,15 +643,17 @@ class ProductionRepairIssueService:
         self,
         uow_factory: ProductionUnitOfWorkFactory,
         artifact_store: ProductionArtifactStore | None = None,
+        payload_resolver: ProductionRepairPayloadResolver | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
+        self._payloads = payload_resolver or ProductionRepairPayloadResolver()
 
     async def list_issues(
         self, edition_id: UUID, subject_id: UUID | None = None
     ) -> tuple[ProductionRepairIssueView, ...]:
         return tuple(
-            view for view, _value in await self._records(edition_id, subject_id=subject_id)
+            view for view, _value, _entry in await self._records(edition_id, subject_id=subject_id)
         )
 
     async def list_issue_views(
@@ -652,7 +668,7 @@ class ProductionRepairIssueService:
         """
         return tuple(
             view
-            for view, _value in await self._records(
+            for view, _value, _entry in await self._records(
                 edition_id, subject_id=subject_id, load_payload=False
             )
         )
@@ -660,15 +676,29 @@ class ProductionRepairIssueService:
     async def get_issue(
         self, edition_id: UUID, repair_key: str, subject_id: UUID | None = None
     ) -> ProductionRepairIssueDetail | None:
-        for view, value in await self._records(edition_id, subject_id=subject_id):
-            if view.repair_key == repair_key:
-                return ProductionRepairIssueDetail(
-                    issue=view,
-                    value=value,
-                    decision_history=await self.decision_history(
-                        edition_id, repair_key, subject_id
-                    ),
-                )
+        """Resolve one issue's exact value, archives included.
+
+        The list stays bounded; only the selected issue is allowed to read a
+        historical Q2 output, and only to recover a value whose SHA-256 the
+        rejection already recorded.
+        """
+        for view, value, entry in await self._records(edition_id, subject_id=subject_id):
+            if view.repair_key != repair_key:
+                continue
+            payload = await self._payloads.resolve(
+                entry,
+                payload_available=value is not None,
+                value_sha256=view.value_sha256,
+            )
+            return ProductionRepairIssueDetail(
+                issue=replace(
+                    view,
+                    payload_available=payload.available,
+                    payload_origin=payload.origin,
+                ),
+                value=payload.value,
+                decision_history=await self.decision_history(edition_id, repair_key, subject_id),
+            )
         return None
 
     async def decision_history(
@@ -850,7 +880,7 @@ class ProductionRepairIssueService:
         *,
         subject_id: UUID | None,
         load_payload: bool = True,
-    ) -> list[tuple[ProductionRepairIssueView, str | None]]:
+    ) -> list[tuple[ProductionRepairIssueView, str | None, Mapping[str, Any]]]:
         async with self._uow_factory() as uow:
             runs = await uow.subject_production_runs.list_for_edition(edition_id)
             artifacts_by_run = await _current_artifacts_by_run(
@@ -873,7 +903,7 @@ class ProductionRepairIssueService:
         decisions_by_key = {
             (decision.subject_id, decision.repair_key): decision for decision in decisions
         }
-        records: list[tuple[ProductionRepairIssueView, str | None]] = []
+        records: list[tuple[ProductionRepairIssueView, str | None, Mapping[str, Any]]] = []
         for context in contexts:
             entries, payload_available = await self._entries(
                 context.artifact, load_payload=load_payload
@@ -903,6 +933,7 @@ class ProductionRepairIssueService:
                                 ),
                             ),
                             value,
+                            entry,
                         )
                     )
         return records
@@ -945,9 +976,14 @@ class ProductionRepairAdjudicationService:
         issue_service: ProductionRepairIssueService | None = None,
         decision_service: ProductionRepairDecisionService | None = None,
         artifact_store: ProductionArtifactStore | None = None,
+        payload_resolver: ProductionRepairPayloadResolver | None = None,
     ) -> None:
         self._uow_factory = uow_factory
-        self._issues = issue_service or ProductionRepairIssueService(uow_factory, artifact_store)
+        # Same issue service, therefore the same resolver: an INCLUDE is only
+        # accepted for the exact value the analyst was shown.
+        self._issues = issue_service or ProductionRepairIssueService(
+            uow_factory, artifact_store, payload_resolver
+        )
         self._decisions = decision_service or ProductionRepairDecisionService(uow_factory)
 
     async def decide_current_issue(
@@ -1130,10 +1166,12 @@ class ProductionRepairProjectionService:
         uow_factory: ProductionUnitOfWorkFactory,
         artifact_store: ProductionArtifactStore | None = None,
         extraction_service: ExtractionService | None = None,
+        payload_resolver: ProductionRepairPayloadResolver | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
         self._extraction = extraction_service or ExtractionService(uow_factory, artifact_store)
+        self._payloads = payload_resolver or ProductionRepairPayloadResolver()
 
     async def project_effective_extraction(
         self,
@@ -1230,7 +1268,7 @@ class ProductionRepairProjectionService:
                 if decision.subject_id == run.subject_id
             }
 
-            active_entries: list[tuple[str, ProductionRepairIssueKind, dict[str, Any]]] = []
+            active_entries: list[tuple[str, ProductionRepairIssueKind, dict[str, Any], str]] = []
             for entry in entries:
                 identity = _repair_entry_identity(
                     entry,
@@ -1239,7 +1277,31 @@ class ProductionRepairProjectionService:
                     payload_available=payload_available,
                 )
                 if identity is not None:
-                    active_entries.append((identity[0], identity[1], entry))
+                    active_entries.append((identity[0], identity[1], entry, identity[3]))
+
+            # Resolve every honoured INCLUDE through the SAME resolver the
+            # detail and the adjudication used, grouped so each archived Q2
+            # output is read and parsed at most once for this projection.
+            include_entries = [
+                (repair_key, entry, value_sha256)
+                for repair_key, _kind, entry, value_sha256 in active_entries
+                if (decision := decisions_by_key.get(repair_key)) is not None
+                and _enum_value(decision.action) == ProductionRepairAction.INCLUDE.value
+            ]
+            resolved_payloads = dict(
+                zip(
+                    (repair_key for repair_key, _entry, _hash in include_entries),
+                    await self._payloads.resolve_many(
+                        [entry for _key, entry, _hash in include_entries],
+                        payload_available=payload_available,
+                        value_sha256_by_index={
+                            index: value_sha256
+                            for index, (_key, _entry, value_sha256) in enumerate(include_entries)
+                        },
+                    ),
+                    strict=True,
+                )
+            )
 
             items = list(base_extraction.items)
             rules = list(base_extraction.rules)
@@ -1255,7 +1317,7 @@ class ProductionRepairProjectionService:
             additions: list[ExtractionItem] = []
             rule_additions: list[DetectionRule] = []
 
-            for repair_key, kind, entry in sorted(
+            for repair_key, kind, entry, _entry_hash in sorted(
                 active_entries, key=lambda value: (value[1].value, value[0])
             ):
                 decision = decisions_by_key.get(repair_key)
@@ -1279,13 +1341,13 @@ class ProductionRepairProjectionService:
                 if action != ProductionRepairAction.INCLUDE.value:
                     unresolved.append(repair_key)
                     continue
-                value = entry.get("value")
-                if not payload_available or not isinstance(value, str):
+                payload = resolved_payloads.get(repair_key)
+                if payload is None or not payload.available or payload.value is None:
                     raise ProductionRepairProjectionError("repair_payload_unavailable")
-                value_sha256 = str(
-                    entry.get("value_sha256") or entry.get("value_hash") or ""
-                ).casefold()
-                if value_sha256 != _sha256(value):
+                value = payload.value
+                # The hash is re-verified here, on the value this projection is
+                # about to write, not merely on the one the detail displayed.
+                if payload.value_sha256 != _sha256(value):
                     raise ProductionRepairProjectionError("repair_payload_hash_mismatch")
                 try:
                     if kind is ProductionRepairIssueKind.REJECTED_RULE:
@@ -1357,7 +1419,7 @@ class ProductionRepairProjectionService:
 
             effective_for_base = [
                 decision
-                for repair_key, _kind, _entry in active_entries
+                for repair_key, _kind, _entry, _hash in active_entries
                 if (decision := decisions_by_key.get(repair_key)) is not None
             ]
             effective_for_base.sort(key=lambda item: (item.repair_key, item.id))
@@ -1495,8 +1557,12 @@ def _repair_entry_identity(
     edition_id: UUID,
     subject_id: UUID,
     payload_available: bool = True,
-) -> tuple[str, ProductionRepairIssueKind, str] | None:
-    """Derive the active issue key from immutable evidence, never its position."""
+) -> tuple[str, ProductionRepairIssueKind, str, str] | None:
+    """Derive the active issue key from immutable evidence, never its position.
+
+    Returns the repair key, its kind, the source id and the exact-value hash
+    the key was built from — the hash any later resolution must match.
+    """
     proposal_kind = str(entry.get("proposal_kind", ""))
     kind_value = entry.get("kind") or (
         ProductionRepairIssueKind.REJECTED_RULE.value
@@ -1547,7 +1613,7 @@ def _repair_entry_identity(
         )
     except ValueError:
         return None
-    return key, kind, source_id
+    return key, kind, source_id, value_sha256
 
 
 def _entry_artifact_type(value: object) -> ArtifactType:
@@ -2080,6 +2146,14 @@ def _issue_record(
     preview_source = raw_value if isinstance(raw_value, str) else str(entry.get("preview", ""))
     preview = preview_source[:MAX_REPAIR_PREVIEW_CHARS]
     view = ProductionRepairIssueView(
+        payload_origin=(
+            RepairPayloadOrigin.REPAIR_EVIDENCE_PACK
+            if value is not None
+            else RepairPayloadOrigin.UNAVAILABLE
+        ),
+        # A bounded list never opens an archive, so an entry that predates the
+        # evidence pack is only flagged as possibly recoverable on the detail.
+        legacy_evidence=not payload_available,
         repair_key=repair_key,
         kind=kind,
         artifact_type=artifact_type,

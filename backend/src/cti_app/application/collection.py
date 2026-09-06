@@ -81,6 +81,22 @@ class ManualContentAlreadyArchivedError(CollectionNotAllowedError):
 
 
 @dataclass(frozen=True, slots=True)
+class _CollectorAcquisition:
+    """The collector downloaded the publication under a real job lease."""
+
+    job_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class _ManualAcquisition:
+    """The analyst supplied the publication under a manual upload lease."""
+
+    manual_lease_id: UUID
+    actor_id: str
+    declared_mime_type: str
+
+
+@dataclass(frozen=True, slots=True)
 class SupplementalSource:
     """A publication proposed by reference research, not by discovery."""
 
@@ -661,7 +677,13 @@ class SubjectCollectionService:
                     position[1],
                     f"Archivage de la source {position[0]}/{position[1]}",
                 )
-        await self._archive(collection.id, job_id, started_at, response, candidate=candidate)
+        await self._archive(
+            collection.id,
+            started_at,
+            response,
+            acquisition=_CollectorAcquisition(job_id=job_id),
+            candidate=candidate,
+        )
         self._log_source_result(
             collection,
             job_id,
@@ -699,14 +721,17 @@ class SubjectCollectionService:
         if not isinstance(detected_content_type, DetectedMimeType):
             raise ManualContentTypeError("Detected content type is not supported")
 
-        job_id = uuid4()
+        # A lease token, never a job id: no row in ``jobs`` describes an
+        # analyst upload, and ``source_collections.fetch_job_id`` is a foreign
+        # key into that table.
+        manual_lease_id = uuid4()
         started_at = datetime.now(UTC)
         async with self._uow_factory() as uow:
             collection = await _require_collection(uow, collection_id)
             if collection.state in _COLLECTED_STATES:
                 raise ManualContentAlreadyArchivedError("source_already_archived")
             claimed = collection.claim_manual_upload(
-                job_id,
+                manual_lease_id,
                 lease_duration=self._fetch_lease,
                 policy_snapshot_id=self._policy_snapshot.id,
                 now=started_at,
@@ -736,33 +761,19 @@ class SubjectCollectionService:
             content_encoding="identity",
             acquired_at=datetime.now(UTC),
         )
-        await self._archive(collection_id, job_id, started_at, response)
+        await self._archive(
+            collection_id,
+            started_at,
+            response,
+            acquisition=_ManualAcquisition(
+                manual_lease_id=manual_lease_id,
+                actor_id=actor_id,
+                declared_mime_type=declared_mime_type,
+            ),
+        )
 
         async with self._uow_factory() as uow:
             collection = await _require_collection(uow, collection_id)
-            subject = await uow.subjects.get(collection.subject_id)
-            if subject is None:
-                raise CollectionNotAllowedError("Collection source lost its canonical context")
-            if collection.origin_kind is not SourceOriginKind.MANUAL:
-                collection.origin_kind = SourceOriginKind.MANUAL
-                await uow.source_collections.save(collection)
-            await uow.provenance.append(
-                ProvenanceEvent(
-                    subject_id=collection.subject_id,
-                    aggregate_type="source_collection",
-                    aggregate_id=collection.id,
-                    event_type="source.archived_manually",
-                    payload={
-                        "actor_id": actor_id,
-                        "declared_mime_type": declared_mime_type,
-                        "size": response.decoded_size,
-                        "decoded_sha256": response.decoded_sha256,
-                    },
-                    tlp=subject.tlp,
-                    actor_id=actor_id,
-                )
-            )
-            await uow.commit()
             return collection
 
     async def _candidate_for(
@@ -949,12 +960,21 @@ class SubjectCollectionService:
     async def _archive(
         self,
         collection_id: UUID,
-        job_id: UUID,
         started_at: datetime,
         response: CollectedResponse,
         *,
+        acquisition: _CollectorAcquisition | _ManualAcquisition,
         candidate: SourceCandidate | None = None,
     ) -> None:
+        """Persist one acquisition: same evidence, two honest audit contexts.
+
+        Blobs, hashes, ``SourceDocument`` and the attempt are identical for a
+        collector download and an analyst upload — only the acquisition token
+        and the provenance event differ, because only those two record who
+        actually obtained the content.
+        """
+        manual = acquisition if isinstance(acquisition, _ManualAcquisition) else None
+        collector = acquisition if isinstance(acquisition, _CollectorAcquisition) else None
         raw_blob = await self._catalog.ingest(
             BytesIO(response.encoded_body),
             logical_bucket="source-raw",
@@ -1028,39 +1048,69 @@ class SubjectCollectionService:
             )
             attempt = _successful_attempt(
                 collection,
-                job_id,
                 started_at,
                 response,
                 self._policy_snapshot.id,
+                job_id=collector.job_id if collector else None,
+                manual_lease_id=manual.manual_lease_id if manual else None,
             )
             await uow.source_documents.add(document)
             await uow.collection_attempts.append(attempt)
-            collection.archive(
-                job_id=job_id,
-                attempt_id=attempt.id,
-                source_document_id=document.id,
-                decoded_blob_id=decoded_blob.id,
-            )
+            if manual is not None:
+                collection.archive_manual(
+                    manual_lease_id=manual.manual_lease_id,
+                    attempt_id=attempt.id,
+                    source_document_id=document.id,
+                    decoded_blob_id=decoded_blob.id,
+                )
+                collection.origin_kind = SourceOriginKind.MANUAL
+            else:
+                assert collector is not None
+                collection.archive(
+                    job_id=collector.job_id,
+                    attempt_id=attempt.id,
+                    source_document_id=document.id,
+                    decoded_blob_id=decoded_blob.id,
+                )
             await uow.source_collections.save(collection)
+            evidence = {
+                "attempt_id": str(attempt.id),
+                "source_document_id": str(document.id),
+                "encoded_sha256": response.encoded_sha256,
+                "decoded_sha256": response.decoded_sha256,
+                "logical_filename": logical_filename,
+                "raw_blob_id": str(raw_blob.id),
+                "decoded_blob_id": str(decoded_blob.id),
+                "content_encoding": response.content_encoding,
+            }
+            if manual is not None:
+                # The analyst supplied this content. Recording a collector
+                # download here would be a lie the audit can never undo.
+                event_type = "source.archived_manually"
+                actor = manual.actor_id
+                payload = {
+                    **evidence,
+                    "actor_id": manual.actor_id,
+                    "manual_lease_id": str(manual.manual_lease_id),
+                    "declared_mime_type": manual.declared_mime_type,
+                    "size": response.decoded_size,
+                    "requested_url": response.requested_url,
+                    "final_url": response.final_url,
+                }
+            else:
+                assert collector is not None
+                event_type = "source.archived"
+                actor = "system:collector"
+                payload = {**evidence, "job_id": str(collector.job_id)}
             await uow.provenance.append(
                 ProvenanceEvent(
                     subject_id=collection.subject_id,
                     aggregate_type="source_collection",
                     aggregate_id=collection.id,
-                    event_type="source.archived",
-                    payload={
-                        "attempt_id": str(attempt.id),
-                        "source_document_id": str(document.id),
-                        "encoded_sha256": response.encoded_sha256,
-                        "decoded_sha256": response.decoded_sha256,
-                        "logical_filename": logical_filename,
-                        "raw_blob_id": str(raw_blob.id),
-                        "decoded_blob_id": str(decoded_blob.id),
-                        "content_encoding": response.content_encoding,
-                        "job_id": str(job_id),
-                    },
+                    event_type=event_type,
+                    payload=payload,
                     tlp=subject.tlp,
-                    actor_id="system:collector",
+                    actor_id=actor,
                 )
             )
             await uow.commit()
@@ -1230,14 +1280,17 @@ def _new_snapshot_collection(
 
 def _successful_attempt(
     collection: SourceCollection,
-    job_id: UUID,
     started_at: datetime,
     response: CollectedResponse,
     policy_snapshot_id: str,
+    *,
+    job_id: UUID | None,
+    manual_lease_id: UUID | None,
 ) -> CollectionAttempt:
     return CollectionAttempt(
         collection_id=collection.id,
         job_id=job_id,
+        manual_lease_id=manual_lease_id,
         policy_snapshot_id=policy_snapshot_id,
         requested_url=response.requested_url,
         final_url=response.final_url,
@@ -1266,9 +1319,14 @@ def _interrupted_attempt(
     fallback_policy_snapshot_id: str,
     reason: str = "Previous fetch lease expired before archival",
 ) -> CollectionAttempt:
+    # An abandoned analyst upload is recorded under its own lease, not
+    # attributed to the collector job that happens to take the source over.
+    manual_lease_id = collection.manual_lease_id if collection.fetch_job_id is None else None
+    job_id = None if manual_lease_id else (collection.fetch_job_id or fallback_job_id)
     return CollectionAttempt(
         collection_id=collection.id,
-        job_id=collection.fetch_job_id or fallback_job_id,
+        job_id=job_id,
+        manual_lease_id=manual_lease_id,
         policy_snapshot_id=(collection.fetch_policy_snapshot_id or fallback_policy_snapshot_id),
         requested_url=collection.requested_url,
         final_url=None,

@@ -77,6 +77,113 @@ def test_manual_upload_can_claim_failed_or_pending_source(state: CollectionState
     assert claimed is True
     assert source.state is CollectionState.FETCHING
     assert source.fetch_started_at == now
+    # A manual upload is not a collector job: no jobs.id is ever invented.
+    assert source.fetch_job_id is None
+    assert source.manual_lease_id is not None
+
+
+def test_manual_archive_requires_the_current_manual_lease() -> None:
+    source = collection()
+    source.state = CollectionState.FAILED_RETRYABLE
+    first_lease = uuid4()
+    assert source.claim_manual_upload(
+        first_lease,
+        lease_duration=timedelta(minutes=2),
+        policy_snapshot_id="policy-snapshot",
+        now=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    # A second upload takes over the expired lease with its own token.
+    second_lease = uuid4()
+    assert source.claim_manual_upload(
+        second_lease,
+        lease_duration=timedelta(minutes=2),
+        policy_snapshot_id="policy-snapshot",
+        now=datetime(2026, 9, 4, 1, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValueError, match="current manual lease owner"):
+        source.archive_manual(
+            manual_lease_id=first_lease,
+            attempt_id=uuid4(),
+            source_document_id=uuid4(),
+            decoded_blob_id=uuid4(),
+        )
+
+    source.archive_manual(
+        manual_lease_id=second_lease,
+        attempt_id=uuid4(),
+        source_document_id=uuid4(),
+        decoded_blob_id=uuid4(),
+    )
+    assert source.state is CollectionState.ARCHIVED
+    assert source.manual_lease_id is None
+
+
+def test_manual_lease_cannot_archive_a_source_taken_over_by_the_collector() -> None:
+    source = collection()
+    source.state = CollectionState.FAILED_RETRYABLE
+    manual_lease = uuid4()
+    assert source.claim_manual_upload(
+        manual_lease,
+        lease_duration=timedelta(minutes=2),
+        policy_snapshot_id="policy-snapshot",
+        now=datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    job_id = uuid4()
+    assert source.claim_fetch(
+        job_id,
+        lease_duration=timedelta(minutes=2),
+        policy_snapshot_id="policy-snapshot",
+        now=datetime(2026, 9, 4, 1, tzinfo=UTC),
+    )
+    assert source.manual_lease_id is None
+
+    with pytest.raises(ValueError, match="current manual lease owner"):
+        source.archive_manual(
+            manual_lease_id=manual_lease,
+            attempt_id=uuid4(),
+            source_document_id=uuid4(),
+            decoded_blob_id=uuid4(),
+        )
+
+
+def test_a_live_lease_blocks_the_other_acquisition_path() -> None:
+    collector = collection()
+    collector.state = CollectionState.PENDING
+    now = datetime(2026, 9, 4, tzinfo=UTC)
+    assert collector.claim_fetch(
+        uuid4(),
+        lease_duration=timedelta(minutes=10),
+        policy_snapshot_id="policy-snapshot",
+        now=now,
+    )
+    assert (
+        collector.claim_manual_upload(
+            uuid4(),
+            lease_duration=timedelta(minutes=10),
+            policy_snapshot_id="policy-snapshot",
+            now=now,
+        )
+        is False
+    )
+
+    manual = collection()
+    manual.state = CollectionState.BLOCKED
+    assert manual.claim_manual_upload(
+        uuid4(),
+        lease_duration=timedelta(minutes=10),
+        policy_snapshot_id="policy-snapshot",
+        now=now,
+    )
+    assert (
+        manual.claim_fetch(
+            uuid4(),
+            lease_duration=timedelta(minutes=10),
+            policy_snapshot_id="policy-snapshot",
+            now=now,
+        )
+        is False
+    )
 
 
 @pytest.mark.parametrize(

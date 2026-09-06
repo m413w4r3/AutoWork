@@ -121,6 +121,13 @@ export interface ProductionRepairDecision {
   observed_pipeline_generation: number;
 }
 
+/** Where the exact value shown for a repair issue came from. */
+export type RepairPayloadOrigin =
+  | "repair_evidence_pack"
+  | "legacy_inline_verified"
+  | "model_output_recovered"
+  | "unavailable";
+
 export interface EditionRepairItem {
   repair_key: string;
   kind: ProductionRepairIssueKind;
@@ -141,6 +148,11 @@ export interface EditionRepairItem {
   reason_code: string;
   value_sha256: string;
   payload_available: boolean;
+  /**
+   * True when this rejection predates the evidence pack. The queue never opens
+   * an archive, so its value may still be recoverable by opening the item.
+   */
+  legacy_evidence?: boolean;
   effective_action: ProductionRepairAction | null;
   effective_decision_id: string | null;
   resolved: boolean;
@@ -193,6 +205,8 @@ export interface EditionRepairDetail {
   value_sha256?: string | null;
   preview?: string | null;
   payload_available?: boolean;
+  /** How the backend obtained `value`; `unavailable` means nothing was found. */
+  payload_origin?: RepairPayloadOrigin;
   value?: string | null;
   body?: string | null;
   collection_id?: string | null;

@@ -8,6 +8,7 @@ import {
   type EditionRepairItem,
   type ProductionRepairAction,
   type RepairDecisionApplicationState,
+  type RepairPayloadOrigin,
   type ReviewItem,
 } from "../../api/publication";
 import { Link } from "../../routing";
@@ -45,6 +46,24 @@ const APPLICATION_LABELS: Record<RepairDecisionApplicationState, string> = {
 };
 
 const SUPERSEDED_LABEL = "remplacée par une décision ultérieure";
+
+/**
+ * L’analyste doit savoir si la valeur affichée est la valeur exacte. La
+ * provenance reste secondaire : c’est la valeur qui porte la décision.
+ */
+const PAYLOAD_ORIGIN_LABELS: Record<RepairPayloadOrigin, string> = {
+  repair_evidence_pack: "conservée dans le pack de preuves",
+  legacy_inline_verified: "valeur héritée vérifiée par son SHA-256",
+  model_output_recovered: "récupérée depuis la sortie Q2 archivée",
+  unavailable: "non récupérable",
+};
+
+const UNRECOVERABLE_VALUE_MESSAGE =
+  "Valeur historique non récupérable depuis les preuves archivées.";
+const UNRECOVERABLE_REMEDIATION =
+  "Cette extraction est antérieure au stockage intégral des rejets. " +
+  "Relancez Extraction pour régénérer les preuves si vous souhaitez " +
+  "réexaminer cet élément.";
 
 const DECISION_DATE_FORMAT = new Intl.DateTimeFormat("fr-FR", {
   day: "2-digit",
@@ -177,11 +196,23 @@ export function RepairIssueInspector({
     );
   }
 
+  const isRejection =
+    item.kind === "rejected_indicator" || item.kind === "rejected_rule";
+  // The detail resolves the exact value; until it answers, the queue's own
+  // (bounded) knowledge stands in. A value that could not be recovered can
+  // never be included: the projection would have nothing to write.
+  const payloadOrigin: RepairPayloadOrigin | null =
+    currentDetail?.payload_origin ?? null;
+  const includeBlocked =
+    isRejection &&
+    (currentDetail
+      ? currentDetail.payload_available === false
+      : !item.payload_available);
   const alternatives = alternativeRepairActions(
     item.kind,
     effectiveAction,
     item.resolved,
-  );
+  ).filter((action) => !(includeBlocked && action === "include"));
   // An arbitrated issue is no longer inert: it shows what was decided and
   // offers the answers it does not currently hold.
   const showActions = !effectiveAction || revising;
@@ -221,14 +252,27 @@ export function RepairIssueInspector({
         <div>
           <dt>{isRule ? "Extrait" : "Valeur"}</dt>
           <dd>
-            <code className="repair-inspector__value">
-              {value || "Valeur non conservée"}
-            </code>
-            {isRule ? (
-              <span className="repair-inspector__value-hint">
-                Corps intégral ci-dessous.
-              </span>
-            ) : null}
+            {includeBlocked ? (
+              <>
+                <p className="repair-inspector__value-missing">
+                  {UNRECOVERABLE_VALUE_MESSAGE}
+                </p>
+                <p className="repair-inspector__value-hint">
+                  {UNRECOVERABLE_REMEDIATION}
+                </p>
+              </>
+            ) : (
+              <>
+                <code className="repair-inspector__value">
+                  {value || "Valeur en cours de récupération…"}
+                </code>
+                {isRule ? (
+                  <span className="repair-inspector__value-hint">
+                    Corps intégral ci-dessous.
+                  </span>
+                ) : null}
+              </>
+            )}
           </dd>
         </div>
         <div>
@@ -270,6 +314,12 @@ export function RepairIssueInspector({
               <code>{currentDetail?.value_sha256 ?? item.value_sha256}</code>
             </dd>
           </div>
+          {payloadOrigin ? (
+            <div>
+              <dt>Preuve</dt>
+              <dd>{PAYLOAD_ORIGIN_LABELS[payloadOrigin]}</dd>
+            </div>
+          ) : null}
         </dl>
       </details>
 

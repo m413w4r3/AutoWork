@@ -749,6 +749,84 @@ describe("Repair Desk", () => {
     ).toBeInTheDocument();
   });
 
+  it("affiche la valeur historique récupérée et autorise l’inclusion", async () => {
+    // La file est bornée : elle n’a que le hash, le détail récupère la valeur
+    // exacte depuis la sortie Q2 archivée.
+    const legacy = repairItem({
+      preview: "",
+      payload_available: false,
+      legacy_evidence: true,
+    });
+    const recovered: EditionRepairDetail = {
+      ...detailFor(legacy),
+      payload_available: true,
+      payload_origin: "model_output_recovered",
+      value: "malicious.example.com",
+    };
+    renderReview(
+      page([legacy]),
+      new Map([[legacy.repair_key, recovered]]),
+    );
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: /Valeur historique — ouvrir pour tentative de récupération/,
+      }),
+    );
+
+    const inspector = within(
+      await screen.findByRole("region", { name: /Article audit/ }),
+    );
+    expect(await inspector.findByText("malicious.example.com")).toBeInTheDocument();
+    expect(
+      await inspector.findByRole("button", { name: "Inclure dans la fiche" }),
+    ).toBeEnabled();
+    expect(inspector.getByRole("button", { name: "Exclure" })).toBeEnabled();
+  });
+
+  it("explique une valeur irrécupérable et retire l’inclusion", async () => {
+    const legacy = repairItem({
+      preview: "",
+      payload_available: false,
+      legacy_evidence: true,
+    });
+    const unavailable: EditionRepairDetail = {
+      ...detailFor(legacy),
+      payload_available: false,
+      payload_origin: "unavailable",
+      value: null,
+    };
+    renderReview(
+      page([legacy]),
+      new Map([[legacy.repair_key, unavailable]]),
+    );
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: /Valeur historique — ouvrir pour tentative de récupération/,
+      }),
+    );
+
+    const inspector = within(
+      await screen.findByRole("region", { name: /Article audit/ }),
+    );
+    expect(
+      await inspector.findByText(
+        "Valeur historique non récupérable depuis les preuves archivées.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      inspector.getByText(/Relancez Extraction pour régénérer les preuves/),
+    ).toBeInTheDocument();
+    // Exclure reste possible ; Inclure ne doit pas être proposé.
+    expect(inspector.getByRole("button", { name: "Exclure" })).toBeEnabled();
+    expect(
+      inspector.queryByRole("button", { name: "Inclure dans la fiche" }),
+    ).toBeNull();
+  });
+
   it("signale une mutation obsolète et recharge la file", async () => {
     const item = repairItem();
     const { fetchMock } = renderReview(page([item]));

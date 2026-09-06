@@ -180,6 +180,9 @@ class EditionRepairItem:
     reason_code: str
     value_sha256: str
     payload_available: bool
+    # True when this rejection predates the evidence pack: opening it may
+    # still recover the exact value from the archived Q2 output.
+    legacy_evidence: bool
     effective_action: str | None
     effective_decision_id: UUID | None
     resolved: bool
@@ -423,6 +426,7 @@ class EditionRepairReadService:
             ),
             value_sha256=str(getattr(issue, "value_sha256", "")),
             payload_available=bool(getattr(issue, "payload_available", False)),
+            legacy_evidence=bool(getattr(issue, "legacy_evidence", False)),
             effective_action=(
                 getattr(getattr(decision, "action", None), "value", None)
                 if decision is not None

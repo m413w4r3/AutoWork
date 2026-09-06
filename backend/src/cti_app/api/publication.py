@@ -40,6 +40,7 @@ from cti_app.application.edition_review import (
     issue_application_state,
 )
 from cti_app.application.identity import IdentityProvider
+from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
     ProductionReferenceRepairError,
     ProductionReferenceRepairService,
@@ -211,6 +212,7 @@ class EditionRepairItemView(BaseModel):
     reason_code: str
     value_sha256: str
     payload_available: bool
+    legacy_evidence: bool = False
     effective_action: str | None
     effective_decision_id: UUID | None
     resolved: bool
@@ -301,6 +303,14 @@ def _service(request: Request) -> EditionReviewService:
     return configured or EditionReviewService(request.app.state.uow_factory)
 
 
+def _repair_payload_resolver(request: Request) -> ProductionRepairPayloadResolver | None:
+    """The one resolver every repair service must share, when it is wired."""
+    return cast(
+        ProductionRepairPayloadResolver | None,
+        getattr(request.app.state, "production_repair_payload_resolver", None),
+    )
+
+
 def _repair_issue_service(request: Request) -> ProductionRepairIssueService:
     configured = getattr(request.app.state, "production_repair_issue_service", None)
     if configured is not None:
@@ -308,6 +318,7 @@ def _repair_issue_service(request: Request) -> ProductionRepairIssueService:
     return ProductionRepairIssueService(
         request.app.state.uow_factory,
         getattr(request.app.state, "production_artifact_store", None),
+        _repair_payload_resolver(request),
     )
 
 
@@ -589,6 +600,7 @@ async def get_edition_review_repair_detail(
         "value_sha256": issue_detail.issue.value_sha256,
         "preview": issue_detail.issue.preview,
         "payload_available": issue_detail.payload_available,
+        "payload_origin": issue_detail.payload_origin.value,
         "value": issue_detail.value,
         "body": (
             issue_detail.value
@@ -771,6 +783,7 @@ def _repair_projection_service(request: Request) -> ProductionRepairProjectionSe
     return configured or ProductionRepairProjectionService(
         request.app.state.uow_factory,
         getattr(request.app.state, "production_artifact_store", None),
+        payload_resolver=_repair_payload_resolver(request),
     )
 
 
@@ -1304,6 +1317,7 @@ def _repair_item_view(item: EditionRepairItem) -> dict[str, Any]:
         "reason_code": item.reason_code,
         "value_sha256": item.value_sha256,
         "payload_available": item.payload_available,
+        "legacy_evidence": item.legacy_evidence,
         "effective_action": item.effective_action,
         "effective_decision_id": item.effective_decision_id,
         "resolved": item.resolved,

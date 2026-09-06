@@ -72,6 +72,12 @@ class SourceCollectionRow(Base):
             name="ck_source_collections_verified_evidence",
         ),
         CheckConstraint("attempt_count >= 0", name="ck_source_collections_attempt_count"),
+        # A source is leased by the collector or by an analyst upload, never
+        # by both: the two acquisition paths must not share one lease.
+        CheckConstraint(
+            "fetch_job_id IS NULL OR manual_lease_id IS NULL",
+            name="ck_source_collections_single_lease",
+        ),
         Index("ix_source_collections_subject_state", "subject_id", "state"),
     )
 
@@ -121,6 +127,8 @@ class SourceCollectionRow(Base):
     fetch_job_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("jobs.id", ondelete="RESTRICT")
     )
+    # Deliberately not a foreign key: an analyst upload has no collector job.
+    manual_lease_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     fetch_policy_snapshot_id: Mapped[str | None] = mapped_column(
         String(64), ForeignKey("collection_policy_snapshots.id", ondelete="RESTRICT")
     )
@@ -184,6 +192,12 @@ class CollectionAttemptRow(Base):
             "(char_length(decoded_sha256) = 64 AND decoded_sha256 ~ '^[0-9a-f]{64}$')",
             name="ck_collection_attempts_decoded_sha256",
         ),
+        # An attempt records exactly one acquisition token. A NULL job_id is
+        # only legal for the analyst path, which carries its own lease.
+        CheckConstraint(
+            "(job_id IS NULL) <> (manual_lease_id IS NULL)",
+            name="ck_collection_attempts_acquisition",
+        ),
         Index("ix_collection_attempts_collection", "collection_id", "attempted_at"),
         Index("ix_collection_attempts_job", "job_id"),
     )
@@ -192,9 +206,10 @@ class CollectionAttemptRow(Base):
     collection_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("source_collections.id", ondelete="RESTRICT"), nullable=False
     )
-    job_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("jobs.id", ondelete="RESTRICT"), nullable=False
+    job_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("jobs.id", ondelete="RESTRICT")
     )
+    manual_lease_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     policy_snapshot_id: Mapped[str] = mapped_column(
         String(64),
         ForeignKey("collection_policy_snapshots.id", ondelete="RESTRICT"),

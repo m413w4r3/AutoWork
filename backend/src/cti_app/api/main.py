@@ -54,8 +54,10 @@ from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import ProductionStageChain
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
     ProductionReferenceRepairService,
+    ProductionRepairAdjudicationService,
     ProductionRepairDecisionService,
     ProductionRepairIssueService,
     ProductionRepairProjectionService,
@@ -291,8 +293,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.collection_review_service = collection_review_service
     app.state.subject_production_service = subject_production_service
     app.state.edition_production_service = edition_production_service
+    # One resolver for the detail, the adjudication and the projection: an
+    # analyst can only include a value the projection will find again.
+    repair_payload_resolver = ProductionRepairPayloadResolver(model_gateway)
+    app.state.production_repair_payload_resolver = repair_payload_resolver
     production_repair_issue_service = ProductionRepairIssueService(
-        uow_factory, production_artifact_store
+        uow_factory, production_artifact_store, repair_payload_resolver
     )
     app.state.production_repair_issue_service = production_repair_issue_service
     app.state.edition_review_service = EditionReviewService(
@@ -306,7 +312,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory, production_artifact_store
     )
     app.state.production_repair_projection_service = ProductionRepairProjectionService(
-        uow_factory, production_artifact_store
+        uow_factory, production_artifact_store, payload_resolver=repair_payload_resolver
+    )
+    app.state.production_repair_adjudication_service = ProductionRepairAdjudicationService(
+        uow_factory,
+        production_repair_issue_service,
+        app.state.production_repair_decision_service,
     )
     app.state.edition_publication_service = EditionPublicationService(
         uow_factory,
