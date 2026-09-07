@@ -24,6 +24,7 @@ from cti_app.domain.production import (
     ProductionInputSnapshot,
     ProductionInputSource,
     ProductionRepairAction,
+    ProductionRepairCorrection,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
     ProductionReuseInvalidation,
@@ -46,6 +47,7 @@ from cti_app.infrastructure.database.models.production import (
     EditionProductionBatchRow,
     ProductionArtifactRow,
     ProductionInputSnapshotRow,
+    ProductionRepairCorrectionRow,
     ProductionRepairDecisionRow,
     ProductionReuseInvalidationRow,
     SampleAcquisitionAttemptRow,
@@ -763,6 +765,37 @@ class SqlAlchemyProductionReuseInvalidationRepository:
         return [_production_reuse_invalidation_from_row(row) for row in result.scalars()]
 
 
+class SqlAlchemyProductionRepairCorrectionRepository:
+    """Append-only repository for immutable replacement evidence."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def append(self, correction: ProductionRepairCorrection) -> None:
+        self._session.add(
+            ProductionRepairCorrectionRow(
+                id=correction.id,
+                edition_id=correction.edition_id,
+                subject_id=correction.subject_id,
+                production_run_id=correction.production_run_id,
+                original_repair_key=correction.original_repair_key,
+                artifact_type=correction.artifact_type,
+                source_id=correction.source_id,
+                source_url=correction.source_url,
+                replacement_value_sha256=correction.replacement_value_sha256,
+                replacement_payload_blob_id=correction.replacement_payload_blob_id,
+                actor_id=correction.actor_id,
+                verification_state=correction.verification_state.value,
+                created_at=correction.created_at,
+            )
+        )
+        await self._session.flush()
+
+    async def get(self, correction_id: UUID) -> ProductionRepairCorrection | None:
+        row = await self._session.get(ProductionRepairCorrectionRow, correction_id)
+        return _production_repair_correction_from_row(row) if row else None
+
+
 class SqlAlchemyProductionRepairDecisionRepository:
     """Append-only repository for production repair decisions."""
 
@@ -780,6 +813,7 @@ class SqlAlchemyProductionRepairDecisionRepository:
                 repair_key=decision.repair_key,
                 issue_kind=decision.issue_kind.value,
                 action=decision.action.value,
+                correction_id=decision.correction_id,
                 observed_pipeline_generation=decision.observed_pipeline_generation,
                 actor_id=decision.actor_id,
                 reason=decision.reason,
@@ -1354,6 +1388,28 @@ def _production_reuse_invalidation_from_row(
     )
 
 
+def _production_repair_correction_from_row(
+    row: ProductionRepairCorrectionRow,
+) -> ProductionRepairCorrection:
+    from cti_app.domain.production import ProductionRepairVerificationState
+
+    return ProductionRepairCorrection(
+        id=row.id,
+        edition_id=row.edition_id,
+        subject_id=row.subject_id,
+        production_run_id=row.production_run_id,
+        original_repair_key=row.original_repair_key,
+        artifact_type=row.artifact_type,
+        source_id=row.source_id,
+        source_url=row.source_url,
+        replacement_value_sha256=row.replacement_value_sha256,
+        replacement_payload_blob_id=row.replacement_payload_blob_id,
+        actor_id=row.actor_id,
+        verification_state=ProductionRepairVerificationState(row.verification_state),
+        created_at=row.created_at,
+    )
+
+
 def _production_repair_decision_from_row(
     row: ProductionRepairDecisionRow,
 ) -> ProductionRepairDecision:
@@ -1367,6 +1423,7 @@ def _production_repair_decision_from_row(
         repair_key=row.repair_key,
         issue_kind=ProductionRepairIssueKind(row.issue_kind),
         action=ProductionRepairAction(row.action),
+        correction_id=row.correction_id,
         actor_id=row.actor_id,
         reason=row.reason,
         created_at=row.created_at,

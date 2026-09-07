@@ -76,6 +76,7 @@ from cti_app.infrastructure.database.models.model_execution import (
     ModelConversationTurnRow,
     ModelRunRow,
 )
+from cti_app.infrastructure.database.models.production import ProductionRepairCorrectionRow
 
 
 def _insert_succeeded(result: object) -> bool:
@@ -234,6 +235,11 @@ class SqlAlchemyBlobRepository:
             .select_from(EditionReleaseRow)
             .where(EditionReleaseRow.docx_blob_id == blob_id)
         )
+        repair_correction_count = await self._session.scalar(
+            select(func.count())
+            .select_from(ProductionRepairCorrectionRow)
+            .where(ProductionRepairCorrectionRow.replacement_payload_blob_id == blob_id)
+        )
         return (
             int(document_count or 0)
             + int(decoded_document_count or 0)
@@ -256,6 +262,7 @@ class SqlAlchemyBlobRepository:
             + int(release_json_count or 0)
             + int(release_markdown_count or 0)
             + int(release_docx_count or 0)
+            + int(repair_correction_count or 0)
         )
 
     async def delete(self, blob_id: UUID) -> None:

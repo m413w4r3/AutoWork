@@ -2385,7 +2385,8 @@ h1 {
 }
 
 .repair-rule-panel,
-.repair-source-panel {
+.repair-source-panel,
+.repair-correction-panel {
   display: grid;
   gap: 0.7rem;
   padding-top: 0.7rem;
@@ -2417,6 +2418,33 @@ h1 {
 .repair-source-panel__form textarea {
   width: 100%;
   resize: vertical;
+}
+
+.repair-correction-panel input {
+  width: 100%;
+}
+
+.repair-correction-panel__unverified {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.8rem;
+  border: 1px solid #c98077;
+  border-radius: 0.55rem;
+  background: #fff8f7;
+}
+
+.repair-correction-panel__unverified p {
+  margin: 0;
+  color: #752e27;
+}
+
+.repair-evidence-context {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+  padding-left: 1.2rem;
+  color: #294137;
+  font-size: 0.85rem;
 }
 
 .repair-bulk-actions {

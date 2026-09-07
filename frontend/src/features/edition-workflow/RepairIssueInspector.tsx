@@ -5,7 +5,9 @@ import { ApiError } from "../../api/editions";
 import {
   decideEditionRepair,
   getEditionRepairDetail,
+  verifyEditionRepairReplacement,
   type EditionRepairItem,
+  type EditionRepairReplacementVerification,
   type ProductionRepairAction,
   type RepairDecisionApplicationState,
   type RepairPayloadOrigin,
@@ -31,7 +33,19 @@ const CHANGED_REPAIR_MESSAGE =
 const DECISION_ACTION_LABELS: Record<string, string> = {
   include: "Inclure dans la fiche",
   exclude: "Exclure",
+  replace: "Corriger la valeur",
   continue_without_source: "Continuer sans cette source",
+};
+
+const EVIDENCE_SPAN_LABELS: Record<string, string> = {
+  body_text: "Texte",
+  table: "Tableau",
+  list: "Liste",
+  code_block: "Bloc de code",
+  link_text: "Texte de lien",
+  alt_text: "Texte alternatif",
+  visual_unlocated: "Visuel non localisé",
+  unknown: "Contexte non classé",
 };
 
 /**
@@ -99,6 +113,12 @@ export function RepairIssueInspector({
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [reason, setReason] = useState("");
+  const [replacementValue, setReplacementValue] = useState("");
+  const [correcting, setCorrecting] = useState(false);
+  const [forceOverride, setForceOverride] = useState(false);
+  const [auditNoteOpen, setAuditNoteOpen] = useState(false);
+  const [replacementVerification, setReplacementVerification] =
+    useState<EditionRepairReplacementVerification | null>(null);
   // Purely presentational: whether the alternative actions are unfolded. The
   // decision itself is never held locally -- the query is the authority.
   const [revising, setRevising] = useState(false);
@@ -112,6 +132,11 @@ export function RepairIssueInspector({
     setRevising(false);
     setError(null);
     setReason("");
+    setReplacementValue("");
+    setCorrecting(false);
+    setForceOverride(false);
+    setAuditNoteOpen(false);
+    setReplacementVerification(null);
   }, [repairKey]);
 
   const currentDetail = detail.data;
@@ -121,6 +146,30 @@ export function RepairIssueInspector({
   const expectedEffectiveDecisionId =
     effectiveDecision?.id ?? item?.effective_decision_id ?? null;
   const decisionHistory = currentDetail?.decision_history ?? [];
+  const verifyReplacement = useMutation({
+    mutationFn: () => {
+      if (!item || !replacementValue.trim()) {
+        return Promise.reject(new Error("Saisissez une valeur corrigée."));
+      }
+      return verifyEditionRepairReplacement(editionId, item.repair_key, {
+        observedSubjectId: item.subject_id,
+        replacementValue: replacementValue.trim(),
+      });
+    },
+    retry: false,
+    onSuccess: (result) => {
+      setReplacementVerification(result);
+      setError(null);
+    },
+    onError: (mutationError: unknown) => {
+      setReplacementVerification(null);
+      setError(
+        mutationError instanceof Error
+          ? mutationError.message
+          : "La valeur corrigée n’a pas pu être vérifiée.",
+      );
+    },
+  });
   // Never inferred from the action: an unknown state stays unknown.
   const applicationState: RepairDecisionApplicationState | null =
     currentDetail?.application_state ?? item?.application_state ?? null;
@@ -143,6 +192,9 @@ export function RepairIssueInspector({
         observedPipelineGeneration: item.pipeline_generation,
         expectedEffectiveDecisionId,
         reason: reason || null,
+        replacementValue:
+          action === "replace" ? replacementValue.trim() : undefined,
+        forceOverride: action === "replace" && forceOverride,
       });
     },
     retry: false,
@@ -150,6 +202,10 @@ export function RepairIssueInspector({
       setError(null);
       setReason("");
       setRevising(false);
+      setCorrecting(false);
+      setForceOverride(false);
+      setAuditNoteOpen(false);
+      setReplacementVerification(null);
       void queryClient.refetchQueries({
         queryKey: ["edition-repair-detail", editionId, item?.repair_key],
       });
@@ -221,6 +277,7 @@ export function RepairIssueInspector({
   const sourceTitle = currentDetail?.source_title ?? item.source_title;
   const sourceUrl = currentDetail?.source_url ?? item.source_url;
   const isRule = item.kind === "rejected_rule";
+  const isCorrectable = item.kind === "rejected_indicator";
   // A rule body is rendered in full by RepairRulePanel, inside a bounded,
   // scrollable block. Repeating it unbounded in the facts list pushes every
   // action off-screen for a large YARA rule, so the summary stays short here.
@@ -399,6 +456,29 @@ export function RepairIssueInspector({
         />
       ) : null}
 
+      {!readOnly &&
+      item.kind === "rejected_rule" &&
+      showActions &&
+      alternatives.length > 0 ? (
+        <details
+          className="repair-inspector__decision-panel"
+          open={auditNoteOpen || forceOverride}
+          onToggle={(event) => setAuditNoteOpen(event.currentTarget.open)}
+        >
+          <summary>+ Ajouter une note d’audit</summary>
+          <label htmlFor="repair-decision-reason">
+            Note d’audit (facultatif)
+          </label>
+          <textarea
+            id="repair-decision-reason"
+            rows={2}
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+            disabled={decide.isPending}
+          />
+        </details>
+      ) : null}
+
       {item.kind === "rejected_rule" && currentDetail ? (
         <RepairRulePanel
           detail={currentDetail}
@@ -432,16 +512,22 @@ export function RepairIssueInspector({
       showActions &&
       alternatives.length > 0 ? (
         <div className="repair-inspector__decision-panel">
-          <label htmlFor="repair-decision-reason">
-            Raison de la décision (facultatif)
-          </label>
-          <textarea
-            id="repair-decision-reason"
-            rows={2}
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-            disabled={readOnly || decide.isPending}
-          />
+          <details
+            open={auditNoteOpen || forceOverride}
+            onToggle={(event) => setAuditNoteOpen(event.currentTarget.open)}
+          >
+            <summary>+ Ajouter une note d’audit</summary>
+            <label htmlFor="repair-decision-reason">
+              Note d’audit (facultatif)
+            </label>
+            <textarea
+              id="repair-decision-reason"
+              rows={2}
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+              disabled={readOnly || decide.isPending}
+            />
+          </details>
           <div className="repair-inspector__actions">
             {alternatives.map((nextAction) => (
               <button
@@ -449,9 +535,11 @@ export function RepairIssueInspector({
                 className={
                   nextAction === "exclude"
                     ? "button button--danger"
-                    : nextAction === "continue_without_source"
+                    : nextAction === "replace"
                       ? "button button--secondary"
-                      : "button"
+                      : nextAction === "continue_without_source"
+                        ? "button button--secondary"
+                        : "button"
                 }
                 type="button"
                 disabled={
@@ -460,7 +548,16 @@ export function RepairIssueInspector({
                   (nextAction === "continue_without_source" &&
                     !item.artifact_id)
                 }
-                onClick={() => decide.mutate(nextAction)}
+                onClick={() => {
+                  if (nextAction === "replace") {
+                    setCorrecting(true);
+                    setForceOverride(false);
+                    setReplacementVerification(null);
+                    setError(null);
+                  } else {
+                    decide.mutate(nextAction);
+                  }
+                }}
               >
                 {decide.isPending
                   ? "Enregistrement…"
@@ -478,6 +575,108 @@ export function RepairIssueInspector({
             ) : null}
           </div>
         </div>
+      ) : null}
+
+      {!readOnly && correcting && isCorrectable ? (
+        <section
+          className="repair-correction-panel"
+          aria-labelledby="repair-correction-heading"
+        >
+          <h4 id="repair-correction-heading">Corriger la valeur</h4>
+          <label htmlFor="repair-original-value">Valeur proposée par Q2</label>
+          <code id="repair-original-value" className="repair-inspector__value">
+            {value || "Valeur en cours de récupération…"}
+          </code>
+          <label htmlFor="repair-replacement-value">Valeur corrigée</label>
+          <input
+            id="repair-replacement-value"
+            value={replacementValue}
+            onChange={(event) => {
+              setReplacementValue(event.target.value);
+              setReplacementVerification(null);
+              setForceOverride(false);
+            }}
+            disabled={verifyReplacement.isPending || decide.isPending}
+          />
+          <div className="repair-inspector__actions">
+            <button
+              className="button button--secondary"
+              type="button"
+              disabled={
+                verifyReplacement.isPending ||
+                decide.isPending ||
+                !replacementValue.trim()
+              }
+              onClick={() => verifyReplacement.mutate()}
+            >
+              {verifyReplacement.isPending
+                ? "Vérification…"
+                : "Vérifier dans la source"}
+            </button>
+            <button
+              className="button button--secondary"
+              type="button"
+              onClick={() => {
+                setCorrecting(false);
+                setForceOverride(false);
+                setReplacementVerification(null);
+              }}
+              disabled={verifyReplacement.isPending || decide.isPending}
+            >
+              Annuler
+            </button>
+          </div>
+          {replacementVerification?.verified ? (
+            <div className="repair-source-panel__success" role="status">
+              <p>✓ valeur retrouvée dans la source archivée</p>
+              {replacementVerification.context_spans.length > 0 ? (
+                <ul className="repair-evidence-context">
+                  {replacementVerification.context_spans.map((span, index) => (
+                    <li key={`${span.kind}-${index}`}>
+                      <strong>{EVIDENCE_SPAN_LABELS[span.kind]}</strong>
+                      {span.text ? ` — ${span.text}` : ""}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              <button
+                className="button"
+                type="button"
+                disabled={decide.isPending}
+                onClick={() => decide.mutate("replace")}
+              >
+                {decide.isPending ? "Enregistrement…" : "Utiliser cette valeur"}
+              </button>
+            </div>
+          ) : replacementVerification && !replacementVerification.verified ? (
+            <div className="repair-correction-panel__unverified" role="alert">
+              <p>Cette valeur n’a pas été retrouvée dans la source archivée.</p>
+              {!forceOverride ? (
+                <button
+                  className="button button--danger"
+                  type="button"
+                  onClick={() => {
+                    setForceOverride(true);
+                    setAuditNoteOpen(true);
+                  }}
+                >
+                  Forcer comme override analyste
+                </button>
+              ) : (
+                <button
+                  className="button button--danger"
+                  type="button"
+                  disabled={decide.isPending || !reason.trim()}
+                  onClick={() => decide.mutate("replace")}
+                >
+                  {decide.isPending
+                    ? "Enregistrement…"
+                    : "Enregistrer l’override analyste"}
+                </button>
+              )}
+            </div>
+          ) : null}
+        </section>
       ) : null}
 
       <section

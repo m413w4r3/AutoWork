@@ -30,6 +30,7 @@ export function repairKindLabel(item: EditionRepairItem): string {
 
 export function repairActionLabel(action: ProductionRepairAction): string {
   if (action === "continue_without_source") return "Continué sans source";
+  if (action === "replace") return "Valeur corrigée";
   return action === "include" ? "Inclus" : "Exclu";
 }
 
@@ -48,8 +49,10 @@ export function alternativeRepairActions(
     // settled: an archived source owes a rebuild, never a new arbitration.
     return currentAction || resolved ? [] : ["continue_without_source"];
   }
-  return (["include", "exclude"] as const).filter(
-    (action) => action !== currentAction,
+  const actions: ProductionRepairAction[] = ["include", "exclude"];
+  if (kind === "rejected_indicator") actions.push("replace");
+  return actions.filter(
+    (action) => action !== currentAction || action === "replace",
   );
 }
 

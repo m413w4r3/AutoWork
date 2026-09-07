@@ -46,6 +46,7 @@ from cti_app.application.production_repairs import (
     ProductionReferenceRepairService,
     ProductionRepairActionInvalidError,
     ProductionRepairAdjudicationService,
+    ProductionRepairAuditReasonRequiredError,
     ProductionRepairDecisionChangedError,
     ProductionRepairDecisionNoopError,
     ProductionRepairIssueNotFoundError,
@@ -160,13 +161,21 @@ class SupplementalRepairDecisionRequest(BaseModel):
 class ProductionRepairDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["include", "exclude", "continue_without_source"]
+    action: Literal["include", "exclude", "replace", "continue_without_source"]
     observed_artifact_id: UUID
     observed_pipeline_generation: int = Field(ge=0)
     # Optimistic fence: null for a first decision, the displayed decision id
     # when the analyst revises an existing one.
     expected_effective_decision_id: UUID | None = None
     reason: str | None = Field(default=None, max_length=500)
+    replacement_value: str | None = Field(default=None, max_length=10_000_000)
+    force_override: bool = False
+
+
+class ProductionRepairReplacementVerificationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    replacement_value: str = Field(min_length=1, max_length=10_000_000)
 
 
 class ApplyProductionRepairsRequest(BaseModel):
@@ -389,6 +398,7 @@ def _production_repair_adjudication_service(
             request.app.state.uow_factory,
             _production_repair_issue_service(request),
             getattr(request.app.state, "production_repair_decision_service", None),
+            getattr(request.app.state, "production_artifact_store", None),
         )
     return cast(ProductionRepairAdjudicationService, service)
 
@@ -432,6 +442,7 @@ def _repair_decision_view(decision: Any | None) -> dict[str, Any] | None:
         "created_at": decision.created_at.isoformat(),
         "observed_artifact_id": str(decision.observed_artifact_id),
         "observed_pipeline_generation": decision.observed_pipeline_generation,
+        "correction_id": str(decision.correction_id) if decision.correction_id else None,
     }
 
 
@@ -1470,6 +1481,53 @@ async def rebuild_subject_references(
     return response
 
 
+@router.post("/subjects/{subject_id}/production/repairs/{repair_key}/verify-replacement")
+async def verify_subject_production_replacement(
+    subject_id: UUID,
+    repair_key: str,
+    payload: ProductionRepairReplacementVerificationRequest,
+    request: Request,
+) -> dict[str, Any]:
+    uow_factory, _, _ = _runtime(request)
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if run is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No production run found for subject",
+            )
+        edition_id = run.edition_id
+    try:
+        verification = await _production_repair_adjudication_service(
+            request
+        ).verify_current_issue_replacement(
+            edition_id=edition_id,
+            subject_id=subject_id,
+            repair_key=repair_key,
+            replacement_value=payload.replacement_value,
+        )
+    except Exception as exc:
+        _production_repair_decision_error(exc, repair_key)
+    return {
+        "verified": verification.verified,
+        "format_valid": verification.format_valid,
+        "normalized_value": verification.normalized_value,
+        "artifact_type": verification.artifact_type,
+        "source_id": verification.source_id,
+        "source_url": verification.source_url,
+        "reason_code": verification.reason_code,
+        "verification_state": (
+            verification.verification_state.value
+            if verification.verification_state is not None
+            else None
+        ),
+        "context_spans": [
+            {"kind": span.kind.value, "text": span.text}
+            for span in verification.context_spans
+        ],
+    }
+
+
 @router.post("/subjects/{subject_id}/production/repairs/{repair_key}/decision")
 async def decide_subject_production_repair(
     subject_id: UUID,
@@ -1504,6 +1562,8 @@ async def decide_subject_production_repair(
             expected_effective_decision_id=payload.expected_effective_decision_id,
             actor_id=await _actor_id(request),
             reason=payload.reason,
+            replacement_value=payload.replacement_value,
+            force_override=payload.force_override,
         )
     except Exception as exc:
         _production_repair_decision_error(exc, repair_key)
@@ -1537,6 +1597,14 @@ def _production_repair_decision_error(exc: Exception, repair_key: str) -> NoRetu
             status_code=status.HTTP_409_CONFLICT,
             detail={
                 "code": ProductionRepairValueNotVerifiableError.code,
+                "repair_key": repair_key,
+            },
+        ) from exc
+    if isinstance(exc, ProductionRepairAuditReasonRequiredError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": ProductionRepairAuditReasonRequiredError.code,
                 "repair_key": repair_key,
             },
         ) from exc

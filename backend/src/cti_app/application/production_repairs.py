@@ -11,11 +11,16 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any, cast
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.extraction import _html_encoding, parse_document
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    MAX_REPAIR_EVIDENCE_BYTES,
+    REPAIR_CORRECTION_BUCKET,
+    ProductionArtifactStore,
+)
 from cti_app.application.production_artifact_verification import (
     Q2ProposalSubmission,
     verify_q2_proposals,
@@ -42,13 +47,22 @@ from cti_app.application.production_repair_payloads import (
     ProductionRepairPayloadResolver,
     RepairPayloadOrigin,
 )
+from cti_app.application.production_source_evidence import (
+    SourceEvidenceDocument,
+    SourceEvidenceSpan,
+    SourceEvidenceSpanKind,
+    source_evidence_context_for_artifact,
+    source_evidence_context_for_rule,
+    source_evidence_document_from_html,
+    verify_ioc_rules_output_against_source,
+)
 from cti_app.application.production_stages import (
     ExtractionService,
     ProductionQAService,
     PublicationAssemblyService,
     compute_input_hash,
 )
-from cti_app.domain.collection import CollectionState, SourceOriginKind
+from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceOriginKind
 from cti_app.domain.discovery import canonicalize_http_url
 from cti_app.domain.editions import EditionAuditEvent, EditionStatus
 from cti_app.domain.production import (
@@ -61,10 +75,12 @@ from cti_app.domain.production import (
     ProductionEvidenceBasis,
     ProductionReconciliationRequiredError,
     ProductionRepairAction,
+    ProductionRepairCorrection,
     ProductionRepairDecision,
     ProductionRepairImpact,
     ProductionRepairImpactKind,
     ProductionRepairIssueKind,
+    ProductionRepairVerificationState,
     RepairDecisionApplicationState,
     RepairIssueExecutionState,
     SubjectProductionStage,
@@ -81,6 +97,30 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def production_repair_correction_identity(
+    *,
+    original_repair_key: str,
+    artifact_type: str,
+    source_id: str,
+    source_url: str,
+    replacement_value_sha256: str,
+    verification_state: ProductionRepairVerificationState | str,
+) -> UUID:
+    """Return a stable correction id independent of run/fence/version data."""
+    state = ProductionRepairVerificationState(verification_state)
+    payload = {
+        "version": "1",
+        "original_repair_key": original_repair_key,
+        "artifact_type": artifact_type,
+        "source_id": source_id,
+        "source_url": canonicalize_http_url(source_url),
+        "replacement_value_sha256": replacement_value_sha256,
+        "verification_state": state.value,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return uuid5(NAMESPACE_URL, f"cti-production-repair-correction:{encoded}")
 
 
 def _repair_kind(value: ProductionRepairIssueKind | str) -> ProductionRepairIssueKind:
@@ -196,12 +236,16 @@ def extraction_item_contributes_to_synthesis(item: ExtractionItem) -> bool:
     if item.display_policy is DisplayPolicy.HIDDEN:
         return False
 
-    # An analyst override created only for the publication IOC section is not
-    # narrative evidence and must not trigger a new Q4 draft.
+    # A repaired IOC is publication-only regardless of whether the value was
+    # source-verified or explicitly overridden. It must never create Q4
+    # narrative evidence.
     if (
-        item.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
-        and item.display_policy is DisplayPolicy.IOC_SECTION
+        item.display_policy is DisplayPolicy.IOC_SECTION
         and not item.context.strip()
+        and (
+            item.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+            or item.provenance is IndicatorProvenance.ANALYST
+        )
     ):
         return False
 
@@ -484,6 +528,28 @@ class ProductionRepairValueNotVerifiableError(ValueError):
     code = "production_repair_value_not_verifiable"
 
 
+class ProductionRepairAuditReasonRequiredError(ValueError):
+    """An unverified analyst override must explain why it was forced."""
+
+    code = "production_repair_audit_reason_required"
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionRepairCorrectionVerification:
+    """Result of checking a proposed replacement against one archive."""
+
+    verified: bool
+    replacement_value: str
+    normalized_value: str | None
+    format_valid: bool
+    artifact_type: str
+    source_id: str
+    source_url: str
+    reason_code: str | None = None
+    context_spans: tuple[SourceEvidenceSpan, ...] = ()
+    verification_state: ProductionRepairVerificationState | None = None
+
+
 class ProductionRepairProjectionError(ValueError):
     """The effective extraction cannot be safely projected."""
 
@@ -507,6 +573,7 @@ class ProductionRepairDecisionInput:
     repair_key: str
     issue_kind: ProductionRepairIssueKind
     action: ProductionRepairAction
+    correction: ProductionRepairCorrection | None = None
     # Optimistic fence: the effective decision the caller was looking at, or
     # ``None`` for a first decision.  Recomputed under the transaction.
     expected_effective_decision_id: UUID | None = None
@@ -532,6 +599,7 @@ class ProductionRepairDecisionService:
         actor_id: str,
         reason: str | None = None,
         expected_effective_decision_id: UUID | None = None,
+        correction: ProductionRepairCorrection | None = None,
     ) -> ProductionRepairDecision:
         # Construct first so pure invariants fail before opening a transaction.
         decision = ProductionRepairDecision(
@@ -545,7 +613,29 @@ class ProductionRepairDecisionService:
             action=action,
             actor_id=actor_id,
             reason=reason,
+            correction_id=correction.id if correction is not None else None,
         )
+        if action is ProductionRepairAction.REPLACE and correction is None:
+            raise ProductionRepairValueNotVerifiableError(
+                "production_repair_correction_required"
+            )
+        if correction is not None and (
+            correction.edition_id != edition_id
+            or correction.subject_id != subject_id
+            or correction.production_run_id != production_run_id
+            or correction.original_repair_key != repair_key
+        ):
+            raise ProductionRepairValueNotVerifiableError(
+                "production_repair_correction_identity_mismatch"
+            )
+        if (
+            correction is not None
+            and correction.verification_state is ProductionRepairVerificationState.ANALYST_OVERRIDE
+            and not (reason or "").strip()
+        ):
+            raise ProductionRepairAuditReasonRequiredError(
+                ProductionRepairAuditReasonRequiredError.code
+            )
 
         async with self._uow_factory() as uow:
             edition = await _get_for_update(uow.editions, edition_id)
@@ -562,7 +652,15 @@ class ProductionRepairDecisionService:
                 raise ProductionRepairStatusError("edition_frozen_for_publication")
             effective = await _effective_decisions_for_reader(uow, edition_id, subject_id)
             current = _effective_decision_for_key(effective, subject_id, repair_key)
-            if current is not None and _enum_value(current.action) == _enum_value(action):
+            if (
+                current is not None
+                and _enum_value(current.action) == _enum_value(action)
+                and not (
+                    action is ProductionRepairAction.REPLACE
+                    and correction is not None
+                    and current.correction_id != correction.id
+                )
+            ):
                 raise ProductionRepairDecisionNoopError(repair_key)
             _require_decision_fence(
                 effective,
@@ -617,6 +715,15 @@ class ProductionRepairDecisionService:
                 if current_artifact is None or current_artifact.id != artifact.id:
                     raise ProductionRepairStaleError(ProductionRepairStaleError.code)
 
+            if correction is not None:
+                corrections = getattr(uow, "production_repair_corrections", None)
+                if corrections is None:
+                    raise ProductionRepairValueNotVerifiableError(
+                        "production_repair_correction_repository_unavailable"
+                    )
+                existing = await corrections.get(correction.id)
+                if existing is None:
+                    await corrections.append(correction)
             await uow.production_repair_decisions.append(decision)
             await uow.commit()
             return decision
@@ -650,9 +757,20 @@ class ProductionRepairDecisionService:
                 action=item.action,
                 actor_id=actor_id,
                 reason=reason,
+                correction_id=(item.correction.id if item.correction is not None else None),
             )
             for item in decisions
         )
+        for item in decisions:
+            if item.correction is not None and (
+                item.correction.edition_id != edition_id
+                or item.correction.subject_id != item.subject_id
+                or item.correction.production_run_id != item.production_run_id
+                or item.correction.original_repair_key != item.repair_key
+            ):
+                raise ProductionRepairValueNotVerifiableError(
+                    "production_repair_correction_identity_mismatch"
+                )
 
         async with self._uow_factory() as uow:
             edition = await _get_for_update(uow.editions, edition_id)
@@ -678,7 +796,15 @@ class ProductionRepairDecisionService:
 
             for item, _event in zip(decisions, events, strict=True):
                 current = _effective_decision_for_key(effective, item.subject_id, item.repair_key)
-                if current is not None and _enum_value(current.action) == _enum_value(item.action):
+                if (
+                    current is not None
+                    and _enum_value(current.action) == _enum_value(item.action)
+                    and not (
+                        item.action is ProductionRepairAction.REPLACE
+                        and item.correction is not None
+                        and current.correction_id != item.correction.id
+                    )
+                ):
                     raise ProductionRepairDecisionNoopError(item.repair_key)
                 _require_decision_fence(
                     effective,
@@ -732,6 +858,15 @@ class ProductionRepairDecisionService:
                 ):
                     raise ProductionRepairStaleError(ProductionRepairStaleError.code)
 
+            corrections = getattr(uow, "production_repair_corrections", None)
+            for item in decisions:
+                if item.correction is not None:
+                    if corrections is None:
+                        raise ProductionRepairValueNotVerifiableError(
+                            "production_repair_correction_repository_unavailable"
+                        )
+                    if await corrections.get(item.correction.id) is None:
+                        await corrections.append(item.correction)
             for event in events:
                 await uow.production_repair_decisions.append(event)
             await uow.commit()
@@ -1071,7 +1206,10 @@ def _include_is_already_effective(
     issue: ProductionRepairIssueView,
     decision: ProductionRepairDecision,
 ) -> bool:
-    if _decision_action(decision) != ProductionRepairAction.INCLUDE.value:
+    if _decision_action(decision) not in {
+        ProductionRepairAction.INCLUDE.value,
+        ProductionRepairAction.REPLACE.value,
+    }:
         return False
     try:
         state = RepairDecisionApplicationState(
@@ -1169,7 +1307,10 @@ def classify_repair_impact(
         )
 
     q2_issue = cast(ProductionRepairIssueView, issue)
-    action_is_include = action == ProductionRepairAction.INCLUDE.value
+    action_is_include = action in {
+        ProductionRepairAction.INCLUDE.value,
+        ProductionRepairAction.REPLACE.value,
+    }
     action_is_exclude = action == ProductionRepairAction.EXCLUDE.value
     changes_projected_content = (
         action_is_include and not _include_is_already_effective(q2_issue, decision)
@@ -1633,6 +1774,8 @@ class ProductionRepairAdjudicationRequest:
     #: ``None`` for a first decision, the displayed decision id for a revision.
     expected_effective_decision_id: UUID | None = None
     observed_run_id: UUID | None = None
+    replacement_value: str | None = None
+    force_override: bool = False
 
 
 class ProductionRepairAdjudicationService:
@@ -1654,6 +1797,7 @@ class ProductionRepairAdjudicationService:
         payload_resolver: ProductionRepairPayloadResolver | None = None,
     ) -> None:
         self._uow_factory = uow_factory
+        self._artifact_store = artifact_store or getattr(issue_service, "_artifact_store", None)
         # Same issue service, therefore the same resolver: an INCLUDE is only
         # accepted for the exact value the analyst was shown.
         self._issues = issue_service or ProductionRepairIssueService(
@@ -1674,6 +1818,8 @@ class ProductionRepairAdjudicationService:
         actor_id: str,
         reason: str | None = None,
         observed_run_id: UUID | None = None,
+        replacement_value: str | None = None,
+        force_override: bool = False,
     ) -> ProductionRepairDecision:
         """Resolve, validate and append one decision for the CURRENT issue."""
         prepared = await self._prepare(
@@ -1686,7 +1832,11 @@ class ProductionRepairAdjudicationService:
                 observed_pipeline_generation=observed_pipeline_generation,
                 expected_effective_decision_id=expected_effective_decision_id,
                 observed_run_id=observed_run_id,
+                replacement_value=replacement_value,
+                force_override=force_override,
             ),
+            actor_id=actor_id,
+            reason=reason,
         )
         return await self._decisions.decide(
             edition_id=edition_id,
@@ -1700,6 +1850,7 @@ class ProductionRepairAdjudicationService:
             actor_id=actor_id,
             reason=reason,
             expected_effective_decision_id=prepared.expected_effective_decision_id,
+            correction=prepared.correction,
         )
 
     async def decide_current_issues(
@@ -1714,7 +1865,9 @@ class ProductionRepairAdjudicationService:
         prepared: list[ProductionRepairDecisionInput] = []
         for item in requests:
             try:
-                prepared.append(await self._prepare(edition_id, item))
+                prepared.append(
+                    await self._prepare(edition_id, item, actor_id=actor_id, reason=reason)
+                )
             except ValueError as exc:
                 # Name the offending item so a batch refusal stays actionable.
                 exc.repair_key = item.repair_key  # type: ignore[attr-defined]
@@ -1732,7 +1885,12 @@ class ProductionRepairAdjudicationService:
         return await self._decisions.decision_history(edition_id, repair_key, subject_id)
 
     async def _prepare(
-        self, edition_id: UUID, request: ProductionRepairAdjudicationRequest
+        self,
+        edition_id: UUID,
+        request: ProductionRepairAdjudicationRequest,
+        *,
+        actor_id: str = "",
+        reason: str | None = None,
     ) -> ProductionRepairDecisionInput:
         detail: ProductionRepairIssueDetail | None = None
         source: SupplementalSourceRepairIssue | None = None
@@ -1763,8 +1921,19 @@ class ProductionRepairAdjudicationService:
         ):
             raise ProductionRepairStaleError(ProductionRepairStaleError.code)
 
+        correction: ProductionRepairCorrection | None = None
         if request.action is ProductionRepairAction.INCLUDE:
             self._require_buildable_include(request.repair_key, detail)
+        elif request.action is ProductionRepairAction.REPLACE:
+            correction = await self._prepare_correction(
+                edition_id=edition_id,
+                issue=issue,
+                detail=detail,
+                replacement_value=request.replacement_value,
+                force_override=request.force_override,
+                actor_id=actor_id,
+                reason=reason,
+            )
 
         return ProductionRepairDecisionInput(
             subject_id=request.subject_id,
@@ -1774,8 +1943,337 @@ class ProductionRepairAdjudicationService:
             repair_key=request.repair_key,
             issue_kind=kind,
             action=request.action,
+            correction=correction,
             expected_effective_decision_id=request.expected_effective_decision_id,
         )
+
+    async def _prepare_correction(
+        self,
+        *,
+        edition_id: UUID,
+        issue: Any,
+        detail: ProductionRepairIssueDetail | None,
+        replacement_value: str | None,
+        force_override: bool,
+        actor_id: str,
+        reason: str | None,
+    ) -> ProductionRepairCorrection:
+        if detail is None or _repair_kind(issue.kind) not in {
+            ProductionRepairIssueKind.REJECTED_INDICATOR,
+            ProductionRepairIssueKind.REJECTED_RULE,
+        }:
+            raise ProductionRepairValueNotVerifiableError(
+                ProductionRepairValueNotVerifiableError.code
+            )
+        value = replacement_value.strip() if isinstance(replacement_value, str) else ""
+        if not value:
+            raise ProductionRepairValueNotVerifiableError(
+                "production_repair_replacement_value_required"
+            )
+        if force_override and not (reason or "").strip():
+            raise ProductionRepairAuditReasonRequiredError(
+                ProductionRepairAuditReasonRequiredError.code
+            )
+        validation = await self._validate_replacement(
+            issue=issue,
+            value=value,
+            require_source=not force_override,
+        )
+        if not validation.format_valid:
+            raise ProductionRepairValueNotVerifiableError(
+                validation.reason_code or ProductionRepairValueNotVerifiableError.code
+            )
+        if not validation.verified and not force_override:
+            raise ProductionRepairValueNotVerifiableError(
+                validation.reason_code or ProductionRepairValueNotVerifiableError.code
+            )
+        state = (
+            ProductionRepairVerificationState.ANALYST_OVERRIDE
+            if force_override
+            else ProductionRepairVerificationState.SOURCE_VERIFIED
+        )
+        artifact_store = self._artifact_store
+        if artifact_store is None:
+            raise ProductionRepairValueNotVerifiableError(
+                "production_repair_storage_unavailable"
+            )
+        blob_id = await artifact_store.put_text(value, bucket=REPAIR_CORRECTION_BUCKET)
+        correction_id = production_repair_correction_identity(
+            original_repair_key=issue.repair_key,
+            artifact_type=str(issue.artifact_type or ""),
+            source_id=issue.source_id,
+            source_url=issue.source_url,
+            replacement_value_sha256=_sha256(value),
+            verification_state=state,
+        )
+        return ProductionRepairCorrection(
+            id=correction_id,
+            edition_id=edition_id,
+            subject_id=issue.subject_id,
+            production_run_id=issue.production_run_id,
+            original_repair_key=issue.repair_key,
+            artifact_type=str(issue.artifact_type or ""),
+            source_id=issue.source_id,
+            source_url=issue.source_url,
+            replacement_value_sha256=_sha256(value),
+            replacement_payload_blob_id=blob_id,
+            actor_id=actor_id,
+            verification_state=state,
+        )
+
+    async def verify_current_issue_replacement(
+        self,
+        *,
+        edition_id: UUID,
+        subject_id: UUID,
+        repair_key: str,
+        replacement_value: str,
+    ) -> ProductionRepairCorrectionVerification:
+        """Verify a proposed replacement without appending a decision."""
+        detail = await self._issues.get_issue(edition_id, repair_key, subject_id)
+        if detail is None:
+            raise ProductionRepairIssueNotFoundError(ProductionRepairIssueNotFoundError.code)
+        if _repair_kind(detail.issue.kind) not in {
+            ProductionRepairIssueKind.REJECTED_INDICATOR,
+            ProductionRepairIssueKind.REJECTED_RULE,
+        }:
+            raise ProductionRepairActionInvalidError(ProductionRepairActionInvalidError.code)
+        return await self._validate_replacement(
+            issue=detail.issue,
+            value=replacement_value.strip(),
+            require_source=True,
+        )
+
+    async def _validate_replacement(
+        self,
+        *,
+        issue: ProductionRepairIssueView,
+        value: str,
+        require_source: bool,
+    ) -> ProductionRepairCorrectionVerification:
+        """Use Q2 shape validation and the exact source-evidence gate again."""
+        artifact_type = str(issue.artifact_type or "")
+        source_id = issue.source_id
+        source_url = issue.source_url
+        if not value:
+            return ProductionRepairCorrectionVerification(
+                verified=False,
+                replacement_value=value,
+                normalized_value=None,
+                artifact_type=artifact_type,
+                source_id=source_id,
+                source_url=source_url,
+                format_valid=False,
+                reason_code="replacement_value_empty",
+            )
+
+        if _repair_kind(issue.kind) is ProductionRepairIssueKind.REJECTED_RULE:
+            try:
+                proposal = Q2RuleProposal(
+                    rule_type=_entry_rule_type(artifact_type),
+                    body=value,
+                    context="",
+                    evidence_quote="",
+                )
+            except (TypeError, ValueError):
+                return ProductionRepairCorrectionVerification(
+                    verified=False,
+                    replacement_value=value,
+                    normalized_value=None,
+                    artifact_type=artifact_type,
+                    source_id=source_id,
+                    source_url=source_url,
+                    format_valid=False,
+                    reason_code="invalid_rule_type",
+                )
+            output = Q2SourceOutput(rules=[proposal])
+            verified = verify_q2_proposals(
+                [Q2ProposalSubmission(output=output, source_ids=(source_id,))]
+            )
+            format_valid = len(verified.rules) == 1
+            normalized_value = value if format_valid else None
+            if not format_valid:
+                reason_code = (
+                    verified.rejected[0].reason_code
+                    if verified.rejected
+                    else "invalid_rule"
+                )
+                return ProductionRepairCorrectionVerification(
+                    verified=False,
+                    replacement_value=value,
+                    normalized_value=normalized_value,
+                    artifact_type=artifact_type,
+                    source_id=source_id,
+                    source_url=source_url,
+                    format_valid=False,
+                    reason_code=reason_code,
+                )
+        else:
+            try:
+                artifact_enum = _entry_artifact_type(artifact_type)
+                proposal = Q2ArtifactProposal(
+                    value=value,
+                    artifact_type=artifact_enum.value,
+                    indicator_status="confirmed_ioc",
+                    context="",
+                    evidence_quote="",
+                )
+            except (TypeError, ValueError):
+                return ProductionRepairCorrectionVerification(
+                    verified=False,
+                    replacement_value=value,
+                    normalized_value=None,
+                    artifact_type=artifact_type,
+                    source_id=source_id,
+                    source_url=source_url,
+                    format_valid=False,
+                    reason_code="invalid_artifact_type",
+                )
+            verified_shape = verify_q2_proposals(
+                [
+                    Q2ProposalSubmission(
+                        output=Q2SourceOutput(artifacts=[proposal]), source_ids=(source_id,)
+                    )
+                ]
+            )
+            format_valid = len(verified_shape.canonical.items) == 1
+            normalized_value = (
+                verified_shape.canonical.items[0].normalized_value if format_valid else None
+            )
+            if not format_valid:
+                reason_code = (
+                    verified_shape.rejected[0].reason_code
+                    if verified_shape.rejected
+                    else "invalid_value"
+                )
+                return ProductionRepairCorrectionVerification(
+                    verified=False,
+                    replacement_value=value,
+                    normalized_value=normalized_value,
+                    artifact_type=artifact_type,
+                    source_id=source_id,
+                    source_url=source_url,
+                    format_valid=False,
+                    reason_code=reason_code,
+                )
+            output = Q2SourceOutput(artifacts=[proposal])
+
+        if not require_source:
+            return ProductionRepairCorrectionVerification(
+                verified=False,
+                replacement_value=value,
+                normalized_value=normalized_value,
+                artifact_type=artifact_type,
+                source_id=source_id,
+                source_url=source_url,
+                format_valid=True,
+                reason_code="source_verification_bypassed",
+            )
+
+        document = await self._archived_source_document(issue.subject_id, source_url)
+        if document is None:
+            return ProductionRepairCorrectionVerification(
+                verified=False,
+                replacement_value=value,
+                normalized_value=normalized_value,
+                artifact_type=artifact_type,
+                source_id=source_id,
+                source_url=source_url,
+                format_valid=True,
+                reason_code="source_evidence_unavailable",
+            )
+        evidence = verify_ioc_rules_output_against_source(output, document)
+        verified = bool(evidence.output.artifacts or evidence.output.rules)
+        context_spans = (
+            source_evidence_context_for_artifact(proposal, document)
+            if _repair_kind(issue.kind) is ProductionRepairIssueKind.REJECTED_INDICATOR
+            else tuple(
+                span
+                for span in source_evidence_context_for_rule(proposal, document)
+                if span.kind is not SourceEvidenceSpanKind.VISUAL_UNLOCATED
+            )
+        )
+        return ProductionRepairCorrectionVerification(
+            verified=verified,
+            replacement_value=value,
+            normalized_value=normalized_value,
+            artifact_type=artifact_type,
+            source_id=source_id,
+            source_url=source_url,
+            format_valid=True,
+            reason_code=(
+                None
+                if verified
+                else (
+                    evidence.rejections[0].reason_code
+                    if evidence.rejections
+                    else "source_evidence_missing"
+                )
+            ),
+            context_spans=context_spans,
+            verification_state=(
+                ProductionRepairVerificationState.SOURCE_VERIFIED if verified else None
+            ),
+        )
+
+    async def _archived_source_document(
+        self, subject_id: UUID, source_url: str
+    ) -> SourceEvidenceDocument | None:
+        if self._artifact_store is None:
+            return None
+        async with self._uow_factory() as uow:
+            collections = await uow.source_collections.list_for_subject(subject_id)
+            try:
+                expected_url = canonicalize_http_url(source_url)
+            except ValueError:
+                expected_url = source_url.strip()
+            collection = next(
+                (
+                    item
+                    for item in collections
+                    if str(getattr(item, "canonical_url", "")) == expected_url
+                ),
+                None,
+            )
+            if collection is None:
+                return None
+            document = None
+            source_document_id = getattr(collection, "source_document_id", None)
+            if source_document_id is not None:
+                document = await uow.source_documents.get(source_document_id)
+            blob_id = getattr(collection, "decoded_blob_id", None) or getattr(
+                document, "decoded_blob_id", None
+            )
+            expected_sha256 = getattr(document, "decoded_sha256", None)
+            mime_type = getattr(document, "detected_mime_type", None)
+            if blob_id is not None:
+                blob = await uow.blobs.get(blob_id)
+                descriptor = getattr(blob, "descriptor", None)
+                mime_type = mime_type or getattr(descriptor, "mime_type", None)
+                expected_sha256 = expected_sha256 or getattr(
+                    descriptor, "sha256", None
+                )
+        if blob_id is None:
+            return None
+        reader = getattr(self._artifact_store, "read_bytes", None)
+        if not callable(reader):
+            return None
+        try:
+            content = await reader(blob_id)
+            if expected_sha256 and hashlib.sha256(content).hexdigest() != expected_sha256:
+                return None
+            detected = DetectedMimeType(
+                str(mime_type or DetectedMimeType.HTML.value).split(";", 1)[0]
+            )
+            parsed = parse_document(content, detected)
+            if detected is DetectedMimeType.HTML:
+                return source_evidence_document_from_html(
+                    parsed.text,
+                    content.decode(_html_encoding(content), errors="replace"),
+                )
+            return SourceEvidenceDocument(parsed_text=parsed.text)
+        except (OSError, TypeError, ValueError):
+            return None
 
     @staticmethod
     def _require_buildable_include(
@@ -1810,7 +2308,11 @@ def _repair_action_is_compatible(
     """Mirror the domain compatibility rule before a decision is built."""
     if kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED:
         return action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
-    return action in {ProductionRepairAction.INCLUDE, ProductionRepairAction.EXCLUDE}
+    return action in {
+        ProductionRepairAction.INCLUDE,
+        ProductionRepairAction.EXCLUDE,
+        ProductionRepairAction.REPLACE,
+    }
 
 
 def _fallback_synthesis_projection_hash(extraction: TechnicalExtraction) -> str:
@@ -2050,7 +2552,10 @@ class EffectiveExtractionProjector:
                     }
                 )
                 continue
-            if action != ProductionRepairAction.INCLUDE.value:
+            if action not in {
+                ProductionRepairAction.INCLUDE.value,
+                ProductionRepairAction.REPLACE.value,
+            }:
                 unresolved.append(repair_key)
                 continue
             value = resolved_payloads.get(repair_key)
@@ -2077,7 +2582,7 @@ class EffectiveExtractionProjector:
                 {
                     "repair_key": repair_key,
                     "decision_id": str(decision.id),
-                    "action": ProductionRepairAction.INCLUDE.value,
+                    "action": action,
                 }
             )
 
@@ -2362,17 +2867,26 @@ class ProductionRepairProjectionService:
             (repair_key, entry, value_sha256)
             for repair_key, _kind, entry, value_sha256 in active_entries
             if (decision := decisions_by_key.get(repair_key)) is not None
-            and _enum_value(decision.action) == ProductionRepairAction.INCLUDE.value
+            and _enum_value(decision.action)
+            in {ProductionRepairAction.INCLUDE.value, ProductionRepairAction.REPLACE.value}
         ]
-        resolved_payload_objects = dict(
+        original_include_entries = [
+            item
+            for item in include_entries
+            if _enum_value(decisions_by_key[item[0]].action)
+            == ProductionRepairAction.INCLUDE.value
+        ]
+        include_payload_objects = dict(
             zip(
-                (repair_key for repair_key, _entry, _hash in include_entries),
+                (repair_key for repair_key, _entry, _hash in original_include_entries),
                 await self._payloads.resolve_many(
-                    [entry for _key, entry, _hash in include_entries],
+                    [entry for _repair_key, entry, _hash in original_include_entries],
                     payload_available=payload_available,
                     value_sha256_by_index={
                         index: value_sha256
-                        for index, (_key, _entry, value_sha256) in enumerate(include_entries)
+                        for index, (_key, _entry, value_sha256) in enumerate(
+                            original_include_entries
+                        )
                     },
                 ),
                 strict=True,
@@ -2380,18 +2894,59 @@ class ProductionRepairProjectionService:
         )
         resolved_payloads = {
             repair_key: payload.value
-            for repair_key, payload in resolved_payload_objects.items()
+            for repair_key, payload in include_payload_objects.items()
             if payload.available and payload.value is not None
         }
-        projector_entries = [
-            dict(entry)
-            | {
-                "repair_key": repair_key,
-                "kind": kind.value,
-                "value_sha256": value_sha256,
-            }
-            for repair_key, kind, entry, value_sha256 in active_entries
-        ]
+        corrections = getattr(uow, "production_repair_corrections", None)
+        for repair_key, _entry, _hash in include_entries:
+            decision = decisions_by_key[repair_key]
+            if _enum_value(decision.action) != ProductionRepairAction.REPLACE.value:
+                continue
+            if corrections is None or decision.correction_id is None:
+                raise ProductionRepairProjectionError("repair_correction_unavailable")
+            correction = await corrections.get(decision.correction_id)
+            if correction is None or self._artifact_store is None:
+                raise ProductionRepairProjectionError("repair_correction_unavailable")
+            try:
+                replacement = await self._artifact_store.read_text(
+                    correction.replacement_payload_blob_id,
+                    max_bytes=MAX_REPAIR_EVIDENCE_BYTES,
+                )
+            except Exception as exc:
+                raise ProductionRepairProjectionError(
+                    "repair_correction_payload_unavailable"
+                ) from exc
+            if _sha256(replacement) != correction.replacement_value_sha256:
+                raise ProductionRepairProjectionError("repair_correction_hash_mismatch")
+            resolved_payloads[repair_key] = replacement
+        projector_entries = []
+        for repair_key, kind, entry, value_sha256 in active_entries:
+            projected_entry = dict(entry)
+            decision = decisions_by_key.get(repair_key)
+            projected_basis: str | None = None
+            if (
+                decision is not None
+                and _enum_value(decision.action) == ProductionRepairAction.REPLACE.value
+                and corrections is not None
+                and decision.correction_id is not None
+            ):
+                correction = await corrections.get(decision.correction_id)
+                if correction is None:
+                    raise ProductionRepairProjectionError("repair_correction_unavailable")
+                projected_value_hash = correction.replacement_value_sha256
+                projected_basis = correction.verification_state.value
+            else:
+                projected_value_hash = value_sha256
+            projected_entry["value_sha256"] = projected_value_hash
+            if projected_basis is not None:
+                projected_entry["evidence_basis"] = projected_basis
+            projector_entries.append(
+                projected_entry
+                | {
+                    "repair_key": repair_key,
+                    "kind": kind.value,
+                }
+            )
         projection = EffectiveExtractionProjector().project(
             base=base_extraction,
             repair_entries=projector_entries,
@@ -2653,6 +3208,16 @@ async def reconcile_effective_repairs_in_uow(
         for repair_key, _kind, entry, value_sha256 in active_entries
         if any(
             decision.repair_key == repair_key
+            and _enum_value(decision.action)
+            in {ProductionRepairAction.INCLUDE.value, ProductionRepairAction.REPLACE.value}
+            for decision in decisions
+        )
+    ]
+    original_include_entries = [
+        item
+        for item in include_entries
+        if any(
+            decision.repair_key == item[0]
             and _enum_value(decision.action) == ProductionRepairAction.INCLUDE.value
             for decision in decisions
         )
@@ -2660,35 +3225,76 @@ async def reconcile_effective_repairs_in_uow(
     resolver = payload_resolver or ProductionRepairPayloadResolver()
     payload_objects = dict(
         zip(
-            (repair_key for repair_key, _entry, _hash in include_entries),
+            (repair_key for repair_key, _entry, _hash in original_include_entries),
             await resolver.resolve_many(
-                [entry for _key, entry, _hash in include_entries],
+                [entry for _key, entry, _hash in original_include_entries],
                 payload_available=payload_available,
                 value_sha256_by_index={
                     index: value_sha256
-                    for index, (_key, _entry, value_sha256) in enumerate(include_entries)
+                    for index, (_key, _entry, value_sha256) in enumerate(original_include_entries)
                 },
             ),
             strict=True,
         )
     )
-    projected = EffectiveExtractionProjector().project(
-        base=base,
-        repair_entries=[
-            dict(entry)
+    resolved_payloads = {
+        repair_key: payload.value
+        for repair_key, payload in payload_objects.items()
+        if payload.available and payload.value is not None
+    }
+    correction_repository = getattr(uow, "production_repair_corrections", None)
+    decisions_by_key = {decision.repair_key: decision for decision in decisions}
+    for repair_key, _entry, _hash in include_entries:
+        decision = decisions_by_key[repair_key]
+        if _enum_value(decision.action) != ProductionRepairAction.REPLACE.value:
+            continue
+        if correction_repository is None or decision.correction_id is None:
+            raise ProductionRepairProjectionError("repair_correction_unavailable")
+        correction = await correction_repository.get(decision.correction_id)
+        if correction is None:
+            raise ProductionRepairProjectionError("repair_correction_unavailable")
+        try:
+            replacement = await artifact_store.read_text(
+                correction.replacement_payload_blob_id,
+                max_bytes=MAX_REPAIR_EVIDENCE_BYTES,
+            )
+        except Exception as exc:
+            raise ProductionRepairProjectionError("repair_correction_payload_unavailable") from exc
+        if _sha256(replacement) != correction.replacement_value_sha256:
+            raise ProductionRepairProjectionError("repair_correction_hash_mismatch")
+        resolved_payloads[repair_key] = replacement
+    replay_entries = []
+    for repair_key, kind, entry, value_sha256 in active_entries:
+        decision = decisions_by_key.get(repair_key)
+        projected_value_hash = value_sha256
+        projected_basis: str | None = None
+        if (
+            decision is not None
+            and _enum_value(decision.action) == ProductionRepairAction.REPLACE.value
+        ):
+            if correction_repository is None or decision.correction_id is None:
+                raise ProductionRepairProjectionError("repair_correction_unavailable")
+            correction = await correction_repository.get(decision.correction_id)
+            if correction is None:
+                raise ProductionRepairProjectionError("repair_correction_unavailable")
+            projected_value_hash = correction.replacement_value_sha256
+            projected_basis = correction.verification_state.value
+        replay_entry = dict(entry)
+        replay_entry["value_sha256"] = projected_value_hash
+        if projected_basis is not None:
+            replay_entry["evidence_basis"] = projected_basis
+        replay_entries.append(
+            replay_entry
             | {
                 "repair_key": repair_key,
                 "kind": kind.value,
-                "value_sha256": value_sha256,
             }
-            for repair_key, kind, entry, value_sha256 in active_entries
-        ],
+        )
+    projected = EffectiveExtractionProjector().project(
+        base=base,
+        repair_entries=replay_entries,
         effective_decisions=decisions,
-        resolved_payloads={
-            repair_key: payload.value
-            for repair_key, payload in payload_objects.items()
-            if payload.available and payload.value is not None
-        },
+        resolved_payloads=resolved_payloads,
     )
     if projected.extraction == base:
         return None
@@ -3491,6 +4097,9 @@ def _build_override_item(entry: Mapping[str, Any], value: str, repair_key: str) 
     if len(verified.items) != 1:
         raise ValueError("Repair artifact failed deterministic validation")
     item = verified.items[0]
+    evidence_basis = ProductionEvidenceBasis(
+        str(entry.get("evidence_basis", ProductionEvidenceBasis.ANALYST_OVERRIDE.value))
+    )
     publication_ioc = is_publication_ioc_artifact_type(artifact_type)
     return replace(
         item,
@@ -3505,7 +4114,7 @@ def _build_override_item(entry: Mapping[str, Any], value: str, repair_key: str) 
         display_policy=(DisplayPolicy.IOC_SECTION if publication_ioc else DisplayPolicy.BODY_ONLY),
         evidence_quote="",
         model_run_ids=_entry_model_run_ids(entry),
-        evidence_basis=ProductionEvidenceBasis.ANALYST_OVERRIDE,
+        evidence_basis=evidence_basis,
     )
 
 
@@ -3531,12 +4140,15 @@ def _build_override_rule(entry: Mapping[str, Any], value: str, repair_key: str) 
     ).canonical
     if len(verified.rules) != 1:
         raise ValueError("Repair rule failed deterministic validation")
+    evidence_basis = ProductionEvidenceBasis(
+        str(entry.get("evidence_basis", ProductionEvidenceBasis.ANALYST_OVERRIDE.value))
+    )
     return replace(
         verified.rules[0],
         source_ids=(source_id,),
         supported=True,
         model_run_ids=_entry_model_run_ids(entry),
-        evidence_basis=ProductionEvidenceBasis.ANALYST_OVERRIDE,
+        evidence_basis=evidence_basis,
     )
 
 
@@ -3715,10 +4327,17 @@ def repair_decision_application_state(
         applied_action = _marker_applied_action(current_projection_marker, repair_key)
         return (
             RepairDecisionApplicationState.PROJECTION_REQUIRED
-            if applied_action == ProductionRepairAction.INCLUDE.value
+            if applied_action
+            in {
+                ProductionRepairAction.INCLUDE.value,
+                ProductionRepairAction.REPLACE.value,
+            }
             else RepairDecisionApplicationState.ALREADY_EFFECTIVE
         )
-    if action == ProductionRepairAction.INCLUDE.value:
+    if action in {
+        ProductionRepairAction.INCLUDE.value,
+        ProductionRepairAction.REPLACE.value,
+    }:
         return RepairDecisionApplicationState.PROJECTION_REQUIRED
     return RepairDecisionApplicationState.ALREADY_EFFECTIVE
 

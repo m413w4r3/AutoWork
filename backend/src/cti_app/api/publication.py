@@ -47,6 +47,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairActionInvalidError,
     ProductionRepairAdjudicationRequest,
     ProductionRepairAdjudicationService,
+    ProductionRepairAuditReasonRequiredError,
     ProductionRepairDecisionChangedError,
     ProductionRepairDecisionNoopError,
     ProductionRepairIssueNotFoundError,
@@ -160,7 +161,7 @@ class EditionReviewView(BaseModel):
 class EditionRepairDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["include", "exclude", "continue_without_source"]
+    action: Literal["include", "exclude", "replace", "continue_without_source"]
     observed_subject_id: UUID
     observed_run_id: UUID
     observed_artifact_id: UUID
@@ -169,18 +170,29 @@ class EditionRepairDecisionRequest(BaseModel):
     # when the analyst revises an existing one.
     expected_effective_decision_id: UUID | None = None
     reason: str | None = Field(default=None, max_length=500)
+    replacement_value: str | None = Field(default=None, max_length=10_000_000)
+    force_override: bool = False
+
+
+class EditionRepairReplacementVerificationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observed_subject_id: UUID
+    replacement_value: str = Field(min_length=1, max_length=10_000_000)
 
 
 class EditionRepairBulkDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repair_key: str
-    action: Literal["include", "exclude", "continue_without_source"]
+    action: Literal["include", "exclude", "replace", "continue_without_source"]
     observed_subject_id: UUID
     observed_run_id: UUID
     observed_artifact_id: UUID
     observed_pipeline_generation: Annotated[int, Field(ge=0)]
     expected_effective_decision_id: UUID | None = None
+    replacement_value: str | None = Field(default=None, max_length=10_000_000)
+    force_override: bool = False
 
 
 class EditionRepairBulkRequest(BaseModel):
@@ -483,6 +495,14 @@ def _edition_repair_error(exc: Exception, repair_key: str | None = None) -> NoRe
             status_code=status.HTTP_409_CONFLICT,
             detail=_repair_detail(ProductionRepairValueNotVerifiableError.code, repair_key),
         ) from exc
+    if isinstance(exc, ProductionRepairAuditReasonRequiredError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": ProductionRepairAuditReasonRequiredError.code,
+                "repair_key": repair_key,
+            },
+        ) from exc
     if isinstance(exc, ProductionRepairDecisionChangedError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -650,6 +670,47 @@ async def get_edition_review_repair_detail(
     return result
 
 
+@router.post(
+    "/editions/{edition_id}/review/repairs/{repair_key}/verify-replacement",
+)
+async def verify_edition_repair_replacement(
+    edition_id: UUID,
+    repair_key: str,
+    payload: EditionRepairReplacementVerificationRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Check a proposed replacement without appending a decision."""
+    try:
+        verification = await _repair_adjudication_service(
+            request
+        ).verify_current_issue_replacement(
+            edition_id=edition_id,
+            subject_id=payload.observed_subject_id,
+            repair_key=repair_key,
+            replacement_value=payload.replacement_value,
+        )
+    except Exception as exc:
+        _edition_repair_error(exc, repair_key)
+    return {
+        "verified": verification.verified,
+        "format_valid": verification.format_valid,
+        "normalized_value": verification.normalized_value,
+        "artifact_type": verification.artifact_type,
+        "source_id": verification.source_id,
+        "source_url": verification.source_url,
+        "reason_code": verification.reason_code,
+        "verification_state": (
+            verification.verification_state.value
+            if verification.verification_state is not None
+            else None
+        ),
+        "context_spans": [
+            {"kind": span.kind.value, "text": span.text}
+            for span in verification.context_spans
+        ],
+    }
+
+
 @router.post("/editions/{edition_id}/review/repairs/{repair_key}/decision")
 async def decide_edition_review_repair(
     edition_id: UUID,
@@ -675,6 +736,8 @@ async def decide_edition_review_repair(
             expected_effective_decision_id=payload.expected_effective_decision_id,
             actor_id=await _actor_id(request),
             reason=payload.reason,
+            replacement_value=payload.replacement_value,
+            force_override=payload.force_override,
         )
     except Exception as exc:
         _edition_repair_error(exc, repair_key)
@@ -696,6 +759,7 @@ def _repair_adjudication_service(
         request.app.state.uow_factory,
         _repair_issue_service(request),
         getattr(request.app.state, "production_repair_decision_service", None),
+        getattr(request.app.state, "production_artifact_store", None),
     )
 
 
@@ -717,6 +781,8 @@ async def decide_edition_review_repairs(
             observed_pipeline_generation=requested.observed_pipeline_generation,
             expected_effective_decision_id=requested.expected_effective_decision_id,
             observed_run_id=requested.observed_run_id,
+            replacement_value=requested.replacement_value,
+            force_override=requested.force_override,
         )
         for requested in payload.decisions
     ]
@@ -1437,6 +1503,7 @@ def _production_repair_decision_view(decision: Any | None) -> dict[str, Any] | N
         "created_at": decision.created_at.isoformat(),
         "observed_artifact_id": str(decision.observed_artifact_id),
         "observed_pipeline_generation": decision.observed_pipeline_generation,
+        "correction_id": str(decision.correction_id) if decision.correction_id else None,
     }
 
 

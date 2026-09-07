@@ -117,7 +117,15 @@ class ProductionRepairAction(StrEnum):
 
     INCLUDE = "include"
     EXCLUDE = "exclude"
+    REPLACE = "replace"
     CONTINUE_WITHOUT_SOURCE = "continue_without_source"
+
+
+class ProductionRepairVerificationState(StrEnum):
+    """How a replacement value was admitted to a repair projection."""
+
+    SOURCE_VERIFIED = "source_verified"
+    ANALYST_OVERRIDE = "analyst_override"
 
 
 class RepairDecisionApplicationState(StrEnum):
@@ -902,6 +910,49 @@ MAX_PRODUCTION_REPAIR_REASON_LENGTH = 500
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ProductionRepairCorrection:
+    """Immutable replacement payload attached to one REPLACE decision.
+
+    The value itself lives in the content-addressed blob store.  The row only
+    carries its immutable identity and the provenance needed to re-project it;
+    in particular, no preview or truncated copy is part of this entity.
+    """
+
+    edition_id: UUID
+    subject_id: UUID
+    production_run_id: UUID
+    original_repair_key: str
+    artifact_type: str
+    source_id: str
+    source_url: str
+    replacement_value_sha256: str
+    replacement_payload_blob_id: UUID
+    actor_id: str
+    verification_state: ProductionRepairVerificationState
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    id: UUID = field(default_factory=uuid4)
+
+    def __post_init__(self) -> None:
+        if not _PRODUCTION_REPAIR_KEY_RE.fullmatch(self.original_repair_key):
+            raise ValueError("original_repair_key must be a lowercase SHA-256")
+        if not self.artifact_type.strip():
+            raise ValueError("artifact_type must not be empty")
+        if not self.source_id.strip() or not self.source_url.strip():
+            raise ValueError("A production repair correction requires source identity")
+        if not _PRODUCTION_REPAIR_KEY_RE.fullmatch(self.replacement_value_sha256):
+            raise ValueError("replacement_value_sha256 must be a lowercase SHA-256")
+        if not self.actor_id.strip():
+            raise ValueError("actor_id must not be empty")
+        try:
+            state = ProductionRepairVerificationState(self.verification_state)
+        except ValueError as exc:
+            raise ValueError("Unknown production repair verification state") from exc
+        object.__setattr__(self, "verification_state", state)
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ProductionRepairDecision:
     """One immutable human decision attached to a stable repair identity."""
 
@@ -915,6 +966,7 @@ class ProductionRepairDecision:
     action: ProductionRepairAction
     actor_id: str
     reason: str | None = None
+    correction_id: UUID | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     id: UUID = field(default_factory=uuid4)
 
@@ -951,13 +1003,20 @@ class ProductionRepairDecision:
                 ProductionRepairIssueKind.REJECTED_INDICATOR,
                 ProductionRepairIssueKind.REJECTED_RULE,
             }
-            and action in {ProductionRepairAction.INCLUDE, ProductionRepairAction.EXCLUDE}
+            and action
+            in {
+                ProductionRepairAction.INCLUDE,
+                ProductionRepairAction.EXCLUDE,
+                ProductionRepairAction.REPLACE,
+            }
         ) or (
             issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
             and action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
         )
         if not compatible:
             raise ValueError("Production repair action is incompatible with issue kind")
+        if (action is ProductionRepairAction.REPLACE) != (self.correction_id is not None):
+            raise ValueError("REPLACE decisions require exactly one immutable correction")
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("created_at must be timezone-aware")
 

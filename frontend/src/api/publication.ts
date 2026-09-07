@@ -15,7 +15,7 @@ export type ProductionRepairIssueKind =
   "rejected_indicator" | "rejected_rule" | "supplemental_source_unarchived";
 
 export type ProductionRepairAction =
-  "include" | "exclude" | "continue_without_source";
+  "include" | "exclude" | "replace" | "continue_without_source";
 
 export type RepairImpactKind =
   | "no_deliverable_change"
@@ -144,6 +144,34 @@ export interface ProductionRepairDecision {
   created_at: string;
   observed_artifact_id: string;
   observed_pipeline_generation: number;
+  correction_id?: string | null;
+}
+
+export type SourceEvidenceSpanKind =
+  | "body_text"
+  | "table"
+  | "list"
+  | "code_block"
+  | "link_text"
+  | "alt_text"
+  | "visual_unlocated"
+  | "unknown";
+
+export interface SourceEvidenceSpan {
+  kind: SourceEvidenceSpanKind;
+  text: string;
+}
+
+export interface EditionRepairReplacementVerification {
+  verified: boolean;
+  format_valid: boolean;
+  normalized_value: string | null;
+  artifact_type: string;
+  source_id: string;
+  source_url: string;
+  reason_code: string | null;
+  verification_state: "source_verified" | "analyst_override" | null;
+  context_spans: SourceEvidenceSpan[];
 }
 
 /** Where the exact value shown for a repair issue came from. */
@@ -395,6 +423,8 @@ export function decideEditionRepair(
      */
     expectedEffectiveDecisionId: string | null;
     reason?: string | null;
+    replacementValue?: string | null;
+    forceOverride?: boolean;
   },
 ): Promise<EditionRepairDecisionResponse> {
   return request(
@@ -407,6 +437,24 @@ export function decideEditionRepair(
       observed_pipeline_generation: input.observedPipelineGeneration,
       expected_effective_decision_id: input.expectedEffectiveDecisionId,
       ...(input.reason?.trim() ? { reason: input.reason.trim() } : {}),
+      ...(input.replacementValue !== undefined
+        ? { replacement_value: input.replacementValue }
+        : {}),
+      ...(input.forceOverride ? { force_override: true } : {}),
+    }),
+  );
+}
+
+export function verifyEditionRepairReplacement(
+  editionId: string,
+  repairKey: string,
+  input: { observedSubjectId: string; replacementValue: string },
+): Promise<EditionRepairReplacementVerification> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/review/repairs/${encodeURIComponent(repairKey)}/verify-replacement`,
+    jsonRequest({
+      observed_subject_id: input.observedSubjectId,
+      replacement_value: input.replacementValue,
     }),
   );
 }
@@ -432,6 +480,8 @@ export function decideEditionRepairsBulk(
     observedArtifactId: string;
     observedPipelineGeneration: number;
     expectedEffectiveDecisionId: string | null;
+    replacementValue?: string | null;
+    forceOverride?: boolean;
   }>,
   reason?: string | null,
 ): Promise<EditionRepairBulkDecisionResponse> {
@@ -446,6 +496,10 @@ export function decideEditionRepairsBulk(
         observed_artifact_id: decision.observedArtifactId,
         observed_pipeline_generation: decision.observedPipelineGeneration,
         expected_effective_decision_id: decision.expectedEffectiveDecisionId,
+        ...(decision.replacementValue !== undefined
+          ? { replacement_value: decision.replacementValue }
+          : {}),
+        ...(decision.forceOverride ? { force_override: true } : {}),
       })),
       ...(reason?.trim() ? { reason: reason.trim() } : {}),
     }),

@@ -327,6 +327,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory,
         production_repair_issue_service,
         app.state.production_repair_decision_service,
+        production_artifact_store,
     )
     app.state.edition_publication_service = EditionPublicationService(
         uow_factory,

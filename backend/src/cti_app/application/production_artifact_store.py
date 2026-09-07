@@ -30,6 +30,7 @@ _RENDERED_BUCKET = "production-artifacts-rendered"
 _SOURCE_EXTRACTION_RAW_BUCKET = "source-extractions-raw"
 _SOURCE_EXTRACTION_CANONICAL_BUCKET = "source-extractions-canonical"
 _REPAIR_EVIDENCE_BUCKET = "production-repair-evidence"
+REPAIR_CORRECTION_BUCKET = "production-repair-corrections"
 REPAIR_EVIDENCE_BUCKET = _REPAIR_EVIDENCE_BUCKET
 
 
@@ -84,8 +85,10 @@ class ProductionArtifactStore:
         )
         return record.id, hashlib.sha256(encoded).hexdigest()
 
-    async def read_text(self, blob_id: UUID) -> str:
-        return (await self.read_bytes(blob_id)).decode("utf-8")
+    async def read_text(
+        self, blob_id: UUID, *, max_bytes: int = MAX_ARTIFACT_BYTES
+    ) -> str:
+        return (await self.read_bytes(blob_id, max_bytes=max_bytes)).decode("utf-8")
 
     async def read_bytes(self, blob_id: UUID, *, max_bytes: int = MAX_ARTIFACT_BYTES) -> bytes:
         try:

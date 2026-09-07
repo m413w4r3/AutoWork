@@ -29,7 +29,8 @@ EXTRACTION_PROFILE_VALUES_SQL = "'full', 'ioc_rules'"
 PRODUCTION_REPAIR_ISSUE_KIND_VALUES_SQL = (
     "'rejected_indicator', 'rejected_rule', 'supplemental_source_unarchived'"
 )
-PRODUCTION_REPAIR_ACTION_VALUES_SQL = "'include', 'exclude', 'continue_without_source'"
+PRODUCTION_REPAIR_ACTION_VALUES_SQL = "'include', 'exclude', 'replace', 'continue_without_source'"
+PRODUCTION_REPAIR_VERIFICATION_STATE_VALUES_SQL = "'source_verified', 'analyst_override'"
 PRODUCTION_BATCH_STATUS_VALUES_SQL = (
     "'queued', 'running', 'completed', 'completed_with_issues', 'cancelled'"
 )
@@ -556,6 +557,63 @@ class ProductionReuseInvalidationRow(Base):
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class ProductionRepairCorrectionRow(Base):
+    """Append-only immutable replacement payload metadata."""
+
+    __tablename__ = "production_repair_corrections"
+    __table_args__ = (
+        CheckConstraint(
+            f"verification_state IN ({PRODUCTION_REPAIR_VERIFICATION_STATE_VALUES_SQL})",
+            name="ck_production_repair_correction_verification_state",
+        ),
+        CheckConstraint(
+            "char_length(original_repair_key) = 64 AND "
+            "original_repair_key ~ '^[0-9a-f]{64}$'",
+            name="ck_production_repair_correction_original_key",
+        ),
+        CheckConstraint(
+            "char_length(replacement_value_sha256) = 64 AND "
+            "replacement_value_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_production_repair_correction_value_sha256",
+        ),
+        CheckConstraint(
+            "char_length(btrim(actor_id)) > 0",
+            name="ck_production_repair_correction_actor",
+        ),
+        Index(
+            "ix_production_repair_corrections_original_key_created",
+            "edition_id",
+            "original_repair_key",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    edition_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
+    )
+    subject_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("subjects.id", ondelete="RESTRICT"), nullable=False
+    )
+    production_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("subject_production_runs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    original_repair_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    replacement_value_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    replacement_payload_blob_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
+    )
+    actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    verification_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class ProductionRepairDecisionRow(Base):
     """Append-only human decisions for stable production repair issues."""
 
@@ -571,10 +629,14 @@ class ProductionRepairDecisionRow(Base):
         ),
         CheckConstraint(
             "((issue_kind IN ('rejected_indicator', 'rejected_rule') "
-            "AND action IN ('include', 'exclude')) OR "
+            "AND action IN ('include', 'exclude', 'replace')) OR "
             "(issue_kind = 'supplemental_source_unarchived' "
             "AND action = 'continue_without_source'))",
             name="ck_production_repair_action_compatibility",
+        ),
+        CheckConstraint(
+            "(action = 'replace') = (correction_id IS NOT NULL)",
+            name="ck_production_repair_replace_correction",
         ),
         CheckConstraint(
             "char_length(repair_key) = 64 AND repair_key ~ '^[0-9a-f]{64}$'",
@@ -628,6 +690,10 @@ class ProductionRepairDecisionRow(Base):
     repair_key: Mapped[str] = mapped_column(String(64), nullable=False)
     issue_kind: Mapped[str] = mapped_column(String(64), nullable=False)
     action: Mapped[str] = mapped_column(String(32), nullable=False)
+    correction_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("production_repair_corrections.id", ondelete="RESTRICT"),
+    )
     observed_pipeline_generation: Mapped[int] = mapped_column(nullable=False)
     actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)

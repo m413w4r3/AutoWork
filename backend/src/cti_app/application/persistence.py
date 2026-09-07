@@ -66,6 +66,7 @@ from cti_app.domain.production import (
     EditionProductionBatchItem,
     ProductionArtifact,
     ProductionInputSnapshot,
+    ProductionRepairCorrection,
     ProductionRepairDecision,
     ProductionReuseInvalidation,
     SampleAcquisitionAttempt,
@@ -644,6 +645,7 @@ class UnitOfWork(Protocol):
     production_artifacts: ProductionArtifactRepository
     production_reuse_invalidations: ProductionReuseInvalidationRepository
     production_repair_decisions: ProductionRepairDecisionRepository
+    production_repair_corrections: ProductionRepairCorrectionRepository
     source_extractions: SourceExtractionRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository
@@ -837,6 +839,14 @@ class ProductionRepairDecisionRepository(Protocol):
     async def effective_decisions(
         self, edition_id: UUID, subject_id: UUID | None = None
     ) -> Sequence[ProductionRepairDecision]: ...
+
+
+class ProductionRepairCorrectionRepository(Protocol):
+    """Append-only persistence port for immutable replacement evidence."""
+
+    async def append(self, correction: ProductionRepairCorrection) -> None: ...
+
+    async def get(self, correction_id: UUID) -> ProductionRepairCorrection | None: ...
 
 
 class AnalystInvestigationRepository(Protocol):

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from html import unescape
 from html.parser import HTMLParser
 
@@ -46,6 +47,27 @@ _FILENAME_CONTINUATION = ".-_"
 _FILEPATH_CONTINUATION = "._-/\\:"
 
 
+class SourceEvidenceSpanKind(StrEnum):
+    """Structural location available in the archived source evidence."""
+
+    BODY_TEXT = "body_text"
+    TABLE = "table"
+    LIST = "list"
+    CODE_BLOCK = "code_block"
+    LINK_TEXT = "link_text"
+    ALT_TEXT = "alt_text"
+    VISUAL_UNLOCATED = "visual_unlocated"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceEvidenceSpan:
+    """A safe structural text span; it never claims visual localization."""
+
+    kind: SourceEvidenceSpanKind
+    text: str = ""
+
+
 @dataclass(frozen=True, slots=True)
 class SourceEvidenceDocument:
     """The local views allowed to prove one Q2 proposal.
@@ -58,6 +80,15 @@ class SourceEvidenceDocument:
     parsed_text: str
     decoded_source_view: str = ""
     has_unverifiable_visuals: bool = False
+    spans: tuple[SourceEvidenceSpan, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.spans and self.parsed_text:
+            object.__setattr__(
+                self,
+                "spans",
+                (SourceEvidenceSpan(SourceEvidenceSpanKind.BODY_TEXT, self.parsed_text),),
+            )
 
 
 class _SafeHtmlEvidenceParser(HTMLParser):
@@ -160,21 +191,152 @@ class _SafeHtmlEvidenceParser(HTMLParser):
             self._line.append(cleaned)
 
 
+class _StructuredEvidenceParser(HTMLParser):
+    """Build safe structural spans without including URL-bearing attributes."""
+
+    _SKIPPED_TAGS = frozenset({"script", "style", "noscript", "template", "svg"})
+    _VISUAL_TAGS = frozenset({"img", "picture", "canvas", "object", "embed", "svg"})
+    _KNOWN_TAGS = frozenset(
+        {
+            "a",
+            "abbr",
+            "article",
+            "b",
+            "body",
+            "br",
+            "code",
+            "dd",
+            "div",
+            "em",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "head",
+            "html",
+            "i",
+            "li",
+            "main",
+            "p",
+            "pre",
+            "section",
+            "span",
+            "strong",
+            "table",
+            "tbody",
+            "td",
+            "th",
+            "thead",
+            "tr",
+            "ul",
+            "ol",
+        }
+    )
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.spans: list[SourceEvidenceSpan] = []
+        self.stack: list[str] = []
+        self.skip_depth = 0
+        self._kind: SourceEvidenceSpanKind | None = None
+        self._buffer: list[str] = []
+
+    def _flush(self) -> None:
+        if self._kind is not None:
+            text = "".join(self._buffer).strip()
+            if text:
+                self.spans.append(SourceEvidenceSpan(self._kind, text))
+        self._kind = None
+        self._buffer = []
+
+    def _kind_for_stack(self) -> SourceEvidenceSpanKind:
+        if "a" in self.stack:
+            return SourceEvidenceSpanKind.LINK_TEXT
+        if "pre" in self.stack or "code" in self.stack:
+            return SourceEvidenceSpanKind.CODE_BLOCK
+        if "li" in self.stack:
+            return SourceEvidenceSpanKind.LIST
+        if any(tag in self.stack for tag in ("table", "thead", "tbody", "tr", "td", "th")):
+            return SourceEvidenceSpanKind.TABLE
+        if self.stack and self.stack[-1] not in self._KNOWN_TAGS:
+            return SourceEvidenceSpanKind.UNKNOWN
+        return SourceEvidenceSpanKind.BODY_TEXT
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.casefold()
+        if self.skip_depth:
+            if tag in self._SKIPPED_TAGS:
+                self.skip_depth += 1
+            return
+        if tag in self._VISUAL_TAGS:
+            self._flush()
+            self.spans.append(SourceEvidenceSpan(SourceEvidenceSpanKind.VISUAL_UNLOCATED))
+        if tag in self._SKIPPED_TAGS:
+            self.skip_depth += 1
+            return
+        for key, value in attrs:
+            if key.casefold() == "alt" and value:
+                self._flush()
+                cleaned = " ".join(unescape(value).split())
+                if cleaned:
+                    self.spans.append(SourceEvidenceSpan(SourceEvidenceSpanKind.ALT_TEXT, cleaned))
+        self.stack.append(tag)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if tag in self._SKIPPED_TAGS and self.skip_depth:
+            self.skip_depth -= 1
+            return
+        self._flush()
+        if self.stack:
+            try:
+                self.stack.reverse()
+                self.stack.remove(tag)
+                self.stack.reverse()
+            except ValueError:
+                self.stack.reverse()
+
+    def handle_data(self, data: str) -> None:
+        if self.skip_depth:
+            return
+        cleaned = re.sub(r"\s+", " ", data)
+        if not cleaned:
+            return
+        kind = self._kind_for_stack()
+        if self._kind is not None and kind is not self._kind:
+            self._flush()
+        self._kind = kind
+        self._buffer.append(cleaned)
+
+
 def source_evidence_document_from_html(
     parsed_text: str,
     decoded_html: str,
 ) -> SourceEvidenceDocument:
     """Add the minimal safe HTML view needed after a demonstrated text loss."""
     parser = _SafeHtmlEvidenceParser()
+    structured = _StructuredEvidenceParser()
     try:
         parser.feed(decoded_html)
         parser.close()
+        structured.feed(decoded_html)
+        structured.close()
     except Exception:
         return SourceEvidenceDocument(parsed_text=parsed_text)
+    spans = tuple(structured.spans)
+    if not spans and parsed_text:
+        spans = (SourceEvidenceSpan(SourceEvidenceSpanKind.BODY_TEXT, parsed_text),)
     return SourceEvidenceDocument(
         parsed_text=parsed_text,
         decoded_source_view=parser.text,
         has_unverifiable_visuals=parser.has_unverifiable_visuals,
+        spans=spans,
     )
 
 
@@ -441,6 +603,53 @@ def _artifact_is_proven(artifact: Q2ArtifactProposal, source: str) -> bool:
     if artifact_type is ArtifactType.URL:
         return _contains_url(source, candidate)
     return _contains_bounded(source, candidate, _continuation_for(artifact_type))
+
+
+def source_evidence_context_for_artifact(
+    artifact: Q2ArtifactProposal,
+    source_text: str | SourceEvidenceDocument,
+) -> tuple[SourceEvidenceSpan, ...]:
+    """Return structural spans that can explain a source-gated artifact.
+
+    This is intentionally a locator, not a second verifier: callers must use
+    ``verify_*_output_against_source`` for the decision.  Visual spans are
+    never returned as a located match or used as proof of an IOC.
+    """
+    document = (
+        source_text
+        if isinstance(source_text, SourceEvidenceDocument)
+        else SourceEvidenceDocument(parsed_text=source_text)
+    )
+    matches: list[SourceEvidenceSpan] = []
+    for span in document.spans:
+        if span.kind is SourceEvidenceSpanKind.VISUAL_UNLOCATED or not span.text:
+            continue
+        comparison = _artifact_comparison_view(span.text)
+        if _artifact_is_proven(artifact, comparison) or _artifact_is_proven(
+            artifact, _artifact_unwrapped_view(comparison)
+        ):
+            matches.append(span)
+    return tuple(matches)
+
+
+def source_evidence_context_for_rule(
+    rule: Q2RuleProposal,
+    source_text: str | SourceEvidenceDocument,
+) -> tuple[SourceEvidenceSpan, ...]:
+    """Return structural spans containing the exact rule gate view."""
+    document = (
+        source_text
+        if isinstance(source_text, SourceEvidenceDocument)
+        else SourceEvidenceDocument(parsed_text=source_text)
+    )
+    candidate = _rule_whitespace_view(rule.body)
+    if not candidate:
+        return ()
+    return tuple(
+        span
+        for span in document.spans
+        if span.text and candidate in _rule_whitespace_view(span.text)
+    )
 
 
 def _continuation_for(artifact_type: ArtifactType) -> str:

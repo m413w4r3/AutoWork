@@ -9,6 +9,8 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.application.production_source_evidence import (
     SOURCE_EVIDENCE_VERSION,
+    SourceEvidenceSpanKind,
+    source_evidence_context_for_artifact,
     source_evidence_document_from_html,
     verify_ioc_rules_output_against_source,
     verify_q2_output_against_source,
@@ -102,6 +104,52 @@ def test_html_image_without_text_has_a_distinct_non_text_diagnostic() -> None:
 
     assert result.output.artifacts == []
     assert result.rejections[0].reason_code == "source_evidence_not_text_verifiable"
+
+
+def test_structured_evidence_context_locates_table_list_code_and_link_text() -> None:
+    html = """
+    <article>
+      <p>Body mentions body.example.</p>
+      <table><tr><td>table.example</td></tr></table>
+      <ul><li>list.example</li></ul>
+      <pre>code.example</pre>
+      <a href="https://linked.invalid">link.example</a>
+      <img src="screenshot.png">
+    </article>
+    """
+    document = source_evidence_document_from_html("", html)
+
+    kinds = {span.kind for span in document.spans}
+    assert {
+        SourceEvidenceSpanKind.BODY_TEXT,
+        SourceEvidenceSpanKind.TABLE,
+        SourceEvidenceSpanKind.LIST,
+        SourceEvidenceSpanKind.CODE_BLOCK,
+        SourceEvidenceSpanKind.LINK_TEXT,
+        SourceEvidenceSpanKind.VISUAL_UNLOCATED,
+    } <= kinds
+    located = source_evidence_context_for_artifact(
+        _artifact("table.example", "domain"), document
+    )
+    assert [span.kind for span in located] == [SourceEvidenceSpanKind.TABLE]
+    assert all(span.kind is not SourceEvidenceSpanKind.VISUAL_UNLOCATED for span in located)
+
+
+def test_visual_unlocated_never_proves_an_ioc_or_claims_image_localization() -> None:
+    document = source_evidence_document_from_html(
+        "",
+        '<img src="screenshot.png"><p>No IOC in text.</p>',
+    )
+    result = verify_ioc_rules_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact("from-image.example", "domain")]),
+        document,
+    )
+
+    assert result.output.artifacts == []
+    assert source_evidence_context_for_artifact(
+        _artifact("from-image.example", "domain"), document
+    ) == ()
+    assert any(span.kind is SourceEvidenceSpanKind.VISUAL_UNLOCATED for span in document.spans)
 
 
 def test_ioc_present_only_in_another_source_is_rejected() -> None:
