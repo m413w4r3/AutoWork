@@ -416,6 +416,7 @@ def _production_repair_materialization_service(
             projection_service=_production_repair_projection_service(request),
             checkpoint_service=getattr(request.app.state, "production_checkpoint", None),
             artifact_store=getattr(request.app.state, "production_artifact_store", None),
+            diagnostics=getattr(request.app.state, "production_diagnostics", None),
         )
     return cast(ProductionRepairMaterializationService, service)
 
@@ -1627,6 +1628,7 @@ async def apply_subject_production_repairs(
         "unresolved_count": result.projection.unresolved_count,
         "recommended_retry_stage": result.retry_stage,
         "resumed": False,
+        "repair_materialization": result.repair_materialization,
     }
     if (
         (payload or ApplyProductionRepairsRequest()).resume

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import Any, cast
 from uuid import UUID
 
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_artifact_verification import (
@@ -70,6 +73,7 @@ from cti_app.domain.production import (
 from cti_app.domain.publication import ArtifactType, is_publication_ioc_artifact_type
 
 REPAIR_EVIDENCE_SCHEMA_VERSION = "1"
+REPAIR_PLANNER_VERSION = "33.1"
 MAX_REPAIR_PREVIEW_CHARS = 512
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -1834,6 +1838,48 @@ class ProductionRepairProjectionResult:
     # INCLUDE decisions the deterministic pipeline cannot rebuild. Recorded,
     # never fatal: the append-only log would otherwise freeze the article.
     unbuildable_repair_keys: tuple[str, ...] = ()
+    decision_ids: tuple[str, ...] = ()
+    reused_synthesis_artifact_id: UUID | None = None
+
+
+def _repair_materialization_metadata(
+    *,
+    impact: ProductionRepairImpact,
+    decision_ids: Sequence[str],
+    base_extraction_artifact_id: UUID,
+    result_extraction_artifact_id: UUID | None = None,
+    reused_synthesis_artifact_id: UUID | None = None,
+    result_publication_artifact_id: UUID | None = None,
+) -> dict[str, Any]:
+    """Return the stable audit explanation for one repair materialization.
+
+    This is intentionally metadata, not a mutable status record.  The
+    artifact that receives it is immutable; later output versions carry their
+    own copy with the IDs that were not known when the extraction was stored.
+    """
+    return {
+        "planner_version": REPAIR_PLANNER_VERSION,
+        "impact_kind": impact.kind.value,
+        "affected_outputs": sorted(output.value for output in impact.affected_outputs),
+        "model_call_required": impact.model_call_required,
+        "decision_ids": sorted(set(decision_ids)),
+        "base_extraction_artifact_id": str(base_extraction_artifact_id),
+        "result_extraction_artifact_id": (
+            str(result_extraction_artifact_id)
+            if result_extraction_artifact_id is not None
+            else None
+        ),
+        "reused_synthesis_artifact_id": (
+            str(reused_synthesis_artifact_id)
+            if reused_synthesis_artifact_id is not None
+            else None
+        ),
+        "result_publication_artifact_id": (
+            str(result_publication_artifact_id)
+            if result_publication_artifact_id is not None
+            else None
+        ),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -2016,6 +2062,7 @@ class ProductionRepairProjectionService:
             "new_synthesis": None,
             "previous_publication": None,
             "new_publication": None,
+            "synthesis_artifact_id": None,
         }
         if self._artifact_store is None:
             return hashes
@@ -2073,6 +2120,7 @@ class ProductionRepairProjectionService:
         )
         if synthesis is None or synthesis.rendered_blob_id is None:
             return hashes
+        hashes["synthesis_artifact_id"] = str(synthesis.id)
         try:
             synthesis_text = await self._artifact_store.read_text(synthesis.rendered_blob_id)
         except Exception:
@@ -2255,6 +2303,26 @@ class ProductionRepairProjectionService:
                 previous_rule_bundle_hash=str(projection_hashes["previous_rule_bundle"]),
                 new_rule_bundle_hash=str(projection_hashes["new_rule_bundle"]),
             )
+            decision_ids = tuple(
+                sorted(
+                    {
+                        str(entry["decision_id"])
+                        for entry in (
+                            *projection.applied_decisions,
+                            *projection.unbuildable_decisions,
+                        )
+                        if entry.get("decision_id")
+                    }
+                )
+            )
+            reused_synthesis_artifact_id: UUID | None = None
+            if projection_hashes.get("synthesis_artifact_id") is not None and (
+                projection_hashes["previous_synthesis"]
+                == projection_hashes["new_synthesis"]
+            ):
+                reused_synthesis_artifact_id = UUID(
+                    str(projection_hashes["synthesis_artifact_id"])
+                )
 
             # An unbuildable INCLUDE changes nothing in the content, but the
             # article owes the record that it was honoured and not applied.
@@ -2288,6 +2356,8 @@ class ProductionRepairProjectionService:
                     excluded_repair_keys=projection.excluded_repair_keys,
                     unresolved_repair_keys=projection.unresolved_repair_keys,
                     unbuildable_repair_keys=projection.unbuildable_repair_keys,
+                    decision_ids=decision_ids,
+                    reused_synthesis_artifact_id=reused_synthesis_artifact_id,
                 )
 
             effective_for_base = [
@@ -2350,6 +2420,12 @@ class ProductionRepairProjectionService:
                 "repair_projection": projection_metadata,
                 "projection_diagnostics_basis": "base_extraction",
             }
+            metadata["repair_materialization"] = _repair_materialization_metadata(
+                impact=impact,
+                decision_ids=decision_ids,
+                base_extraction_artifact_id=base.id,
+                reused_synthesis_artifact_id=reused_synthesis_artifact_id,
+            )
             if isinstance(base_metadata.get("repair_evidence"), dict):
                 metadata["repair_evidence"] = dict(base_metadata["repair_evidence"])
 
@@ -2379,6 +2455,8 @@ class ProductionRepairProjectionService:
                 excluded_repair_keys=projection.excluded_repair_keys,
                 unresolved_repair_keys=projection.unresolved_repair_keys,
                 unbuildable_repair_keys=projection.unbuildable_repair_keys,
+                decision_ids=decision_ids,
+                reused_synthesis_artifact_id=reused_synthesis_artifact_id,
             )
 
 
@@ -2524,6 +2602,28 @@ async def reconcile_effective_repairs_in_uow(
     )
     canonical_json = technical_extraction_to_json(projected.extraction)
     base_metadata = dict(getattr(base_extraction_artifact, "metadata", {}) or {})
+    replay_impact = _impact_from_projection_hashes(
+        base,
+        projected.extraction,
+        previous_synthesis_projection_hash=None,
+        new_synthesis_projection_hash=None,
+        previous_publication_projection_hash=None,
+        new_publication_projection_hash=None,
+        previous_rule_bundle_hash=rule_bundle_projection_hash(base),
+        new_rule_bundle_hash=rule_bundle_projection_hash(projected.extraction),
+    )
+    replay_decision_ids = tuple(
+        sorted(
+            {
+                str(entry["decision_id"])
+                for entry in (
+                    *projected.applied_decisions,
+                    *projected.unbuildable_decisions,
+                )
+                if entry.get("decision_id")
+            }
+        )
+    )
     projection_metadata = {
         "version": "1",
         "base_extraction_artifact_id": str(base_extraction_artifact.id),
@@ -2565,6 +2665,11 @@ async def reconcile_effective_repairs_in_uow(
         "applied_decisions": list(projected.applied_decisions),
         "replay_origin": "post_q2_reconciliation",
         "projection_diagnostics_basis": "base_extraction",
+        "repair_materialization": _repair_materialization_metadata(
+            impact=replay_impact,
+            decision_ids=replay_decision_ids,
+            base_extraction_artifact_id=base_extraction_artifact.id,
+        ),
     }
     if isinstance(base_metadata.get("repair_evidence"), dict):
         metadata["repair_evidence"] = dict(base_metadata["repair_evidence"])
@@ -2590,6 +2695,7 @@ class ProductionRepairMaterializationResult:
     full_chain: bool = False
     publication_artifact: ProductionArtifact | None = None
     qa: dict[str, Any] | None = None
+    repair_materialization: dict[str, Any] | None = None
 
     @property
     def artifact(self) -> ProductionArtifact:
@@ -2615,6 +2721,7 @@ class ProductionRepairMaterializationService:
         qa_service: ProductionQAService | None = None,
         checkpoint_service: Any | None = None,
         artifact_store: ProductionArtifactStore | None = None,
+        diagnostics: DiagnosticsLog | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._projection = projection_service or ProductionRepairProjectionService(
@@ -2627,6 +2734,7 @@ class ProductionRepairMaterializationService:
         )
         self._qa = qa_service or ProductionQAService(uow_factory)
         self._checkpoint = checkpoint_service
+        self._diagnostics = diagnostics or DiagnosticsLog(None)
 
     async def apply(
         self,
@@ -2637,6 +2745,7 @@ class ProductionRepairMaterializationService:
         observed_run_id: UUID | None = None,
         observed_pipeline_generation: int | None = None,
     ) -> ProductionRepairMaterializationResult:
+        started = perf_counter()
         actor_id = actor_id.strip()
         if not actor_id:
             raise ProductionRepairProjectionError("production_repair_actor_required")
@@ -2648,10 +2757,46 @@ class ProductionRepairMaterializationService:
             observed_pipeline_generation=observed_pipeline_generation,
         )
         projection = await self._projection.project_effective_extraction(run.id, actor_id=actor_id)
+        base_artifact_id_value: Any = projection.artifact.id
+        projection_audit = (
+            projection.artifact.metadata.get("repair_materialization")
+            if isinstance(projection.artifact.metadata, dict)
+            else None
+        )
+        if isinstance(projection_audit, dict):
+            base_artifact_id_value = projection_audit.get(
+                "base_extraction_artifact_id", base_artifact_id_value
+            )
+        try:
+            base_artifact_id = UUID(str(base_artifact_id_value))
+        except (TypeError, ValueError):
+            base_artifact_id = projection.artifact.id
+        repair_audit = _repair_materialization_metadata(
+            impact=projection.impact,
+            decision_ids=projection.decision_ids,
+            base_extraction_artifact_id=base_artifact_id,
+            result_extraction_artifact_id=projection.artifact.id,
+            reused_synthesis_artifact_id=projection.reused_synthesis_artifact_id,
+        )
+        self._record_repair_diagnostic(
+            event="production.repair.plan",
+            run=run,
+            projection=projection,
+            started=started,
+            reused_synthesis=projection.reused_synthesis_artifact_id is not None,
+        )
+        self._record_repair_diagnostic(
+            event="production.repair.projection_completed",
+            run=run,
+            projection=projection,
+            started=started,
+            reused_synthesis=projection.reused_synthesis_artifact_id is not None,
+        )
         if projection.unresolved_count:
             return ProductionRepairMaterializationResult(
                 projection=projection,
                 action="awaiting_repair_decision",
+                repair_materialization=repair_audit,
             )
 
         impact = projection.impact
@@ -2659,14 +2804,26 @@ class ProductionRepairMaterializationService:
             not projection.changed
             or impact.kind is ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE
         ):
-            return ProductionRepairMaterializationResult(projection=projection, action="none")
+            return ProductionRepairMaterializationResult(
+                projection=projection,
+                action="none",
+                repair_materialization=repair_audit,
+            )
 
         if impact.kind is ProductionRepairImpactKind.SOURCE_CORPUS:
+            self._record_repair_diagnostic(
+                event="production.repair.model_retry_requested",
+                run=run,
+                projection=projection,
+                started=started,
+                reused_synthesis=False,
+            )
             return ProductionRepairMaterializationResult(
                 projection=projection,
                 action="retry_required",
                 retry_stage=SubjectProductionStage.REFERENCES.value,
                 full_chain=True,
+                repair_materialization=repair_audit,
             )
 
         publication: ProductionArtifact | None = None
@@ -2678,8 +2835,18 @@ class ProductionRepairMaterializationService:
                 run_id=run.id,
                 pipeline_generation=run.pipeline_generation,
                 extraction=projection.artifact,
+                repair_materialization=repair_audit,
             )
             action = "publication_reassembled"
+            if publication is not None:
+                repair_audit["result_publication_artifact_id"] = str(publication.id)
+            self._record_repair_diagnostic(
+                event="production.repair.publication_reassembled",
+                run=run,
+                projection=projection,
+                started=started,
+                reused_synthesis=True,
+            )
         elif impact.kind is ProductionRepairImpactKind.RULE_BUNDLE_ONLY:
             qa_result = await self._materialize_rules_and_qa(
                 edition_id=edition_id,
@@ -2689,6 +2856,13 @@ class ProductionRepairMaterializationService:
                 extraction=projection.artifact,
             )
             action = "rules_materialized"
+            self._record_repair_diagnostic(
+                event="production.repair.rule_bundle_materialized",
+                run=run,
+                projection=projection,
+                started=started,
+                reused_synthesis=True,
+            )
         else:
             await self._stale_narrative(
                 edition_id=edition_id,
@@ -2696,10 +2870,18 @@ class ProductionRepairMaterializationService:
                 run_id=run.id,
                 pipeline_generation=run.pipeline_generation,
             )
+            self._record_repair_diagnostic(
+                event="production.repair.model_retry_requested",
+                run=run,
+                projection=projection,
+                started=started,
+                reused_synthesis=False,
+            )
             return ProductionRepairMaterializationResult(
                 projection=projection,
                 action="retry_required",
                 retry_stage=SubjectProductionStage.SYNTHESIS.value,
+                repair_materialization=repair_audit,
             )
 
         if self._checkpoint is not None:
@@ -2709,6 +2891,31 @@ class ProductionRepairMaterializationService:
             action=action,
             publication_artifact=publication,
             qa=qa_result,
+            repair_materialization=repair_audit,
+        )
+
+    def _record_repair_diagnostic(
+        self,
+        *,
+        event: str,
+        run: Any,
+        projection: ProductionRepairProjectionResult,
+        started: float,
+        reused_synthesis: bool,
+    ) -> None:
+        self._diagnostics.record(
+            event=event,
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage="repair",
+            impact_kind=projection.impact.kind.value,
+            decision_count=len(projection.decision_ids),
+            affected_outputs=sorted(
+                output.value for output in projection.impact.affected_outputs
+            ),
+            model_call_required=projection.impact.model_call_required,
+            reused_synthesis=reused_synthesis,
+            duration_ms=max(0, round((perf_counter() - started) * 1000)),
         )
 
     async def _fenced_run(
@@ -2785,6 +2992,7 @@ class ProductionRepairMaterializationService:
         run_id: UUID,
         pipeline_generation: int,
         extraction: ProductionArtifact,
+        repair_materialization: Mapping[str, Any] | None = None,
     ) -> tuple[ProductionArtifact, dict[str, Any] | None]:
         async with self._uow_factory() as uow:
             await self._lock_edition_and_check(uow, edition_id)
@@ -2808,6 +3016,24 @@ class ProductionRepairMaterializationService:
                     uow, run_id, {ProductionArtifactStage.PUBLICATION.value}
                 )
             title = await self._subject_title(uow, run_id, subject_id)
+            assembly_kwargs: dict[str, Any] = (
+                {"metadata_extra": {"repair_materialization": dict(repair_materialization)}}
+                if repair_materialization is not None
+                else {}
+            )
+            try:
+                parameters: Mapping[str, inspect.Parameter]
+                parameters = inspect.signature(
+                    self._assembly.assemble_publication_in_uow
+                ).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            accepts_metadata = "metadata_extra" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            if not accepts_metadata:
+                assembly_kwargs = {}
             new_publication = await self._assembly.assemble_publication_in_uow(
                 uow,
                 run_id,
@@ -2816,6 +3042,7 @@ class ProductionRepairMaterializationService:
                 references,
                 extraction,
                 synthesis,
+                **assembly_kwargs,
             )
             qa_result = await self._run_qa(
                 uow,

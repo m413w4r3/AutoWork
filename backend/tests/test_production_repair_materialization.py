@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
 
+from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.production_parsers import ReferenceReport, TechnicalExtraction
 from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
@@ -232,6 +234,7 @@ def _service(
     kind: ProductionRepairImpactKind,
     *,
     edition_status: EditionStatus = EditionStatus.REVIEW,
+    diagnostics: DiagnosticsLog | None = None,
 ) -> tuple[ProductionRepairMaterializationService, _Uow, _Projection, _Assembly, _QA, _Checkpoint]:
     uow = _Uow(edition_status)
     projection = _Projection(
@@ -251,6 +254,7 @@ def _service(
         qa_service=qa,  # type: ignore[arg-type]
         checkpoint_service=checkpoint,
         artifact_store=object(),  # make QA path execute
+        diagnostics=diagnostics,
     )
     return service, uow, projection, assembly, qa, checkpoint
 
@@ -333,3 +337,34 @@ async def test_materialization_refuses_a_frozen_edition() -> None:
     with pytest.raises(ProductionRepairProjectionError, match="edition_frozen_for_publication"):
         await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
     assert projection.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_materialization_diagnostics_are_structured_and_value_free(tmp_path) -> None:
+    diagnostics = DiagnosticsLog.from_env(tmp_path / "diagnostics")
+    service, _uow, _projection, _assembly, _qa, _checkpoint = _service(
+        ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
+        diagnostics=diagnostics,
+    )
+
+    await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "diagnostics" / "events.jsonl").read_text().splitlines()
+    ]
+    names = {event["event"] for event in events}
+    assert {
+        "production.repair.plan",
+        "production.repair.projection_completed",
+        "production.repair.rule_bundle_materialized",
+    } <= names
+    for event in events:
+        if event["event"].startswith("production.repair."):
+            assert event["run_id"] == str(RUN_ID)
+            assert event["subject_id"] == str(SUBJECT_ID)
+            assert event["impact_kind"] == ProductionRepairImpactKind.RULE_BUNDLE_ONLY.value
+            assert event["affected_outputs"]
+            assert isinstance(event["model_call_required"], bool)
+            assert isinstance(event["reused_synthesis"], bool)
+            assert isinstance(event["duration_ms"], int)

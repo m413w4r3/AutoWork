@@ -321,6 +321,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         projection_service=app.state.production_repair_projection_service,
         checkpoint_service=production_checkpoint,
         artifact_store=production_artifact_store,
+        diagnostics=production_diagnostics,
     )
     app.state.production_repair_adjudication_service = ProductionRepairAdjudicationService(
         uow_factory,

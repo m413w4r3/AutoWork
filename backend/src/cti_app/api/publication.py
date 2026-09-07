@@ -829,6 +829,7 @@ def _repair_materialization_service(request: Request) -> ProductionRepairMateria
         projection_service=_repair_projection_service(request),
         checkpoint_service=getattr(request.app.state, "production_checkpoint", None),
         artifact_store=getattr(request.app.state, "production_artifact_store", None),
+        diagnostics=getattr(request.app.state, "production_diagnostics", None),
     )
 
 
@@ -1018,6 +1019,7 @@ async def rebuild_edition_review_item(
                     "batch_id": str(batch_id) if batch_id else None,
                     "changed": False,
                     "job_id": None,
+                    "repair_materialization": materialization.repair_materialization,
                 }
             if (
                 projection.impact.kind is ProductionRepairImpactKind.NARRATIVE
@@ -1036,6 +1038,7 @@ async def rebuild_edition_review_item(
                     "batch_id": retry.get("batch_id"),
                     "changed": projection.changed,
                     "job_id": retry.get("job_id"),
+                    "repair_materialization": materialization.repair_materialization,
                 }
             return {
                 "action": materialization.action,
@@ -1044,6 +1047,7 @@ async def rebuild_edition_review_item(
                 "batch_id": str(batch_id) if batch_id else None,
                 "changed": projection.changed,
                 "job_id": None,
+                "repair_materialization": materialization.repair_materialization,
             }
 
         references = current.get(ProductionArtifactStage.REFERENCES.value)

@@ -12,6 +12,8 @@ from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateService,
     ProductionStateSnapshotV1,
+    ProductionStateSnapshotV3,
+    _exported_repair_block,
     _validate_snapshot,
     compute_production_state_checksum,
 )
@@ -156,6 +158,62 @@ async def test_import_without_batch_item_succeeds() -> None:
     assert result.status == "needs_review"
     uow.edition_production_batch_items.get_by_run.assert_awaited_once()
     uow.edition_production_batch_items.save.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_import_round_trip_preserves_repair_audit_without_regeneration() -> None:
+    payload = _payload()
+    payload["schema_version"] = 3
+    payload["origin"] = {
+        "subject_title": "Titre original",
+        "research_date": "2026-08-26",
+    }
+    decision_id = str(uuid4())
+    base_id = str(uuid4())
+    materialization = {
+        "planner_version": "33.1",
+        "impact_kind": "publication_only",
+        "affected_outputs": ["extraction", "publication", "checkpoint"],
+        "model_call_required": False,
+        "decision_ids": [decision_id],
+        "base_extraction_artifact_id": base_id,
+        "result_extraction_artifact_id": str(uuid4()),
+        "reused_synthesis_artifact_id": str(uuid4()),
+        "result_publication_artifact_id": str(uuid4()),
+    }
+    payload["repair"] = {
+        "projection_version": "33.1",
+        "base_extraction_artifact_id": base_id,
+        "included_repair_keys": ["d" * 64],
+        "decisions": [
+            {
+                "repair_key": "d" * 64,
+                "decision_id": decision_id,
+                "issue_kind": "rejected_indicator",
+                "action": "include",
+                "actor_id": "analyst",
+                "decided_at": "2026-08-26T15:00:00Z",
+                "reason": "validated",
+            }
+        ],
+        "materialization": materialization,
+    }
+    payload["content_sha256"] = compute_production_state_checksum(
+        ProductionStateSnapshotV3.model_validate(payload)
+    )
+    service, uow, subject_id, edition_id = _import_service(None)
+
+    await service.import_state(subject_id=subject_id, edition_id=edition_id, payload=payload)
+
+    extraction = uow.production_artifacts.append.await_args_list[1].args[0]
+    imported_audit = extraction.metadata["imported_repair_audit"]
+    assert imported_audit["decisions"][0]["decision_id"] == decision_id
+    assert extraction.metadata["repair_materialization"] == materialization
+
+    exported = _exported_repair_block(extraction.metadata, {})
+    assert exported is not None
+    assert exported.materialization == materialization
+    assert exported.decisions[0].decision_id == decision_id
 
 
 def test_checksum_tool_repairs_edited_snapshot() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -293,6 +294,13 @@ class ExtractionService(_ArtifactPayloadMixin):
             conversation_turn_id=None,
             metadata=dict(metadata),
         )
+        # The extraction row is immutable once appended.  Fill its own audit
+        # identity before the insert instead of updating it afterwards.
+        repair_materialization = artifact.metadata.get("repair_materialization")
+        if isinstance(repair_materialization, dict):
+            repair_materialization = dict(repair_materialization)
+            repair_materialization["result_extraction_artifact_id"] = str(artifact.id)
+            artifact.metadata["repair_materialization"] = repair_materialization
         # A repair projection is an analyst-level derivative.  Its semantic
         # impact is decided by ProductionRepairMaterializationService; a
         # linear downstream invalidation here would erase a still-valid
@@ -320,6 +328,7 @@ class SynthesisService(_ArtifactPayloadMixin):
         model_run_id: UUID | None = None,
         conversation_turn_id: UUID | None = None,
         diagnostics: dict[str, Any] | None = None,
+        metadata_extra: Mapping[str, Any] | None = None,
     ) -> ProductionArtifact:
         async with self._uow_factory() as uow:
             # Not get_current: a synthesis retry stales every prior synthesis
@@ -340,6 +349,14 @@ class SynthesisService(_ArtifactPayloadMixin):
             raw_id, _, rendered_id = await self._store_payloads(
                 raw=raw_result, rendered=markdown_content
             )
+            metadata = {
+                "word_count": word_count,
+                "reference_count": reference_count,
+                "diagnostics": diagnostics or {},
+                "generated_at": datetime.now(UTC).isoformat(),
+            }
+            if metadata_extra:
+                metadata.update(dict(metadata_extra))
             artifact = ProductionArtifact(
                 production_run_id=run_id,
                 subject_id=subject_id,
@@ -351,12 +368,7 @@ class SynthesisService(_ArtifactPayloadMixin):
                 rendered_blob_id=rendered_id,
                 model_run_id=model_run_id,
                 conversation_turn_id=conversation_turn_id,
-                metadata={
-                    "word_count": word_count,
-                    "reference_count": reference_count,
-                    "diagnostics": diagnostics or {},
-                    "generated_at": datetime.now(UTC).isoformat(),
-                },
+                metadata=metadata,
             )
             await uow.production_artifacts.append(artifact)
 
@@ -366,6 +378,66 @@ class SynthesisService(_ArtifactPayloadMixin):
 
             await uow.commit()
             return artifact
+
+    async def reuse_synthesis_result_in_uow(
+        self,
+        uow: Any,
+        *,
+        run_id: UUID,
+        subject_id: UUID,
+        source_artifact: ProductionArtifact,
+        semantic_projection_hash: str,
+        metadata_extra: Mapping[str, Any] | None = None,
+    ) -> ProductionArtifact:
+        """Append a current Q4 version backed by a valid historical draft.
+
+        Compatibility reuse never changes the historical row or its input
+        hash.  The new row points at the old rendered blob and records the
+        compatibility basis so a later audit can distinguish it from a model
+        generation.
+        """
+        if source_artifact.rendered_blob_id is None:
+            raise ValueError("Historical synthesis artifact has no rendered payload")
+        existing = await uow.production_artifacts.list_for_run(run_id)
+        prior_versions = [
+            artifact.version
+            for artifact in existing
+            if artifact.stage is ProductionArtifactStage.SYNTHESIS
+        ]
+        metadata = dict(source_artifact.metadata)
+        metadata.update(
+            {
+                "reused": True,
+                "reused_from_artifact_id": str(source_artifact.id),
+                "reuse_basis": "semantic_projection_compatibility",
+                "semantic_projection_hash": semantic_projection_hash,
+                "historical_input_hash": source_artifact.input_hash,
+                "generated_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        if metadata_extra:
+            metadata.update(dict(metadata_extra))
+        artifact = ProductionArtifact(
+            production_run_id=run_id,
+            subject_id=subject_id,
+            stage=ProductionArtifactStage.SYNTHESIS,
+            version=max(prior_versions, default=0) + 1,
+            # Preserve the historical identity.  It is an old valid input
+            # hash, not a rewritten claim about the new semantic projection.
+            input_hash=source_artifact.input_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            raw_blob_id=source_artifact.raw_blob_id,
+            rendered_blob_id=source_artifact.rendered_blob_id,
+            model_run_id=source_artifact.model_run_id,
+            conversation_turn_id=source_artifact.conversation_turn_id,
+            reused_from_artifact_id=source_artifact.id,
+            metadata=metadata,
+        )
+        await uow.production_artifacts.append(artifact)
+        await uow.production_artifacts.mark_downstream_stale(
+            run_id, ProductionArtifactStage.SYNTHESIS.value
+        )
+        return artifact
 
 
 class PublicationAssemblyService(_ArtifactPayloadMixin):
@@ -387,6 +459,7 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
         references_artifact: ProductionArtifact,
         extraction_artifact: ProductionArtifact,
         synthesis_artifact: ProductionArtifact,
+        metadata_extra: Mapping[str, Any] | None = None,
     ) -> ProductionArtifact:
         """Render the final publication from the stored artifacts.
 
@@ -406,6 +479,7 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
                 references_artifact=references_artifact,
                 extraction_artifact=extraction_artifact,
                 synthesis_artifact=synthesis_artifact,
+                metadata_extra=metadata_extra,
                 report=report,
                 extraction=extraction,
                 synthesis_text=synthesis_text,
@@ -422,6 +496,7 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
         references_artifact: ProductionArtifact,
         extraction_artifact: ProductionArtifact,
         synthesis_artifact: ProductionArtifact,
+        metadata_extra: Mapping[str, Any] | None = None,
     ) -> ProductionArtifact:
         """Assemble without committing, for a caller holding repair fences."""
         report, extraction, synthesis_text = await self._load_inputs(
@@ -435,6 +510,7 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
             references_artifact=references_artifact,
             extraction_artifact=extraction_artifact,
             synthesis_artifact=synthesis_artifact,
+            metadata_extra=metadata_extra,
             report=report,
             extraction=extraction,
             synthesis_text=synthesis_text,
@@ -450,6 +526,7 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
         references_artifact: ProductionArtifact,
         extraction_artifact: ProductionArtifact,
         synthesis_artifact: ProductionArtifact,
+        metadata_extra: Mapping[str, Any] | None = None,
         report: ReferenceReport,
         extraction: TechnicalExtraction,
         synthesis_text: str,
@@ -514,6 +591,14 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
                 "generated_at": datetime.now(UTC).isoformat(),
             },
         )
+        if metadata_extra:
+            extra = dict(metadata_extra)
+            repair_materialization = extra.get("repair_materialization")
+            if isinstance(repair_materialization, dict):
+                repair_materialization = dict(repair_materialization)
+                repair_materialization["result_publication_artifact_id"] = str(artifact.id)
+                extra["repair_materialization"] = repair_materialization
+            artifact.metadata.update(extra)
         await uow.production_artifacts.append(artifact)
         return artifact
 

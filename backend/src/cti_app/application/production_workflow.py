@@ -95,6 +95,7 @@ from cti_app.application.production_repairs import (
     build_repair_evidence_pack,
     reconcile_effective_repairs_in_uow,
     repair_key_for_rejection,
+    synthesis_projection_hash,
     synthesis_projection_payload,
 )
 from cti_app.application.production_source_evidence import (
@@ -125,7 +126,9 @@ from cti_app.domain.model_conversations import (
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
 from cti_app.domain.production import (
     ExtractionProfile,
+    ProductionArtifact,
     ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionInputSnapshot,
     ProductionRepairIssueKind,
     SubjectProductionRun,
@@ -1076,6 +1079,95 @@ class ProductionWorkflowOrchestrator:
                 else None
             ),
         }
+
+    async def _find_compatible_historical_synthesis(
+        self,
+        *,
+        uow: Any,
+        run: SubjectProductionRun,
+        report: ReferenceReport,
+        extraction_payload: Any,
+        source_tiers_by_url: dict[str, str],
+        semantic_projection_hash: str,
+    ) -> ProductionArtifact | None:
+        """Find an old valid Q4 draft whose semantic input is unchanged.
+
+        Older synthesis rows used a broader extraction identity and therefore
+        cannot match the current input hash.  They remain reusable when the
+        planner proves that the before/after semantic evidence projection is
+        identical.  The old row is never updated; the caller appends a new
+        current row pointing to its rendered blob.
+        """
+        if self._artifact_store is None:
+            return None
+        artifacts = await uow.production_artifacts.list_for_run(run.id)
+        candidates = sorted(
+            (
+                artifact
+                for artifact in artifacts
+                if artifact.stage is ProductionArtifactStage.SYNTHESIS
+                and artifact.rendered_blob_id is not None
+                and artifact.status
+                in {ProductionArtifactStatus.VERIFIED, ProductionArtifactStatus.STALE}
+            ),
+            key=lambda artifact: (artifact.created_at, str(artifact.id)),
+            reverse=True,
+        )
+        extraction_artifacts = sorted(
+            (
+                artifact
+                for artifact in artifacts
+                if artifact.stage is ProductionArtifactStage.EXTRACTION
+                and artifact.canonical_blob_id is not None
+                and artifact.status
+                in {ProductionArtifactStatus.VERIFIED, ProductionArtifactStatus.STALE}
+            ),
+            key=lambda artifact: (artifact.created_at, artifact.version),
+            reverse=True,
+        )
+        for candidate in candidates:
+            try:
+                candidate_text = await self._artifact_store.read_text(
+                    cast(UUID, candidate.rendered_blob_id)
+                )
+            except Exception:
+                continue
+            parsed = validate_synthesis(candidate_text, report, extraction_payload)
+            if not parsed.usable:
+                continue
+
+            metadata_hash = (
+                candidate.metadata.get("semantic_projection_hash")
+                if isinstance(candidate.metadata, dict)
+                else None
+            )
+            if metadata_hash is None and isinstance(candidate.metadata, dict):
+                diagnostics = candidate.metadata.get("diagnostics")
+                if isinstance(diagnostics, dict):
+                    metadata_hash = diagnostics.get("semantic_projection_hash")
+            if metadata_hash == semantic_projection_hash:
+                return cast(ProductionArtifact, candidate)
+
+            # Legacy rows have no semantic marker.  Compare the candidate to
+            # every extraction version that existed before it; this is the
+            # explicit BEFORE/AFTER compatibility check for historical hashes.
+            for historical_extraction in extraction_artifacts:
+                if historical_extraction.created_at > candidate.created_at:
+                    continue
+                try:
+                    historical = technical_extraction_from_json(
+                        await self._artifact_store.read_json(
+                            cast(UUID, historical_extraction.canonical_blob_id)
+                        )
+                    )
+                except Exception:
+                    continue
+                if (
+                    synthesis_projection_hash(report, historical, source_tiers_by_url)
+                    == semantic_projection_hash
+                ):
+                    return cast(ProductionArtifact, candidate)
+        return None
 
     async def _ask_with_format_repair(
         self,
@@ -3882,6 +3974,55 @@ class ProductionWorkflowOrchestrator:
             reused = await self._reuse_artifact(run, "synthesis", input_hash)
             if reused is not None:
                 return reused
+            compatible = await self._find_compatible_historical_synthesis(
+                uow=uow,
+                run=run,
+                report=report,
+                extraction_payload=extraction_payload,
+                source_tiers_by_url=source_tiers_by_url,
+                semantic_projection_hash=semantic_synthesis_hash,
+            )
+            if compatible is not None:
+                repair_marker = (
+                    extraction.metadata.get("repair_materialization")
+                    if isinstance(extraction.metadata, dict)
+                    else None
+                )
+                repair_materialization = (
+                    dict(cast(dict[str, Any], repair_marker))
+                    if isinstance(repair_marker, dict)
+                    else None
+                )
+                if repair_materialization is not None:
+                    repair_materialization["reused_synthesis_artifact_id"] = str(compatible.id)
+                artifact = await self._synthesis.reuse_synthesis_result_in_uow(
+                    uow,
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    source_artifact=compatible,
+                    semantic_projection_hash=semantic_synthesis_hash,
+                    metadata_extra=(
+                        {
+                            "repair_materialization": repair_materialization,
+                            "semantic_projection_before": semantic_synthesis_hash,
+                            "semantic_projection_after": semantic_synthesis_hash,
+                        }
+                        if repair_materialization is not None
+                        else {
+                            "semantic_projection_before": semantic_synthesis_hash,
+                            "semantic_projection_after": semantic_synthesis_hash,
+                        }
+                    ),
+                )
+                await uow.commit()
+                return {
+                    "stage": "synthesis",
+                    "status": "reused",
+                    "artifact_id": str(artifact.id),
+                    "reused": True,
+                    "reused_from_artifact_id": str(compatible.id),
+                    "compatibility": "semantic_projection_unchanged",
+                }
             if not self._model_service:
                 return {
                     "stage": "synthesis",
@@ -3973,6 +4114,11 @@ class ProductionWorkflowOrchestrator:
                 citation_counts = {"core": 0, "supporting": 0, "unknown": 0}
                 for source_id in re.findall(r"\[S(\d+)\]", output_text):
                     citation_counts[source_tiers_by_id.get(f"S{source_id}", "unknown")] += 1
+                repair_marker = (
+                    extraction.metadata.get("repair_materialization")
+                    if isinstance(extraction.metadata, dict)
+                    else None
+                )
                 artifact = await self._synthesis.store_synthesis_result(
                     run_id=run.id,
                     subject_id=run.subject_id,
@@ -3984,7 +4130,13 @@ class ProductionWorkflowOrchestrator:
                         "core_citation_count": citation_counts["core"],
                         "supporting_citation_count": citation_counts["supporting"],
                         "unknown_citation_count": citation_counts["unknown"],
+                        "semantic_projection_hash": semantic_synthesis_hash,
                     },
+                    metadata_extra=(
+                        {"repair_materialization": dict(cast(dict[str, Any], repair_marker))}
+                        if isinstance(repair_marker, dict)
+                        else None
+                    ),
                 )
 
                 result = {
@@ -4008,6 +4160,7 @@ class ProductionWorkflowOrchestrator:
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
         """Deterministic: pure rendering from artifacts, no LLM call."""
+        started = time.perf_counter()
         await self._check_cancellation(run.id, context)
         async with self._uow_factory() as uow:
             references = await uow.production_artifacts.get_current(run.id, "references")
@@ -4020,6 +4173,17 @@ class ProductionWorkflowOrchestrator:
                     "status": "error",
                     "error": "Missing upstream artifacts",
                 }
+
+            repair_marker = None
+            for candidate in (synthesis, extraction):
+                candidate_marker = (
+                    candidate.metadata.get("repair_materialization")
+                    if isinstance(candidate.metadata, dict)
+                    else None
+                )
+                if isinstance(candidate_marker, dict):
+                    repair_marker = dict(candidate_marker)
+                    break
 
             subject_title, _ = await self._subject_context(uow, run.subject_id, snapshot)
             archived_urls = {
@@ -4034,7 +4198,32 @@ class ProductionWorkflowOrchestrator:
                 references_artifact=references,
                 extraction_artifact=extraction,
                 synthesis_artifact=synthesis,
+                metadata_extra=(
+                    {"repair_materialization": repair_marker}
+                    if repair_marker is not None
+                    else None
+                ),
             )
+
+            if repair_marker is not None:
+                decision_ids = repair_marker.get("decision_ids", ())
+                affected_outputs = repair_marker.get("affected_outputs", ())
+                self._diagnostics.record(
+                    event="production.repair.publication_reassembled",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="assembly",
+                    impact_kind=repair_marker.get("impact_kind", "unknown"),
+                    decision_count=len(decision_ids) if isinstance(decision_ids, list) else 0,
+                    affected_outputs=(
+                        sorted(str(output) for output in affected_outputs)
+                        if isinstance(affected_outputs, list)
+                        else []
+                    ),
+                    model_call_required=bool(repair_marker.get("model_call_required", False)),
+                    reused_synthesis=bool(repair_marker.get("reused_synthesis_artifact_id")),
+                    duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
+                )
 
             # QA reads the real payloads, not the counters.
             qa_inputs = await self._load_qa_inputs(references, extraction, synthesis, publication)

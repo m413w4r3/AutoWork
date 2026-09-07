@@ -132,6 +132,7 @@ class ProductionStateRepairDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     repair_key: str = Field(pattern=_HASH)
+    decision_id: str | None = None
     issue_kind: str = Field(min_length=1)
     action: str = Field(min_length=1)
     actor_id: str = Field(min_length=1)
@@ -158,6 +159,7 @@ class ProductionStateRepair(BaseModel):
     excluded_repair_keys: tuple[str, ...] = ()
     unresolved_repair_keys: tuple[str, ...] = ()
     decisions: tuple[ProductionStateRepairDecision, ...] = ()
+    materialization: dict[str, Any] | None = None
 
 
 class ProductionStateSnapshotV1(BaseModel):
@@ -349,10 +351,20 @@ def _snapshot_repair(snapshot: ProductionStateSnapshot) -> ProductionStateRepair
 def _exported_repair_block(
     metadata: Mapping[str, Any] | None,
     decisions: Mapping[str, Any],
+    materialization: Mapping[str, Any] | None = None,
 ) -> ProductionStateRepair | None:
     """Describe the repair projection that produced the exported extraction."""
     marker = metadata.get("repair_projection") if isinstance(metadata, Mapping) else None
     if not isinstance(marker, Mapping):
+        # Imported states deliberately do not forge local projection markers:
+        # their original audit is still portable and must survive a second
+        # export unchanged.
+        imported = metadata.get("imported_repair_audit") if isinstance(metadata, Mapping) else None
+        if isinstance(imported, Mapping):
+            try:
+                return ProductionStateRepair.model_validate(imported)
+            except ValidationError:
+                return None
         return None
     base_id = marker.get("base_extraction_artifact_id")
     if not isinstance(base_id, str):
@@ -369,6 +381,7 @@ def _exported_repair_block(
     exported_decisions = tuple(
         ProductionStateRepairDecision(
             repair_key=str(decision.repair_key),
+            decision_id=str(decision.id),
             issue_kind=str(getattr(decision.issue_kind, "value", decision.issue_kind)),
             action=str(getattr(decision.action, "value", decision.action)),
             actor_id=str(decision.actor_id),
@@ -378,6 +391,17 @@ def _exported_repair_block(
         for _decision_id, decision in sorted(decisions.items())
     )
     actor_id = marker.get("actor_id")
+    marker_materialization = marker.get("repair_materialization")
+    merged_materialization: dict[str, Any] | None = (
+        dict(cast(Mapping[str, Any], marker_materialization))
+        if isinstance(marker_materialization, Mapping)
+        else None
+    )
+    if materialization is not None:
+        merged_materialization = {
+            **(merged_materialization or {}),
+            **dict(materialization),
+        }
     return ProductionStateRepair(
         projection_version=str(marker.get("version") or "1"),
         base_extraction_artifact_id=base_id,
@@ -386,6 +410,7 @@ def _exported_repair_block(
         excluded_repair_keys=_keys("excluded_repair_keys"),
         unresolved_repair_keys=_keys("unresolved_repair_keys"),
         decisions=exported_decisions,
+        materialization=merged_materialization,
     )
 
 
@@ -463,6 +488,7 @@ class ProductionStateService:
             refs = await uow.production_artifacts.get_current(run.id, "references")
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
             synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
+            publication = await uow.production_artifacts.get_current(run.id, "publication")
             # The current extraction already IS the effective projection; the
             # decisions travel with it so an import stays auditable, not only
             # byte-identical.
@@ -489,6 +515,13 @@ class ProductionStateService:
             raise ProductionStateError(
                 code="production_state_incomplete", message="Production artifact content is missing"
             )
+        repair_materialization: dict[str, Any] = {}
+        for artifact in (extraction, synthesis, publication):
+            if artifact is None:
+                continue
+            candidate = artifact.metadata.get("repair_materialization")
+            if isinstance(candidate, Mapping):
+                repair_materialization.update(dict(candidate))
         try:
             refs_content = await self._artifact_store.read_json(refs.canonical_blob_id)
             extraction_content = _portable_extraction_content(
@@ -507,7 +540,11 @@ class ProductionStateService:
             schema_version=PRODUCTION_STATE_SCHEMA_VERSION,
             exported_at=datetime.now(UTC),
             origin=origin,
-            repair=_exported_repair_block(extraction.metadata, repair_decisions),
+            repair=_exported_repair_block(
+                extraction.metadata,
+                repair_decisions,
+                repair_materialization or None,
+            ),
             artifacts=ProductionStateArtifacts(
                 references=ProductionStateReferences(
                     input_hash=refs.input_hash, canonical_content=refs_content
@@ -584,6 +621,11 @@ class ProductionStateService:
             **(
                 {"imported_repair_audit": repair_block.model_dump(mode="json")}
                 if repair_block is not None
+                else {}
+            ),
+            **(
+                {"repair_materialization": dict(repair_block.materialization)}
+                if repair_block is not None and repair_block.materialization is not None
                 else {}
             ),
         }
