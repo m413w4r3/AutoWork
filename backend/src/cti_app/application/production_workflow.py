@@ -89,9 +89,11 @@ from cti_app.application.production_q2_batch import (
     q2_batch_model_run_id,
 )
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
+from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
     SYNTHESIS_EVIDENCE_PACK_VERSION,
     build_repair_evidence_pack,
+    reconcile_effective_repairs_in_uow,
     repair_key_for_rejection,
     synthesis_projection_payload,
 )
@@ -841,6 +843,7 @@ class ProductionWorkflowOrchestrator:
         )
         self._model_service = model_service
         self._model_gateway = model_gateway or getattr(model_service, "_gateway", None)
+        self._repair_payloads = ProductionRepairPayloadResolver(self._model_gateway)
         self._collection_service = collection_service
         self._artifact_store = artifact_store
         self._diagnostics = diagnostics or DiagnosticsLog(None)
@@ -3720,11 +3723,56 @@ class ProductionWorkflowOrchestrator:
             repair_evidence_entry_count=len(repair_evidence_entries),
             repair_evidence_index=repair_evidence_index,
         )
+        # Q2 is now durable.  Replay the still-applicable Repair Desk
+        # decisions before the stage chain advances to SYNTHESIS.  This uses a
+        # fresh transaction because ExtractionService's historical persistence
+        # API commits its artifact, but it deliberately bypasses review fences:
+        # the workflow is allowed to reconcile a RUNNING run without changing
+        # its generation or opening another model turn.
+        effective_artifact_id: str | None = None
+        decisions_repository = getattr(uow, "production_repair_decisions", None)
+        decisions_getter = getattr(decisions_repository, "effective_decisions", None)
+        effective_decisions = (
+            tuple(
+                decision
+                for decision in await decisions_getter(run.edition_id, run.subject_id)
+                if getattr(decision.issue_kind, "value", decision.issue_kind)
+                in {"rejected_indicator", "rejected_rule"}
+            )
+            if callable(decisions_getter)
+            else ()
+        )
+        if (
+            self._artifact_store is not None
+            and getattr(artifact, "canonical_blob_id", None) is not None
+            and effective_decisions
+        ):
+            async with self._uow_factory() as replay_uow:
+                replay_run = await replay_uow.subject_production_runs.get(run.id)
+                if replay_run is None:
+                    replay_run = run
+                effective_artifact = await reconcile_effective_repairs_in_uow(
+                    replay_uow,
+                    run=replay_run,
+                    base_extraction_artifact=artifact,
+                    artifact_store=self._artifact_store,
+                    payload_resolver=getattr(
+                        self,
+                        "_repair_payloads",
+                        ProductionRepairPayloadResolver(getattr(self, "_model_gateway", None)),
+                    ),
+                )
+                if effective_artifact is not None:
+                    effective_artifact_id = str(effective_artifact.id)
+                commit = getattr(replay_uow, "commit", None)
+                if callable(commit):
+                    await commit()
         await self._persist_extraction_progress(run.id, progress)
         return {
             "stage": "extraction",
             "status": "success",
             "artifact_id": str(artifact.id),
+            "effective_artifact_id": effective_artifact_id,
             "items_count": len(extraction.items),
             "rules_count": len(extraction.rules),
             "supported_items": len(extraction.supported_items()),
@@ -3818,14 +3866,17 @@ class ProductionWorkflowOrchestrator:
             synthesis_pack = self._build_synthesis_evidence_pack(
                 report, extraction_payload, source_tiers_by_url
             )
+            # Q4 identity follows the semantic evidence pack.  Detection-rule
+            # repairs and publication-only IOC overrides are intentionally not
+            # part of that pack, so replaying them cannot manufacture a second
+            # synthesis call after a source-driven Q2.
+            semantic_synthesis_hash = compute_input_hash(synthesis_pack)
             input_hash = _synthesis_input_hash(
                 subject_id=run.subject_id,
                 references_hash=references.input_hash,
                 reference_report_hash=compute_input_hash(reference_report_to_json(report)),
-                extraction_hash=extraction.input_hash,
-                technical_extraction_hash=compute_input_hash(
-                    technical_extraction_to_json(extraction_payload)
-                ),
+                extraction_hash=semantic_synthesis_hash,
+                technical_extraction_hash=semantic_synthesis_hash,
                 synthesis_evidence_pack_hash=compute_input_hash(synthesis_pack),
             )
             reused = await self._reuse_artifact(run, "synthesis", input_hash)

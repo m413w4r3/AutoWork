@@ -47,7 +47,7 @@ from cti_app.application.production_stages import (
 )
 from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.discovery import canonicalize_http_url
-from cti_app.domain.editions import EditionStatus
+from cti_app.domain.editions import EditionAuditEvent, EditionStatus
 from cti_app.domain.production import (
     DetectionRule,
     DetectionRuleType,
@@ -1009,8 +1009,7 @@ def classify_repair_impact(
     action_is_include = action == ProductionRepairAction.INCLUDE.value
     action_is_exclude = action == ProductionRepairAction.EXCLUDE.value
     changes_projected_content = (
-        action_is_include
-        and not _include_is_already_effective(issue, decision)
+        action_is_include and not _include_is_already_effective(issue, decision)
     ) or (action_is_exclude and _exclude_revises_projected_content(issue, decision))
     if not changes_projected_content:
         return _repair_impact(
@@ -1606,8 +1605,7 @@ def _impact_from_projection_hashes(
     synthesis_changed = previous_synthesis != new_synthesis
 
     previous_publication = (
-        previous_publication_projection_hash
-        or _fallback_publication_projection_hash(previous)
+        previous_publication_projection_hash or _fallback_publication_projection_hash(previous)
     )
     new_publication = new_publication_projection_hash or _fallback_publication_projection_hash(
         projected
@@ -1622,9 +1620,7 @@ def _impact_from_projection_hashes(
     if rules_changed:
         affected.add(ProductionDerivedOutput.RULE_BUNDLE)
     if synthesis_changed:
-        affected.update(
-            {ProductionDerivedOutput.SYNTHESIS, ProductionDerivedOutput.PUBLICATION}
-        )
+        affected.update({ProductionDerivedOutput.SYNTHESIS, ProductionDerivedOutput.PUBLICATION})
         kind = ProductionRepairImpactKind.NARRATIVE
         reason = "The repair changes the evidence consumed by synthesis."
     elif publication_changed:
@@ -1671,6 +1667,153 @@ class ProductionRepairProjectionResult:
     # INCLUDE decisions the deterministic pipeline cannot rebuild. Recorded,
     # never fatal: the append-only log would otherwise freeze the article.
     unbuildable_repair_keys: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveExtractionProjection:
+    """Pure result of applying the still-active repair decisions to Q2."""
+
+    extraction: TechnicalExtraction
+    applied_decisions: tuple[dict[str, str], ...]
+    unbuildable_decisions: tuple[dict[str, str], ...]
+    included_repair_keys: tuple[str, ...]
+    excluded_repair_keys: tuple[str, ...]
+    unresolved_repair_keys: tuple[str, ...] = ()
+    accepted_indicator_count: int = 0
+    accepted_rule_count: int = 0
+    unbuildable_repair_keys: tuple[str, ...] = ()
+
+
+class EffectiveExtractionProjector:
+    """Apply repair decisions without locks, I/O or artifact persistence.
+
+    Callers must provide entries whose identity has already been derived from
+    persisted Q2 evidence.  This keeps source/edition identity resolution in
+    the application layer while ensuring the actual merge rules have one home.
+    """
+
+    def project(
+        self,
+        *,
+        base: TechnicalExtraction,
+        repair_entries: Sequence[Mapping[str, Any]],
+        effective_decisions: Sequence[ProductionRepairDecision],
+        resolved_payloads: Mapping[str, str],
+    ) -> EffectiveExtractionProjection:
+        decisions_by_key = {decision.repair_key: decision for decision in effective_decisions}
+        active_entries: list[tuple[str, ProductionRepairIssueKind, Mapping[str, Any], str]] = []
+        for entry in repair_entries:
+            repair_key = entry.get("repair_key")
+            value_sha256 = entry.get("value_sha256") or entry.get("value_hash")
+            kind_value = entry.get("kind") or (
+                ProductionRepairIssueKind.REJECTED_RULE.value
+                if entry.get("proposal_kind") == "rule"
+                else ProductionRepairIssueKind.REJECTED_INDICATOR.value
+            )
+            try:
+                kind = ProductionRepairIssueKind(str(kind_value))
+            except ValueError:
+                continue
+            if (
+                kind
+                not in {
+                    ProductionRepairIssueKind.REJECTED_INDICATOR,
+                    ProductionRepairIssueKind.REJECTED_RULE,
+                }
+                or not isinstance(repair_key, str)
+                or not isinstance(value_sha256, str)
+            ):
+                continue
+            active_entries.append((repair_key, kind, entry, value_sha256.casefold()))
+
+        items = list(base.items)
+        rules = list(base.rules)
+        included: list[str] = []
+        excluded: list[str] = []
+        unresolved: list[str] = []
+        unbuildable: list[str] = []
+        applied_decisions: list[dict[str, str]] = []
+        unbuildable_decisions: list[dict[str, str]] = []
+        accepted_indicator_count = 0
+        accepted_rule_count = 0
+        additions: list[ExtractionItem] = []
+        rule_additions: list[DetectionRule] = []
+
+        for repair_key, kind, entry, entry_hash in sorted(
+            active_entries, key=lambda value: (value[1].value, value[0])
+        ):
+            decision = decisions_by_key.get(repair_key)
+            if decision is None:
+                unresolved.append(repair_key)
+                continue
+            action = _enum_value(decision.action)
+            if action == ProductionRepairAction.EXCLUDE.value:
+                excluded.append(repair_key)
+                applied_decisions.append(
+                    {
+                        "repair_key": repair_key,
+                        "decision_id": str(decision.id),
+                        "action": ProductionRepairAction.EXCLUDE.value,
+                    }
+                )
+                continue
+            if action != ProductionRepairAction.INCLUDE.value:
+                unresolved.append(repair_key)
+                continue
+            value = resolved_payloads.get(repair_key)
+            if value is None:
+                raise ProductionRepairProjectionError("repair_payload_unavailable")
+            if _sha256(value) != entry_hash:
+                raise ProductionRepairProjectionError("repair_payload_hash_mismatch")
+            try:
+                if kind is ProductionRepairIssueKind.REJECTED_RULE:
+                    rule_additions.append(_build_override_rule(entry, value, repair_key))
+                    accepted_rule_count += 1
+                else:
+                    additions.append(_build_override_item(entry, value, repair_key))
+                    if is_publication_ioc_artifact_type(entry.get("artifact_type")):
+                        accepted_indicator_count += 1
+            except (KeyError, TypeError, ValueError):
+                unbuildable.append(repair_key)
+                unbuildable_decisions.append(
+                    {"repair_key": repair_key, "decision_id": str(decision.id)}
+                )
+                continue
+            included.append(repair_key)
+            applied_decisions.append(
+                {
+                    "repair_key": repair_key,
+                    "decision_id": str(decision.id),
+                    "action": ProductionRepairAction.INCLUDE.value,
+                }
+            )
+
+        return EffectiveExtractionProjection(
+            extraction=TechnicalExtraction(
+                # _merge_projection_items/_merge_projection_rules deliberately
+                # prefer SOURCE_VERIFIED objects over analyst overrides.
+                items=_merge_projection_items(items, additions),
+                uncertainties=base.uncertainties,
+                rules=_merge_projection_rules(rules, rule_additions),
+            ),
+            applied_decisions=tuple(
+                sorted(
+                    applied_decisions, key=lambda entry: (entry["repair_key"], entry["decision_id"])
+                )
+            ),
+            unbuildable_decisions=tuple(
+                sorted(
+                    unbuildable_decisions,
+                    key=lambda entry: (entry["repair_key"], entry["decision_id"]),
+                )
+            ),
+            included_repair_keys=tuple(sorted(included)),
+            excluded_repair_keys=tuple(sorted(excluded)),
+            unresolved_repair_keys=tuple(sorted(unresolved)),
+            accepted_indicator_count=accepted_indicator_count,
+            accepted_rule_count=accepted_rule_count,
+            unbuildable_repair_keys=tuple(sorted(unbuildable)),
+        )
 
 
 class ProductionRepairProjectionService:
@@ -1737,9 +1880,7 @@ class ProductionRepairProjectionService:
                 if getattr(source, "canonical_url", None)
             }
             source_tiers_by_url.update({url: "core" for url in core_urls})
-            source_tiers_by_url.update(
-                {url: "supporting" for url in relevant_urls - core_urls}
-            )
+            source_tiers_by_url.update({url: "supporting" for url in relevant_urls - core_urls})
         else:
             collections = getattr(uow, "source_collections", None)
             values = (
@@ -1758,9 +1899,7 @@ class ProductionRepairProjectionService:
         hashes["previous_synthesis"] = synthesis_projection_hash(
             report, previous, source_tiers_by_url
         )
-        hashes["new_synthesis"] = synthesis_projection_hash(
-            report, projected, source_tiers_by_url
-        )
+        hashes["new_synthesis"] = synthesis_projection_hash(report, projected, source_tiers_by_url)
 
         synthesis = await uow.production_artifacts.get_current(
             run.id, ProductionArtifactStage.SYNTHESIS.value
@@ -1774,9 +1913,7 @@ class ProductionRepairProjectionService:
         hashes["previous_publication"] = publication_projection_hash(
             report, previous, synthesis_text
         )
-        hashes["new_publication"] = publication_projection_hash(
-            report, projected, synthesis_text
-        )
+        hashes["new_publication"] = publication_projection_hash(report, projected, synthesis_text)
         return hashes
 
     async def project_effective_extraction(
@@ -1894,7 +2031,7 @@ class ProductionRepairProjectionService:
                 if (decision := decisions_by_key.get(repair_key)) is not None
                 and _enum_value(decision.action) == ProductionRepairAction.INCLUDE.value
             ]
-            resolved_payloads = dict(
+            resolved_payload_objects = dict(
                 zip(
                     (repair_key for repair_key, _entry, _hash in include_entries),
                     await self._payloads.resolve_many(
@@ -1908,85 +2045,27 @@ class ProductionRepairProjectionService:
                     strict=True,
                 )
             )
-
-            items = list(base_extraction.items)
-            rules = list(base_extraction.rules)
-            included: list[str] = []
-            excluded: list[str] = []
-            unresolved: list[str] = []
-            unbuildable: list[str] = []
-            # The honest record of what this projection really materializes.
-            applied_decisions: list[dict[str, str]] = []
-            unbuildable_decisions: list[dict[str, str]] = []
-            accepted_indicator_count = 0
-            accepted_rule_count = 0
-            additions: list[ExtractionItem] = []
-            rule_additions: list[DetectionRule] = []
-
-            for repair_key, kind, entry, _entry_hash in sorted(
-                active_entries, key=lambda value: (value[1].value, value[0])
-            ):
-                decision = decisions_by_key.get(repair_key)
-                if decision is None:
-                    unresolved.append(repair_key)
-                    continue
-                action = _enum_value(decision.action)
-                if action == ProductionRepairAction.EXCLUDE.value:
-                    excluded.append(repair_key)
-                    # An exclusion is materialized by this very projection: the
-                    # value is absent from it, whether or not a previous
-                    # projection had put it in.
-                    applied_decisions.append(
-                        {
-                            "repair_key": repair_key,
-                            "decision_id": str(decision.id),
-                            "action": ProductionRepairAction.EXCLUDE.value,
-                        }
-                    )
-                    continue
-                if action != ProductionRepairAction.INCLUDE.value:
-                    unresolved.append(repair_key)
-                    continue
-                payload = resolved_payloads.get(repair_key)
-                if payload is None or not payload.available or payload.value is None:
-                    raise ProductionRepairProjectionError("repair_payload_unavailable")
-                value = payload.value
-                # The hash is re-verified here, on the value this projection is
-                # about to write, not merely on the one the detail displayed.
-                if payload.value_sha256 != _sha256(value):
-                    raise ProductionRepairProjectionError("repair_payload_hash_mismatch")
-                try:
-                    if kind is ProductionRepairIssueKind.REJECTED_RULE:
-                        rule_additions.append(_build_override_rule(entry, value, repair_key))
-                        accepted_rule_count += 1
-                    else:
-                        additions.append(_build_override_item(entry, value, repair_key))
-                        if is_publication_ioc_artifact_type(entry.get("artifact_type")):
-                            accepted_indicator_count += 1
-                except (KeyError, TypeError, ValueError):
-                    # The decision log is append-only, so raising here would
-                    # make the article permanently unbuildable. Record the
-                    # honoured-but-unbuildable include and keep projecting; the
-                    # decision endpoint refuses such an include up front.
-                    unbuildable.append(repair_key)
-                    unbuildable_decisions.append(
-                        {"repair_key": repair_key, "decision_id": str(decision.id)}
-                    )
-                    continue
-                included.append(repair_key)
-                applied_decisions.append(
-                    {
-                        "repair_key": repair_key,
-                        "decision_id": str(decision.id),
-                        "action": ProductionRepairAction.INCLUDE.value,
-                    }
-                )
-
-            projected = TechnicalExtraction(
-                items=_merge_projection_items(items, additions),
-                uncertainties=base_extraction.uncertainties,
-                rules=_merge_projection_rules(rules, rule_additions),
+            resolved_payloads = {
+                repair_key: payload.value
+                for repair_key, payload in resolved_payload_objects.items()
+                if payload.available and payload.value is not None
+            }
+            projector_entries = [
+                dict(entry)
+                | {
+                    "repair_key": repair_key,
+                    "kind": kind.value,
+                    "value_sha256": value_sha256,
+                }
+                for repair_key, kind, entry, value_sha256 in active_entries
+            ]
+            projection = EffectiveExtractionProjector().project(
+                base=base_extraction,
+                repair_entries=projector_entries,
+                effective_decisions=tuple(decisions_by_key.values()),
+                resolved_payloads=resolved_payloads,
             )
+            projected = projection.extraction
             current_extraction = base_extraction
             if current.id != base.id:
                 try:
@@ -2021,7 +2100,7 @@ class ProductionRepairProjectionService:
             }
             unbuildable_is_recorded = all(
                 (entry["repair_key"], entry["decision_id"]) in unbuildable_already_recorded
-                for entry in unbuildable_decisions
+                for entry in projection.unbuildable_decisions
             )
             if projected == current_extraction and unbuildable_is_recorded:
                 await uow.commit()
@@ -2035,13 +2114,13 @@ class ProductionRepairProjectionService:
                     new_publication_projection_hash=projection_hashes["new_publication"],
                     previous_rule_bundle_hash=projection_hashes["previous_rule_bundle"],
                     new_rule_bundle_hash=projection_hashes["new_rule_bundle"],
-                    accepted_indicator_count=accepted_indicator_count,
-                    accepted_rule_count=accepted_rule_count,
-                    unresolved_count=len(unresolved),
-                    included_repair_keys=tuple(sorted(included)),
-                    excluded_repair_keys=tuple(sorted(excluded)),
-                    unresolved_repair_keys=tuple(sorted(unresolved)),
-                    unbuildable_repair_keys=tuple(sorted(unbuildable)),
+                    accepted_indicator_count=projection.accepted_indicator_count,
+                    accepted_rule_count=projection.accepted_rule_count,
+                    unresolved_count=len(projection.unresolved_repair_keys),
+                    included_repair_keys=projection.included_repair_keys,
+                    excluded_repair_keys=projection.excluded_repair_keys,
+                    unresolved_repair_keys=projection.unresolved_repair_keys,
+                    unbuildable_repair_keys=projection.unbuildable_repair_keys,
                 )
 
             effective_for_base = [
@@ -2071,18 +2150,12 @@ class ProductionRepairProjectionService:
                 # ``applied_decisions`` is the only proof that a decision is
                 # materialized here; a decision merely considered but not
                 # rebuildable lands in ``unbuildable_decisions`` instead.
-                "applied_decisions": sorted(
-                    applied_decisions,
-                    key=lambda entry: (entry["repair_key"], entry["decision_id"]),
-                ),
-                "unbuildable_decisions": sorted(
-                    unbuildable_decisions,
-                    key=lambda entry: (entry["repair_key"], entry["decision_id"]),
-                ),
-                "included_repair_keys": sorted(included),
-                "excluded_repair_keys": sorted(excluded),
-                "unresolved_repair_keys": sorted(unresolved),
-                "unbuildable_repair_keys": sorted(unbuildable),
+                "applied_decisions": list(projection.applied_decisions),
+                "unbuildable_decisions": list(projection.unbuildable_decisions),
+                "included_repair_keys": list(projection.included_repair_keys),
+                "excluded_repair_keys": list(projection.excluded_repair_keys),
+                "unresolved_repair_keys": list(projection.unresolved_repair_keys),
+                "unbuildable_repair_keys": list(projection.unbuildable_repair_keys),
                 "actor_id": actor_id,
             }
             metadata: dict[str, Any] = {
@@ -2132,14 +2205,212 @@ class ProductionRepairProjectionService:
                 new_publication_projection_hash=projection_hashes["new_publication"],
                 previous_rule_bundle_hash=projection_hashes["previous_rule_bundle"],
                 new_rule_bundle_hash=projection_hashes["new_rule_bundle"],
-                accepted_indicator_count=accepted_indicator_count,
-                accepted_rule_count=accepted_rule_count,
-                unresolved_count=len(unresolved),
-                included_repair_keys=tuple(sorted(included)),
-                excluded_repair_keys=tuple(sorted(excluded)),
-                unresolved_repair_keys=tuple(sorted(unresolved)),
-                unbuildable_repair_keys=tuple(sorted(unbuildable)),
+                accepted_indicator_count=projection.accepted_indicator_count,
+                accepted_rule_count=projection.accepted_rule_count,
+                unresolved_count=len(projection.unresolved_repair_keys),
+                included_repair_keys=projection.included_repair_keys,
+                excluded_repair_keys=projection.excluded_repair_keys,
+                unresolved_repair_keys=projection.unresolved_repair_keys,
+                unbuildable_repair_keys=projection.unbuildable_repair_keys,
             )
+
+
+async def reconcile_effective_repairs_in_uow(
+    uow: Any,
+    *,
+    run: Any,
+    base_extraction_artifact: ProductionArtifact,
+    artifact_store: ProductionArtifactStore | None,
+    payload_resolver: ProductionRepairPayloadResolver | None = None,
+    actor_id: str = "system:repair-replay",
+) -> ProductionArtifact | None:
+    """Reconcile decisions after Q2 while the workflow owns the transaction.
+
+    This deliberately does not inspect or mutate run status, pipeline
+    generation, conversations, or review fences.  It is the internal
+    transaction primitive for a live RUNNING workflow; the review-facing
+    ``ProductionRepairProjectionService`` remains fenced separately.
+    """
+    actor_id = actor_id.strip()
+    if not actor_id:
+        raise ProductionRepairProjectionError("production_repair_actor_required")
+    if artifact_store is None or base_extraction_artifact.canonical_blob_id is None:
+        raise ProductionRepairProjectionError("production_repair_storage_unavailable")
+
+    base = technical_extraction_from_json(
+        await artifact_store.read_json(base_extraction_artifact.canonical_blob_id)
+    )
+    entries, payload_available = await _repair_entries_for_artifact(
+        base_extraction_artifact, artifact_store
+    )
+    decisions = tuple(
+        decision
+        for decision in await _effective_decisions_for_reader(uow, run.edition_id, run.subject_id)
+        if decision.subject_id == run.subject_id
+    )
+    active_entries: list[tuple[str, ProductionRepairIssueKind, dict[str, Any], str]] = []
+    for entry in entries:
+        identity = _repair_entry_identity(
+            entry,
+            edition_id=run.edition_id,
+            subject_id=run.subject_id,
+            payload_available=payload_available,
+        )
+        if identity is not None:
+            active_entries.append((identity[0], identity[1], entry, identity[3]))
+
+    active_keys = {repair_key for repair_key, _kind, _entry, _hash in active_entries}
+    superseded = tuple(
+        decision
+        for decision in decisions
+        if decision.issue_kind
+        in {
+            ProductionRepairIssueKind.REJECTED_INDICATOR,
+            ProductionRepairIssueKind.REJECTED_RULE,
+        }
+        and decision.repair_key not in active_keys
+    )
+    if superseded:
+        audit = getattr(uow, "edition_audit", None)
+        append_audit = getattr(audit, "append", None)
+        if callable(append_audit):
+            for decision in superseded:
+                await append_audit(
+                    EditionAuditEvent(
+                        edition_id=run.edition_id,
+                        actor_id=actor_id,
+                        action="production.repair_decision_superseded_by_new_extraction",
+                        before=None,
+                        after={
+                            "subject_id": str(run.subject_id),
+                            "production_run_id": str(run.id),
+                            "decision_id": str(decision.id),
+                            "repair_key": decision.repair_key,
+                            "reason": "superseded by new extraction",
+                            "base_extraction_artifact_id": str(base_extraction_artifact.id),
+                        },
+                        correlation_id="production-repair-replay",
+                    )
+                )
+
+    include_entries = [
+        (repair_key, entry, value_sha256)
+        for repair_key, _kind, entry, value_sha256 in active_entries
+        if any(
+            decision.repair_key == repair_key
+            and _enum_value(decision.action) == ProductionRepairAction.INCLUDE.value
+            for decision in decisions
+        )
+    ]
+    resolver = payload_resolver or ProductionRepairPayloadResolver()
+    payload_objects = dict(
+        zip(
+            (repair_key for repair_key, _entry, _hash in include_entries),
+            await resolver.resolve_many(
+                [entry for _key, entry, _hash in include_entries],
+                payload_available=payload_available,
+                value_sha256_by_index={
+                    index: value_sha256
+                    for index, (_key, _entry, value_sha256) in enumerate(include_entries)
+                },
+            ),
+            strict=True,
+        )
+    )
+    projected = EffectiveExtractionProjector().project(
+        base=base,
+        repair_entries=[
+            dict(entry)
+            | {
+                "repair_key": repair_key,
+                "kind": kind.value,
+                "value_sha256": value_sha256,
+            }
+            for repair_key, kind, entry, value_sha256 in active_entries
+        ],
+        effective_decisions=decisions,
+        resolved_payloads={
+            repair_key: payload.value
+            for repair_key, payload in payload_objects.items()
+            if payload.available and payload.value is not None
+        },
+    )
+    if projected.extraction == base:
+        return None
+
+    effective_decision_payload = [
+        [decision.repair_key, _enum_value(decision.action), str(decision.id)]
+        for decision in sorted(
+            decisions,
+            key=lambda item: (item.repair_key, str(item.id)),
+        )
+        if decision.repair_key in active_keys
+    ]
+    input_hash = compute_input_hash(
+        {
+            "repair_projection_version": "1",
+            "base_extraction_artifact_id": str(base_extraction_artifact.id),
+            "base_input_hash": base_extraction_artifact.input_hash,
+            "effective_decisions": effective_decision_payload,
+            "replay_origin": "post_q2_reconciliation",
+        }
+    )
+    canonical_json = technical_extraction_to_json(projected.extraction)
+    base_metadata = dict(getattr(base_extraction_artifact, "metadata", {}) or {})
+    projection_metadata = {
+        "version": "1",
+        "base_extraction_artifact_id": str(base_extraction_artifact.id),
+        "derived_repair": True,
+        "replay_origin": "post_q2_reconciliation",
+        "applied_decisions": list(projected.applied_decisions),
+        "unbuildable_decisions": list(projected.unbuildable_decisions),
+        "included_repair_keys": list(projected.included_repair_keys),
+        "excluded_repair_keys": list(projected.excluded_repair_keys),
+        "unresolved_repair_keys": list(projected.unresolved_repair_keys),
+        "unbuildable_repair_keys": list(projected.unbuildable_repair_keys),
+        "superseded_decisions": [
+            {
+                "decision_id": str(decision.id),
+                "repair_key": decision.repair_key,
+                "reason": "superseded by new extraction",
+            }
+            for decision in superseded
+        ],
+        "actor_id": actor_id,
+    }
+    metadata: dict[str, Any] = {
+        "element_counts": {
+            category: len(value)
+            for category, value in canonical_json.items()
+            if isinstance(value, list)
+        },
+        "warnings": list(base_metadata.get("warnings", []))
+        if isinstance(base_metadata.get("warnings", []), list)
+        else [],
+        "parser_version": canonical_json.get("parser_version"),
+        "generated_at": datetime.now(UTC).isoformat(),
+        "deterministic_verification": dict(base_metadata.get("deterministic_verification", {}))
+        if isinstance(base_metadata.get("deterministic_verification"), dict)
+        else {},
+        "repair_projection": projection_metadata,
+        "derived_repair": True,
+        "base_extraction_artifact_id": str(base_extraction_artifact.id),
+        "applied_decisions": list(projected.applied_decisions),
+        "replay_origin": "post_q2_reconciliation",
+        "projection_diagnostics_basis": "base_extraction",
+    }
+    if isinstance(base_metadata.get("repair_evidence"), dict):
+        metadata["repair_evidence"] = dict(base_metadata["repair_evidence"])
+
+    extraction_service = ExtractionService(cast(Any, lambda: None), artifact_store)
+    return await extraction_service._store_repair_projection_in_uow(
+        uow,
+        run_id=run.id,
+        subject_id=run.subject_id,
+        input_hash=input_hash,
+        canonical_json=canonical_json,
+        metadata=metadata,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2209,9 +2480,7 @@ class ProductionRepairMaterializationService:
             observed_run_id=observed_run_id,
             observed_pipeline_generation=observed_pipeline_generation,
         )
-        projection = await self._projection.project_effective_extraction(
-            run.id, actor_id=actor_id
-        )
+        projection = await self._projection.project_effective_extraction(run.id, actor_id=actor_id)
         if projection.unresolved_count:
             return ProductionRepairMaterializationResult(
                 projection=projection,
@@ -2322,10 +2591,7 @@ class ProductionRepairMaterializationService:
         }:
             raise ProductionRepairProjectionError("edition_frozen_for_publication")
         manifests = getattr(uow, "publication_manifests", None)
-        if (
-            manifests is not None
-            and await manifests.get_latest_for_edition(edition_id) is not None
-        ):
+        if manifests is not None and await manifests.get_latest_for_edition(edition_id) is not None:
             raise ProductionRepairProjectionError("edition_frozen_for_publication")
         return edition
 
