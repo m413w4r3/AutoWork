@@ -240,7 +240,7 @@ async def test_same_content_from_two_urls_reuses_blob_but_preserves_observations
 
 
 async def test_manual_content_archives_blocked_source_and_records_provenance(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     factory = InMemoryCollectionUnitOfWorkFactory()
     subject = selected_subject(factory, ("https://blocked.example/report",))
@@ -249,12 +249,13 @@ async def test_manual_content_archives_blocked_source_and_records_provenance(
     factory.collections[source.id].state = CollectionState.BLOCKED
     content = b"<html><body>Analyst supplied evidence with ExampleRAT.</body></html>"
 
-    archived = await app.archive_manual_content(
-        source.id,
-        content=content,
-        declared_mime_type="text/html",
-        actor_id="analyst-1",
-    )
+    with caplog.at_level("INFO", logger="cti_app.application.collection"):
+        archived = await app.archive_manual_content(
+            source.id,
+            content=content,
+            declared_mime_type="text/html",
+            actor_id="analyst-1",
+        )
 
     assert archived.state is CollectionState.ARCHIVED
     assert archived.origin_kind is SourceOriginKind.MANUAL
@@ -284,6 +285,18 @@ async def test_manual_content_archives_blocked_source_and_records_provenance(
     attempts = await app.attempts(archived.id)
     assert [attempt.job_id for attempt in attempts] == [None]
     assert attempts[-1].manual_lease_id == UUID(payload["manual_lease_id"])
+    completed = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "source.manual_archive.completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0].encoded_sha256 == hashlib.sha256(content).hexdigest()
+    assert completed[0].decoded_sha256 == hashlib.sha256(content).hexdigest()
+    assert completed[0].bytes == len(content)
+    assert completed[0].raw_blob_id
+    assert completed[0].decoded_blob_id == str(archived.decoded_blob_id)
+    assert "ExampleRAT" not in completed[0].getMessage()
 
 
 async def test_manual_content_rejects_empty_and_oversized_content(tmp_path: Path) -> None:

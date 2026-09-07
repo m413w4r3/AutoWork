@@ -17,6 +17,11 @@ from cti_app.api.production import (
 )
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.collection_errors import CollectionNotAllowedError
+from cti_app.application.edition_preview import (
+    EditionPreviewError,
+    EditionPreviewService,
+    EditionPreviewStaleError,
+)
 from cti_app.application.edition_publication import (
     EditionPublicationService,
     EditionReleaseStatus,
@@ -332,6 +337,24 @@ class EditionReleaseMaterializationView(BaseModel):
     materialized: bool
 
 
+class EditionPreviewArtifactView(BaseModel):
+    position: int
+    subject_id: UUID
+    artifact_id: UUID
+    artifact_version: int
+    input_hash: str
+
+
+class EditionPreviewView(BaseModel):
+    edition_id: UUID
+    edition_version: int
+    preview_input_hash: str
+    artifacts: list[EditionPreviewArtifactView]
+    canonical_markdown: str
+    sanitized_html: str
+    stale: bool
+
+
 def _service(request: Request) -> EditionReviewService:
     configured = getattr(request.app.state, "edition_review_service", None)
     return configured or EditionReviewService(request.app.state.uow_factory)
@@ -374,6 +397,17 @@ def _publication_service(request: Request) -> EditionPublicationService:
             request.app.state.production_artifact_store,
             job_service=getattr(request.app.state, "job_service", None),
             job_dispatcher=getattr(request.app.state, "job_dispatcher", None),
+        )
+    return configured
+
+
+def _preview_service(request: Request) -> EditionPreviewService:
+    configured = getattr(request.app.state, "edition_preview_service", None)
+    if configured is None:
+        configured = EditionPreviewService(
+            request.app.state.uow_factory,
+            request.app.state.production_artifact_store,
+            repair_issue_reader=getattr(request.app.state, "production_repair_issue_service", None),
         )
     return configured
 
@@ -684,9 +718,7 @@ async def verify_edition_repair_replacement(
 ) -> dict[str, Any]:
     """Check a proposed replacement without appending a decision."""
     try:
-        verification = await _repair_adjudication_service(
-            request
-        ).verify_current_issue_replacement(
+        verification = await _repair_adjudication_service(request).verify_current_issue_replacement(
             edition_id=edition_id,
             subject_id=payload.observed_subject_id,
             repair_key=repair_key,
@@ -708,8 +740,7 @@ async def verify_edition_repair_replacement(
             else None
         ),
         "context_spans": [
-            {"kind": span.kind.value, "text": span.text}
-            for span in verification.context_spans
+            {"kind": span.kind.value, "text": span.text} for span in verification.context_spans
         ],
     }
 
@@ -1314,6 +1345,39 @@ async def get_edition_release(edition_id: UUID, request: Request) -> EditionRele
         _raise_publication_error(exc)
 
 
+@router.get("/editions/{edition_id}/preview", response_model=EditionPreviewView)
+async def get_edition_preview(
+    edition_id: UUID,
+    request: Request,
+    preview_input_hash: Annotated[str | None, Query(pattern=_SHA256_PATTERN)] = None,
+) -> EditionPreviewView:
+    try:
+        preview = await _preview_service(request).preview(
+            edition_id,
+            previous_preview_input_hash=preview_input_hash,
+        )
+    except Exception as exc:
+        _raise_publication_error(exc)
+    return EditionPreviewView(
+        edition_id=preview.edition_id,
+        edition_version=preview.edition_version,
+        preview_input_hash=preview.preview_input_hash,
+        artifacts=[
+            EditionPreviewArtifactView(
+                position=artifact.position,
+                subject_id=artifact.subject_id,
+                artifact_id=artifact.artifact_id,
+                artifact_version=artifact.artifact_version,
+                input_hash=artifact.input_hash,
+            )
+            for artifact in preview.artifacts
+        ],
+        canonical_markdown=preview.canonical_markdown,
+        sanitized_html=preview.sanitized_html,
+        stale=preview.stale,
+    )
+
+
 @router.post(
     "/editions/{edition_id}/release/materialize",
     response_model=EditionReleaseMaterializationView,
@@ -1357,6 +1421,28 @@ async def download_edition_docx(edition_id: UUID, request: Request) -> Response:
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="bulletin-{edition_id}.docx"'},
+    )
+
+
+@router.get("/editions/{edition_id}/preview/docx")
+async def download_edition_preview_docx(
+    edition_id: UUID,
+    request: Request,
+    preview_input_hash: Annotated[str | None, Query(pattern=_SHA256_PATTERN)] = None,
+) -> Response:
+    try:
+        content = await _preview_service(request).docx(
+            edition_id,
+            expected_preview_input_hash=preview_input_hash,
+        )
+    except Exception as exc:
+        _raise_publication_error(exc)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": f'attachment; filename="bulletin-{edition_id}-preview.docx"'
+        },
     )
 
 
@@ -1582,6 +1668,18 @@ def _raise_review_error(exc: Exception) -> NoReturn:
 
 
 def _raise_publication_error(exc: Exception) -> NoReturn:
+    if isinstance(exc, EditionPreviewStaleError):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "edition_preview_stale"},
+        ) from exc
+    if isinstance(exc, EditionPreviewError):
+        code = str(exc)
+        if code == "edition_not_found":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Edition not found"
+            ) from exc
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"code": code}) from exc
     if isinstance(exc, PublicationManifestNotFoundError):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Edition release not available"

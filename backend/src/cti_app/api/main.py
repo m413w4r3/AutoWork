@@ -27,6 +27,7 @@ from cti_app.application.discovery.cumulative.jobs import RECONCILE_DISCOVERY_JO
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
 from cti_app.application.discovery.service import DiscoveryService
+from cti_app.application.edition_preview import EditionPreviewService
 from cti_app.application.edition_publication import (
     EditionAssemblyService,
     EditionPublicationService,
@@ -334,6 +335,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         production_artifact_store,
         job_service=job_service,
         job_dispatcher=job_dispatcher,
+        repair_issue_reader=production_repair_issue_service,
+    )
+    app.state.edition_preview_service = EditionPreviewService(
+        uow_factory,
+        production_artifact_store,
         repair_issue_reader=production_repair_issue_service,
     )
     app.state.edition_release_rematerializer = edition_release_rematerializer

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from html import escape
 from typing import Final
+from urllib.parse import urlsplit
 
 from cti_app.application.french_typography import format_french_date
 from cti_app.application.production_normalization import display_indicator_value
@@ -160,3 +162,81 @@ def render_edition_pandoc(document: EditionDocumentV1 | EditionDocumentV2) -> st
         for publication in document.publications
     )
     return rendered.rstrip() + "\n"
+
+
+def _safe_html_url(url: str) -> str | None:
+    parsed = urlsplit(url)
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return None
+    return escape(url, quote=True)
+
+
+def _render_rich_html(text: RichText, sources: dict[str, str]) -> str:
+    output: list[str] = []
+    for span in text:
+        value = escape(span.text)
+        if span.kind is RichSpanKind.CITATION:
+            links = []
+            for source_id in dict.fromkeys(span.source_ids):
+                url = _safe_html_url(sources[source_id]) if source_id in sources else None
+                if url is not None:
+                    links.append(f'<a href="{url}" rel="noreferrer">source</a>')
+            if links:
+                output.append(f'<sup class="citation">{" ; ".join(links)}</sup>')
+        elif span.kind in {RichSpanKind.ACTOR, RichSpanKind.MALWARE}:
+            output.append(f"<strong>{value}</strong>")
+        elif span.kind is RichSpanKind.EMPHASIS:
+            output.append(f"<em>{value}</em>")
+        elif span.kind is RichSpanKind.CODE:
+            output.append(f"<code>{value}</code>")
+        elif span.kind in {RichSpanKind.TOOL, RichSpanKind.TECHNICAL, RichSpanKind.IOC}:
+            output.append(f'<span class="{span.kind.value}">{value}</span>')
+        else:
+            output.append(value)
+    return "".join(output)
+
+
+def _render_publication_html(document: PublicationDocumentV2) -> str:
+    sources = {source.source_id: source.canonical_url for source in document.sources}
+    blocks = [f"<h1>{escape(document.title)}</h1>"]
+    for entry in document.timeline:
+        content = _render_rich_html(entry.content, sources)
+        if entry.date is not None:
+            content = f"<time>{escape(format_french_date(entry.date))}</time>\u00a0: {content}"
+        blocks.append(f"<p>{content}</p>")
+
+    blocks.append("<h2>Synthèse</h2>")
+    blocks.extend(
+        f"<p>{_render_rich_html(paragraph, sources)}</p>" for paragraph in document.synthesis
+    )
+    if document.analyst_note is not None:
+        blocks.append(f"<h2>{escape(ANALYST_NOTE_TITLE)}</h2>")
+        blocks.append(f"<p>{_render_rich_html(document.analyst_note, sources)}</p>")
+
+    by_type = {group.artifact_type: group for group in document.indicators}
+    populated = [pair for pair in _GROUPS if pair[0] in by_type and by_type[pair[0]].values]
+    if populated:
+        blocks.append("<h2>IOC</h2>")
+        for artifact_type, label in populated:
+            blocks.append(f"<h3>{escape(label)}</h3>")
+            values = "".join(
+                "<li>"
+                + escape(
+                    display_indicator_value(item.normalized_value, artifact_type, defanged=False)
+                )
+                + "</li>"
+                for item in by_type[artifact_type].values
+            )
+            blocks.append(f"<ul>{values}</ul>")
+    return "\n".join(blocks) + "\n"
+
+
+def render_edition_html(document: EditionDocumentV2) -> str:
+    """Render a deliberately small, escaped HTML view for browser preview."""
+    return (
+        "\n<hr />\n".join(
+            _render_publication_html(publication.document).rstrip()
+            for publication in document.publications
+        )
+        + "\n"
+    )

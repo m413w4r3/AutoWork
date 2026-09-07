@@ -97,6 +97,44 @@ class _ManualAcquisition:
 
 
 @dataclass(frozen=True, slots=True)
+class ManualArchiveReceipt:
+    """The immutable facts of a successful analyst-supplied archive."""
+
+    subject_id: UUID
+    collection_id: UUID
+    source_document_id: UUID
+    raw_blob_id: UUID
+    decoded_blob_id: UUID
+    encoded_sha256: str
+    decoded_sha256: str
+    bytes: int
+    declared_mime_type: str
+    detected_mime_type: str
+    actor_id: str
+    correlation_id: str
+    completed_at: datetime
+
+    def log_fields(self) -> dict[str, object]:
+        """Return only metadata; raw analyst content is never loggable here."""
+        return {
+            "subject_id": str(self.subject_id),
+            "collection_id": str(self.collection_id),
+            "source_document_id": str(self.source_document_id),
+            "raw_blob_id": str(self.raw_blob_id),
+            "decoded_blob_id": str(self.decoded_blob_id),
+            "encoded_sha256": self.encoded_sha256,
+            "decoded_sha256": self.decoded_sha256,
+            "bytes": self.bytes,
+            "declared_mime": self.declared_mime_type,
+            "detected_mime": self.detected_mime_type,
+            "declared_mime_type": self.declared_mime_type,
+            "detected_mime_type": self.detected_mime_type,
+            "actor_id": self.actor_id,
+            "correlation_id": self.correlation_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class SupplementalSource:
     """A publication proposed by reference research, not by discovery."""
 
@@ -701,7 +739,8 @@ class SubjectCollectionService:
         declared_mime_type: str,
         final_url: str | None = None,
         actor_id: str,
-    ) -> SourceCollection:
+        return_receipt: bool = False,
+    ) -> SourceCollection | tuple[SourceCollection, ManualArchiveReceipt]:
         """Archive analyst-supplied bytes as if they had been fetched.
 
         An anti-bot page, a 403 or a JavaScript-rendered article cannot be
@@ -710,71 +749,97 @@ class SubjectCollectionService:
         that text restores the whole downstream chain — extraction, evidence
         verification, publication — with no special case anywhere else.
         """
-        if not content:
-            raise ManualContentEmptyError("Manual source content is empty")
-        if len(content) > self._policy.max_download_bytes:
-            raise ManualContentTooLargeError("Manual source content exceeds the download limit")
+        correlation_id = get_correlation_id()
+        subject_id: UUID | None = None
         try:
-            detected_content_type = _detect_mime(content)
-        except UnsupportedContentError as exc:
-            raise ManualContentTypeError("Detected content type is not supported") from exc
-        if not isinstance(detected_content_type, DetectedMimeType):
-            raise ManualContentTypeError("Detected content type is not supported")
+            if not content:
+                raise ManualContentEmptyError("Manual source content is empty")
+            if len(content) > self._policy.max_download_bytes:
+                raise ManualContentTooLargeError("Manual source content exceeds the download limit")
+            try:
+                detected_content_type = _detect_mime(content)
+            except UnsupportedContentError as exc:
+                raise ManualContentTypeError("Detected content type is not supported") from exc
+            if not isinstance(detected_content_type, DetectedMimeType):
+                raise ManualContentTypeError("Detected content type is not supported")
 
-        # A lease token, never a job id: no row in ``jobs`` describes an
-        # analyst upload, and ``source_collections.fetch_job_id`` is a foreign
-        # key into that table.
-        manual_lease_id = uuid4()
-        started_at = datetime.now(UTC)
-        async with self._uow_factory() as uow:
-            collection = await _require_collection(uow, collection_id)
-            if collection.state in _COLLECTED_STATES:
-                raise ManualContentAlreadyArchivedError("source_already_archived")
-            claimed = collection.claim_manual_upload(
-                manual_lease_id,
-                lease_duration=self._fetch_lease,
-                policy_snapshot_id=self._policy_snapshot.id,
-                now=started_at,
-            )
-            if not claimed:
-                raise CollectionNotAllowedError(
-                    "Manual source content cannot be archived in the current state"
+            # A lease token, never a job id: no row in ``jobs`` describes an
+            # analyst upload, and ``source_collections.fetch_job_id`` is a foreign
+            # key into that table.
+            manual_lease_id = uuid4()
+            started_at = datetime.now(UTC)
+            async with self._uow_factory() as uow:
+                collection = await _require_collection(uow, collection_id)
+                subject_id = collection.subject_id
+                if collection.state in _COLLECTED_STATES:
+                    raise ManualContentAlreadyArchivedError("source_already_archived")
+                claimed = collection.claim_manual_upload(
+                    manual_lease_id,
+                    lease_duration=self._fetch_lease,
+                    policy_snapshot_id=self._policy_snapshot.id,
+                    now=started_at,
                 )
-            await uow.collection_policy_snapshots.add_if_absent(self._policy_snapshot)
-            await uow.source_collections.save(collection)
-            await uow.commit()
+                if not claimed:
+                    raise CollectionNotAllowedError(
+                        "Manual source content cannot be archived in the current state"
+                    )
+                await uow.collection_policy_snapshots.add_if_absent(self._policy_snapshot)
+                await uow.source_collections.save(collection)
+                await uow.commit()
 
-        response = CollectedResponse(
-            requested_url=collection.canonical_url,
-            final_url=final_url or collection.canonical_url,
-            redirect_chain=(),
-            status=200,
-            headers={},
-            declared_content_type=declared_mime_type,
-            detected_content_type=detected_content_type,
-            encoded_body=content,
-            decoded_body=content,
-            encoded_size=len(content),
-            encoded_sha256=hashlib.sha256(content).hexdigest(),
-            decoded_size=len(content),
-            decoded_sha256=hashlib.sha256(content).hexdigest(),
-            content_encoding="identity",
-            acquired_at=datetime.now(UTC),
-        )
-        await self._archive(
-            collection_id,
-            started_at,
-            response,
-            acquisition=_ManualAcquisition(
-                manual_lease_id=manual_lease_id,
-                actor_id=actor_id,
-                declared_mime_type=declared_mime_type,
-            ),
-        )
+            response = CollectedResponse(
+                requested_url=collection.canonical_url,
+                final_url=final_url or collection.canonical_url,
+                redirect_chain=(),
+                status=200,
+                headers={},
+                declared_content_type=declared_mime_type,
+                detected_content_type=detected_content_type,
+                encoded_body=content,
+                decoded_body=content,
+                encoded_size=len(content),
+                encoded_sha256=hashlib.sha256(content).hexdigest(),
+                decoded_size=len(content),
+                decoded_sha256=hashlib.sha256(content).hexdigest(),
+                content_encoding="identity",
+                acquired_at=datetime.now(UTC),
+            )
+            receipt = await self._archive(
+                collection_id,
+                started_at,
+                response,
+                acquisition=_ManualAcquisition(
+                    manual_lease_id=manual_lease_id,
+                    actor_id=actor_id,
+                    declared_mime_type=declared_mime_type,
+                ),
+            )
+            if receipt is None:
+                raise RuntimeError("manual archive did not produce a receipt")
+            # This is deliberately after the provenance/blob transaction has
+            # committed. The log is metadata-only and therefore contains no
+            # analyst-supplied bytes.
+            logger.info(
+                "source_manual_archive_completed",
+                extra={"event": "source.manual_archive.completed", **receipt.log_fields()},
+            )
 
-        async with self._uow_factory() as uow:
-            collection = await _require_collection(uow, collection_id)
-            return collection
+            async with self._uow_factory() as uow:
+                collection = await _require_collection(uow, collection_id)
+                return (collection, receipt) if return_receipt else collection
+        except Exception as exc:
+            logger.warning(
+                "source_manual_archive_failed",
+                extra={
+                    "event": "source.manual_archive.failed",
+                    "subject_id": str(subject_id) if subject_id is not None else None,
+                    "collection_id": str(collection_id),
+                    "actor_id": actor_id,
+                    "correlation_id": correlation_id,
+                    "error_code": type(exc).__name__,
+                },
+            )
+            raise
 
     async def _candidate_for(
         self,
@@ -965,7 +1030,7 @@ class SubjectCollectionService:
         *,
         acquisition: _CollectorAcquisition | _ManualAcquisition,
         candidate: SourceCandidate | None = None,
-    ) -> None:
+    ) -> ManualArchiveReceipt | None:
         """Persist one acquisition: same evidence, two honest audit contexts.
 
         Blobs, hashes, ``SourceDocument`` and the attempt are identical for a
@@ -1093,9 +1158,11 @@ class SubjectCollectionService:
                     "actor_id": manual.actor_id,
                     "manual_lease_id": str(manual.manual_lease_id),
                     "declared_mime_type": manual.declared_mime_type,
+                    "detected_mime_type": response.detected_content_type.value,
                     "size": response.decoded_size,
                     "requested_url": response.requested_url,
                     "final_url": response.final_url,
+                    "correlation_id": get_correlation_id(),
                 }
             else:
                 assert collector is not None
@@ -1114,6 +1181,24 @@ class SubjectCollectionService:
                 )
             )
             await uow.commit()
+
+            if manual is None:
+                return None
+            return ManualArchiveReceipt(
+                subject_id=collection.subject_id,
+                collection_id=collection.id,
+                source_document_id=document.id,
+                raw_blob_id=raw_blob.id,
+                decoded_blob_id=decoded_blob.id,
+                encoded_sha256=response.encoded_sha256,
+                decoded_sha256=response.decoded_sha256,
+                bytes=response.decoded_size,
+                declared_mime_type=manual.declared_mime_type,
+                detected_mime_type=response.detected_content_type.value,
+                actor_id=manual.actor_id,
+                correlation_id=get_correlation_id(),
+                completed_at=datetime.now(UTC),
+            )
 
     async def _renew_fetch_lease(self, collection_id: UUID, job_id: UUID) -> bool:
         async with self._uow_factory() as uow:

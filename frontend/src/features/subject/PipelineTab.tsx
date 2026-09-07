@@ -14,10 +14,12 @@ import {
 import {
   archiveManualSourceContent,
   getSubjectWorkbench,
+  type ArchiveReceipt,
   type CollectedSource,
   type SubjectWorkbenchResult,
 } from "../../api/collection";
 import { SubjectProduction } from "../../components/SubjectProduction";
+import { ArchiveReceiptSummary } from "../../components/ArchiveReceiptSummary";
 
 const MANUAL_SOURCE_STATES = new Set([
   "blocked",
@@ -89,6 +91,9 @@ function SourceContentPanel({
   const [archivedSourceIds, setArchivedSourceIds] = useState<Set<string>>(
     new Set(),
   );
+  const [archiveReceipts, setArchiveReceipts] = useState<
+    Record<string, ArchiveReceipt>
+  >({});
   const manualUpload = useMutation({
     mutationFn: (input: {
       source: CollectedSource;
@@ -99,8 +104,14 @@ function SourceContentPanel({
         content: input.content,
         declaredMimeType: input.declaredMimeType,
       }),
-    onSuccess: (_result, input) => {
+    onSuccess: (result, input) => {
       setArchivedSourceIds((current) => new Set(current).add(input.source.id));
+      if (result.archive_receipt) {
+        setArchiveReceipts((current) => ({
+          ...current,
+          [input.source.id]: result.archive_receipt as ArchiveReceipt,
+        }));
+      }
       void workbench.refetch();
     },
   });
@@ -144,8 +155,10 @@ function SourceContentPanel({
     );
   }
 
-  const sources = (workbench.data?.sources ?? []).filter((source) =>
-    MANUAL_SOURCE_STATES.has(source.state),
+  const sources = (workbench.data?.sources ?? []).filter(
+    (source) =>
+      MANUAL_SOURCE_STATES.has(source.state) ||
+      archivedSourceIds.has(source.id),
   );
   const canRestart = archivedSourceIds.size > 0 || replacedSourceIds.size > 0;
   return (
@@ -173,6 +186,7 @@ function SourceContentPanel({
           const replacementPending =
             replacement.isPending &&
             replacement.variables?.source.id === source.id;
+          const receipt = archiveReceipts[source.id];
           return (
             <li key={source.id} className="is-source-failure">
               <strong>{source.title}</strong>
@@ -243,6 +257,7 @@ function SourceContentPanel({
                   {pending ? "Archivage…" : "Archiver ce contenu"}
                 </button>
               </form>
+              {receipt ? <ArchiveReceiptSummary receipt={receipt} /> : null}
               <form
                 className="source-replacement-form"
                 onSubmit={(event) => {

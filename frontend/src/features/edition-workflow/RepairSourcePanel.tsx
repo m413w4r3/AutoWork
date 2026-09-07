@@ -4,11 +4,13 @@ import { useState } from "react";
 import {
   archiveManualSourceContent,
   getSubjectWorkbench,
+  type ArchiveReceipt,
 } from "../../api/collection";
 import {
   prepareEditionRepairSource,
   type EditionRepairDetail,
 } from "../../api/publication";
+import { ArchiveReceiptSummary } from "../../components/ArchiveReceiptSummary";
 
 export function RepairSourcePanel({
   editionId,
@@ -28,6 +30,9 @@ export function RepairSourcePanel({
   const [content, setContent] = useState("");
   const [mimeType, setMimeType] = useState("text/html");
   const [archived, setArchived] = useState(false);
+  const [archiveReceipt, setArchiveReceipt] = useState<ArchiveReceipt | null>(
+    null,
+  );
   const sourceQuery = useQuery({
     queryKey: ["subject-workbench", subjectId],
     queryFn: () => getSubjectWorkbench(subjectId),
@@ -84,8 +89,9 @@ export function RepairSourcePanel({
       });
     },
     retry: false,
-    onSuccess: () => {
+    onSuccess: (result) => {
       setArchived(true);
+      setArchiveReceipt(result.archive_receipt);
       void queryClient.invalidateQueries({
         queryKey: ["edition-repair-detail", editionId, detail.repair_key],
       });
@@ -233,6 +239,9 @@ export function RepairSourcePanel({
         <p className="repair-source-panel__success" role="status">
           Source archivée — reconstruction des références nécessaire.
         </p>
+      ) : null}
+      {archiveReceipt ? (
+        <ArchiveReceiptSummary receipt={archiveReceipt} />
       ) : null}
       {archive.error ? (
         <p className="error-message" role="alert">

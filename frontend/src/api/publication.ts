@@ -94,6 +94,24 @@ export interface EditionReleaseResponse {
   can_retry_assembly: boolean;
 }
 
+export interface EditionPreviewArtifact {
+  position: number;
+  subject_id: string;
+  artifact_id: string;
+  artifact_version: number;
+  input_hash: string;
+}
+
+export interface EditionPreviewResponse {
+  edition_id: string;
+  edition_version: number;
+  preview_input_hash: string;
+  artifacts: EditionPreviewArtifact[];
+  canonical_markdown: string;
+  sanitized_html: string;
+  stale: boolean;
+}
+
 export interface ReviewItem {
   position: number;
   subject_id: string;
@@ -554,6 +572,28 @@ export function getEditionRelease(
 
 export function editionDocxUrl(editionId: string): string {
   return `/api/editions/${encodeURIComponent(editionId)}/release/docx`;
+}
+
+export function getEditionPreview(
+  editionId: string,
+  previousPreviewInputHash?: string | null,
+): Promise<EditionPreviewResponse> {
+  const query = previousPreviewInputHash
+    ? `?preview_input_hash=${encodeURIComponent(previousPreviewInputHash)}`
+    : "";
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/preview${query}`,
+  );
+}
+
+export function editionPreviewDocxUrl(
+  editionId: string,
+  previewInputHash?: string | null,
+): string {
+  const query = previewInputHash
+    ? `?preview_input_hash=${encodeURIComponent(previewInputHash)}`
+    : "";
+  return `/api/editions/${encodeURIComponent(editionId)}/preview/docx${query}`;
 }
 
 export async function includeReviewItem(

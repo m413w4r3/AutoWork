@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Literal
+import logging
+from typing import Literal, cast
 from urllib.parse import quote
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import UploadFile
 
 from cti_app.application.collection import (
+    ManualArchiveReceipt,
     ManualContentAlreadyArchivedError,
     ManualContentEmptyError,
     ManualContentTooLargeError,
@@ -40,6 +42,7 @@ from cti_app.domain.entities import SourceDocument
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api/subjects", tags=["subject-workbench"])
+logger = logging.getLogger(__name__)
 
 
 class CollectionLaunchView(BaseModel):
@@ -66,6 +69,23 @@ class AttemptView(BaseModel):
     failure_reason: str | None
 
 
+class ArchiveReceiptView(BaseModel):
+    subject_id: UUID
+    collection_id: UUID
+    source_document_id: UUID
+    raw_blob_id: UUID
+    decoded_blob_id: UUID
+    blob_ids: dict[str, UUID]
+    encoded_sha256: str
+    decoded_sha256: str
+    bytes: int
+    declared_mime_type: str
+    detected_mime_type: str
+    actor_id: str
+    correlation_id: str
+    completed_at: str
+
+
 class SourceView(BaseModel):
     id: UUID
     requested_url: str
@@ -84,6 +104,7 @@ class SourceView(BaseModel):
     tlp: str | None
     logical_filename: str | None
     detected_mime_type: str | None
+    archive_receipt: ArchiveReceiptView | None = None
 
 
 class ClaimView(BaseModel):
@@ -232,27 +253,35 @@ async def archive_manual_source_content(
     subject_id: UUID, collection_id: UUID, request: Request
 ) -> SourceView:
     service, _review, _, _ = _runtime(request)
+    actor_id = await _actor_id(request)
     source_for_subject = next(
         (item for item in await service.list_sources(subject_id) if item.id == collection_id),
         None,
     )
     if source_for_subject is None:
+        _log_manual_archive_failure(subject_id, collection_id, actor_id, "source_not_found")
         raise HTTPException(status_code=404, detail="Source collection not found")
     if source_for_subject.state in {
         CollectionState.ARCHIVED,
         CollectionState.EXTRACTED,
         CollectionState.COMPLETED,
     }:
+        _log_manual_archive_failure(subject_id, collection_id, actor_id, "source_already_archived")
         raise HTTPException(status_code=409, detail="source_already_archived")
 
-    content, declared_mime_type, final_url = await _manual_content_payload(request)
     try:
-        source = await service.archive_manual_content(
+        content, declared_mime_type, final_url = await _manual_content_payload(request)
+    except HTTPException as exc:
+        _log_manual_archive_failure(subject_id, collection_id, actor_id, "invalid_payload")
+        raise exc
+    try:
+        archived = await service.archive_manual_content(
             collection_id,
             content=content,
             declared_mime_type=declared_mime_type,
             final_url=final_url,
-            actor_id=await _actor_id(request),
+            actor_id=actor_id,
+            return_receipt=True,
         )
     except CollectionItemNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Source collection not found") from exc
@@ -265,9 +294,16 @@ async def archive_manual_source_content(
     except CollectionNotAllowedError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    source, receipt = cast(tuple[SourceCollection, ManualArchiveReceipt], archived)
     attempts = await service.attempts(source.id)
     candidate, document = await service.source_context(source)
-    return _source_view(source, attempts[-1] if attempts else None, candidate, document)
+    return _source_view(
+        source,
+        attempts[-1] if attempts else None,
+        candidate,
+        document,
+        archive_receipt=receipt,
+    )
 
 
 @router.get("/{subject_id}/workbench", response_model=WorkbenchView)
@@ -455,6 +491,8 @@ def _source_view(
     attempt: CollectionAttempt | None,
     candidate: SourceCandidate | None,
     document: SourceDocument | None,
+    *,
+    archive_receipt: ManualArchiveReceipt | None = None,
 ) -> SourceView:
     return SourceView(
         id=source.id,
@@ -494,6 +532,45 @@ def _source_view(
             if attempt
             else None
         ),
+        archive_receipt=(
+            ArchiveReceiptView(
+                subject_id=archive_receipt.subject_id,
+                collection_id=archive_receipt.collection_id,
+                source_document_id=archive_receipt.source_document_id,
+                raw_blob_id=archive_receipt.raw_blob_id,
+                decoded_blob_id=archive_receipt.decoded_blob_id,
+                blob_ids={
+                    "raw": archive_receipt.raw_blob_id,
+                    "decoded": archive_receipt.decoded_blob_id,
+                },
+                encoded_sha256=archive_receipt.encoded_sha256,
+                decoded_sha256=archive_receipt.decoded_sha256,
+                bytes=archive_receipt.bytes,
+                declared_mime_type=archive_receipt.declared_mime_type,
+                detected_mime_type=archive_receipt.detected_mime_type,
+                actor_id=archive_receipt.actor_id,
+                correlation_id=archive_receipt.correlation_id,
+                completed_at=archive_receipt.completed_at.isoformat(),
+            )
+            if archive_receipt is not None
+            else None
+        ),
+    )
+
+
+def _log_manual_archive_failure(
+    subject_id: UUID, collection_id: UUID, actor_id: str, error_code: str
+) -> None:
+    logger.warning(
+        "source_manual_archive_failed",
+        extra={
+            "event": "source.manual_archive.failed",
+            "subject_id": str(subject_id),
+            "collection_id": str(collection_id),
+            "actor_id": actor_id,
+            "correlation_id": get_correlation_id(),
+            "error_code": error_code,
+        },
     )
 
 

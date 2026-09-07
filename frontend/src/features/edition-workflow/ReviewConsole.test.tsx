@@ -136,6 +136,27 @@ function renderReview(
 ) {
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     if (init?.method === "POST") return Promise.resolve(postResponse());
+    if (urlOf(input).includes("/preview")) {
+      return Promise.resolve(
+        Response.json({
+          edition_id: EDITION_ID,
+          edition_version: 4,
+          preview_input_hash: HASH,
+          artifacts: [
+            {
+              position: 1,
+              subject_id: "subject-1",
+              artifact_id: "artifact-1",
+              artifact_version: 2,
+              input_hash: HASH,
+            },
+          ],
+          canonical_markdown: "# Bulletin",
+          sanitized_html: "<h1>Bulletin</h1>",
+          stale: false,
+        }),
+      );
+    }
     return Promise.resolve(
       Response.json(
         urlOf(input).includes("/review/repairs") ? emptyRepairPage : review,
@@ -153,6 +174,28 @@ function renderReview(
   );
   return { client, fetchMock };
 }
+
+it("affiche la prévisualisation canonique et son téléchargement DOCX", async () => {
+  const { fetchMock } = renderReview(makeReview());
+  const user = userEvent.setup();
+
+  await user.click(
+    await screen.findByRole("button", { name: "Prévisualisation" }),
+  );
+
+  expect(await screen.findByTitle("Vue bulletin")).toBeInTheDocument();
+  expect(
+    screen.getByRole("link", {
+      name: "Télécharger DOCX de prévisualisation",
+    }),
+  ).toHaveAttribute(
+    "href",
+    `/api/editions/${EDITION_ID}/preview/docx?preview_input_hash=${HASH}`,
+  );
+  expect(
+    fetchMock.mock.calls.some(([input]) => urlOf(input).includes("/preview")),
+  ).toBe(true);
+});
 
 function postCalls(fetchMock: FetchMock) {
   return fetchMock.mock.calls

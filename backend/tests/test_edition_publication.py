@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import zipfile
+from dataclasses import replace
 from datetime import date
 from io import BytesIO
 from pathlib import Path
@@ -23,6 +24,7 @@ from cti_app.application.edition_publication import (
     PublicationAcceptanceError,
     PublicationAssemblyError,
 )
+from cti_app.application.edition_preview import EditionPreviewService
 from cti_app.application.edition_review import EditionReviewReadItem, EditionReviewService
 from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
 from cti_app.application.identity import LocalIdentityProvider
@@ -255,6 +257,15 @@ class _Artifacts:
         # each included document consumed them (LOT 34).  It still selects the
         # document itself by manifest identity, never by "current".
         self.current_calls.append((run_id, stage))
+        if stage == ProductionArtifactStage.PUBLICATION.value:
+            return next(
+                (
+                    artifact
+                    for artifact in self.artifacts.values()
+                    if artifact.production_run_id == run_id
+                ),
+                None,
+            )
         assert stage in {
             ProductionArtifactStage.EXTRACTION.value,
             ProductionArtifactStage.REFERENCES.value,
@@ -575,6 +586,89 @@ async def test_accept_refuses_an_include_until_its_projection_is_materialized() 
     assert response.json()["detail"]["code"] == "review_cannot_be_accepted"
     assert uow.publication_manifests.manifest is None
     assert uow.editions.edition.status is EditionStatus.REVIEW
+
+
+@pytest.mark.asyncio
+async def test_preview_is_read_only_and_uses_the_same_edition_document_as_final() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=SubjectProductionStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    preview_service = EditionPreviewService(lambda: uow, blobs)  # type: ignore[arg-type]
+    before = uow.editions.edition.snapshot()
+
+    preview = await preview_service.preview(EDITION_ID)
+
+    assert preview.stale is False
+    assert preview.artifacts[0].artifact_id == ARTIFACT_A
+    assert uow.publication_manifests.manifest is None
+    assert uow.editions.edition.snapshot() == before
+
+    accepted = await EditionPublicationService(lambda: uow, blobs).accept(
+        EDITION_ID, actor_id="analyst"
+    )
+    release = await EditionAssemblyService(lambda: uow, blobs).assemble(accepted.manifest_id)
+    final_document = await blobs.read_json(release.edition_document_blob_id)
+    assert EditionDocumentV2.from_json(final_document) == preview.document
+
+
+@pytest.mark.asyncio
+async def test_preview_becomes_stale_when_the_current_publication_artifact_changes() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=SubjectProductionStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    preview_service = EditionPreviewService(lambda: uow, blobs)  # type: ignore[arg-type]
+    previous = await preview_service.preview(EDITION_ID)
+
+    replacement_id = uuid4()
+    replacement_blob = uuid4()
+    blobs.blobs[replacement_blob] = json.dumps(_document("Replacement").to_json()).encode()
+    replacement = _artifact(replacement_id, RUN_A, SUBJECT_A, replacement_blob)
+    replacement.input_hash = "b" * 64
+    uow.production_artifacts.artifacts = {
+        replacement_id: replacement
+    }
+    uow.edition_review_read_model.rows[0] = replace(
+        row,
+        document_artifact_id=replacement_id,
+        document_input_hash="b" * 64,
+    )
+
+    current = await preview_service.preview(
+        EDITION_ID,
+        previous_preview_input_hash=previous.preview_input_hash,
+    )
+
+    assert current.stale is True
+    assert current.preview_input_hash != previous.preview_input_hash
+    assert current.document.publications[0].document.title == "Replacement"
 
 
 @pytest.mark.parametrize(

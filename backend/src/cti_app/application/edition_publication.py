@@ -15,6 +15,11 @@ from uuid import UUID
 from pydantic import ConfigDict
 
 from cti_app.application.docx_postprocessing import edition_template_values
+from cti_app.application.edition_document import (
+    EditionDocumentArtifactRef,
+    EditionDocumentBuildError,
+    build_edition_document,
+)
 from cti_app.application.edition_release_materialization import (
     EditionReleaseRematerializationService,
 )
@@ -38,8 +43,6 @@ from cti_app.application.production_repairs import (
     publication_is_compatible_with_current_effective_inputs,
 )
 from cti_app.domain.edition_publication import (
-    EditionDocumentV2,
-    EditionPublicationV2,
     EditionRelease,
     PublicationManifestEntryV1,
     PublicationManifestExclusionV1,
@@ -48,10 +51,6 @@ from cti_app.domain.edition_publication import (
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.jobs import InvalidJobTransitionError, Job, JobStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
-from cti_app.domain.publication import (
-    PublicationDocumentV2,
-    publication_document_from_json,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -119,23 +118,6 @@ class EditionReleaseStatus:
     @property
     def published_at(self) -> datetime | None:
         return self.release.created_at if self.release is not None else None
-
-
-def _edition_metadata_projection(edition: Edition) -> dict[str, Any]:
-    """Return the stable editorial metadata embedded in a release document."""
-    return {
-        "id": str(edition.id),
-        "country": edition.country,
-        "country_code": edition.country_code,
-        "period_start": edition.period_start.isoformat(),
-        "period_end": edition.period_end.isoformat(),
-        "tlp": edition.tlp.value,
-        "languages": list(edition.languages),
-        "previous_edition_id": (
-            str(edition.previous_edition_id) if edition.previous_edition_id else None
-        ),
-        "source_profile": edition.source_profile,
-    }
 
 
 class _WorkspaceReleaseMaterializer(Protocol):
@@ -528,48 +510,34 @@ class EditionAssemblyService:
             if blob_manifest != manifest:
                 raise PublicationAssemblyError("manifest_blob_mismatch")
 
-            current_publications: list[EditionPublicationV2] = []
-            async with self._uow_factory() as uow:
-                for entry in manifest.entries:
-                    run = await uow.subject_production_runs.get(entry.production_run_id)
-                    artifact = await uow.production_artifacts.get(entry.document_artifact_id)
-                    if (
-                        run is None
-                        or artifact is None
-                        or run.edition_id != manifest.edition_id
-                        or run.subject_id != entry.subject_id
-                        or run.pipeline_generation != entry.pipeline_generation
-                        or artifact.production_run_id != entry.production_run_id
-                        or artifact.subject_id != entry.subject_id
-                        or artifact.id != entry.document_artifact_id
-                        or artifact.version != entry.document_artifact_version
-                        or artifact.input_hash != entry.document_input_hash
-                        or artifact.stage is not ProductionArtifactStage.PUBLICATION
-                        or artifact.status is not ProductionArtifactStatus.VERIFIED
-                        or artifact.canonical_blob_id is None
-                    ):
-                        raise PublicationAssemblyError("manifest_artifact_mismatch")
-                    payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
-                    try:
-                        publication = publication_document_from_json(payload)
-                    except (KeyError, TypeError, ValueError) as exc:
-                        raise PublicationAssemblyError("publication_document_invalid") from exc
-                    if not isinstance(publication, PublicationDocumentV2):
-                        raise PublicationAssemblyError("publication_document_schema_mismatch")
-                    current_publications.append(
-                        EditionPublicationV2(
-                            position=entry.position,
-                            subject_id=entry.subject_id,
-                            document=publication,
-                        )
-                    )
-
-            # Keep the stable projection and routing metadata detached from
-            # the UoW; they are rendering/workspace inputs only.
-            edition_document = EditionDocumentV2(
-                edition=_edition_metadata_projection(edition),
-                publications=tuple(current_publications),
+            refs = tuple(
+                EditionDocumentArtifactRef(
+                    position=entry.position,
+                    subject_id=entry.subject_id,
+                    production_run_id=entry.production_run_id,
+                    pipeline_generation=entry.pipeline_generation,
+                    artifact_id=entry.document_artifact_id,
+                    artifact_version=entry.document_artifact_version,
+                    input_hash=entry.document_input_hash,
+                )
+                for entry in manifest.entries
             )
+            async with self._uow_factory() as uow:
+                try:
+                    edition_document = await build_edition_document(
+                        uow,
+                        self._artifact_store,
+                        edition,
+                        refs,
+                        require_current=False,
+                    )
+                except EditionDocumentBuildError as exc:
+                    code = (
+                        "manifest_artifact_mismatch"
+                        if exc.code == "edition_document_artifact_mismatch"
+                        else exc.code
+                    )
+                    raise PublicationAssemblyError(code) from exc
             markdown = render_edition_pandoc(edition_document)
             edition_json = edition_document.to_json()
             edition_blob_id, edition_hash = await self._artifact_store.put_canonical_json(

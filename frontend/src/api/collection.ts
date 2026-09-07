@@ -49,6 +49,24 @@ export interface CollectedSource {
   tlp: string | null;
   logical_filename: string | null;
   detected_mime_type: string | null;
+  archive_receipt: ArchiveReceipt | null;
+}
+
+export interface ArchiveReceipt {
+  subject_id: string;
+  collection_id: string;
+  source_document_id: string;
+  raw_blob_id: string;
+  decoded_blob_id: string;
+  blob_ids: Record<string, string>;
+  encoded_sha256: string;
+  decoded_sha256: string;
+  bytes: number;
+  declared_mime_type: string;
+  detected_mime_type: string;
+  actor_id: string;
+  correlation_id: string;
+  completed_at: string;
 }
 
 export type SourceRole =
