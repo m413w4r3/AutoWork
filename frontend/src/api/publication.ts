@@ -703,20 +703,112 @@ function emptyEditionRepairPage(): EditionRepairPage {
 
 async function apiError(response: Response): Promise<ApiError> {
   const body = (await response.json().catch(() => null)) as {
-    detail?: { code?: unknown; message?: unknown } | string;
+    detail?: Record<string, unknown> | string;
   } | null;
   const detail = body?.detail;
+  const structured =
+    typeof detail === "object" && detail !== null ? detail : null;
   const message =
     typeof detail === "string"
       ? detail
-      : typeof detail?.message === "string"
-        ? detail.message
+      : typeof structured?.message === "string"
+        ? structured.message
         : "La revue de publication n’a pas pu être mise à jour.";
   const code =
-    typeof detail === "object" &&
-    detail !== null &&
-    typeof detail.code === "string"
-      ? detail.code
+    typeof structured?.code === "string"
+      ? structured.code
       : "publication_error";
-  return new ApiError(message, code, response.status);
+  const diagnostic = repairDiagnostic(structured);
+  return diagnostic
+    ? new RepairApplicationError(message, code, response.status, diagnostic)
+    : new ApiError(message, code, response.status);
+}
+
+/**
+ * Structured explanation of a failed repair application. The backend names the
+ * step that stopped and the single action that unblocks it; the wording of
+ * that action belongs here, never to the API.
+ */
+export interface RepairApplicationDiagnostic {
+  repair_id: string;
+  stage: RepairApplicationStage;
+  error_code: string;
+  message: string;
+  remediation: RepairRemediation;
+}
+
+export type RepairApplicationStage =
+  "fence" | "payload" | "projection" | "assembly" | "qa" | "references";
+
+export type RepairRemediation =
+  | "reload_repair_queue"
+  | "reauthenticate"
+  | "wait_for_run"
+  | "reopen_edition"
+  | "rerun_extraction"
+  | "resubmit_correction"
+  | "rerun_assembly"
+  | "rerun_references"
+  | "open_qa_report"
+  | "reconcile_submission"
+  | "contact_operations";
+
+export class RepairApplicationError extends ApiError {
+  constructor(
+    message: string,
+    code: string,
+    status: number,
+    public readonly diagnostic: RepairApplicationDiagnostic,
+  ) {
+    super(message, code, status);
+  }
+}
+
+const REPAIR_APPLICATION_STAGES: ReadonlySet<string> = new Set([
+  "fence",
+  "payload",
+  "projection",
+  "assembly",
+  "qa",
+  "references",
+]);
+
+const REPAIR_REMEDIATIONS: ReadonlySet<string> = new Set([
+  "reload_repair_queue",
+  "reauthenticate",
+  "wait_for_run",
+  "reopen_edition",
+  "rerun_extraction",
+  "resubmit_correction",
+  "rerun_assembly",
+  "rerun_references",
+  "open_qa_report",
+  "reconcile_submission",
+  "contact_operations",
+]);
+
+/** Accept the diagnostic only when every control value is one we can render. */
+function repairDiagnostic(
+  detail: Record<string, unknown> | null,
+): RepairApplicationDiagnostic | null {
+  if (detail === null) return null;
+  const { repair_id, stage, error_code, message, remediation } = detail;
+  if (
+    typeof repair_id !== "string" ||
+    typeof error_code !== "string" ||
+    typeof message !== "string" ||
+    typeof stage !== "string" ||
+    typeof remediation !== "string" ||
+    !REPAIR_APPLICATION_STAGES.has(stage) ||
+    !REPAIR_REMEDIATIONS.has(remediation)
+  ) {
+    return null;
+  }
+  return {
+    repair_id,
+    stage: stage as RepairApplicationStage,
+    error_code,
+    message,
+    remediation: remediation as RepairRemediation,
+  };
 }

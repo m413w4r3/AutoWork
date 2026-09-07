@@ -13,10 +13,13 @@ import {
   type EditionRepairItem,
   type EditionRepairPage,
   type EditionRepairSummary,
+  RepairApplicationError,
   type ProductionRepairAction,
+  type RepairApplicationDiagnostic,
   type ReviewItem,
 } from "../../api/publication";
 import { ApiError } from "../../api/editions";
+import { RepairApplicationDiagnosticView } from "./RepairApplicationDiagnostic";
 import { ReviewItemCard } from "./ReviewItemCard";
 import {
   RepairQueue,
@@ -107,6 +110,10 @@ export function RepairDesk({
     null,
   );
   const [message, setMessage] = useState<string | null>(null);
+  // A failed application is not a sentence: the backend names the step and the
+  // single action that unblocks it, and the analyst sees both.
+  const [applicationError, setApplicationError] =
+    useState<RepairApplicationDiagnostic | null>(null);
   const [pendingRebuilds, setPendingRebuilds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -276,6 +283,7 @@ export function RepairDesk({
       rebuildEditionReviewItem(editionId, subjectId),
     retry: false,
     onMutate: (subjectId) => {
+      setApplicationError(null);
       setPendingRebuilds((current) => new Set(current).add(subjectId));
     },
     onSuccess: (result, subjectId) => {
@@ -320,6 +328,9 @@ export function RepairDesk({
           "L’article a changé. La file a été rechargée avant une nouvelle tentative.",
         );
         invalidateRepairDesk(queryClient, editionId);
+      } else if (error instanceof RepairApplicationError) {
+        setMessage(null);
+        setApplicationError(error.diagnostic);
       } else {
         setMessage(
           error instanceof Error ? error.message : "L’application a échoué.",
@@ -395,6 +406,9 @@ export function RepairDesk({
         </div>
       </div>
 
+      {applicationError ? (
+        <RepairApplicationDiagnosticView diagnostic={applicationError} />
+      ) : null}
       {message ? (
         <p className="repair-desk__message" role="status">
           {message}

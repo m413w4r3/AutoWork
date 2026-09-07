@@ -64,6 +64,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairStatusError,
     ProductionRepairValueNotVerifiableError,
     classify_repair_impact,
+    repair_application_diagnostic,
     repair_issue_execution_state,
 )
 from cti_app.domain.jobs import JobStatus
@@ -982,25 +983,34 @@ async def _edition_subject_production_state(
         return run, current, batch_id
 
 
-def _rebuild_error(exc: Exception) -> HTTPException:
+def _rebuild_error(exc: Exception, *, repair_id: str) -> HTTPException:
+    """Return the failure as a diagnostic, never as an opaque conflict.
+
+    ``code`` and ``message`` keep the historical shape every existing client
+    reads; the added ``stage`` and ``remediation`` say where the application
+    stopped and what the analyst can do, so the desk stops falling back to
+    "the publication review could not be updated".
+    """
     if isinstance(exc, ProductionReconciliationRequiredError):
-        return HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "production_reconciliation_required"},
-        )
-    if isinstance(exc, (ProductionReferenceRepairError, ProductionRepairProjectionError)):
+        code = "production_reconciliation_required"
+        message = str(exc) or code
+    elif isinstance(exc, (ProductionReferenceRepairError, ProductionRepairProjectionError)):
         code = getattr(exc, "code", None) or str(exc)
-        return HTTPException(
-            status_code=(
-                status.HTTP_404_NOT_FOUND
-                if code in {"production_run_not_found", "references_artifact_not_found"}
-                else status.HTTP_409_CONFLICT
-            ),
-            detail={"code": code, "message": str(exc)},
-        )
+        message = str(exc)
+    else:
+        code = getattr(exc, "code", None) or str(exc)
+        message = str(exc)
     return HTTPException(
-        status_code=status.HTTP_409_CONFLICT,
-        detail={"code": str(exc)},
+        status_code=(
+            status.HTTP_404_NOT_FOUND
+            if code in {"production_run_not_found", "references_artifact_not_found"}
+            else status.HTTP_409_CONFLICT
+        ),
+        detail={
+            "code": code,
+            "message": message or code,
+            **repair_application_diagnostic(code, message, repair_id=repair_id),
+        },
     )
 
 
@@ -1269,7 +1279,7 @@ async def rebuild_edition_review_item(
     except HTTPException:
         raise
     except Exception as exc:
-        raise _rebuild_error(exc) from exc
+        raise _rebuild_error(exc, repair_id=str(subject_id)) from exc
 
 
 @router.post(

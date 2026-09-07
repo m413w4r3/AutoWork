@@ -41,6 +41,45 @@ class ProductionRepairIssueKind(StrEnum):
     SUPPLEMENTAL_SOURCE_UNARCHIVED = "supplemental_source_unarchived"
 
 
+class RepairApplicationStage(StrEnum):
+    """Where a repair application stopped.
+
+    The analyst needs to know which step failed to know what to do next: a
+    decision the desk can revise, a payload that must be recovered, an
+    assembly to retry, or an edition state to change.  Free-form messages
+    could not carry that, so the stage is a control value like every other.
+    """
+
+    FENCE = "fence"
+    PAYLOAD = "payload"
+    PROJECTION = "projection"
+    ASSEMBLY = "assembly"
+    QA = "qa"
+    REFERENCES = "references"
+
+
+class RepairRemediation(StrEnum):
+    """The one action that unblocks a failed repair application.
+
+    A control value, not a sentence: the desk owns the wording, the backend
+    owns which action is correct. An analyst who is told "the review could not
+    be updated" has nothing to do; one who is told the payload must be
+    recovered or the value excluded has exactly one next step.
+    """
+
+    RELOAD_REPAIR_QUEUE = "reload_repair_queue"
+    REAUTHENTICATE = "reauthenticate"
+    WAIT_FOR_RUN = "wait_for_run"
+    REOPEN_EDITION = "reopen_edition"
+    RERUN_EXTRACTION = "rerun_extraction"
+    RESUBMIT_CORRECTION = "resubmit_correction"
+    RERUN_ASSEMBLY = "rerun_assembly"
+    RERUN_REFERENCES = "rerun_references"
+    OPEN_QA_REPORT = "open_qa_report"
+    RECONCILE_SUBMISSION = "reconcile_submission"
+    CONTACT_OPERATIONS = "contact_operations"
+
+
 class ProductionRepairImpactKind(StrEnum):
     """Semantic impact of a repair on the derived production outputs."""
 
@@ -116,6 +155,34 @@ class RepairExecutionPlan:
     reuse_unknown_count: int = 0
 
 
+#: Impact kinds allowed to invalidate narrative content.  Everything else is a
+#: deterministic rebuild: it may never cost a provider call, and it may never
+#: stale SYNTHESIS or REFERENCES.  This is the granularity invariant -- it is
+#: enforced here, at the only place every planner, read model and
+#: materialization result must pass through, so no caller can quietly widen a
+#: publication repair into a full narrative rebuild.
+NARRATIVE_REPAIR_IMPACT_KINDS = frozenset(
+    {
+        ProductionRepairImpactKind.NARRATIVE,
+        ProductionRepairImpactKind.SOURCE_CORPUS,
+    }
+)
+
+#: Outputs only a narrative-class impact may invalidate.
+_NARRATIVE_ONLY_OUTPUTS = frozenset(
+    {
+        ProductionDerivedOutput.SYNTHESIS,
+        ProductionDerivedOutput.REFERENCES,
+    }
+)
+
+
+class RepairImpactInvariantError(ValueError):
+    """A repair impact claimed work its own kind forbids."""
+
+    code = "repair_impact_invariant_violated"
+
+
 @dataclass(frozen=True, slots=True)
 class ProductionRepairImpact:
     """Typed, immutable description of a repair's semantic impact."""
@@ -130,6 +197,24 @@ class ProductionRepairImpact:
     expected_q2_calls: int = 0
     expected_q2_reuses: int = 0
     reuse_unknown_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.kind in NARRATIVE_REPAIR_IMPACT_KINDS:
+            return
+        if self.model_call_required:
+            raise RepairImpactInvariantError(
+                f"{self.kind.value} must not require a model call"
+            )
+        if self.provider_steps:
+            raise RepairImpactInvariantError(
+                f"{self.kind.value} must not declare provider steps"
+            )
+        forbidden = self.affected_outputs & _NARRATIVE_ONLY_OUTPUTS
+        if forbidden:
+            raise RepairImpactInvariantError(
+                f"{self.kind.value} must not invalidate "
+                + ", ".join(sorted(output.value for output in forbidden))
+            )
 
     @property
     def execution_plan(self) -> RepairExecutionPlan:

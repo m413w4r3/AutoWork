@@ -90,8 +90,10 @@ from cti_app.domain.production import (
     ProductionRepairImpactKind,
     ProductionRepairIssueKind,
     ProductionRepairVerificationState,
+    RepairApplicationStage,
     RepairDecisionApplicationState,
     RepairIssueExecutionState,
+    RepairRemediation,
     SubjectProductionStage,
     SubjectProductionStatus,
     SupplementalSourceRepairState,
@@ -245,12 +247,16 @@ def extraction_item_contributes_to_synthesis(item: ExtractionItem) -> bool:
     if item.display_policy is DisplayPolicy.HIDDEN:
         return False
 
-    # A repaired IOC is publication-only regardless of whether the value was
-    # source-verified or explicitly overridden. It must never create Q4
-    # narrative evidence.
+    # A value re-admitted by a repair carries no narrative evidence: the
+    # projection builds it with an empty context and no evidence quote, so it
+    # belongs to a deterministic publication list -- the IOC section for a
+    # publication IOC, the technical body otherwise -- and never to the Q4
+    # evidence pack.  Restricting this carve-out to ``IOC_SECTION`` made a
+    # filename/filepath/CVE repair change the Q4 projection, which classified
+    # the whole article as NARRATIVE and charged it a synthesis model call.
     if (
-        item.display_policy is DisplayPolicy.IOC_SECTION
-        and not item.context.strip()
+        not item.context.strip()
+        and not item.evidence_quote.strip()
         and (
             item.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
             or item.provenance is IndicatorProvenance.ANALYST
@@ -569,6 +575,140 @@ class ProductionReferenceRepairError(ValueError):
     def __init__(self, code: str, message: str | None = None) -> None:
         self.code = code
         super().__init__(message or code)
+
+
+#: Every way a repair application can stop, mapped to the step that stopped it
+#: and to the one action that unblocks it.  A code absent from this table is
+#: still reported -- with the generic remediation -- so a new failure is never
+#: rendered as an unexplained "the review could not be updated".
+_REPAIR_FAILURE_DIAGNOSTICS: dict[str, tuple[RepairApplicationStage, RepairRemediation]] = {
+    "production_repair_actor_required": (
+        RepairApplicationStage.FENCE,
+        RepairRemediation.REAUTHENTICATE,
+    ),
+    "production_run_not_found": (
+        RepairApplicationStage.FENCE,
+        RepairRemediation.RELOAD_REPAIR_QUEUE,
+    ),
+    "production_run_edition_changed": (
+        RepairApplicationStage.FENCE,
+        RepairRemediation.RELOAD_REPAIR_QUEUE,
+    ),
+    "production_repair_stale": (
+        RepairApplicationStage.FENCE,
+        RepairRemediation.RELOAD_REPAIR_QUEUE,
+    ),
+    "edition_not_found": (
+        RepairApplicationStage.FENCE,
+        RepairRemediation.RELOAD_REPAIR_QUEUE,
+    ),
+    "production_repair_run_not_reviewable": (
+        RepairApplicationStage.FENCE,
+        RepairRemediation.WAIT_FOR_RUN,
+    ),
+    "edition_frozen_for_publication": (
+        RepairApplicationStage.FENCE,
+        RepairRemediation.REOPEN_EDITION,
+    ),
+    "production_reconciliation_required": (
+        RepairApplicationStage.FENCE,
+        RepairRemediation.RECONCILE_SUBMISSION,
+    ),
+    "repair_payload_unavailable": (
+        RepairApplicationStage.PAYLOAD,
+        RepairRemediation.RERUN_EXTRACTION,
+    ),
+    "repair_payload_hash_mismatch": (
+        RepairApplicationStage.PAYLOAD,
+        RepairRemediation.RERUN_EXTRACTION,
+    ),
+    "repair_correction_unavailable": (
+        RepairApplicationStage.PAYLOAD,
+        RepairRemediation.RESUBMIT_CORRECTION,
+    ),
+    "repair_correction_payload_unavailable": (
+        RepairApplicationStage.PAYLOAD,
+        RepairRemediation.RESUBMIT_CORRECTION,
+    ),
+    "repair_correction_hash_mismatch": (
+        RepairApplicationStage.PAYLOAD,
+        RepairRemediation.RESUBMIT_CORRECTION,
+    ),
+    "extraction_artifact_not_found": (
+        RepairApplicationStage.PROJECTION,
+        RepairRemediation.RERUN_EXTRACTION,
+    ),
+    "extraction_payload_missing": (
+        RepairApplicationStage.PROJECTION,
+        RepairRemediation.RERUN_EXTRACTION,
+    ),
+    "extraction_payload_unavailable": (
+        RepairApplicationStage.PROJECTION,
+        RepairRemediation.RERUN_EXTRACTION,
+    ),
+    "repair_projection_base_not_found": (
+        RepairApplicationStage.PROJECTION,
+        RepairRemediation.RERUN_EXTRACTION,
+    ),
+    "production_repair_storage_unavailable": (
+        RepairApplicationStage.PROJECTION,
+        RepairRemediation.CONTACT_OPERATIONS,
+    ),
+    "production_artifact_stale_port_unavailable": (
+        RepairApplicationStage.PROJECTION,
+        RepairRemediation.CONTACT_OPERATIONS,
+    ),
+    "publication_inputs_missing": (
+        RepairApplicationStage.ASSEMBLY,
+        RepairRemediation.RERUN_ASSEMBLY,
+    ),
+    "qa_inputs_missing": (
+        RepairApplicationStage.QA,
+        RepairRemediation.RERUN_ASSEMBLY,
+    ),
+    "production_repair_qa_failed": (
+        RepairApplicationStage.QA,
+        RepairRemediation.OPEN_QA_REPORT,
+    ),
+    "references_artifact_not_found": (
+        RepairApplicationStage.REFERENCES,
+        RepairRemediation.RERUN_REFERENCES,
+    ),
+    "references_payload_missing": (
+        RepairApplicationStage.REFERENCES,
+        RepairRemediation.RERUN_REFERENCES,
+    ),
+    "research_date_missing": (
+        RepairApplicationStage.REFERENCES,
+        RepairRemediation.RERUN_REFERENCES,
+    ),
+}
+
+
+def repair_application_diagnostic(
+    error_code: str,
+    message: str,
+    *,
+    repair_id: str,
+) -> dict[str, str]:
+    """Describe a failed repair application in terms an analyst can act on.
+
+    ``repair_id`` identifies the arbitration the analyst was applying -- the
+    article's subject for an article-wide application -- so a support exchange
+    names the same object the desk shows.  An unmapped code degrades to the
+    projection stage and a queue reload rather than to nothing at all.
+    """
+    stage, remediation = _REPAIR_FAILURE_DIAGNOSTICS.get(
+        error_code,
+        (RepairApplicationStage.PROJECTION, RepairRemediation.RELOAD_REPAIR_QUEUE),
+    )
+    return {
+        "repair_id": repair_id,
+        "stage": stage.value,
+        "error_code": error_code,
+        "message": message or error_code,
+        "remediation": remediation.value,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1248,11 +1388,26 @@ def _q2_preview(issue: Any) -> dict[str, int]:
     }
 
 
+#: Every arbitration of a rejected Q2 artifact -- an IOC or any other
+#: extraction value -- is projected without context and without an evidence
+#: quote, so it can only change the deterministic publication.  Narrative
+#: content (attribution, chronology, conclusion) is decided by Q4 from the Q1
+#: report and the contextual Q2 evidence, neither of which a repair touches.
+_INDICATOR_REPAIR_REASON = (
+    "The repair changes only the deterministic publication projection of an extracted value."
+)
+
+
 def classify_repair_impact(
     issue: ProductionRepairIssueView | SupplementalSourceRepairIssue,
     decision: ProductionRepairDecision | None,
 ) -> ProductionRepairImpact:
     """Classify a repair by the derived products whose content can change.
+
+    An arbitration of a rejected extraction value is never NARRATIVE: the
+    projection admits it with an empty context, so it reaches the publication
+    (IOC section or technical body) without entering the Q4 evidence pack.
+    Only a source-corpus change can still owe a new synthesis.
 
     A Q1 source is classified from the CURRENT factual state of its
     collection, before any decision is read: current factual source state
@@ -1328,20 +1483,12 @@ def classify_repair_impact(
                 ready_to_apply=False,
                 reason="Including the rule changes only the accepted detection-rule bundle.",
             )
-        if is_publication_ioc_artifact_type(getattr(issue, "artifact_type", None)):
-            return _repair_impact(
-                ProductionRepairImpactKind.PUBLICATION_ONLY,
-                _PUBLICATION_OUTPUTS,
-                model_call_required=False,
-                ready_to_apply=False,
-                reason="Including the IOC changes only a public IOC projection.",
-            )
         return _repair_impact(
-            ProductionRepairImpactKind.NARRATIVE,
-            _NARRATIVE_OUTPUTS,
-            model_call_required=True,
+            ProductionRepairImpactKind.PUBLICATION_ONLY,
+            _PUBLICATION_OUTPUTS,
+            model_call_required=False,
             ready_to_apply=False,
-            reason="Including the value adds or removes narrative technical evidence.",
+            reason=_INDICATOR_REPAIR_REASON,
         )
 
     q2_issue = cast(ProductionRepairIssueView, issue)
@@ -1370,23 +1517,12 @@ def classify_repair_impact(
             reason="The repair changes only the accepted detection-rule bundle.",
         )
 
-    # Deliberately classify from the actual artifact type, never from the
-    # broad rejected-indicator label or a copied UI boolean.
-    if is_publication_ioc_artifact_type(q2_issue.artifact_type):
-        return _repair_impact(
-            ProductionRepairImpactKind.PUBLICATION_ONLY,
-            _PUBLICATION_OUTPUTS,
-            model_call_required=False,
-            ready_to_apply=not _issue_is_unbuildable(q2_issue),
-            reason="The repair changes only a public IOC projection.",
-        )
-
     return _repair_impact(
-        ProductionRepairImpactKind.NARRATIVE,
-        _NARRATIVE_OUTPUTS,
-        model_call_required=True,
+        ProductionRepairImpactKind.PUBLICATION_ONLY,
+        _PUBLICATION_OUTPUTS,
+        model_call_required=False,
         ready_to_apply=not _issue_is_unbuildable(q2_issue),
-        reason="The repair adds or removes narrative technical evidence.",
+        reason=_INDICATOR_REPAIR_REASON,
     )
 
 
@@ -3508,6 +3644,28 @@ class ProductionRepairMaterializationResult:
         return self.projection.changed
 
 
+def _repair_artifacts_updated(
+    result: ProductionRepairMaterializationResult,
+) -> list[str]:
+    """Name the artifacts an application really rewrote, never those it planned.
+
+    ``affected_outputs`` is a plan; this is the observed outcome, so a
+    diagnostic can be read as proof that an IOC repair left SYNTHESIS alone.
+    """
+    updated: list[str] = []
+    if result.changed and result.action not in {"none", "awaiting_repair_decision"}:
+        updated.append(ProductionArtifactStage.EXTRACTION.value)
+    if result.publication_artifact is not None:
+        updated.append(ProductionArtifactStage.PUBLICATION.value)
+    if result.action == "rules_materialized":
+        updated.append(ProductionDerivedOutput.RULE_BUNDLE.value)
+    if result.retry_stage is not None:
+        # A retry stales an output instead of rewriting it: the analyst is
+        # told which stage now owes a rebuild.
+        updated.append(f"stale:{result.retry_stage}")
+    return updated
+
+
 class ProductionRepairMaterializationService:
     """Apply only the downstream work required by a semantic repair impact."""
 
@@ -3543,6 +3701,46 @@ class ProductionRepairMaterializationService:
         observed_run_id: UUID | None = None,
         observed_pipeline_generation: int | None = None,
     ) -> ProductionRepairMaterializationResult:
+        """Apply a repair and record exactly what it changed.
+
+        The outcome is recorded here rather than at each early return, so
+        ``production.repair.applied`` is emitted once per application and
+        always describes the result the caller receives.
+        """
+        started = perf_counter()
+        result = await self._apply(
+            edition_id=edition_id,
+            subject_id=subject_id,
+            actor_id=actor_id,
+            observed_run_id=observed_run_id,
+            observed_pipeline_generation=observed_pipeline_generation,
+            started=started,
+        )
+        self._diagnostics.record(
+            event="production.repair.applied",
+            run_id=result.projection.artifact.production_run_id,
+            subject_id=subject_id,
+            stage="repair",
+            impact_kind=result.impact.kind.value,
+            action=result.action,
+            projection_changed=result.changed,
+            artifacts_updated=_repair_artifacts_updated(result),
+            model_call_required=result.impact.model_call_required,
+            decision_count=len(result.projection.decision_ids),
+            duration_ms=max(0, round((perf_counter() - started) * 1000)),
+        )
+        return result
+
+    async def _apply(
+        self,
+        *,
+        edition_id: UUID,
+        subject_id: UUID,
+        actor_id: str,
+        observed_run_id: UUID | None,
+        observed_pipeline_generation: int | None,
+        started: float,
+    ) -> ProductionRepairMaterializationResult:
         """Apply a repair as a single transactional change to the deliverable.
 
         One transaction and one fence: the optimistic generation check, the
@@ -3552,7 +3750,6 @@ class ProductionRepairMaterializationService:
         outputs it invalidates are still the previous ones, and a freeze
         running concurrently observes either the whole repair or none of it.
         """
-        started = perf_counter()
         actor_id = actor_id.strip()
         if not actor_id:
             raise ProductionRepairProjectionError("production_repair_actor_required")

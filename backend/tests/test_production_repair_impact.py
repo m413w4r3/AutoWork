@@ -173,14 +173,41 @@ def test_include_of_already_materialized_value_has_no_deliverable_change() -> No
 
 
 @pytest.mark.parametrize("artifact_type", ["filename", "filepath", "cve"])
-def test_include_non_ioc_artifact_is_narrative(artifact_type: str) -> None:
+def test_include_non_ioc_artifact_is_publication_only(artifact_type: str) -> None:
+    """A non-IOC extracted value reaches the body, never the Q4 evidence pack.
+
+    The projection admits it without context and without an evidence quote, so
+    the publication can render it deterministically from the existing
+    synthesis. Charging it a narrative rebuild was the defect this pins.
+    """
     issue = _issue(artifact_type=artifact_type)
 
     impact = classify_repair_impact(issue, _decision(issue, ProductionRepairAction.INCLUDE))
 
-    assert impact.kind is ProductionRepairImpactKind.NARRATIVE
-    assert impact.model_call_required
-    assert ProductionDerivedOutput.SYNTHESIS in impact.affected_outputs
+    assert impact.kind is ProductionRepairImpactKind.PUBLICATION_ONLY
+    assert not impact.model_call_required
+    assert ProductionDerivedOutput.SYNTHESIS not in impact.affected_outputs
+
+
+@pytest.mark.parametrize(
+    "action", [ProductionRepairAction.INCLUDE, ProductionRepairAction.EXCLUDE]
+)
+@pytest.mark.parametrize(
+    "artifact_type", ["hash", "ip", "domain", "url", "email", "filename", "filepath", "cve"]
+)
+def test_no_extraction_value_repair_is_ever_narrative(
+    artifact_type: str, action: ProductionRepairAction
+) -> None:
+    """The granularity invariant, stated once over the whole action matrix."""
+    for state in RepairDecisionApplicationState:
+        issue = _issue(artifact_type=artifact_type, application_state=state)
+
+        impact = classify_repair_impact(issue, _decision(issue, action))
+
+        assert impact.kind is not ProductionRepairImpactKind.NARRATIVE
+        assert not impact.model_call_required
+        assert ProductionDerivedOutput.SYNTHESIS not in impact.affected_outputs
+        assert ProductionDerivedOutput.REFERENCES not in impact.affected_outputs
 
 
 def _source_issue(

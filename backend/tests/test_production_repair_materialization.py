@@ -413,16 +413,24 @@ async def test_materialization_diagnostics_are_structured_and_value_free(tmp_pat
         "production.repair.plan",
         "production.repair.projection_completed",
         "production.repair.rule_bundle_materialized",
+        "production.repair.applied",
     } <= names
     for event in events:
-        if event["event"].startswith("production.repair."):
-            assert event["run_id"] == str(RUN_ID)
-            assert event["subject_id"] == str(SUBJECT_ID)
-            assert event["impact_kind"] == ProductionRepairImpactKind.RULE_BUNDLE_ONLY.value
+        if not event["event"].startswith("production.repair."):
+            continue
+        assert event["run_id"] == str(RUN_ID)
+        assert event["subject_id"] == str(SUBJECT_ID)
+        assert event["impact_kind"] == ProductionRepairImpactKind.RULE_BUNDLE_ONLY.value
+        assert isinstance(event["model_call_required"], bool)
+        assert isinstance(event["duration_ms"], int)
+        if event["event"] == "production.repair.applied":
+            # The outcome, not the plan: what really changed on disk.
+            assert isinstance(event["projection_changed"], bool)
+            assert event["artifacts_updated"] == ["extraction", "rule_bundle"]
+            assert event["action"] == "rules_materialized"
+        else:
             assert event["affected_outputs"]
-            assert isinstance(event["model_call_required"], bool)
             assert isinstance(event["reused_synthesis"], bool)
-            assert isinstance(event["duration_ms"], int)
 
 
 @pytest.mark.asyncio

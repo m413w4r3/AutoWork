@@ -136,7 +136,10 @@ _ARCHIVED_WAIVED = _source_issue(SupplementalSourceRepairState.ARCHIVED_PENDING_
 _RULE_INCLUDE = _rule_issue(RepairDecisionApplicationState.PROJECTION_REQUIRED)
 _RULE_EXCLUDE_FIRST = _rule_issue(RepairDecisionApplicationState.ALREADY_EFFECTIVE)
 _IOC_INCLUDE = _q2_issue(application_state=RepairDecisionApplicationState.PROJECTION_REQUIRED)
-_NARRATIVE_INCLUDE = _q2_issue(
+# A non-IOC extracted value (CVE, filename, filepath) is re-admitted by the
+# projection without context, so it reaches the publication body without
+# entering the Q4 evidence pack: it is publication-only, never narrative.
+_NON_IOC_INCLUDE = _q2_issue(
     artifact_type="cve",
     application_state=RepairDecisionApplicationState.PROJECTION_REQUIRED,
 )
@@ -278,11 +281,11 @@ PLANNER_MATRIX: tuple[_Row, ...] = (
         desk_offers_apply=True,
     ),
     _Row(
-        label="Q2 · narrative · include",
-        issue=_NARRATIVE_INCLUDE,
-        decision=_decision(_NARRATIVE_INCLUDE, ProductionRepairAction.INCLUDE),
+        label="Q2 · non-IOC value · include",
+        issue=_NON_IOC_INCLUDE,
+        decision=_decision(_NON_IOC_INCLUDE, ProductionRepairAction.INCLUDE),
         application_state=RepairDecisionApplicationState.PROJECTION_REQUIRED,
-        impact_kind=ProductionRepairImpactKind.NARRATIVE,
+        impact_kind=ProductionRepairImpactKind.PUBLICATION_ONLY,
         resolved=True,
         blocks_signoff=True,
         rebuild_required=True,
@@ -293,11 +296,11 @@ PLANNER_MATRIX: tuple[_Row, ...] = (
     _Row(
         # The one blocking state with no applicable plan: it is legal only
         # because the typed arbitration says what to do instead.
-        label="Q2 · narrative · include nothing could build",
+        label="Q2 · non-IOC value · include nothing could build",
         issue=_UNBUILDABLE_INCLUDE,
         decision=_decision(_UNBUILDABLE_INCLUDE, ProductionRepairAction.INCLUDE),
         application_state=RepairDecisionApplicationState.UNBUILDABLE,
-        impact_kind=ProductionRepairImpactKind.NARRATIVE,
+        impact_kind=ProductionRepairImpactKind.PUBLICATION_ONLY,
         resolved=True,
         blocks_signoff=True,
         rebuild_required=True,

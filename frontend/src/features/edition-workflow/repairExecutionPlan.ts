@@ -13,7 +13,7 @@ const IMPACT_SUBTITLES: Record<RepairExecutionPlan["impact_kind"], string> = {
   rule_bundle_only:
     "Extraction effective et fichiers de règles uniquement. Aucun appel modèle.",
   publication_only:
-    "Liste des IOC et rendu final uniquement. La synthèse existante sera conservée. Aucun appel modèle.",
+    "Valeurs publiées et rendu final uniquement. La synthèse existante sera conservée. Aucun appel modèle.",
   narrative:
     "Cette correction change le contenu narratif. Une nouvelle synthèse sera demandée.",
   source_corpus: "Les références, l’extraction et la synthèse peuvent changer.",

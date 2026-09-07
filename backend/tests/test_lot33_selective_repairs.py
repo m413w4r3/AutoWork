@@ -103,8 +103,10 @@ def _decision(
             ProductionRepairIssueKind.REJECTED_INDICATOR,
             "filename",
             ProductionRepairAction.INCLUDE,
-            ProductionRepairImpactKind.NARRATIVE,
-            True,
+            # A non-IOC value is projected without context: it renders in the
+            # body from the existing synthesis, so it stays publication-only.
+            ProductionRepairImpactKind.PUBLICATION_ONLY,
+            False,
         ),
         (
             ProductionRepairIssueKind.REJECTED_INDICATOR,
