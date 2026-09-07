@@ -20,6 +20,7 @@ from cti_app.application.production_repairs import (
     SupplementalSourceRepairIssue,
     classify_repair_impact,
     extraction_item_contributes_to_synthesis,
+    merge_repair_impacts,
     publication_projection_hash,
     rule_bundle_projection_hash,
     synthesis_projection_hash,
@@ -240,6 +241,57 @@ def test_archived_source_pending_references_invalidates_full_chain() -> None:
             ProductionDerivedOutput.PUBLICATION,
             ProductionDerivedOutput.CHECKPOINT,
         }
+    )
+
+
+def test_merge_rule_and_ioc_uses_publication_dominance_and_unions_outputs() -> None:
+    rule = _issue(
+        kind=ProductionRepairIssueKind.REJECTED_RULE,
+        artifact_type="yara_rule",
+    )
+    ioc = _issue(artifact_type="domain")
+
+    merged = merge_repair_impacts(
+        (
+            classify_repair_impact(rule, _decision(rule, ProductionRepairAction.INCLUDE)),
+            classify_repair_impact(ioc, _decision(ioc, ProductionRepairAction.INCLUDE)),
+        )
+    )
+
+    assert merged.kind is ProductionRepairImpactKind.PUBLICATION_ONLY
+    assert merged.affected_outputs == frozenset(
+        {
+            ProductionDerivedOutput.EXTRACTION,
+            ProductionDerivedOutput.PUBLICATION,
+            ProductionDerivedOutput.RULE_BUNDLE,
+            ProductionDerivedOutput.CHECKPOINT,
+        }
+    )
+    assert not merged.model_call_required
+    assert merged.ready_to_apply
+    assert "Mise à jour des fichiers YARA/Sigma" in merged.deterministic_steps
+    assert "Rendu Publication" in merged.deterministic_steps
+
+
+def test_merge_source_dominates_narrative_and_preserves_model_steps() -> None:
+    source = classify_repair_impact(
+        _source_issue(SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES), None
+    )
+    narrative_issue = _issue(artifact_type="filename")
+    narrative = classify_repair_impact(
+        narrative_issue,
+        _decision(narrative_issue, ProductionRepairAction.INCLUDE),
+    )
+
+    merged = merge_repair_impacts((narrative, source))
+
+    assert merged.kind is ProductionRepairImpactKind.SOURCE_CORPUS
+    assert ProductionDerivedOutput.REFERENCES in merged.affected_outputs
+    assert ProductionDerivedOutput.SYNTHESIS in merged.affected_outputs
+    assert merged.model_call_required
+    assert merged.provider_steps == (
+        "Nouvelle extraction possible",
+        "Nouvelle synthèse possible",
     )
 
 

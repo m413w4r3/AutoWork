@@ -107,9 +107,6 @@ export function RepairDesk({
     null,
   );
   const [message, setMessage] = useState<string | null>(null);
-  const [forcedRebuilds, setForcedRebuilds] = useState<
-    ReadonlyMap<string, string>
-  >(() => new Map());
   const [pendingRebuilds, setPendingRebuilds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -162,22 +159,8 @@ export function RepairDesk({
   );
   const articles = useMemo(() => {
     const current = deduplicateArticles(pages.flatMap((page) => page.articles));
-    const bySubject = new Map(
-      current.map((article) => [article.subject_id, article]),
-    );
-    for (const [subjectId, recommendedStage] of forcedRebuilds) {
-      if (!bySubject.has(subjectId)) {
-        bySubject.set(subjectId, {
-          subject_id: subjectId,
-          has_pending_projection: false,
-          recommended_stage: recommendedStage,
-          active_repair_count: 0,
-          resolved_since_last_build_count: 1,
-        });
-      }
-    }
-    return Array.from(bySubject.values());
-  }, [forcedRebuilds, pages]);
+    return current;
+  }, [pages]);
   const titles = useMemo(
     () => new Map(reviewItems.map((item) => [item.subject_id, item.title])),
     [reviewItems],
@@ -298,7 +281,7 @@ export function RepairDesk({
     onSuccess: (result, subjectId) => {
       if (result.action === "awaiting_repair_decision") {
         setMessage(
-          "La reconstruction attend encore des décisions dans la file de réparation.",
+          "L’application attend encore des décisions dans la file de réparation.",
         );
         setPendingRebuilds((current) => {
           const next = new Set(current);
@@ -307,15 +290,8 @@ export function RepairDesk({
         });
       } else {
         setMessage(
-          "Reconstruction lancée. Les arbitrages déjà enregistrés sont conservés.",
+          "Application lancée. Les arbitrages déjà enregistrés sont conservés.",
         );
-      }
-      if (result.action !== "awaiting_repair_decision") {
-        setForcedRebuilds((current) => {
-          const next = new Map(current);
-          next.delete(subjectId);
-          return next;
-        });
       }
       invalidateRepairDesk(queryClient, editionId);
     },
@@ -335,9 +311,7 @@ export function RepairDesk({
         invalidateRepairDesk(queryClient, editionId);
       } else {
         setMessage(
-          error instanceof Error
-            ? error.message
-            : "La reconstruction a échoué.",
+          error instanceof Error ? error.message : "L’application a échoué.",
         );
       }
     },
@@ -530,15 +504,7 @@ export function RepairDesk({
           }
           readOnly={readOnly}
           onChanged={changeRepair}
-          onArchived={(item) => {
-            const recommendedStage = item.recommended_stage;
-            if (recommendedStage) {
-              setForcedRebuilds((current) => {
-                const next = new Map(current);
-                next.set(item.subject_id, recommendedStage);
-                return next;
-              });
-            }
+          onArchived={() => {
             setMessage(
               "Source archivée — reconstruction des références nécessaire.",
             );

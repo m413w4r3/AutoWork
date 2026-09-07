@@ -15,12 +15,38 @@ import type {
   EditionRepairItem,
   EditionRepairPage,
   EditionReview,
+  RepairExecutionPlan,
   ReviewItem,
 } from "../../api/publication";
 import { ReviewConsole } from "./ReviewConsole";
 
 const EDITION_ID = "edition-lot24";
 const HASH = "a".repeat(64);
+
+const SOURCE_PLAN: RepairExecutionPlan = {
+  impact_kind: "source_corpus",
+  affected_outputs: [
+    "references",
+    "extraction",
+    "synthesis",
+    "publication",
+    "checkpoint",
+  ],
+  model_call_required: true,
+  provider_steps: [
+    "Nouvelle extraction possible",
+    "Nouvelle synthèse possible",
+  ],
+  deterministic_steps: [
+    "Source archivée",
+    "Références",
+    "Extraction",
+    "Synthèse si nécessaire",
+    "Publication",
+    "Contrôle QA",
+  ],
+  ready_to_apply: true,
+};
 
 const reviewItem: ReviewItem = {
   position: 1,
@@ -75,6 +101,7 @@ function sourceItem(
     resolved: true,
     resolution_reason: "source_archived_pending_references",
     rebuild_required: true,
+    execution_plan: SOURCE_PLAN,
     recommended_stage: "rebuild_references",
     repair_state: "archived_pending_references",
     is_publication_ioc: false,
@@ -94,6 +121,7 @@ function detailFor(item: EditionRepairItem): EditionRepairDetail {
     collection_state: item.collection_state,
     repair_state: item.repair_state,
     rebuild_required: item.rebuild_required,
+    execution_plan: item.execution_plan,
     effective_decision: item.effective_action
       ? {
           id: item.effective_decision_id ?? "decision-waive",
@@ -124,6 +152,7 @@ function serverState(item: EditionRepairItem) {
       {
         subject_id: "subject-1",
         has_pending_projection: false,
+        execution_plan: item.execution_plan,
         recommended_stage: item.recommended_stage ?? "none",
         active_repair_count: item.resolved ? 0 : 1,
         resolved_since_last_build_count:
@@ -206,12 +235,12 @@ afterEach(() => {
 });
 
 describe("Repair Desk — dette de reconstruction durable", () => {
-  it("expose le bouton reconstruire depuis le serveur et le conserve après un remount", async () => {
+  it("expose le plan source depuis le serveur et le conserve après un remount", async () => {
     stubServer(sourceItem());
 
     mountConsole();
     expect(
-      await screen.findByRole("button", { name: "Reconstruire cet article" }),
+      await screen.findByRole("button", { name: "Réintégrer la source" }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Accepter la production" }),
@@ -225,7 +254,7 @@ describe("Repair Desk — dette de reconstruction durable", () => {
     mountConsole();
 
     expect(
-      await screen.findByRole("button", { name: "Reconstruire cet article" }),
+      await screen.findByRole("button", { name: "Réintégrer la source" }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Accepter la production" }),

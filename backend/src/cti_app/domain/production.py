@@ -63,6 +63,18 @@ class ProductionDerivedOutput(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class RepairExecutionPlan:
+    """Backend-authoritative description of the work a repair entails."""
+
+    impact_kind: ProductionRepairImpactKind
+    affected_outputs: frozenset[ProductionDerivedOutput]
+    model_call_required: bool
+    provider_steps: tuple[str, ...]
+    deterministic_steps: tuple[str, ...]
+    ready_to_apply: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ProductionRepairImpact:
     """Typed, immutable description of a repair's semantic impact."""
 
@@ -70,6 +82,20 @@ class ProductionRepairImpact:
     affected_outputs: frozenset[ProductionDerivedOutput]
     model_call_required: bool
     reason: str
+    provider_steps: tuple[str, ...] = ()
+    deterministic_steps: tuple[str, ...] = ()
+    ready_to_apply: bool = True
+
+    @property
+    def execution_plan(self) -> RepairExecutionPlan:
+        return RepairExecutionPlan(
+            impact_kind=self.kind,
+            affected_outputs=self.affected_outputs,
+            model_call_required=self.model_call_required,
+            provider_steps=self.provider_steps,
+            deterministic_steps=self.deterministic_steps,
+            ready_to_apply=self.ready_to_apply,
+        )
 
 
 class SupplementalSourceRepairState(StrEnum):

@@ -13,6 +13,7 @@ import type {
   EditionRepairDetail,
   EditionRepairItem,
   EditionRepairPage,
+  RepairExecutionPlan,
   EditionReview,
   ProductionRepairDecision,
   ReviewItem,
@@ -21,6 +22,66 @@ import { ReviewConsole } from "./ReviewConsole";
 
 const EDITION_ID = "edition-repair-test";
 const HASH = "a".repeat(64);
+
+function executionPlanFor(
+  kind: EditionRepairItem["kind"],
+  ready = false,
+): RepairExecutionPlan {
+  if (kind === "rejected_rule") {
+    return {
+      impact_kind: "rule_bundle_only",
+      affected_outputs: ["extraction", "rule_bundle", "checkpoint"],
+      model_call_required: false,
+      provider_steps: [],
+      deterministic_steps: [
+        "Décision analyste",
+        "Projection Extraction",
+        "Mise à jour des fichiers YARA/Sigma",
+        "Contrôle QA",
+      ],
+      ready_to_apply: ready,
+    };
+  }
+  if (kind === "supplemental_source_unarchived") {
+    return {
+      impact_kind: "source_corpus",
+      affected_outputs: [
+        "references",
+        "extraction",
+        "synthesis",
+        "publication",
+        "checkpoint",
+      ],
+      model_call_required: true,
+      provider_steps: [
+        "Nouvelle extraction possible",
+        "Nouvelle synthèse possible",
+      ],
+      deterministic_steps: [
+        "Source archivée",
+        "Références",
+        "Extraction",
+        "Synthèse si nécessaire",
+        "Publication",
+        "Contrôle QA",
+      ],
+      ready_to_apply: ready,
+    };
+  }
+  return {
+    impact_kind: "publication_only",
+    affected_outputs: ["extraction", "publication", "checkpoint"],
+    model_call_required: false,
+    provider_steps: [],
+    deterministic_steps: [
+      "Décision analyste",
+      "Projection Extraction",
+      "Rendu Publication",
+      "Contrôle QA",
+    ],
+    ready_to_apply: ready,
+  };
+}
 
 function urlOf(input: RequestInfo | URL): string {
   if (typeof input === "string") return input;
@@ -80,9 +141,10 @@ const reviewItem: ReviewItem = {
 function repairItem(
   overrides: Partial<EditionRepairItem> = {},
 ): EditionRepairItem {
+  const kind = overrides.kind ?? "rejected_indicator";
   return {
     repair_key: "repair-ioc-1",
-    kind: "rejected_indicator",
+    kind,
     position: 1,
     subject_id: "subject-1",
     article_title: "Article audit",
@@ -105,6 +167,7 @@ function repairItem(
     resolved: false,
     resolution_reason: null,
     rebuild_required: false,
+    execution_plan: executionPlanFor(kind),
     recommended_stage: null,
     is_publication_ioc: true,
     ...overrides,
@@ -160,6 +223,7 @@ function detailFor(item: EditionRepairItem): EditionRepairDetail {
     collection_id: item.collection_id,
     collection_state: item.collection_state,
     effective_decision: null,
+    execution_plan: item.execution_plan,
   };
 }
 
@@ -326,6 +390,101 @@ afterEach(() => {
 });
 
 describe("Repair Desk", () => {
+  it("affiche le plan backend par type et le coût modèle exact", async () => {
+    const rule = repairItem({
+      repair_key: "repair-rule-plan",
+      kind: "rejected_rule",
+      preview: "rule Plan",
+      is_publication_ioc: false,
+    });
+    const narrative = repairItem({
+      repair_key: "repair-narrative-plan",
+      preview: "filename.exe",
+      artifact_type: "filename",
+      is_publication_ioc: false,
+      execution_plan: {
+        impact_kind: "narrative",
+        affected_outputs: [
+          "extraction",
+          "synthesis",
+          "publication",
+          "checkpoint",
+        ],
+        model_call_required: true,
+        provider_steps: ["Nouvelle synthèse"],
+        deterministic_steps: [
+          "Décision analyste",
+          "Projection Extraction",
+          "Nouvelle synthèse",
+          "Rendu Publication",
+          "Contrôle QA",
+        ],
+        ready_to_apply: false,
+      },
+    });
+    const source = repairItem({
+      repair_key: "repair-source-plan",
+      kind: "supplemental_source_unarchived",
+      source_id: "Q1",
+      preview: "https://source.example/extra",
+      is_publication_ioc: false,
+      execution_plan: executionPlanFor("supplemental_source_unarchived"),
+    });
+    renderReview(page([rule, narrative, source]));
+
+    expect(
+      await screen.findByText(/Mettre à jour les règles/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Aucun appel modèle/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Régénérer la synthèse/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Nouvelle synthèse requise/)).toBeInTheDocument();
+    expect(await screen.findByText(/Réintégrer la source/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Nouvelle extraction et synthèse possibles/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Références → Extraction"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Synthèse → Assemblage")).not.toBeInTheDocument();
+  });
+
+  it("affiche le no-change résolu sans barre d’application", async () => {
+    const noChange = repairItem({
+      resolved: true,
+      effective_action: "exclude",
+      repair_key: "repair-no-change",
+      execution_plan: {
+        impact_kind: "no_deliverable_change",
+        affected_outputs: [],
+        model_call_required: false,
+        provider_steps: [],
+        deterministic_steps: ["Décision analyste"],
+        ready_to_apply: true,
+      },
+    });
+    renderReview(page([noChange]), undefined, undefined, undefined, {
+      readOnly: true,
+    });
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Résolus" }));
+    expect(
+      await screen.findByText(
+        "Décision appliquée — aucun contenu à reconstruire",
+      ),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /evil\.example/ }));
+    expect(
+      await screen.findByText(
+        "Décision appliquée — aucun contenu à reconstruire",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^Appliquer/ }),
+    ).not.toBeInTheDocument();
+  });
+
   it("affiche le résumé, filtre localement et ouvre l’inspecteur", async () => {
     const ioc = repairItem();
     const source = repairItem({
@@ -668,6 +827,7 @@ describe("Repair Desk", () => {
       {
         subject_id: "subject-1",
         has_pending_projection: false,
+        execution_plan: executionPlanFor("rejected_indicator", true),
         recommended_stage: "references",
         active_repair_count: 0,
         resolved_since_last_build_count: 1,
@@ -675,6 +835,25 @@ describe("Repair Desk", () => {
       {
         subject_id: "subject-2",
         has_pending_projection: true,
+        execution_plan: {
+          ...executionPlanFor("rejected_rule", true),
+          impact_kind: "narrative",
+          affected_outputs: [
+            "extraction",
+            "synthesis",
+            "publication",
+            "checkpoint",
+          ],
+          model_call_required: true,
+          provider_steps: ["Nouvelle synthèse"],
+          deterministic_steps: [
+            "Décision analyste",
+            "Projection Extraction",
+            "Nouvelle synthèse",
+            "Rendu Publication",
+            "Contrôle QA",
+          ],
+        } satisfies RepairExecutionPlan,
         recommended_stage: "synthesis",
         active_repair_count: 0,
         resolved_since_last_build_count: 0,
@@ -692,9 +871,13 @@ describe("Repair Desk", () => {
     );
     const user = userEvent.setup();
     expect(
-      await screen.findByText(/Références → Extraction/),
+      await screen.findByRole("button", {
+        name: "Mettre à jour la publication",
+      }),
     ).toBeInTheDocument();
-    expect(screen.getByText(/Synthèse → Assemblage/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Régénérer la synthèse" }),
+    ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Accepter la production" }),
     ).toBeDisabled();
@@ -704,7 +887,9 @@ describe("Repair Desk", () => {
       ),
     ).toBeInTheDocument();
     await user.click(
-      screen.getAllByRole("button", { name: "Reconstruire cet article" })[0]!,
+      screen.getAllByRole("button", {
+        name: "Mettre à jour la publication",
+      })[0]!,
     );
     await waitFor(() =>
       expect(
@@ -725,7 +910,7 @@ describe("Repair Desk", () => {
     );
     const multipleUser = userEvent.setup();
     await multipleUser.click(
-      await screen.findByRole("button", { name: "Reconstruire 2 articles" }),
+      await screen.findByRole("button", { name: "Appliquer 2 articles" }),
     );
     await waitFor(() =>
       expect(
@@ -909,7 +1094,7 @@ describe("Repair Desk en revue historique (lecture seule)", () => {
       screen.queryByRole("button", { name: /^Exclure/ }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /Reconstruire/ }),
+      screen.queryByRole("button", { name: /^Appliquer \d+ articles?$/ }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Accepter la production" }),

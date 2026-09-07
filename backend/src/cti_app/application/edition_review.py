@@ -10,15 +10,20 @@ from uuid import UUID
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_repairs import (
+    classify_repair_impact,
+    merge_repair_impacts,
     repair_issue_application_state,
     repair_issue_blocks_signoff,
 )
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
     ProductionArtifactStatus,
+    ProductionRepairImpact,
+    ProductionRepairImpactKind,
     ProductionRepairIssueKind,
     ProductionSubmissionReconciliation,
     RepairDecisionApplicationState,
+    RepairExecutionPlan,
     SubjectProductionStage,
     SubjectProductionStatus,
     SupplementalSourceRepairState,
@@ -189,6 +194,7 @@ class EditionRepairItem:
     resolution_reason: str | None
     rebuild_required: bool
     recommended_stage: str | None
+    execution_plan: RepairExecutionPlan
     # Only carried by supplemental-source issues; ``None`` for Q2 rejections.
     repair_state: str | None = None
     is_publication_ioc: bool = False
@@ -217,6 +223,7 @@ class EditionRepairArticle:
     subject_id: UUID
     has_pending_projection: bool
     recommended_stage: str
+    execution_plan: RepairExecutionPlan
     active_repair_count: int
     resolved_since_last_build_count: int
 
@@ -374,6 +381,7 @@ class EditionRepairReadService:
         artifact_id = getattr(issue, "observed_artifact_id", None)
         artifact_version = getattr(issue, "observed_artifact_version", None)
         state = issue_application_state(issue, decision)
+        impact = classify_repair_impact(issue, decision)
         if is_source and pending_references:
             # The content exists; only the deterministic REFERENCES rebuild is
             # missing. This debt is served by the backend, so a page reload
@@ -444,6 +452,7 @@ class EditionRepairReadService:
             ),
             rebuild_required=rebuild_required,
             recommended_stage=recommended_stage,
+            execution_plan=impact.execution_plan,
             is_publication_ioc=is_ioc,
             in_publication_scope=_row_in_publication_scope(row),
             application_state=state.value,
@@ -555,9 +564,17 @@ def _repair_articles(items: Sequence[EditionRepairItem]) -> tuple[EditionRepairA
                 EditionRepairArticle(
                     subject_id=subject_id,
                     has_pending_projection=any(
-                        item.recommended_stage == "apply_projection" for item in subject_items
+                        item.rebuild_required
+                        and item.execution_plan.ready_to_apply
+                        and item.execution_plan.impact_kind
+                        is not ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE
+                        for item in subject_items
                     ),
                     recommended_stage=recommended,
+                    execution_plan=merge_repair_impacts(
+                        _impact_from_execution_plan(item.execution_plan)
+                        for item in subject_items
+                    ).execution_plan,
                     active_repair_count=sum(not item.resolved for item in subject_items),
                     resolved_since_last_build_count=sum(
                         item.resolved and item.rebuild_required for item in subject_items
@@ -566,6 +583,19 @@ def _repair_articles(items: Sequence[EditionRepairItem]) -> tuple[EditionRepairA
             )
         )
     return tuple(item for _position, item in sorted(articles, key=lambda pair: pair[0]))
+
+
+def _impact_from_execution_plan(plan: RepairExecutionPlan) -> ProductionRepairImpact:
+    """Rehydrate the internal impact used by the pure article aggregator."""
+    return ProductionRepairImpact(
+        kind=plan.impact_kind,
+        affected_outputs=plan.affected_outputs,
+        model_call_required=plan.model_call_required,
+        reason="Aggregated Repair Desk plan.",
+        provider_steps=plan.provider_steps,
+        deterministic_steps=plan.deterministic_steps,
+        ready_to_apply=plan.ready_to_apply,
+    )
 
 
 def _repair_cursor_encode(position: int, repair_key: str) -> str:

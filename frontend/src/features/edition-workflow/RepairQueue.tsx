@@ -3,6 +3,10 @@ import type {
   ProductionRepairAction,
   ProductionRepairIssueKind,
 } from "../../api/publication";
+import {
+  repairPlanActionLabel,
+  repairPlanCostLabel,
+} from "./repairExecutionPlan";
 
 export type RepairQueueFilter =
   "all" | "sources" | "ioc" | "rules" | "other" | "resolved" | "blocking";
@@ -60,7 +64,7 @@ export function repairPreviewFallback(item: EditionRepairItem): string {
 }
 
 export function repairStatusLabel(item: EditionRepairItem): string {
-  if (item.recommended_stage === "revise_decision") {
+  if (item.application_state === "unbuildable") {
     return "Décision inapplicable";
   }
   if (item.rebuild_required && item.resolved) return "À reconstruire";
@@ -253,6 +257,17 @@ export function RepairQueue({
                           <span className="repair-issue-row__status">
                             {repairStatusLabel(item)}
                           </span>
+                          {item.execution_plan.impact_kind !==
+                          "no_deliverable_change" ? (
+                            <span className="repair-issue-row__status">
+                              {repairPlanActionLabel(item.execution_plan)} —{" "}
+                              {repairPlanCostLabel(item.execution_plan)}
+                            </span>
+                          ) : item.execution_plan.ready_to_apply ? (
+                            <span className="repair-issue-row__status">
+                              Décision appliquée — aucun contenu à reconstruire
+                            </span>
+                          ) : null}
                         </span>
                         <code className="repair-issue-row__preview">
                           {item.preview || repairPreviewFallback(item)}

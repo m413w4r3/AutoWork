@@ -2268,6 +2268,41 @@ h1 {
   border-top: 1px solid #d4ded7;
 }
 
+.repair-execution-plan {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.8rem;
+  border: 1px solid #b8d0bd;
+  border-radius: 0.65rem;
+  background: #f2f8f3;
+}
+
+.repair-execution-plan h4,
+.repair-execution-plan p {
+  margin: 0;
+}
+
+.repair-execution-plan strong {
+  color: #1f6042;
+}
+
+.repair-execution-plan__cost {
+  font-weight: 700;
+}
+
+.repair-execution-plan__steps {
+  display: grid;
+  gap: 0.2rem;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.repair-execution-plan__steps span {
+  color: #1f6042;
+  font-weight: 700;
+}
+
 .repair-inspector__audit h4,
 .repair-inspector__provenance h4,
 .repair-inspector__effective-decision h4 {
@@ -2432,6 +2467,12 @@ h1 {
 .repair-rebuild-bar li > span {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.repair-rebuild-bar li small {
+  display: block;
+  margin-top: 0.2rem;
+  color: #55665c;
 }
 
 .review-articles {

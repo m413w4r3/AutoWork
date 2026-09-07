@@ -232,6 +232,9 @@ async def test_edition_repair_http_list_exposes_summary_items_and_cursor() -> No
     assert body["summary"]["rejected_iocs_to_review"] == 1
     assert body["items"][0]["subject_id"] == str(SUBJECT_A)
     assert body["items"][0]["payload_available"] is True
+    assert body["items"][0]["execution_plan"]["impact_kind"] == "publication_only"
+    assert body["items"][0]["execution_plan"]["model_call_required"] is False
+    assert "Rendu Publication" in body["items"][0]["execution_plan"]["deterministic_steps"]
     assert body["next_cursor"] is None
 
 

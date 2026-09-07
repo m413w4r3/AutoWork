@@ -14,6 +14,7 @@ import {
 import { Link } from "../../routing";
 import { RepairRulePanel } from "./RepairRulePanel";
 import { RepairSourcePanel } from "./RepairSourcePanel";
+import { RepairExecutionPlanView } from "./RepairExecutionPlan";
 import {
   alternativeRepairActions,
   repairActionLabel,
@@ -149,7 +150,7 @@ export function RepairIssueInspector({
       setError(null);
       setReason("");
       setRevising(false);
-      void queryClient.invalidateQueries({
+      void queryClient.refetchQueries({
         queryKey: ["edition-repair-detail", editionId, item?.repair_key],
       });
       onChanged();
@@ -227,6 +228,7 @@ export function RepairIssueInspector({
   const projectionArtifactId = currentDetail?.artifact_id ?? item.artifact_id;
   const projectionArtifactVersion =
     currentDetail?.artifact_version ?? item.artifact_version;
+  const executionPlan = currentDetail?.execution_plan ?? item.execution_plan;
 
   return (
     <section
@@ -374,6 +376,8 @@ export function RepairIssueInspector({
           </div>
         </dl>
       </section>
+
+      <RepairExecutionPlanView plan={executionPlan} />
 
       {detail.isPending ? <p role="status">Chargement du détail…</p> : null}
       {detail.isError ? (

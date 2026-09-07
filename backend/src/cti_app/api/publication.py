@@ -57,10 +57,12 @@ from cti_app.application.production_repairs import (
     ProductionRepairStaleError,
     ProductionRepairStatusError,
     ProductionRepairValueNotVerifiableError,
+    classify_repair_impact,
 )
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import (
     ProductionArtifactStage,
+    ProductionDerivedOutput,
     ProductionReconciliationRequiredError,
     ProductionRepairAction,
     ProductionRepairImpactKind,
@@ -69,6 +71,7 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
+from cti_app.domain.production import RepairExecutionPlan as DomainRepairExecutionPlan
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
 from cti_app.logging import get_correlation_id
 
@@ -194,6 +197,17 @@ class EditionRepairRebuildRequest(BaseModel):
     observed_artifact_id: UUID | None = None
 
 
+class RepairExecutionPlan(BaseModel):
+    """Public, typed projection of the backend repair planner."""
+
+    impact_kind: ProductionRepairImpactKind
+    affected_outputs: list[ProductionDerivedOutput]
+    model_call_required: bool
+    provider_steps: list[str]
+    deterministic_steps: list[str]
+    ready_to_apply: bool
+
+
 class EditionRepairItemView(BaseModel):
     repair_key: str
     kind: str
@@ -221,6 +235,7 @@ class EditionRepairItemView(BaseModel):
     resolution_reason: str | None
     rebuild_required: bool
     recommended_stage: str | None
+    execution_plan: RepairExecutionPlan
     repair_state: str | None = None
     is_publication_ioc: bool
     in_publication_scope: bool = True
@@ -241,6 +256,7 @@ class EditionRepairArticleView(BaseModel):
     subject_id: UUID
     has_pending_projection: bool
     recommended_stage: str
+    execution_plan: RepairExecutionPlan
     active_repair_count: int
     resolved_since_last_build_count: int
 
@@ -406,6 +422,7 @@ async def get_edition_review_repairs(
                 subject_id=item.subject_id,
                 has_pending_projection=item.has_pending_projection,
                 recommended_stage=item.recommended_stage,
+                execution_plan=_repair_execution_plan_view(item.execution_plan),
                 active_repair_count=item.active_repair_count,
                 resolved_since_last_build_count=item.resolved_since_last_build_count,
             )
@@ -549,6 +566,15 @@ async def get_edition_review_repair_detail(
         source_detail = await service.get_supplemental_source_issue(
             edition_id, repair_key, subject_id
         )
+        effective_decision = (
+            getattr(source_detail, "effective_decision", None)
+            if source_detail is not None
+            else getattr(issue, "effective_decision", None)
+        )
+        source_plan = classify_repair_impact(
+            source_detail or issue,
+            effective_decision,
+        ).execution_plan
         result = {
             "repair_key": repair_key,
             "kind": _repair_issue_kind(issue).value,
@@ -571,9 +597,8 @@ async def get_edition_review_repair_detail(
             "recommended_action": getattr(source_detail, "recommended_action", None)
             if source_detail
             else None,
-            "effective_decision": _production_repair_decision_view(
-                getattr(source_detail, "effective_decision", None) if source_detail else None
-            ),
+            "effective_decision": _production_repair_decision_view(effective_decision),
+            "execution_plan": _repair_execution_plan_view(source_plan),
             "application_state": _repair_application_state(source_detail),
             "decision_history": _production_repair_decision_history_view(
                 await _repair_adjudication_service(request).decision_history(
@@ -611,6 +636,12 @@ async def get_edition_review_repair_detail(
         ),
         "effective_decision": _production_repair_decision_view(
             issue_detail.issue.effective_decision
+        ),
+        "execution_plan": _repair_execution_plan_view(
+            classify_repair_impact(
+                issue_detail.issue,
+                issue_detail.issue.effective_decision,
+            ).execution_plan
         ),
         "application_state": _repair_application_state(issue_detail.issue),
         "decision_history": _production_repair_decision_history_view(issue_detail.decision_history),
@@ -960,7 +991,12 @@ async def rebuild_edition_review_item(
         if (
             not references_pending
             and q2_resolved
-            and any(item.recommended_stage == "apply_projection" for item in q2_resolved)
+            and any(
+                item.execution_plan.ready_to_apply
+                and item.execution_plan.impact_kind
+                is not ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE
+                for item in q2_resolved
+            )
         ):
             materialization = await _repair_materialization_service(request).apply(
                 edition_id=edition_id,
@@ -1350,11 +1386,39 @@ def _repair_item_view(item: EditionRepairItem) -> dict[str, Any]:
         "resolution_reason": item.resolution_reason,
         "rebuild_required": item.rebuild_required,
         "recommended_stage": item.recommended_stage,
+        "execution_plan": _repair_execution_plan_view(item.execution_plan),
         "repair_state": item.repair_state,
         "is_publication_ioc": item.is_publication_ioc,
         "in_publication_scope": item.in_publication_scope,
         "application_state": item.application_state,
     }
+
+
+def _repair_execution_plan_view(plan: DomainRepairExecutionPlan) -> RepairExecutionPlan:
+    output_order = {
+        output: index
+        for index, output in enumerate(
+            (
+                ProductionDerivedOutput.REFERENCES,
+                ProductionDerivedOutput.EXTRACTION,
+                ProductionDerivedOutput.SYNTHESIS,
+                ProductionDerivedOutput.PUBLICATION,
+                ProductionDerivedOutput.RULE_BUNDLE,
+                ProductionDerivedOutput.CHECKPOINT,
+            )
+        )
+    }
+    return RepairExecutionPlan(
+        impact_kind=plan.impact_kind,
+        affected_outputs=sorted(
+            plan.affected_outputs,
+            key=lambda output: output_order[output],
+        ),
+        model_call_required=plan.model_call_required,
+        provider_steps=list(plan.provider_steps),
+        deterministic_steps=list(plan.deterministic_steps),
+        ready_to_apply=plan.ready_to_apply,
+    )
 
 
 def _production_repair_decision_view(decision: Any | None) -> dict[str, Any] | None:

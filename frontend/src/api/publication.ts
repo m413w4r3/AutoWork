@@ -17,6 +17,31 @@ export type ProductionRepairIssueKind =
 export type ProductionRepairAction =
   "include" | "exclude" | "continue_without_source";
 
+export type RepairImpactKind =
+  | "no_deliverable_change"
+  | "rule_bundle_only"
+  | "publication_only"
+  | "narrative"
+  | "source_corpus";
+
+export type RepairAffectedOutput =
+  | "references"
+  | "extraction"
+  | "synthesis"
+  | "publication"
+  | "rule_bundle"
+  | "checkpoint";
+
+/** Backend-authoritative work plan for a repair issue or article. */
+export interface RepairExecutionPlan {
+  impact_kind: RepairImpactKind;
+  affected_outputs: RepairAffectedOutput[];
+  model_call_required: boolean;
+  provider_steps: string[];
+  deterministic_steps: string[];
+  ready_to_apply: boolean;
+}
+
 /**
  * What the current projection really materializes. Deciding and materializing
  * are two distinct facts: an INCLUDE stays `projection_required` until a
@@ -158,6 +183,8 @@ export interface EditionRepairItem {
   resolved: boolean;
   resolution_reason: string | null;
   rebuild_required: boolean;
+  execution_plan: RepairExecutionPlan;
+  /** Compatibility field; execution_plan is the authority. */
   recommended_stage: string | null;
   repair_state?: SupplementalSourceRepairState | null;
   is_publication_ioc: boolean;
@@ -179,6 +206,8 @@ export interface EditionRepairSummary {
 export interface EditionRepairArticle {
   subject_id: string;
   has_pending_projection: boolean;
+  execution_plan: RepairExecutionPlan;
+  /** Compatibility field; execution_plan is the authority. */
   recommended_stage: string;
   active_repair_count: number;
   resolved_since_last_build_count: number;
@@ -213,6 +242,7 @@ export interface EditionRepairDetail {
   collection_state?: string | null;
   repair_state?: SupplementalSourceRepairState | null;
   rebuild_required?: boolean;
+  execution_plan?: RepairExecutionPlan;
   recommended_action?: string | null;
   effective_decision?: ProductionRepairDecision | null;
   /**

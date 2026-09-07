@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -914,6 +914,56 @@ _SOURCE_CORPUS_OUTPUTS = frozenset(
     }
 )
 
+_REPAIR_IMPACT_DOMINANCE = {
+    ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE: 0,
+    ProductionRepairImpactKind.RULE_BUNDLE_ONLY: 1,
+    ProductionRepairImpactKind.PUBLICATION_ONLY: 2,
+    ProductionRepairImpactKind.NARRATIVE: 3,
+    ProductionRepairImpactKind.SOURCE_CORPUS: 4,
+}
+
+_REPAIR_PLAN_STEPS: dict[ProductionRepairImpactKind, tuple[str, ...]] = {
+    ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE: ("Décision analyste",),
+    ProductionRepairImpactKind.RULE_BUNDLE_ONLY: (
+        "Décision analyste",
+        "Projection Extraction",
+        "Mise à jour des fichiers YARA/Sigma",
+        "Contrôle QA",
+    ),
+    ProductionRepairImpactKind.PUBLICATION_ONLY: (
+        "Décision analyste",
+        "Projection Extraction",
+        "Rendu Publication",
+        "Contrôle QA",
+    ),
+    ProductionRepairImpactKind.NARRATIVE: (
+        "Décision analyste",
+        "Projection Extraction",
+        "Nouvelle synthèse",
+        "Rendu Publication",
+        "Contrôle QA",
+    ),
+    ProductionRepairImpactKind.SOURCE_CORPUS: (
+        "Source archivée",
+        "Références",
+        "Extraction",
+        "Synthèse si nécessaire",
+        "Publication",
+        "Contrôle QA",
+    ),
+}
+
+_REPAIR_PROVIDER_STEPS: dict[ProductionRepairImpactKind, tuple[str, ...]] = {
+    ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE: (),
+    ProductionRepairImpactKind.RULE_BUNDLE_ONLY: (),
+    ProductionRepairImpactKind.PUBLICATION_ONLY: (),
+    ProductionRepairImpactKind.NARRATIVE: ("Nouvelle synthèse",),
+    ProductionRepairImpactKind.SOURCE_CORPUS: (
+        "Nouvelle extraction possible",
+        "Nouvelle synthèse possible",
+    ),
+}
+
 
 def _repair_impact(
     kind: ProductionRepairImpactKind,
@@ -921,12 +971,83 @@ def _repair_impact(
     *,
     model_call_required: bool,
     reason: str,
+    ready_to_apply: bool = True,
+    provider_steps: tuple[str, ...] | None = None,
+    deterministic_steps: tuple[str, ...] | None = None,
 ) -> ProductionRepairImpact:
     return ProductionRepairImpact(
         kind=kind,
         affected_outputs=affected_outputs,
         model_call_required=model_call_required,
         reason=reason,
+        provider_steps=(
+            _REPAIR_PROVIDER_STEPS[kind]
+            if provider_steps is None
+            else provider_steps
+        ),
+        deterministic_steps=(
+            _REPAIR_PLAN_STEPS[kind]
+            if deterministic_steps is None
+            else deterministic_steps
+        ),
+        ready_to_apply=ready_to_apply,
+    )
+
+
+def merge_repair_impacts(
+    impacts: Iterable[ProductionRepairImpact],
+) -> ProductionRepairImpact:
+    """Merge issue impacts for one article using the semantic dominance order."""
+    values = tuple(impacts)
+    if not values:
+        return _repair_impact(
+            ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+            frozenset(),
+            model_call_required=False,
+            reason="No repair changes a deliverable.",
+        )
+
+    dominant = max(values, key=lambda impact: _REPAIR_IMPACT_DOMINANCE[impact.kind])
+    affected_outputs = frozenset(
+        output for impact in values for output in impact.affected_outputs
+    )
+    provider_steps = tuple(
+        step
+        for step in _REPAIR_PROVIDER_STEPS[dominant.kind]
+        if any(
+            step in (impact.provider_steps or _REPAIR_PROVIDER_STEPS[impact.kind])
+            for impact in values
+        )
+    )
+    deterministic_steps = tuple(
+        step
+        for step in (
+            "Décision analyste",
+            "Source archivée",
+            "Références",
+            "Projection Extraction",
+            "Extraction",
+            "Nouvelle synthèse",
+            "Synthèse si nécessaire",
+            "Mise à jour des fichiers YARA/Sigma",
+            "Rendu Publication",
+            "Publication",
+            "Contrôle QA",
+        )
+        if any(
+            step
+            in (impact.deterministic_steps or _REPAIR_PLAN_STEPS[impact.kind])
+            for impact in values
+        )
+    )
+    return ProductionRepairImpact(
+        kind=dominant.kind,
+        affected_outputs=affected_outputs,
+        model_call_required=any(impact.model_call_required for impact in values),
+        reason=dominant.reason,
+        provider_steps=provider_steps,
+        deterministic_steps=deterministic_steps,
+        ready_to_apply=all(impact.ready_to_apply for impact in values),
     )
 
 
@@ -980,8 +1101,11 @@ def classify_repair_impact(
             reason="The analyst waived the supplemental source without adding content.",
         )
 
-    if isinstance(issue, SupplementalSourceRepairIssue):
-        if issue.repair_state is SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES:
+    issue_kind = _repair_kind(getattr(issue, "kind", ""))
+    is_source_issue = issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
+    if is_source_issue:
+        repair_state = _projection_enum_value(getattr(issue, "repair_state", None))
+        if repair_state == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES.value:
             return _repair_impact(
                 ProductionRepairImpactKind.SOURCE_CORPUS,
                 _SOURCE_CORPUS_OUTPUTS,
@@ -991,6 +1115,14 @@ def classify_repair_impact(
                     "source corpus."
                 ),
             )
+        if decision is None:
+            return _repair_impact(
+                ProductionRepairImpactKind.SOURCE_CORPUS,
+                _SOURCE_CORPUS_OUTPUTS,
+                model_call_required=True,
+                ready_to_apply=False,
+                reason="Archiving the supplemental source may change the source corpus.",
+            )
         return _repair_impact(
             ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
             _NO_DELIVERABLE_OUTPUTS,
@@ -999,6 +1131,31 @@ def classify_repair_impact(
         )
 
     if decision is None:
+        if issue_kind is ProductionRepairIssueKind.REJECTED_RULE:
+            return _repair_impact(
+                ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
+                _RULE_BUNDLE_OUTPUTS,
+                model_call_required=False,
+                ready_to_apply=False,
+                reason="Including the rule changes only the accepted detection-rule bundle.",
+            )
+        if is_publication_ioc_artifact_type(getattr(issue, "artifact_type", None)):
+            return _repair_impact(
+                ProductionRepairImpactKind.PUBLICATION_ONLY,
+                _PUBLICATION_OUTPUTS,
+                model_call_required=False,
+                ready_to_apply=False,
+                reason="Including the IOC changes only a public IOC projection.",
+            )
+        return _repair_impact(
+            ProductionRepairImpactKind.NARRATIVE,
+            _NARRATIVE_OUTPUTS,
+            model_call_required=True,
+            ready_to_apply=False,
+            reason="Including the value adds or removes narrative technical evidence.",
+        )
+
+    if issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED:
         return _repair_impact(
             ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
             _NO_DELIVERABLE_OUTPUTS,
@@ -1006,11 +1163,12 @@ def classify_repair_impact(
             reason="No repair decision is materialized.",
         )
 
+    q2_issue = cast(ProductionRepairIssueView, issue)
     action_is_include = action == ProductionRepairAction.INCLUDE.value
     action_is_exclude = action == ProductionRepairAction.EXCLUDE.value
     changes_projected_content = (
-        action_is_include and not _include_is_already_effective(issue, decision)
-    ) or (action_is_exclude and _exclude_revises_projected_content(issue, decision))
+        action_is_include and not _include_is_already_effective(q2_issue, decision)
+    ) or (action_is_exclude and _exclude_revises_projected_content(q2_issue, decision))
     if not changes_projected_content:
         return _repair_impact(
             ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
@@ -1019,22 +1177,23 @@ def classify_repair_impact(
             reason="The rejected value was not previously included in a deliverable.",
         )
 
-    issue_kind = _repair_kind(issue.kind)
     if issue_kind is ProductionRepairIssueKind.REJECTED_RULE:
         return _repair_impact(
             ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
             _RULE_BUNDLE_OUTPUTS,
             model_call_required=False,
+            ready_to_apply=not _issue_is_unbuildable(q2_issue),
             reason="The repair changes only the accepted detection-rule bundle.",
         )
 
     # Deliberately classify from the actual artifact type, never from the
     # broad rejected-indicator label or a copied UI boolean.
-    if is_publication_ioc_artifact_type(issue.artifact_type):
+    if is_publication_ioc_artifact_type(q2_issue.artifact_type):
         return _repair_impact(
             ProductionRepairImpactKind.PUBLICATION_ONLY,
             _PUBLICATION_OUTPUTS,
             model_call_required=False,
+            ready_to_apply=not _issue_is_unbuildable(q2_issue),
             reason="The repair changes only a public IOC projection.",
         )
 
@@ -1042,7 +1201,15 @@ def classify_repair_impact(
         ProductionRepairImpactKind.NARRATIVE,
         _NARRATIVE_OUTPUTS,
         model_call_required=True,
+        ready_to_apply=not _issue_is_unbuildable(q2_issue),
         reason="The repair adds or removes narrative technical evidence.",
+    )
+
+
+def _issue_is_unbuildable(issue: Any) -> bool:
+    return bool(
+        _projection_enum_value(getattr(issue, "application_state", None))
+        == RepairDecisionApplicationState.UNBUILDABLE.value
     )
 
 
