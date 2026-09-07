@@ -18,13 +18,13 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.publication import router as publication_router
+from cti_app.application.edition_preview import EditionPreviewService
 from cti_app.application.edition_publication import (
     EditionAssemblyService,
     EditionPublicationService,
     PublicationAcceptanceError,
     PublicationAssemblyError,
 )
-from cti_app.application.edition_preview import EditionPreviewService
 from cti_app.application.edition_review import EditionReviewReadItem, EditionReviewService
 from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
 from cti_app.application.identity import LocalIdentityProvider
@@ -652,9 +652,7 @@ async def test_preview_becomes_stale_when_the_current_publication_artifact_chang
     blobs.blobs[replacement_blob] = json.dumps(_document("Replacement").to_json()).encode()
     replacement = _artifact(replacement_id, RUN_A, SUBJECT_A, replacement_blob)
     replacement.input_hash = "b" * 64
-    uow.production_artifacts.artifacts = {
-        replacement_id: replacement
-    }
+    uow.production_artifacts.artifacts = {replacement_id: replacement}
     uow.edition_review_read_model.rows[0] = replace(
         row,
         document_artifact_id=replacement_id,

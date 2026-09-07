@@ -1401,6 +1401,16 @@ class ProductionWorkflowOrchestrator:
             previous_synthesis_artifact_id=(
                 str(previous_artifact_id) if previous_artifact_id is not None else None
             ),
+            # The revision identity depends on the previous *content*, never on
+            # the artifact id, so the log has to name that content hash too.
+            previous_synthesis_sha256=(
+                synthesis_content_hash(context.previous_text) if context is not None else None
+            ),
+            semantic_projection_changed=(
+                context.previous_semantic_hash != context.current_semantic_hash
+                if context is not None
+                else False
+            ),
             previous_word_count=previous_word_count,
             semantic_delta_added_sources=(
                 list(context.added_source_ids) if context is not None else []
@@ -1942,9 +1952,7 @@ class ProductionWorkflowOrchestrator:
             parsed.warnings.extend(integration.warnings)
             report = integration.report
 
-            archived_for_index = await _archived_sources_by_url(
-                uow, run.subject_id, report
-            )
+            archived_for_index = await _archived_sources_by_url(uow, run.subject_id, report)
 
             await self._check_cancellation(run.id, context)
             artifact = await self._references.store_references_result(
@@ -1965,8 +1973,7 @@ class ProductionWorkflowOrchestrator:
                         for source in report.sources
                     ],
                     "source_hashes": {
-                        url: item.content_sha256
-                        for url, item in archived_for_index.items()
+                        url: item.content_sha256 for url, item in archived_for_index.items()
                     },
                 },
             )
@@ -2502,9 +2509,7 @@ class ProductionWorkflowOrchestrator:
                     raw=raw,
                     canonical=q2_source_output_to_json(output),
                 )
-                versions = q2_identity_versions(
-                    work, batched=batched, access_mode=access_mode
-                )
+                versions = q2_identity_versions(work, batched=batched, access_mode=access_mode)
                 extraction = SourceExtraction(
                     canonical_url=work.source.canonical_url,
                     source_content_sha256=work.source_content_sha256,
@@ -2729,11 +2734,9 @@ class ProductionWorkflowOrchestrator:
             for row in rows:
                 if (
                     getattr(row, "status", None) is SourceExtractionStatus.VERIFIED
-                    and
-                    getattr(row, "source_content_sha256", None) == work.source_content_sha256
+                    and getattr(row, "source_content_sha256", None) == work.source_content_sha256
                     and getattr(row, "profile", None) is work.plan.profile
-                    and getattr(row, "contract_version", None)
-                    == versions["contract_version"]
+                    and getattr(row, "contract_version", None) == versions["contract_version"]
                     and getattr(row, "prompt_version", None) == versions["prompt_version"]
                     and getattr(row, "parser_version", None) == versions["parser_version"]
                     and getattr(row, "verifier_version", None) == ARTIFACT_VERIFIER_VERSION
@@ -2810,8 +2813,7 @@ class ProductionWorkflowOrchestrator:
                     row
                     for row in rows
                     if isinstance(getattr(row, "source_content_sha256", None), str)
-                    and getattr(row, "source_content_sha256", None)
-                    != work.source_content_sha256
+                    and getattr(row, "source_content_sha256", None) != work.source_content_sha256
                 ),
                 None,
             )
@@ -2863,11 +2865,7 @@ class ProductionWorkflowOrchestrator:
                     canonical_url=work.source.canonical_url,
                     profile=work.plan.profile,
                     prompt_version=str(versions["prompt_version"]),
-                    batch_parser_version=(
-                        str(versions["parser_version"])
-                        if batched
-                        else None
-                    ),
+                    batch_parser_version=(str(versions["parser_version"]) if batched else None),
                     provider=ModelProvider.OPENAI,
                     requested_model=requested_model,
                     source_content_sha256=None,
@@ -3013,7 +3011,11 @@ class ProductionWorkflowOrchestrator:
                 await evaluate(
                     Q2ReuseDecision(
                         status=Q2ReuseStatus.HIT,
-                        reason=Q2ReuseReason.REUSABLE_CHECKPOINT,
+                        reason=(
+                            Q2ReuseReason.LEGACY_CHECKPOINT_RECOVERED
+                            if legacy_recovery
+                            else Q2ReuseReason.REUSABLE_CHECKPOINT
+                        ),
                         source_url=work.source.canonical_url,
                         current_source_sha256=work.source_content_sha256,
                         previous_source_sha256=work.source_content_sha256,
@@ -3054,7 +3056,11 @@ class ProductionWorkflowOrchestrator:
                 await evaluate(
                     Q2ReuseDecision(
                         status=Q2ReuseStatus.HIT,
-                        reason=Q2ReuseReason.REUSABLE_CHECKPOINT,
+                        reason=(
+                            Q2ReuseReason.LEGACY_CHECKPOINT_RECOVERED
+                            if legacy_recovery
+                            else Q2ReuseReason.REUSABLE_CHECKPOINT
+                        ),
                         source_url=work.source.canonical_url,
                         current_source_sha256=work.source_content_sha256,
                         previous_source_sha256=work.source_content_sha256,

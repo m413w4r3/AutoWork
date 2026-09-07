@@ -22,6 +22,7 @@ from cti_app.application.production_repairs import (
     extraction_item_contributes_to_synthesis,
     production_repair_correction_identity,
 )
+from cti_app.application.production_source_evidence import SourceEvidenceSpanKind
 from cti_app.domain.production import (
     ProductionEvidenceBasis,
     ProductionRepairAction,
@@ -287,3 +288,75 @@ async def test_source_verified_replacement_and_explicit_override_policy() -> Non
             actor_id="analyst",
             reason=None,
         )
+
+
+def _rule_issue(value: str) -> ProductionRepairIssueView:
+    return ProductionRepairIssueView(
+        repair_key=REPAIR_KEY,
+        kind=ProductionRepairIssueKind.REJECTED_RULE,
+        artifact_type="yara",
+        source_id=SOURCE_ID,
+        source_title="Source",
+        is_publication_ioc=False,
+        source_url=SOURCE_URL,
+        reason_code="source_evidence_missing",
+        value_sha256=_sha256(value),
+        preview=value,
+        payload_available=True,
+        production_run_id=RUN_ID,
+        observed_artifact_id=ARTIFACT_ID,
+        observed_artifact_version=1,
+        observed_pipeline_generation=2,
+        subject_id=SUBJECT_ID,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_detection_rule_correction_reaches_the_source_gate() -> None:
+    """A rule REPLACE must be shape-checked and then gated on the archive.
+
+    Reading verified rules off the verification result instead of its canonical
+    extraction made every rule correction raise before the gate, so the
+    publication-only rule case of LOT 36 could never be exercised.
+    """
+    rule_body = 'rule LotForty { strings: $a = "evil" condition: $a }'
+    content = f"<pre>{rule_body}</pre>".encode()
+    catalog = _Catalog(content)
+    store = ProductionArtifactStore(catalog)  # type: ignore[arg-type]
+    uow = _ArchiveUow(catalog.blob_id, content)
+    service = ProductionRepairAdjudicationService(lambda: uow, artifact_store=store)
+    issue = _rule_issue("rule Broken { condition: false }")
+
+    verification = await service._validate_replacement(
+        issue=issue,
+        value=rule_body,
+        require_source=True,
+    )
+
+    assert verification.format_valid is True
+    assert verification.verified is True
+    assert verification.verification_state is ProductionRepairVerificationState.SOURCE_VERIFIED
+    assert verification.normalized_value == rule_body
+    # The structural context is reported, and never a visual span.
+    assert verification.context_spans
+    assert all(
+        span.kind is not SourceEvidenceSpanKind.VISUAL_UNLOCATED
+        for span in verification.context_spans
+    )
+
+    absent = await service._validate_replacement(
+        issue=issue,
+        value='rule Absent { strings: $a = "nowhere" condition: $a }',
+        require_source=True,
+    )
+    assert absent.format_valid is True
+    assert absent.verified is False
+    assert absent.verification_state is None
+
+    malformed = await service._validate_replacement(
+        issue=_rule_issue("x"),
+        value="",
+        require_source=True,
+    )
+    assert malformed.format_valid is False
+    assert malformed.reason_code == "replacement_value_empty"

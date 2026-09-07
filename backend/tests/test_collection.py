@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.collection import (
+    ManualArchiveReceipt,
     ManualContentAlreadyArchivedError,
     ManualContentEmptyError,
     ManualContentTooLargeError,
@@ -297,6 +298,66 @@ async def test_manual_content_archives_blocked_source_and_records_provenance(
     assert completed[0].raw_blob_id
     assert completed[0].decoded_blob_id == str(archived.decoded_blob_id)
     assert "ExampleRAT" not in completed[0].getMessage()
+
+
+async def test_manual_archive_receipt_survives_a_reload_and_is_rebuilt_from_provenance(
+    tmp_path: Path,
+) -> None:
+    """The receipt must be reconstructible by the backend, not held by the UI."""
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://blocked.example/report",))
+    app = service(factory, Transport([]), tmp_path / "blobs")
+    source = (await app.initialize(subject.id))[0]
+    factory.collections[source.id].state = CollectionState.BLOCKED
+    content = b"<html><body>Analyst supplied evidence with ExampleRAT.</body></html>"
+
+    archived, posted = cast(
+        tuple[object, ManualArchiveReceipt],
+        await app.archive_manual_content(
+            source.id,
+            content=content,
+            declared_mime_type="text/html",
+            actor_id="analyst-1",
+            return_receipt=True,
+        ),
+    )
+
+    # A brand new service instance: nothing is carried over in memory, exactly
+    # like the first request after a browser refresh.
+    reloaded_app = service(factory, Transport([]), tmp_path / "blobs")
+    reloaded_source = next(
+        item for item in await reloaded_app.list_sources(subject.id) if item.id == source.id
+    )
+    assert reloaded_source.state is CollectionState.ARCHIVED
+    assert reloaded_source.origin_kind is SourceOriginKind.MANUAL
+
+    receipt = await reloaded_app.manual_archive_receipt(reloaded_source)
+    assert receipt is not None
+    assert receipt.decoded_sha256 == hashlib.sha256(content).hexdigest()
+    assert receipt.encoded_sha256 == posted.encoded_sha256
+    assert receipt.bytes == len(content)
+    assert receipt.declared_mime_type == "text/html"
+    assert receipt.detected_mime_type == "text/html"
+    assert receipt.actor_id == "analyst-1"
+    assert receipt.source_document_id == posted.source_document_id
+    assert receipt.decoded_blob_id == posted.decoded_blob_id
+    assert receipt.raw_blob_id == posted.raw_blob_id
+    assert receipt.collection_id == source.id
+    assert receipt.subject_id == subject.id
+    assert getattr(archived, "source_document_id", None) == posted.source_document_id
+
+    # A collector-archived source never claims a manual receipt.
+    other_factory = InMemoryCollectionUnitOfWorkFactory()
+    other_subject = selected_subject(other_factory, ("https://one.example/report",))
+    collector_app = service(other_factory, Transport([response()]), tmp_path / "collector-blobs")
+    collected = (await collector_app.initialize(other_subject.id))[0]
+    await collector_app.archive_one(collected.id, uuid4())
+    stored = next(
+        item
+        for item in await collector_app.list_sources(other_subject.id)
+        if item.id == collected.id
+    )
+    assert await collector_app.manual_archive_receipt(stored) is None
 
 
 async def test_manual_content_rejects_empty_and_oversized_content(tmp_path: Path) -> None:

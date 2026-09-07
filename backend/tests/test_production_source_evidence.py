@@ -128,9 +128,7 @@ def test_structured_evidence_context_locates_table_list_code_and_link_text() -> 
         SourceEvidenceSpanKind.LINK_TEXT,
         SourceEvidenceSpanKind.VISUAL_UNLOCATED,
     } <= kinds
-    located = source_evidence_context_for_artifact(
-        _artifact("table.example", "domain"), document
-    )
+    located = source_evidence_context_for_artifact(_artifact("table.example", "domain"), document)
     assert [span.kind for span in located] == [SourceEvidenceSpanKind.TABLE]
     assert all(span.kind is not SourceEvidenceSpanKind.VISUAL_UNLOCATED for span in located)
 
@@ -146,9 +144,10 @@ def test_visual_unlocated_never_proves_an_ioc_or_claims_image_localization() -> 
     )
 
     assert result.output.artifacts == []
-    assert source_evidence_context_for_artifact(
-        _artifact("from-image.example", "domain"), document
-    ) == ()
+    assert (
+        source_evidence_context_for_artifact(_artifact("from-image.example", "domain"), document)
+        == ()
+    )
     assert any(span.kind is SourceEvidenceSpanKind.VISUAL_UNLOCATED for span in document.spans)
 
 

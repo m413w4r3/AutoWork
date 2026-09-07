@@ -9,6 +9,7 @@ or data conversions involved.
 from collections.abc import Sequence
 
 from alembic import op
+from sqlalchemy import inspect
 
 from cti_app.infrastructure.database.models import (  # noqa: F401
     collection,
@@ -344,8 +345,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # A later migration may already own and have removed one of these tables --
+    # 0004 drops ``production_repair_corrections`` with its trigger -- so the
+    # baseline drops each trigger only where its table is still present. It is
+    # the same tolerance the table drops below already have.
+    inspector = inspect(op.get_bind())
+    existing_tables = set(inspector.get_table_names())
     for table, trigger_name, _function_name, _kind in reversed(_TRIGGERS):
-        op.execute(f"DROP TRIGGER {trigger_name} ON {table}")
+        if table in existing_tables:
+            op.execute(f"DROP TRIGGER IF EXISTS {trigger_name} ON {table}")
     # The current metadata intentionally contains a small mutual-FK cycle
     # between source_collections and collection_attempts. PostgreSQL can drop
     # the fresh schema deterministically when the tables are removed with

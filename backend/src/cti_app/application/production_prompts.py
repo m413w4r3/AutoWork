@@ -844,13 +844,17 @@ text: <event>
         )
         if revision_context is None:
             return prompt
-        return prompt + "\n\n" + cls.PREVIOUS_DRAFT_NON_AUTHORITATIVE.format(
-            revision_prompt_version=SYNTHESIS_REVISION_PROMPT_VERSION,
-            added_source_ids=", ".join(revision_context.added_source_ids) or "none",
-            removed_source_ids=", ".join(revision_context.removed_source_ids) or "none",
-            added_repair_keys=", ".join(revision_context.added_repair_keys) or "none",
-            removed_repair_keys=", ".join(revision_context.removed_repair_keys) or "none",
-            previous_semantic_hash=revision_context.previous_semantic_hash,
-            current_semantic_hash=revision_context.current_semantic_hash,
-            previous_text=revision_context.previous_text,
+        return (
+            prompt
+            + "\n\n"
+            + cls.PREVIOUS_DRAFT_NON_AUTHORITATIVE.format(
+                revision_prompt_version=SYNTHESIS_REVISION_PROMPT_VERSION,
+                added_source_ids=", ".join(revision_context.added_source_ids) or "none",
+                removed_source_ids=", ".join(revision_context.removed_source_ids) or "none",
+                added_repair_keys=", ".join(revision_context.added_repair_keys) or "none",
+                removed_repair_keys=", ".join(revision_context.removed_repair_keys) or "none",
+                previous_semantic_hash=revision_context.previous_semantic_hash,
+                current_semantic_hash=revision_context.current_semantic_hash,
+                previous_text=revision_context.previous_text,
+            )
         )

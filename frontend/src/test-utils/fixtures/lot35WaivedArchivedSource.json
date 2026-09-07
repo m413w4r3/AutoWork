@@ -59,7 +59,10 @@
             "Publication",
             "Contrôle QA"
           ],
-          "ready_to_apply": true
+          "ready_to_apply": true,
+          "expected_q2_calls": 0,
+          "expected_q2_reuses": 0,
+          "reuse_unknown_count": 2
         },
         "repair_state": "archived_pending_references",
         "is_publication_ioc": false,
@@ -94,7 +97,10 @@
             "Publication",
             "Contrôle QA"
           ],
-          "ready_to_apply": true
+          "ready_to_apply": true,
+          "expected_q2_calls": 0,
+          "expected_q2_reuses": 0,
+          "reuse_unknown_count": 2
         },
         "active_repair_count": 0,
         "resolved_since_last_build_count": 1

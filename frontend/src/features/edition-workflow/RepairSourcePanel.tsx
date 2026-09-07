@@ -4,7 +4,6 @@ import { useState } from "react";
 import {
   archiveManualSourceContent,
   getSubjectWorkbench,
-  type ArchiveReceipt,
 } from "../../api/collection";
 import {
   prepareEditionRepairSource,
@@ -30,9 +29,6 @@ export function RepairSourcePanel({
   const [content, setContent] = useState("");
   const [mimeType, setMimeType] = useState("text/html");
   const [archived, setArchived] = useState(false);
-  const [archiveReceipt, setArchiveReceipt] = useState<ArchiveReceipt | null>(
-    null,
-  );
   const sourceQuery = useQuery({
     queryKey: ["subject-workbench", subjectId],
     queryFn: () => getSubjectWorkbench(subjectId),
@@ -41,6 +37,10 @@ export function RepairSourcePanel({
   const source = sourceQuery.data?.sources.find(
     (candidate) => candidate.id === detail.collection_id,
   );
+  // The receipt is rebuilt by the backend from the durable
+  // `source.archived_manually` provenance event, so it survives a reload
+  // instead of living only in this component's state.
+  const archiveReceipt = source?.archive_receipt ?? null;
   // The backend owns the state: `archived_pending_references` means the
   // content exists and only the deterministic REFERENCES rebuild is missing.
   const repairState = detail.repair_state ?? null;
@@ -89,14 +89,16 @@ export function RepairSourcePanel({
       });
     },
     retry: false,
-    onSuccess: (result) => {
+    onSuccess: () => {
       setArchived(true);
-      setArchiveReceipt(result.archive_receipt);
       void queryClient.invalidateQueries({
         queryKey: ["edition-repair-detail", editionId, detail.repair_key],
       });
       void queryClient.invalidateQueries({
         queryKey: ["edition-repair", editionId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["subject-workbench", subjectId],
       });
       onArchived();
     },

@@ -567,8 +567,7 @@ class ProductionRepairCorrectionRow(Base):
             name="ck_production_repair_correction_verification_state",
         ),
         CheckConstraint(
-            "char_length(original_repair_key) = 64 AND "
-            "original_repair_key ~ '^[0-9a-f]{64}$'",
+            "char_length(original_repair_key) = 64 AND original_repair_key ~ '^[0-9a-f]{64}$'",
             name="ck_production_repair_correction_original_key",
         ),
         CheckConstraint(

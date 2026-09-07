@@ -917,6 +917,10 @@ class ProductionUnitOfWork(Protocol):
     publication_manifest_entries: PublicationManifestEntryRepository
     publication_manifest_exclusions: PublicationManifestExclusionRepository
     edition_releases: EditionReleaseRepository
+    # A repair reads the archived source back to verify a corrected value,
+    # so the archived document and its blob are part of this contract.
+    source_documents: SourceDocumentRepository
+    blobs: BlobRepository
 
     async def __aenter__(self) -> Self: ...
 

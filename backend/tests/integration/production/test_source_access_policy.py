@@ -32,9 +32,31 @@ S2 = "https://example.test/source-2"
 S3 = "https://example.test/source-3"
 BOOTSTRAP = "https://example.test/bootstrap"
 
-ARCHIVE_S1 = "ARCHIVE_S1 ExampleRAT live-success.security-lab.io"
-ARCHIVE_S2 = "ARCHIVE_S2 ExampleRAT archive-fallback.security-lab.io"
-ARCHIVE_S3 = "ARCHIVE_S3 ExampleRAT batch-success.security-lab.io"
+
+def _archive(marker: str, indicator: str) -> str:
+    """Build an archived body a real publication would plausibly have.
+
+    ``production_archive_fallback_min_chars`` (1200 by default) is the guard
+    that stops the pipeline from paying for an archive-fallback model call on a
+    stub, an anti-bot notice or a JavaScript shell.  A one-line fixture is
+    exactly such a stub, so it silently skipped the very fallback these tests
+    exist to cover.  The filler carries no indicator: the evidence gate still
+    only ever sees ``indicator`` and ``ExampleRAT``.
+    """
+    head = f"{marker} ExampleRAT {indicator}"
+    body = (
+        " The analysed campaign is attributed to the ExampleRAT operators, whose "
+        "tooling has been tracked across successive intrusion sets. The report "
+        "details the delivery chain, the loader stage and the persistence "
+        "mechanism observed on compromised hosts, together with the operator "
+        "tradecraft seen during hands-on-keyboard activity."
+    )
+    return head + body * 4
+
+
+ARCHIVE_S1 = _archive("ARCHIVE_S1", "live-success.security-lab.io")
+ARCHIVE_S2 = _archive("ARCHIVE_S2", "archive-fallback.security-lab.io")
+ARCHIVE_S3 = _archive("ARCHIVE_S3", "batch-success.security-lab.io")
 EMPTY_ARCHIVE = ""
 
 SYNTHESIS = "ExampleRAT activity is documented by the selected source [S1]."
@@ -784,7 +806,7 @@ async def test_archive_fallback_still_passes_the_source_evidence_gate(
 ) -> None:
     scenario = _configure(
         production_scenario_factory,
-        {S1: "ARCHIVE_ONLY trusted.security-lab.io"},
+        {S1: _archive("ARCHIVE_ONLY", "trusted.security-lab.io")},
         report_urls=(S1,),
     )
     scenario.model.script.q2(source_url=S1, access_mode="live_url", response="UNAVAILABLE")

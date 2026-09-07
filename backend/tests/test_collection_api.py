@@ -142,6 +142,9 @@ async def test_manual_content_endpoint_accepts_multipart_and_refuses_replacement
             path,
             json={"content": HTML.decode(), "declared_mime_type": "text/html"},
         )
+        # A fresh GET is what the browser issues after F5: the receipt has to
+        # come back from durable state, not from the POST response.
+        workbench = await client.get(f"/api/subjects/{subject.id}/workbench")
 
     assert archived.status_code == 200
     assert archived.json()["state"] == "archived"
@@ -151,6 +154,22 @@ async def test_manual_content_endpoint_accepts_multipart_and_refuses_replacement
         event.event_type == "source.archived_manually" and event.actor_id == "analyst-1"
         for event in collection_uow.provenance
     )
+
+    posted_receipt = archived.json()["archive_receipt"]
+    assert posted_receipt is not None
+    assert workbench.status_code == 200
+    reloaded = next(item for item in workbench.json()["sources"] if item["id"] == str(source.id))
+    assert reloaded["state"] == "archived"
+    reloaded_receipt = reloaded["archive_receipt"]
+    assert reloaded_receipt is not None
+    assert reloaded_receipt["decoded_sha256"] == posted_receipt["decoded_sha256"]
+    assert reloaded_receipt["encoded_sha256"] == posted_receipt["encoded_sha256"]
+    assert reloaded_receipt["bytes"] == posted_receipt["bytes"]
+    assert reloaded_receipt["detected_mime_type"] == posted_receipt["detected_mime_type"]
+    assert reloaded_receipt["declared_mime_type"] == posted_receipt["declared_mime_type"]
+    assert reloaded_receipt["actor_id"] == "analyst-1"
+    assert reloaded_receipt["source_document_id"] == posted_receipt["source_document_id"]
+    assert reloaded_receipt["decoded_blob_id"] == posted_receipt["decoded_blob_id"]
 
 
 async def test_retry_endpoint_processes_only_requested_source(tmp_path: Path) -> None:

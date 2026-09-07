@@ -79,6 +79,11 @@ test:
 	cd backend && $(UV) run --python $(PYTHON_VERSION) pytest
 	cd frontend && $(PNPM) test --run
 
+# Extra pytest arguments for a targeted integration run, e.g.
+#   make test-integration INTEGRATION_PYTEST_ARGS="tests/integration/production -x -vv"
+# Empty by default, so `make test-integration` still runs the whole suite.
+INTEGRATION_PYTEST_ARGS ?=
+
 test-integration:
 	@set -eu; \
 	started=0; \
@@ -96,7 +101,7 @@ test-integration:
 		test_dsn="postgresql+asyncpg://postgres:postgres@127.0.0.1:$${TEST_POSTGRES_PORT:-55432}/postgres"; \
 	fi; \
 	cd backend; \
-	TEST_POSTGRES_ADMIN_DSN="$$test_dsn" $(UV) run --python $(PYTHON_VERSION) pytest -m integration
+	TEST_POSTGRES_ADMIN_DSN="$$test_dsn" $(UV) run --python $(PYTHON_VERSION) pytest -m integration $(INTEGRATION_PYTEST_ARGS)
 
 lint:
 	cd backend && $(UV) run --python $(PYTHON_VERSION) ruff check .

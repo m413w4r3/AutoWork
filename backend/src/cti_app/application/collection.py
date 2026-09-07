@@ -133,6 +133,36 @@ class ManualArchiveReceipt:
             "correlation_id": self.correlation_id,
         }
 
+    @classmethod
+    def from_provenance(cls, event: ProvenanceEvent) -> ManualArchiveReceipt | None:
+        """Rebuild the receipt from the durable ``source.archived_manually`` row.
+
+        The receipt is never stored as such: the provenance event already
+        carries every fact, so a reload reconstructs it instead of trusting a
+        response the browser happened to keep.
+        """
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.subject_id is None:
+            return None
+        try:
+            return cls(
+                subject_id=event.subject_id,
+                collection_id=event.aggregate_id,
+                source_document_id=UUID(str(payload["source_document_id"])),
+                raw_blob_id=UUID(str(payload["raw_blob_id"])),
+                decoded_blob_id=UUID(str(payload["decoded_blob_id"])),
+                encoded_sha256=str(payload["encoded_sha256"]),
+                decoded_sha256=str(payload["decoded_sha256"]),
+                bytes=int(payload["size"]),
+                declared_mime_type=str(payload["declared_mime_type"]),
+                detected_mime_type=str(payload["detected_mime_type"]),
+                actor_id=str(event.actor_id or payload.get("actor_id") or ""),
+                correlation_id=str(payload.get("correlation_id") or ""),
+                completed_at=event.occurred_at,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
 
 @dataclass(frozen=True, slots=True)
 class SupplementalSource:
@@ -469,6 +499,25 @@ class SubjectCollectionService:
                 else None
             )
             return candidate, document
+
+    async def manual_archive_receipt(self, source: SourceCollection) -> ManualArchiveReceipt | None:
+        """Return the durable receipt of an analyst upload, or ``None``.
+
+        Only a manually archived source can have one, so the provenance log is
+        read for those alone.  The facts survive a reload because they live in
+        ``source.archived_manually``, never in a client-held response.
+        """
+        if source.origin_kind is not SourceOriginKind.MANUAL:
+            return None
+        async with self._uow_factory() as uow:
+            events = await uow.provenance.list_for_aggregate("source_collection", source.id)
+        for event in sorted(events, key=lambda item: item.occurred_at, reverse=True):
+            if event.event_type != "source.archived_manually":
+                continue
+            receipt = ManualArchiveReceipt.from_provenance(event)
+            if receipt is not None:
+                return receipt
+        return None
 
     async def download_source(
         self, subject_id: UUID, collection_id: UUID

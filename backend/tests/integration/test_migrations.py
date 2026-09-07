@@ -70,6 +70,24 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
 from cti_app.infrastructure.database.models.base import Base
 from tests.integration.conftest import _alembic_config
 
+
+def _head_revision() -> str:
+    """Read the chain head instead of pinning one migration by name.
+
+    The rest of this module compares the live schema against ``Base.metadata``
+    precisely so it stays correct as migrations are added; hardcoding the head
+    revision was the one place that silently drifted.
+    """
+    from alembic.script import ScriptDirectory
+
+    return (
+        ScriptDirectory.from_config(
+            _alembic_config("postgresql://unused/unused")
+        ).get_current_head()
+        or ""
+    )
+
+
 pytestmark = pytest.mark.integration
 
 # ---------------------------------------------------------------------------
@@ -123,6 +141,12 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
     (
         "production_repair_decisions",
         "trg_production_repair_decisions_append_only",
+    ): "reject_evidence_mutation",
+    # A correction is the immutable replacement payload of a REPLACE decision:
+    # rewriting it would rewrite the audit of what the analyst actually chose.
+    (
+        "production_repair_corrections",
+        "trg_production_repair_corrections_append_only",
     ): "reject_evidence_mutation",
     ("virustotal_observations", "trg_vt_observations_append_only"): "reject_evidence_mutation",
     ("virustotal_file_views", "trg_vt_file_views_append_only"): "reject_evidence_mutation",
@@ -783,7 +807,7 @@ def test_legacy_0001_database_gets_repair_desk_without_data_loss(
 
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_manual_source_archival"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     after_tables = asyncio.run(_table_names(temporary_postgres_url))
     assert after_tables == before_tables | {_REPAIR_TABLE}
     repair_table = Base.metadata.tables[_REPAIR_TABLE]
@@ -884,7 +908,7 @@ def test_existing_database_gains_the_manual_lease_without_data_loss(
 
     command.upgrade(config, "head")
 
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_manual_source_archival"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     snapshot = asyncio.run(_database_snapshot(temporary_postgres_url))
     for table_name in ("source_collections", "collection_attempts"):
         table = Base.metadata.tables[table_name]
@@ -920,7 +944,7 @@ def test_downgrade_refuses_to_destroy_manual_collection_attempts(
         command.downgrade(config, "0002_repair_desk_compat")
 
     # The refused downgrade left the audit row and the schema in place.
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_manual_source_archival"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     assert asyncio.run(_manual_attempt_count(temporary_postgres_url)) == 1
 
 
@@ -984,7 +1008,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
 
     command.upgrade(config, "head")
     command.current(config)
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_manual_source_archival"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -999,7 +1023,7 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     # 0002 must observe the table and trigger made by 0001 and perform no DDL
     # that conflicts with them.
     command.upgrade(config, "head")
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0003_manual_source_archival"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     assert asyncio.run(_table_names(temporary_postgres_url)) == tables
     assert asyncio.run(_trigger_definitions(temporary_postgres_url)) == trigger_definitions
 

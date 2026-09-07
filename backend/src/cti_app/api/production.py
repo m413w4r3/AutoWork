@@ -1522,8 +1522,7 @@ async def verify_subject_production_replacement(
             else None
         ),
         "context_spans": [
-            {"kind": span.kind.value, "text": span.text}
-            for span in verification.context_spans
+            {"kind": span.kind.value, "text": span.text} for span in verification.context_spans
         ],
     }
 

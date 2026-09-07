@@ -59,8 +59,7 @@ def _sources() -> dict[str, dict[str, object]]:
             "status": 200 if index < 6 else 404,
             "mime": "text/plain",
             "body": (
-                f"LOT 38 source {index} documents ExampleRAT and "
-                f"source-{index}.security-lab.io."
+                f"LOT 38 source {index} documents ExampleRAT and source-{index}.security-lab.io."
             ),
         }
         for index, url in enumerate(URLS, start=1)
@@ -125,10 +124,7 @@ async def test_references_rebuild_reuses_five_q2_sources_and_calls_s6_once(
     assert s6.state is CollectionState.FAILED_TERMINAL
     await scenario.collection_service.archive_manual_content(
         s6.id,
-        content=(
-            b"LOT 38 source 6 documents ExampleRAT and "
-            b"source-6.security-lab.io."
-        ),
+        content=(b"LOT 38 source 6 documents ExampleRAT and source-6.security-lab.io."),
         declared_mime_type="text/plain",
         final_url=URLS[5],
         actor_id="lot38-analyst",

@@ -618,6 +618,7 @@ def _multi_individual_setup(
         monkeypatch,
         blobs,
     )
+
     async def load_report(*args: object) -> ReferenceReport:
         del args
         return ReferenceReport(sources=tuple(state._report_sources), events=())
@@ -809,8 +810,7 @@ async def test_changed_source_hash_is_a_q2_miss_with_explainable_events(
     reuse = [
         event
         for event in orchestrator._diagnostics.events
-        if event.get("event") == "q2.source.reuse_evaluated"
-        and event.get("run_id") == next_run.id
+        if event.get("event") == "q2.source.reuse_evaluated" and event.get("run_id") == next_run.id
     ]
     assert len(reuse) == 1
     assert reuse[0]["status"] == "miss"
@@ -818,8 +818,7 @@ async def test_changed_source_hash_is_a_q2_miss_with_explainable_events(
     started = [
         event
         for event in orchestrator._diagnostics.events
-        if event.get("event") == "q2.source.started"
-        and event.get("run_id") == next_run.id
+        if event.get("event") == "q2.source.started" and event.get("run_id") == next_run.id
     ]
     assert len(started) == 1
 
@@ -871,8 +870,7 @@ async def test_five_source_rebuild_reuses_unchanged_q2_and_calls_once_for_s6(
     evaluated = [
         event
         for event in orchestrator._diagnostics.events
-        if event.get("event") == "q2.source.reuse_evaluated"
-        and event.get("run_id") == next_run.id
+        if event.get("event") == "q2.source.reuse_evaluated" and event.get("run_id") == next_run.id
     ]
     # S6 is first checked against the IOC batch checkpoint and then against
     # the individual checkpoint because it is the only remaining IOC source.
@@ -882,16 +880,14 @@ async def test_five_source_rebuild_reuses_unchanged_q2_and_calls_once_for_s6(
     started = [
         event
         for event in orchestrator._diagnostics.events
-        if event.get("event") == "q2.source.started"
-        and event.get("run_id") == next_run.id
+        if event.get("event") == "q2.source.started" and event.get("run_id") == next_run.id
     ]
     assert len(started) == 1
     assert started[0]["source_url"] == urls[5]
     assert not [
         event
         for event in orchestrator._diagnostics.events
-        if event.get("event") == "q4.started"
-        and event.get("run_id") == next_run.id
+        if event.get("event") == "q4.started" and event.get("run_id") == next_run.id
     ]
 
 
@@ -912,9 +908,7 @@ async def test_changed_s3_plus_new_s6_only_call_two_q2_sources(
     assert len(gateway.calls) == 5
 
     document = next(
-        document
-        for document in state._docs_by_id.values()
-        if document.final_url == urls[2]
+        document for document in state._docs_by_id.values() if document.final_url == urls[2]
     )
     assert isinstance(orchestrator._blob_reader, _ArchivedBlobs)
     blob_id, digest = orchestrator._blob_reader.add(b"ARCHIVED BODY S3 c2.example.org changed")
@@ -951,7 +945,6 @@ async def test_changed_s3_plus_new_s6_only_call_two_q2_sources(
     started = [
         event
         for event in orchestrator._diagnostics.events
-        if event.get("event") == "q2.source.started"
-        and event.get("run_id") == next_run.id
+        if event.get("event") == "q2.source.started" and event.get("run_id") == next_run.id
     ]
     assert {event["source_url"] for event in started} == {urls[2], urls[5]}

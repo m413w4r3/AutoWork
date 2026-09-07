@@ -90,8 +90,7 @@ def narrative_repair_keys(extraction: Any, metadata: Mapping[str, Any] | None) -
         key = str(value)
         marker = f"RPA-{key[:16]}"
         if any(
-            getattr(item, "local_id", None) == marker
-            and _item_contributes_to_synthesis(item)
+            getattr(item, "local_id", None) == marker and _item_contributes_to_synthesis(item)
             for item in items
         ):
             keys.append(key)

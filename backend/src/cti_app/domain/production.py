@@ -62,6 +62,9 @@ class Q2ReuseReason(StrEnum):
     """Stable explanation for a source-level Q2 reuse decision."""
 
     REUSABLE_CHECKPOINT = "reusable_checkpoint"
+    #: A pre-checkpoint ModelRun proved the same functional identity and its
+    #: archived output was re-indexed without calling the provider.
+    LEGACY_CHECKPOINT_RECOVERED = "legacy_checkpoint_recovered"
     NO_CHECKPOINT = "no_checkpoint"
     SOURCE_CONTENT_CHANGED = "source_content_changed"
     PROMPT_VERSION_CHANGED = "prompt_version_changed"

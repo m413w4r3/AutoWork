@@ -38,6 +38,8 @@ from cti_app.application.production_workflow import _q2_batch_model_run_id
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import ModelRole, ModelRunStatus
 from cti_app.domain.production import (
+    ExtractionProfile,
+    SourceExtractionStatus,
     SubjectProductionRun,
     SubjectProductionStage,
 )
@@ -525,9 +527,17 @@ async def test_four_light_sources_use_one_web_batch_of_urls(
     assert result["light_calls"] == 1
     assert result["light_batches"] == 1
     assert result["light_sources_batched"] == 4
-    # The batch never reads or writes a content-addressed checkpoint.
-    assert state.extractions.rows == {}
-    assert state.extractions.lookups == 0
+    # LOT 38: one web batch still yields one reusable, content-addressed
+    # checkpoint per batched source, so a later rebuild explains and avoids
+    # every one of these four readings individually.
+    assert len(state.extractions.rows) == 4
+    assert {row.canonical_url for row in state.extractions.rows.values()} == {
+        f"https://example.test/source-{index}" for index in range(1, 5)
+    }
+    assert {row.profile for row in state.extractions.rows.values()} == {ExtractionProfile.IOC_RULES}
+    assert all(
+        row.status is SourceExtractionStatus.VERIFIED for row in state.extractions.rows.values()
+    )
     assert run.extraction_progress["model_calls"] == 1  # type: ignore[index]
     assert len(sink.calls[-1]["canonical_json"]["items"]) == 0  # type: ignore[index]
 
@@ -635,7 +645,13 @@ async def test_batch_source_unavailable_uses_archive_fallback_for_only_that_sour
     assert len(gateway.calls) == 2
     assert gateway.calls[1].web_search is False
     assert gateway.calls[1].metadata["source_id"] == "S2"
-    assert state.extractions.rows == {}
+    # LOT 38: the readings that succeeded leave a verified, content-addressed
+    # checkpoint. The archive fallback is a different access mode, so it never
+    # publishes a live-URL checkpoint another run could reuse blindly.
+    assert state.extractions.rows
+    assert all(
+        row.status is SourceExtractionStatus.VERIFIED for row in state.extractions.rows.values()
+    )
     assert sink.calls  # The archive fallback makes extraction non-blocking.
 
 
@@ -696,7 +712,12 @@ async def test_single_light_candidate_uses_the_individual_path(
     assert result["light_calls"] == 1
     assert result["light_batches"] == 0
     assert gateway.calls[0].prompt_template_id == "production-q2-url"
-    assert state.extractions.rows == {}
+    # LOT 38: a single IOC candidate takes the individual path and still leaves
+    # one reusable checkpoint for it.
+    assert len(state.extractions.rows) == 1
+    row = next(iter(state.extractions.rows.values()))
+    assert row.profile is ExtractionProfile.IOC_RULES
+    assert row.status is SourceExtractionStatus.VERIFIED
 
 
 @pytest.mark.asyncio
@@ -763,7 +784,12 @@ async def test_full_sources_are_never_batched(
     assert result["status"] == "success"
     assert result["light_batches"] == 0
     assert gateway.calls[0].prompt_template_id == "production-q2-url"
-    assert state.extractions.rows == {}
+    # LOT 38: a FULL source is never batched, and its individual reading is
+    # checkpointed under its own profile so a rebuild can reuse it.
+    assert len(state.extractions.rows) == 1
+    full_row = next(iter(state.extractions.rows.values()))
+    assert full_row.profile is ExtractionProfile.FULL
+    assert full_row.status is SourceExtractionStatus.VERIFIED
     canonical = sink.calls[-1]["canonical_json"]
     assert [item["value"] for item in canonical["items"]] == ["ExampleRAT"]
 
@@ -858,7 +884,11 @@ async def test_retry_of_the_same_run_reuses_the_batch_model_run(
     assert len(model_uow.state) == 1
     assert retry["model_calls"] == 0
 
-    # A new production run is a new reading of mutable web sources.
+    # LOT 38 replaced "a new run re-reads the web" with "a new run re-reads the
+    # web only when something functional changed".  The archived content of
+    # these sources is unchanged, so the new run consumes the checkpoint and
+    # pays no provider call, and every skipped call is explained by a typed
+    # reuse decision rather than by silence.
     replay = SubjectProductionRun(
         subject_id=run.subject_id,
         edition_id=uuid4(),
@@ -868,6 +898,20 @@ async def test_retry_of_the_same_run_reuses_the_batch_model_run(
     second = await orchestrator._execute_direct_url_extraction(replay, snapshot=snapshot)
 
     assert second["status"] == "success"
-    assert len(adapter.calls) == 2
-    assert len(model_uow.state) == 2
-    assert state.extractions.rows == {}
+    assert len(adapter.calls) == 1
+    assert len(model_uow.state) == 1
+    assert second["model_calls"] == 0
+    assert state.extractions.rows
+    evaluated = [
+        event
+        for event in orchestrator._diagnostics.events
+        if event.get("event") == "q2.source.reuse_evaluated" and event.get("run_id") == replay.id
+    ]
+    assert evaluated
+    assert all(event["status"] == "hit" for event in evaluated)
+    assert {event["reason"] for event in evaluated} == {"reusable_checkpoint"}
+    assert not [
+        event
+        for event in orchestrator._diagnostics.events
+        if event.get("event") == "q2.source.started" and event.get("run_id") == replay.id
+    ]

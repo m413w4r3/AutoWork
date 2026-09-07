@@ -322,7 +322,13 @@ async def get_workbench(subject_id: UUID, request: Request) -> WorkbenchView:
         attempts = await service.attempts(source.id)
         candidate, document = await service.source_context(source)
         source_views.append(
-            _source_view(source, attempts[-1] if attempts else None, candidate, document)
+            _source_view(
+                source,
+                attempts[-1] if attempts else None,
+                candidate,
+                document,
+                archive_receipt=await service.manual_archive_receipt(source),
+            )
         )
     claim_views: list[ClaimView] = []
     text_cache: dict[UUID, str] = {}
@@ -409,7 +415,13 @@ async def decide_relationship(
         raise HTTPException(status_code=404, detail="Source collection not found") from exc
     attempts = await service.attempts(source.id)
     candidate, document = await service.source_context(source)
-    return _source_view(source, attempts[-1] if attempts else None, candidate, document)
+    return _source_view(
+        source,
+        attempts[-1] if attempts else None,
+        candidate,
+        document,
+        archive_receipt=await service.manual_archive_receipt(source),
+    )
 
 
 @router.get("/{subject_id}/sources/{collection_id}/download")

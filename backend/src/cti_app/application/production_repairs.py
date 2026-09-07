@@ -625,9 +625,7 @@ class ProductionRepairDecisionService:
             correction_id=correction.id if correction is not None else None,
         )
         if action is ProductionRepairAction.REPLACE and correction is None:
-            raise ProductionRepairValueNotVerifiableError(
-                "production_repair_correction_required"
-            )
+            raise ProductionRepairValueNotVerifiableError("production_repair_correction_required")
         if correction is not None and (
             correction.edition_id != edition_id
             or correction.subject_id != subject_id
@@ -2071,9 +2069,7 @@ class ProductionRepairAdjudicationService:
         )
         artifact_store = self._artifact_store
         if artifact_store is None:
-            raise ProductionRepairValueNotVerifiableError(
-                "production_repair_storage_unavailable"
-            )
+            raise ProductionRepairValueNotVerifiableError("production_repair_storage_unavailable")
         blob_id = await artifact_store.put_text(value, bucket=REPAIR_CORRECTION_BUCKET)
         correction_id = production_repair_correction_identity(
             original_repair_key=issue.repair_key,
@@ -2144,9 +2140,11 @@ class ProductionRepairAdjudicationService:
                 reason_code="replacement_value_empty",
             )
 
+        rule_proposal: Q2RuleProposal | None = None
+        artifact_proposal: Q2ArtifactProposal | None = None
         if _repair_kind(issue.kind) is ProductionRepairIssueKind.REJECTED_RULE:
             try:
-                proposal = Q2RuleProposal(
+                rule_proposal = Q2RuleProposal(
                     rule_type=_entry_rule_type(artifact_type),
                     body=value,
                     context="",
@@ -2163,16 +2161,19 @@ class ProductionRepairAdjudicationService:
                     format_valid=False,
                     reason_code="invalid_rule_type",
                 )
-            output = Q2SourceOutput(rules=[proposal])
-            verified = verify_q2_proposals(
+            output = Q2SourceOutput(rules=[rule_proposal])
+            verified_rule_shape = verify_q2_proposals(
                 [Q2ProposalSubmission(output=output, source_ids=(source_id,))]
             )
-            format_valid = len(verified.rules) == 1
+            # Verified rules live in the canonical extraction, exactly like
+            # verified artifacts: reading them off the result itself would
+            # raise, so a rule correction would never reach the source gate.
+            format_valid = len(verified_rule_shape.canonical.rules) == 1
             normalized_value = value if format_valid else None
             if not format_valid:
                 reason_code = (
-                    verified.rejected[0].reason_code
-                    if verified.rejected
+                    verified_rule_shape.rejected[0].reason_code
+                    if verified_rule_shape.rejected
                     else "invalid_rule"
                 )
                 return ProductionRepairCorrectionVerification(
@@ -2188,7 +2189,7 @@ class ProductionRepairAdjudicationService:
         else:
             try:
                 artifact_enum = _entry_artifact_type(artifact_type)
-                proposal = Q2ArtifactProposal(
+                artifact_proposal = Q2ArtifactProposal(
                     value=value,
                     artifact_type=artifact_enum.value,
                     indicator_status="confirmed_ioc",
@@ -2209,7 +2210,8 @@ class ProductionRepairAdjudicationService:
             verified_shape = verify_q2_proposals(
                 [
                     Q2ProposalSubmission(
-                        output=Q2SourceOutput(artifacts=[proposal]), source_ids=(source_id,)
+                        output=Q2SourceOutput(artifacts=[artifact_proposal]),
+                        source_ids=(source_id,),
                     )
                 ]
             )
@@ -2233,7 +2235,7 @@ class ProductionRepairAdjudicationService:
                     format_valid=False,
                     reason_code=reason_code,
                 )
-            output = Q2SourceOutput(artifacts=[proposal])
+            output = Q2SourceOutput(artifacts=[artifact_proposal])
 
         if not require_source:
             return ProductionRepairCorrectionVerification(
@@ -2247,7 +2249,11 @@ class ProductionRepairAdjudicationService:
                 reason_code="source_verification_bypassed",
             )
 
-        document = await self._archived_source_document(issue.subject_id, source_url)
+        document = (
+            await self._archived_source_document(issue.subject_id, source_url)
+            if issue.subject_id is not None
+            else None
+        )
         if document is None:
             return ProductionRepairCorrectionVerification(
                 verified=False,
@@ -2260,18 +2266,20 @@ class ProductionRepairAdjudicationService:
                 reason_code="source_evidence_unavailable",
             )
         evidence = verify_ioc_rules_output_against_source(output, document)
-        verified = bool(evidence.output.artifacts or evidence.output.rules)
+        source_verified = bool(evidence.output.artifacts or evidence.output.rules)
         context_spans = (
-            source_evidence_context_for_artifact(proposal, document)
-            if _repair_kind(issue.kind) is ProductionRepairIssueKind.REJECTED_INDICATOR
+            source_evidence_context_for_artifact(artifact_proposal, document)
+            if artifact_proposal is not None
             else tuple(
                 span
-                for span in source_evidence_context_for_rule(proposal, document)
+                for span in source_evidence_context_for_rule(
+                    cast(Q2RuleProposal, rule_proposal), document
+                )
                 if span.kind is not SourceEvidenceSpanKind.VISUAL_UNLOCATED
             )
         )
         return ProductionRepairCorrectionVerification(
-            verified=verified,
+            verified=source_verified,
             replacement_value=value,
             normalized_value=normalized_value,
             artifact_type=artifact_type,
@@ -2280,7 +2288,7 @@ class ProductionRepairAdjudicationService:
             format_valid=True,
             reason_code=(
                 None
-                if verified
+                if source_verified
                 else (
                     evidence.rejections[0].reason_code
                     if evidence.rejections
@@ -2289,7 +2297,7 @@ class ProductionRepairAdjudicationService:
             ),
             context_spans=context_spans,
             verification_state=(
-                ProductionRepairVerificationState.SOURCE_VERIFIED if verified else None
+                ProductionRepairVerificationState.SOURCE_VERIFIED if source_verified else None
             ),
         )
 
@@ -2327,9 +2335,7 @@ class ProductionRepairAdjudicationService:
                 blob = await uow.blobs.get(blob_id)
                 descriptor = getattr(blob, "descriptor", None)
                 mime_type = mime_type or getattr(descriptor, "mime_type", None)
-                expected_sha256 = expected_sha256 or getattr(
-                    descriptor, "sha256", None
-                )
+                expected_sha256 = expected_sha256 or getattr(descriptor, "sha256", None)
         if blob_id is None:
             return None
         reader = getattr(self._artifact_store, "read_bytes", None)
@@ -2950,8 +2956,7 @@ class ProductionRepairProjectionService:
         original_include_entries = [
             item
             for item in include_entries
-            if _enum_value(decisions_by_key[item[0]].action)
-            == ProductionRepairAction.INCLUDE.value
+            if _enum_value(decisions_by_key[item[0]].action) == ProductionRepairAction.INCLUDE.value
         ]
         include_payload_objects = dict(
             zip(
@@ -3342,16 +3347,16 @@ async def reconcile_effective_repairs_in_uow(
         resolved_payloads[repair_key] = replacement
     replay_entries = []
     for repair_key, kind, entry, value_sha256 in active_entries:
-        decision = decisions_by_key.get(repair_key)
+        effective = decisions_by_key.get(repair_key)
         projected_value_hash = value_sha256
         projected_basis: str | None = None
         if (
-            decision is not None
-            and _enum_value(decision.action) == ProductionRepairAction.REPLACE.value
+            effective is not None
+            and _enum_value(effective.action) == ProductionRepairAction.REPLACE.value
         ):
-            if correction_repository is None or decision.correction_id is None:
+            if correction_repository is None or effective.correction_id is None:
                 raise ProductionRepairProjectionError("repair_correction_unavailable")
-            correction = await correction_repository.get(decision.correction_id)
+            correction = await correction_repository.get(effective.correction_id)
             if correction is None:
                 raise ProductionRepairProjectionError("repair_correction_unavailable")
             projected_value_hash = correction.replacement_value_sha256
@@ -4950,11 +4955,7 @@ class ProductionReferenceRepairService:
                         }
                         for source in reconciliation.report.sources
                     ],
-                    "source_hashes": {
-                        url: digest
-                        for url, digest in archived_projection
-                        if digest
-                    },
+                    "source_hashes": {url: digest for url, digest in archived_projection if digest},
                 }
             artifact = ProductionArtifact(
                 production_run_id=run.id,
@@ -4993,8 +4994,7 @@ class ProductionReferenceRepairService:
                         item["canonical_url"] for item in source_delta["unchanged_sources"]
                     ],
                     "changed_content_sources": [
-                        item["canonical_url"]
-                        for item in source_delta["changed_content_sources"]
+                        item["canonical_url"] for item in source_delta["changed_content_sources"]
                     ],
                     **(
                         {"repair_source_index": repair_source_index}
@@ -5173,9 +5173,7 @@ async def _q2_reuse_preview(
         if snapshots is not None and callable(getattr(snapshots, "get_by_run", None))
         else None
     )
-    core_urls = {
-        source.canonical_url for source in getattr(snapshot, "core_sources", ())
-    }
+    core_urls = {source.canonical_url for source in getattr(snapshot, "core_sources", ())}
     repository = getattr(uow, "source_extractions", None)
     finder = getattr(repository, "list_for_url", None)
     expected_reuses = 0
@@ -5204,7 +5202,7 @@ async def _q2_reuse_preview(
             and getattr(row, "parser_version", None)
             in {Q2_MARKDOWN_PARSER_VERSION, Q2_BATCH_PARSER_VERSION}
             and getattr(row, "verifier_version", None) == ARTIFACT_VERIFIER_VERSION
-        for row in rows
+            for row in rows
         )
         if reusable:
             expected_reuses += 1
