@@ -268,8 +268,9 @@ class _HistoricalArtifacts:
 
 
 @pytest.mark.asyncio
-async def test_lot33_legacy_synthesis_hash_is_reused_when_semantic_projection_is_unchanged(
-) -> None:
+async def test_lot33_legacy_synthesis_hash_is_reused_when_semantic_projection_is_unchanged() -> (
+    None
+):
     now = datetime.now(UTC)
     extraction_blob = uuid4()
     synthesis_blob = uuid4()

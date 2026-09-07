@@ -1631,9 +1631,8 @@ async def apply_subject_production_repairs(
         "repair_materialization": result.repair_materialization,
     }
     if (
-        (payload or ApplyProductionRepairsRequest()).resume
-        and result.projection.impact.kind is ProductionRepairImpactKind.NARRATIVE
-    ):
+        payload or ApplyProductionRepairsRequest()
+    ).resume and result.projection.impact.kind is ProductionRepairImpactKind.NARRATIVE:
         try:
             await _retry_production_run(
                 request,

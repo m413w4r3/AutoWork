@@ -34,6 +34,9 @@ from cti_app.application.pandoc_export import export_markdown_docx
 from cti_app.application.pandoc_rendering import render_edition_pandoc
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_repairs import (
+    publication_is_compatible_with_current_effective_inputs,
+)
 from cti_app.domain.edition_publication import (
     EditionDocumentV2,
     EditionPublicationV2,
@@ -251,6 +254,24 @@ class EditionPublicationService:
                     or artifact.canonical_blob_id is None
                 ):
                     raise PublicationAcceptanceError("included_artifact_mismatch")
+                # Defence in depth: the manifest must never freeze a document
+                # older than the repair already applied to its Extraction.
+                # The proof comes from the document's own recorded inputs, not
+                # from a decision marker on the Extraction.
+                current_extraction = await uow.production_artifacts.get_current(
+                    item.run_id, ProductionArtifactStage.EXTRACTION.value
+                )
+                current_references = await uow.production_artifacts.get_current(
+                    item.run_id, ProductionArtifactStage.REFERENCES.value
+                )
+                if current_extraction is not None and (
+                    not publication_is_compatible_with_current_effective_inputs(
+                        publication=artifact,
+                        extraction=current_extraction,
+                        references=current_references,
+                    )
+                ):
+                    raise PublicationAcceptanceError("repair_materialization_incomplete")
                 entries.append(
                     PublicationManifestEntryV1(
                         position=item.position,

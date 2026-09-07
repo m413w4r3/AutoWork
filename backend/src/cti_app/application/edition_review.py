@@ -572,8 +572,7 @@ def _repair_articles(items: Sequence[EditionRepairItem]) -> tuple[EditionRepairA
                     ),
                     recommended_stage=recommended,
                     execution_plan=merge_repair_impacts(
-                        _impact_from_execution_plan(item.execution_plan)
-                        for item in subject_items
+                        _impact_from_execution_plan(item.execution_plan) for item in subject_items
                     ).execution_plan,
                     active_repair_count=sum(not item.resolved for item in subject_items),
                     resolved_since_last_build_count=sum(

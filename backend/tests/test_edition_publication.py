@@ -245,15 +245,21 @@ class _Runs:
 class _Artifacts:
     def __init__(self, artifacts: dict[UUID, ProductionArtifact]) -> None:
         self.artifacts = artifacts
-        self.current_called = False
+        self.current_calls: list[tuple[UUID, str]] = []
 
     async def get(self, artifact_id: UUID) -> ProductionArtifact | None:
         return self.artifacts.get(artifact_id)
 
     async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
-        del run_id, stage
-        self.current_called = True
-        raise AssertionError("frozen assembly must not resolve current artifacts")
+        # The freeze resolves the current EXTRACTION/REFERENCES to prove that
+        # each included document consumed them (LOT 34).  It still selects the
+        # document itself by manifest identity, never by "current".
+        self.current_calls.append((run_id, stage))
+        assert stage in {
+            ProductionArtifactStage.EXTRACTION.value,
+            ProductionArtifactStage.REFERENCES.value,
+        }, "frozen assembly must not resolve the current document"
+        return None
 
 
 class _ReadModel:

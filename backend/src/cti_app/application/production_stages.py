@@ -589,6 +589,15 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
                 "semantic_annotator_version": SEMANTIC_ANNOTATOR_VERSION,
                 "pandoc_renderer_version": PANDOC_RENDERER_VERSION,
                 "generated_at": datetime.now(UTC).isoformat(),
+                # The identity of what this document actually consumed.  The
+                # freeze proves against it that a published article was built
+                # from the effective Extraction, without trusting a marker
+                # carried by the Extraction alone.
+                "input_artifacts": {
+                    "references_artifact_id": str(references_artifact.id),
+                    "extraction_artifact_id": str(extraction_artifact.id),
+                    "synthesis_artifact_id": str(synthesis_artifact.id),
+                },
             },
         )
         if metadata_extra:

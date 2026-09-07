@@ -4199,9 +4199,7 @@ class ProductionWorkflowOrchestrator:
                 extraction_artifact=extraction,
                 synthesis_artifact=synthesis,
                 metadata_extra=(
-                    {"repair_materialization": repair_marker}
-                    if repair_marker is not None
-                    else None
+                    {"repair_materialization": repair_marker} if repair_marker is not None else None
                 ),
             )
 

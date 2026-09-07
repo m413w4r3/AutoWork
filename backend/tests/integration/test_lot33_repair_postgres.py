@@ -95,9 +95,7 @@ async def test_lot33_postgres_selective_versions_keep_current_and_audit_distinct
         "reused_synthesis_artifact_id": str(uuid4()),
         "result_publication_artifact_id": None,
     }
-    extraction_v2 = artifact(
-        ProductionArtifactStage.EXTRACTION, 2, repair_materialization=audit_v2
-    )
+    extraction_v2 = artifact(ProductionArtifactStage.EXTRACTION, 2, repair_materialization=audit_v2)
     publication_v2 = artifact(ProductionArtifactStage.PUBLICATION, 2)
     audit_v2["result_extraction_artifact_id"] = str(extraction_v2.id)
     audit_v2["result_publication_artifact_id"] = str(publication_v2.id)
@@ -125,9 +123,7 @@ async def test_lot33_postgres_selective_versions_keep_current_and_audit_distinct
         "result_extraction_artifact_id": None,
         "result_publication_artifact_id": None,
     }
-    extraction_v3 = artifact(
-        ProductionArtifactStage.EXTRACTION, 3, repair_materialization=audit_v3
-    )
+    extraction_v3 = artifact(ProductionArtifactStage.EXTRACTION, 3, repair_materialization=audit_v3)
     publication_v3 = artifact(ProductionArtifactStage.PUBLICATION, 3)
     audit_v3["result_extraction_artifact_id"] = str(extraction_v3.id)
     audit_v3["result_publication_artifact_id"] = str(publication_v3.id)
@@ -149,9 +145,7 @@ async def test_lot33_postgres_selective_versions_keep_current_and_audit_distinct
             run.id, ProductionArtifactStage.PUBLICATION.value
         )
         rows = await uow.production_artifacts.list_for_run(run.id)
-        decisions = await uow.production_repair_decisions.list_for_edition(
-            edition.id, subject.id
-        )
+        decisions = await uow.production_repair_decisions.list_for_edition(edition.id, subject.id)
         effective = await uow.production_repair_decisions.effective_decisions(
             edition.id, subject.id
         )
@@ -165,12 +159,16 @@ async def test_lot33_postgres_selective_versions_keep_current_and_audit_distinct
         str(decision_two.id)
     ]
     assert len({(row.stage, row.version) for row in rows}) == len(rows)
-    assert {
-        row.version for row in rows if row.stage is ProductionArtifactStage.EXTRACTION
-    } == {1, 2, 3}
-    assert {
-        row.version for row in rows if row.stage is ProductionArtifactStage.PUBLICATION
-    } == {1, 2, 3}
+    assert {row.version for row in rows if row.stage is ProductionArtifactStage.EXTRACTION} == {
+        1,
+        2,
+        3,
+    }
+    assert {row.version for row in rows if row.stage is ProductionArtifactStage.PUBLICATION} == {
+        1,
+        2,
+        3,
+    }
     assert all(
         row.status is ProductionArtifactStatus.STALE
         for row in rows

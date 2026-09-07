@@ -161,9 +161,10 @@ async def test_mark_stages_stale_updates_only_requested_non_stale_stages(
         await uow.commit()
 
     async with uow_factory() as uow:
-        assert await uow.production_artifacts.mark_stages_stale(
-            run.id, {"publication", "synthesis"}
-        ) == []
+        assert (
+            await uow.production_artifacts.mark_stages_stale(run.id, {"publication", "synthesis"})
+            == []
+        )
         assert await uow.production_artifacts.mark_stages_stale(run.id, []) == []
         await uow.commit()
         artifacts = await uow.production_artifacts.list_for_run(run.id)

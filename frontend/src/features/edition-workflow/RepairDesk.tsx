@@ -288,6 +288,17 @@ export function RepairDesk({
           next.delete(subjectId);
           return next;
         });
+      } else if (result.action === "rules_projection_pending") {
+        // La décision est bien dans l’extraction canonique ; seule la
+        // projection des sidecars de règles reste à rejouer.
+        setMessage(
+          "Décision appliquée. La projection des règles reste à régénérer.",
+        );
+        setPendingRebuilds((current) => {
+          const next = new Set(current);
+          next.delete(subjectId);
+          return next;
+        });
       } else {
         setMessage(
           "Application lancée. Les arbitrages déjà enregistrés sont conservés.",

@@ -326,6 +326,4 @@ async def test_post_q2_replay_audits_a_disappeared_decision_without_blocking_deb
     assert derived is None
     assert len(uow.production_artifacts.items) == 1
     assert len(audit.events) == 1
-    assert audit.events[0].action == (
-        "production.repair_decision_superseded_by_new_extraction"
-    )
+    assert audit.events[0].action == ("production.repair_decision_superseded_by_new_extraction")
