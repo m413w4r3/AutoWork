@@ -509,6 +509,14 @@ class ProductionArtifactStatus(StrEnum):
     NEEDS_REVIEW = "needs_review"
 
 
+class SynthesisMode(StrEnum):
+    """How Q4 obtained the current synthesis artifact."""
+
+    REUSE_EXACT = "reuse_exact"
+    REVISE_PREVIOUS = "revise_previous"
+    FRESH = "fresh"
+
+
 @dataclass(slots=True, kw_only=True)
 class SourceExtraction:
     """Subject-independent, content-addressed Q2 extraction checkpoint."""

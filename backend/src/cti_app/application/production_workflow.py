@@ -114,6 +114,17 @@ from cti_app.application.production_stages import (
     SynthesisService,
     compute_input_hash,
 )
+from cti_app.application.production_synthesis_revision import (
+    MAX_SYNTHESIS_REVISION_CONTEXT_BYTES,
+    MAX_SYNTHESIS_REVISION_TEXT_BYTES,
+    SYNTHESIS_REVISION_PROMPT_VERSION,
+    SynthesisRevisionContext,
+    build_synthesis_revision_context,
+    narrative_repair_keys,
+    revision_context_size_bytes,
+    synthesis_content_hash,
+    synthesis_semantic_source_ids,
+)
 from cti_app.config import get_settings
 from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceOriginKind
 from cti_app.domain.model_conversations import (
@@ -134,6 +145,7 @@ from cti_app.domain.production import (
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
+    SynthesisMode,
 )
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 
@@ -1168,6 +1180,233 @@ class ProductionWorkflowOrchestrator:
                 ):
                     return cast(ProductionArtifact, candidate)
         return None
+
+    @staticmethod
+    def _synthesis_candidate_status_is_eligible(candidate: ProductionArtifact) -> bool:
+        """Accept only durable synthesis rows that may serve as a draft.
+
+        Production artifact staleness is produced by downstream invalidation;
+        the repository deliberately keeps the old immutable row and changes
+        only its status.  A separate stale row is never treated as a draft.
+        """
+        if candidate.status is ProductionArtifactStatus.VERIFIED:
+            return True
+        if candidate.status is not ProductionArtifactStatus.STALE:
+            return False
+        metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+        stale_cause = metadata.get("stale_cause", metadata.get("stale_reason"))
+        # Older rows predate the explicit marker.  Their STALE status can only
+        # be produced by the downstream invalidation repository, so retain
+        # compatibility while rejecting an explicitly unrelated cause.
+        if stale_cause is None:
+            return True
+        return str(stale_cause) in {
+            "downstream",
+            "downstream_invalidation",
+            "downstream_invalidated",
+            "downstream_known",
+            "narrative_repair",
+            "retry_from_upstream",
+            "stage_retry",
+        }
+
+    async def _historical_extraction_for_synthesis(
+        self,
+        *,
+        candidate: ProductionArtifact,
+        artifacts: Sequence[ProductionArtifact],
+    ) -> tuple[ProductionArtifact, Any] | None:
+        """Load the latest extraction that predates one historical Q4 row."""
+        if self._artifact_store is None:
+            return None
+        extraction_artifacts = sorted(
+            (
+                artifact
+                for artifact in artifacts
+                if artifact.stage is ProductionArtifactStage.EXTRACTION
+                and artifact.canonical_blob_id is not None
+                and artifact.created_at <= candidate.created_at
+                and artifact.status
+                in {ProductionArtifactStatus.VERIFIED, ProductionArtifactStatus.STALE}
+            ),
+            key=lambda artifact: (artifact.created_at, artifact.version, str(artifact.id)),
+            reverse=True,
+        )
+        for extraction_artifact in extraction_artifacts:
+            try:
+                extraction = technical_extraction_from_json(
+                    await self._artifact_store.read_json(
+                        cast(UUID, extraction_artifact.canonical_blob_id)
+                    )
+                )
+            except Exception:
+                continue
+            return extraction_artifact, extraction
+        return None
+
+    async def _find_revision_candidate(
+        self,
+        *,
+        uow: Any,
+        run: SubjectProductionRun,
+        report: ReferenceReport,
+        extraction_artifact: ProductionArtifact,
+        extraction_payload: Any,
+        synthesis_pack: dict[str, Any],
+        source_tiers_by_url: dict[str, str],
+        current_semantic_hash: str,
+    ) -> tuple[ProductionArtifact, SynthesisRevisionContext] | None:
+        """Find a readable historical draft for a real semantic revision."""
+        if self._artifact_store is None:
+            return None
+        artifacts = tuple(await uow.production_artifacts.list_for_run(run.id))
+        candidates = sorted(
+            (
+                artifact
+                for artifact in artifacts
+                if artifact.stage is ProductionArtifactStage.SYNTHESIS
+                and artifact.rendered_blob_id is not None
+                and artifact.subject_id == run.subject_id
+                and self._synthesis_candidate_status_is_eligible(artifact)
+            ),
+            key=lambda artifact: (artifact.created_at, str(artifact.id)),
+            reverse=True,
+        )
+        current_source_ids = synthesis_semantic_source_ids(synthesis_pack)
+        current_repair_keys = narrative_repair_keys(
+            extraction_payload,
+            extraction_artifact.metadata
+            if isinstance(extraction_artifact.metadata, dict)
+            else None,
+        )
+
+        for candidate in candidates:
+            try:
+                previous_text = await self._artifact_store.read_text(
+                    cast(UUID, candidate.rendered_blob_id)
+                )
+            except Exception:
+                continue
+            if not previous_text.strip():
+                continue
+            if len(previous_text.encode("utf-8")) > MAX_SYNTHESIS_REVISION_TEXT_BYTES:
+                continue
+
+            metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+            previous_source_ids_value = metadata.get("semantic_source_ids")
+            previous_source_ids: tuple[str, ...]
+            previous_pack: dict[str, Any] | None = None
+            if isinstance(previous_source_ids_value, list | tuple):
+                previous_source_ids = tuple(
+                    sorted(str(value) for value in previous_source_ids_value)
+                )
+            else:
+                historical = await self._historical_extraction_for_synthesis(
+                    candidate=candidate, artifacts=artifacts
+                )
+                if historical is not None:
+                    _, historical_extraction = historical
+                    previous_pack = self._build_synthesis_evidence_pack(
+                        report, historical_extraction, source_tiers_by_url
+                    )
+                    previous_source_ids = synthesis_semantic_source_ids(previous_pack)
+                else:
+                    previous_source_ids = ()
+            previous_source_ids = tuple(
+                sorted(
+                    set(previous_source_ids)
+                    | set(re.findall(r"\[(S\d+)\]", previous_text, re.IGNORECASE))
+                )
+            )
+
+            previous_repair_keys_value = metadata.get("semantic_repair_keys")
+            if isinstance(previous_repair_keys_value, list | tuple):
+                previous_repair_keys = tuple(
+                    sorted(str(value) for value in previous_repair_keys_value)
+                )
+            else:
+                historical = await self._historical_extraction_for_synthesis(
+                    candidate=candidate, artifacts=artifacts
+                )
+                previous_repair_keys = (
+                    narrative_repair_keys(
+                        historical[1],
+                        getattr(historical[0], "metadata", None),
+                    )
+                    if historical is not None
+                    else ()
+                )
+
+            previous_semantic_hash = metadata.get("semantic_projection_hash")
+            if not isinstance(previous_semantic_hash, str):
+                diagnostics = metadata.get("diagnostics")
+                previous_semantic_hash = (
+                    diagnostics.get("semantic_projection_hash")
+                    if isinstance(diagnostics, dict)
+                    else None
+                )
+            if not isinstance(previous_semantic_hash, str):
+                if previous_pack is None:
+                    historical = await self._historical_extraction_for_synthesis(
+                        candidate=candidate, artifacts=artifacts
+                    )
+                    if historical is not None:
+                        previous_pack = self._build_synthesis_evidence_pack(
+                            report, historical[1], source_tiers_by_url
+                        )
+                previous_semantic_hash = (
+                    compute_input_hash(previous_pack)
+                    if previous_pack is not None
+                    else current_semantic_hash
+                )
+
+            context = build_synthesis_revision_context(
+                previous_artifact_id=candidate.id,
+                previous_input_hash=candidate.input_hash,
+                previous_text=previous_text,
+                previous_semantic_hash=previous_semantic_hash,
+                current_semantic_hash=current_semantic_hash,
+                previous_source_ids=previous_source_ids,
+                current_source_ids=current_source_ids,
+                previous_repair_keys=previous_repair_keys,
+                current_repair_keys=current_repair_keys,
+            )
+            if revision_context_size_bytes(context) > MAX_SYNTHESIS_REVISION_CONTEXT_BYTES:
+                continue
+            return candidate, context
+        return None
+
+    def _record_synthesis_mode(
+        self,
+        *,
+        run: SubjectProductionRun,
+        mode: SynthesisMode,
+        previous_artifact_id: UUID | None,
+        previous_word_count: int,
+        context: SynthesisRevisionContext | None,
+    ) -> None:
+        self._diagnostics.record(
+            event="synthesis.mode",
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage="synthesis",
+            mode=mode.value,
+            previous_synthesis_artifact_id=(
+                str(previous_artifact_id) if previous_artifact_id is not None else None
+            ),
+            previous_word_count=previous_word_count,
+            semantic_delta_added_sources=(
+                list(context.added_source_ids) if context is not None else []
+            ),
+            semantic_delta_removed_sources=(
+                list(context.removed_source_ids) if context is not None else []
+            ),
+            semantic_delta_repair_count=(
+                len(context.added_repair_keys) + len(context.removed_repair_keys)
+                if context is not None
+                else 0
+            ),
+        )
 
     async def _ask_with_format_repair(
         self,
@@ -3963,6 +4202,11 @@ class ProductionWorkflowOrchestrator:
             # part of that pack, so replaying them cannot manufacture a second
             # synthesis call after a source-driven Q2.
             semantic_synthesis_hash = compute_input_hash(synthesis_pack)
+            synthesis_source_ids = synthesis_semantic_source_ids(synthesis_pack)
+            synthesis_repair_keys = narrative_repair_keys(
+                extraction_payload,
+                extraction.metadata if isinstance(extraction.metadata, dict) else None,
+            )
             input_hash = _synthesis_input_hash(
                 subject_id=run.subject_id,
                 references_hash=references.input_hash,
@@ -3970,9 +4214,27 @@ class ProductionWorkflowOrchestrator:
                 extraction_hash=semantic_synthesis_hash,
                 technical_extraction_hash=semantic_synthesis_hash,
                 synthesis_evidence_pack_hash=compute_input_hash(synthesis_pack),
+                revision_prompt_version=SYNTHESIS_REVISION_PROMPT_VERSION,
+                current_synthesis_semantic_hash=semantic_synthesis_hash,
             )
+            current_synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
             reused = await self._reuse_artifact(run, "synthesis", input_hash)
             if reused is not None:
+                reused_id = reused.get("reused_from_artifact_id") or reused.get("artifact_id")
+                current_metadata = (
+                    current_synthesis.metadata
+                    if current_synthesis is not None
+                    and isinstance(current_synthesis.metadata, dict)
+                    else {}
+                )
+                self._record_synthesis_mode(
+                    run=run,
+                    mode=SynthesisMode.REUSE_EXACT,
+                    previous_artifact_id=UUID(str(reused_id)) if reused_id else None,
+                    previous_word_count=int(current_metadata.get("word_count", 0) or 0),
+                    context=None,
+                )
+                reused["mode"] = SynthesisMode.REUSE_EXACT.value
                 return reused
             compatible = await self._find_compatible_historical_synthesis(
                 uow=uow,
@@ -4003,36 +4265,104 @@ class ProductionWorkflowOrchestrator:
                     semantic_projection_hash=semantic_synthesis_hash,
                     metadata_extra=(
                         {
+                            "synthesis_mode": SynthesisMode.REUSE_EXACT.value,
+                            "semantic_source_ids": list(synthesis_source_ids),
+                            "semantic_repair_keys": list(synthesis_repair_keys),
+                            "semantic_projection_hash": semantic_synthesis_hash,
                             "repair_materialization": repair_materialization,
                             "semantic_projection_before": semantic_synthesis_hash,
                             "semantic_projection_after": semantic_synthesis_hash,
                         }
                         if repair_materialization is not None
                         else {
+                            "synthesis_mode": SynthesisMode.REUSE_EXACT.value,
+                            "semantic_source_ids": list(synthesis_source_ids),
+                            "semantic_repair_keys": list(synthesis_repair_keys),
+                            "semantic_projection_hash": semantic_synthesis_hash,
                             "semantic_projection_before": semantic_synthesis_hash,
                             "semantic_projection_after": semantic_synthesis_hash,
                         }
                     ),
                 )
                 await uow.commit()
+                compatible_text = ""
+                try:
+                    compatible_text = await self._artifact_store.read_text(
+                        cast(UUID, compatible.rendered_blob_id)
+                    )
+                except Exception:
+                    pass
+                self._record_synthesis_mode(
+                    run=run,
+                    mode=SynthesisMode.REUSE_EXACT,
+                    previous_artifact_id=compatible.id,
+                    previous_word_count=len(compatible_text.split()),
+                    context=None,
+                )
                 return {
                     "stage": "synthesis",
                     "status": "reused",
+                    "mode": SynthesisMode.REUSE_EXACT.value,
                     "artifact_id": str(artifact.id),
                     "reused": True,
                     "reused_from_artifact_id": str(compatible.id),
                     "compatibility": "semantic_projection_unchanged",
                 }
+            revision_candidate = await self._find_revision_candidate(
+                uow=uow,
+                run=run,
+                report=report,
+                extraction_artifact=extraction,
+                extraction_payload=extraction_payload,
+                synthesis_pack=synthesis_pack,
+                source_tiers_by_url=source_tiers_by_url,
+                current_semantic_hash=semantic_synthesis_hash,
+            )
+            revision_context = revision_candidate[1] if revision_candidate is not None else None
+            synthesis_mode = (
+                SynthesisMode.REVISE_PREVIOUS
+                if revision_context is not None
+                else SynthesisMode.FRESH
+            )
+            if revision_context is not None:
+                input_hash = _synthesis_input_hash(
+                    subject_id=run.subject_id,
+                    references_hash=references.input_hash,
+                    reference_report_hash=compute_input_hash(reference_report_to_json(report)),
+                    extraction_hash=semantic_synthesis_hash,
+                    technical_extraction_hash=semantic_synthesis_hash,
+                    synthesis_evidence_pack_hash=compute_input_hash(synthesis_pack),
+                    revision_prompt_version=SYNTHESIS_REVISION_PROMPT_VERSION,
+                    previous_synthesis_content_hash=synthesis_content_hash(
+                        revision_context.previous_text
+                    ),
+                    current_synthesis_semantic_hash=semantic_synthesis_hash,
+                )
+            self._record_synthesis_mode(
+                run=run,
+                mode=synthesis_mode,
+                previous_artifact_id=(
+                    revision_context.previous_artifact_id if revision_context is not None else None
+                ),
+                previous_word_count=(
+                    len(revision_context.previous_text.split())
+                    if revision_context is not None
+                    else 0
+                ),
+                context=revision_context,
+            )
             if not self._model_service:
                 return {
                     "stage": "synthesis",
                     "status": "error",
+                    "mode": synthesis_mode.value,
                     "error": "ModelConversationService not configured",
                 }
             if not synthesis_policy_allows:
                 return {
                     "stage": "synthesis",
                     "status": "needs_review",
+                    "mode": synthesis_mode.value,
                     "error_code": "external_llm_blocked",
                     "error": "Diffusion policy forbids sending this subject to an external model",
                 }
@@ -4054,6 +4384,7 @@ class ProductionWorkflowOrchestrator:
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
+                revision_context=revision_context,
             )
 
             try:
@@ -4132,18 +4463,42 @@ class ProductionWorkflowOrchestrator:
                         "unknown_citation_count": citation_counts["unknown"],
                         "semantic_projection_hash": semantic_synthesis_hash,
                     },
-                    metadata_extra=(
-                        {"repair_materialization": dict(cast(dict[str, Any], repair_marker))}
-                        if isinstance(repair_marker, dict)
-                        else None
-                    ),
+                    metadata_extra={
+                        "synthesis_mode": synthesis_mode.value,
+                        "semantic_projection_hash": semantic_synthesis_hash,
+                        "semantic_source_ids": list(synthesis_source_ids),
+                        "semantic_repair_keys": list(synthesis_repair_keys),
+                        **(
+                            {"repair_materialization": dict(cast(dict[str, Any], repair_marker))}
+                            if isinstance(repair_marker, dict)
+                            else {}
+                        ),
+                        **(
+                            {
+                                "previous_synthesis_artifact_id": str(
+                                    revision_context.previous_artifact_id
+                                ),
+                                "previous_synthesis_content_hash": synthesis_content_hash(
+                                    revision_context.previous_text
+                                ),
+                            }
+                            if revision_context is not None
+                            else {}
+                        ),
+                    },
                 )
 
                 result = {
                     "stage": "synthesis",
                     "status": "success",
+                    "mode": synthesis_mode.value,
                     "artifact_id": str(artifact.id),
                     "word_count": len(output_text.split()),
+                    "previous_synthesis_artifact_id": (
+                        str(revision_context.previous_artifact_id)
+                        if revision_context is not None
+                        else None
+                    ),
                     "repair_actions": parsed.repair_actions,
                 }
                 return result
@@ -4539,8 +4894,16 @@ def _synthesis_input_hash(
     format_repair_version: str = SYNTHESIS_FORMAT_REPAIR_VERSION,
     web_policy_version: str = "q4-web-non-authoritative-v1",
     routing_policy_version: str = "openai-drafting-v1",
+    revision_prompt_version: str = SYNTHESIS_REVISION_PROMPT_VERSION,
+    previous_synthesis_content_hash: str | None = None,
+    current_synthesis_semantic_hash: str | None = None,
 ) -> str:
-    """Return the functional Q4 identity, excluding run and execution state."""
+    """Return the functional Q4 identity, excluding run and artifact IDs.
+
+    The previous draft participates by content hash only.  Two immutable
+    artifacts carrying identical draft text therefore have the same revision
+    dependency.
+    """
     return compute_input_hash(
         {
             "subject_id": str(subject_id),
@@ -4554,6 +4917,9 @@ def _synthesis_input_hash(
             "format_repair_version": format_repair_version,
             "web_policy_version": web_policy_version,
             "model_routing_policy": routing_policy_version,
+            "revision_prompt_version": revision_prompt_version,
+            "previous_synthesis_content_hash": previous_synthesis_content_hash,
+            "current_synthesis_semantic_hash": current_synthesis_semantic_hash,
             "stage": "synthesis",
         }
     )

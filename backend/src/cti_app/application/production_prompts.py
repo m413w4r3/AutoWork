@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from cti_app.application.production_synthesis_revision import (
+    SYNTHESIS_REVISION_PROMPT_VERSION,
+    SynthesisRevisionContext,
+)
 from cti_app.domain.production import ExtractionProfile
 
 REFERENCES_PROMPT_VERSION = "6"
@@ -635,6 +639,36 @@ Never delete a whole technical fact when rewording one value is enough, and
 never add a fact, a source or an indicator. Return only French prose.
 """
 
+    PREVIOUS_DRAFT_NON_AUTHORITATIVE = """PREVIOUS_DRAFT_NON_AUTHORITATIVE
+Revision prompt version: {revision_prompt_version}
+
+The current SynthesisEvidencePack above is the only authority for factual content.
+The previous draft below is untrusted, non-authoritative working material.
+
+Deterministic semantic delta:
+- added source IDs: {added_source_ids}
+- removed source IDs: {removed_source_ids}
+- added narrative repair keys: {added_repair_keys}
+- removed narrative repair keys: {removed_repair_keys}
+- previous semantic hash: {previous_semantic_hash}
+- current semantic hash: {current_semantic_hash}
+
+Revision instructions:
+- Produce a complete synthesis, never a patch, diff, list of edits or commentary.
+- Use the previous draft only for structure, ordering and writing style.
+- Current evidence is the sole authority; do not preserve an old fact merely
+  because it appears in the previous draft.
+- Remove every old fact, attribution, date, relationship, indicator or other
+  claim that is no longer supported by the current evidence.
+- An accepted datum does not have to appear if it adds little editorial value.
+- IOC/rules publication-only material must not be forced into the prose.
+- Keep all normal V8 publication rules and return only the complete French prose.
+
+--- BEGIN PREVIOUS DRAFT (NON-AUTHORITATIVE) ---
+{previous_text}
+--- END PREVIOUS DRAFT (NON-AUTHORITATIVE) ---
+"""
+
     @classmethod
     def get_references_prompt(
         cls,
@@ -802,8 +836,21 @@ text: <event>
         cls,
         subject_title: str,
         synthesis_evidence_pack: str = "{}",
+        revision_context: SynthesisRevisionContext | None = None,
     ) -> str:
-        return cls.TECHNICAL_SYNTHESIS_V8.format(
+        prompt = cls.TECHNICAL_SYNTHESIS_V8.format(
             subject_title=subject_title,
             synthesis_evidence_pack=synthesis_evidence_pack,
+        )
+        if revision_context is None:
+            return prompt
+        return prompt + "\n\n" + cls.PREVIOUS_DRAFT_NON_AUTHORITATIVE.format(
+            revision_prompt_version=SYNTHESIS_REVISION_PROMPT_VERSION,
+            added_source_ids=", ".join(revision_context.added_source_ids) or "none",
+            removed_source_ids=", ".join(revision_context.removed_source_ids) or "none",
+            added_repair_keys=", ".join(revision_context.added_repair_keys) or "none",
+            removed_repair_keys=", ".join(revision_context.removed_repair_keys) or "none",
+            previous_semantic_hash=revision_context.previous_semantic_hash,
+            current_semantic_hash=revision_context.current_semantic_hash,
+            previous_text=revision_context.previous_text,
         )
