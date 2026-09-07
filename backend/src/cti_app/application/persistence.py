@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import date, datetime
 from types import TracebackType
 from typing import TYPE_CHECKING, Protocol, Self
@@ -784,6 +784,10 @@ class ProductionArtifactRepository(Protocol):
     async def list_for_run(self, run_id: UUID) -> Sequence[ProductionArtifact]: ...
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None: ...
+
+    async def mark_stages_stale(
+        self, run_id: UUID, stages: Collection[str]
+    ) -> list[str]: ...
 
     async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]: ...
 

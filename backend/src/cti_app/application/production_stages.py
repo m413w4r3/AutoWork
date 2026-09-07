@@ -293,10 +293,11 @@ class ExtractionService(_ArtifactPayloadMixin):
             conversation_turn_id=None,
             metadata=dict(metadata),
         )
+        # A repair projection is an analyst-level derivative.  Its semantic
+        # impact is decided by ProductionRepairMaterializationService; a
+        # linear downstream invalidation here would erase a still-valid
+        # synthesis and publication.
         await uow.production_artifacts.append(artifact)
-        await uow.production_artifacts.mark_downstream_stale(
-            run_id, ProductionArtifactStage.EXTRACTION.value
-        )
         return artifact
 
 
@@ -397,74 +398,124 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
         )
 
         async with self._uow_factory() as uow:
-            input_data = {
-                "references_id": str(references_artifact.id),
-                "references_hash": references_artifact.input_hash,
-                "extraction_id": str(extraction_artifact.id),
-                "extraction_hash": extraction_artifact.input_hash,
-                "synthesis_id": str(synthesis_artifact.id),
-                "synthesis_hash": synthesis_artifact.input_hash,
-                "publication_schema_version": PUBLICATION_SCHEMA_VERSION,
-                "semantic_annotator_version": SEMANTIC_ANNOTATOR_VERSION,
-                "pandoc_renderer_version": PANDOC_RENDERER_VERSION,
-            }
-            input_hash = compute_input_hash(input_data)
-
-            # Not get_current: a synthesis retry stales the previous publication
-            # first, and get_current excludes STALE rows — using it here
-            # would restart numbering at 1 and collide with the
-            # (production_run_id, stage, version) uniqueness of the original.
-            existing = await uow.production_artifacts.list_for_run(run_id)
-            prior_versions = [
-                artifact.version
-                for artifact in existing
-                if artifact.stage is ProductionArtifactStage.PUBLICATION
-            ]
-            version = max(prior_versions) + 1 if prior_versions else 1
-
-            document = build_publication_document(
+            artifact = await self._assemble_publication_in_uow(
+                uow,
+                run_id=run_id,
+                subject_id=subject_id,
                 subject_title=subject_title,
+                references_artifact=references_artifact,
+                extraction_artifact=extraction_artifact,
+                synthesis_artifact=synthesis_artifact,
                 report=report,
                 extraction=extraction,
                 synthesis_text=synthesis_text,
             )
-            publication_markdown = render_publication_pandoc(document)
-
-            raw_id, canonical_id, rendered_id = await self._store_payloads(
-                canonical=document.to_json(),
-                rendered=publication_markdown,
-            )
-            artifact = ProductionArtifact(
-                production_run_id=run_id,
-                subject_id=subject_id,
-                stage=ProductionArtifactStage.PUBLICATION,
-                version=version,
-                input_hash=input_hash,
-                status=ProductionArtifactStatus.VERIFIED,
-                raw_blob_id=raw_id,
-                canonical_blob_id=canonical_id,
-                rendered_blob_id=rendered_id,
-                metadata={
-                    "word_count": len(publication_markdown.split()),
-                    "reference_count": len(document.sources),
-                    "indicator_count": len(collect_indicators(extraction)),
-                    "analyst_override_indicator_count": sum(
-                        item.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
-                        for item in extraction.items
-                    ),
-                    "analyst_override_rule_count": sum(
-                        rule.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
-                        for rule in extraction.rules
-                    ),
-                    "publication_schema_version": PUBLICATION_SCHEMA_VERSION,
-                    "semantic_annotator_version": SEMANTIC_ANNOTATOR_VERSION,
-                    "pandoc_renderer_version": PANDOC_RENDERER_VERSION,
-                    "generated_at": datetime.now(UTC).isoformat(),
-                },
-            )
-            await uow.production_artifacts.append(artifact)
             await uow.commit()
             return artifact
+
+    async def assemble_publication_in_uow(
+        self,
+        uow: Any,
+        run_id: UUID,
+        subject_id: UUID,
+        subject_title: str,
+        references_artifact: ProductionArtifact,
+        extraction_artifact: ProductionArtifact,
+        synthesis_artifact: ProductionArtifact,
+    ) -> ProductionArtifact:
+        """Assemble without committing, for a caller holding repair fences."""
+        report, extraction, synthesis_text = await self._load_inputs(
+            references_artifact, extraction_artifact, synthesis_artifact
+        )
+        return await self._assemble_publication_in_uow(
+            uow,
+            run_id=run_id,
+            subject_id=subject_id,
+            subject_title=subject_title,
+            references_artifact=references_artifact,
+            extraction_artifact=extraction_artifact,
+            synthesis_artifact=synthesis_artifact,
+            report=report,
+            extraction=extraction,
+            synthesis_text=synthesis_text,
+        )
+
+    async def _assemble_publication_in_uow(
+        self,
+        uow: Any,
+        *,
+        run_id: UUID,
+        subject_id: UUID,
+        subject_title: str,
+        references_artifact: ProductionArtifact,
+        extraction_artifact: ProductionArtifact,
+        synthesis_artifact: ProductionArtifact,
+        report: ReferenceReport,
+        extraction: TechnicalExtraction,
+        synthesis_text: str,
+    ) -> ProductionArtifact:
+        input_data = {
+            "references_id": str(references_artifact.id),
+            "references_hash": references_artifact.input_hash,
+            "extraction_id": str(extraction_artifact.id),
+            "extraction_hash": extraction_artifact.input_hash,
+            "synthesis_id": str(synthesis_artifact.id),
+            "synthesis_hash": synthesis_artifact.input_hash,
+            "publication_schema_version": PUBLICATION_SCHEMA_VERSION,
+            "semantic_annotator_version": SEMANTIC_ANNOTATOR_VERSION,
+            "pandoc_renderer_version": PANDOC_RENDERER_VERSION,
+        }
+        input_hash = compute_input_hash(input_data)
+
+        # Not get_current: a synthesis retry stales the previous publication
+        # first, and get_current excludes STALE rows — using it here would
+        # restart numbering at 1 and collide with the unique version key.
+        existing = await uow.production_artifacts.list_for_run(run_id)
+        prior_versions = [
+            artifact.version
+            for artifact in existing
+            if artifact.stage is ProductionArtifactStage.PUBLICATION
+        ]
+        version = max(prior_versions) + 1 if prior_versions else 1
+
+        document = build_publication_document(
+            subject_title=subject_title,
+            report=report,
+            extraction=extraction,
+            synthesis_text=synthesis_text,
+        )
+        publication_markdown = render_publication_pandoc(document)
+
+        raw_id, canonical_id, rendered_id = await self._store_payloads(
+            canonical=document.to_json(),
+            rendered=publication_markdown,
+        )
+        artifact = ProductionArtifact(
+            production_run_id=run_id,
+            subject_id=subject_id,
+            stage=ProductionArtifactStage.PUBLICATION,
+            version=version,
+            input_hash=input_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            raw_blob_id=raw_id,
+            canonical_blob_id=canonical_id,
+            rendered_blob_id=rendered_id,
+            metadata={
+                "word_count": len(publication_markdown.split()),
+                "reference_count": len(document.sources),
+                "indicator_count": len(collect_indicators(extraction)),
+                "analyst_override_indicator_count": sum(
+                    item.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+                    for item in extraction.items
+                ),
+                "publication_schema_version": PUBLICATION_SCHEMA_VERSION,
+                "semantic_annotator_version": SEMANTIC_ANNOTATOR_VERSION,
+                "pandoc_renderer_version": PANDOC_RENDERER_VERSION,
+                "generated_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        await uow.production_artifacts.append(artifact)
+        return artifact
 
     async def _load_inputs(
         self,

@@ -589,10 +589,11 @@ async def test_audit2_projection_adds_a_version_and_never_touches_the_base() -> 
         == base_before
     )
     assert json.dumps(stored_base.metadata, sort_keys=True) == base_metadata_before
-    # Downstream artifacts are staled, upstream ones are not.
-    assert (RUN_A, "extraction") in uow.production_artifacts.stale_calls
+    # An analyst projection does not linearly stale downstream artifacts;
+    # materialization applies the semantic impact separately.
+    assert uow.production_artifacts.stale_calls == []
     staled = await uow.production_artifacts.get(synthesis.id)
-    assert staled is not None and staled.status is ProductionArtifactStatus.STALE
+    assert staled is not None and staled.status is ProductionArtifactStatus.VERIFIED
     # And the old artifact remains auditable as a distinct version.
     versions = {
         item.version

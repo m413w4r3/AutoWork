@@ -39,8 +39,13 @@ from cti_app.application.production_repair_payloads import (
     ProductionRepairPayloadResolver,
     RepairPayloadOrigin,
 )
-from cti_app.application.production_stages import ExtractionService, compute_input_hash
-from cti_app.domain.collection import CollectionState
+from cti_app.application.production_stages import (
+    ExtractionService,
+    ProductionQAService,
+    PublicationAssemblyService,
+    compute_input_hash,
+)
+from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.discovery import canonicalize_http_url
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
@@ -58,6 +63,7 @@ from cti_app.domain.production import (
     ProductionRepairImpactKind,
     ProductionRepairIssueKind,
     RepairDecisionApplicationState,
+    SubjectProductionStage,
     SubjectProductionStatus,
     SupplementalSourceRepairState,
 )
@@ -944,6 +950,21 @@ def _exclude_revises_projected_content(
     return state is RepairDecisionApplicationState.PROJECTION_REQUIRED
 
 
+def _include_is_already_effective(
+    issue: ProductionRepairIssueView,
+    decision: ProductionRepairDecision,
+) -> bool:
+    if _decision_action(decision) != ProductionRepairAction.INCLUDE.value:
+        return False
+    try:
+        state = RepairDecisionApplicationState(
+            _projection_enum_value(getattr(issue, "application_state", None))
+        )
+    except ValueError:
+        return False
+    return state is RepairDecisionApplicationState.ALREADY_EFFECTIVE
+
+
 def classify_repair_impact(
     issue: ProductionRepairIssueView | SupplementalSourceRepairIssue,
     decision: ProductionRepairDecision | None,
@@ -987,9 +1008,10 @@ def classify_repair_impact(
 
     action_is_include = action == ProductionRepairAction.INCLUDE.value
     action_is_exclude = action == ProductionRepairAction.EXCLUDE.value
-    changes_projected_content = action_is_include or (
-        action_is_exclude and _exclude_revises_projected_content(issue, decision)
-    )
+    changes_projected_content = (
+        action_is_include
+        and not _include_is_already_effective(issue, decision)
+    ) or (action_is_exclude and _exclude_revises_projected_content(issue, decision))
     if not changes_projected_content:
         return _repair_impact(
             ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
@@ -1539,12 +1561,107 @@ def _repair_action_is_compatible(
     return action in {ProductionRepairAction.INCLUDE, ProductionRepairAction.EXCLUDE}
 
 
+def _fallback_synthesis_projection_hash(extraction: TechnicalExtraction) -> str:
+    """Hash extraction's contribution to Q4 when Q1 is unavailable.
+
+    The empty report is intentional: the report is identical before and
+    after a Q2 repair, so it is only used as a conservative equality test.
+    """
+    return _projection_hash(
+        synthesis_projection_payload(ReferenceReport(sources=(), events=()), extraction, {})
+    )
+
+
+def _fallback_publication_projection_hash(extraction: TechnicalExtraction) -> str:
+    """Hash extraction's publication-visible fields without Q1 payloads."""
+    items = [_publication_item_projection(item) for item in extraction.items]
+    items.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+    return _projection_hash({"items": items, "uncertainties": sorted(extraction.uncertainties)})
+
+
+def _impact_from_projection_hashes(
+    previous: TechnicalExtraction,
+    projected: TechnicalExtraction,
+    *,
+    previous_synthesis_projection_hash: str | None,
+    new_synthesis_projection_hash: str | None,
+    previous_publication_projection_hash: str | None,
+    new_publication_projection_hash: str | None,
+    previous_rule_bundle_hash: str,
+    new_rule_bundle_hash: str,
+) -> ProductionRepairImpact:
+    """Classify the actual functional before/after projection delta."""
+    if previous == projected:
+        return _repair_impact(
+            ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+            _NO_DELIVERABLE_OUTPUTS,
+            model_call_required=False,
+            reason="The effective extraction is unchanged.",
+        )
+
+    previous_synthesis = previous_synthesis_projection_hash or _fallback_synthesis_projection_hash(
+        previous
+    )
+    new_synthesis = new_synthesis_projection_hash or _fallback_synthesis_projection_hash(projected)
+    synthesis_changed = previous_synthesis != new_synthesis
+
+    previous_publication = (
+        previous_publication_projection_hash
+        or _fallback_publication_projection_hash(previous)
+    )
+    new_publication = new_publication_projection_hash or _fallback_publication_projection_hash(
+        projected
+    )
+    publication_changed = previous_publication != new_publication
+    rules_changed = previous_rule_bundle_hash != new_rule_bundle_hash
+
+    affected = {
+        ProductionDerivedOutput.EXTRACTION,
+        ProductionDerivedOutput.CHECKPOINT,
+    }
+    if rules_changed:
+        affected.add(ProductionDerivedOutput.RULE_BUNDLE)
+    if synthesis_changed:
+        affected.update(
+            {ProductionDerivedOutput.SYNTHESIS, ProductionDerivedOutput.PUBLICATION}
+        )
+        kind = ProductionRepairImpactKind.NARRATIVE
+        reason = "The repair changes the evidence consumed by synthesis."
+    elif publication_changed:
+        affected.add(ProductionDerivedOutput.PUBLICATION)
+        kind = ProductionRepairImpactKind.PUBLICATION_ONLY
+        reason = "The repair changes publication-visible content but not synthesis evidence."
+    elif rules_changed:
+        kind = ProductionRepairImpactKind.RULE_BUNDLE_ONLY
+        reason = "The repair changes only the accepted detection-rule bundle."
+    else:
+        # This is defensive for a future extraction field that is not yet
+        # represented in either downstream projection.
+        kind = ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE
+        affected = set()
+        reason = "The repair changes no functional deliverable projection."
+
+    return _repair_impact(
+        kind,
+        frozenset(affected),
+        model_call_required=kind is ProductionRepairImpactKind.NARRATIVE,
+        reason=reason,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ProductionRepairProjectionResult:
     """Result of materializing the effective extraction projection."""
 
     artifact: ProductionArtifact
     changed: bool
+    impact: ProductionRepairImpact
+    previous_synthesis_projection_hash: str | None = None
+    new_synthesis_projection_hash: str | None = None
+    previous_publication_projection_hash: str | None = None
+    new_publication_projection_hash: str | None = None
+    previous_rule_bundle_hash: str | None = None
+    new_rule_bundle_hash: str | None = None
     accepted_indicator_count: int = 0
     accepted_rule_count: int = 0
     unresolved_count: int = 0
@@ -1573,6 +1690,94 @@ class ProductionRepairProjectionService:
         self._artifact_store = artifact_store
         self._extraction = extraction_service or ExtractionService(uow_factory, artifact_store)
         self._payloads = payload_resolver or ProductionRepairPayloadResolver()
+
+    async def _projection_hashes(
+        self,
+        uow: Any,
+        run: Any,
+        previous: TechnicalExtraction,
+        projected: TechnicalExtraction,
+    ) -> dict[str, str | None]:
+        """Return functional hashes for the before/after effective outputs."""
+        hashes: dict[str, str | None] = {
+            "previous_rule_bundle": rule_bundle_projection_hash(previous),
+            "new_rule_bundle": rule_bundle_projection_hash(projected),
+            "previous_synthesis": None,
+            "new_synthesis": None,
+            "previous_publication": None,
+            "new_publication": None,
+        }
+        if self._artifact_store is None:
+            return hashes
+
+        references = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.REFERENCES.value
+        )
+        if references is None or references.canonical_blob_id is None:
+            return hashes
+        try:
+            report = reference_report_from_json(
+                await self._artifact_store.read_json(references.canonical_blob_id)
+            )
+        except Exception:
+            return hashes
+
+        source_tiers_by_url: dict[str, str] = {}
+        snapshots = getattr(uow, "production_input_snapshots", None)
+        snapshot = (
+            await snapshots.get_by_run(run.id)
+            if snapshots is not None and callable(getattr(snapshots, "get_by_run", None))
+            else None
+        )
+        relevant_urls = {source.canonical_url for source in report.sources}
+        if snapshot is not None:
+            core_urls = {
+                str(source.canonical_url)
+                for source in getattr(snapshot, "core_sources", ())
+                if getattr(source, "canonical_url", None)
+            }
+            source_tiers_by_url.update({url: "core" for url in core_urls})
+            source_tiers_by_url.update(
+                {url: "supporting" for url in relevant_urls - core_urls}
+            )
+        else:
+            collections = getattr(uow, "source_collections", None)
+            values = (
+                await collections.list_for_subject(run.subject_id)
+                if collections is not None
+                and callable(getattr(collections, "list_for_subject", None))
+                else ()
+            )
+            for collection in values:
+                origin = getattr(collection, "origin_kind", None)
+                if origin in {SourceOriginKind.DISCOVERY, SourceOriginKind.MANUAL}:
+                    source_tiers_by_url[collection.canonical_url] = "core"
+                elif origin is SourceOriginKind.REFERENCE_RESEARCH:
+                    source_tiers_by_url[collection.canonical_url] = "supporting"
+
+        hashes["previous_synthesis"] = synthesis_projection_hash(
+            report, previous, source_tiers_by_url
+        )
+        hashes["new_synthesis"] = synthesis_projection_hash(
+            report, projected, source_tiers_by_url
+        )
+
+        synthesis = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.SYNTHESIS.value
+        )
+        if synthesis is None or synthesis.rendered_blob_id is None:
+            return hashes
+        try:
+            synthesis_text = await self._artifact_store.read_text(synthesis.rendered_blob_id)
+        except Exception:
+            return hashes
+        hashes["previous_publication"] = publication_projection_hash(
+            report, previous, synthesis_text
+        )
+        hashes["new_publication"] = publication_projection_hash(
+            report, projected, synthesis_text
+        )
+        return hashes
 
     async def project_effective_extraction(
         self,
@@ -1791,6 +1996,20 @@ class ProductionRepairProjectionService:
                 except Exception:
                     current_extraction = base_extraction
 
+            projection_hashes = await self._projection_hashes(
+                uow, run, current_extraction, projected
+            )
+            impact = _impact_from_projection_hashes(
+                current_extraction,
+                projected,
+                previous_synthesis_projection_hash=projection_hashes["previous_synthesis"],
+                new_synthesis_projection_hash=projection_hashes["new_synthesis"],
+                previous_publication_projection_hash=projection_hashes["previous_publication"],
+                new_publication_projection_hash=projection_hashes["new_publication"],
+                previous_rule_bundle_hash=str(projection_hashes["previous_rule_bundle"]),
+                new_rule_bundle_hash=str(projection_hashes["new_rule_bundle"]),
+            )
+
             # An unbuildable INCLUDE changes nothing in the content, but the
             # article owes the record that it was honoured and not applied.
             # Without a new version that debt would be invisible forever.
@@ -1809,6 +2028,13 @@ class ProductionRepairProjectionService:
                 return ProductionRepairProjectionResult(
                     artifact=current,
                     changed=False,
+                    impact=impact,
+                    previous_synthesis_projection_hash=projection_hashes["previous_synthesis"],
+                    new_synthesis_projection_hash=projection_hashes["new_synthesis"],
+                    previous_publication_projection_hash=projection_hashes["previous_publication"],
+                    new_publication_projection_hash=projection_hashes["new_publication"],
+                    previous_rule_bundle_hash=projection_hashes["previous_rule_bundle"],
+                    new_rule_bundle_hash=projection_hashes["new_rule_bundle"],
                     accepted_indicator_count=accepted_indicator_count,
                     accepted_rule_count=accepted_rule_count,
                     unresolved_count=len(unresolved),
@@ -1869,6 +2095,13 @@ class ProductionRepairProjectionService:
                 if isinstance(base_metadata.get("warnings", []), list)
                 else [],
                 "parser_version": canonical_json.get("parser_version"),
+                # Rule counters belong to the effective extraction/rule
+                # bundle.  Keeping them here prevents a YARA-only repair from
+                # changing the functional publication projection.
+                "analyst_override_rule_count": sum(
+                    rule.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+                    for rule in projected.rules
+                ),
                 "generated_at": datetime.now(UTC).isoformat(),
                 # These diagnostics describe BASE, never a fresh model call.
                 "deterministic_verification": dict(base_diagnostics)
@@ -1892,6 +2125,13 @@ class ProductionRepairProjectionService:
             return ProductionRepairProjectionResult(
                 artifact=artifact,
                 changed=True,
+                impact=impact,
+                previous_synthesis_projection_hash=projection_hashes["previous_synthesis"],
+                new_synthesis_projection_hash=projection_hashes["new_synthesis"],
+                previous_publication_projection_hash=projection_hashes["previous_publication"],
+                new_publication_projection_hash=projection_hashes["new_publication"],
+                previous_rule_bundle_hash=projection_hashes["previous_rule_bundle"],
+                new_rule_bundle_hash=projection_hashes["new_rule_bundle"],
                 accepted_indicator_count=accepted_indicator_count,
                 accepted_rule_count=accepted_rule_count,
                 unresolved_count=len(unresolved),
@@ -1900,6 +2140,395 @@ class ProductionRepairProjectionService:
                 unresolved_repair_keys=tuple(sorted(unresolved)),
                 unbuildable_repair_keys=tuple(sorted(unbuildable)),
             )
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionRepairMaterializationResult:
+    """Durable outcome of applying a repair projection to derived products."""
+
+    projection: ProductionRepairProjectionResult
+    action: str
+    retry_stage: str | None = None
+    full_chain: bool = False
+    publication_artifact: ProductionArtifact | None = None
+    qa: dict[str, Any] | None = None
+
+    @property
+    def artifact(self) -> ProductionArtifact:
+        return self.projection.artifact
+
+    @property
+    def impact(self) -> ProductionRepairImpact:
+        return self.projection.impact
+
+    @property
+    def changed(self) -> bool:
+        return self.projection.changed
+
+
+class ProductionRepairMaterializationService:
+    """Apply only the downstream work required by a semantic repair impact."""
+
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        projection_service: ProductionRepairProjectionService | None = None,
+        publication_assembly_service: PublicationAssemblyService | None = None,
+        qa_service: ProductionQAService | None = None,
+        checkpoint_service: Any | None = None,
+        artifact_store: ProductionArtifactStore | None = None,
+    ) -> None:
+        self._uow_factory = uow_factory
+        self._projection = projection_service or ProductionRepairProjectionService(
+            uow_factory, artifact_store
+        )
+        resolved_store = artifact_store or getattr(self._projection, "_artifact_store", None)
+        self._artifact_store = resolved_store
+        self._assembly = publication_assembly_service or PublicationAssemblyService(
+            uow_factory, resolved_store
+        )
+        self._qa = qa_service or ProductionQAService(uow_factory)
+        self._checkpoint = checkpoint_service
+
+    async def apply(
+        self,
+        *,
+        edition_id: UUID,
+        subject_id: UUID,
+        actor_id: str,
+        observed_run_id: UUID | None = None,
+        observed_pipeline_generation: int | None = None,
+    ) -> ProductionRepairMaterializationResult:
+        actor_id = actor_id.strip()
+        if not actor_id:
+            raise ProductionRepairProjectionError("production_repair_actor_required")
+
+        run = await self._fenced_run(
+            edition_id=edition_id,
+            subject_id=subject_id,
+            observed_run_id=observed_run_id,
+            observed_pipeline_generation=observed_pipeline_generation,
+        )
+        projection = await self._projection.project_effective_extraction(
+            run.id, actor_id=actor_id
+        )
+        if projection.unresolved_count:
+            return ProductionRepairMaterializationResult(
+                projection=projection,
+                action="awaiting_repair_decision",
+            )
+
+        impact = projection.impact
+        if (
+            not projection.changed
+            or impact.kind is ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE
+        ):
+            return ProductionRepairMaterializationResult(projection=projection, action="none")
+
+        if impact.kind is ProductionRepairImpactKind.SOURCE_CORPUS:
+            return ProductionRepairMaterializationResult(
+                projection=projection,
+                action="retry_required",
+                retry_stage=SubjectProductionStage.REFERENCES.value,
+                full_chain=True,
+            )
+
+        publication: ProductionArtifact | None = None
+        qa_result: dict[str, Any] | None = None
+        if impact.kind is ProductionRepairImpactKind.PUBLICATION_ONLY:
+            publication, qa_result = await self._materialize_publication(
+                edition_id=edition_id,
+                subject_id=subject_id,
+                run_id=run.id,
+                pipeline_generation=run.pipeline_generation,
+                extraction=projection.artifact,
+            )
+            action = "publication_reassembled"
+        elif impact.kind is ProductionRepairImpactKind.RULE_BUNDLE_ONLY:
+            qa_result = await self._materialize_rules_and_qa(
+                edition_id=edition_id,
+                subject_id=subject_id,
+                run_id=run.id,
+                pipeline_generation=run.pipeline_generation,
+                extraction=projection.artifact,
+            )
+            action = "rules_materialized"
+        else:
+            await self._stale_narrative(
+                edition_id=edition_id,
+                subject_id=subject_id,
+                run_id=run.id,
+                pipeline_generation=run.pipeline_generation,
+            )
+            return ProductionRepairMaterializationResult(
+                projection=projection,
+                action="retry_required",
+                retry_stage=SubjectProductionStage.SYNTHESIS.value,
+            )
+
+        if self._checkpoint is not None:
+            await self._checkpoint.checkpoint(run.id)
+        return ProductionRepairMaterializationResult(
+            projection=projection,
+            action=action,
+            publication_artifact=publication,
+            qa=qa_result,
+        )
+
+    async def _fenced_run(
+        self,
+        *,
+        edition_id: UUID,
+        subject_id: UUID,
+        observed_run_id: UUID | None,
+        observed_pipeline_generation: int | None,
+    ) -> Any:
+        async with self._uow_factory() as uow:
+            runs = uow.subject_production_runs
+            initial = (
+                await runs.get(observed_run_id)
+                if observed_run_id is not None
+                else await runs.get_current_for_subject(subject_id)
+            )
+            if initial is None:
+                raise ProductionRepairProjectionError("production_run_not_found")
+            if initial.edition_id != edition_id or initial.subject_id != subject_id:
+                raise ProductionRepairProjectionError("production_run_edition_changed")
+            if (observed_run_id is not None and initial.id != observed_run_id) or (
+                observed_pipeline_generation is not None
+                and initial.pipeline_generation != observed_pipeline_generation
+            ):
+                raise ProductionRepairStaleError(ProductionRepairStaleError.code)
+            await self._lock_edition_and_check(uow, edition_id)
+            run: Any = await _get_for_update(runs, initial.id)
+            self._check_reviewable_run(run, edition_id, subject_id)
+            if (
+                observed_pipeline_generation is not None
+                and run.pipeline_generation != observed_pipeline_generation
+            ):
+                raise ProductionRepairStaleError(ProductionRepairStaleError.code)
+            return run
+
+    async def _lock_edition_and_check(self, uow: Any, edition_id: UUID) -> Any:
+        editions = getattr(uow, "editions", None)
+        if editions is None:
+            return None
+        edition = await _get_for_update(editions, edition_id)
+        if edition is None:
+            raise ProductionRepairProjectionError("edition_not_found")
+        if _enum_value(getattr(edition, "status", None)) not in {
+            EditionStatus.PRODUCTION.value,
+            EditionStatus.REVIEW.value,
+        }:
+            raise ProductionRepairProjectionError("edition_frozen_for_publication")
+        manifests = getattr(uow, "publication_manifests", None)
+        if (
+            manifests is not None
+            and await manifests.get_latest_for_edition(edition_id) is not None
+        ):
+            raise ProductionRepairProjectionError("edition_frozen_for_publication")
+        return edition
+
+    @staticmethod
+    def _check_reviewable_run(run: Any, edition_id: UUID, subject_id: UUID) -> None:
+        if run is None:
+            raise ProductionRepairProjectionError("production_run_not_found")
+        if run.edition_id != edition_id or run.subject_id != subject_id:
+            raise ProductionRepairProjectionError("production_run_edition_changed")
+        if _enum_value(getattr(run, "status", None)) not in {
+            SubjectProductionStatus.READY.value,
+            SubjectProductionStatus.NEEDS_REVIEW.value,
+            SubjectProductionStatus.FAILED.value,
+        }:
+            raise ProductionRepairProjectionError("production_repair_run_not_reviewable")
+        if getattr(run, "requires_reconciliation", False):
+            raise ProductionReconciliationRequiredError
+
+    async def _materialize_publication(
+        self,
+        *,
+        edition_id: UUID,
+        subject_id: UUID,
+        run_id: UUID,
+        pipeline_generation: int,
+        extraction: ProductionArtifact,
+    ) -> tuple[ProductionArtifact, dict[str, Any] | None]:
+        async with self._uow_factory() as uow:
+            await self._lock_edition_and_check(uow, edition_id)
+            run: Any = await _get_for_update(uow.subject_production_runs, run_id)
+            self._check_reviewable_run(run, edition_id, subject_id)
+            if run.pipeline_generation != pipeline_generation:
+                raise ProductionRepairStaleError(ProductionRepairStaleError.code)
+            references = await uow.production_artifacts.get_current(
+                run_id, ProductionArtifactStage.REFERENCES.value
+            )
+            synthesis = await uow.production_artifacts.get_current(
+                run_id, ProductionArtifactStage.SYNTHESIS.value
+            )
+            if references is None or synthesis is None:
+                raise ProductionRepairProjectionError("publication_inputs_missing")
+            publication = await uow.production_artifacts.get_current(
+                run_id, ProductionArtifactStage.PUBLICATION.value
+            )
+            if publication is not None:
+                await self._mark_stages_stale(
+                    uow, run_id, {ProductionArtifactStage.PUBLICATION.value}
+                )
+            title = await self._subject_title(uow, run_id, subject_id)
+            new_publication = await self._assembly.assemble_publication_in_uow(
+                uow,
+                run_id,
+                subject_id,
+                title,
+                references,
+                extraction,
+                synthesis,
+            )
+            qa_result = await self._run_qa(
+                uow,
+                run_id,
+                references,
+                extraction,
+                synthesis,
+                new_publication,
+                subject_id,
+                run,
+            )
+            await self._ensure_qa_passed(qa_result)
+            await uow.commit()
+            return new_publication, qa_result
+
+    async def _materialize_rules_and_qa(
+        self,
+        *,
+        edition_id: UUID,
+        subject_id: UUID,
+        run_id: UUID,
+        pipeline_generation: int,
+        extraction: ProductionArtifact,
+    ) -> dict[str, Any] | None:
+        async with self._uow_factory() as uow:
+            await self._lock_edition_and_check(uow, edition_id)
+            run: Any = await _get_for_update(uow.subject_production_runs, run_id)
+            self._check_reviewable_run(run, edition_id, subject_id)
+            if run.pipeline_generation != pipeline_generation:
+                raise ProductionRepairStaleError(ProductionRepairStaleError.code)
+            references = await uow.production_artifacts.get_current(
+                run_id, ProductionArtifactStage.REFERENCES.value
+            )
+            synthesis = await uow.production_artifacts.get_current(
+                run_id, ProductionArtifactStage.SYNTHESIS.value
+            )
+            publication = await uow.production_artifacts.get_current(
+                run_id, ProductionArtifactStage.PUBLICATION.value
+            )
+            if references is None or synthesis is None or publication is None:
+                raise ProductionRepairProjectionError("qa_inputs_missing")
+            qa_result = await self._run_qa(
+                uow,
+                run_id,
+                references,
+                extraction,
+                synthesis,
+                publication,
+                subject_id,
+                run,
+            )
+            await self._ensure_qa_passed(qa_result)
+            await uow.commit()
+            return qa_result
+
+    async def _stale_narrative(
+        self,
+        *,
+        edition_id: UUID,
+        subject_id: UUID,
+        run_id: UUID,
+        pipeline_generation: int,
+    ) -> None:
+        async with self._uow_factory() as uow:
+            await self._lock_edition_and_check(uow, edition_id)
+            run: Any = await _get_for_update(uow.subject_production_runs, run_id)
+            self._check_reviewable_run(run, edition_id, subject_id)
+            if run.pipeline_generation != pipeline_generation:
+                raise ProductionRepairStaleError(ProductionRepairStaleError.code)
+            await self._mark_stages_stale(
+                uow,
+                run_id,
+                {
+                    ProductionArtifactStage.SYNTHESIS.value,
+                    ProductionArtifactStage.PUBLICATION.value,
+                },
+            )
+            await uow.commit()
+
+    @staticmethod
+    async def _mark_stages_stale(uow: Any, run_id: UUID, stages: set[str]) -> list[str]:
+        marker = getattr(uow.production_artifacts, "mark_stages_stale", None)
+        if not callable(marker):
+            raise ProductionRepairProjectionError("production_artifact_stale_port_unavailable")
+        return cast(list[str], await marker(run_id, stages))
+
+    async def _subject_title(self, uow: Any, run_id: UUID, subject_id: UUID) -> str:
+        snapshots = getattr(uow, "production_input_snapshots", None)
+        if snapshots is not None and callable(getattr(snapshots, "get_by_run", None)):
+            snapshot = await snapshots.get_by_run(run_id)
+            title = getattr(snapshot, "subject_title", None) if snapshot is not None else None
+            if isinstance(title, str) and title:
+                return title
+        return str(subject_id)
+
+    async def _run_qa(
+        self,
+        uow: Any,
+        run_id: UUID,
+        references: ProductionArtifact,
+        extraction: ProductionArtifact,
+        synthesis: ProductionArtifact,
+        publication: ProductionArtifact,
+        subject_id: UUID,
+        run: Any,
+    ) -> dict[str, Any]:
+        if self._artifact_store is None:
+            return {"passed": True, "checks": {}, "errors": [], "warnings": []}
+        report, extraction_value, synthesis_text = await self._assembly._load_inputs(
+            references, extraction, synthesis
+        )
+        publication_markdown = ""
+        if publication.rendered_blob_id is not None:
+            publication_markdown = await self._artifact_store.read_text(
+                publication.rendered_blob_id
+            )
+        collections = getattr(uow, "source_collections", None)
+        archived_urls = {
+            collection.canonical_url
+            for collection in (
+                await collections.list_for_subject(subject_id)
+                if collections is not None
+                and callable(getattr(collections, "list_for_subject", None))
+                else ()
+            )
+            if _enum_value(getattr(collection, "state", None))
+            in {"archived", "extracted", "completed"}
+        }
+        return await self._qa.run_qa(
+            run_id=run_id,
+            references_artifact=references,
+            extraction_artifact=extraction,
+            synthesis_artifact=synthesis,
+            publication_artifact=publication,
+            report=report,
+            extraction=extraction_value,
+            synthesis_text=synthesis_text,
+            publication_markdown=publication_markdown,
+            archived_urls=archived_urls,
+            research_date=getattr(run, "research_date", None),
+        )
+
+    @staticmethod
+    async def _ensure_qa_passed(qa_result: dict[str, Any]) -> None:
+        if not qa_result.get("passed", False):
+            raise ProductionRepairProjectionError("production_repair_qa_failed")
 
 
 async def _repair_entries_for_artifact(

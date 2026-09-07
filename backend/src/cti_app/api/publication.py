@@ -51,6 +51,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairDecisionNoopError,
     ProductionRepairIssueNotFoundError,
     ProductionRepairIssueService,
+    ProductionRepairMaterializationService,
     ProductionRepairProjectionError,
     ProductionRepairProjectionService,
     ProductionRepairStaleError,
@@ -62,6 +63,7 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionReconciliationRequiredError,
     ProductionRepairAction,
+    ProductionRepairImpactKind,
     ProductionRepairIssueKind,
     RepairDecisionApplicationState,
     SubjectProductionStage,
@@ -787,6 +789,18 @@ def _repair_projection_service(request: Request) -> ProductionRepairProjectionSe
     )
 
 
+def _repair_materialization_service(request: Request) -> ProductionRepairMaterializationService:
+    configured = getattr(request.app.state, "production_repair_materialization_service", None)
+    if configured is not None:
+        return cast(ProductionRepairMaterializationService, configured)
+    return ProductionRepairMaterializationService(
+        request.app.state.uow_factory,
+        projection_service=_repair_projection_service(request),
+        checkpoint_service=getattr(request.app.state, "production_checkpoint", None),
+        artifact_store=getattr(request.app.state, "production_artifact_store", None),
+    )
+
+
 async def _edition_subject_production_state(
     request: Request, edition_id: UUID, subject_id: UUID
 ) -> tuple[Any, dict[str, Any], UUID | None]:
@@ -948,10 +962,19 @@ async def rebuild_edition_review_item(
             and q2_resolved
             and any(item.recommended_stage == "apply_projection" for item in q2_resolved)
         ):
-            projection = await _repair_projection_service(request).project_effective_extraction(
-                run.id, actor_id=actor_id
+            materialization = await _repair_materialization_service(request).apply(
+                edition_id=edition_id,
+                subject_id=subject_id,
+                actor_id=actor_id,
+                observed_run_id=(payload.observed_run_id if payload is not None else run.id),
+                observed_pipeline_generation=(
+                    payload.observed_pipeline_generation
+                    if payload is not None
+                    else run.pipeline_generation
+                ),
             )
-            if projection.unresolved_count:
+            projection = materialization.projection
+            if materialization.action == "awaiting_repair_decision":
                 return {
                     "action": "awaiting_repair_decision",
                     "stage": None,
@@ -960,7 +983,10 @@ async def rebuild_edition_review_item(
                     "changed": False,
                     "job_id": None,
                 }
-            if projection.changed or current.get(ProductionArtifactStage.PUBLICATION.value) is None:
+            if (
+                projection.impact.kind is ProductionRepairImpactKind.NARRATIVE
+                and materialization.action == "retry_required"
+            ):
                 retry = await _retry_production_run(
                     request,
                     run.id,
@@ -968,7 +994,7 @@ async def rebuild_edition_review_item(
                     actor_id,
                 )
                 return {
-                    "action": "apply_projection_and_retry",
+                    "action": "retry_required",
                     "stage": SubjectProductionStage.SYNTHESIS.value,
                     "run_id": str(retry.get("run_id", run.id)),
                     "batch_id": retry.get("batch_id"),
@@ -976,11 +1002,11 @@ async def rebuild_edition_review_item(
                     "job_id": retry.get("job_id"),
                 }
             return {
-                "action": "none",
-                "stage": "none",
+                "action": materialization.action,
+                "stage": materialization.retry_stage or "none",
                 "run_id": str(run.id),
                 "batch_id": str(batch_id) if batch_id else None,
-                "changed": False,
+                "changed": projection.changed,
                 "job_id": None,
             }
 

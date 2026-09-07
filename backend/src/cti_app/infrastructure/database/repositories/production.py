@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
@@ -588,6 +588,32 @@ class SqlAlchemyProductionArtifactRepository:
                 .values(status=ProductionArtifactStatus.STALE.value)
             )
             await self._session.execute(stmt)
+
+    async def mark_stages_stale(self, run_id: UUID, stages: Collection[str]) -> list[str]:
+        """Mark exactly the requested artifact stages stale."""
+        pipeline = [
+            ProductionArtifactStage.REFERENCES.value,
+            ProductionArtifactStage.EXTRACTION.value,
+            ProductionArtifactStage.SYNTHESIS.value,
+            ProductionArtifactStage.PUBLICATION.value,
+        ]
+        requested = set(stages)
+        affected = [stage for stage in pipeline if stage in requested]
+        if not affected:
+            return []
+
+        result = await self._session.execute(
+            update(ProductionArtifactRow)
+            .where(
+                (ProductionArtifactRow.production_run_id == run_id)
+                & (ProductionArtifactRow.stage.in_(affected))
+                & (ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value)
+            )
+            .values(status=ProductionArtifactStatus.STALE.value)
+            .returning(ProductionArtifactRow.stage)
+        )
+        updated = set(result.scalars().all())
+        return [stage for stage in affected if stage in updated]
 
     async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]:
         """Mark selected production output and every downstream output stale."""

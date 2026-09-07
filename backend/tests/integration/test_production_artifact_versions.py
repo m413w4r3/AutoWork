@@ -130,6 +130,53 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
 
 
 @pytest.mark.asyncio
+async def test_mark_stages_stale_updates_only_requested_non_stale_stages(
+    uow_factory: UnitOfWorkFactory,
+) -> None:
+    edition = Edition(
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 9, 1),
+        period_end=date(2026, 9, 30),
+        tlp=TLP.AMBER,
+        languages=("fr",),
+        target_articles=1,
+        source_profile="test",
+    )
+    subject = Subject(external_id="SUBJ-MARK-STAGES-STALE", slug="mark-stages-stale", tlp=TLP.AMBER)
+    run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
+
+    async with uow_factory() as uow:
+        assert await uow.editions.add_if_absent(edition)
+        await uow.subjects.add(subject)
+        await uow.subject_production_runs.add(run)
+        for stage in ProductionArtifactStage:
+            await uow.production_artifacts.append(_artifact(run, stage, 1))
+        await uow.commit()
+
+    async with uow_factory() as uow:
+        assert await uow.production_artifacts.mark_stages_stale(
+            run.id, {"publication", "synthesis"}
+        ) == ["synthesis", "publication"]
+        await uow.commit()
+
+    async with uow_factory() as uow:
+        assert await uow.production_artifacts.mark_stages_stale(
+            run.id, {"publication", "synthesis"}
+        ) == []
+        assert await uow.production_artifacts.mark_stages_stale(run.id, []) == []
+        await uow.commit()
+        artifacts = await uow.production_artifacts.list_for_run(run.id)
+
+    assert [(item.stage.value, item.status.value) for item in artifacts] == [
+        ("extraction", "verified"),
+        ("publication", "stale"),
+        ("references", "verified"),
+        ("synthesis", "stale"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
     uow_factory: UnitOfWorkFactory, tmp_path: Path
 ) -> None:

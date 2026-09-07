@@ -162,6 +162,15 @@ def test_first_exclude_of_already_rejected_ioc_has_no_deliverable_change() -> No
     assert impact.affected_outputs == frozenset()
 
 
+def test_include_of_already_materialized_value_has_no_deliverable_change() -> None:
+    issue = _issue(application_state=RepairDecisionApplicationState.ALREADY_EFFECTIVE)
+
+    impact = classify_repair_impact(issue, _decision(issue, ProductionRepairAction.INCLUDE))
+
+    assert impact.kind is ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE
+    assert impact.affected_outputs == frozenset()
+
+
 @pytest.mark.parametrize("artifact_type", ["filename", "filepath", "cve"])
 def test_include_non_ioc_artifact_is_narrative(artifact_type: str) -> None:
     issue = _issue(artifact_type=artifact_type)

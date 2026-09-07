@@ -50,6 +50,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairDecisionNoopError,
     ProductionRepairIssueNotFoundError,
     ProductionRepairIssueService,
+    ProductionRepairMaterializationService,
     ProductionRepairProjectionError,
     ProductionRepairProjectionService,
     ProductionRepairStaleError,
@@ -82,6 +83,7 @@ from cti_app.domain.production import (
     ProductionBatchStatus,
     ProductionReconciliationRequiredError,
     ProductionRepairAction,
+    ProductionRepairImpactKind,
     ProductionRepairIssueKind,
     ProductionReuseInvalidation,
     ProductionSubmissionReconciliation,
@@ -402,6 +404,20 @@ def _production_repair_projection_service(
             payload_resolver=getattr(request.app.state, "production_repair_payload_resolver", None),
         )
     return service
+
+
+def _production_repair_materialization_service(
+    request: Request,
+) -> ProductionRepairMaterializationService:
+    service = getattr(request.app.state, "production_repair_materialization_service", None)
+    if service is None:
+        service = ProductionRepairMaterializationService(
+            request.app.state.uow_factory,
+            projection_service=_production_repair_projection_service(request),
+            checkpoint_service=getattr(request.app.state, "production_checkpoint", None),
+            artifact_store=getattr(request.app.state, "production_artifact_store", None),
+        )
+    return cast(ProductionRepairMaterializationService, service)
 
 
 def _repair_decision_view(decision: Any | None) -> dict[str, Any] | None:
@@ -1575,9 +1591,12 @@ async def apply_subject_production_repairs(
         run_id = run.id
 
     try:
-        result = await _production_repair_projection_service(request).project_effective_extraction(
-            run_id,
+        result = await _production_repair_materialization_service(request).apply(
+            edition_id=run.edition_id,
+            subject_id=subject_id,
             actor_id=await _actor_id(request),
+            observed_run_id=run_id,
+            observed_pipeline_generation=run.pipeline_generation,
         )
     except ProductionReconciliationRequiredError as exc:
         raise HTTPException(
@@ -1593,17 +1612,26 @@ async def apply_subject_production_repairs(
             ),
             detail={"code": code, "message": code},
         ) from exc
+    except (ProductionRepairStaleError, ProductionRepairStatusError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": str(getattr(exc, "code", None) or exc)},
+        ) from exc
 
     response: dict[str, Any] = {
-        "changed": result.changed,
+        "changed": result.projection.changed,
+        "action": result.action,
         "extraction_artifact_id": str(result.artifact.id),
-        "accepted_indicator_count": result.accepted_indicator_count,
-        "accepted_rule_count": result.accepted_rule_count,
-        "unresolved_count": result.unresolved_count,
-        "recommended_retry_stage": SubjectProductionStage.SYNTHESIS.value,
+        "accepted_indicator_count": result.projection.accepted_indicator_count,
+        "accepted_rule_count": result.projection.accepted_rule_count,
+        "unresolved_count": result.projection.unresolved_count,
+        "recommended_retry_stage": result.retry_stage,
         "resumed": False,
     }
-    if (payload or ApplyProductionRepairsRequest()).resume:
+    if (
+        (payload or ApplyProductionRepairsRequest()).resume
+        and result.projection.impact.kind is ProductionRepairImpactKind.NARRATIVE
+    ):
         try:
             await _retry_production_run(
                 request,
