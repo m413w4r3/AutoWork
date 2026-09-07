@@ -58,6 +58,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairStatusError,
     ProductionRepairValueNotVerifiableError,
     classify_repair_impact,
+    repair_issue_execution_state,
 )
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import (
@@ -571,10 +572,12 @@ async def get_edition_review_repair_detail(
             if source_detail is not None
             else getattr(issue, "effective_decision", None)
         )
-        source_plan = classify_repair_impact(
+        # The detail view answers with the same execution state the Repair Desk
+        # list computed: one issue, one truth.
+        source_execution = repair_issue_execution_state(
             source_detail or issue,
             effective_decision,
-        ).execution_plan
+        )
         result = {
             "repair_key": repair_key,
             "kind": _repair_issue_kind(issue).value,
@@ -591,14 +594,12 @@ async def get_edition_review_repair_detail(
             if source_detail
             else None,
             "repair_state": _repair_state_value(source_detail),
-            "rebuild_required": bool(
-                getattr(source_detail, "rebuild_required", False) if source_detail else False
-            ),
+            "rebuild_required": source_execution.rebuild_required,
             "recommended_action": getattr(source_detail, "recommended_action", None)
             if source_detail
             else None,
             "effective_decision": _production_repair_decision_view(effective_decision),
-            "execution_plan": _repair_execution_plan_view(source_plan),
+            "execution_plan": _repair_execution_plan_view(source_execution.execution_plan),
             "application_state": _repair_application_state(source_detail),
             "decision_history": _production_repair_decision_history_view(
                 await _repair_adjudication_service(request).decision_history(

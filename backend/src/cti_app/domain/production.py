@@ -140,6 +140,39 @@ class RepairDecisionApplicationState(StrEnum):
     UNRESOLVED = "unresolved"
 
 
+@dataclass(frozen=True, slots=True)
+class RepairIssueExecutionState:
+    """The single business truth of one repair issue.
+
+    Sign-off, the rebuild debt, the execution plan and the action the desk
+    offers are all read from here, so a read model can never publish one truth
+    while the planner computes another.  Two invariants hold by construction
+    and are pinned by the planner matrix tests:
+
+    * ``impact.kind is NO_DELIVERABLE_CHANGE`` implies ``not rebuild_required``;
+    * ``rebuild_required`` implies the plan is applicable
+      (``impact.ready_to_apply``) or ``recommended_stage`` names the typed
+      arbitration that unblocks it (``revise_decision``).  A blocking issue
+      with neither would be a UX deadlock: nothing to arbitrate and nothing to
+      apply.
+    """
+
+    application_state: RepairDecisionApplicationState
+    impact: ProductionRepairImpact
+    resolved: bool
+    blocking: bool
+    rebuild_required: bool
+    recommended_stage: str | None
+
+    @property
+    def ready_to_apply(self) -> bool:
+        return self.impact.ready_to_apply
+
+    @property
+    def execution_plan(self) -> RepairExecutionPlan:
+        return self.impact.execution_plan
+
+
 PRODUCTION_RECONCILIATION_ERROR_CODE = "model_submission_reconciliation_required"
 
 # Bridge review reasons that all describe the same situation: the prompt was

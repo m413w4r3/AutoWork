@@ -66,6 +66,7 @@ from cti_app.domain.production import (
     ProductionRepairImpactKind,
     ProductionRepairIssueKind,
     RepairDecisionApplicationState,
+    RepairIssueExecutionState,
     SubjectProductionStage,
     SubjectProductionStatus,
     SupplementalSourceRepairState,
@@ -1085,20 +1086,20 @@ def classify_repair_impact(
     issue: ProductionRepairIssueView | SupplementalSourceRepairIssue,
     decision: ProductionRepairDecision | None,
 ) -> ProductionRepairImpact:
-    """Classify a repair by the derived products whose content can change."""
+    """Classify a repair by the derived products whose content can change.
+
+    A Q1 source is classified from the CURRENT factual state of its
+    collection, before any decision is read: current factual source state
+    dominates an older waiver.  Once the analyst finally supplied the
+    publication, the edition owes a REFERENCES reconciliation even though an
+    older ``continue_without_source`` said it could be published without it.
+    The waiver is never rewritten or deleted -- it stays in the append-only
+    audit, it simply no longer describes the corpus.
+    """
     action = _decision_action(decision)
-
-    if action == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value:
-        return _repair_impact(
-            ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
-            _NO_DELIVERABLE_OUTPUTS,
-            model_call_required=False,
-            reason="The analyst waived the supplemental source without adding content.",
-        )
-
     issue_kind = _repair_kind(getattr(issue, "kind", ""))
-    is_source_issue = issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
-    if is_source_issue:
+
+    if issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED:
         repair_state = _projection_enum_value(getattr(issue, "repair_state", None))
         if repair_state == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES.value:
             return _repair_impact(
@@ -1109,6 +1110,23 @@ def classify_repair_impact(
                     "An archived Q1 source is absent from REFERENCES and can change the "
                     "source corpus."
                 ),
+            )
+        if repair_state == SupplementalSourceRepairState.COLLECTION_MISSING.value:
+            # There is nothing to reintegrate yet: the plan describes real
+            # work but no rebuild can run before the source is prepared.
+            return _repair_impact(
+                ProductionRepairImpactKind.SOURCE_CORPUS,
+                _SOURCE_CORPUS_OUTPUTS,
+                model_call_required=True,
+                ready_to_apply=False,
+                reason="The supplemental source has no collection to archive yet.",
+            )
+        if action == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value:
+            return _repair_impact(
+                ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+                _NO_DELIVERABLE_OUTPUTS,
+                model_call_required=False,
+                reason="The analyst waived the supplemental source without adding content.",
             )
         if decision is None:
             return _repair_impact(
@@ -1148,14 +1166,6 @@ def classify_repair_impact(
             model_call_required=True,
             ready_to_apply=False,
             reason="Including the value adds or removes narrative technical evidence.",
-        )
-
-    if issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED:
-        return _repair_impact(
-            ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
-            _NO_DELIVERABLE_OUTPUTS,
-            model_call_required=False,
-            reason="No repair decision is materialized.",
         )
 
     q2_issue = cast(ProductionRepairIssueView, issue)
@@ -1205,6 +1215,87 @@ def _issue_is_unbuildable(issue: Any) -> bool:
     return bool(
         _projection_enum_value(getattr(issue, "application_state", None))
         == RepairDecisionApplicationState.UNBUILDABLE.value
+    )
+
+
+def repair_issue_pending_references(issue: Any) -> bool:
+    """True when the source is archived but REFERENCES has not caught up.
+
+    This is the single backend definition of the rebuild debt: the Repair Desk
+    read model, the review sign-off rule and the publication freeze all use it,
+    so no client-side state can make the debt disappear.
+    """
+    return bool(
+        _projection_enum_value(getattr(issue, "repair_state", None))
+        == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES.value
+    )
+
+
+def repair_issue_execution_state(
+    issue: Any,
+    decision: ProductionRepairDecision | None = None,
+    *,
+    document_missing: bool = False,
+) -> RepairIssueExecutionState:
+    """Derive the one business truth of an issue: plan, debt and next action.
+
+    Every consumer -- the Repair Desk read model, the issue detail endpoint and
+    the sign-off rule -- goes through this function instead of recomputing its
+    own answer from the decision action, so an issue can never advertise a
+    blocking rebuild together with a plan the desk refuses to show.
+
+    ``document_missing`` is the only row-level fact the issue cannot carry: an
+    already-effective decision whose article has no current publication still
+    owes a synthesis rebuild.
+    """
+    effective = decision if decision is not None else getattr(issue, "effective_decision", None)
+    is_source = (
+        _repair_kind(getattr(issue, "kind", ""))
+        is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
+    )
+    pending_references = repair_issue_pending_references(issue)
+    application_state = repair_issue_application_state(issue, effective)
+    impact = classify_repair_impact(issue, effective)
+    blocking = repair_issue_blocks_signoff(issue, effective)
+    # An archived source no longer needs an arbitration: what it owes the
+    # edition is a REFERENCES reconciliation, tracked as a rebuild debt.
+    resolved = effective is not None or pending_references
+
+    if is_source and pending_references:
+        # The content exists; only the deterministic REFERENCES rebuild is
+        # missing. This debt is served by the backend, so a page reload cannot
+        # lose it -- and an older waiver cannot cancel it.
+        rebuild_required = blocking
+        recommended_stage: str | None = "rebuild_references"
+    elif is_source:
+        rebuild_required = False
+        # The source still needs an explicit archive/waive decision before the
+        # deterministic REFERENCES reconciliation can run.
+        recommended_stage = "none" if resolved else "rebuild_references"
+    elif application_state is RepairDecisionApplicationState.UNRESOLVED:
+        rebuild_required = False
+        recommended_stage = None
+    elif application_state is RepairDecisionApplicationState.UNBUILDABLE:
+        # The decision is recorded but nothing materialized it. It stays a
+        # blocking debt the analyst clears by revising it to EXCLUDE.
+        rebuild_required = blocking
+        recommended_stage = "revise_decision"
+    elif application_state is RepairDecisionApplicationState.PROJECTION_REQUIRED:
+        # Covers the first INCLUDE as well as every revision that makes the
+        # applied projection disagree with the effective decision.
+        rebuild_required = blocking
+        recommended_stage = "apply_projection"
+    else:
+        rebuild_required = document_missing
+        recommended_stage = "synthesis" if document_missing else "none"
+
+    return RepairIssueExecutionState(
+        application_state=application_state,
+        impact=impact,
+        resolved=resolved,
+        blocking=blocking,
+        rebuild_required=rebuild_required,
+        recommended_stage=recommended_stage,
     )
 
 
@@ -3662,14 +3753,17 @@ def repair_issue_application_state(
     return repair_decision_application_state(issue, decision, marker)
 
 
-def repair_issue_blocks_signoff(issue: Any) -> bool:
-    """Return whether a repair issue still changes the deliverable before freeze."""
-    if (
-        _enum_value(getattr(issue, "repair_state", None))
-        == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES.value
-    ):
+def repair_issue_blocks_signoff(
+    issue: Any, effective_decision: ProductionRepairDecision | None = None
+) -> bool:
+    """Return whether a repair issue still changes the deliverable before freeze.
+
+    An archived source pending REFERENCES blocks whatever the decision says:
+    the current state of the corpus dominates an older waiver.
+    """
+    if repair_issue_pending_references(issue):
         return True
-    return repair_issue_application_state(issue) in {
+    return repair_issue_application_state(issue, effective_decision) in {
         RepairDecisionApplicationState.PROJECTION_REQUIRED,
         RepairDecisionApplicationState.UNBUILDABLE,
     }

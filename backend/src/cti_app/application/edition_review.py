@@ -10,10 +10,11 @@ from uuid import UUID
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_repairs import (
-    classify_repair_impact,
     merge_repair_impacts,
     repair_issue_application_state,
     repair_issue_blocks_signoff,
+    repair_issue_execution_state,
+    repair_issue_pending_references,
 )
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
@@ -26,7 +27,6 @@ from cti_app.domain.production import (
     RepairExecutionPlan,
     SubjectProductionStage,
     SubjectProductionStatus,
-    SupplementalSourceRepairState,
     requires_submission_reconciliation,
 )
 from cti_app.domain.publication_review import (
@@ -365,11 +365,14 @@ class EditionRepairReadService:
             return None
         kind = _issue_kind(issue)
         decision = getattr(issue, "effective_decision", None)
-        is_source = kind == ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value
         pending_references = _issue_pending_references(issue)
-        # An archived source no longer needs an arbitration: what it owes the
-        # edition is a REFERENCES reconciliation, tracked as a rebuild debt.
-        resolved = decision is not None or pending_references
+        # One helper owns sign-off, the rebuild debt, the plan and the next
+        # action, so this read model can never disagree with the planner.
+        execution = repair_issue_execution_state(
+            issue,
+            decision,
+            document_missing=row.document_artifact_id is None,
+        )
         is_ioc = bool(getattr(issue, "is_publication_ioc", False))
         repair_key = str(issue.repair_key)
         source_id = getattr(issue, "source_id", None)
@@ -380,35 +383,6 @@ class EditionRepairReadService:
         artifact_type = getattr(issue, "artifact_type", None)
         artifact_id = getattr(issue, "observed_artifact_id", None)
         artifact_version = getattr(issue, "observed_artifact_version", None)
-        state = issue_application_state(issue, decision)
-        impact = classify_repair_impact(issue, decision)
-        if is_source and pending_references:
-            # The content exists; only the deterministic REFERENCES rebuild is
-            # missing. This debt is served by the backend, so a page reload
-            # cannot lose it.
-            rebuild_required = repair_issue_blocks_signoff(issue)
-            recommended_stage = "rebuild_references"
-        elif is_source:
-            rebuild_required = False
-            # The source still needs an explicit archive/waive decision before
-            # the deterministic REFERENCES reconciliation can run.
-            recommended_stage = "none" if resolved else "rebuild_references"
-        elif state is RepairDecisionApplicationState.UNRESOLVED:
-            rebuild_required = False
-            recommended_stage = None
-        elif state is RepairDecisionApplicationState.UNBUILDABLE:
-            # The decision is recorded but nothing materialized it. It stays a
-            # blocking debt the analyst clears by revising it to EXCLUDE.
-            rebuild_required = repair_issue_blocks_signoff(issue)
-            recommended_stage = "revise_decision"
-        elif state is RepairDecisionApplicationState.PROJECTION_REQUIRED:
-            # Covers the first INCLUDE as well as every revision that makes the
-            # applied projection disagree with the effective decision.
-            rebuild_required = repair_issue_blocks_signoff(issue)
-            recommended_stage = "apply_projection"
-        else:
-            rebuild_required = row.document_artifact_id is None
-            recommended_stage = "synthesis" if rebuild_required else "none"
 
         return EditionRepairItem(
             repair_key=repair_key,
@@ -442,7 +416,7 @@ class EditionRepairReadService:
             ),
             effective_decision_id=getattr(decision, "id", None),
             repair_state=_issue_repair_state(issue),
-            resolved=resolved,
+            resolved=execution.resolved,
             resolution_reason=(
                 getattr(decision, "reason", None)
                 if decision is not None
@@ -450,12 +424,12 @@ class EditionRepairReadService:
                 if pending_references
                 else None
             ),
-            rebuild_required=rebuild_required,
-            recommended_stage=recommended_stage,
-            execution_plan=impact.execution_plan,
+            rebuild_required=execution.rebuild_required,
+            recommended_stage=execution.recommended_stage,
+            execution_plan=execution.execution_plan,
             is_publication_ioc=is_ioc,
             in_publication_scope=_row_in_publication_scope(row),
-            application_state=state.value,
+            application_state=execution.application_state.value,
         )
 
 
@@ -476,17 +450,9 @@ def _issue_repair_state(issue: Any) -> str | None:
     return str(getattr(value, "value", value))
 
 
-def _issue_pending_references(issue: Any) -> bool:
-    """True when the source is archived but REFERENCES has not caught up.
-
-    This is the single backend definition of the rebuild debt: the Repair Desk
-    read model, the review sign-off rule and the publication freeze all use it,
-    so no client-side state can make the debt disappear.
-    """
-    return (
-        _issue_repair_state(issue)
-        == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES.value
-    )
+#: Re-exported under the module-local name every caller here already uses; the
+#: definition itself lives with the planner so both share one rule.
+_issue_pending_references = repair_issue_pending_references
 
 
 def _issue_subject(issue: Any) -> UUID | None:
