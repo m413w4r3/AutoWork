@@ -26,6 +26,7 @@ from cti_app.application.production_parsers import (
     Q2ArtifactProposal,
     Q2RuleProposal,
     Q2SourceOutput,
+    ReferenceReport,
     TechnicalExtraction,
     parse_reference_report,
     reconcile_reference_report_with_archives,
@@ -48,10 +49,13 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionDerivedOutput,
     ProductionEvidenceBasis,
     ProductionReconciliationRequiredError,
     ProductionRepairAction,
     ProductionRepairDecision,
+    ProductionRepairImpact,
+    ProductionRepairImpactKind,
     ProductionRepairIssueKind,
     RepairDecisionApplicationState,
     SubjectProductionStatus,
@@ -160,6 +164,253 @@ def build_repair_evidence_pack(entries: Sequence[Mapping[str, Any]]) -> dict[str
         "schema_version": REPAIR_EVIDENCE_SCHEMA_VERSION,
         "entries": [dict(entry) for entry in entries],
     }
+
+
+# This version is part of the functional Q4 input.  Keep it alongside the
+# pure projection so callers cannot accidentally hash a different pack from
+# the one sent to the synthesis stage.
+SYNTHESIS_EVIDENCE_PACK_VERSION = "7"
+
+
+def _projection_enum_value(value: Any) -> Any:
+    return getattr(value, "value", value)
+
+
+def extraction_item_contributes_to_synthesis(item: ExtractionItem) -> bool:
+    """Return whether one extraction item belongs in the Q4 evidence pack."""
+    if not item.supported:
+        return False
+    if item.indicator_status is IndicatorStatus.EXCLUDED:
+        return False
+    if item.display_policy is DisplayPolicy.HIDDEN:
+        return False
+
+    # An analyst override created only for the publication IOC section is not
+    # narrative evidence and must not trigger a new Q4 draft.
+    if (
+        item.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+        and item.display_policy is DisplayPolicy.IOC_SECTION
+        and not item.context.strip()
+    ):
+        return False
+
+    return True
+
+
+def synthesis_projection_payload(
+    report: ReferenceReport,
+    extraction: TechnicalExtraction,
+    source_tiers_by_url: Mapping[str, str],
+) -> dict[str, Any]:
+    """Build the exact deterministic evidence projection consumed by Q4."""
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in extraction.items:
+        if not extraction_item_contributes_to_synthesis(item):
+            continue
+
+        category = item.category or ""
+        dedup_key = (category, item.value.strip().casefold())
+        artifact_type = (
+            item.artifact_type.value
+            if isinstance(item.artifact_type, ArtifactType)
+            else item.artifact_type
+        )
+        candidate = {
+            "category": category,
+            "value": item.value,
+            "context": item.context,
+            "source_ids": sorted(item.source_ids),
+            "is_confirmed_indicator": item.indicator_status is IndicatorStatus.CONFIRMED_IOC,
+            "artifact_type": artifact_type,
+        }
+        existing = merged.get(dedup_key)
+        if existing is None:
+            merged[dedup_key] = candidate
+            continue
+
+        # These choices make duplicate extraction rows independent of their
+        # input order while preserving the historical preference for the most
+        # informative context.
+        contexts = (str(existing["context"] or ""), str(candidate["context"] or ""))
+        existing["context"] = max(contexts, key=lambda value: (len(value), value))
+        existing["value"] = min(
+            (str(existing["value"]), str(candidate["value"])),
+            key=lambda value: (value.casefold(), value),
+        )
+        existing["category"] = min(str(existing["category"]), str(candidate["category"]))
+        artifact_types: set[str] = {
+            str(value)
+            for value in (existing.get("artifact_type"), candidate.get("artifact_type"))
+            if value is not None
+        }
+        existing["artifact_type"] = min(artifact_types) if artifact_types else None
+        existing["is_confirmed_indicator"] = bool(
+            existing["is_confirmed_indicator"] or candidate["is_confirmed_indicator"]
+        )
+        existing_source_ids = {
+            str(source_id) for source_id in cast(Sequence[Any], existing["source_ids"])
+        }
+        candidate_source_ids = {
+            str(source_id) for source_id in cast(Sequence[Any], candidate["source_ids"])
+        }
+        existing["source_ids"] = sorted(existing_source_ids | candidate_source_ids)
+
+    items = sorted(
+        merged.values(),
+        key=lambda item: (
+            str(item["category"]),
+            str(item["value"]),
+            str(item["context"]),
+            tuple(item["source_ids"]),
+        ),
+    )
+
+    return {
+        "version": SYNTHESIS_EVIDENCE_PACK_VERSION,
+        "reference_report": {
+            "sources": [
+                {
+                    "id": source.local_id,
+                    "tier": source_tiers_by_url.get(source.canonical_url, "unknown"),
+                    "title": source.title,
+                    "publisher": source.publisher,
+                    "published_at": (
+                        source.published_at.isoformat() if source.published_at else None
+                    ),
+                }
+                for source in sorted(report.sources, key=lambda source: source.local_id)
+            ],
+            "events": [
+                {
+                    "date": event.event_date.isoformat() if event.event_date else None,
+                    "source_ids": sorted(event.source_ids),
+                    "text": re.sub(
+                        r"\b(?:https?|hxxps?)://\S+",
+                        "[URL omitted]",
+                        event.text,
+                        flags=re.IGNORECASE,
+                    ),
+                }
+                for event in sorted(
+                    report.events,
+                    key=lambda event: (
+                        event.event_date.isoformat() if event.event_date else "",
+                        event.local_id,
+                    ),
+                )
+            ],
+            "uncertainties": sorted(report.uncertainties),
+        },
+        "technical_extraction": {
+            "items": items,
+            "uncertainties": sorted(extraction.uncertainties),
+        },
+    }
+
+
+def _publication_item_projection(item: ExtractionItem) -> dict[str, Any]:
+    """Keep only fields consumed by the publication builder and annotator."""
+    artifact_type = (
+        item.artifact_type.value
+        if isinstance(item.artifact_type, ArtifactType)
+        else item.artifact_type
+    )
+    return {
+        "category": item.category,
+        "value": item.value,
+        "supported": item.supported,
+        "semantic_type": _projection_enum_value(item.semantic_type),
+        "indicator_status": _projection_enum_value(item.indicator_status),
+        "artifact_type": artifact_type,
+        "display_policy": _projection_enum_value(item.display_policy),
+        "normalized_value": item.normalized_value,
+        "source_ids": sorted(item.source_ids),
+    }
+
+
+def publication_projection_payload(
+    report: ReferenceReport,
+    extraction: TechnicalExtraction,
+    synthesis_text: str,
+) -> dict[str, Any]:
+    """Build the functional inputs used by ``build_publication_document``."""
+    items = [_publication_item_projection(item) for item in extraction.items]
+    items.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+    return {
+        "reference_report": {
+            "sources": [
+                {
+                    "id": source.local_id,
+                    "canonical_url": source.canonical_url,
+                    "title": source.title,
+                    "publisher": source.publisher,
+                    "published_at": (
+                        source.published_at.isoformat() if source.published_at else None
+                    ),
+                }
+                for source in sorted(report.sources, key=lambda source: source.local_id)
+            ],
+            "events": [
+                {
+                    "date": event.event_date.isoformat() if event.event_date else None,
+                    "source_ids": sorted(event.source_ids),
+                    "text": event.text,
+                }
+                for event in report.events
+            ],
+            "uncertainties": sorted(report.uncertainties),
+            "editorial_title": report.editorial_title,
+        },
+        "extraction": {
+            "items": items,
+            "uncertainties": sorted(extraction.uncertainties),
+        },
+        "synthesis_text": synthesis_text,
+    }
+
+
+def rule_bundle_projection_payload(extraction: TechnicalExtraction) -> dict[str, Any]:
+    """Build the functional projection of the detection-rule bundle."""
+    rules = [
+        {
+            "rule_type": _projection_enum_value(rule.rule_type),
+            "name": rule.name,
+            "body": rule.body,
+            "sha256": rule.sha256,
+            "source_ids": sorted(rule.source_ids),
+            "context": rule.context,
+            "evidence_quote": rule.evidence_quote,
+            "supported": rule.supported,
+            "evidence_basis": _projection_enum_value(rule.evidence_basis),
+        }
+        for rule in extraction.rules
+    ]
+    rules.sort(key=lambda rule: json.dumps(rule, sort_keys=True, separators=(",", ":")))
+    return {"rules": rules}
+
+
+def _projection_hash(payload: dict[str, Any]) -> str:
+    return _sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def synthesis_projection_hash(
+    report: ReferenceReport,
+    extraction: TechnicalExtraction,
+    source_tiers_by_url: Mapping[str, str],
+) -> str:
+    return _projection_hash(synthesis_projection_payload(report, extraction, source_tiers_by_url))
+
+
+def publication_projection_hash(
+    report: ReferenceReport,
+    extraction: TechnicalExtraction,
+    synthesis_text: str,
+) -> str:
+    return _projection_hash(publication_projection_payload(report, extraction, synthesis_text))
+
+
+def rule_bundle_projection_hash(extraction: TechnicalExtraction) -> str:
+    return _projection_hash(rule_bundle_projection_payload(extraction))
 
 
 class ProductionRepairStatusError(ValueError):
@@ -622,6 +873,156 @@ class SupplementalSourceRepairIssue:
     effective_decision: ProductionRepairDecision | None = None
     recommended_action: str = "archive_manual_content"
     subject_id: UUID | None = None
+
+
+_NO_DELIVERABLE_OUTPUTS = frozenset[ProductionDerivedOutput]()
+_RULE_BUNDLE_OUTPUTS = frozenset(
+    {
+        ProductionDerivedOutput.EXTRACTION,
+        ProductionDerivedOutput.RULE_BUNDLE,
+        ProductionDerivedOutput.CHECKPOINT,
+    }
+)
+_PUBLICATION_OUTPUTS = frozenset(
+    {
+        ProductionDerivedOutput.EXTRACTION,
+        ProductionDerivedOutput.PUBLICATION,
+        ProductionDerivedOutput.CHECKPOINT,
+    }
+)
+_NARRATIVE_OUTPUTS = frozenset(
+    {
+        ProductionDerivedOutput.EXTRACTION,
+        ProductionDerivedOutput.SYNTHESIS,
+        ProductionDerivedOutput.PUBLICATION,
+        ProductionDerivedOutput.CHECKPOINT,
+    }
+)
+_SOURCE_CORPUS_OUTPUTS = frozenset(
+    {
+        ProductionDerivedOutput.REFERENCES,
+        ProductionDerivedOutput.EXTRACTION,
+        ProductionDerivedOutput.SYNTHESIS,
+        ProductionDerivedOutput.PUBLICATION,
+        ProductionDerivedOutput.CHECKPOINT,
+    }
+)
+
+
+def _repair_impact(
+    kind: ProductionRepairImpactKind,
+    affected_outputs: frozenset[ProductionDerivedOutput],
+    *,
+    model_call_required: bool,
+    reason: str,
+) -> ProductionRepairImpact:
+    return ProductionRepairImpact(
+        kind=kind,
+        affected_outputs=affected_outputs,
+        model_call_required=model_call_required,
+        reason=reason,
+    )
+
+
+def _decision_action(decision: ProductionRepairDecision | None) -> Any:
+    return _projection_enum_value(getattr(decision, "action", None))
+
+
+def _exclude_revises_projected_content(
+    issue: ProductionRepairIssueView,
+    decision: ProductionRepairDecision,
+) -> bool:
+    """Use the existing application state to detect an applied INCLUDE."""
+    if _decision_action(decision) != ProductionRepairAction.EXCLUDE.value:
+        return False
+    try:
+        state = RepairDecisionApplicationState(
+            _projection_enum_value(getattr(issue, "application_state", None))
+        )
+    except ValueError:
+        return False
+    return state is RepairDecisionApplicationState.PROJECTION_REQUIRED
+
+
+def classify_repair_impact(
+    issue: ProductionRepairIssueView | SupplementalSourceRepairIssue,
+    decision: ProductionRepairDecision | None,
+) -> ProductionRepairImpact:
+    """Classify a repair by the derived products whose content can change."""
+    action = _decision_action(decision)
+
+    if action == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value:
+        return _repair_impact(
+            ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+            _NO_DELIVERABLE_OUTPUTS,
+            model_call_required=False,
+            reason="The analyst waived the supplemental source without adding content.",
+        )
+
+    if isinstance(issue, SupplementalSourceRepairIssue):
+        if issue.repair_state is SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES:
+            return _repair_impact(
+                ProductionRepairImpactKind.SOURCE_CORPUS,
+                _SOURCE_CORPUS_OUTPUTS,
+                model_call_required=True,
+                reason=(
+                    "An archived Q1 source is absent from REFERENCES and can change the "
+                    "source corpus."
+                ),
+            )
+        return _repair_impact(
+            ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+            _NO_DELIVERABLE_OUTPUTS,
+            model_call_required=False,
+            reason="The supplemental source has no materialized deliverable change.",
+        )
+
+    if decision is None:
+        return _repair_impact(
+            ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+            _NO_DELIVERABLE_OUTPUTS,
+            model_call_required=False,
+            reason="No repair decision is materialized.",
+        )
+
+    action_is_include = action == ProductionRepairAction.INCLUDE.value
+    action_is_exclude = action == ProductionRepairAction.EXCLUDE.value
+    changes_projected_content = action_is_include or (
+        action_is_exclude and _exclude_revises_projected_content(issue, decision)
+    )
+    if not changes_projected_content:
+        return _repair_impact(
+            ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+            _NO_DELIVERABLE_OUTPUTS,
+            model_call_required=False,
+            reason="The rejected value was not previously included in a deliverable.",
+        )
+
+    issue_kind = _repair_kind(issue.kind)
+    if issue_kind is ProductionRepairIssueKind.REJECTED_RULE:
+        return _repair_impact(
+            ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
+            _RULE_BUNDLE_OUTPUTS,
+            model_call_required=False,
+            reason="The repair changes only the accepted detection-rule bundle.",
+        )
+
+    # Deliberately classify from the actual artifact type, never from the
+    # broad rejected-indicator label or a copied UI boolean.
+    if is_publication_ioc_artifact_type(issue.artifact_type):
+        return _repair_impact(
+            ProductionRepairImpactKind.PUBLICATION_ONLY,
+            _PUBLICATION_OUTPUTS,
+            model_call_required=False,
+            reason="The repair changes only a public IOC projection.",
+        )
+
+    return _repair_impact(
+        ProductionRepairImpactKind.NARRATIVE,
+        _NARRATIVE_OUTPUTS,
+        model_call_required=True,
+        reason="The repair adds or removes narrative technical evidence.",
+    )
 
 
 # Name used by Repair Desk consumers that distinguish list DTOs from the

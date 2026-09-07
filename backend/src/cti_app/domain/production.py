@@ -41,6 +41,37 @@ class ProductionRepairIssueKind(StrEnum):
     SUPPLEMENTAL_SOURCE_UNARCHIVED = "supplemental_source_unarchived"
 
 
+class ProductionRepairImpactKind(StrEnum):
+    """Semantic impact of a repair on the derived production outputs."""
+
+    NO_DELIVERABLE_CHANGE = "no_deliverable_change"
+    RULE_BUNDLE_ONLY = "rule_bundle_only"
+    PUBLICATION_ONLY = "publication_only"
+    NARRATIVE = "narrative"
+    SOURCE_CORPUS = "source_corpus"
+
+
+class ProductionDerivedOutput(StrEnum):
+    """Derived products which may be invalidated by a production repair."""
+
+    REFERENCES = "references"
+    EXTRACTION = "extraction"
+    SYNTHESIS = "synthesis"
+    PUBLICATION = "publication"
+    RULE_BUNDLE = "rule_bundle"
+    CHECKPOINT = "checkpoint"
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionRepairImpact:
+    """Typed, immutable description of a repair's semantic impact."""
+
+    kind: ProductionRepairImpactKind
+    affected_outputs: frozenset[ProductionDerivedOutput]
+    model_call_required: bool
+    reason: str
+
+
 class SupplementalSourceRepairState(StrEnum):
     """Durable state of a Q1 proposal absent from the current REFERENCES.
 

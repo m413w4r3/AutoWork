@@ -90,8 +90,10 @@ from cti_app.application.production_q2_batch import (
 )
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.production_repairs import (
+    SYNTHESIS_EVIDENCE_PACK_VERSION,
     build_repair_evidence_pack,
     repair_key_for_rejection,
+    synthesis_projection_payload,
 )
 from cti_app.application.production_source_evidence import (
     SOURCE_EVIDENCE_VERSION,
@@ -154,10 +156,6 @@ REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
 # Une fermeture d'onglet qui tombe pendant une éviction du service worker MV3
 # réussit quelques secondes plus tard.
 _CONVERSATION_CLOSE_RETRY_DELAY_SECONDS = 5.0
-
-# Functional content of the Q4 evidence pack. Bumped whenever what Q4 can read
-# changes, so a cached synthesis built on an older pack is never reused.
-SYNTHESIS_EVIDENCE_PACK_VERSION = "7"
 
 # Keep archive reads within the same decoded-document limit as collection and
 # deterministic source processing. This is a local proof read, never prompt
@@ -3750,102 +3748,8 @@ class ProductionWorkflowOrchestrator:
         extraction: Any,
         source_tiers_by_url: dict[str, str],
     ) -> dict[str, Any]:
-        """Deterministic Q4 input, stripped of operational/internal evidence.
-
-        Q4 must write from the verified Q1/Q2 results, not from raw collection
-        material. In particular, never expose source URLs or model IDs, or
-        items explicitly kept out of publication.
-        """
-        # Le pack Q4 ne transporte jamais les libellés internes
-        # (`indicator_status`, `display_policy`) : le modèle les recopiait dans
-        # la prose, ce que la validation rejette ensuite.
-        #
-        # L'extraction émet souvent deux entrées pour une même valeur : l'une
-        # typée sans contexte, l'autre non typée avec le contexte utile. Elles
-        # sont fusionnées ici sur (catégorie, valeur), en gardant le plus
-        # informatif de chaque attribut.
-        merged: dict[tuple[str, str], dict[str, Any]] = {}
-        order: list[tuple[str, str]] = []
-        for item in extraction.items:
-            if (
-                not item.supported
-                or item.indicator_status is IndicatorStatus.EXCLUDED
-                or item.display_policy.value == "hidden"
-            ):
-                continue
-            dedup_key = (item.category or "", item.value.strip().casefold())
-            artifact_type = item.artifact_type.value if item.artifact_type else None
-            confirmed = item.indicator_status is IndicatorStatus.CONFIRMED_IOC
-            existing = merged.get(dedup_key)
-            if existing is None:
-                merged[dedup_key] = {
-                    "category": item.category,
-                    "value": item.value,
-                    "context": item.context,
-                    "source_ids": sorted(item.source_ids),
-                    "is_confirmed_indicator": confirmed,
-                    "artifact_type": artifact_type,
-                }
-                order.append(dedup_key)
-                continue
-            if len(item.context or "") > len(existing["context"] or ""):
-                existing["context"] = item.context
-            if existing["artifact_type"] is None and artifact_type is not None:
-                existing["artifact_type"] = artifact_type
-            if confirmed:
-                existing["is_confirmed_indicator"] = True
-            existing["source_ids"] = sorted(set(existing["source_ids"]) | set(item.source_ids))
-
-        items: list[dict[str, Any]] = [merged[key] for key in order]
-
-        return {
-            "version": SYNTHESIS_EVIDENCE_PACK_VERSION,
-            "reference_report": {
-                "sources": [
-                    {
-                        "id": source.local_id,
-                        "tier": source_tiers_by_url.get(source.canonical_url, "unknown"),
-                        "title": source.title,
-                        "publisher": source.publisher,
-                        "published_at": (
-                            source.published_at.isoformat() if source.published_at else None
-                        ),
-                    }
-                    for source in sorted(report.sources, key=lambda source: source.local_id)
-                ],
-                "events": [
-                    {
-                        "date": event.event_date.isoformat() if event.event_date else None,
-                        "source_ids": sorted(event.source_ids),
-                        "text": re.sub(
-                            r"\b(?:https?|hxxps?)://\S+",
-                            "[URL omitted]",
-                            event.text,
-                            flags=re.IGNORECASE,
-                        ),
-                    }
-                    for event in sorted(
-                        report.events,
-                        key=lambda event: (
-                            event.event_date.isoformat() if event.event_date else "",
-                            event.local_id,
-                        ),
-                    )
-                ],
-                "uncertainties": sorted(report.uncertainties),
-            },
-            "technical_extraction": {
-                "items": sorted(
-                    items,
-                    key=lambda item: (
-                        item["category"],
-                        item.get("value", ""),
-                        item["context"],
-                    ),
-                ),
-                "uncertainties": sorted(extraction.uncertainties),
-            },
-        }
+        """Return the canonical Q4 projection, including the pure item filter."""
+        return synthesis_projection_payload(report, extraction, source_tiers_by_url)
 
     async def _execute_synthesis_stage(
         self,
