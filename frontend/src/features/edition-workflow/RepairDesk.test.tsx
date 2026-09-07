@@ -763,10 +763,7 @@ describe("Repair Desk", () => {
       payload_origin: "model_output_recovered",
       value: "malicious.example.com",
     };
-    renderReview(
-      page([legacy]),
-      new Map([[legacy.repair_key, recovered]]),
-    );
+    renderReview(page([legacy]), new Map([[legacy.repair_key, recovered]]));
     const user = userEvent.setup();
 
     await user.click(
@@ -778,7 +775,9 @@ describe("Repair Desk", () => {
     const inspector = within(
       await screen.findByRole("region", { name: /Article audit/ }),
     );
-    expect(await inspector.findByText("malicious.example.com")).toBeInTheDocument();
+    expect(
+      await inspector.findByText("malicious.example.com"),
+    ).toBeInTheDocument();
     expect(
       await inspector.findByRole("button", { name: "Inclure dans la fiche" }),
     ).toBeEnabled();
@@ -797,10 +796,7 @@ describe("Repair Desk", () => {
       payload_origin: "unavailable",
       value: null,
     };
-    renderReview(
-      page([legacy]),
-      new Map([[legacy.repair_key, unavailable]]),
-    );
+    renderReview(page([legacy]), new Map([[legacy.repair_key, unavailable]]));
     const user = userEvent.setup();
 
     await user.click(
