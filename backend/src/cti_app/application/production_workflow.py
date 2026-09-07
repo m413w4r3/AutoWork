@@ -59,6 +59,8 @@ from cti_app.application.production_parsers import (
     ReferenceReport,
     parse_q2_proposals_markdown,
     parse_reference_report,
+    q2_source_output_from_json,
+    q2_source_output_to_json,
     reconcile_reference_report_with_archives,
     reference_report_from_json,
     reference_report_to_json,
@@ -142,6 +144,11 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionInputSnapshot,
     ProductionRepairIssueKind,
+    Q2ReuseDecision,
+    Q2ReuseReason,
+    Q2ReuseStatus,
+    SourceExtraction,
+    SourceExtractionStatus,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
@@ -1935,6 +1942,10 @@ class ProductionWorkflowOrchestrator:
             parsed.warnings.extend(integration.warnings)
             report = integration.report
 
+            archived_for_index = await _archived_sources_by_url(
+                uow, run.subject_id, report
+            )
+
             await self._check_cancellation(run.id, context)
             artifact = await self._references.store_references_result(
                 run_id=run.id,
@@ -1953,6 +1964,10 @@ class ProductionWorkflowOrchestrator:
                         }
                         for source in report.sources
                     ],
+                    "source_hashes": {
+                        url: item.content_sha256
+                        for url, item in archived_for_index.items()
+                    },
                 },
             )
 
@@ -2211,6 +2226,23 @@ class ProductionWorkflowOrchestrator:
                     return None
                 return checkpoint
 
+        async def find_legacy_q2_checkpoint(work: _Q2SourceWork) -> Any | None:
+            if work.source_content_sha256 is None:
+                return None
+            async with self._uow_factory() as uow:
+                model_runs = getattr(uow, "model_runs", None)
+                finder = getattr(model_runs, "find_legacy_q2_checkpoint", None)
+                if not callable(finder):
+                    return None
+                checkpoint = await finder(
+                    source_url=work.source.canonical_url,
+                    source_content_sha256=work.source_content_sha256,
+                    not_before=q2_reuse_not_before,
+                )
+                if checkpoint is None or checkpoint.status is not ModelRunStatus.SUCCEEDED:
+                    return None
+                return checkpoint
+
         async def read_q2_checkpoint(checkpoint: Any) -> str | None:
             reference = getattr(checkpoint, "raw_output_reference", None) or (
                 checkpoint.output_references[0]
@@ -2237,6 +2269,289 @@ class ProductionWorkflowOrchestrator:
             if not isinstance(content, bytes):
                 return None
             return content.decode("utf-8", errors="replace")
+
+        def q2_identity_versions(
+            work: _Q2SourceWork,
+            *,
+            batched: bool,
+            access_mode: str,
+        ) -> dict[str, str | None]:
+            if access_mode == "archive_fallback":
+                return {
+                    "prompt_version": ARCHIVE_FALLBACK_PROMPT_VERSION,
+                    "parser_version": Q2_MARKDOWN_PARSER_VERSION,
+                    "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+                    "access_mode": access_mode,
+                }
+            return {
+                "prompt_version": (
+                    IOC_RULES_BATCH_PROMPT_VERSION
+                    if batched
+                    else EXTRACTION_PROMPT_VERSION_BY_PROFILE[work.plan.profile]
+                ),
+                "parser_version": (
+                    Q2_BATCH_PARSER_VERSION if batched else Q2_MARKDOWN_PARSER_VERSION
+                ),
+                "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+                "access_mode": access_mode,
+            }
+
+        async def source_extraction_rows_for_url(canonical_url: str) -> tuple[Any, ...]:
+            async with self._uow_factory() as uow:
+                repository = getattr(uow, "source_extractions", None)
+                finder = getattr(repository, "list_for_url", None)
+                if not callable(finder):
+                    return ()
+                rows = await finder(canonical_url)
+                return tuple(rows) if rows is not None else ()
+
+        async def source_extraction_by_identity(
+            work: _Q2SourceWork,
+            *,
+            batched: bool,
+            access_mode: str,
+        ) -> Any | None:
+            if work.source_content_sha256 is None:
+                return None
+            versions = q2_identity_versions(work, batched=batched, access_mode=access_mode)
+            async with self._uow_factory() as uow:
+                repository = getattr(uow, "source_extractions", None)
+                finder = getattr(repository, "get_by_identity", None)
+                if not callable(finder):
+                    return None
+                return await finder(
+                    source_content_sha256=work.source_content_sha256,
+                    profile=work.plan.profile.value,
+                    contract_version=str(versions["contract_version"]),
+                    prompt_version=str(versions["prompt_version"]),
+                    parser_version=str(versions["parser_version"]),
+                    verifier_version=ARTIFACT_VERIFIER_VERSION,
+                )
+
+        async def read_source_extraction_checkpoint(
+            checkpoint: Any,
+            work: _Q2SourceWork,
+            *,
+            batched: bool,
+            access_mode: str,
+        ) -> _Q2ReusableSource | None:
+            canonical_blob_id = getattr(checkpoint, "canonical_blob_id", None)
+            if canonical_blob_id is None:
+                return None
+            reader = getattr(self._artifact_store, "read_json", None)
+            if not callable(reader):
+                return None
+            try:
+                payload = await reader(canonical_blob_id)
+                if not isinstance(payload, dict):
+                    return None
+                output = q2_source_output_from_json(payload)
+            except Exception:
+                return None
+
+            raw = ""
+            raw_blob_id = getattr(checkpoint, "raw_blob_id", None)
+            text_reader = getattr(self._artifact_store, "read_text", None)
+            if raw_blob_id is not None and callable(text_reader):
+                try:
+                    raw_value = await text_reader(raw_blob_id)
+                    if isinstance(raw_value, str):
+                        raw = raw_value
+                except Exception:
+                    # The canonical source-local output is enough to reuse the
+                    # checkpoint; retain a deterministic JSON representation
+                    # when the optional raw archive is unavailable.
+                    raw = ""
+            if not raw:
+                raw = json.dumps(q2_source_output_to_json(output), sort_keys=True)
+            model_run_id = getattr(checkpoint, "model_run_id", None)
+            if not isinstance(model_run_id, UUID):
+                model_run_id = UUID(str(model_run_id)) if model_run_id is not None else None
+            if model_run_id is None:
+                return _Q2ReusableSource(output=output, raw=raw, model_run_id=UUID(int=0))
+            return _Q2ReusableSource(output=output, raw=raw, model_run_id=model_run_id)
+
+        async def model_run_parameters(model_run_id: UUID | None) -> dict[str, Any] | None:
+            if model_run_id is None:
+                return None
+            async with self._uow_factory() as uow:
+                repository = getattr(uow, "model_runs", None)
+                if repository is None:
+                    # Lightweight callers may persist a source checkpoint
+                    # without exposing the ModelRun repository. The source
+                    # checkpoint contains its own validated canonical output.
+                    return {"_source_checkpoint_metadata_only": True}
+                getter = getattr(repository, "get", None)
+                if not callable(getter):
+                    return None
+                model_run = await getter(model_run_id)
+                parameters = getattr(model_run, "parameters", None)
+                if not isinstance(parameters, dict):
+                    return None
+                enriched = dict(parameters)
+                enriched.setdefault(
+                    "prompt_version", getattr(model_run, "prompt_template_version", None)
+                )
+                enriched.setdefault("requested_model", getattr(model_run, "requested_model", None))
+                provider = getattr(model_run, "provider", None)
+                enriched.setdefault("provider", getattr(provider, "value", provider))
+                return enriched
+
+        def parameter_reason(
+            parameters: dict[str, Any] | None,
+            work: _Q2SourceWork,
+            *,
+            batched: bool,
+            access_mode: str,
+        ) -> Q2ReuseReason | None:
+            if parameters is None:
+                return Q2ReuseReason.NO_CHECKPOINT
+            if parameters.get("_source_checkpoint_metadata_only") is True:
+                return None
+            target: dict[str, Any] = parameters
+            execution_kind = parameters.get("q2_execution_kind")
+            if execution_kind is None:
+                if isinstance(parameters.get("q2_batch_sources"), list):
+                    execution_kind = "batch"
+                elif isinstance(parameters.get("source_url"), str):
+                    execution_kind = "individual"
+            if execution_kind == "batch":
+                sources = parameters.get("q2_batch_sources")
+                if not isinstance(sources, list):
+                    return Q2ReuseReason.NO_CHECKPOINT
+                match = next(
+                    (
+                        item
+                        for item in sources
+                        if isinstance(item, dict)
+                        and item.get("canonical_url") == work.source.canonical_url
+                    ),
+                    None,
+                )
+                if not isinstance(match, dict):
+                    return Q2ReuseReason.NO_CHECKPOINT
+                target = {
+                    **parameters,
+                    **match,
+                    "source_url": match.get("canonical_url"),
+                }
+
+            expected = {
+                "source_url": work.source.canonical_url,
+                "source_content_sha256": work.source_content_sha256,
+                "profile": work.plan.profile.value,
+                "q2_access_mode": access_mode,
+                "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+                "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
+                "verifier_version": ARTIFACT_VERIFIER_VERSION,
+                "source_evidence_version": SOURCE_EVIDENCE_VERSION,
+                "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+                "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
+            }
+            if batched:
+                expected["q2_batch_parser_version"] = Q2_BATCH_PARSER_VERSION
+            else:
+                expected["prompt_version"] = (
+                    ARCHIVE_FALLBACK_PROMPT_VERSION
+                    if access_mode == "archive_fallback"
+                    else EXTRACTION_PROMPT_VERSION_BY_PROFILE[work.plan.profile]
+                )
+            for key, value in expected.items():
+                if value is None:
+                    continue
+                actual = target.get(key)
+                if actual is None:
+                    # A missing identity field is insufficient historical
+                    # metadata, not proof that a particular policy changed.
+                    return Q2ReuseReason.NO_CHECKPOINT
+                if str(actual) != str(value):
+                    if key == "source_content_sha256":
+                        return Q2ReuseReason.SOURCE_CONTENT_CHANGED
+                    if key == "profile":
+                        return Q2ReuseReason.EXTRACTION_PROFILE_CHANGED
+                    if key in {"prompt_version"}:
+                        return Q2ReuseReason.PROMPT_VERSION_CHANGED
+                    if key == "q2_model_policy_version":
+                        return Q2ReuseReason.MODEL_POLICY_CHANGED
+                    if key == "q2_routing_policy_version":
+                        return Q2ReuseReason.ROUTING_POLICY_CHANGED
+                    if key == "source_evidence_version":
+                        return Q2ReuseReason.EVIDENCE_GATE_VERSION_CHANGED
+                    if key == "q2_access_mode":
+                        return Q2ReuseReason.ACCESS_MODE_INCOMPATIBLE
+                    return Q2ReuseReason.PARSER_CONTRACT_CHANGED
+            return None
+
+        async def persist_source_extraction_checkpoint(
+            work: _Q2SourceWork,
+            output: Q2SourceOutput,
+            raw: str,
+            *,
+            model_run_id: UUID,
+            batched: bool,
+            access_mode: str,
+            legacy_recovery: bool = False,
+        ) -> None:
+            if work.source_content_sha256 is None or self._artifact_store is None:
+                return
+            store_payloads = getattr(self._artifact_store, "store_source_extraction_payloads", None)
+            if not callable(store_payloads):
+                return
+            try:
+                raw_blob_id, canonical_blob_id = await store_payloads(
+                    raw=raw,
+                    canonical=q2_source_output_to_json(output),
+                )
+                versions = q2_identity_versions(
+                    work, batched=batched, access_mode=access_mode
+                )
+                extraction = SourceExtraction(
+                    canonical_url=work.source.canonical_url,
+                    source_content_sha256=work.source_content_sha256,
+                    profile=work.plan.profile,
+                    contract_version=Q2_EXTRACTION_CONTRACT_VERSION,
+                    prompt_version=str(versions["prompt_version"]),
+                    parser_version=str(versions["parser_version"]),
+                    verifier_version=ARTIFACT_VERIFIER_VERSION,
+                    status=SourceExtractionStatus.VERIFIED,
+                    canonical_blob_id=canonical_blob_id,
+                    raw_blob_id=raw_blob_id,
+                    model_run_id=model_run_id if model_run_id.int else None,
+                )
+                async with self._uow_factory() as uow:
+                    repository = getattr(uow, "source_extractions", None)
+                    claim = getattr(repository, "claim", None)
+                    commit = getattr(uow, "commit", None)
+                    if not callable(claim):
+                        return
+                    await claim(extraction)
+                    if callable(commit):
+                        await commit()
+                if legacy_recovery:
+                    self._diagnostics.record(
+                        event="q2.source.legacy_checkpoint_recovered",
+                        run_id=run.id,
+                        subject_id=run.subject_id,
+                        stage="extraction",
+                        correlation_id=self._correlation_id,
+                        source_id=work.source.local_id,
+                        source_url=work.source.canonical_url,
+                        source_content_sha256=work.source_content_sha256,
+                        model_run_id=(str(model_run_id) if model_run_id.int else None),
+                    )
+            except Exception as exc:
+                self._diagnostics.record(
+                    event="q2.checkpoint.persist_failed",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    source_id=work.source.local_id,
+                    source_url=work.source.canonical_url,
+                    source_content_sha256=work.source_content_sha256,
+                    model_run_id=(str(model_run_id) if model_run_id.int else None),
+                    error=str(exc)[:512],
+                )
 
         def checkpoint_key(
             work: _Q2SourceWork,
@@ -2269,6 +2584,7 @@ class ProductionWorkflowOrchestrator:
                 batch_parser_version=batch_parser_version,
                 provider=ModelProvider.OPENAI,
                 requested_model=requested_model,
+                source_content_sha256=work.source_content_sha256,
             )
 
         def clear_active_source() -> None:
@@ -2381,21 +2697,267 @@ class ProductionWorkflowOrchestrator:
             access_mode: str = "live_url",
         ) -> _Q2ReusableSource | None:
             key = checkpoint_key(work, batched=batched, access_mode=access_mode)
+
+            async def evaluate(
+                decision: Q2ReuseDecision,
+            ) -> None:
+                self._diagnostics.record(
+                    event="q2.source.reuse_evaluated",
+                    run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage="extraction",
+                    correlation_id=self._correlation_id,
+                    status=decision.status.value,
+                    reason=decision.reason.value,
+                    source_id=work.source.local_id,
+                    source_url=decision.source_url,
+                    current_source_sha256=decision.current_source_sha256,
+                    previous_source_sha256=decision.previous_source_sha256,
+                    candidate_model_run_id=(
+                        str(decision.candidate_model_run_id)
+                        if decision.candidate_model_run_id is not None
+                        else None
+                    ),
+                    profile=work.plan.profile.value,
+                    access_mode=access_mode,
+                    batched=batched,
+                )
+
+            rows = await source_extraction_rows_for_url(work.source.canonical_url)
+            versions = q2_identity_versions(work, batched=batched, access_mode=access_mode)
+            exact: Any | None = None
+            for row in rows:
+                if (
+                    getattr(row, "status", None) is SourceExtractionStatus.VERIFIED
+                    and
+                    getattr(row, "source_content_sha256", None) == work.source_content_sha256
+                    and getattr(row, "profile", None) is work.plan.profile
+                    and getattr(row, "contract_version", None)
+                    == versions["contract_version"]
+                    and getattr(row, "prompt_version", None) == versions["prompt_version"]
+                    and getattr(row, "parser_version", None) == versions["parser_version"]
+                    and getattr(row, "verifier_version", None) == ARTIFACT_VERIFIER_VERSION
+                ):
+                    exact = row
+                    break
+            if exact is None:
+                exact = await source_extraction_by_identity(
+                    work, batched=batched, access_mode=access_mode
+                )
+                if (
+                    exact is not None
+                    and getattr(exact, "status", None) is not SourceExtractionStatus.VERIFIED
+                ):
+                    exact = None
+
+            if exact is not None:
+                candidate_id = getattr(exact, "model_run_id", None)
+                candidate_uuid = candidate_id if isinstance(candidate_id, UUID) else None
+                parameter_mismatch = parameter_reason(
+                    await model_run_parameters(candidate_uuid),
+                    work,
+                    batched=batched,
+                    access_mode=access_mode,
+                )
+                if parameter_mismatch is None:
+                    reusable = await read_source_extraction_checkpoint(
+                        exact,
+                        work,
+                        batched=batched,
+                        access_mode=access_mode,
+                    )
+                    if reusable is not None:
+                        await evaluate(
+                            Q2ReuseDecision(
+                                status=Q2ReuseStatus.HIT,
+                                reason=Q2ReuseReason.REUSABLE_CHECKPOINT,
+                                source_url=work.source.canonical_url,
+                                current_source_sha256=work.source_content_sha256,
+                                previous_source_sha256=work.source_content_sha256,
+                                candidate_model_run_id=candidate_uuid,
+                            )
+                        )
+                        return reusable
+                    await evaluate(
+                        Q2ReuseDecision(
+                            status=Q2ReuseStatus.MISS,
+                            reason=(
+                                Q2ReuseReason.ARCHIVED_OUTPUT_MISSING
+                                if getattr(exact, "canonical_blob_id", None) is None
+                                else Q2ReuseReason.CHECKPOINT_CORRUPT
+                            ),
+                            source_url=work.source.canonical_url,
+                            current_source_sha256=work.source_content_sha256,
+                            previous_source_sha256=work.source_content_sha256,
+                            candidate_model_run_id=candidate_uuid,
+                        )
+                    )
+                    return None
+                await evaluate(
+                    Q2ReuseDecision(
+                        status=Q2ReuseStatus.MISS,
+                        reason=parameter_mismatch,
+                        source_url=work.source.canonical_url,
+                        current_source_sha256=work.source_content_sha256,
+                        previous_source_sha256=getattr(exact, "source_content_sha256", None),
+                        candidate_model_run_id=candidate_uuid,
+                    )
+                )
+                return None
+
+            previous = next(
+                (
+                    row
+                    for row in rows
+                    if isinstance(getattr(row, "source_content_sha256", None), str)
+                    and getattr(row, "source_content_sha256", None)
+                    != work.source_content_sha256
+                ),
+                None,
+            )
+            previous_sha = getattr(previous, "source_content_sha256", None)
+            reason: Q2ReuseReason = (
+                Q2ReuseReason.SOURCE_CONTENT_CHANGED
+                if previous is not None
+                else Q2ReuseReason.NO_CHECKPOINT
+            )
+            previous_candidate_id = getattr(previous, "model_run_id", None)
+            previous_candidate_uuid = (
+                previous_candidate_id if isinstance(previous_candidate_id, UUID) else None
+            )
+            if previous is not None and previous_sha == work.source_content_sha256:
+                if getattr(previous, "profile", None) is not work.plan.profile:
+                    reason = Q2ReuseReason.EXTRACTION_PROFILE_CHANGED
+                elif getattr(previous, "prompt_version", None) != versions["prompt_version"]:
+                    reason = Q2ReuseReason.PROMPT_VERSION_CHANGED
+                elif any(
+                    getattr(previous, name, None) != expected
+                    for name, expected in (
+                        ("contract_version", versions["contract_version"]),
+                        ("parser_version", versions["parser_version"]),
+                        ("verifier_version", ARTIFACT_VERIFIER_VERSION),
+                    )
+                ):
+                    reason = Q2ReuseReason.PARSER_CONTRACT_CHANGED
+                else:
+                    parameter_mismatch = parameter_reason(
+                        await model_run_parameters(previous_candidate_uuid),
+                        work,
+                        batched=batched,
+                        access_mode=access_mode,
+                    )
+                    if (
+                        parameter_mismatch is not None
+                        and parameter_mismatch is not Q2ReuseReason.NO_CHECKPOINT
+                    ):
+                        reason = parameter_mismatch
+
+            # ModelRun checkpoint keys remain a recovery path for deployments
+            # that crashed after the provider output was durable but before the
+            # new source_extractions row was committed. This path only reads
+            # persisted bytes; it never calls the provider to rebuild a cache.
             checkpoint = await find_q2_checkpoint(key)
+            legacy_recovery = False
             if checkpoint is None:
+                legacy_key = _q2_checkpoint_key(
+                    canonical_url=work.source.canonical_url,
+                    profile=work.plan.profile,
+                    prompt_version=str(versions["prompt_version"]),
+                    batch_parser_version=(
+                        str(versions["parser_version"])
+                        if batched
+                        else None
+                    ),
+                    provider=ModelProvider.OPENAI,
+                    requested_model=requested_model,
+                    source_content_sha256=None,
+                )
+                if legacy_key != key:
+                    checkpoint = await find_q2_checkpoint(legacy_key)
+                    legacy_recovery = checkpoint is not None
+            if checkpoint is None:
+                checkpoint = await find_legacy_q2_checkpoint(work)
+                legacy_recovery = checkpoint is not None
+            if checkpoint is None:
+                await evaluate(
+                    Q2ReuseDecision(
+                        status=Q2ReuseStatus.MISS,
+                        reason=reason,
+                        source_url=work.source.canonical_url,
+                        current_source_sha256=work.source_content_sha256,
+                        previous_source_sha256=previous_sha,
+                        candidate_model_run_id=previous_candidate_uuid,
+                    )
+                )
                 return None
             raw = await read_q2_checkpoint(checkpoint)
             if raw is None or not raw.strip():
+                await evaluate(
+                    Q2ReuseDecision(
+                        status=Q2ReuseStatus.MISS,
+                        reason=Q2ReuseReason.ARCHIVED_OUTPUT_MISSING,
+                        source_url=work.source.canonical_url,
+                        current_source_sha256=work.source_content_sha256,
+                        previous_source_sha256=previous_sha,
+                        candidate_model_run_id=checkpoint.id,
+                    )
+                )
                 return None
 
             parameters = getattr(checkpoint, "parameters", {})
             kind = parameters.get("q2_execution_kind") if isinstance(parameters, dict) else None
+            if kind is None and isinstance(parameters, dict):
+                # Older successful Q2 ModelRuns predate the explicit execution
+                # kind. Their source URL/hash metadata is enough to identify
+                # the individual response deterministically.
+                if isinstance(parameters.get("source_url"), str):
+                    kind = "individual"
+                elif isinstance(parameters.get("q2_batch_sources"), list):
+                    kind = "batch"
+            checkpoint_mismatch = parameter_reason(
+                parameters if isinstance(parameters, dict) else None,
+                work,
+                batched=(kind == "batch"),
+                access_mode=access_mode,
+            )
+            if checkpoint_mismatch is not None:
+                await evaluate(
+                    Q2ReuseDecision(
+                        status=Q2ReuseStatus.MISS,
+                        reason=checkpoint_mismatch,
+                        source_url=work.source.canonical_url,
+                        current_source_sha256=work.source_content_sha256,
+                        previous_source_sha256=previous_sha,
+                        candidate_model_run_id=checkpoint.id,
+                    )
+                )
+                return None
             persisted_access_mode = (
                 parameters.get("q2_access_mode") if isinstance(parameters, dict) else None
             )
             if access_mode == "archive_fallback" and persisted_access_mode != "archive_fallback":
+                await evaluate(
+                    Q2ReuseDecision(
+                        status=Q2ReuseStatus.MISS,
+                        reason=Q2ReuseReason.ACCESS_MODE_INCOMPATIBLE,
+                        source_url=work.source.canonical_url,
+                        current_source_sha256=work.source_content_sha256,
+                        previous_source_sha256=previous_sha,
+                        candidate_model_run_id=checkpoint.id,
+                    )
+                )
                 return None
             if access_mode == "live_url" and persisted_access_mode == "archive_fallback":
+                await evaluate(
+                    Q2ReuseDecision(
+                        status=Q2ReuseStatus.MISS,
+                        reason=Q2ReuseReason.ACCESS_MODE_INCOMPATIBLE,
+                        source_url=work.source.canonical_url,
+                        current_source_sha256=work.source_content_sha256,
+                        previous_source_sha256=previous_sha,
+                        candidate_model_run_id=checkpoint.id,
+                    )
+                )
                 return None
             if kind == "batch":
                 batch_sources = parameters.get("q2_batch_sources", [])
@@ -2409,6 +2971,16 @@ class ProductionWorkflowOrchestrator:
                     None,
                 )
                 if not isinstance(target, dict) or not isinstance(target.get("batch_id"), str):
+                    await evaluate(
+                        Q2ReuseDecision(
+                            status=Q2ReuseStatus.MISS,
+                            reason=Q2ReuseReason.NO_CHECKPOINT,
+                            source_url=work.source.canonical_url,
+                            current_source_sha256=work.source_content_sha256,
+                            previous_source_sha256=previous_sha,
+                            candidate_model_run_id=checkpoint.id,
+                        )
+                    )
                     return None
                 parsed_batch = parse_q2_batch_response(
                     raw,
@@ -2419,25 +2991,97 @@ class ProductionWorkflowOrchestrator:
                     or not parsed_batch.sources
                     or not parsed_batch.sources[0].usable
                 ):
+                    await evaluate(
+                        Q2ReuseDecision(
+                            status=Q2ReuseStatus.MISS,
+                            reason=Q2ReuseReason.CHECKPOINT_CORRUPT,
+                            source_url=work.source.canonical_url,
+                            current_source_sha256=work.source_content_sha256,
+                            previous_source_sha256=previous_sha,
+                            candidate_model_run_id=checkpoint.id,
+                        )
+                    )
                     return None
                 source_result = parsed_batch.sources[0]
                 assert source_result.output is not None
-                return _Q2ReusableSource(
+                reusable = _Q2ReusableSource(
                     output=source_result.output,
                     raw=source_result.raw_block,
                     model_run_id=checkpoint.id,
                     warnings=(*parsed_batch.warnings, *source_result.warnings),
                 )
+                await evaluate(
+                    Q2ReuseDecision(
+                        status=Q2ReuseStatus.HIT,
+                        reason=Q2ReuseReason.REUSABLE_CHECKPOINT,
+                        source_url=work.source.canonical_url,
+                        current_source_sha256=work.source_content_sha256,
+                        previous_source_sha256=work.source_content_sha256,
+                        candidate_model_run_id=checkpoint.id,
+                    )
+                )
+                if legacy_recovery:
+                    await persist_source_extraction_checkpoint(
+                        work,
+                        reusable.output,
+                        reusable.raw,
+                        model_run_id=checkpoint.id,
+                        batched=batched,
+                        access_mode=access_mode,
+                        legacy_recovery=True,
+                    )
+                return reusable
             if kind == "individual":
                 parsed_individual = parse_q2_proposals_markdown(raw)
                 if not parsed_individual.usable or parsed_individual.value is None:
+                    await evaluate(
+                        Q2ReuseDecision(
+                            status=Q2ReuseStatus.MISS,
+                            reason=Q2ReuseReason.CHECKPOINT_CORRUPT,
+                            source_url=work.source.canonical_url,
+                            current_source_sha256=work.source_content_sha256,
+                            previous_source_sha256=previous_sha,
+                            candidate_model_run_id=checkpoint.id,
+                        )
+                    )
                     return None
-                return _Q2ReusableSource(
+                reusable = _Q2ReusableSource(
                     output=parsed_individual.value,
                     raw=raw,
                     model_run_id=checkpoint.id,
                     warnings=tuple(parsed_individual.warnings),
                 )
+                await evaluate(
+                    Q2ReuseDecision(
+                        status=Q2ReuseStatus.HIT,
+                        reason=Q2ReuseReason.REUSABLE_CHECKPOINT,
+                        source_url=work.source.canonical_url,
+                        current_source_sha256=work.source_content_sha256,
+                        previous_source_sha256=work.source_content_sha256,
+                        candidate_model_run_id=checkpoint.id,
+                    )
+                )
+                if legacy_recovery:
+                    await persist_source_extraction_checkpoint(
+                        work,
+                        reusable.output,
+                        reusable.raw,
+                        model_run_id=checkpoint.id,
+                        batched=batched,
+                        access_mode=access_mode,
+                        legacy_recovery=True,
+                    )
+                return reusable
+            await evaluate(
+                Q2ReuseDecision(
+                    status=Q2ReuseStatus.MISS,
+                    reason=Q2ReuseReason.NO_CHECKPOINT,
+                    source_url=work.source.canonical_url,
+                    current_source_sha256=work.source_content_sha256,
+                    previous_source_sha256=previous_sha,
+                    candidate_model_run_id=checkpoint.id,
+                )
+            )
             return None
 
         async def persist_q2_checkpoint_keys(model_run_id: UUID, keys: Sequence[str]) -> None:
@@ -2759,6 +3403,25 @@ class ProductionWorkflowOrchestrator:
                 )
                 return None
 
+            # The fallback is a distinct Q2 access mode. Evaluate its own
+            # checkpoint immediately before the fallback provider call; a
+            # live miss must never silently authorize a second model call.
+            if work.source_content_sha256 is not None:
+                reusable = await load_reusable_source(
+                    work,
+                    batched=False,
+                    access_mode="archive_fallback",
+                )
+                if reusable is not None:
+                    await record_reused_source(
+                        work,
+                        reusable,
+                        access_mode="archive_fallback",
+                        source_text=archived_text,
+                        live_failure_code=live_failure_code,
+                    )
+                    return None
+
             archive_model_run_id = _q2_archive_fallback_model_run_id(
                 production_run_id=run.id,
                 pipeline_generation=run.pipeline_generation,
@@ -2856,8 +3519,17 @@ class ProductionWorkflowOrchestrator:
                         },
                         parameters={
                             "q2_execution_kind": "individual",
-                            "q2_access_mode": "archive_fallback",
+                            "source_url": source.canonical_url,
                             "source_content_sha256": work.source_content_sha256,
+                            "profile": plan.profile.value,
+                            "q2_access_mode": "archive_fallback",
+                            "prompt_version": ARCHIVE_FALLBACK_PROMPT_VERSION,
+                            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+                            "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
+                            "verifier_version": ARTIFACT_VERIFIER_VERSION,
+                            "source_evidence_version": SOURCE_EVIDENCE_VERSION,
+                            "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+                            "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
                             "archive_fallback_prompt_version": ARCHIVE_FALLBACK_PROMPT_VERSION,
                             "archived_source_access_version": ARCHIVED_SOURCE_ACCESS_VERSION,
                         },
@@ -2921,6 +3593,14 @@ class ProductionWorkflowOrchestrator:
                 await persist_q2_checkpoint_keys(
                     execution.run.id,
                     [checkpoint_key(work, batched=False, access_mode="archive_fallback")],
+                )
+                await persist_source_extraction_checkpoint(
+                    work,
+                    filtered_output,
+                    raw,
+                    model_run_id=execution.run.id,
+                    batched=False,
+                    access_mode="archive_fallback",
                 )
                 clear_active_source()
                 await self._persist_extraction_progress(run.id, progress)
@@ -3144,6 +3824,17 @@ class ProductionWorkflowOrchestrator:
                         },
                         parameters={
                             "q2_execution_kind": "individual",
+                            "source_url": source.canonical_url,
+                            "source_content_sha256": source_content_sha256,
+                            "profile": plan.profile.value,
+                            "q2_access_mode": "live_url",
+                            "prompt_version": prompt_version,
+                            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+                            "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
+                            "verifier_version": ARTIFACT_VERIFIER_VERSION,
+                            "source_evidence_version": SOURCE_EVIDENCE_VERSION,
+                            "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+                            "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
                         },
                     ),
                     ModelRole.RESEARCH,
@@ -3208,6 +3899,14 @@ class ProductionWorkflowOrchestrator:
                 await persist_q2_checkpoint_keys(
                     execution.run.id,
                     [checkpoint_key(work, batched=False)],
+                )
+                await persist_source_extraction_checkpoint(
+                    work,
+                    filtered_output,
+                    raw,
+                    model_run_id=execution.run.id,
+                    batched=False,
+                    access_mode="live_url",
                 )
                 clear_active_source()
                 await self._persist_extraction_progress(run.id, progress)
@@ -3410,10 +4109,23 @@ class ProductionWorkflowOrchestrator:
                         },
                         parameters={
                             "q2_execution_kind": "batch",
+                            "q2_access_mode": "live_url",
+                            "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
+                            "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
+                            "source_evidence_version": SOURCE_EVIDENCE_VERSION,
+                            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+                            "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
+                            "verifier_version": ARTIFACT_VERIFIER_VERSION,
+                            "ioc_rules_batch_prompt_version": IOC_RULES_BATCH_PROMPT_VERSION,
+                            "q2_batch_parser_version": Q2_BATCH_PARSER_VERSION,
                             "q2_batch_sources": [
                                 {
                                     "batch_id": item.batch_id,
                                     "canonical_url": item.canonical_url,
+                                    "source_content_sha256": pending[
+                                        item.source.local_id
+                                    ].source_content_sha256,
+                                    "profile": ExtractionProfile.IOC_RULES.value,
                                 }
                                 for item in batch_sources
                             ],
@@ -3518,6 +4230,14 @@ class ProductionWorkflowOrchestrator:
                         item.source,
                         status="succeeded",
                         counts=_source_progress_counts(filtered_output, item.source.local_id),
+                    )
+                    await persist_source_extraction_checkpoint(
+                        pending[item.source.local_id],
+                        filtered_output,
+                        source_result.raw_block,
+                        model_run_id=execution.run.id,
+                        batched=True,
+                        access_mode="live_url",
                     )
                     await self._persist_extraction_progress(run.id, progress)
                     self._diagnostics.record(
@@ -4636,12 +5356,14 @@ def _q2_checkpoint_key(
     batch_parser_version: str | None,
     provider: ModelProvider,
     requested_model: str,
+    source_content_sha256: str | None = None,
 ) -> str:
     """Return the identity of a reusable successful Q2 source response.
 
-    The identity is deliberately cross-run: the same canonical URL extracted
-    with the same profile, contract and prompt versions yields the same
-    result. Freshness is bounded at lookup time, not in the key. A batch
+    The identity is deliberately cross-run: the same canonical URL and
+    archived content capture extracted with the same profile, contract and
+    prompt versions yields the same result. Freshness is bounded at lookup
+    time, not in the key. A batch
     response carries one key for every source it was asked to process; the
     parser decides which of those source results actually succeeded.
     """
@@ -4658,6 +5380,7 @@ def _q2_checkpoint_key(
         "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
         "provider": provider.value,
         "requested_model": requested_model,
+        "source_content_sha256": source_content_sha256,
     }
     return hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()

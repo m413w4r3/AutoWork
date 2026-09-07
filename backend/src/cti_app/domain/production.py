@@ -51,6 +51,42 @@ class ProductionRepairImpactKind(StrEnum):
     SOURCE_CORPUS = "source_corpus"
 
 
+class Q2ReuseStatus(StrEnum):
+    """Whether one source-level Q2 checkpoint can be consumed."""
+
+    HIT = "hit"
+    MISS = "miss"
+
+
+class Q2ReuseReason(StrEnum):
+    """Stable explanation for a source-level Q2 reuse decision."""
+
+    REUSABLE_CHECKPOINT = "reusable_checkpoint"
+    NO_CHECKPOINT = "no_checkpoint"
+    SOURCE_CONTENT_CHANGED = "source_content_changed"
+    PROMPT_VERSION_CHANGED = "prompt_version_changed"
+    MODEL_POLICY_CHANGED = "model_policy_changed"
+    ROUTING_POLICY_CHANGED = "routing_policy_changed"
+    EXTRACTION_PROFILE_CHANGED = "extraction_profile_changed"
+    PARSER_CONTRACT_CHANGED = "parser_contract_changed"
+    EVIDENCE_GATE_VERSION_CHANGED = "evidence_gate_version_changed"
+    ARCHIVED_OUTPUT_MISSING = "archived_output_missing"
+    CHECKPOINT_CORRUPT = "checkpoint_corrupt"
+    ACCESS_MODE_INCOMPATIBLE = "access_mode_incompatible"
+
+
+@dataclass(frozen=True, slots=True)
+class Q2ReuseDecision:
+    """Auditable decision made immediately before a Q2 source call."""
+
+    status: Q2ReuseStatus
+    reason: Q2ReuseReason
+    source_url: str
+    current_source_sha256: str | None = None
+    previous_source_sha256: str | None = None
+    candidate_model_run_id: UUID | None = None
+
+
 class ProductionDerivedOutput(StrEnum):
     """Derived products which may be invalidated by a production repair."""
 
@@ -72,6 +108,9 @@ class RepairExecutionPlan:
     provider_steps: tuple[str, ...]
     deterministic_steps: tuple[str, ...]
     ready_to_apply: bool
+    expected_q2_calls: int = 0
+    expected_q2_reuses: int = 0
+    reuse_unknown_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +124,9 @@ class ProductionRepairImpact:
     provider_steps: tuple[str, ...] = ()
     deterministic_steps: tuple[str, ...] = ()
     ready_to_apply: bool = True
+    expected_q2_calls: int = 0
+    expected_q2_reuses: int = 0
+    reuse_unknown_count: int = 0
 
     @property
     def execution_plan(self) -> RepairExecutionPlan:
@@ -95,6 +137,9 @@ class ProductionRepairImpact:
             provider_steps=self.provider_steps,
             deterministic_steps=self.deterministic_steps,
             ready_to_apply=self.ready_to_apply,
+            expected_q2_calls=self.expected_q2_calls,
+            expected_q2_reuses=self.expected_q2_reuses,
+            reuse_unknown_count=self.reuse_unknown_count,
         )
 
 

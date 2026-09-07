@@ -560,6 +560,9 @@ def _impact_from_execution_plan(plan: RepairExecutionPlan) -> ProductionRepairIm
         provider_steps=plan.provider_steps,
         deterministic_steps=plan.deterministic_steps,
         ready_to_apply=plan.ready_to_apply,
+        expected_q2_calls=plan.expected_q2_calls,
+        expected_q2_reuses=plan.expected_q2_reuses,
+        reuse_unknown_count=plan.reuse_unknown_count,
     )
 
 

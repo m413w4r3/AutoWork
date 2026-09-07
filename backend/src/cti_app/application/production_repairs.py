@@ -7,7 +7,7 @@ import inspect
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any, cast
@@ -22,11 +22,14 @@ from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
 )
 from cti_app.application.production_artifact_verification import (
+    ARTIFACT_VERIFIER_VERSION,
     Q2ProposalSubmission,
     verify_q2_proposals,
 )
 from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
+    Q2_EXTRACTION_CONTRACT_VERSION,
+    Q2_MARKDOWN_PARSER_VERSION,
     DisplayPolicy,
     ExtractionItem,
     IndicatorProvenance,
@@ -43,6 +46,11 @@ from cti_app.application.production_parsers import (
     technical_extraction_from_json,
     technical_extraction_to_json,
 )
+from cti_app.application.production_prompts import (
+    EXTRACTION_PROMPT_VERSION_BY_PROFILE,
+    IOC_RULES_BATCH_PROMPT_VERSION,
+)
+from cti_app.application.production_q2_batch import Q2_BATCH_PARSER_VERSION
 from cti_app.application.production_repair_payloads import (
     ProductionRepairPayloadResolver,
     RepairPayloadOrigin,
@@ -68,6 +76,7 @@ from cti_app.domain.editions import EditionAuditEvent, EditionStatus
 from cti_app.domain.production import (
     DetectionRule,
     DetectionRuleType,
+    ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -1019,6 +1028,9 @@ class SupplementalSourceRepairIssue:
     effective_decision: ProductionRepairDecision | None = None
     recommended_action: str = "archive_manual_content"
     subject_id: UUID | None = None
+    expected_q2_calls: int = 0
+    expected_q2_reuses: int = 0
+    reuse_unknown_count: int = 0
 
 
 _NO_DELIVERABLE_OUTPUTS = frozenset[ProductionDerivedOutput]()
@@ -1114,6 +1126,9 @@ def _repair_impact(
     ready_to_apply: bool = True,
     provider_steps: tuple[str, ...] | None = None,
     deterministic_steps: tuple[str, ...] | None = None,
+    expected_q2_calls: int = 0,
+    expected_q2_reuses: int = 0,
+    reuse_unknown_count: int = 0,
 ) -> ProductionRepairImpact:
     return ProductionRepairImpact(
         kind=kind,
@@ -1125,6 +1140,9 @@ def _repair_impact(
             _REPAIR_PLAN_STEPS[kind] if deterministic_steps is None else deterministic_steps
         ),
         ready_to_apply=ready_to_apply,
+        expected_q2_calls=max(0, expected_q2_calls),
+        expected_q2_reuses=max(0, expected_q2_reuses),
+        reuse_unknown_count=max(0, reuse_unknown_count),
     )
 
 
@@ -1179,6 +1197,9 @@ def merge_repair_impacts(
         provider_steps=provider_steps,
         deterministic_steps=deterministic_steps,
         ready_to_apply=all(impact.ready_to_apply for impact in values),
+        expected_q2_calls=sum(impact.expected_q2_calls for impact in values),
+        expected_q2_reuses=sum(impact.expected_q2_reuses for impact in values),
+        reuse_unknown_count=sum(impact.reuse_unknown_count for impact in values),
     )
 
 
@@ -1220,6 +1241,15 @@ def _include_is_already_effective(
     return state is RepairDecisionApplicationState.ALREADY_EFFECTIVE
 
 
+def _q2_preview(issue: Any) -> dict[str, int]:
+    """Read the optional precomputed source-corpus cost preview."""
+    return {
+        "expected_q2_calls": int(getattr(issue, "expected_q2_calls", 0) or 0),
+        "expected_q2_reuses": int(getattr(issue, "expected_q2_reuses", 0) or 0),
+        "reuse_unknown_count": int(getattr(issue, "reuse_unknown_count", 0) or 0),
+    }
+
+
 def classify_repair_impact(
     issue: ProductionRepairIssueView | SupplementalSourceRepairIssue,
     decision: ProductionRepairDecision | None,
@@ -1238,6 +1268,7 @@ def classify_repair_impact(
     issue_kind = _repair_kind(getattr(issue, "kind", ""))
 
     if issue_kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED:
+        preview = _q2_preview(issue)
         repair_state = _projection_enum_value(getattr(issue, "repair_state", None))
         if repair_state == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES.value:
             return _repair_impact(
@@ -1248,6 +1279,9 @@ def classify_repair_impact(
                     "An archived Q1 source is absent from REFERENCES and can change the "
                     "source corpus."
                 ),
+                expected_q2_calls=preview["expected_q2_calls"],
+                expected_q2_reuses=preview["expected_q2_reuses"],
+                reuse_unknown_count=preview["reuse_unknown_count"],
             )
         if repair_state == SupplementalSourceRepairState.COLLECTION_MISSING.value:
             # There is nothing to reintegrate yet: the plan describes real
@@ -1258,6 +1292,9 @@ def classify_repair_impact(
                 model_call_required=True,
                 ready_to_apply=False,
                 reason="The supplemental source has no collection to archive yet.",
+                expected_q2_calls=preview["expected_q2_calls"],
+                expected_q2_reuses=preview["expected_q2_reuses"],
+                reuse_unknown_count=preview["reuse_unknown_count"],
             )
         if action == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value:
             return _repair_impact(
@@ -1273,6 +1310,9 @@ def classify_repair_impact(
                 model_call_required=True,
                 ready_to_apply=False,
                 reason="Archiving the supplemental source may change the source corpus.",
+                expected_q2_calls=preview["expected_q2_calls"],
+                expected_q2_reuses=preview["expected_q2_reuses"],
+                reuse_unknown_count=preview["reuse_unknown_count"],
             )
         return _repair_impact(
             ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
@@ -1575,12 +1615,35 @@ class ProductionRepairIssueService:
                     continue
                 collections = collections_by_subject.get(run.subject_id, ())
                 contexts.append((run, artifact, collections, _reference_source_index(artifact)))
+            q2_previews: dict[UUID, dict[str, int]] = {}
+            for run, _artifact, collections, source_index in contexts:
+                if source_index is None:
+                    continue
+                proposed_sources, canonical_urls = source_index
+                archived_urls = {
+                    str(collection.canonical_url)
+                    for collection in collections
+                    if _enum_value(getattr(collection, "state", None))
+                    in {"archived", "extracted", "completed"}
+                }
+                proposed_urls = {
+                    str(item.get("source_url"))
+                    for item in proposed_sources
+                    if isinstance(item, dict) and item.get("source_url")
+                }
+                q2_previews[run.id] = await _q2_reuse_preview(
+                    uow,
+                    run=run,
+                    source_urls=sorted((set(canonical_urls) | proposed_urls) & archived_urls),
+                    collections=collections,
+                )
             decisions = await _effective_decisions_for_reader(uow, edition_id, subject_id)
 
         decisions_by_key = {
             (decision.subject_id, decision.repair_key): decision for decision in decisions
         }
         issues: list[SupplementalSourceRepairIssue] = []
+        preview_assigned: set[UUID] = set()
         for run, artifact, collections, source_index in contexts:
             if source_index is not None:
                 proposed_sources, canonical_urls = source_index
@@ -1629,6 +1692,17 @@ class ProductionRepairIssueService:
                 )
                 decision = decisions_by_key.get((run.subject_id, repair_key))
                 repair_state, recommended_action = _supplemental_repair_state(collection, decision)
+                preview = (
+                    q2_previews.get(run.id, {})
+                    if (
+                        run.id not in preview_assigned
+                        and repair_state
+                        == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES
+                    )
+                    else {}
+                )
+                if preview:
+                    preview_assigned.add(run.id)
                 issues.append(
                     SupplementalSourceRepairIssue(
                         repair_key=repair_key,
@@ -1663,6 +1737,9 @@ class ProductionRepairIssueService:
                         effective_decision=decision,
                         recommended_action=recommended_action,
                         subject_id=run.subject_id,
+                        expected_q2_calls=int(preview.get("expected_q2_calls", 0)),
+                        expected_q2_reuses=int(preview.get("expected_q2_reuses", 0)),
+                        reuse_unknown_count=int(preview.get("reuse_unknown_count", 0)),
                     )
                 )
         return tuple(sorted(issues, key=lambda item: (item.source_url, item.source_id)))
@@ -4693,6 +4770,7 @@ class ProductionReferenceRepairResult:
     changed: bool
     restored_source_ids: tuple[str, ...] = ()
     restored_event_ids: tuple[str, ...] = ()
+    source_delta: dict[str, list[dict[str, str | None]]] = field(default_factory=dict)
 
     @property
     def references_artifact(self) -> ProductionArtifact:
@@ -4808,9 +4886,24 @@ class ProductionReferenceRepairService:
                 {item[0] for item in archived_projection},
                 previous_canonical_report=canonical,
             )
-            if reconciliation.report == canonical:
+            source_delta = await _source_delta(
+                uow,
+                previous_report=canonical,
+                current_report=reconciliation.report,
+                archived_projection=archived_projection,
+                base_artifact=base,
+            )
+            has_source_delta = any(
+                source_delta[key]
+                for key in ("added_sources", "removed_sources", "changed_content_sources")
+            )
+            if reconciliation.report == canonical and not has_source_delta:
                 await uow.commit()
-                return ProductionReferenceRepairResult(artifact=base, changed=False)
+                return ProductionReferenceRepairResult(
+                    artifact=base,
+                    changed=False,
+                    source_delta=source_delta,
+                )
 
             derived_input_hash = compute_input_hash(
                 {
@@ -4857,6 +4950,11 @@ class ProductionReferenceRepairService:
                         }
                         for source in reconciliation.report.sources
                     ],
+                    "source_hashes": {
+                        url: digest
+                        for url, digest in archived_projection
+                        if digest
+                    },
                 }
             artifact = ProductionArtifact(
                 production_run_id=run.id,
@@ -4884,6 +4982,20 @@ class ProductionReferenceRepairService:
                     "dropped_source_ids": list(reconciliation.dropped_source_ids),
                     "dropped_event_ids": list(reconciliation.dropped_event_ids),
                     "archived_sources": [list(item) for item in archived_projection],
+                    "source_delta": source_delta,
+                    "added_sources": [
+                        item["canonical_url"] for item in source_delta["added_sources"]
+                    ],
+                    "removed_sources": [
+                        item["canonical_url"] for item in source_delta["removed_sources"]
+                    ],
+                    "unchanged_sources": [
+                        item["canonical_url"] for item in source_delta["unchanged_sources"]
+                    ],
+                    "changed_content_sources": [
+                        item["canonical_url"]
+                        for item in source_delta["changed_content_sources"]
+                    ],
                     **(
                         {"repair_source_index": repair_source_index}
                         if repair_source_index is not None
@@ -4901,6 +5013,7 @@ class ProductionReferenceRepairService:
                 changed=True,
                 restored_source_ids=reconciliation.restored_source_ids,
                 restored_event_ids=reconciliation.restored_event_ids,
+                source_delta=source_delta,
             )
 
 
@@ -4936,6 +5049,170 @@ async def _archived_source_projection(uow: Any, subject_id: UUID) -> tuple[tuple
             digest = getattr(getattr(blob, "descriptor", None), "sha256", None)
         projection[canonical_url] = str(digest).casefold() if _is_sha256(digest) else ""
     return tuple(sorted(projection.items()))
+
+
+async def _source_delta(
+    uow: Any,
+    *,
+    previous_report: ReferenceReport,
+    current_report: ReferenceReport,
+    archived_projection: Sequence[tuple[str, str]],
+    base_artifact: ProductionArtifact,
+) -> dict[str, list[dict[str, str | None]]]:
+    """Compare REFERENCES sources by canonical URL and archived content hash."""
+    current_hashes = {url: digest or None for url, digest in archived_projection}
+    previous_hashes: dict[str, str | None] = {}
+    metadata = base_artifact.metadata if isinstance(base_artifact.metadata, dict) else {}
+    source_index = metadata.get("repair_source_index")
+    historical_hashes = (
+        source_index.get("source_hashes") if isinstance(source_index, dict) else None
+    )
+    if isinstance(historical_hashes, dict):
+        previous_hashes.update(
+            {
+                str(url): str(value).casefold()
+                for url, value in historical_hashes.items()
+                if isinstance(url, str) and isinstance(value, str) and _is_sha256(value)
+            }
+        )
+    archived_sources = metadata.get("archived_sources")
+    if isinstance(archived_sources, list):
+        for item in archived_sources:
+            if (
+                isinstance(item, list | tuple)
+                and len(item) == 2
+                and isinstance(item[0], str)
+                and isinstance(item[1], str)
+                and _is_sha256(item[1])
+            ):
+                previous_hashes.setdefault(item[0], item[1].casefold())
+
+    repository = getattr(uow, "source_extractions", None)
+    finder = getattr(repository, "list_for_url", None)
+    if callable(finder):
+        for source in previous_report.sources:
+            if source.canonical_url in previous_hashes:
+                continue
+            try:
+                rows = await finder(source.canonical_url)
+            except Exception:
+                rows = ()
+            if rows:
+                digest = getattr(rows[0], "source_content_sha256", None)
+                if isinstance(digest, str) and _is_sha256(digest):
+                    previous_hashes[source.canonical_url] = digest.casefold()
+
+    previous_urls = {source.canonical_url for source in previous_report.sources}
+    current_urls = {source.canonical_url for source in current_report.sources}
+    added = sorted(current_urls - previous_urls)
+    removed = sorted(previous_urls - current_urls)
+    unchanged: list[dict[str, str | None]] = []
+    changed: list[dict[str, str | None]] = []
+    for url in sorted(previous_urls & current_urls):
+        previous_sha = previous_hashes.get(url)
+        current_sha = current_hashes.get(url)
+        entry = {
+            "canonical_url": url,
+            "previous_source_sha256": previous_sha,
+            "current_source_sha256": current_sha,
+        }
+        if previous_sha is not None and current_sha == previous_sha:
+            unchanged.append(entry)
+        else:
+            changed.append(entry)
+
+    return {
+        "added_sources": [
+            {
+                "canonical_url": url,
+                "previous_source_sha256": None,
+                "current_source_sha256": current_hashes.get(url),
+            }
+            for url in added
+        ],
+        "removed_sources": [
+            {
+                "canonical_url": url,
+                "previous_source_sha256": previous_hashes.get(url),
+                "current_source_sha256": None,
+            }
+            for url in removed
+        ],
+        "unchanged_sources": unchanged,
+        "changed_content_sources": changed,
+    }
+
+
+async def _q2_reuse_preview(
+    uow: Any,
+    *,
+    run: Any,
+    source_urls: Sequence[str],
+    collections: Sequence[Any],
+) -> dict[str, int]:
+    """Estimate Q2 calls from durable source checkpoints before a rebuild."""
+    documents_repository = getattr(uow, "source_documents", None)
+    documents = (
+        await documents_repository.list_for_subject(run.subject_id)
+        if documents_repository is not None
+        and callable(getattr(documents_repository, "list_for_subject", None))
+        else ()
+    )
+    documents_by_id = {getattr(document, "id", None): document for document in documents}
+    hashes: dict[str, str] = {}
+    for collection in collections:
+        url = getattr(collection, "canonical_url", None)
+        document = documents_by_id.get(getattr(collection, "source_document_id", None))
+        digest = getattr(document, "decoded_sha256", None)
+        if isinstance(url, str) and isinstance(digest, str) and _is_sha256(digest):
+            hashes[url] = digest.casefold()
+
+    snapshots = getattr(uow, "production_input_snapshots", None)
+    snapshot = (
+        await snapshots.get_by_run(run.id)
+        if snapshots is not None and callable(getattr(snapshots, "get_by_run", None))
+        else None
+    )
+    core_urls = {
+        source.canonical_url for source in getattr(snapshot, "core_sources", ())
+    }
+    repository = getattr(uow, "source_extractions", None)
+    finder = getattr(repository, "list_for_url", None)
+    expected_reuses = 0
+    unknown = 0
+    for url in sorted(set(source_urls)):
+        digest = hashes.get(url)
+        if digest is None or not callable(finder):
+            unknown += 1
+            continue
+        profile = ExtractionProfile.FULL if url in core_urls else ExtractionProfile.IOC_RULES
+        rows = await finder(url)
+        reusable = any(
+            getattr(row, "source_content_sha256", None) == digest
+            and getattr(row, "profile", None) is profile
+            and _enum_value(getattr(row, "status", None)) == "verified"
+            and getattr(row, "canonical_blob_id", None) is not None
+            and getattr(row, "model_run_id", None) is not None
+            and getattr(row, "contract_version", None) == Q2_EXTRACTION_CONTRACT_VERSION
+            and getattr(row, "prompt_version", None)
+            in {
+                EXTRACTION_PROMPT_VERSION_BY_PROFILE[profile],
+                # Supporting-source checkpoints may have been produced by a
+                # deterministic IOC batch.
+                IOC_RULES_BATCH_PROMPT_VERSION,
+            }
+            and getattr(row, "parser_version", None)
+            in {Q2_MARKDOWN_PARSER_VERSION, Q2_BATCH_PARSER_VERSION}
+            and getattr(row, "verifier_version", None) == ARTIFACT_VERIFIER_VERSION
+        for row in rows
+        )
+        if reusable:
+            expected_reuses += 1
+    return {
+        "expected_q2_calls": max(0, len(set(source_urls)) - expected_reuses - unknown),
+        "expected_q2_reuses": expected_reuses,
+        "reuse_unknown_count": unknown,
+    }
 
 
 def _is_sha256(value: Any) -> bool:

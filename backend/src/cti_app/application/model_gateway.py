@@ -278,6 +278,14 @@ class ModelRunRepository(Protocol):
         self, checkpoint_key: str, *, not_before: datetime | None = None
     ) -> ModelRun | None: ...
 
+    async def find_legacy_q2_checkpoint(
+        self,
+        *,
+        source_url: str,
+        source_content_sha256: str,
+        not_before: datetime | None = None,
+    ) -> ModelRun | None: ...
+
     async def save(self, run: ModelRun) -> None: ...
 
 

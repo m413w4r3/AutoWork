@@ -14,6 +14,11 @@ export function RepairExecutionPlanView({
   compact?: boolean;
 }) {
   const noDeliverableChange = plan.impact_kind === "no_deliverable_change";
+  const expectedQ2Calls = plan.expected_q2_calls ?? 0;
+  const expectedQ2Reuses = plan.expected_q2_reuses ?? 0;
+  const reuseUnknownCount = plan.reuse_unknown_count ?? 0;
+  const sourcesToAnalyze =
+    expectedQ2Calls + expectedQ2Reuses + reuseUnknownCount;
   return (
     <section
       className={`repair-execution-plan${compact ? " repair-execution-plan--compact" : ""}`}
@@ -33,6 +38,19 @@ export function RepairExecutionPlanView({
       <p className="repair-execution-plan__cost" role="status">
         {repairPlanCostLabel(plan)}
       </p>
+      {plan.impact_kind === "source_corpus" ? (
+        <p>
+          {sourcesToAnalyze} source{sourcesToAnalyze === 1 ? "" : "s"} à
+          analyser, {expectedQ2Reuses} résultat
+          {expectedQ2Reuses === 1 ? "" : "s"} réutilisable
+          {expectedQ2Reuses === 1 ? "" : "s"}, {expectedQ2Calls} extraction
+          {expectedQ2Calls === 1 ? "" : "s"} Q2 attendue
+          {reuseUnknownCount > 0
+            ? `, ${reuseUnknownCount} réutilisation${reuseUnknownCount === 1 ? "" : "s"} à confirmer`
+            : ""}
+          .
+        </p>
+      ) : null}
       {noDeliverableChange && plan.ready_to_apply ? (
         <p role="status">Décision appliquée — aucun contenu à reconstruire.</p>
       ) : null}

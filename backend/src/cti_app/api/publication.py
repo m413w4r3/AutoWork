@@ -219,6 +219,9 @@ class RepairExecutionPlan(BaseModel):
     provider_steps: list[str]
     deterministic_steps: list[str]
     ready_to_apply: bool
+    expected_q2_calls: int = 0
+    expected_q2_reuses: int = 0
+    reuse_unknown_count: int = 0
 
 
 class EditionRepairItemView(BaseModel):
@@ -1489,6 +1492,9 @@ def _repair_execution_plan_view(plan: DomainRepairExecutionPlan) -> RepairExecut
         provider_steps=list(plan.provider_steps),
         deterministic_steps=list(plan.deterministic_steps),
         ready_to_apply=plan.ready_to_apply,
+        expected_q2_calls=plan.expected_q2_calls,
+        expected_q2_reuses=plan.expected_q2_reuses,
+        reuse_unknown_count=plan.reuse_unknown_count,
     )
 
 

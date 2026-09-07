@@ -678,6 +678,16 @@ class SqlAlchemySourceExtractionRepository:
         )
         return _source_extraction_from_row(row) if row else None
 
+    async def list_for_url(self, canonical_url: str) -> Sequence[SourceExtraction]:
+        rows = (
+            await self._session.scalars(
+                select(SourceExtractionRow)
+                .where(SourceExtractionRow.canonical_url == canonical_url)
+                .order_by(SourceExtractionRow.created_at.desc(), SourceExtractionRow.id.desc())
+            )
+        ).all()
+        return tuple(_source_extraction_from_row(row) for row in rows)
+
     async def claim(self, extraction: SourceExtraction, *, force: bool = False) -> bool:
         values = _source_extraction_values(extraction)
         inserted_id = await self._session.scalar(

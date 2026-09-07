@@ -40,6 +40,9 @@ export interface RepairExecutionPlan {
   provider_steps: string[];
   deterministic_steps: string[];
   ready_to_apply: boolean;
+  expected_q2_calls?: number;
+  expected_q2_reuses?: number;
+  reuse_unknown_count?: number;
 }
 
 /**

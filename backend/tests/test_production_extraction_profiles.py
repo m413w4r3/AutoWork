@@ -274,6 +274,9 @@ class _CacheRepository:
         self.lookups += 1
         return self.rows.get(self._key(values))
 
+    async def list_for_url(self, canonical_url: str) -> tuple[SourceExtraction, ...]:
+        return tuple(row for row in self.rows.values() if row.canonical_url == canonical_url)
+
     async def claim(self, extraction: SourceExtraction, *, force: bool = False) -> bool:
         identity = {
             "source_content_sha256": extraction.source_content_sha256,
@@ -478,10 +481,13 @@ class _ExtractionSink:
 
 class _Diagnostics:
     def record(self, **values: object) -> None:
-        del values
+        self.events.append(values)
 
     def record_parse(self, **values: object) -> None:
         del values
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
 
 
 def _cached_orchestrator(
@@ -578,6 +584,54 @@ def _individual_setup(
     return orchestrator, run, state, sink
 
 
+def _multi_individual_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    urls: list[str],
+    gateway: _CacheGateway,
+) -> tuple[
+    production_workflow.ProductionWorkflowOrchestrator,
+    SubjectProductionRun,
+    _CacheState,
+]:
+    subject = uuid4()
+    blobs = _ArchivedBlobs()
+    documents: dict[UUID, SimpleNamespace] = {}
+    collections: dict[UUID, SimpleNamespace] = {}
+    for index, url in enumerate(urls, start=1):
+        document = _archived_document(
+            subject_id=subject,
+            url=url,
+            content=f"ARCHIVED BODY S{index} c2.example.org".encode(),
+            blobs=blobs,
+        )
+        documents[document.id] = document
+        collections[uuid4()] = _collection_for(document, url)
+
+    state = _CacheState(documents, collections)
+    state._report_sources = [_source(url, date(2026, 7, 10)) for url in urls]
+    orchestrator = _cached_orchestrator(
+        state,
+        gateway,
+        _CacheStore(),
+        _ExtractionSink(),
+        monkeypatch,
+        blobs,
+    )
+    async def load_report(*args: object) -> ReferenceReport:
+        del args
+        return ReferenceReport(sources=tuple(state._report_sources), events=())
+
+    orchestrator._load_reference_report = load_report
+    run = SubjectProductionRun(
+        subject_id=subject,
+        edition_id=uuid4(),
+        current_stage=SubjectProductionStage.EXTRACTION,
+    )
+    state._runs[run.id] = run
+    return orchestrator, run, state
+
+
 @pytest.mark.asyncio
 async def test_individual_request_carries_the_exact_url_and_never_the_archive(
     monkeypatch: pytest.MonkeyPatch,
@@ -607,10 +661,10 @@ async def test_individual_request_carries_the_exact_url_and_never_the_archive(
     assert request.web_search is True
     assert request.routing_hint is production_workflow.ModelRoutingHint.WEB_RESEARCH
     assert "source_content_sha256" not in request.metadata
-    # A live reading is never looked up in, nor written to, the content-addressed
-    # SourceExtraction cache.
-    assert state.extractions.rows == {}
-    assert state.extractions.lookups == 0
+    # The validated live response is now a reusable source checkpoint. The
+    # archive remains local evidence only; its body never entered the prompt.
+    assert len(state.extractions.rows) == 1
+    assert state.extractions.lookups == 1
 
 
 @pytest.mark.asyncio
@@ -668,7 +722,7 @@ async def test_individual_ioc_rules_drops_facts_before_canonical_extraction(
 
 
 @pytest.mark.asyncio
-async def test_retry_of_the_same_run_reuses_the_model_run_and_a_new_run_reads_again(
+async def test_retry_and_new_run_reuse_the_unchanged_source_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     url = "https://example.test/idempotent"
@@ -701,7 +755,8 @@ async def test_retry_of_the_same_run_reuses_the_model_run_and_a_new_run_reads_ag
     assert len(model_uow.state) == 1
     assert retry["model_calls"] == 0
 
-    # A new production run is a new reading of a mutable web source.
+    # A new production run with the same archived capture reuses the same
+    # source checkpoint too; a changed decoded SHA is what authorizes a read.
     next_run = SubjectProductionRun(
         subject_id=run.subject_id,
         edition_id=uuid4(),
@@ -711,6 +766,192 @@ async def test_retry_of_the_same_run_reuses_the_model_run_and_a_new_run_reads_ag
     third = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)
 
     assert third["status"] == "success", third
-    assert len(adapter.calls) == 2
-    assert len(model_uow.state) == 2
-    assert state.extractions.rows == {}
+    assert len(adapter.calls) == 1
+    assert len(model_uow.state) == 1
+    assert len(state.extractions.rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_changed_source_hash_is_a_q2_miss_with_explainable_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://example.test/changed"
+    gateway = _CacheGateway()
+    orchestrator, run, state, _sink = _individual_setup(
+        monkeypatch,
+        url=url,
+        archived_text=b"ARCHIVED BODY c2.example.org v1",
+        gateway=gateway,
+    )
+    snapshot = _snapshot((_input_source(url, date(2026, 7, 10)),))
+    first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
+    assert first["status"] == "success", first
+
+    document = next(iter(state._docs_by_id.values()))
+    collection = next(iter(state._collections_by_id.values()))
+    blob_reader = orchestrator._blob_reader
+    assert isinstance(blob_reader, _ArchivedBlobs)
+    blob_id, digest = blob_reader.add(b"ARCHIVED BODY c2.example.org v2")
+    document.decoded_blob_id = blob_id
+    document.decoded_sha256 = digest
+    collection.decoded_blob_id = blob_id
+
+    next_run = SubjectProductionRun(
+        subject_id=run.subject_id,
+        edition_id=uuid4(),
+        current_stage=SubjectProductionStage.EXTRACTION,
+    )
+    state._runs[next_run.id] = next_run
+    second = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)
+
+    assert second["status"] == "success", second
+    assert len(gateway.calls) == 2
+    reuse = [
+        event
+        for event in orchestrator._diagnostics.events
+        if event.get("event") == "q2.source.reuse_evaluated"
+        and event.get("run_id") == next_run.id
+    ]
+    assert len(reuse) == 1
+    assert reuse[0]["status"] == "miss"
+    assert reuse[0]["reason"] == "source_content_changed"
+    started = [
+        event
+        for event in orchestrator._diagnostics.events
+        if event.get("event") == "q2.source.started"
+        and event.get("run_id") == next_run.id
+    ]
+    assert len(started) == 1
+
+
+@pytest.mark.asyncio
+async def test_five_source_rebuild_reuses_unchanged_q2_and_calls_once_for_s6(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urls = [f"https://example.test/s{index}" for index in range(1, 7)]
+    gateway = _CacheGateway()
+    orchestrator, run, state = _multi_individual_setup(
+        monkeypatch,
+        urls=urls[:5],
+        gateway=gateway,
+    )
+    snapshot = _snapshot(tuple(_input_source(url, date(2026, 7, 10)) for url in urls[:5]))
+
+    initial = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
+    assert initial["status"] == "success", initial
+    assert len(gateway.calls) == 5
+
+    # S6 is archived after the initial extraction. Its supporting-source
+    # profile still uses one individual call when it is the only uncached IOC
+    # source in the rebuild.
+    s6 = _archived_document(
+        subject_id=run.subject_id,
+        url=urls[5],
+        content=b"ARCHIVED BODY S6 c2.example.org",
+        blobs=orchestrator._blob_reader,
+    )
+    assert isinstance(orchestrator._blob_reader, _ArchivedBlobs)
+    state._docs_by_id[s6.id] = s6
+    state._collections_by_id[uuid4()] = _collection_for(s6, urls[5])
+    state._report_sources.append(_source(urls[5], date(2026, 7, 10)))
+
+    next_run = SubjectProductionRun(
+        subject_id=run.subject_id,
+        edition_id=uuid4(),
+        current_stage=SubjectProductionStage.EXTRACTION,
+    )
+    state._runs[next_run.id] = next_run
+    second = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)
+
+    assert second["status"] == "success", second
+    assert second["cache_hits"] == 5
+    assert second["model_calls"] == 1
+    assert len(gateway.calls) == 6
+
+    evaluated = [
+        event
+        for event in orchestrator._diagnostics.events
+        if event.get("event") == "q2.source.reuse_evaluated"
+        and event.get("run_id") == next_run.id
+    ]
+    # S6 is first checked against the IOC batch checkpoint and then against
+    # the individual checkpoint because it is the only remaining IOC source.
+    assert len(evaluated) == 7
+    assert sum(event["status"] == "hit" for event in evaluated) == 5
+    assert sum(event["status"] == "miss" for event in evaluated) == 2
+    started = [
+        event
+        for event in orchestrator._diagnostics.events
+        if event.get("event") == "q2.source.started"
+        and event.get("run_id") == next_run.id
+    ]
+    assert len(started) == 1
+    assert started[0]["source_url"] == urls[5]
+    assert not [
+        event
+        for event in orchestrator._diagnostics.events
+        if event.get("event") == "q4.started"
+        and event.get("run_id") == next_run.id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_changed_s3_plus_new_s6_only_call_two_q2_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urls = [f"https://example.test/s{index}" for index in range(1, 7)]
+    gateway = _CacheGateway()
+    orchestrator, run, state = _multi_individual_setup(
+        monkeypatch,
+        urls=urls[:5],
+        gateway=gateway,
+    )
+    snapshot = _snapshot(tuple(_input_source(url, date(2026, 7, 10)) for url in urls[:5]))
+    initial = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
+    assert initial["status"] == "success", initial
+    assert len(gateway.calls) == 5
+
+    document = next(
+        document
+        for document in state._docs_by_id.values()
+        if document.final_url == urls[2]
+    )
+    assert isinstance(orchestrator._blob_reader, _ArchivedBlobs)
+    blob_id, digest = orchestrator._blob_reader.add(b"ARCHIVED BODY S3 c2.example.org changed")
+    document.decoded_blob_id = blob_id
+    document.decoded_sha256 = digest
+    next_collection = next(
+        collection
+        for collection in state._collections_by_id.values()
+        if collection.canonical_url == urls[2]
+    )
+    next_collection.decoded_blob_id = blob_id
+
+    s6 = _archived_document(
+        subject_id=run.subject_id,
+        url=urls[5],
+        content=b"ARCHIVED BODY S6 c2.example.org",
+        blobs=orchestrator._blob_reader,
+    )
+    state._docs_by_id[s6.id] = s6
+    state._collections_by_id[uuid4()] = _collection_for(s6, urls[5])
+    state._report_sources.append(_source(urls[5], date(2026, 7, 10)))
+    next_run = SubjectProductionRun(
+        subject_id=run.subject_id,
+        edition_id=uuid4(),
+        current_stage=SubjectProductionStage.EXTRACTION,
+    )
+    state._runs[next_run.id] = next_run
+    second = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)
+
+    assert second["status"] == "success", second
+    assert second["cache_hits"] == 4
+    assert second["model_calls"] == 2
+    assert len(gateway.calls) == 7
+    started = [
+        event
+        for event in orchestrator._diagnostics.events
+        if event.get("event") == "q2.source.started"
+        and event.get("run_id") == next_run.id
+    ]
+    assert {event["source_url"] for event in started} == {urls[2], urls[5]}

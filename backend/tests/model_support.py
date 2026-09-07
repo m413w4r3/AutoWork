@@ -39,6 +39,36 @@ class InMemoryModelRunRepository:
             return None
         return deepcopy(max(matches, key=lambda run: (run.updated_at, str(run.id))))
 
+    async def find_legacy_q2_checkpoint(
+        self,
+        *,
+        source_url: str,
+        source_content_sha256: str,
+        not_before: datetime | None = None,
+    ) -> ModelRun | None:
+        matches = []
+        for run in self._state.values():
+            parameters = run.parameters
+            individual = (
+                parameters.get("source_url") == source_url
+                and parameters.get("source_content_sha256") == source_content_sha256
+            )
+            batch = any(
+                isinstance(item, dict)
+                and item.get("canonical_url") == source_url
+                and item.get("source_content_sha256") == source_content_sha256
+                for item in parameters.get("q2_batch_sources", [])
+            )
+            if (
+                run.status is ModelRunStatus.SUCCEEDED
+                and (individual or batch)
+                and (not_before is None or run.updated_at >= not_before)
+            ):
+                matches.append(run)
+        if not matches:
+            return None
+        return deepcopy(max(matches, key=lambda run: (run.updated_at, str(run.id))))
+
     async def save(self, run: ModelRun) -> None:
         if run.id not in self._state:
             raise LookupError(run.id)
