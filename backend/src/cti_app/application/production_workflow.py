@@ -736,12 +736,24 @@ def _mark_extraction_source_complete(
     )
 
 
+def _recount_skipped_sources(progress: dict[str, Any]) -> None:
+    """Derive the skip counter from the source entries, never incrementally.
+
+    Every writer of a `skipped` entry status goes through this, so a caller
+    that sets the status by another route cannot leave the aggregate behind.
+    """
+    progress["skipped_sources"] = sum(
+        item["status"] == "skipped" for item in cast(list[dict[str, Any]], progress["sources"])
+    )
+
+
 def _mark_extraction_source_failed(
     progress: dict[str, Any],
     source_id: str,
     status: str,
 ) -> None:
     _progress_source(progress, source_id)["status"] = status
+    _recount_skipped_sources(progress)
 
 
 def _mark_extraction_source_skipped(
@@ -755,9 +767,7 @@ def _mark_extraction_source_skipped(
     source_skips = progress.setdefault("source_skips", {})
     if isinstance(source_skips, dict) and source_id not in source_skips:
         source_skips[source_id] = details
-    progress["skipped_sources"] = sum(
-        item["status"] == "skipped" for item in cast(list[dict[str, Any]], progress["sources"])
-    )
+    _recount_skipped_sources(progress)
 
 
 @dataclass(frozen=True, slots=True)
@@ -4511,7 +4521,21 @@ class ProductionWorkflowOrchestrator:
                 None,
             )
             if primary_submission is None:
-                _mark_extraction_source_failed(progress, duplicate_id, "skipped")
+                # The duplicate carries the very same bytes as its primary, so
+                # it inherits the primary's disposition whole. When the primary
+                # was skipped, the duplicate is a skip too and must appear in
+                # the skip ledger the read models expose, not only as a status.
+                primary_skip = source_skips.get(primary_id)
+                if primary_skip is None:
+                    _mark_extraction_source_failed(progress, duplicate_id, "skipped")
+                    continue
+                inherited = dict(primary_skip)
+                inherited["source_url"] = pending[duplicate_id].source.canonical_url
+                inherited["duplicate_of_source_id"] = primary_id
+                source_skips[duplicate_id] = inherited
+                if duplicate_id not in skipped:
+                    skipped.append(duplicate_id)
+                _mark_extraction_source_skipped(progress, duplicate_id, inherited)
                 continue
             submissions.append(
                 Q2ProposalSubmission(
@@ -4970,6 +4994,38 @@ class ProductionWorkflowOrchestrator:
                 source_tiers_by_url=source_tiers_by_url,
                 semantic_projection_hash=semantic_synthesis_hash,
             )
+            if (
+                compatible is not None
+                and current_synthesis is not None
+                and compatible.id == current_synthesis.id
+                and current_synthesis.status is ProductionArtifactStatus.VERIFIED
+            ):
+                # Technical replay of an unchanged stage. A draft written in
+                # REVISE_PREVIOUS mode carries the revision identity, which the
+                # pre-revision probe hash above can never match, so the same-run
+                # cache check misses it. The run already holds this exact row as
+                # its current artifact: cloning it onto itself would make the
+                # replay append a row and report a reuse it did not perform.
+                current_metadata = (
+                    current_synthesis.metadata
+                    if isinstance(current_synthesis.metadata, dict)
+                    else {}
+                )
+                self._record_synthesis_mode(
+                    run=run,
+                    mode=SynthesisMode.REUSE_EXACT,
+                    previous_artifact_id=current_synthesis.id,
+                    previous_word_count=int(current_metadata.get("word_count", 0) or 0),
+                    context=None,
+                )
+                return {
+                    "stage": "synthesis",
+                    "status": "cached",
+                    "mode": SynthesisMode.REUSE_EXACT.value,
+                    "artifact_id": str(current_synthesis.id),
+                    "reused": False,
+                    "reused_from_artifact_id": None,
+                }
             if compatible is not None:
                 repair_marker = (
                     extraction.metadata.get("repair_materialization")

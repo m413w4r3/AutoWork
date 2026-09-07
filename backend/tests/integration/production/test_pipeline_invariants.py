@@ -36,6 +36,7 @@ from cti_app.application.production_jobs import (
     production_stage_idempotency_key,
     stage_job_kind,
 )
+from cti_app.application.production_q2_batch import MAX_Q2_BATCH_SOURCES
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.production_workflow import (
     _classify_q2_failure,
@@ -65,9 +66,42 @@ from .support import ProductionScenario
 pytestmark = pytest.mark.integration
 
 ScenarioFactory = Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario]
-_PRINCE_ARCHIVE = (
-    "domain,first_seen\nreserve-one.example,2026-08-13\nreserve-two.example,2026-08-13\n"
-)
+
+
+def _expected_q2_batches(ordered_urls: tuple[str, ...]) -> list[tuple[str, ...]]:
+    """Group IOC_RULES sources the way the planner bounds them.
+
+    The bound is a tuned product decision (see ``MAX_Q2_BATCH_SOURCES``), not
+    part of the invariant under test: what these tests pin is that every source
+    lands in exactly one call, in reference-report order.  Deriving the grouping
+    keeps that invariant intact when the bound is retuned.
+    """
+    return [
+        tuple(ordered_urls[start : start + MAX_Q2_BATCH_SOURCES])
+        for start in range(0, len(ordered_urls), MAX_Q2_BATCH_SOURCES)
+    ]
+
+
+def _prince_archive_csv() -> str:
+    """Build an archived annex a real publication would plausibly have.
+
+    ``production_archive_fallback_min_chars`` (1200 by default) is the guard
+    that stops the pipeline from paying for an archive-fallback model call on a
+    stub, an anti-bot notice or a JavaScript shell.  A three-line CSV is exactly
+    such a stub, so it silently skipped the very fallback this regression
+    exists to cover.  The filler rows carry no proposed indicator: the evidence
+    gate still only ever sees the two reserved domains.
+    """
+    rows = [
+        "domain,first_seen",
+        "reserve-one.example,2026-08-13",
+        "reserve-two.example,2026-08-13",
+    ]
+    rows.extend(f"annex-filler-{index:03d}.example,2026-08-13" for index in range(1, 40))
+    return "\n".join(rows) + "\n"
+
+
+_PRINCE_ARCHIVE = _prince_archive_csv()
 _PRINCE_FALLBACK = (
     "IOC confirmed domain\n"
     "- reserve-one.example :: Archived Prince of Persia annex.\n"
@@ -75,8 +109,38 @@ _PRINCE_FALLBACK = (
 )
 
 
-def _urls(source_count: int) -> tuple[str, ...]:
-    return tuple(f"https://invariants.test/source-{index}" for index in range(1, source_count + 1))
+def _urls(source_count: int, *, namespace: str = "source") -> tuple[str, ...]:
+    """Build the Q1 source URLs of one scenario.
+
+    Q2 checkpoint identity is deliberately cross-run: the same canonical URL
+    with the same archived bytes is never re-asked.  Two scenarios inside one
+    test share the database and the blob root, so they must use distinct URLs
+    whenever the test needs the second one to be a genuinely cold run.
+    """
+    return tuple(
+        f"https://invariants.test/{namespace}-{index}" for index in range(1, source_count + 1)
+    )
+
+
+def _source_body(index: int) -> str:
+    """Build an archived body a real report would plausibly have.
+
+    ``production_archive_fallback_min_chars`` (1200 by default) stops the
+    pipeline from paying for an archive-fallback model call on a stub, an
+    anti-bot notice or a JavaScript shell.  A one-line fixture is exactly such a
+    stub, so it silently skipped the archive fallback these tests exist to
+    cover.  The filler carries no indicator: the evidence gate still only ever
+    sees ``source-<index>.security-lab.io`` and ``ExampleRAT``.
+    """
+    head = f"ExampleRAT source {index} source-{index}.security-lab.io was archived."
+    filler = (
+        " The analysed campaign is attributed to the ExampleRAT operators, whose "
+        "tooling has been tracked across successive intrusion sets. The report "
+        "details the delivery chain, the loader stage and the persistence "
+        "mechanism observed on compromised hosts, together with the operator "
+        "tradecraft seen during hands-on-keyboard activity."
+    )
+    return head + filler * 4
 
 
 def _source_specs(
@@ -86,11 +150,7 @@ def _source_specs(
         url: {
             "status": 200,
             "mime": "text/plain",
-            "body": (
-                ""
-                if url in empty_urls
-                else f"ExampleRAT source {index} source-{index}.security-lab.io was archived."
-            ),
+            "body": "" if url in empty_urls else _source_body(index),
         }
         for index, url in enumerate(urls, start=1)
     }
@@ -143,8 +203,9 @@ def _configure(
     empty_urls: frozenset[str] = frozenset(),
     live_q2: Mapping[str, str | Exception] | None = None,
     fallback_q2: Mapping[str, str | Exception] | None = None,
+    url_namespace: str = "source",
 ) -> tuple[ProductionScenario, tuple[str, ...]]:
-    urls = _urls(source_count)
+    urls = _urls(source_count, namespace=url_namespace)
     scenario = factory(_source_specs(urls, empty_urls=empty_urls))
     scenario.edition.country = "Production Invariant Tests"
     if all_core:
@@ -500,16 +561,15 @@ async def test_archived_source_unavailable_live_does_not_block_publication(
     assert s14_document.decoded_sha256 == hashlib.sha256(archived_content).hexdigest()
 
     q2_calls = _q2_calls(scenario)
-    assert len(q2_calls) == 6  # two IOC_RULES batches, three FULL calls, one fallback
-    assert len(scenario.model.calls) == 8  # references + Q2 + synthesis
+    expected_batches = _expected_q2_batches((*urls[:9], urls[12], urls[13]))
+    # IOC_RULES batches, three FULL calls, one archive fallback for S14.
+    assert len(q2_calls) == len(expected_batches) + 4
+    assert len(scenario.model.calls) == len(q2_calls) + 2  # references + Q2 + synthesis
     assert [
         call.source_urls
         for call in q2_calls
         if call.request.prompt_template_id == "production-q2-ioc-batch"
-    ] == [
-        tuple(urls[:8]),
-        (urls[8], urls[12], urls[13]),
-    ]
+    ] == expected_batches
     assert [
         call.source_url
         for call in q2_calls
@@ -637,8 +697,9 @@ async def test_unavailable_source_without_archive_is_warning_not_pipeline_failur
     assert skip["archive_reason"] == "Archived source text is empty"
 
     q2_calls = _q2_calls(scenario)
-    assert len(q2_calls) == 5  # two IOC_RULES batches and three FULL calls
-    assert len(scenario.model.calls) == 7  # references + Q2 + synthesis
+    expected_batches = _expected_q2_batches((*urls[:9], urls[12], urls[13]))
+    assert len(q2_calls) == len(expected_batches) + 3  # IOC_RULES batches and three FULL calls
+    assert len(scenario.model.calls) == len(q2_calls) + 2  # references + Q2 + synthesis
     for url in urls[:-1]:
         assert len(_q2_calls_for_source(scenario, url)) == 1
     assert len(_q2_calls_for_source(scenario, urls[-1])) == 1
@@ -1178,12 +1239,16 @@ async def test_restart_reconstructs_the_same_business_decision_from_postgres_and
     production_scenario_factory: ScenarioFactory,
     migrated_postgres_url: str,
 ) -> None:
-    uninterrupted, _ = _configure(production_scenario_factory, 2)
+    # The two runs must be independent replicas of the same shape. They share
+    # the database and the blob root, and Q2 checkpoint identity is
+    # deliberately cross-run, so identical URLs would make the second run a
+    # cache hit of the first and compare a cold run against a warm one.
+    uninterrupted, _ = _configure(production_scenario_factory, 2, url_namespace="uninterrupted")
     await uninterrupted.start()
     uninterrupted_final = await uninterrupted.run_until_terminal()
     _, uninterrupted_artifacts, _, _ = await _state(uninterrupted)
 
-    restarted_before, urls = _configure(production_scenario_factory, 2)
+    restarted_before, urls = _configure(production_scenario_factory, 2, url_namespace="restarted")
     await restarted_before.start()
     assert await restarted_before.runner.run_next()
     assert await restarted_before.runner.run_next()

@@ -121,7 +121,11 @@ async def test_references_rebuild_reuses_five_q2_sources_and_calls_s6_once(
 
     collections = await scenario.collection_service.list_sources(scenario.subject.id)
     s6 = next(collection for collection in collections if collection.canonical_url == URLS[5])
-    assert s6.state is CollectionState.FAILED_TERMINAL
+    # A 404 is a non-retryable fetch outcome, not a definitive failure: the
+    # collection is UNAVAILABLE and the manual archive path below is exactly
+    # how an analyst recovers it. FAILED_TERMINAL is reserved for a payload the
+    # system refuses outright, such as an oversized download.
+    assert s6.state is CollectionState.UNAVAILABLE
     await scenario.collection_service.archive_manual_content(
         s6.id,
         content=(b"LOT 38 source 6 documents ExampleRAT and source-6.security-lab.io."),

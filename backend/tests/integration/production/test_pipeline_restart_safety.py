@@ -92,6 +92,27 @@ def _urls(source_count: int) -> tuple[str, ...]:
     )
 
 
+def _source_body(index: int) -> str:
+    """Build an archived body a real report would plausibly have.
+
+    ``production_archive_fallback_min_chars`` (1200 by default) stops the
+    pipeline from paying for an archive-fallback model call on a stub, an
+    anti-bot notice or a JavaScript shell.  A one-line fixture is exactly such a
+    stub, so it silently skipped the archive fallback these restart tests exist
+    to cover.  The filler carries no indicator: the evidence gate still only
+    ever sees ``source-<index>.security-lab.io`` and ``ExampleRAT``.
+    """
+    head = f"ExampleRAT source {index} source-{index}.security-lab.io was archived."
+    filler = (
+        " The analysed campaign is attributed to the ExampleRAT operators, whose "
+        "tooling has been tracked across successive intrusion sets. The report "
+        "details the delivery chain, the loader stage and the persistence "
+        "mechanism observed on compromised hosts, together with the operator "
+        "tradecraft seen during hands-on-keyboard activity."
+    )
+    return head + filler * 4
+
+
 def _source_specs(
     urls: tuple[str, ...],
     *,
@@ -101,10 +122,7 @@ def _source_specs(
         url: {
             "status": 200,
             "mime": "text/plain",
-            "body": (bodies or {}).get(
-                url,
-                f"ExampleRAT source {index} source-{index}.security-lab.io was archived.",
-            ),
+            "body": (bodies or {}).get(url, _source_body(index)),
         }
         for index, url in enumerate(urls, start=1)
     }

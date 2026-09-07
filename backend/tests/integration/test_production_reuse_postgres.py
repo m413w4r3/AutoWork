@@ -410,13 +410,18 @@ async def _seed_reusable_article(
     synthesis_pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
         report, extraction, {source.canonical_url: "core"}
     )
+    # Q4 identity follows the semantic evidence pack, not the Q2 stage hash:
+    # the orchestrator feeds the pack hash into every extraction slot so a
+    # non-semantic Q2 replay cannot manufacture a second synthesis call.
+    semantic_synthesis_hash = compute_input_hash(synthesis_pack)
     synthesis_hash = _synthesis_input_hash(
         subject_id=subject.id,
         references_hash=refs_hash,
         reference_report_hash=compute_input_hash(refs_payload),
-        extraction_hash=extraction_hash,
-        technical_extraction_hash=compute_input_hash(extraction_payload),
-        synthesis_evidence_pack_hash=compute_input_hash(synthesis_pack),
+        extraction_hash=semantic_synthesis_hash,
+        technical_extraction_hash=semantic_synthesis_hash,
+        synthesis_evidence_pack_hash=semantic_synthesis_hash,
+        current_synthesis_semantic_hash=semantic_synthesis_hash,
     )
 
     refs_raw_id, refs_blob_id, _ = await store.store_stage_payloads(
@@ -765,13 +770,18 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     synthesis_pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
         report, extraction, {source.canonical_url: "core"}
     )
+    # Q4 identity follows the semantic evidence pack, not the Q2 stage hash:
+    # the orchestrator feeds the pack hash into every extraction slot so a
+    # non-semantic Q2 replay cannot manufacture a second synthesis call.
+    semantic_synthesis_hash = compute_input_hash(synthesis_pack)
     synthesis_hash = _synthesis_input_hash(
         subject_id=subject.id,
         references_hash=refs_hash,
         reference_report_hash=compute_input_hash(refs_payload),
-        extraction_hash=extraction_hash,
-        technical_extraction_hash=compute_input_hash(extraction_payload),
-        synthesis_evidence_pack_hash=compute_input_hash(synthesis_pack),
+        extraction_hash=semantic_synthesis_hash,
+        technical_extraction_hash=semantic_synthesis_hash,
+        synthesis_evidence_pack_hash=semantic_synthesis_hash,
+        current_synthesis_semantic_hash=semantic_synthesis_hash,
     )
 
     refs_raw_id, refs_blob_id, _ = await store.store_stage_payloads(

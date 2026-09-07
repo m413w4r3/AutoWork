@@ -85,11 +85,15 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
         source_profile="test",
     )
     subject = Subject(external_id="SUBJ-ARTIFACT-VERSIONS", slug="artifact-versions", tlp=TLP.AMBER)
-    run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
 
     async with uow_factory() as uow:
-        assert await uow.editions.add_if_absent(edition)
+        # Editions are unique on (country_code, period_start, period_end) and
+        # the integration database is shared for the whole session, so
+        # add_if_absent may rebind `edition.id` to a row another module already
+        # owns. Nothing referencing the edition may be built before that.
+        await uow.editions.add_if_absent(edition)
         await uow.subjects.add(subject)
+        run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
         await uow.subject_production_runs.add(run)
         for stage in (ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION):
             await uow.production_artifacts.append(_artifact(run, stage, 1))
@@ -144,11 +148,13 @@ async def test_mark_stages_stale_updates_only_requested_non_stale_stages(
         source_profile="test",
     )
     subject = Subject(external_id="SUBJ-MARK-STAGES-STALE", slug="mark-stages-stale", tlp=TLP.AMBER)
-    run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
 
     async with uow_factory() as uow:
-        assert await uow.editions.add_if_absent(edition)
+        # See the note above: the edition identity is only settled once
+        # add_if_absent has returned.
+        await uow.editions.add_if_absent(edition)
         await uow.subjects.add(subject)
+        run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
         await uow.subject_production_runs.add(run)
         for stage in ProductionArtifactStage:
             await uow.production_artifacts.append(_artifact(run, stage, 1))
@@ -277,10 +283,6 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
     }
     extraction: dict[str, Any] = {"items": [], "uncertainties": []}
     synthesis = "Fait [S1]"
-    run = SubjectProductionRun(subject_id=source.id, edition_id=edition.id)
-    run.start_running()
-    run.current_stage = SubjectProductionStage.ASSEMBLY
-    run.mark_needs_review(code="seed", message="seed")
     ref_blob = await store.store_stage_payloads(canonical=refs)
     extraction_blob = await store.store_stage_payloads(canonical=extraction)
     synthesis_blob = await store.store_stage_payloads(rendered=synthesis)
@@ -290,9 +292,16 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
         (ProductionArtifactStage.SYNTHESIS, None, synthesis_blob[2]),
     )
     async with uow_factory() as uow:
+        # add_if_absent rebinds `edition.id` to the row an earlier test in this
+        # session-scoped database already created for the same period, so the
+        # run may only be built once that identity is settled.
         await uow.editions.add_if_absent(edition)
         await uow.subjects.add(source)
         await uow.subjects.add(target)
+        run = SubjectProductionRun(subject_id=source.id, edition_id=edition.id)
+        run.start_running()
+        run.current_stage = SubjectProductionStage.ASSEMBLY
+        run.mark_needs_review(code="seed", message="seed")
         await uow.subject_production_runs.add(run)
         for stage, canonical_blob_id, rendered_blob_id in artifacts:
             await uow.production_artifacts.append(

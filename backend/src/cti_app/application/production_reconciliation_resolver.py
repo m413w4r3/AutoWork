@@ -248,22 +248,64 @@ class ProductionReconciliationResolver:
         await prepare_batch_for_recovery(uow, run, reopen=True)
 
 
+def _bridge_id_in(source: dict[str, Any]) -> str | None:
+    # A real response id is canonical when the POST response reached us. A
+    # timeout may leave only bridge_request_id (`<uuid>:aN`). The bridge route
+    # accepts that exact idempotency key as a lookup alias; preserve the suffix
+    # instead of guessing a different provider identity.
+    for key in ("bridge_run_id", "bridge_response_id", "bridge_request_id"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:255]
+    return None
+
+
+def _bridge_id_for_model_run(value: object, model_run_id: UUID) -> str | None:
+    """Find the bridge identity recorded beside one exact ModelRun id.
+
+    Q2 records its reconciliation per source, under ``source_failures.<S#>``,
+    so the identity sits deeper than the run's own error details.  Anchoring on
+    the ModelRun the reconciliation names keeps a multi-source failure from
+    handing back another source's bridge identity.
+    """
+    if isinstance(value, list):
+        for child in value:
+            found = _bridge_id_for_model_run(child, model_run_id)
+            if found is not None:
+                return found
+        return None
+    if not isinstance(value, dict):
+        return None
+    if str(value.get("model_run_id")) == str(model_run_id):
+        found = _bridge_id_in(value)
+        nested = value.get("details")
+        if found is None and isinstance(nested, dict):
+            found = _bridge_id_in(nested)
+        if found is not None:
+            return found
+    for child in value.values():
+        found = _bridge_id_for_model_run(child, model_run_id)
+        if found is not None:
+            return found
+    return None
+
+
 def _bridge_run_id(run: SubjectProductionRun) -> str | None:
     details = run.error_details if isinstance(run.error_details, dict) else {}
     nested = details.get("details")
     sources = (details, nested) if isinstance(nested, dict) else (details,)
 
-    # A real response id is canonical when the POST response reached us. A
-    # timeout may leave only bridge_request_id (`<uuid>:aN`). The bridge route
-    # accepts that exact idempotency key as a lookup alias; preserve the suffix
-    # instead of guessing a different provider identity.
     for source in sources:
-        for key in ("bridge_run_id", "bridge_response_id", "bridge_request_id"):
-            value = source.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()[:255]
+        found = _bridge_id_in(source)
+        if found is not None:
+            return found
     reconciliation = run.reconciliation
-    if reconciliation is not None and reconciliation.bridge_response_id:
+    if reconciliation is None:
+        return None
+    anchored = _bridge_id_for_model_run(details, reconciliation.model_run_id)
+    if anchored is not None:
+        return anchored
+    if reconciliation.bridge_response_id:
         return reconciliation.bridge_response_id[:255]
     return None
 
