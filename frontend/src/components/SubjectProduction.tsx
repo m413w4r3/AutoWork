@@ -1,6 +1,7 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   getSubjectProduction,
+  resumeProduction,
   retryProductionStage,
   startSubjectProduction,
   shouldPollProduction,
@@ -41,6 +42,15 @@ const STAGE_LABELS: Record<string, string> = {
   extraction: "Extraction",
   synthesis: "Synthèse",
   assembly: "Assemblage",
+};
+
+// Resume plans name artifact stages, whose vocabulary differs from the
+// pipeline's on the last stage only: the assembly stage produces "publication".
+const STAGE_ARTIFACT_LABELS: Record<string, string> = {
+  references: "les références",
+  extraction: "l’extraction",
+  synthesis: "la synthèse",
+  publication: "l’assemblage",
 };
 
 const RETRY_STAGES = [
@@ -184,6 +194,11 @@ export function SubjectProduction({
     },
   });
 
+  const resumeMutation = useMutation({
+    mutationFn: () => resumeProduction(subjectId),
+    onSuccess: () => void refetch(),
+  });
+
   const startMutation = useMutation({
     mutationFn: () => startSubjectProduction(subjectId),
     onSuccess: () => void refetch(),
@@ -204,6 +219,10 @@ export function SubjectProduction({
   // standalone run here would create an article the batch never sees, so the
   // backend refuses it and the page must not offer it either.
   const batchOwned = Boolean(status?.batch_id);
+  // Cancellation stops the pipeline without deleting anything, so a cancelled
+  // run is continued from its first incomplete stage — inside its batch when
+  // it has one. Only the absence of a plan leaves a fresh start as the way out.
+  const resumePlan = status?.resume_plan ?? null;
 
   if (restartable) {
     return (
@@ -220,16 +239,45 @@ export function SubjectProduction({
           références et analyse chaque source technique ; AutoWork normalise et
           valide les artefacts avant la synthèse.
         </p>
+        {resumePlan ? (
+          <p className="production-counters">
+            Les artefacts déjà produits sont conservés. La reprise repart de
+            l’étape{" "}
+            <strong>
+              {STAGE_LABELS[resumePlan.resume_from_stage] ??
+                resumePlan.resume_from_stage}
+            </strong>
+            {resumePlan.reused_artifacts.length > 0
+              ? ` et réutilise ${resumePlan.reused_artifacts
+                  .map((stage) => STAGE_ARTIFACT_LABELS[stage] ?? stage)
+                  .join(", ")}`
+              : ""}
+            {` (${resumePlan.model_calls_expected} appel(s) modèle au plus).`}
+          </p>
+        ) : null}
         {startMutation.error ? (
           <p className="error-message" role="alert">
             {String(startMutation.error)}
           </p>
         ) : null}
-        {batchOwned ? (
+        {resumeMutation.error ? (
+          <p className="error-message" role="alert">
+            {String(resumeMutation.error)}
+          </p>
+        ) : null}
+        {resumePlan ? (
+          <button
+            className="button"
+            disabled={resumeMutation.isPending}
+            onClick={() => resumeMutation.mutate()}
+          >
+            {resumeMutation.isPending ? "Reprise…" : "Reprendre la production"}
+          </button>
+        ) : batchOwned ? (
           <p role="note">
             Cet article appartient à une production d’édition. Une nouvelle
-            production isolée ne réparerait pas l’article annulé du lot :
-            reprenez-le depuis la revue de l’édition.
+            production isolée ne réparerait pas l’article du lot : reprenez-le
+            depuis la revue de l’édition.
           </p>
         ) : (
           <button

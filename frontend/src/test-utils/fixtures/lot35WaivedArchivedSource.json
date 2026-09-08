@@ -137,6 +137,7 @@
         "pending_rebuild_count": 1,
         "can_retry": false,
         "retry_stage": null,
+        "can_resume": false,
         "requires_reconciliation": false,
         "reconciliation": null
       }

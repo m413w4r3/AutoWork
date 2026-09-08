@@ -100,6 +100,7 @@ from cti_app.application.production_repairs import (
     synthesis_projection_hash,
     synthesis_projection_payload,
 )
+from cti_app.application.production_resume import EXTRACTION_PROGRESS_COMPLETED_STATUSES
 from cti_app.application.production_source_evidence import (
     SOURCE_EVIDENCE_VERSION,
     SourceEvidenceDocument,
@@ -129,6 +130,7 @@ from cti_app.application.production_synthesis_revision import (
 )
 from cti_app.config import get_settings
 from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceOriginKind
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
@@ -138,6 +140,7 @@ from cti_app.domain.model_conversations import (
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
 from cti_app.domain.production import (
+    ExtractionImpactPlan,
     ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
@@ -147,6 +150,8 @@ from cti_app.domain.production import (
     Q2ReuseDecision,
     Q2ReuseReason,
     Q2ReuseStatus,
+    Q2SourceDisposition,
+    Q2SourceImpact,
     SourceExtraction,
     SourceExtractionStatus,
     SubjectProductionRun,
@@ -533,33 +538,135 @@ def plan_q2_extraction_profiles(
     period_start: date | str | None = None,
     period_end: date | str | None = None,
 ) -> tuple[Q2SourcePlan, ...]:
-    """Assign FULL only to frozen core sources; all supporting sources use IOC_RULES."""
+    """Assign FULL only to PRIMARY discovery sources; everything else IOC_RULES.
+
+    The scope of a reading is an editorial property of the source, decided
+    once by discovery and carried on ``ProductionInputSource.role``. Only a
+    primary publication -- the one reporting first hand -- earns the expensive
+    narrative reading the synthesis quotes from.
+
+    Membership in ``core_sources`` is deliberately NOT the criterion: the
+    snapshot captures *every* discovered source, so testing membership made
+    every source FULL, silently disabled batching, and discarded the role
+    discovery had already computed.
+    """
 
     if snapshot is None:
         raise ValueError("q2_extraction_plan_missing_snapshot")
 
-    core_urls = {source.canonical_url for source in snapshot.core_sources}
+    roles_by_url = {source.canonical_url: source.role for source in snapshot.core_sources}
 
-    return tuple(
-        Q2SourcePlan(
-            source_id=source.local_id,
-            canonical_url=source.canonical_url,
-            profile=(
-                ExtractionProfile.FULL
-                if source.canonical_url in core_urls
-                else ExtractionProfile.IOC_RULES
-            ),
-            reason=("core_source" if source.canonical_url in core_urls else "supporting_source"),
+    def plan_for(canonical_url: str) -> tuple[ExtractionProfile, str]:
+        role = roles_by_url.get(canonical_url)
+        if role is None:
+            # Not in the frozen snapshot at all: a supplemental source the Q1
+            # report introduced. It has no editorial role, so it stays light.
+            return ExtractionProfile.IOC_RULES, "supporting_source"
+        if role is SourceRole.PRIMARY:
+            return ExtractionProfile.FULL, "primary_source"
+        return ExtractionProfile.IOC_RULES, f"non_primary_source:{role.value}"
+
+    plans: list[Q2SourcePlan] = []
+    for source in report.sources:
+        profile, reason = plan_for(source.canonical_url)
+        plans.append(
+            Q2SourcePlan(
+                source_id=source.local_id,
+                canonical_url=source.canonical_url,
+                profile=profile,
+                reason=reason,
+            )
         )
-        for source in report.sources
-    )
+    return tuple(plans)
 
 
 # A descriptive alias keeps the policy easy to discover from callers/tests.
 select_q2_extraction_profiles = plan_q2_extraction_profiles
 
 
-_EXTRACTION_PROGRESS_COMPLETED_STATUSES = {"cached", "succeeded"}
+# Shared with the resume planner, which reads these entries back to decide how
+# many sources a resumed extraction still owes a model call.
+_EXTRACTION_PROGRESS_COMPLETED_STATUSES = EXTRACTION_PROGRESS_COMPLETED_STATUSES
+
+
+def _extraction_reason(
+    decision: Q2ReuseDecision | None,
+    fallback: Q2ReuseReason,
+) -> str:
+    """The reuse probe's own verdict, or the default when it never ran."""
+    return (decision.reason if decision is not None else fallback).value
+
+
+def _build_extraction_impact_plan(
+    *,
+    report: ReferenceReport,
+    plans_by_url: dict[str, Q2SourcePlan],
+    duplicate_source_ids: dict[str, str],
+    individual_source_ids: set[str],
+    batched_source_ids: dict[str, int],
+    batches: tuple[tuple[str, ...], ...],
+    reuse_decisions: dict[str, Q2ReuseDecision],
+) -> ExtractionImpactPlan:
+    """Assemble the planner's decisions into the single auditable plan.
+
+    Every source in the Q1 report appears exactly once, and every disposition
+    carries the reuse probe's own verdict as its justification -- a hit names
+    the checkpoint that was accepted, a miss names why one could not be.
+    """
+    impacts: list[Q2SourceImpact] = []
+    for source in report.sources:
+        source_id = source.local_id
+        profile = plans_by_url[source.canonical_url].profile
+        decision = reuse_decisions.get(source_id)
+        primary = duplicate_source_ids.get(source_id)
+        if primary is not None:
+            disposition = Q2SourceDisposition.CONTENT_DUPLICATE
+            reason = "same_content_as_primary_source"
+        elif source_id in batched_source_ids:
+            disposition = Q2SourceDisposition.EXTRACT_BATCHED
+            reason = _extraction_reason(decision, Q2ReuseReason.NO_CHECKPOINT)
+        elif source_id in individual_source_ids:
+            disposition = Q2SourceDisposition.EXTRACT_INDIVIDUAL
+            reason = _extraction_reason(decision, Q2ReuseReason.NO_CHECKPOINT)
+        else:
+            disposition = Q2SourceDisposition.REUSED
+            reason = _extraction_reason(decision, Q2ReuseReason.REUSABLE_CHECKPOINT)
+        impacts.append(
+            Q2SourceImpact(
+                source_id=source_id,
+                canonical_url=source.canonical_url,
+                disposition=disposition,
+                profile=profile,
+                reason=reason,
+                primary_source_id=primary,
+                batch_index=batched_source_ids.get(source_id),
+            )
+        )
+    return ExtractionImpactPlan(sources=tuple(impacts), batches=batches)
+
+
+def _apply_impact_plan_to_progress(
+    progress: dict[str, Any],
+    plan: ExtractionImpactPlan,
+) -> None:
+    """Publish the planner's verdict on the progress the desk reads.
+
+    The desk showed a cost ("Résultats existants : 0") without its cause, so an
+    analyst could not tell a legitimate first extraction from a lost
+    checkpoint. Every source now carries the reason the planner recorded.
+    """
+    by_source = {item.source_id: item for item in plan.sources}
+    for entry in progress.get("sources", ()):
+        impact = by_source.get(entry.get("source_id"))
+        if impact is None:
+            continue
+        entry["plan_disposition"] = impact.disposition.value
+        entry["plan_reason"] = impact.reason
+        if impact.primary_source_id is not None:
+            entry["plan_primary_source_id"] = impact.primary_source_id
+    progress["planned_model_calls"] = plan.estimated_model_calls
+    progress["planned_reuses"] = len(plan.reused)
+    progress["planned_duplicates"] = len(plan.content_duplicates)
 
 
 def _batch_candidate(source: ParsedSource) -> Q2BatchCandidate | None:
@@ -2196,6 +2303,10 @@ class ProductionWorkflowOrchestrator:
         individual_source_ids: set[str] = set()
         batch_candidates: list[Q2BatchCandidate] = []
         pending: dict[str, _Q2SourceWork] = {}
+        # The last reuse decision taken for each source. It is the
+        # justification the impact plan publishes: on a hit, why the checkpoint
+        # was accepted; on a miss, the business event that owes the call.
+        reuse_decisions: dict[str, Q2ReuseDecision] = {}
 
         requested_model = "unknown"
         router = getattr(model_gateway, "_router", None)
@@ -2716,6 +2827,7 @@ class ProductionWorkflowOrchestrator:
             async def evaluate(
                 decision: Q2ReuseDecision,
             ) -> None:
+                reuse_decisions[work.source.local_id] = decision
                 self._diagnostics.record(
                     event="q2.source.reuse_evaluated",
                     run_id=run.id,
@@ -3422,32 +3534,9 @@ class ProductionWorkflowOrchestrator:
             # The fallback is a distinct Q2 access mode. Evaluate its own
             # checkpoint immediately before the fallback provider call; a
             # live miss must never silently authorize a second model call.
-            if work.source_content_sha256 is not None:
-                reusable = await load_reusable_source(
-                    work,
-                    batched=False,
-                    access_mode="archive_fallback",
-                )
-                if reusable is not None:
-                    await record_reused_source(
-                        work,
-                        reusable,
-                        access_mode="archive_fallback",
-                        source_text=archived_text,
-                        live_failure_code=live_failure_code,
-                    )
-                    return None
-
-            archive_model_run_id = _q2_archive_fallback_model_run_id(
-                production_run_id=run.id,
-                pipeline_generation=run.pipeline_generation,
-                source_id=source.local_id,
-                canonical_url=source.canonical_url,
-                source_content_sha256=work.source_content_sha256 or "",
-                profile=plan.profile,
-                provider=ModelProvider.OPENAI,
-                requested_model=requested_model,
-            )
+            # Probed exactly once: a second identical probe would repeat the
+            # lookup and emit a duplicate `q2.source.reuse_evaluated` miss,
+            # double-counting the same decision in the reuse ledger.
             reusable = await load_reusable_source(
                 work,
                 batched=False,
@@ -3462,6 +3551,17 @@ class ProductionWorkflowOrchestrator:
                     live_failure_code=live_failure_code,
                 )
                 return None
+
+            archive_model_run_id = _q2_archive_fallback_model_run_id(
+                production_run_id=run.id,
+                pipeline_generation=run.pipeline_generation,
+                source_id=source.local_id,
+                canonical_url=source.canonical_url,
+                source_content_sha256=work.source_content_sha256 or "",
+                profile=plan.profile,
+                provider=ModelProvider.OPENAI,
+                requested_model=requested_model,
+            )
 
             prompt = ProductionPromptTemplates.get_archived_extraction_prompt(
                 subject_title,
@@ -4461,27 +4561,34 @@ class ProductionWorkflowOrchestrator:
                 else:
                     individual_source_ids.add(source.local_id)
 
-        for candidate_group in partition_q2_batch_candidates(batch_candidates):
-            remaining: list[Q2BatchCandidate] = []
-            for candidate in candidate_group:
-                work = pending[candidate.source.local_id]
-                reusable = await load_reusable_source(work, batched=True)
-                if reusable is None:
-                    # An earlier individual IOC_RULES response is also a valid
-                    # source checkpoint; it is parsed without batch framing.
-                    reusable = await load_reusable_source(work, batched=False)
-                if reusable is not None:
-                    await record_reused_source(work, reusable)
-                else:
-                    remaining.append(candidate)
+        # Every batch candidate's checkpoint is probed BEFORE the candidates are
+        # partitioned. Reuse is a per-source decision -- it does not depend on
+        # which batch a source lands in -- so partitioning first only fragments
+        # the residual work: with MAX_Q2_BATCH_SOURCES sources per group, two
+        # groups each left with a single unreusable source become two
+        # individual calls where one shared batch would do. Filtering first
+        # keeps the residue contiguous and bills the minimum number of calls.
+        unreusable: list[Q2BatchCandidate] = []
+        for candidate in batch_candidates:
+            work = pending[candidate.source.local_id]
+            reusable = await load_reusable_source(work, batched=True)
+            if reusable is None:
+                # An earlier individual IOC_RULES response is also a valid
+                # source checkpoint; it is parsed without batch framing.
+                reusable = await load_reusable_source(work, batched=False)
+            if reusable is not None:
+                await record_reused_source(work, reusable)
+            else:
+                unreusable.append(candidate)
 
-            if len(remaining) == 1:
-                # A one-source retry is always the individual IOC_RULES path.
-                individual_source_ids.add(remaining[0].source.local_id)
+        batched_source_ids: dict[str, int] = {}
+        planned_batches: list[tuple[str, ...]] = []
+        for candidate_group in partition_q2_batch_candidates(unreusable):
+            if len(candidate_group) < 2:
+                # A one-source residue is always the individual IOC_RULES path.
+                individual_source_ids.update(item.source.local_id for item in candidate_group)
                 continue
-            if len(remaining) < 2:
-                continue
-            local_batch = make_q2_batch(remaining)
+            local_batch = make_q2_batch(candidate_group)
             batch_run_id = _q2_batch_model_run_id(
                 production_run_id=run.id,
                 pipeline_generation=run.pipeline_generation,
@@ -4491,6 +4598,32 @@ class ProductionWorkflowOrchestrator:
                 local_batch.sources,
                 batch_run_id,
             )
+            batch_index = len(planned_batches)
+            planned_batches.append(tuple(item.source.local_id for item in local_batch.sources))
+            for item in local_batch.sources:
+                batched_source_ids[item.source.local_id] = batch_index
+
+        impact_plan = _build_extraction_impact_plan(
+            report=report,
+            plans_by_url=plans_by_url,
+            duplicate_source_ids=duplicate_source_ids,
+            individual_source_ids=individual_source_ids,
+            batched_source_ids=batched_source_ids,
+            batches=tuple(planned_batches),
+            reuse_decisions=reuse_decisions,
+        )
+        _apply_impact_plan_to_progress(progress, impact_plan)
+        await self._persist_extraction_progress(run.id, progress)
+        # The complete cost decision is readable before the first provider call.
+        self._diagnostics.record(
+            event="q2.extraction.plan",
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage="extraction",
+            correlation_id=self._correlation_id,
+            pipeline_generation=run.pipeline_generation,
+            **impact_plan.as_event_payload(),
+        )
 
         handled_source_ids = set(completed)
         for source in report.sources:

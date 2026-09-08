@@ -58,6 +58,11 @@ from cti_app.application.production_repairs import (
     ProductionRepairStatusError,
     ProductionRepairValueNotVerifiableError,
 )
+from cti_app.application.production_resume import (
+    STAGE_ARTIFACT,
+    plan_production_resume,
+)
+from cti_app.application.production_review_recovery import ReviewRecoveryConflictError
 from cti_app.application.production_stage_status import (
     build_stage_statuses,
     completed_stage_count,
@@ -204,6 +209,15 @@ class ExtractionRejections(BaseModel):
     q2_source_evidence_rejections: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class ProductionResumePlanView(BaseModel):
+    """What resuming a cancelled run would reuse, run, and cost."""
+
+    previous_status: str
+    resume_from_stage: SubjectProductionStage
+    reused_artifacts: list[str]
+    model_calls_expected: int
+
+
 class ProductionStatus(BaseModel):
     subject_id: str
     edition_id: str
@@ -229,6 +243,9 @@ class ProductionStatus(BaseModel):
     # Set when this run belongs to an edition production batch: such a run is
     # only ever resumed through the batch, never restarted standalone.
     batch_id: str | None = None
+    # Present exactly when the run is cancelled: cancellation destroys nothing,
+    # so the UI offers a resume rather than a fresh production.
+    resume_plan: ProductionResumePlanView | None = None
     # Parser recoveries worth showing to an analyst, never blocking.
     warnings: list[str] = []
     stages: dict[str, StageStatus]
@@ -978,6 +995,106 @@ async def _cancel_non_terminal_run_jobs(
                     pass
 
 
+async def _resume_plan_view(
+    uow: Any,
+    run: SubjectProductionRun,
+    *,
+    archived_sources: int,
+) -> ProductionResumePlanView:
+    """Preview the resume of a cancelled run, without changing anything."""
+    current: dict[str, Any] = {}
+    for artifact_stage in STAGE_ARTIFACT.values():
+        if artifact_stage is None:
+            continue
+        current[artifact_stage.value] = await uow.production_artifacts.get_current(
+            run.id, artifact_stage.value
+        )
+    plan = plan_production_resume(
+        run,
+        artifacts=current,
+        archived_source_count=archived_sources,
+    )
+    return ProductionResumePlanView(
+        previous_status=plan.previous_status.value,
+        resume_from_stage=plan.resume_from_stage,
+        reused_artifacts=list(plan.reused_artifacts),
+        model_calls_expected=plan.model_calls_expected,
+    )
+
+
+async def _resume_production_run(
+    request: Request,
+    run_id: UUID,
+    actor_id: str,
+) -> dict[str, Any]:
+    """Continue a cancelled run at its first incomplete stage."""
+    uow_factory, jobs, dispatcher = _runtime(request)
+
+    service = SubjectProductionService(uow_factory)
+    try:
+        resumed = await service.resume_cancelled_run(run_id)
+    except ProductionRunNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No production run found for run {run_id}",
+        ) from exc
+    except ReviewRecoveryConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": f"production_{exc.reason}"},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": str(exc)},
+        ) from exc
+
+    run = resumed.run
+    plan = resumed.plan
+    stage = plan.resume_from_stage
+    parameters = ProductionStageParameters(
+        run_id=run.id,
+        expected_stage=stage.value,
+        pipeline_generation=run.pipeline_generation,
+    )
+    job = await jobs.submit(
+        kind=stage_job_kind(stage),
+        aggregate_type="subject",
+        aggregate_id=run.subject_id,
+        idempotency_key=production_stage_idempotency_key(run, stage),
+        correlation_id=get_correlation_id(),
+        input_parameters=parameters.model_dump(mode="json"),
+        max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
+        actor_id=actor_id,
+    )
+    await dispatcher.dispatch(
+        job.id,
+        delay_ms=_production_pacing(request).model_delay_ms(stage),
+    )
+    diagnostics = getattr(request.app.state, "production_diagnostics", None)
+    if diagnostics is not None:
+        diagnostics.record(
+            event="production.resume.plan",
+            run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage.value,
+            correlation_id=get_correlation_id(),
+            old_generation=resumed.old_generation,
+            new_generation=run.pipeline_generation,
+            batch_id=str(resumed.batch_id) if resumed.batch_id else None,
+            job_id=str(job.id),
+            actor_id=actor_id,
+            **plan.as_log_fields(),
+        )
+
+    view = _run_view(run, run.edition_id, job_id=job.id)
+    view["action"] = "production_resume_requested"
+    view["resume_plan"] = plan.as_log_fields()
+    view["old_generation"] = resumed.old_generation
+    view["pipeline_generation"] = run.pipeline_generation
+    return view
+
+
 async def _cancel_production_run(
     request: Request,
     run_id: UUID,
@@ -1234,6 +1351,11 @@ async def get_subject_production(
             research_date=snapshot.research_date,
         )
         completed_stages = completed_stage_count(stages)
+        resume_plan = (
+            await _resume_plan_view(uow, run, archived_sources=archived_sources)
+            if run.status is SubjectProductionStatus.CANCELLED
+            else None
+        )
 
         return ProductionStatus(
             subject_id=str(run.subject_id),
@@ -1277,6 +1399,7 @@ async def get_subject_production(
                 )
             ),
             batch_id=str(batch_item.batch_id) if batch_item is not None else None,
+            resume_plan=resume_plan,
             warnings=_collect_warnings(artifacts),
             stages={name: StageStatus(**stage) for name, stage in stages.items()},
         )
@@ -1914,6 +2037,34 @@ async def retry_production_run(
     request: Request,
 ) -> dict[str, Any]:
     return await _retry_production_run(request, run_id, payload, await _actor_id(request))
+
+
+@router.post("/production/runs/{run_id}/resume")
+async def resume_production_run(
+    run_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    """Resume one cancelled run, reusing everything it already produced."""
+    return await _resume_production_run(request, run_id, await _actor_id(request))
+
+
+@router.post("/subjects/{subject_id}/production/resume")
+async def resume_production(
+    subject_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    uow_factory, _, _ = _runtime(request)
+
+    async with uow_factory() as uow:
+        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        if not run:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No production run found for subject {subject_id}",
+            )
+        current_run_id = run.id
+
+    return await _resume_production_run(request, current_run_id, await _actor_id(request))
 
 
 @router.post("/production/runs/{run_id}/cancel")

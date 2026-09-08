@@ -41,7 +41,13 @@ export interface ExtractionProgressSource {
   skip?: ExtractionProgressSourceSkip | null;
   access_mode?: "live_url" | "archive_fallback" | null;
   archive_fallback?: boolean;
+  plan_disposition?: Q2SourceDisposition | null;
+  plan_reason?: string | null;
+  plan_primary_source_id?: string | null;
 }
+
+export type Q2SourceDisposition =
+  "reused" | "content_duplicate" | "extract_individual" | "extract_batched";
 
 export interface ExtractionProgress {
   total_sources: number;
@@ -66,6 +72,9 @@ export interface ExtractionProgress {
   skipped_sources?: number;
   skipped_source_ids?: string[];
   source_skips?: Record<string, ExtractionProgressSourceSkip>;
+  planned_model_calls?: number;
+  planned_reuses?: number;
+  planned_duplicates?: number;
 }
 
 export interface ExtractionRejection {
@@ -112,6 +121,15 @@ export interface StageStatus {
   archived_sources?: number;
 }
 
+export interface ProductionResumePlan {
+  previous_status: SubjectProductionStatus;
+  resume_from_stage: SubjectProductionStage;
+  /** Stages whose artifact the resume keeps instead of recomputing. */
+  reused_artifacts: string[];
+  /** Upper bound: a stage that runs may still hit a reusable checkpoint. */
+  model_calls_expected: number;
+}
+
 export interface ProductionStatus {
   subject_id: string;
   edition_id: string;
@@ -139,6 +157,11 @@ export interface ProductionStatus {
    * only ever resumed through its batch, never restarted as a standalone one.
    */
   batch_id?: string | null;
+  /**
+   * Present exactly when the run is cancelled. Cancellation deletes nothing,
+   * so the run can continue at its first stage without a live artifact.
+   */
+  resume_plan?: ProductionResumePlan | null;
   /** Parser recoveries worth showing, never blocking. */
   warnings: string[];
   stages: Record<string, StageStatus>;
@@ -442,6 +465,28 @@ export async function retryProductionStage(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ stage }),
   });
+}
+
+export async function resumeProduction(subjectId: string): Promise<{
+  run_id: string;
+  status: string;
+  job_id: string | null;
+  pipeline_generation: number;
+  resume_plan: ProductionResumePlan;
+}> {
+  return request(`/api/subjects/${subjectId}/production/resume`, {
+    method: "POST",
+  });
+}
+
+export async function resumeProductionRun(runId: string): Promise<{
+  run_id: string;
+  status: string;
+  job_id: string | null;
+  pipeline_generation: number;
+  resume_plan: ProductionResumePlan;
+}> {
+  return request(`/api/production/runs/${runId}/resume`, { method: "POST" });
 }
 
 export async function previewProductionReconciliationVisible(

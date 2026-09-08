@@ -151,6 +151,8 @@ class ReviewItemView(BaseModel):
     # each names exactly one operator action.
     can_retry: bool
     retry_stage: SubjectProductionStage | None
+    # A cancelled article is resumed instead: nothing it produced was deleted.
+    can_resume: bool = False
     requires_reconciliation: bool = False
     reconciliation: ProductionReconciliationView | None = None
 
@@ -1512,6 +1514,7 @@ def _review_view(review: EditionReview) -> EditionReviewView:
                 pending_rebuild_count=item.pending_rebuild_count,
                 can_retry=item.can_retry,
                 retry_stage=item.retry_stage,
+                can_resume=item.can_resume,
                 requires_reconciliation=item.requires_reconciliation,
                 reconciliation=reconciliation_view(
                     item.run_id,

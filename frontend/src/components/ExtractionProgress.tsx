@@ -1,8 +1,44 @@
 import type {
   ExtractionProgress,
   ExtractionProgressProfile,
+  ExtractionProgressSource,
   ExtractionProgressSourceStatus,
 } from "../api/production";
+
+// Why the planner decided to read a source, or to keep an existing result.
+// The desk used to show only the cost, so a legitimate first extraction was
+// indistinguishable from a checkpoint the pipeline failed to reuse.
+const PLAN_REASON_LABELS: Record<string, string> = {
+  reusable_checkpoint: "résultat existant réutilisé",
+  legacy_checkpoint_recovered: "résultat archivé récupéré",
+  same_content_as_primary_source: "contenu identique à une autre source",
+  // NE PAS lire « jamais extraite » : une extraction antérieure au registre
+  // par source n’a laissé aucune empreinte adressée par contenu, donc elle
+  // est invisible ici. Le fait certain est l’absence de résultat réutilisable.
+  no_checkpoint: "aucun résultat réutilisable",
+  source_content_changed: "contenu réarchivé différent",
+  prompt_version_changed: "version de prompt changée",
+  model_policy_changed: "politique modèle changée",
+  routing_policy_changed: "politique de routage changée",
+  extraction_profile_changed: "profil d’extraction différent",
+  parser_contract_changed: "contrat d’analyse changé",
+  evidence_gate_version_changed: "contrôle de preuve changé",
+  archived_output_missing: "sortie archivée introuvable",
+  checkpoint_corrupt: "résultat archivé illisible",
+  access_mode_incompatible: "mode d’accès incompatible",
+};
+
+function planReasonLabel(source: ExtractionProgressSource): string | null {
+  const reason = source.plan_reason;
+  if (!reason) return null;
+  const label = PLAN_REASON_LABELS[reason] ?? reason;
+  if (source.plan_disposition === "content_duplicate") {
+    return source.plan_primary_source_id
+      ? `${label} (${source.plan_primary_source_id})`
+      : label;
+  }
+  return label;
+}
 
 const PROFILE_LABELS: Record<ExtractionProgressProfile, string> = {
   full: "FULL",
@@ -95,23 +131,39 @@ export function ExtractionProgressView({
           Résultats existants : {progress.cache_hits} · Appels modèle :{" "}
           {progress.model_calls}
         </span>
+        {typeof progress.planned_model_calls === "number" ? (
+          <span className="extraction-progress__plan">
+            Plan : {progress.planned_model_calls} appel
+            {progress.planned_model_calls === 1 ? "" : "s"} prévu
+            {progress.planned_model_calls === 1 ? "" : "s"} ·{" "}
+            {progress.planned_reuses ?? 0} source
+            {(progress.planned_reuses ?? 0) === 1 ? "" : "s"} réutilisée
+            {(progress.planned_reuses ?? 0) === 1 ? "" : "s"}
+          </span>
+        ) : null}
       </div>
 
       <ul
         className="extraction-progress__sources"
         aria-label="Sources de l’extraction"
       >
-        {progress.sources.map((source) => (
-          <li key={source.source_id} className={`is-${source.status}`}>
-            <span aria-hidden="true">{SOURCE_STATUS_ICONS[source.status]}</span>
-            <span>{source.source_id}</span>
-            <span>{PROFILE_LABELS[source.profile]}</span>
-            <span className="extraction-progress__source-status">
-              {SOURCE_STATUS_LABELS[source.status]}
-              {usesArchiveFallback(source) ? " · Archive de secours" : ""}
-            </span>
-          </li>
-        ))}
+        {progress.sources.map((source) => {
+          const reason = planReasonLabel(source);
+          return (
+            <li key={source.source_id} className={`is-${source.status}`}>
+              <span aria-hidden="true">
+                {SOURCE_STATUS_ICONS[source.status]}
+              </span>
+              <span>{source.source_id}</span>
+              <span>{PROFILE_LABELS[source.profile]}</span>
+              <span className="extraction-progress__source-status">
+                {SOURCE_STATUS_LABELS[source.status]}
+                {usesArchiveFallback(source) ? " · Archive de secours" : ""}
+                {reason ? ` · ${reason}` : ""}
+              </span>
+            </li>
+          );
+        })}
       </ul>
     </section>
   );

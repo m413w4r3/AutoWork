@@ -5193,6 +5193,9 @@ class ProductionReferenceRepairService:
                     "changed_content_sources": [
                         item["canonical_url"] for item in source_delta["changed_content_sources"]
                     ],
+                    "unknown_baseline_sources": [
+                        item["canonical_url"] for item in source_delta["unknown_baseline_sources"]
+                    ],
                     **(
                         {"repair_source_index": repair_source_index}
                         if repair_source_index is not None
@@ -5284,20 +5287,12 @@ async def _source_delta(
             ):
                 previous_hashes.setdefault(item[0], item[1].casefold())
 
-    repository = getattr(uow, "source_extractions", None)
-    finder = getattr(repository, "list_for_url", None)
-    if callable(finder):
-        for source in previous_report.sources:
-            if source.canonical_url in previous_hashes:
-                continue
-            try:
-                rows = await finder(source.canonical_url)
-            except Exception:
-                rows = ()
-            if rows:
-                digest = getattr(rows[0], "source_content_sha256", None)
-                if isinstance(digest, str) and _is_sha256(digest):
-                    previous_hashes[source.canonical_url] = digest.casefold()
+    # The baseline is deliberately NOT completed from ``source_extractions``:
+    # that table is content-addressed and shared by every subject, so an
+    # arbitrary row for the same URL may describe another edition's capture.
+    # Attributing it to this subject would report "content changed" for a
+    # source this subject never captured differently. When this subject holds
+    # no recorded baseline, the honest answer is "unknown", below.
 
     previous_urls = {source.canonical_url for source in previous_report.sources}
     current_urls = {source.canonical_url for source in current_report.sources}
@@ -5305,6 +5300,7 @@ async def _source_delta(
     removed = sorted(previous_urls - current_urls)
     unchanged: list[dict[str, str | None]] = []
     changed: list[dict[str, str | None]] = []
+    unknown_baseline: list[dict[str, str | None]] = []
     for url in sorted(previous_urls & current_urls):
         previous_sha = previous_hashes.get(url)
         current_sha = current_hashes.get(url)
@@ -5313,7 +5309,13 @@ async def _source_delta(
             "previous_source_sha256": previous_sha,
             "current_source_sha256": current_sha,
         }
-        if previous_sha is not None and current_sha == previous_sha:
+        if previous_sha is None:
+            # No recorded capture for this subject: the source predates the
+            # per-source baseline. "We do not know" is not "it changed" --
+            # reporting it as changed tells the analyst their correction
+            # rewrote sources it never touched.
+            unknown_baseline.append(entry)
+        elif current_sha == previous_sha:
             unchanged.append(entry)
         else:
             changed.append(entry)
@@ -5337,6 +5339,7 @@ async def _source_delta(
         ],
         "unchanged_sources": unchanged,
         "changed_content_sources": changed,
+        "unknown_baseline_sources": unknown_baseline,
     }
 
 

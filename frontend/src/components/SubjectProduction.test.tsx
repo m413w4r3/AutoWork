@@ -550,7 +550,67 @@ describe("SubjectProduction retry from stage", () => {
     expect(screen.queryByRole("combobox")).toBeNull();
   });
 
-  it("un run annulé appartenant à un lot n’offre pas de production isolée", async () => {
+  it("un run annulé propose la reprise et non une production isolée", async () => {
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+      init?.method === "POST"
+        ? Promise.resolve(
+            Response.json({
+              action: "production_resume_requested",
+              run_id: "r-1",
+              status: "running",
+              job_id: "j-1",
+              pipeline_generation: 4,
+              resume_plan: {
+                previous_status: "cancelled",
+                resume_from_stage: "extraction",
+                reused_artifacts: ["references"],
+                model_calls_expected: 2,
+              },
+            }),
+          )
+        : Promise.resolve(
+            Response.json({
+              ...status("failed"),
+              status: "cancelled",
+              batch_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              resume_plan: {
+                previous_status: "cancelled",
+                resume_from_stage: "extraction",
+                reused_artifacts: ["references"],
+                model_calls_expected: 2,
+              },
+            }),
+          ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderProduction();
+
+    const resume = await screen.findByRole("button", {
+      name: "Reprendre la production",
+    });
+    // The batch no longer sends the analyst back to the edition review.
+    expect(
+      screen.queryByText(/appartient à une production d’édition/),
+    ).toBeNull();
+    expect(screen.getByText(/repart de l’étape/)).toHaveTextContent(
+      /Extraction/,
+    );
+    expect(screen.getByText(/repart de l’étape/)).toHaveTextContent(
+      /2 appel\(s\) modèle au plus/,
+    );
+
+    await user.click(resume);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/api/subjects/${SUBJECT_ID}/production/resume`,
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+  });
+
+  it("sans plan de reprise, un run annulé d’un lot renvoie vers la revue", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(

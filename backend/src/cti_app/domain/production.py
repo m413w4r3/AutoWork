@@ -404,6 +404,118 @@ class ExtractionProfile(StrEnum):
     IOC_RULES = "ioc_rules"
 
 
+class Q2SourceDisposition(StrEnum):
+    """What the extraction planner decided to do with one Q1 source."""
+
+    #: A durable checkpoint proved the same functional identity: no call.
+    REUSED = "reused"
+    #: The source carries the exact bytes of another source in the same run.
+    CONTENT_DUPLICATE = "content_duplicate"
+    #: One source-level request, on its own.
+    EXTRACT_INDIVIDUAL = "extract_individual"
+    #: One shared request with the other members of its batch.
+    EXTRACT_BATCHED = "extract_batched"
+
+
+@dataclass(frozen=True, slots=True)
+class Q2SourceImpact:
+    """The planner's decision for one source, with its justification."""
+
+    source_id: str
+    canonical_url: str
+    disposition: Q2SourceDisposition
+    profile: ExtractionProfile
+    #: Why this source is extracted or reused. For a reuse this is a
+    #: ``Q2ReuseReason``; for an extraction it is the reuse probe's miss
+    #: reason, so every provider call names the business event that owes it.
+    reason: str
+    #: Set only for ``CONTENT_DUPLICATE``: the source whose result it inherits.
+    primary_source_id: str | None = None
+    #: Set only for ``EXTRACT_BATCHED``: which batch carries the request.
+    batch_index: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionImpactPlan:
+    """The whole Q2 cost decision for one extraction stage, before execution.
+
+    Built once, after every reuse probe and before the first provider call, so
+    the plan can be logged and asserted rather than reconstructed from the
+    calls it produced. ``estimated_model_calls`` is exact, not a forecast:
+    reuse is already decided by the time this plan exists, and each remaining
+    source is either its own request or a member of one shared batch request.
+    Archive fallbacks are the one thing it cannot foresee -- they are decided
+    only after a live source answers UNAVAILABLE -- so the estimate is a
+    floor for a run in which every live source is reachable.
+    """
+
+    sources: tuple[Q2SourceImpact, ...]
+    #: Each batch, as the source ids it will read in one request.
+    batches: tuple[tuple[str, ...], ...] = ()
+
+    def _with(self, disposition: Q2SourceDisposition) -> tuple[Q2SourceImpact, ...]:
+        return tuple(item for item in self.sources if item.disposition is disposition)
+
+    @property
+    def total_sources(self) -> int:
+        return len(self.sources)
+
+    @property
+    def reused(self) -> tuple[Q2SourceImpact, ...]:
+        return self._with(Q2SourceDisposition.REUSED)
+
+    @property
+    def content_duplicates(self) -> tuple[Q2SourceImpact, ...]:
+        return self._with(Q2SourceDisposition.CONTENT_DUPLICATE)
+
+    @property
+    def extracted(self) -> tuple[Q2SourceImpact, ...]:
+        return tuple(
+            item
+            for item in self.sources
+            if item.disposition
+            in {
+                Q2SourceDisposition.EXTRACT_INDIVIDUAL,
+                Q2SourceDisposition.EXTRACT_BATCHED,
+            }
+        )
+
+    @property
+    def estimated_model_calls(self) -> int:
+        """One call per individually extracted source, plus one per batch."""
+        return len(self._with(Q2SourceDisposition.EXTRACT_INDIVIDUAL)) + len(self.batches)
+
+    @property
+    def model_calls_avoided(self) -> int:
+        return len(self.reused) + len(self.content_duplicates)
+
+    def as_event_payload(self) -> dict[str, Any]:
+        """The `q2.extraction.plan` body: why every source costs what it costs."""
+
+        def entry(item: Q2SourceImpact) -> dict[str, Any]:
+            body: dict[str, Any] = {
+                "source": item.source_id,
+                "url": item.canonical_url,
+                "reason": item.reason,
+                "profile": item.profile.value,
+            }
+            if item.primary_source_id is not None:
+                body["primary_source"] = item.primary_source_id
+            if item.batch_index is not None:
+                body["batch"] = item.batch_index
+            return body
+
+        return {
+            "total_sources": self.total_sources,
+            "reused": [entry(item) for item in self.reused],
+            "extracted": [entry(item) for item in self.extracted],
+            "duplicates": [entry(item) for item in self.content_duplicates],
+            "batches": [list(batch) for batch in self.batches],
+            "estimated_calls": self.estimated_model_calls,
+            "model_calls_avoided": self.model_calls_avoided,
+        }
+
+
 class DetectionRuleType(StrEnum):
     YARA = "yara"
     SIGMA = "sigma"
@@ -931,20 +1043,58 @@ class SubjectProductionRun:
             }[stage]
         else:
             self.force_recompute_from_stage = None
-        if stage is SubjectProductionStage.SOURCES:
-            self.references_conversation_id = None
-            self.synthesis_conversation_id = None
-        elif stage is SubjectProductionStage.REFERENCES:
-            self.references_conversation_id = None
-            self.synthesis_conversation_id = None
-        elif stage is SubjectProductionStage.EXTRACTION:
-            self.synthesis_conversation_id = None
-        elif stage is SubjectProductionStage.SYNTHESIS:
-            self.synthesis_conversation_id = None
+        self._reset_conversations_from(stage)
         self.error_code = None
         self.error_message = None
         self.error_details = None
         self.reconciliation = None
+        self.finished_at = None
+        self.updated_at = now or datetime.now(UTC)
+        self.version += 1
+
+    def _reset_conversations_from(self, stage: SubjectProductionStage) -> None:
+        """Drop the model conversations the stages from ``stage`` on will rebuild."""
+        if stage in (SubjectProductionStage.SOURCES, SubjectProductionStage.REFERENCES):
+            self.references_conversation_id = None
+            self.synthesis_conversation_id = None
+        elif stage in (SubjectProductionStage.EXTRACTION, SubjectProductionStage.SYNTHESIS):
+            self.synthesis_conversation_id = None
+
+    def resume_after_cancellation(
+        self,
+        stage: SubjectProductionStage,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Continue a cancelled run at its first incomplete stage.
+
+        Cancellation only stops the pipeline: it deletes no artifact, no
+        archived source and no checkpoint.  Resuming is therefore not a retry —
+        nothing is invalidated, ``force_recompute_from_stage`` stays unset, and
+        every already produced artifact keeps evidencing its stage.  The
+        pipeline generation still advances: the stage jobs of the cancelled
+        generation were cancelled with the run, and a resumed stage must not
+        collide with their idempotency keys.
+
+        Callers pick ``stage`` from the artifacts that really exist; the domain
+        only guarantees the transition itself.
+        """
+        if self.status is not SubjectProductionStatus.CANCELLED:
+            raise ValueError("production_run_not_resumable")
+        # A cancelled run cannot carry an unresolved submission today — the
+        # NEEDS_REVIEW transition that records one refuses a cancelled run.
+        # The fence stays explicit so a future cancellation path cannot make a
+        # resume duplicate a provider request.
+        if self.reconciliation is not None:
+            raise ProductionReconciliationRequiredError
+        self.status = SubjectProductionStatus.RUNNING
+        self.current_stage = stage
+        self.pipeline_generation += 1
+        self.force_recompute_from_stage = None
+        self._reset_conversations_from(stage)
+        self.error_code = None
+        self.error_message = None
+        self.error_details = None
         self.finished_at = None
         self.updated_at = now or datetime.now(UTC)
         self.version += 1

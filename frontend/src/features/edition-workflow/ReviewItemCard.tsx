@@ -9,6 +9,7 @@ import {
   retryProductionRun,
   type ReviewItem,
 } from "../../api/publication";
+import { resumeProductionRun } from "../../api/production";
 import { Link } from "../../routing";
 import { ReconciliationPanel } from "./ReconciliationPanel";
 import type { RepairQueueFilter } from "./RepairQueue";
@@ -160,6 +161,18 @@ export function ReviewItemCard({
     onError: handleError,
   });
 
+  // Resuming keeps every artifact the cancelled run produced, so the review
+  // list is refreshed exactly like a retry: same batch, same run, new stage.
+  const resume = useMutation({
+    mutationFn: () => resumeProductionRun(item.run_id),
+    retry: false,
+    onSuccess: () => {
+      setStaleMessage(null);
+      invalidateAfterRetry(queryClient, editionId, item.subject_id);
+    },
+    onError: handleError,
+  });
+
   const cancel = useMutation({
     mutationFn: () => cancelProductionRun(item.run_id),
     retry: false,
@@ -184,6 +197,12 @@ export function ReviewItemCard({
     item.can_retry === true &&
     item.retry_stage !== null &&
     !needsReconciliation;
+  // Cancellation preserves the pipeline's outputs: the article continues from
+  // its first incomplete stage instead of being excluded from the edition.
+  const canResume =
+    item.can_resume === true &&
+    item.run_status === "cancelled" &&
+    !needsReconciliation;
   const isProblem =
     item.run_status === "failed" ||
     item.run_status === "needs_review" ||
@@ -200,9 +219,14 @@ export function ReviewItemCard({
     include.isPending ||
     exclude.isPending ||
     retry.isPending ||
+    resume.isPending ||
     cancel.isPending;
   const mutationError =
-    include.error ?? exclude.error ?? retry.error ?? cancel.error;
+    include.error ??
+    exclude.error ??
+    retry.error ??
+    resume.error ??
+    cancel.error;
   const hasLossSignals =
     item.rejected_indicator_count > 0 ||
     item.rejected_rule_count > 0 ||
@@ -305,6 +329,16 @@ export function ReviewItemCard({
         ) : null}
         {!readOnly && !isActive && isProblem && !isExcluded ? (
           <>
+            {canResume ? (
+              <button
+                className="button button--secondary"
+                type="button"
+                disabled={actionPending}
+                onClick={() => resume.mutate()}
+              >
+                {resume.isPending ? "Reprise…" : "Reprendre la production"}
+              </button>
+            ) : null}
             {canRetry ? (
               <button
                 className="button button--secondary"
@@ -324,6 +358,16 @@ export function ReviewItemCard({
               Exclure
             </button>
           </>
+        ) : null}
+        {!readOnly && !isActive && isProblem && isExcluded && canResume ? (
+          <button
+            className="button button--secondary"
+            type="button"
+            disabled={actionPending}
+            onClick={() => resume.mutate()}
+          >
+            {resume.isPending ? "Reprise…" : "Reprendre la production"}
+          </button>
         ) : null}
         {!readOnly && !isActive && isProblem && isExcluded && canRetry ? (
           <button

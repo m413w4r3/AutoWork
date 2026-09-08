@@ -568,7 +568,16 @@ async def test_batch_progress_marks_only_current_sources_running_before_provider
     assert len(gateway.calls) == 1
     assert all(item["status"] == "pending" for item in snapshots[0]["sources"])
     assert snapshots[0]["active_source_id"] is None
-    before_call = snapshots[1]
+    # The planner publishes its verdict before touching the provider: every
+    # source is still pending, but each now carries the reason it will be read.
+    plan_snapshot = snapshots[1]
+    assert plan_snapshot["planned_model_calls"] == 1
+    assert all(item["status"] == "pending" for item in plan_snapshot["sources"])
+    assert [item["plan_reason"] for item in plan_snapshot["sources"]] == [
+        "no_checkpoint"
+    ] * 4
+    # The snapshot immediately before the call marks the batch, and only it.
+    before_call = snapshots[2]
     assert [item["status"] for item in before_call["sources"]] == [
         "running",
         "running",

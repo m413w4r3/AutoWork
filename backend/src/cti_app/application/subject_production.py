@@ -15,6 +15,11 @@ from cti_app.application.persistence import (
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
+from cti_app.application.production_resume import (
+    STAGE_ARTIFACT,
+    ProductionResumePlan,
+    plan_production_resume,
+)
 from cti_app.application.production_review_recovery import prepare_batch_for_recovery
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.production import (
@@ -57,6 +62,14 @@ class SubjectProductionRetryResult:
         """Keep the former ``run, staled`` unpacking contract for callers."""
         yield self.run
         yield self.staled_artifacts
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectProductionResumeResult:
+    run: SubjectProductionRun
+    plan: ProductionResumePlan
+    old_generation: int
+    batch_id: UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,6 +398,102 @@ class SubjectProductionService:
                 batch_id=item.batch_id if item is not None else None,
                 changed=not was_cancelled,
             )
+
+    async def resume_cancelled_run(self, run_id: UUID) -> SubjectProductionResumeResult:
+        """Continue a cancelled run at its first stage without a live artifact.
+
+        Cancellation preserves everything the run produced, so this reopens the
+        exact same run rather than starting a rival one: no new edition entry,
+        no duplicated artifact, no orphan.  The lock order is the one every
+        other recovery gesture takes — Edition, then batch, then run.
+        """
+        async with self._uow_factory() as uow:
+            initial_run = await uow.subject_production_runs.get(run_id)
+            if not initial_run:
+                raise ProductionRunNotFoundError(str(run_id))
+            if initial_run.status is not SubjectProductionStatus.CANCELLED:
+                raise ValueError("production_run_not_resumable")
+
+            batch_id: UUID | None = None
+            editions = getattr(uow, "editions", None)
+            if editions is not None:
+                get_edition_for_update = getattr(editions, "get_for_update", None)
+                edition = (
+                    await get_edition_for_update(initial_run.edition_id)
+                    if get_edition_for_update is not None
+                    else await editions.get(initial_run.edition_id)
+                )
+                if edition is None:
+                    raise ValueError("edition_not_found")
+                if edition.status not in {EditionStatus.PRODUCTION, EditionStatus.REVIEW}:
+                    raise ValueError("edition_frozen_for_publication")
+
+                # A frozen edition owns immutable evidence of what it published;
+                # reviving one of its articles would contradict that manifest.
+                manifests = getattr(uow, "publication_manifests", None)
+                if (
+                    manifests is not None
+                    and await manifests.get_latest_for_edition(initial_run.edition_id) is not None
+                ):
+                    raise ValueError("edition_frozen_for_publication")
+
+                # A cancelled article of an edition batch is resumed inside its
+                # own batch: that batch is the dispatch fence and the
+                # serialization point, exactly as for a Review-time retry.
+                batch = await prepare_batch_for_recovery(uow, initial_run, reopen=True)
+                if batch is not None:
+                    batch_id = batch.id
+
+            run = await uow.subject_production_runs.get_for_update(run_id)
+            if not run:
+                raise ProductionRunNotFoundError(str(run_id))
+            if run.edition_id != initial_run.edition_id:
+                raise ValueError("production_run_edition_changed")
+            if run.status is not SubjectProductionStatus.CANCELLED:
+                raise ValueError("production_run_not_resumable")
+
+            plan = plan_production_resume(
+                run,
+                artifacts=await self._current_artifacts(uow, run_id),
+                archived_source_count=await self._archived_source_count(uow, run.subject_id),
+            )
+            old_generation = run.pipeline_generation
+            run.resume_after_cancellation(plan.resume_from_stage, now=datetime.now(UTC))
+            await uow.subject_production_runs.save(run)
+            await uow.commit()
+            return SubjectProductionResumeResult(
+                run=run,
+                plan=plan,
+                old_generation=old_generation,
+                batch_id=batch_id,
+            )
+
+    @staticmethod
+    async def _current_artifacts(uow: ProductionUnitOfWork, run_id: UUID) -> dict[str, Any]:
+        artifacts = getattr(uow, "production_artifacts", None)
+        if artifacts is None:
+            return {}
+        current: dict[str, Any] = {}
+        for artifact_stage in STAGE_ARTIFACT.values():
+            if artifact_stage is None:
+                continue
+            current[artifact_stage.value] = await artifacts.get_current(
+                run_id, artifact_stage.value
+            )
+        return current
+
+    @staticmethod
+    async def _archived_source_count(uow: ProductionUnitOfWork, subject_id: UUID) -> int:
+        collections = getattr(uow, "source_collections", None)
+        if collections is None:
+            return 0
+        sources = await collections.list_for_subject(subject_id)
+        return sum(
+            1
+            for source in sources
+            if getattr(source.state, "value", source.state)
+            in {"archived", "extracted", "completed"}
+        )
 
     async def retry_from_stage(
         self,

@@ -2350,3 +2350,96 @@ async def test_a_subject_outside_any_batch_can_still_be_restarted(
 
     assert response.status_code == 200, response.text
     assert response.json()["run_id"] != str(run.id)
+
+
+async def _cancelled_batch_run(api: AsyncClient, uow: _Uow) -> tuple[UUID, SubjectProductionRun]:
+    """One article of an edition batch, cancelled right after it started."""
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert started.status_code == 200, started.text
+    run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+    assert run is not None
+    cancelled = await api.post(f"/api/production/runs/{run.id}/cancel")
+    assert cancelled.status_code == 200, cancelled.text
+    return subject_id, uow.subject_production_runs.items[run.id]
+
+
+async def test_cancelled_production_status_carries_its_resume_plan(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    """The UI offers a resume, so the status says what one would do."""
+    subject_id, run = await _cancelled_batch_run(api, uow)
+
+    response = await api.get(f"/api/subjects/{subject_id}/production")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "cancelled"
+    assert body["resume_plan"] == {
+        "previous_status": "cancelled",
+        "resume_from_stage": "references",
+        "reused_artifacts": [],
+        # Q1, one Q2 call for the single archived source, then Q4.
+        "model_calls_expected": 3,
+    }
+    assert run.status is SubjectProductionStatus.CANCELLED
+
+
+async def test_resume_dispatches_the_first_incomplete_stage_and_logs_its_plan(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+    tmp_path: Path,
+) -> None:
+    subject_id, run = await _cancelled_batch_run(api, uow)
+    await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.REFERENCES))
+    production_app.state.identity_provider = LocalIdentityProvider("analyst-1")
+    production_app.state.production_diagnostics = DiagnosticsLog.from_env(tmp_path)
+    jobs = production_app.state.job_service
+    dispatcher = production_app.state.job_dispatcher
+    jobs.submitted.clear()
+    dispatcher.dispatched.clear()
+
+    response = await api.post(f"/api/subjects/{subject_id}/production/resume")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["action"] == "production_resume_requested"
+    assert body["status"] == "running"
+    assert body["resume_plan"]["resume_from_stage"] == "extraction"
+    assert body["resume_plan"]["reused_artifacts"] == ["references"]
+    resumed = uow.subject_production_runs.items[run.id]
+    assert resumed.status is SubjectProductionStatus.RUNNING
+    assert resumed.current_stage is SubjectProductionStage.EXTRACTION
+    # A resume reuses; only a retry invalidates a stage.
+    assert resumed.force_recompute_from_stage is None
+    assert resumed.pipeline_generation == run.pipeline_generation + 1
+    assert [job["kind"] for job in jobs.submitted] == ["production.subject.extraction"]
+    assert len(dispatcher.dispatched) == 1
+
+    event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
+    assert event["event"] == "production.resume.plan"
+    assert event["run_id"] == str(run.id)
+    assert event["previous_status"] == "cancelled"
+    assert event["resume_from_stage"] == "extraction"
+    assert event["reused_artifacts"] == ["references"]
+    assert event["model_calls_expected"] == 2
+    assert event["actor_id"] == "analyst-1"
+
+
+async def test_resume_is_refused_on_a_run_that_is_not_cancelled(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
+    await uow.subject_production_runs.add(run)
+    jobs = production_app.state.job_service
+    jobs.submitted.clear()
+
+    response = await api.post(f"/api/production/runs/{run.id}/resume")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "production_run_not_resumable"
+    assert uow.subject_production_runs.items[run.id].pipeline_generation == 0
+    assert jobs.submitted == []

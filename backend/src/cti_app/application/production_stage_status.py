@@ -5,23 +5,14 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from cti_app.application.production_resume import STAGE_ARTIFACT as _STAGE_ARTIFACT
 from cti_app.domain.production import (
     ProductionArtifact,
-    ProductionArtifactStage,
     SubjectProductionRun,
     SubjectProductionStage,
     SubjectProductionStatus,
     production_stages,
 )
-
-# Artifact that evidences each stage, when there is one.
-_STAGE_ARTIFACT: dict[SubjectProductionStage, ProductionArtifactStage | None] = {
-    SubjectProductionStage.SOURCES: None,
-    SubjectProductionStage.REFERENCES: ProductionArtifactStage.REFERENCES,
-    SubjectProductionStage.EXTRACTION: ProductionArtifactStage.EXTRACTION,
-    SubjectProductionStage.SYNTHESIS: ProductionArtifactStage.SYNTHESIS,
-    SubjectProductionStage.ASSEMBLY: ProductionArtifactStage.PUBLICATION,
-}
 
 
 def build_stage_statuses(

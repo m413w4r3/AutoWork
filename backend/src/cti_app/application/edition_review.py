@@ -107,8 +107,8 @@ def review_item_can_retry(
 
     ``CANCELLED`` is deliberately absent: the domain refuses
     ``SubjectProductionRun.retry_from_stage`` on a cancelled run, so offering a
-    retry would only produce a conflict.  A cancelled article is resolved by
-    excluding it from the edition.
+    retry would only produce a conflict.  A cancelled article owns its own
+    gesture instead — see :func:`review_item_can_resume`.
     """
     if reconciliation_required:
         return False
@@ -116,6 +116,23 @@ def review_item_can_retry(
         SubjectProductionStatus.FAILED,
         SubjectProductionStatus.NEEDS_REVIEW,
     } or (run_status is SubjectProductionStatus.READY and not artifact_verified)
+
+
+def review_item_can_resume(
+    run_status: SubjectProductionStatus,
+    *,
+    reconciliation_required: bool,
+) -> bool:
+    """A cancelled article is resumed, not retried.
+
+    Cancellation stops the pipeline without destroying anything, so the article
+    can continue at its first incomplete stage, keeping every artifact it
+    already produced.  Excluding it from the edition stays available, but is no
+    longer the only way out.
+    """
+    if reconciliation_required:
+        return False
+    return run_status is SubjectProductionStatus.CANCELLED
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +154,7 @@ class EditionReviewItem:
     can_retry: bool
     effective_decision_id: UUID | None = None
     retry_stage: SubjectProductionStage | None = None
+    can_resume: bool = False
     requires_reconciliation: bool = False
     reconciliation: ProductionSubmissionReconciliation | None = None
     rejected_indicator_count: int = 0
@@ -841,6 +859,10 @@ def _build_item(row: EditionReviewReadItem, repair_issues: Sequence[Any] = ()) -
         reconciliation_required=reconciliation_required,
     )
     retry_stage = row.retry_stage if can_retry else None
+    can_resume = review_item_can_resume(
+        row.run_status,
+        reconciliation_required=reconciliation_required,
+    )
     active_repair_count = len(repair_issues)
     unresolved_repair_count = sum(
         _repair_issue_is_actionable(issue) and not _repair_issue_resolved(issue)
@@ -865,6 +887,7 @@ def _build_item(row: EditionReviewReadItem, repair_issues: Sequence[Any] = ()) -
         can_retry=can_retry,
         effective_decision_id=row.effective_decision_id,
         retry_stage=retry_stage,
+        can_resume=can_resume,
         requires_reconciliation=reconciliation_required,
         reconciliation=row.reconciliation if reconciliation_required else None,
         # Une perte d'indicateurs ou de règles n'est jamais bloquante : c'est un

@@ -861,4 +861,50 @@ describe("ReviewConsole", () => {
     // Il reste exclusible, seule sortie cohérente avec le domaine.
     expect(screen.getByRole("button", { name: "Exclure" })).toBeInTheDocument();
   });
+
+  it("reprend un article annulé sans toucher aux autres du lot", async () => {
+    const { fetchMock } = renderReview(
+      makeReview([
+        makeItem({
+          run_id: "run-cancelled",
+          run_status: "cancelled",
+          effective_decision: null,
+          included: false,
+          blocking: true,
+          can_retry: false,
+          retry_stage: null,
+          can_resume: true,
+          document_artifact_id: null,
+          document_artifact_version: null,
+          document_input_hash: null,
+        }),
+      ]),
+      () =>
+        Response.json({
+          action: "production_resume_requested",
+          run_id: "run-cancelled",
+          status: "running",
+          job_id: "job-1",
+          pipeline_generation: 4,
+          resume_plan: {
+            previous_status: "cancelled",
+            resume_from_stage: "synthesis",
+            reused_artifacts: ["references", "extraction"],
+            model_calls_expected: 1,
+          },
+        }),
+    );
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Reprendre la production" }),
+    );
+
+    await waitFor(() => expect(postCalls(fetchMock)).toHaveLength(1));
+    const [url, init] = postCall(fetchMock);
+    expect(urlOf(url)).toBe("/api/production/runs/run-cancelled/resume");
+    expect(init.method).toBe("POST");
+    // La reprise n’est jamais un retry : aucune étape n’est invalidée.
+    expect(init.body).toBeUndefined();
+  });
 });

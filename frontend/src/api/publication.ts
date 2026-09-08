@@ -140,6 +140,11 @@ export interface ReviewItem {
    */
   can_retry: boolean;
   retry_stage: ReviewRetryStage | null;
+  /**
+   * A cancelled article is resumed rather than retried: cancellation deleted
+   * none of its artifacts, so the run continues where it stopped.
+   */
+  can_resume?: boolean;
   requires_reconciliation: boolean;
   reconciliation: ProductionReconciliation | null;
   error_code: string | null;
