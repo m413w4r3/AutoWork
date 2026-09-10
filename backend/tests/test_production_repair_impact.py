@@ -189,9 +189,7 @@ def test_include_non_ioc_artifact_is_publication_only(artifact_type: str) -> Non
     assert ProductionDerivedOutput.SYNTHESIS not in impact.affected_outputs
 
 
-@pytest.mark.parametrize(
-    "action", [ProductionRepairAction.INCLUDE, ProductionRepairAction.EXCLUDE]
-)
+@pytest.mark.parametrize("action", [ProductionRepairAction.INCLUDE, ProductionRepairAction.EXCLUDE])
 @pytest.mark.parametrize(
     "artifact_type", ["hash", "ip", "domain", "url", "email", "filename", "filepath", "cve"]
 )

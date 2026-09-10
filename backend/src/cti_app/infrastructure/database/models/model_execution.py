@@ -42,9 +42,7 @@ class ModelRunRow(Base):
         CheckConstraint(
             f"provider IN ({MODEL_PROVIDER_VALUES_SQL})", name="ck_model_runs_provider"
         ),
-        CheckConstraint(
-            f"backend IN ({MODEL_BACKEND_VALUES_SQL})", name="ck_model_runs_backend"
-        ),
+        CheckConstraint(f"backend IN ({MODEL_BACKEND_VALUES_SQL})", name="ck_model_runs_backend"),
         CheckConstraint(
             f"transport IN ({MODEL_TRANSPORT_VALUES_SQL})", name="ck_model_runs_transport"
         ),

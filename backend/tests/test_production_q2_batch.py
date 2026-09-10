@@ -573,9 +573,7 @@ async def test_batch_progress_marks_only_current_sources_running_before_provider
     plan_snapshot = snapshots[1]
     assert plan_snapshot["planned_model_calls"] == 1
     assert all(item["status"] == "pending" for item in plan_snapshot["sources"])
-    assert [item["plan_reason"] for item in plan_snapshot["sources"]] == [
-        "no_checkpoint"
-    ] * 4
+    assert [item["plan_reason"] for item in plan_snapshot["sources"]] == ["no_checkpoint"] * 4
     # The snapshot immediately before the call marks the batch, and only it.
     before_call = snapshots[2]
     assert [item["status"] for item in before_call["sources"]] == [

@@ -185,9 +185,7 @@ async def test_a_cancelled_run_is_never_moved() -> None:
 def test_retry_stage_is_the_first_missing_artifact(
     live: set[str], expected: SubjectProductionStage
 ) -> None:
-    assert (
-        resolve_retry_stage(live, current_stage=SubjectProductionStage.ASSEMBLY) is expected
-    )
+    assert resolve_retry_stage(live, current_stage=SubjectProductionStage.ASSEMBLY) is expected
 
 
 def test_a_complete_run_replays_its_last_stage() -> None:
@@ -342,9 +340,7 @@ async def test_ioc_added_after_publication_leaves_a_named_debt() -> None:
     run = _run()
     uow = _Uow()
 
-    await _require_publication_rebuild(
-        uow, run, retry_stage=SubjectProductionStage.SYNTHESIS.value
-    )
+    await _require_publication_rebuild(uow, run, retry_stage=SubjectProductionStage.SYNTHESIS.value)
     row = _row(
         run_status=run.status,
         live_stages=frozenset({_REFERENCES, _EXTRACTION}),

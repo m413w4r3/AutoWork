@@ -306,9 +306,7 @@ async def test_manifest_names_the_article_that_carries_each_rule() -> None:
 async def test_a_rule_published_twice_is_written_once_and_credits_both_articles() -> None:
     # Two articles citing the same vendor report legitimately carry the same
     # rule.  The analyst must not load it twice into a scanner.
-    fixture = _Fixture(
-        article_b_rules=[_rule("yara", YARA_BODY, name="Marki", source_ids=["S1"])]
-    )
+    fixture = _Fixture(article_b_rules=[_rule("yara", YARA_BODY, name="Marki", source_ids=["S1"])])
 
     archive = await fixture.service().build(EDITION_ID)
 

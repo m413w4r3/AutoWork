@@ -784,9 +784,7 @@ async def test_a_fully_produced_run_replays_only_the_free_assembly() -> None:
     plan = plan_production_resume(
         world.run,
         artifacts={
-            stage.value: await world.uow.production_artifacts.get_current(
-                world.run.id, stage.value
-            )
+            stage.value: await world.uow.production_artifacts.get_current(world.run.id, stage.value)
             for stage in ProductionArtifactStage
         },
         archived_source_count=len(SOURCE_IDS),

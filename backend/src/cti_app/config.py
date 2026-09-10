@@ -83,24 +83,20 @@ class Settings(BaseSettings):
     model_route_web_research: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
         "chatgpt_bridge"
     )
-    model_route_bulk_extraction: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
-        "qwen"
+    model_route_bulk_extraction: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = "qwen"
+    model_route_ambiguous_clustering: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
+        "chatgpt_bridge"
     )
-    model_route_ambiguous_clustering: Literal[
-        "chatgpt_bridge", "gemini_webai", "qwen", "fake"
-    ] = "chatgpt_bridge"
-    model_route_standard_draft: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
-        "qwen"
+    model_route_standard_draft: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = "qwen"
+    model_route_premium_synthesis: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
+        "chatgpt_bridge"
     )
-    model_route_premium_synthesis: Literal[
-        "chatgpt_bridge", "gemini_webai", "qwen", "fake"
-    ] = "chatgpt_bridge"
     model_route_critique: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
         "chatgpt_bridge"
     )
-    model_route_discovery_merge: Literal[
-        "chatgpt_bridge", "gemini_webai", "qwen", "fake"
-    ] = "chatgpt_bridge"
+    model_route_discovery_merge: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
+        "chatgpt_bridge"
+    )
     model_request_timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
     model_conversation_retention_days: int = Field(default=90, ge=1, le=3650)
     discovery_chatgpt_structuring_fallback: bool = False
