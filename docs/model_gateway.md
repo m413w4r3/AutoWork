@@ -147,6 +147,16 @@ table ni dans les logs. Les sorties complètes vivent dans `model-outputs/` sur 
 | `MODEL_REQUEST_TIMEOUT_SECONDS` | timeout HTTP borné |
 | `DISCOVERY_CHATGPT_STRUCTURING_FALLBACK` | fallback explicite, désactivé par défaut |
 
+Le Bridge est une stack Docker séparée : AutoWork ne le construit, ne le démarre
+ni ne dépend de lui pour démarrer. `backend`, `worker` et `job-recovery`
+déclarent `host.docker.internal:host-gateway` et joignent par défaut
+`http://host.docker.internal:8001/v1`. Sous Linux, cette adresse n'atteint pas
+un port publié sur `127.0.0.1` : le Bridge doit être publié sur la passerelle
+`docker0` (`BRIDGE_BIND_ADDRESS=172.17.0.1` dans son `.env`, invisible depuis le
+LAN) ou sur `0.0.0.0` derrière un pare-feu. Hors loopback, le Bridge exige un
+`BRIDGE_API_KEY` fort, que `OPENAI_BRIDGE_API_KEY` reprend côté AutoWork. Les
+deux dépôts gardent chacun leur nom de variable.
+
 Le `.env.example` pointe vers le gateway Qwen retenu. Placer la clé uniquement dans `.env` ou
 un secret manager ; elle n'est jamais nécessaire pour les tests. La décision de confiance
 actuelle conserve `QWEN_IS_EXTERNAL=false`.
