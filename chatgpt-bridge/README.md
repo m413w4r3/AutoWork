@@ -6,9 +6,9 @@
 
 API locale compatible OpenAI, servie par ton onglet `chatgpt.com` via une extension Chrome.
 
-Les URLs `http://127.0.0.1:8001/v1` ci-dessous concernent les clients lancés
-directement sur l'hôte. Dans le réseau Compose, un client peut utiliser
-`http://chatgpt-bridge:8001/v1`.
+Le Bridge est un service autonome. Chaque application cliente lui fournit
+explicitement son URL, par exemple `http://127.0.0.1:8001/v1` lorsqu'elle
+s'exécute sur le même hôte.
 
 ```
 [ton script]  ──POST 127.0.0.1:8001/v1/chat/completions──>  [server.py launcher]
@@ -42,9 +42,8 @@ le prochain `up`. `/health` indique que le serveur répond ; `/ready` indique
 que le Bridge est réellement utilisable, notamment lorsque l'extension est
 disponible.
 
-Le serveur Bridge ne consomme que ses variables `BRIDGE_*`. Les variables
-clientes AutoWork, notamment `OPENAI_BRIDGE_BASE_URL` et
-`OPENAI_BRIDGE_API_KEY`, ne sont pas des variables serveur du Bridge.
+Le serveur Bridge ne consomme que ses variables `BRIDGE_*`. L'application
+cliente configure séparément son URL HTTP et ses identifiants d'accès.
 
 ## Installation
 

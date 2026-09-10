@@ -35,5 +35,6 @@ extension should use `/ready`.
 
 The server only consumes Bridge variables such as `BRIDGE_HOST`,
 `BRIDGE_PORT`, `BRIDGE_API_KEY`, `BRIDGE_WS_TOKEN`, `BRIDGE_RUN_DB`, and the
-Bridge timeout settings. Client-side AutoWork variables are not server
-configuration and do not belong in this deployment.
+Bridge timeout settings. The Bridge is standalone: each client application
+provides its own HTTP and WebSocket URLs to this service and configures its
+own client-side credentials separately.
