@@ -2,13 +2,13 @@
 
 > La topologie sécurisée, l’idempotence, la matrice de retry et les procédures
 > d’exploitation sont décrites dans
-> [`docs/chatgpt_bridge_operations.md`](../docs/chatgpt_bridge_operations.md).
+> [`docs/chatgpt_bridge_operations.md`](docs/chatgpt_bridge_operations.md).
 
 API locale compatible OpenAI, servie par ton onglet `chatgpt.com` via une extension Chrome.
 
-Les URLs `http://127.0.0.1:8001/v1` ci-dessous concernent uniquement les
-clients lancés directement sur l’hôte. Dans Compose, `backend` et `worker`
-utilisent obligatoirement `http://chatgpt-bridge:8001/v1`.
+Les URLs `http://127.0.0.1:8001/v1` ci-dessous concernent les clients lancés
+directement sur l'hôte. Dans le réseau Compose, un client peut utiliser
+`http://chatgpt-bridge:8001/v1`.
 
 ```
 [ton script]  ──POST 127.0.0.1:8001/v1/chat/completions──>  [server.py launcher]
@@ -24,6 +24,27 @@ utilisent obligatoirement `http://chatgpt-bridge:8001/v1`.
 ```
 
 Pas de Cloudflare à contourner : c'est un vrai navigateur, déjà authentifié.
+
+## Standalone deployment
+
+Depuis ce dossier :
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+docker compose ps
+docker compose logs -f chatgpt-bridge
+docker compose down
+```
+
+Le volume Docker nommé `bridge_data` conserve la base SQLite entre `down` et
+le prochain `up`. `/health` indique que le serveur répond ; `/ready` indique
+que le Bridge est réellement utilisable, notamment lorsque l'extension est
+disponible.
+
+Le serveur Bridge ne consomme que ses variables `BRIDGE_*`. Les variables
+clientes AutoWork, notamment `OPENAI_BRIDGE_BASE_URL` et
+`OPENAI_BRIDGE_API_KEY`, ne sont pas des variables serveur du Bridge.
 
 ## Installation
 
