@@ -78,6 +78,7 @@ from cti_app.application.subject_production import (
     EditionProductionBatchOwnershipError,
     EditionProductionService,
     ProductionRunNotFoundError,
+    RetryPrerequisiteMissingError,
     StaleEditionProductionBatchError,
     SubjectProductionService,
 )
@@ -903,6 +904,74 @@ async def _dispatch_handed_off_production_run(
         return
 
 
+# A refused retry is an operational instruction, not a stack trace.  The code
+# stays the machine identity the frontend switches on; the message is what the
+# Review console renders when it has nothing better to say.  Leaving it out is
+# what made every conflict surface as the generic "la revue de publication n'a
+# pas pu être mise à jour".
+_RETRY_CONFLICT_MESSAGES: dict[str, str] = {
+    "production_run_cancelled": (
+        "Cette production a été arrêtée. Utilisez « Reprendre la production »."
+    ),
+    "retry_not_allowed_while_running": (
+        "Une tentative est déjà en cours pour cet article. Attendez qu'elle se termine."
+    ),
+    "retry_stage_not_in_pipeline": "Cette étape ne fait pas partie du pipeline de production.",
+    "edition_frozen_for_publication": (
+        "L'édition est gelée pour publication : plus aucune production ne peut être relancée."
+    ),
+    "edition_not_found": "L'édition de cet article est introuvable.",
+    "production_run_edition_changed": (
+        "Cet article a changé d'édition depuis l'ouverture de la revue. Rechargez la page."
+    ),
+    "automatic_recovery_not_allowed": (
+        "La reprise automatique n'est pas autorisée pour cet article."
+    ),
+    "production_batch_missing": "Le lot de production de cet article est introuvable.",
+    "production_batch_cancelled": ("Le lot de production a été annulé : il n'est jamais rouvert."),
+    "production_batch_superseded": (
+        "Une production plus récente existe pour cette édition. Rechargez la revue."
+    ),
+    "production_active_sibling": (
+        "Un autre article du lot est en cours de production. Réessayez quand il sera terminé."
+    ),
+    "production_batch_not_recoverable": "Le lot de production ne peut pas être rouvert.",
+}
+
+_STAGE_LABELS: dict[str, str] = {
+    "sources": "Collecte des sources",
+    "references": "Références",
+    "extraction": "Extraction",
+    "synthesis": "Synthèse",
+    "assembly": "Assemblage",
+}
+
+
+def _retry_conflict_detail(exc: ValueError) -> dict[str, Any]:
+    """Turn a refused retry into something an analyst can act on."""
+    if isinstance(exc, RetryPrerequisiteMissingError):
+        runnable = exc.runnable_stage
+        detail: dict[str, Any] = {
+            "code": exc.code,
+            "requested_stage": exc.requested_stage.value,
+            "missing_artifact": exc.missing_artifact,
+        }
+        if runnable is not None and runnable is not exc.requested_stage:
+            detail["retry_stage"] = runnable.value
+            detail["message"] = (
+                "La publication doit être reconstruite après la réparation en amont. "
+                f"Étape requise : {_STAGE_LABELS.get(runnable.value, runnable.value)}."
+            )
+        else:
+            detail["message"] = (
+                "L'étape demandée ne peut pas être relancée : ses entrées ne sont plus disponibles."
+            )
+        return detail
+    code = str(exc)
+    message = _RETRY_CONFLICT_MESSAGES.get(code)
+    return {"code": code} | ({"message": message} if message else {})
+
+
 async def _retry_production_run(
     request: Request,
     run_id: UUID,
@@ -923,7 +992,7 @@ async def _retry_production_run(
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={"code": str(e)},
+            detail=_retry_conflict_detail(e),
         ) from e
     run = retry.run
     old_generation = retry.old_generation
@@ -1039,14 +1108,20 @@ async def _resume_production_run(
             detail=f"No production run found for run {run_id}",
         ) from exc
     except ReviewRecoveryConflictError as exc:
+        code = f"production_{exc.reason}"
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={"code": f"production_{exc.reason}"},
+            detail={"code": code}
+            | (
+                {"message": _RETRY_CONFLICT_MESSAGES[code]}
+                if code in _RETRY_CONFLICT_MESSAGES
+                else {}
+            ),
         ) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={"code": str(exc)},
+            detail=_retry_conflict_detail(exc),
         ) from exc
 
     run = resumed.run

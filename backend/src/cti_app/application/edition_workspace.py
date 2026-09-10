@@ -58,6 +58,26 @@ def safe_slug(value: str) -> str:
     return slug or "item"
 
 
+def detection_rule_filename(rule: DetectionRule) -> str:
+    """Return the one filename a detection rule carries in every projection.
+
+    Shared by the workspace sidecars and the edition rule archive so an analyst
+    recognises the same rule under both names.
+    """
+    expected_sha256 = hashlib.sha256(rule.body.encode("utf-8")).hexdigest()
+    if rule.sha256 != expected_sha256:
+        raise ValueError("Rule sidecar hash does not match its body")
+    extensions = {
+        DetectionRuleType.YARA: ".yar",
+        DetectionRuleType.SIGMA: ".yml",
+        DetectionRuleType.SURICATA: ".rules",
+        DetectionRuleType.SNORT: ".rules",
+    }
+    source = safe_slug(sorted(rule.source_ids)[0]) if rule.source_ids else "rule"
+    name = safe_slug(rule.name or "unnamed-rule")[:48].strip("-_") or "rule"
+    return f"{source}-{name}-{rule.sha256}{extensions[rule.rule_type]}"
+
+
 class EditionWorkspaceMaterializer:
     """Materialize only the small, already available editorial projections."""
 
@@ -193,20 +213,7 @@ class EditionWorkspaceMaterializer:
         files.append(manifest_path)
         return tuple(files)
 
-    @staticmethod
-    def _rule_filename(rule: DetectionRule) -> str:
-        expected_sha256 = hashlib.sha256(rule.body.encode("utf-8")).hexdigest()
-        if rule.sha256 != expected_sha256:
-            raise ValueError("Rule sidecar hash does not match its body")
-        extensions = {
-            DetectionRuleType.YARA: ".yar",
-            DetectionRuleType.SIGMA: ".yml",
-            DetectionRuleType.SURICATA: ".rules",
-            DetectionRuleType.SNORT: ".rules",
-        }
-        source = safe_slug(sorted(rule.source_ids)[0]) if rule.source_ids else "rule"
-        name = safe_slug(rule.name or "unnamed-rule")[:48].strip("-_") or "rule"
-        return f"{source}-{name}-{rule.sha256}{extensions[rule.rule_type]}"
+    _rule_filename = staticmethod(detection_rule_filename)
 
     async def materialize_release(
         self,

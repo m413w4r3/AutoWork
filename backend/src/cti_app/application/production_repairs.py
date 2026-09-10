@@ -74,6 +74,7 @@ from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceO
 from cti_app.domain.discovery import canonicalize_http_url
 from cti_app.domain.editions import EditionAuditEvent, EditionStatus
 from cti_app.domain.production import (
+    PUBLICATION_REBUILD_REQUIRED_ERROR_CODE,
     DetectionRule,
     DetectionRuleType,
     ExtractionProfile,
@@ -3859,6 +3860,12 @@ class ProductionRepairMaterializationService:
                     started=started,
                     reused_synthesis=False,
                 )
+                # The run no longer has the deliverable it claimed: it leaves
+                # READY in the same transaction as the stale, so no reader ever
+                # observes a READY run without a current PUBLICATION.
+                await _require_publication_rebuild(
+                    uow, run, retry_stage=SubjectProductionStage.SYNTHESIS.value
+                )
                 # The stale is committed with the new Extraction, so no reader
                 # ever sees the repaired content beside the old narrative.
                 await uow.commit()
@@ -4796,6 +4803,42 @@ def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
 
 
+async def _require_publication_rebuild(uow: Any, run: Any, *, retry_stage: str) -> bool:
+    """Move a run that just lost its deliverable out of READY.
+
+    Called in the SAME transaction as the stale, never after the commit:
+    between the two there would be a window where the run claims READY while
+    no PUBLICATION artifact is current -- exactly the state the review read
+    model cannot describe, since it only ever sees non-STALE artifacts.  The
+    article then shows as "à corriger" with no reason and no working gesture.
+
+    A run that is already NEEDS_REVIEW or FAILED keeps its own diagnosis: the
+    rebuild it owes is not more informative than the failure that put it
+    there.  CANCELLED is left alone entirely -- ``mark_needs_review`` refuses
+    it, and a cancelled run owns its own resume use case.
+
+    Returns whether the run actually changed.
+    """
+    if _enum_value(getattr(run, "status", None)) != SubjectProductionStatus.READY.value:
+        return False
+    mark = getattr(run, "mark_needs_review", None)
+    if not callable(mark):
+        return False
+    mark(
+        code=PUBLICATION_REBUILD_REQUIRED_ERROR_CODE,
+        message=(
+            "La publication a été invalidée par une réparation en amont. "
+            f"Reconstruction requise à partir de l'étape « {retry_stage} »."
+        ),
+        details={"retry_stage": retry_stage},
+    )
+    runs = getattr(uow, "subject_production_runs", None)
+    save = getattr(runs, "save", None) if runs is not None else None
+    if callable(save):
+        await save(run)
+    return True
+
+
 def _supplemental_repair_state(
     collection: Any, decision: ProductionRepairDecision | None
 ) -> tuple[SupplementalSourceRepairState, str]:
@@ -5206,6 +5249,12 @@ class ProductionReferenceRepairService:
             await uow.production_artifacts.append(artifact)
             await uow.production_artifacts.mark_downstream_stale(
                 run.id, ProductionArtifactStage.REFERENCES.value
+            )
+            # Same invariant as the Extraction repair: the deliverable this run
+            # published is gone, so the run cannot keep claiming READY. The
+            # transition rides the stale's transaction.
+            await _require_publication_rebuild(
+                uow, run, retry_stage=SubjectProductionStage.EXTRACTION.value
             )
             await uow.commit()
             return ProductionReferenceRepairResult(

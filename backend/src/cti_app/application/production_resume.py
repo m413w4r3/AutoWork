@@ -15,7 +15,7 @@ executing, which says nothing about whether that stage produced its artifact.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -106,6 +106,40 @@ def _artifact_completes_stage(artifact: ProductionArtifact | None) -> bool:
     return getattr(artifact, "status", ProductionArtifactStatus.VERIFIED) is not (
         ProductionArtifactStatus.STALE
     )
+
+
+def resolve_retry_stage(
+    live_artifact_stages: Collection[str],
+    *,
+    current_stage: SubjectProductionStage,
+) -> SubjectProductionStage:
+    """The stage a retry must actually start from.
+
+    Same doctrine as :func:`plan_production_resume`, applied to the Review
+    retry: ``current_stage`` is where the run last executed, which says nothing
+    about what is still missing.  An upstream repair stales SYNTHESIS and
+    PUBLICATION while the run keeps pointing at ASSEMBLY; offering ASSEMBLY
+    there sends the analyst straight into ``retry_prerequisite_missing``,
+    because ASSEMBLY requires the current SYNTHESIS artifact the repair just
+    invalidated.
+
+    So the retry aims at the first pipeline stage whose artifact is not
+    current.  SOURCES is skipped: it is evidenced by archived collections
+    rather than by an artifact, and the retry's own prerequisite check owns
+    that question.  When every stage has its artifact the run is complete, and
+    replaying its last stage is the honest answer.
+
+    ``live_artifact_stages`` holds :class:`ProductionArtifactStage` values for
+    the artifacts that are not STALE.
+    """
+    live = set(live_artifact_stages)
+    for stage in production_stages():
+        artifact_stage = STAGE_ARTIFACT[stage]
+        if artifact_stage is None:
+            continue
+        if artifact_stage.value not in live:
+            return stage
+    return current_stage
 
 
 def plan_production_resume(

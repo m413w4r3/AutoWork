@@ -1644,6 +1644,61 @@ async def test_retry_by_run_changes_only_the_requested_run(
     )
 
 
+async def test_a_refused_retry_names_the_stage_that_would_run(
+    api: AsyncClient,
+    uow: _Uow,
+) -> None:
+    """The 409 must carry an instruction, not just a machine code.
+
+    An upstream repair stales SYNTHESIS and PUBLICATION, so ASSEMBLY -- the
+    stage the run still points at -- can no longer run.  Returning a bare
+    ``{"code": ...}`` made the console fall back to "la revue de publication
+    n'a pas pu être mise à jour", which tells the analyst nothing and hides the
+    one gesture that works.
+    """
+    subject_id = uuid4()
+    run = _terminal_run(uuid4(), subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
+    await uow.subject_production_runs.add(run)
+    (await uow.editions.get(run.edition_id)).status = EditionStatus.REVIEW
+    # Everything downstream of EXTRACTION was invalidated by the repair.
+    await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.REFERENCES))
+    await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.EXTRACTION))
+
+    response = await api.post(f"/api/production/runs/{run.id}/retry", json={"stage": "assembly"})
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "retry_prerequisite_missing"
+    assert detail["missing_artifact"] == "synthesis"
+    assert detail["requested_stage"] == "assembly"
+    # The stage the analyst should actually run, and a message that says so.
+    assert detail["retry_stage"] == "synthesis"
+    assert "Synthèse" in detail["message"]
+    # Nothing was started: a refused retry must not open a generation.
+    assert uow.subject_production_runs.items[run.id].pipeline_generation == 0
+
+
+async def test_the_named_retry_stage_is_the_one_that_succeeds(
+    api: AsyncClient,
+    uow: _Uow,
+) -> None:
+    """Following the instruction the refusal gave must actually work."""
+    subject_id = uuid4()
+    run = _terminal_run(uuid4(), subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
+    await uow.subject_production_runs.add(run)
+    (await uow.editions.get(run.edition_id)).status = EditionStatus.REVIEW
+    await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.REFERENCES))
+    await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.EXTRACTION))
+
+    refused = await api.post(f"/api/production/runs/{run.id}/retry", json={"stage": "assembly"})
+    stage = refused.json()["detail"]["retry_stage"]
+    accepted = await api.post(f"/api/production/runs/{run.id}/retry", json={"stage": stage})
+
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["requested_stage"] == "synthesis"
+    assert uow.subject_production_runs.items[run.id].pipeline_generation == 1
+
+
 async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
     api: AsyncClient,
     uow: _Uow,

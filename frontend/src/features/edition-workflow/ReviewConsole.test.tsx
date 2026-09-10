@@ -441,6 +441,83 @@ describe("ReviewConsole", () => {
     });
   });
 
+  it("explique la dette de reconstruction et nomme l’étape à rejouer", async () => {
+    // Le pipeline a réussi puis une réparation amont a invalidé la
+    // publication : le run ne porte donc aucune erreur. Sans ce message, la
+    // carte affichait un « À corriger » nu et un bouton « Réessayer » pointé
+    // sur l’assemblage, dont le prérequis venait d’être périmé.
+    const item = makeItem({
+      run_id: "run-rebuild",
+      run_status: "ready",
+      effective_decision: "include",
+      included: false,
+      blocking: true,
+      rebuild_required: true,
+      can_retry: true,
+      retry_stage: "synthesis",
+      error_message: null,
+      document_artifact_id: null,
+      document_artifact_version: null,
+      document_input_hash: null,
+    });
+    const { fetchMock } = renderReview(makeReview([item]));
+    const user = userEvent.setup();
+
+    expect(
+      await screen.findByText(/invalidée par une réparation en amont/),
+    ).toBeInTheDocument();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Reconstruire (Synthèse)" }),
+    );
+
+    await waitFor(() => expect(postCalls(fetchMock)).toHaveLength(1));
+    const [url, init] = postCall(fetchMock);
+    expect(url).toBe("/api/production/runs/run-rebuild/retry");
+    expect(JSON.parse(bodyOf(init))).toEqual({ stage: "synthesis" });
+  });
+
+  it("affiche le message du backend quand la reconstruction est refusée", async () => {
+    const item = makeItem({
+      run_id: "run-refused",
+      run_status: "ready",
+      included: false,
+      blocking: true,
+      rebuild_required: true,
+      can_retry: true,
+      retry_stage: "assembly",
+      document_artifact_id: null,
+      document_artifact_version: null,
+      document_input_hash: null,
+    });
+    const { fetchMock } = renderReview(makeReview([item]), () =>
+      Promise.resolve(
+        Response.json(
+          {
+            detail: {
+              code: "retry_prerequisite_missing",
+              retry_stage: "synthesis",
+              message:
+                "La publication doit être reconstruite après la réparation en amont. Étape requise : Synthèse.",
+            },
+          },
+          { status: 409 },
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Reconstruire (Assemblage)" }),
+    );
+
+    // Le libellé générique masquait la seule information exploitable.
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Étape requise : Synthèse.",
+    );
+    expect(fetchMock).toBeDefined();
+  });
+
   it("ne dérive pas retry_stage depuis un item non retryable", async () => {
     renderReview(
       makeReview([

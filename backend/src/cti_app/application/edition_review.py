@@ -16,9 +16,11 @@ from cti_app.application.production_repairs import (
     repair_issue_execution_state,
     repair_issue_pending_references,
 )
+from cti_app.application.production_resume import resolve_retry_stage
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
     ProductionArtifactStatus,
+    ProductionDerivedOutput,
     ProductionRepairImpact,
     ProductionRepairImpactKind,
     ProductionRepairIssueKind,
@@ -73,6 +75,57 @@ class EditionReviewReadItem:
     rejected_other_artifact_count: int = 0
     rejected_rule_count: int = 0
     published_rule_count: int = 0
+    #: ``ProductionArtifactStage`` values whose artifact is not STALE.
+    #: ``None`` means the caller did not supply the artifact inventory, which
+    #: is not the same fact as "nothing is current"; the distinction decides
+    #: whether a stage can be named at all.
+    live_artifact_stages: frozenset[str] | None = None
+
+    @property
+    def rebuild_required(self) -> bool:
+        """The article owes a rebuild: it has no deliverable to publish.
+
+        Derived from the artifacts, never from the repair decisions.  A repair
+        is one cause among others -- a reference reconciliation, an import, a
+        manual stale -- and an article can be missing its deliverable with no
+        open repair issue at all.  Making the decisions the source of truth is
+        what left such articles invisible to the Repair Desk, hence with no
+        gesture that works.
+
+        The current PUBLICATION artifact is the whole question: the read model
+        only ever joins non-STALE rows, so a staled or absent publication both
+        surface here as no document.  A staled SYNTHESIS under a valid
+        PUBLICATION is not a rebuild debt -- the article is still publishable
+        exactly as it stands -- and the repair paths stale the two together
+        anyway.
+
+        QUEUED and RUNNING are excluded: a run in flight is expected not to
+        have its outputs yet, and the pipeline itself owns that.
+        """
+        if self.run_status in {
+            SubjectProductionStatus.QUEUED,
+            SubjectProductionStatus.RUNNING,
+        }:
+            return False
+        return (
+            self.document_artifact_id is None
+            or self.document_artifact_status is not ProductionArtifactStatus.VERIFIED
+        )
+
+    @property
+    def rebuild_stage(self) -> SubjectProductionStage | None:
+        """The stage the rebuild must start from, read off the artifacts.
+
+        ``None`` when the artifact inventory was not supplied: naming a stage
+        from an unknown state would send the analyst to the wrong gesture,
+        which is the failure this whole path exists to remove.
+        """
+        if self.live_artifact_stages is None:
+            return None
+        return resolve_retry_stage(
+            self.live_artifact_stages,
+            current_stage=SubjectProductionStage.ASSEMBLY,
+        )
 
 
 class EditionReviewReadRepository(Protocol):
@@ -165,6 +218,9 @@ class EditionReviewItem:
     active_repair_count: int = 0
     unresolved_repair_count: int = 0
     pending_rebuild_count: int = 0
+    #: The article has no current deliverable and owes a rebuild. Derived from
+    #: the artifacts, so it is true whether or not a repair issue is open.
+    rebuild_required: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,10 +412,21 @@ class EditionRepairReadService:
             if start + len(page) < len(page_records) and page
             else None
         )
+        # An article can owe a rebuild without carrying a single repair issue:
+        # a reference reconciliation, an import or a manual stale all destroy
+        # the deliverable without arbitrating anything. Deriving the debt from
+        # the issues alone is what hid those articles from the Repair Desk.
+        rebuild_rows = tuple(
+            row
+            for row in rows
+            if row.rebuild_required
+            and _row_in_publication_scope(row)
+            and (subject_id is None or row.subject_id == subject_id)
+        )
         return EditionRepairPage(
-            summary=_repair_summary(scoped),
+            summary=_repair_summary(scoped, rebuild_rows),
             items=page,
-            articles=_repair_articles(scoped),
+            articles=_repair_articles(scoped, rebuild_rows),
             next_cursor=next_cursor,
         )
 
@@ -490,7 +557,10 @@ def _row_in_publication_scope(row: EditionReviewReadItem) -> bool:
     return decision is not PublicationDecision.EXCLUDE
 
 
-def _repair_summary(items: Sequence[EditionRepairItem]) -> EditionRepairSummary:
+def _repair_summary(
+    items: Sequence[EditionRepairItem],
+    rebuild_rows: Sequence[EditionReviewReadItem] = (),
+) -> EditionRepairSummary:
     # Counters that gate sign-off only describe the publication scope; an
     # excluded article keeps its issues listed but adds no edition-level debt.
     in_scope = [item for item in items if item.in_publication_scope]
@@ -515,13 +585,19 @@ def _repair_summary(items: Sequence[EditionRepairItem]) -> EditionRepairSummary:
             for item in open_items
         ),
         articles_with_repairs=len({item.subject_id for item in items}),
+        # The artifact-derived debt is the source of truth; a repair issue
+        # asking for a rebuild is one way to incur it, not the definition.
         articles_needing_rebuild=len(
             {item.subject_id for item in in_scope if item.rebuild_required}
+            | {row.subject_id for row in rebuild_rows}
         ),
     )
 
 
-def _repair_articles(items: Sequence[EditionRepairItem]) -> tuple[EditionRepairArticle, ...]:
+def _repair_articles(
+    items: Sequence[EditionRepairItem],
+    rebuild_rows: Sequence[EditionReviewReadItem] = (),
+) -> tuple[EditionRepairArticle, ...]:
     by_subject: dict[UUID, list[EditionRepairItem]] = {}
     for item in items:
         by_subject.setdefault(item.subject_id, []).append(item)
@@ -536,12 +612,24 @@ def _repair_articles(items: Sequence[EditionRepairItem]) -> tuple[EditionRepairA
         "synthesis": 5,
         "none": 6,
     }
+    # The artifact-derived debt outranks "none": an article with no current
+    # deliverable always names the stage that rebuilds it, whether or not any
+    # repair issue happens to ask for one.
+    rebuild_by_subject = {row.subject_id: row for row in rebuild_rows}
+
     articles: list[tuple[int, EditionRepairArticle]] = []
     for subject_id, subject_items in by_subject.items():
         recommended = min(
             (item.recommended_stage or "none" for item in subject_items),
             key=lambda value: priority.get(value, 99),
         )
+        rebuild_row = rebuild_by_subject.pop(subject_id, None)
+        rebuild_stage = rebuild_row.rebuild_stage if rebuild_row is not None else None
+        if rebuild_stage is not None:
+            recommended = min(
+                (recommended, rebuild_stage.value),
+                key=lambda value: priority.get(value, 99),
+            )
         articles.append(
             (
                 min(item.position for item in subject_items),
@@ -565,7 +653,49 @@ def _repair_articles(items: Sequence[EditionRepairItem]) -> tuple[EditionRepairA
                 ),
             )
         )
+    # Whatever is left owes a rebuild without carrying a single repair issue.
+    # It still needs a row, or the Repair Desk offers the analyst nothing.
+    for row in rebuild_by_subject.values():
+        rebuild_stage = row.rebuild_stage
+        if rebuild_stage is None:
+            continue
+        articles.append(
+            (
+                row.position,
+                EditionRepairArticle(
+                    subject_id=row.subject_id,
+                    has_pending_projection=False,
+                    recommended_stage=rebuild_stage.value,
+                    execution_plan=_rebuild_only_execution_plan(rebuild_stage),
+                    active_repair_count=0,
+                    resolved_since_last_build_count=0,
+                ),
+            )
+        )
     return tuple(item for _position, item in sorted(articles, key=lambda pair: pair[0]))
+
+
+def _rebuild_only_execution_plan(stage: SubjectProductionStage) -> RepairExecutionPlan:
+    """The plan for an article that owes only a rebuild, with no arbitration.
+
+    Nothing is pending an analyst decision here: the deliverable was destroyed
+    upstream and has to be produced again.  SYNTHESIS is the one stage in that
+    set that owes a provider call; the rest is deterministic.
+    """
+    model_call_required = stage in {
+        SubjectProductionStage.REFERENCES,
+        SubjectProductionStage.SYNTHESIS,
+    }
+    return RepairExecutionPlan(
+        impact_kind=ProductionRepairImpactKind.NARRATIVE,
+        affected_outputs=frozenset(
+            {ProductionDerivedOutput.SYNTHESIS, ProductionDerivedOutput.PUBLICATION}
+        ),
+        model_call_required=model_call_required,
+        provider_steps=(f"Rejouer l'étape « {stage.value} »",) if model_call_required else (),
+        deterministic_steps=("Reconstruction de la publication", "Contrôle QA"),
+        ready_to_apply=True,
+    )
 
 
 def _impact_from_execution_plan(plan: RepairExecutionPlan) -> ProductionRepairImpact:
@@ -901,6 +1031,7 @@ def _build_item(row: EditionReviewReadItem, repair_issues: Sequence[Any] = ()) -
         active_repair_count=active_repair_count,
         unresolved_repair_count=unresolved_repair_count,
         pending_rebuild_count=pending_rebuild_count,
+        rebuild_required=row.rebuild_required,
     )
 
 

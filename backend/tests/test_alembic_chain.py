@@ -11,6 +11,7 @@ EXPECTED_CHAIN = (
     "0002_repair_desk_compat",
     "0003_manual_source_archival",
     "0004_repair_corrections",
+    "0005_publication_rebuild",
 )
 
 
@@ -30,4 +31,5 @@ def test_alembic_chain_has_one_short_head_and_exact_revisions() -> None:
         "0002_repair_desk_compat": "0001_baseline",
         "0003_manual_source_archival": "0002_repair_desk_compat",
         "0004_repair_corrections": "0003_manual_source_archival",
+        "0005_publication_rebuild": "0004_repair_corrections",
     }

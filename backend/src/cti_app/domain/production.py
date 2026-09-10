@@ -202,13 +202,9 @@ class ProductionRepairImpact:
         if self.kind in NARRATIVE_REPAIR_IMPACT_KINDS:
             return
         if self.model_call_required:
-            raise RepairImpactInvariantError(
-                f"{self.kind.value} must not require a model call"
-            )
+            raise RepairImpactInvariantError(f"{self.kind.value} must not require a model call")
         if self.provider_steps:
-            raise RepairImpactInvariantError(
-                f"{self.kind.value} must not declare provider steps"
-            )
+            raise RepairImpactInvariantError(f"{self.kind.value} must not declare provider steps")
         forbidden = self.affected_outputs & _NARRATIVE_ONLY_OUTPUTS
         if forbidden:
             raise RepairImpactInvariantError(
@@ -315,6 +311,14 @@ class RepairIssueExecutionState:
 
 
 PRODUCTION_RECONCILIATION_ERROR_CODE = "model_submission_reconciliation_required"
+
+# A repair invalidated an output the run had already delivered. READY means
+# "assembly complete and QA passed", so a run whose PUBLICATION was staled and
+# not rebuilt in the same transaction is no longer READY -- it owes a rebuild.
+# Without this code the run keeps claiming READY while the review read model,
+# which only ever sees non-STALE artifacts, reports no document at all: the
+# article shows up as "à corriger" with no reason and no working gesture.
+PUBLICATION_REBUILD_REQUIRED_ERROR_CODE = "publication_rebuild_required"
 
 # Bridge review reasons that all describe the same situation: the prompt was
 # submitted, ChatGPT did not close the turn, and the answer may still be visible

@@ -261,6 +261,29 @@ describe("PublicationConsole", () => {
     ).toBe(true);
   });
 
+  it("propose l’archive des règles à côté du bulletin, sans fetcher le ZIP", async () => {
+    const release = {
+      ...baseRelease,
+      edition_status: "published" as const,
+      assembly_status: "succeeded" as const,
+      release_id: "release-1",
+      docx_available: true,
+      published_at: "2026-08-29T10:00:00Z",
+    };
+    const { fetchMock } = renderConsole("published", release);
+    const link = await screen.findByRole("link", {
+      name: "Télécharger les règles (ZIP)",
+    });
+    expect(link).toHaveAttribute(
+      "href",
+      "/api/editions/edition-1/release/rules",
+    );
+    expect(link).toHaveAttribute("download");
+    expect(
+      fetchMock.mock.calls.every(([input]) => !urlOf(input).endsWith("/rules")),
+    ).toBe(true);
+  });
+
   it("conserve le téléchargement en mode ARCHIVED et n’affiche pas de commande", async () => {
     const release = { ...baseRelease, docx_available: true };
     renderConsole("archived", release);
@@ -268,6 +291,9 @@ describe("PublicationConsole", () => {
       await screen.findByRole("link", {
         name: "Télécharger le bulletin DOCX",
       }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Télécharger les règles (ZIP)" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });

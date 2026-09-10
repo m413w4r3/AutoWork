@@ -36,6 +36,7 @@ from cti_app.application.edition_release_materialization import (
     EditionReleaseRematerializationService,
 )
 from cti_app.application.edition_review import EditionRepairReadService, EditionReviewService
+from cti_app.application.edition_rule_archive import EditionRuleArchiveService
 from cti_app.application.edition_workspace import (
     EditionProductionCheckpointService,
     EditionWorkspaceMaterializer,
@@ -341,6 +342,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory,
         production_artifact_store,
         repair_issue_reader=production_repair_issue_service,
+    )
+    app.state.edition_rule_archive_service = EditionRuleArchiveService(
+        uow_factory,
+        production_artifact_store,
     )
     app.state.edition_release_rematerializer = edition_release_rematerializer
     yield

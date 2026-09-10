@@ -44,6 +44,10 @@ from cti_app.application.edition_review import (
     ReviewItemStaleError,
     issue_application_state,
 )
+from cti_app.application.edition_rule_archive import (
+    EditionRuleArchiveError,
+    EditionRuleArchiveService,
+)
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
@@ -146,6 +150,9 @@ class ReviewItemView(BaseModel):
     active_repair_count: int = 0
     unresolved_repair_count: int = 0
     pending_rebuild_count: int = 0
+    # The article has no current deliverable. Derived from the artifacts, so it
+    # is true whether or not a repair issue is open on the article.
+    rebuild_required: bool = False
     # The frontend must never infer the retry policy from an error message:
     # ``can_retry`` and ``requires_reconciliation`` are mutually exclusive and
     # each names exactly one operator action.
@@ -411,6 +418,16 @@ def _preview_service(request: Request) -> EditionPreviewService:
             request.app.state.uow_factory,
             request.app.state.production_artifact_store,
             repair_issue_reader=getattr(request.app.state, "production_repair_issue_service", None),
+        )
+    return configured
+
+
+def _rule_archive_service(request: Request) -> EditionRuleArchiveService:
+    configured = getattr(request.app.state, "edition_rule_archive_service", None)
+    if configured is None:
+        configured = EditionRuleArchiveService(
+            request.app.state.uow_factory,
+            request.app.state.production_artifact_store,
         )
     return configured
 
@@ -1436,6 +1453,23 @@ async def download_edition_docx(edition_id: UUID, request: Request) -> Response:
     )
 
 
+@router.get("/editions/{edition_id}/release/rules")
+async def download_edition_rules(edition_id: UUID, request: Request) -> Response:
+    """Return every detection rule published by the edition, as one ZIP."""
+    try:
+        archive = await _rule_archive_service(request).build(edition_id)
+    except Exception as exc:
+        _raise_publication_error(exc)
+    return Response(
+        content=archive.content,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{archive.filename}"',
+            "X-Rule-Count": str(archive.rule_count),
+        },
+    )
+
+
 @router.get("/editions/{edition_id}/preview/docx")
 async def download_edition_preview_docx(
     edition_id: UUID,
@@ -1512,6 +1546,7 @@ def _review_view(review: EditionReview) -> EditionReviewView:
                 active_repair_count=item.active_repair_count,
                 unresolved_repair_count=item.unresolved_repair_count,
                 pending_rebuild_count=item.pending_rebuild_count,
+                rebuild_required=item.rebuild_required,
                 can_retry=item.can_retry,
                 retry_stage=item.retry_stage,
                 can_resume=item.can_resume,
@@ -1681,6 +1716,13 @@ def _raise_review_error(exc: Exception) -> NoReturn:
 
 
 def _raise_publication_error(exc: Exception) -> NoReturn:
+    if isinstance(exc, EditionRuleArchiveError):
+        status_code = (
+            status.HTTP_404_NOT_FOUND
+            if exc.code in {"edition_not_found", "publication_manifest_not_found"}
+            else status.HTTP_409_CONFLICT
+        )
+        raise HTTPException(status_code=status_code, detail={"code": exc.code}) from exc
     if isinstance(exc, EditionPreviewStaleError):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

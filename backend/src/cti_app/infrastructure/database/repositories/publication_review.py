@@ -12,6 +12,7 @@ from cti_app.application.edition_review import (
     requires_reconciliation,
     review_item_can_retry,
 )
+from cti_app.application.production_resume import resolve_retry_stage
 from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
     ProductionArtifactStage,
@@ -181,6 +182,19 @@ class SqlAlchemyEditionReviewReadRepository:
             )
             .subquery("current_review_extraction")
         )
+        # Which stages still hold a current artifact, per run.  The review has
+        # to answer "what is missing", not merely "is the document verified":
+        # a repair stales SYNTHESIS and PUBLICATION together, and the retry it
+        # offers must aim at the first gap, not at the run's last stage.
+        live_stages = (
+            select(
+                ProductionArtifactRow.production_run_id.label("run_id"),
+                func.array_agg(ProductionArtifactRow.stage.distinct()).label("stages"),
+            )
+            .where(ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value)
+            .group_by(ProductionArtifactRow.production_run_id)
+            .subquery("current_review_live_stages")
+        )
         group_title = (
             select(EditorialGroupRow.title)
             .where(
@@ -210,6 +224,7 @@ class SqlAlchemyEditionReviewReadRepository:
                 current_artifacts.c.artifact_version,
                 current_artifacts.c.artifact_hash,
                 current_artifacts.c.artifact_status,
+                live_stages.c.stages.label("live_artifact_stages"),
                 func.coalesce(current_extraction.c.rejected_indicator_count, 0).label(
                     "rejected_indicator_count"
                 ),
@@ -279,6 +294,10 @@ class SqlAlchemyEditionReviewReadRepository:
                     current_extraction.c.run_id == EditionProductionBatchItemRow.production_run_id,
                     current_extraction.c.artifact_rank == 1,
                 ),
+            )
+            .outerjoin(
+                live_stages,
+                live_stages.c.run_id == EditionProductionBatchItemRow.production_run_id,
             )
             .outerjoin(
                 PublicationReviewDecisionRow,
@@ -354,6 +373,7 @@ def _reconciliation_from_row(row: Any, run_id: UUID) -> ProductionSubmissionReco
 
 def _read_item_from_row(row: Any) -> EditionReviewReadItem:
     run_status = SubjectProductionStatus(row["run_status"])
+    live_artifact_stages = frozenset(row["live_artifact_stages"] or ())
     artifact_status = (
         ProductionArtifactStatus(row["artifact_status"])
         if row["artifact_status"] is not None
@@ -385,7 +405,15 @@ def _read_item_from_row(row: Any) -> EditionReviewReadItem:
         effective_decision=(
             PublicationDecision(row["decision"]) if row["decision"] is not None else None
         ),
-        retry_stage=SubjectProductionStage(row["current_stage"]) if can_retry else None,
+        live_artifact_stages=live_artifact_stages,
+        retry_stage=(
+            resolve_retry_stage(
+                live_artifact_stages,
+                current_stage=SubjectProductionStage(row["current_stage"]),
+            )
+            if can_retry
+            else None
+        ),
         reconciliation=reconciliation,
         rejected_indicator_count=row["rejected_indicator_count"] or 0,
         rejected_ioc_count=row["rejected_ioc_count"] or 0,

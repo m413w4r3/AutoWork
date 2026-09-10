@@ -2543,6 +2543,12 @@ h1 {
   margin: 0;
 }
 
+.publication-console__downloads {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
 .publication-console__download {
   justify-self: start;
   text-decoration: none;

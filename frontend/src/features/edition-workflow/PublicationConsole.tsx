@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 import {
   acceptEditionPublication,
   editionDocxUrl,
+  editionRulesUrl,
   getEditionRelease,
   type EditionReleaseResponse,
 } from "../../api/publication";
@@ -34,13 +35,22 @@ function invalidatePublication(
 
 function DownloadAction({ editionId }: { editionId: string }) {
   return (
-    <a
-      className="button publication-console__download"
-      href={editionDocxUrl(editionId)}
-      download
-    >
-      Télécharger le bulletin DOCX
-    </a>
+    <div className="publication-console__downloads">
+      <a
+        className="button publication-console__download"
+        href={editionDocxUrl(editionId)}
+        download
+      >
+        Télécharger le bulletin DOCX
+      </a>
+      <a
+        className="button publication-console__download publication-console__download--rules"
+        href={editionRulesUrl(editionId)}
+        download
+      >
+        Télécharger les règles (ZIP)
+      </a>
+    </div>
   );
 }
 

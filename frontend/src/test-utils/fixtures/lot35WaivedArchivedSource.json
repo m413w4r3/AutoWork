@@ -135,6 +135,7 @@
         "active_repair_count": 1,
         "unresolved_repair_count": 0,
         "pending_rebuild_count": 1,
+        "rebuild_required": false,
         "can_retry": false,
         "retry_stage": null,
         "can_resume": false,

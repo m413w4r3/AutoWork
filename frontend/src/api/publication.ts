@@ -134,6 +134,13 @@ export interface ReviewItem {
   active_repair_count?: number;
   unresolved_repair_count?: number;
   /**
+   * The article has no current publication artifact and owes a rebuild. The
+   * backend derives it from the artifacts, so it is true whether or not a
+   * repair issue is open — an upstream repair, a reference reconciliation or
+   * an import all destroy the deliverable without arbitrating anything.
+   */
+  rebuild_required?: boolean;
+  /**
    * The backend owns the Review action policy. `can_retry` and
    * `requires_reconciliation` are mutually exclusive, so the UI never has to
    * infer which action is legal from an error message.
@@ -577,6 +584,15 @@ export function getEditionRelease(
 
 export function editionDocxUrl(editionId: string): string {
   return `/api/editions/${encodeURIComponent(editionId)}/release/docx`;
+}
+
+/**
+ * ZIP of every detection rule published by the edition, grouped by engine.
+ * The rules are not part of the bulletin document: the backend rebuilds the
+ * archive from the extraction artifacts pinned by the publication manifest.
+ */
+export function editionRulesUrl(editionId: string): string {
+  return `/api/editions/${encodeURIComponent(editionId)}/release/rules`;
 }
 
 export function getEditionPreview(

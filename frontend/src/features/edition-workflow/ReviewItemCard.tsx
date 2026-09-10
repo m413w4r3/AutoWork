@@ -16,6 +16,24 @@ import type { RepairQueueFilter } from "./RepairQueue";
 
 const STALE_MESSAGE =
   "Cet article a changé depuis son ouverture. La revue a été rechargée.";
+
+/**
+ * An article whose publication was invalidated upstream carries no run error
+ * of its own: the pipeline succeeded, then a repair destroyed the deliverable.
+ * Saying nothing left the analyst with a bare "À corriger", so the card states
+ * the debt and the retry button says "Reconstruire" rather than "Réessayer".
+ */
+const REBUILD_MESSAGE =
+  "La publication a été invalidée par une réparation en amont. " +
+  "L’article doit être reconstruit avant d’être publié.";
+
+const STAGE_LABELS: Record<string, string> = {
+  sources: "Collecte des sources",
+  references: "Références",
+  extraction: "Extraction",
+  synthesis: "Synthèse",
+  assembly: "Assemblage",
+};
 function isStaleReviewError(error: unknown): boolean {
   return error instanceof ApiError && error.code === "review_item_stale";
 }
@@ -203,6 +221,9 @@ export function ReviewItemCard({
     item.can_resume === true &&
     item.run_status === "cancelled" &&
     !needsReconciliation;
+  // A rebuild debt is not a run failure: the run reports success and carries
+  // no error. It still has nothing to publish, so it needs its own wording.
+  const needsRebuild = item.rebuild_required === true && !isExcluded;
   const isProblem =
     item.run_status === "failed" ||
     item.run_status === "needs_review" ||
@@ -227,6 +248,18 @@ export function ReviewItemCard({
     retry.error ??
     resume.error ??
     cancel.error;
+  // The backend resolves the stage a retry must start from; naming it here
+  // tells the analyst what the click will actually run and what it will cost.
+  const retryStageLabel =
+    item.retry_stage !== null ? STAGE_LABELS[item.retry_stage] : null;
+  const retryLabel = needsRebuild
+    ? retryStageLabel
+      ? `Reconstruire (${retryStageLabel})`
+      : "Reconstruire"
+    : "Réessayer";
+  const retryPendingLabel = needsRebuild
+    ? "Reconstruction…"
+    : "Nouvelle tentative…";
   const hasLossSignals =
     item.rejected_indicator_count > 0 ||
     item.rejected_rule_count > 0 ||
@@ -293,6 +326,8 @@ export function ReviewItemCard({
 
       {isProblem && item.error_message ? (
         <p className="review-item-card__message">{item.error_message}</p>
+      ) : needsRebuild ? (
+        <p className="review-item-card__message">{REBUILD_MESSAGE}</p>
       ) : null}
 
       <div className="review-item-card__actions">
@@ -346,7 +381,7 @@ export function ReviewItemCard({
                 disabled={actionPending}
                 onClick={() => retry.mutate()}
               >
-                {retry.isPending ? "Nouvelle tentative…" : "Réessayer"}
+                {retry.isPending ? retryPendingLabel : retryLabel}
               </button>
             ) : null}
             <button
@@ -376,7 +411,7 @@ export function ReviewItemCard({
             disabled={actionPending}
             onClick={() => retry.mutate()}
           >
-            {retry.isPending ? "Nouvelle tentative…" : "Réessayer"}
+            {retry.isPending ? retryPendingLabel : retryLabel}
           </button>
         ) : null}
       </div>

@@ -34,6 +34,7 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
+from cti_app.domain.publication_review import PublicationDecision
 
 EDITION_ID = UUID("11111111-1111-4111-8111-111111111111")
 SUBJECT_A = UUID("22222222-2222-4222-8222-222222222222")
@@ -272,6 +273,79 @@ async def test_repair_summary_separates_ioc_rule_other_and_resolved() -> None:
     ).list(EDITION_ID, status="resolved", limit=20)
     assert len(resolved.items) == 1
     assert resolved.items[0].resolved
+
+
+def _broken_row(subject_id: UUID, position: int) -> EditionReviewReadItem:
+    """A run whose publication was invalidated upstream and never rebuilt.
+
+    READY, no current publication artifact, and -- crucially -- no repair issue
+    of its own: a references reconciliation or a state import destroys the
+    deliverable without arbitrating anything.
+    """
+    return replace(
+        _row(subject_id, position),
+        document_artifact_id=None,
+        document_artifact_version=None,
+        document_input_hash=None,
+        document_artifact_status=None,
+        live_artifact_stages=frozenset(
+            {
+                ProductionArtifactStage.REFERENCES.value,
+                ProductionArtifactStage.EXTRACTION.value,
+            }
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_article_with_no_repair_issue_still_appears_when_it_owes_a_rebuild() -> None:
+    """Deriving the debt from the decisions made these articles invisible.
+
+    The desk listed nothing for them, so the analyst had no gesture at all --
+    while the review showed a bare "À corriger".
+    """
+    healthy = _row(SUBJECT_A, 1)
+    broken = _broken_row(SUBJECT_B, 2)
+    page = await EditionRepairReadService(
+        _ReadModelFactory(_ReadModelUow([healthy, broken])),
+        _IssueReader([_issue(1, healthy)]),  # type: ignore[arg-type]
+    ).list(EDITION_ID, limit=20)
+
+    assert page.summary.articles_needing_rebuild == 1
+    article = next(item for item in page.articles if item.subject_id == SUBJECT_B)
+    # The stage named here is the one the retry endpoint will accept.
+    assert article.recommended_stage == "synthesis"
+    assert article.active_repair_count == 0
+    assert article.execution_plan.model_call_required is True
+
+
+@pytest.mark.asyncio
+async def test_the_rebuild_debt_outranks_a_repair_plan_that_asks_for_nothing() -> None:
+    """An article can carry a resolved issue and still owe its deliverable."""
+    broken = _broken_row(SUBJECT_A, 1)
+    page = await EditionRepairReadService(
+        _ReadModelFactory(_ReadModelUow([broken])),
+        _IssueReader([_issue(1, broken, resolved=True, projection_applied=True)]),  # type: ignore[arg-type]
+    ).list(EDITION_ID, status="all", limit=20)
+
+    assert page.summary.articles_needing_rebuild == 1
+    assert page.articles[0].recommended_stage == "synthesis"
+
+
+@pytest.mark.asyncio
+async def test_an_excluded_article_adds_no_rebuild_debt() -> None:
+    """Sign-off only counts the publication scope; an exclusion owes nothing."""
+    excluded = replace(
+        _broken_row(SUBJECT_A, 1),
+        effective_decision=PublicationDecision.EXCLUDE,
+    )
+    page = await EditionRepairReadService(
+        _ReadModelFactory(_ReadModelUow([excluded])),
+        _IssueReader([]),  # type: ignore[arg-type]
+    ).list(EDITION_ID, limit=20)
+
+    assert page.summary.articles_needing_rebuild == 0
+    assert page.articles == ()
 
 
 def test_signoff_requires_actionable_repairs_to_be_arbitrated() -> None:

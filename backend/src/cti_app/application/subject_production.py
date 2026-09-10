@@ -19,12 +19,14 @@ from cti_app.application.production_resume import (
     STAGE_ARTIFACT,
     ProductionResumePlan,
     plan_production_resume,
+    resolve_retry_stage,
 )
 from cti_app.application.production_review_recovery import prepare_batch_for_recovery
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
+    ProductionArtifactStatus,
     ProductionBatchPhase,
     ProductionBatchStatus,
     ProductionInputSnapshot,
@@ -48,6 +50,30 @@ _SOURCE_ROLE_ORDER = {
 
 class ProductionRunNotFoundError(LookupError):
     pass
+
+
+class RetryPrerequisiteMissingError(ValueError):
+    """The requested stage cannot run: its input artifact is not current.
+
+    Carries the stage that *would* run, so the caller can offer the analyst the
+    gesture that unblocks the article instead of a dead end.  ``runnable_stage``
+    is ``None`` only when nothing in the pipeline can start -- a run with no
+    archived source, typically.
+    """
+
+    code = "retry_prerequisite_missing"
+
+    def __init__(
+        self,
+        *,
+        requested_stage: SubjectProductionStage,
+        missing_artifact: str | None,
+        runnable_stage: SubjectProductionStage | None,
+    ) -> None:
+        self.requested_stage = requested_stage
+        self.missing_artifact = missing_artifact
+        self.runnable_stage = runnable_stage
+        super().__init__(self.code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,7 +656,11 @@ class SubjectProductionService:
                 source.state.value in {"archived", "extracted", "completed"} for source in sources
             )
             if not source_ready:
-                raise ValueError("retry_prerequisite_missing")
+                raise RetryPrerequisiteMissingError(
+                    requested_stage=stage,
+                    missing_artifact=None,
+                    runnable_stage=SubjectProductionStage.SOURCES,
+                )
         prerequisite = {
             SubjectProductionStage.EXTRACTION: "references",
             SubjectProductionStage.SYNTHESIS: "extraction",
@@ -642,7 +672,23 @@ class SubjectProductionService:
                 await artifacts.get_current(run_id, prerequisite) if artifacts is not None else None
             )
             if artifact is None:
-                raise ValueError("retry_prerequisite_missing")
+                # Name the stage that can actually run.  The analyst asked for
+                # the wrong one because the Review offered it; a bare refusal
+                # would leave the article with no working gesture at all.
+                live = (
+                    [
+                        item.stage.value
+                        for item in await artifacts.list_for_run(run_id)
+                        if item.status is not ProductionArtifactStatus.STALE
+                    ]
+                    if artifacts is not None
+                    else []
+                )
+                raise RetryPrerequisiteMissingError(
+                    requested_stage=stage,
+                    missing_artifact=prerequisite,
+                    runnable_stage=resolve_retry_stage(live, current_stage=stage),
+                )
 
         previous_status = run.status
         previous_stage = run.current_stage
