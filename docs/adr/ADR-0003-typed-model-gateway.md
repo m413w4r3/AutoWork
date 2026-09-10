@@ -17,9 +17,11 @@ sanitation et avant tout accès réseau. Toute exécution crée un `ModelRun` Po
 en clair ; les sorties complètes sont des blobs adressés par contenu.
 
 Les concepts Responses restent confinés à l'adaptateur OpenAI et le protocole Chat Completions
-à l'adaptateur Qwen. `ChatGPTBridgeTransport` traduit les premiers vers le contrat natif
-`/v1/bridge/*` ; la façade Responses du bridge reste explicitement non native. Les réponses
-structurées sont toujours revalidées localement.
+aux adapters qui l'implémentent réellement. Le data plane du ChatGPT Bridge passe par sa façade
+Responses `/v1/responses`; les endpoints `/v1/bridge/*` sont réservés au contrôle et à la
+récupération. Les réponses structurées sont toujours revalidées localement : le bridge ne
+fournit pas de garantie native de schéma JSON, tandis que le contrat `response_format` reste
+spécifique à Qwen.
 
 ## Conséquences
 

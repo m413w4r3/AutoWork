@@ -41,9 +41,9 @@ Capacités déclarées par AutoWork :
 
 | Backend | web search | background | conversation | structured output |
 | --- | ---: | ---: | ---: | ---: |
-| `chatgpt_bridge` | oui | oui | oui | oui |
-| `gemini_webai` | non | non | non | oui |
-| `qwen` | non | non | non | oui |
+| `chatgpt_bridge` | oui | oui | oui | oui, contrat textuel et validation locale |
+| `gemini_webai` | non | non | non | oui, validation locale uniquement |
+| `qwen` | non | non | non | oui, contrat Qwen et validation locale |
 | `fake` | permissif pour les tests | oui | permissif | oui |
 
 Le routage conceptuel est le suivant :
@@ -100,15 +100,13 @@ Il retry seulement tant que le statut est `queued` ou `in_progress`, conforméme
 Un futur transport direct vers OpenAI devra en plus tenir compte du fait que ce mode n'est pas
 compatible Zero Data Retention, avant de l'autoriser pour une classification sensible.
 
-`OpenAIStructuredAdapter` envoie `text.format.type=json_schema` avec `strict=true`, puis
-normalise le schéma Pydantic vers le sous-ensemble strict (`required` et
-`additionalProperties=false`), puis revalide malgré tout la réponse avec le modèle attendu.
-Cette défense reste nécessaire pour le bridge et pour détecter toute incompatibilité
-fournisseur. Voir la
-[documentation Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs).
-Pour la découverte, Qwen reçoit plutôt un contrat compact versionné et
-`response_format={"type":"json_object"}` ; le schéma Pydantic complet n'est jamais injecté dans
-le prompt, mais reste la référence finale locale.
+`OpenAIStructuredAdapter` ajoute un contrat textuel à l'entrée, puis revalide la réponse texte
+avec le modèle Pydantic attendu. Le ChatGPT Bridge ne fournit pas de Structured Outputs natifs
+OpenAI : ce chemin ne doit donc pas être décrit comme une garantie fournisseur de JSON Schema.
+Pour la découverte, Qwen conserve son comportement historique : contrat compact versionné,
+`response_format={"type":"json_object"}` et validation locale finale. Gemini WebAI utilise le
+même protocole HTTP Chat Completions, mais ne reçoit ni `response_format` ni extension de schéma
+OpenAI ; sa structure éventuelle est obtenue par le prompt métier et validée localement.
 Les extractions structurées de fond sont refusées pour l'instant : reprendre un tel run exige
 de persister l'identité du schéma, ce qui appartient à un incrément ultérieur.
 
@@ -127,11 +125,11 @@ Il traduit ensuite la requête vers l'interface ChatGPT :
   (`metadata.web_search_mode = ui_tool`), sinon il retombe sur l'instruction dans le prompt
   (`prompt_instructed`) ; dans les deux cas il ne fabrique pas les objets sources natifs
   absents de l'interface ;
-- le JSON Schema est injecté comme contrainte et validé par l'application, sans prétendre à
-  une garantie native du bridge ;
-- le contrat natif `/bridge/runs` possède un registre SQLite durable et déduplique sur l'UUID du
-  `ModelRun`. Une exécution terminée survit au redémarrage ; une exécution interrompue échoue
-  sans resoumission implicite. Seule la façade Responses historique garde un cache mémoire.
+- le contrat de structure est injecté comme instruction textuelle et validé par l'application,
+  sans prétendre à une garantie native du bridge ;
+- les contrôles de récupération du Bridge possèdent un registre SQLite durable et dédupliquent
+  sur l'UUID du `ModelRun`. Une exécution terminée survit au redémarrage ; une exécution
+  interrompue échoue sans resoumission implicite. Le data plane reste la façade Responses.
 
 L'intégration est donc remplaçable par le service Responses officiel sans modifier les ports
 métier.
@@ -173,7 +171,7 @@ table ni dans les logs. Les sorties complètes vivent dans `model-outputs/` sur 
 | `QWEN_IS_EXTERNAL` | change explicitement la frontière de confiance Qwen |
 | `WEBAI_BASE_URL` | base `/v1` du gateway WebAI-to-API |
 | `WEBAI_API_KEY` | clé Bearer optionnelle de WebAI |
-| `WEBAI_MODEL` | identifiant Gemini demandé à WebAI |
+| `WEBAI_MODEL` | identifiant Gemini demandé à WebAI, par défaut `gemini-3-flash` |
 | `WEBAI_IS_EXTERNAL` | frontière de confiance WebAI, `true` par défaut |
 | `MODEL_ROUTE_<HINT>` | backend choisi pour chaque type de tâche |
 | `MODEL_FORCE_ADAPTER` | `auto`, ou forçage de développement |
@@ -193,3 +191,6 @@ deux dépôts gardent chacun leur nom de variable.
 Le `.env.example` pointe vers le gateway Qwen retenu. Placer la clé uniquement dans `.env` ou
 un secret manager ; elle n'est jamais nécessaire pour les tests. La décision de confiance
 actuelle conserve `QWEN_IS_EXTERNAL=false`.
+
+Le modèle WebAI reste celui fourni par la configuration (`gemini-3-flash` par défaut) ; le
+catalogue `/v1/models` de WebAI n'est pas utilisé pour le remplacer.

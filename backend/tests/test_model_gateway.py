@@ -17,6 +17,7 @@ from cti_app.application.model_gateway import (
     AdapterResultStatus,
     BinaryModelInputError,
     ExternalModelBlockedError,
+    ModelCapabilities,
     ModelGateway,
     ModelGatewayError,
     ModelRequest,
@@ -46,6 +47,17 @@ from cti_app.integrations.models import (
 )
 from tests.job_support import InMemoryJobUnitOfWorkFactory
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
+
+
+def test_structured_output_capability_is_opt_in() -> None:
+    assert ModelCapabilities().structured_output is False
+    assert OpenAIStructuredAdapter.capabilities.structured_output is True
+    assert (
+        QwenAdapter(
+            FixedChatTransport(), model="Qwen3-32B", is_external=False
+        ).capabilities.structured_output
+        is True
+    )
 
 
 class SequencedResponsesTransport:

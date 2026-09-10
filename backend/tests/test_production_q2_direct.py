@@ -269,7 +269,7 @@ def test_q2_markdown_parses_compact_facts_without_changing_windows_paths() -> No
 
 
 def test_bridge_timeout_codes_are_preserved() -> None:
-    request = httpx.Request("POST", "https://bridge.test/v1/bridge/runs")
+    request = httpx.Request("POST", "https://bridge.test/v1/responses")
     for code in ("bridge_idle_timeout", "bridge_total_timeout"):
         error = _bridge_http_error(
             httpx.Response(502, request=request, json={"error": {"code": code}}), 1

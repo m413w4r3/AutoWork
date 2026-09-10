@@ -126,7 +126,9 @@ class ModelCapabilities:
     web_search: bool = False
     background: bool = False
     conversation: bool = False
-    structured_output: bool = True
+    # This is an AutoWork contract (obtain and validate a structure locally),
+    # not a claim that the provider exposes native JSON/schema controls.
+    structured_output: bool = False
 
 
 class AdapterResultStatus(StrEnum):

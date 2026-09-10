@@ -31,6 +31,13 @@ def test_model_api_keys_are_secret_values(monkeypatch: pytest.MonkeyPatch) -> No
     assert settings.qwen_api_key.get_secret_value() == "test-only-secret"
 
 
+def test_webai_defaults_keep_the_verified_gemini_model() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.webai_base_url == "http://web_ai:6969/v1"
+    assert settings.webai_model == "gemini-3-flash"
+
+
 def test_qwen_trust_boundary_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("QWEN_BASE_URL", "https://gateway.example.test/v1")
     monkeypatch.setenv("QWEN_IS_EXTERNAL", "false")

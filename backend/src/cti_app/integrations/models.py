@@ -484,83 +484,6 @@ def _archive_response_error(
     )
 
 
-class ChatGPTBridgeTransport(HttpResponsesTransport):
-    """Translate Responses-shaped adapter calls to the bridge's honest native contract."""
-
-    async def create(
-        self, payload: dict[str, Any], *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
-        tools = payload.get("tools", [])
-        web_search = isinstance(tools, list) and any(
-            isinstance(tool, dict) and tool.get("type") == "web_search" for tool in tools
-        )
-        text = payload.get("text")
-        response_format = text.get("format") if isinstance(text, dict) else None
-        bridge_payload = {
-            "requested_model": payload.get("model", "chatgpt-web"),
-            "input": payload.get("input", ""),
-            "web_search": web_search,
-            "response_format": response_format,
-            "background": bool(payload.get("background", False)),
-        }
-        if payload.get("bridge_recovery") is True:
-            bridge_payload["recovery"] = True
-        if idempotency_key:
-            bridge_payload["request_id"] = idempotency_key
-        conversation = payload.get("conversation")
-        if isinstance(conversation, dict):
-            bridge_payload["conversation"] = conversation
-        if isinstance(payload.get("bridge_profile"), str):
-            bridge_payload["profile"] = payload["bridge_profile"]
-        if isinstance(payload.get("bridge_ui_model"), str):
-            bridge_payload["ui_model"] = payload["bridge_ui_model"]
-        reasoning = payload.get("reasoning")
-        if isinstance(reasoning, dict):
-            bridge_payload["reasoning_effort"] = reasoning.get("effort")
-        return await self._request(
-            "POST",
-            "/bridge/runs",
-            json_body=bridge_payload,
-            idempotency_key=idempotency_key,
-            # Seul un 429 prouve que le bridge n'a pas admis la soumission. Une
-            # perte de réponse ou un 5xx peut suivre le clic UI : GET/recovery,
-            # jamais un second POST implicite.
-            retry=True,
-            retry_status_codes=frozenset({429}),
-        )
-
-    async def retrieve(self, response_id: str) -> dict[str, Any]:
-        return await self._request("GET", f"/bridge/runs/{response_id}")
-
-    async def preview_visible_recovery(self, bridge_run_id: str) -> dict[str, Any]:
-        return await self._request("POST", f"/bridge/runs/{bridge_run_id}/recovery/visible")
-
-    async def release_visible_recovery(self, bridge_run_id: str) -> dict[str, Any]:
-        """Release only the exact browser target retained for this bridge run."""
-        return await self._request("POST", f"/bridge/runs/{bridge_run_id}/recovery/release")
-
-    async def capabilities(self) -> dict[str, Any]:
-        return await self._request(
-            "GET", "/bridge/capabilities", timeout_seconds=self._capabilities_timeout
-        )
-
-    async def archive_conversation(self, conversation_id: UUID) -> None:
-        # Une seule tentative de transport. La reprise est pilotée plus haut,
-        # par l'orchestrateur, qui attend cinq secondes entre les deux essais :
-        # c'est ce délai qui couvre une éviction du service worker MV3, pas un
-        # rejeu immédiat dans la même fenêtre d'indisponibilité. Deux filets
-        # cumulés porteraient le pire cas à plus de six minutes par étape.
-        response = await self._request(
-            "DELETE",
-            f"/bridge/conversations/{conversation_id}",
-            phase="conversation_archive",
-            timeout_seconds=self._archive_timeout,
-            idempotency_key=f"conversation-archive-{conversation_id}",
-        )
-        if response.get("archived") is not True:
-            raise _archive_response_error(response, conversation_id)
-
-
 class ChatGPTBridgeClient(HttpResponsesTransport):
     """Responses data plane plus Bridge-only control and recovery operations."""
 
@@ -686,7 +609,9 @@ class OpenAIStructuredAdapter:
     provider = ModelProvider.OPENAI
     backend = ModelBackend.CHATGPT_BRIDGE
     transport = ModelTransport.OPENAI_RESPONSES
-    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
+    capabilities = ModelCapabilities(
+        web_search=True, background=True, conversation=True, structured_output=True
+    )
     is_external = True
 
     def __init__(self, transport: ResponsesTransport, *, model: str) -> None:
@@ -707,18 +632,18 @@ class OpenAIStructuredAdapter:
             raise ModelGatewayError(
                 "Structured background calls require a persisted schema and are not supported"
             )
+        schema = request.metadata.get("compact_contract")
+        contract = schema if isinstance(schema, dict) else output_schema.model_json_schema()
         payload: dict[str, Any] = {
             "model": self.requested_model,
-            "input": _responses_input(request),
+            "input": _responses_input(
+                request,
+                instruction=(
+                    "Réponds uniquement avec un objet JSON conforme à ce contrat : "
+                    + json.dumps(contract, sort_keys=True, ensure_ascii=False)
+                ),
+            ),
             "background": request.background,
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": output_schema.__name__.lower(),
-                    "strict": True,
-                    "schema": _strict_json_schema(output_schema),
-                }
-            },
         }
         if request.conversation is not None:
             payload["conversation"] = request.conversation.bridge_payload()
@@ -760,6 +685,7 @@ class OpenAICompatibleChatAdapter:
         backend: ModelBackend,
         model: str,
         is_external: bool,
+        capabilities: ModelCapabilities | None = None,
     ) -> None:
         self._transport = transport
         self.provider = provider
@@ -767,7 +693,7 @@ class OpenAICompatibleChatAdapter:
         self.transport = ModelTransport.OPENAI_CHAT_COMPLETIONS
         self.requested_model = model
         self.is_external = is_external
-        self.capabilities = ModelCapabilities()
+        self.capabilities = capabilities or ModelCapabilities()
 
     async def invoke(
         self,
@@ -788,18 +714,7 @@ class OpenAICompatibleChatAdapter:
             ],
         }
         if output_schema is not None:
-            compact_contract = request.metadata.get("compact_contract")
-            schema_text = json.dumps(
-                compact_contract
-                if isinstance(compact_contract, dict)
-                else output_schema.model_json_schema(),
-                sort_keys=True,
-                ensure_ascii=False,
-            )
-            payload["messages"][0]["content"] += (
-                " Réponds uniquement avec un objet JSON conforme à ce contrat : " + schema_text
-            )
-            payload["response_format"] = {"type": "json_object"}
+            self._apply_structured_contract(payload, request, output_schema)
         elif role is ModelRole.STRUCTURED_EXTRACTION:
             raise ModelGatewayError("Structured extraction requires an output schema")
         payload.update(_allowed_parameters(request.parameters, _CHAT_PARAMETERS))
@@ -820,6 +735,14 @@ class OpenAICompatibleChatAdapter:
             structured_output=structured,
         )
 
+    def _apply_structured_contract(
+        self,
+        payload: dict[str, Any],
+        request: SafeModelRequest,
+        output_schema: type[BaseModel],
+    ) -> None:
+        del payload, request, output_schema
+
     async def resume(
         self,
         response_id: str,
@@ -834,7 +757,7 @@ class OpenAICompatibleChatAdapter:
 
 
 class QwenAdapter(OpenAICompatibleChatAdapter):
-    """Compatibility wrapper around the generic OpenAI-compatible adapter."""
+    """Qwen's historical JSON contract, kept out of the shared transport adapter."""
 
     def __init__(
         self,
@@ -849,14 +772,36 @@ class QwenAdapter(OpenAICompatibleChatAdapter):
             backend=ModelBackend.QWEN,
             model=model,
             is_external=is_external,
+            capabilities=ModelCapabilities(structured_output=True),
         )
+
+    def _apply_structured_contract(
+        self,
+        payload: dict[str, Any],
+        request: SafeModelRequest,
+        output_schema: type[BaseModel],
+    ) -> None:
+        compact_contract = request.metadata.get("compact_contract")
+        schema_text = json.dumps(
+            compact_contract
+            if isinstance(compact_contract, dict)
+            else output_schema.model_json_schema(),
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        payload["messages"][0]["content"] += (
+            " Réponds uniquement avec un objet JSON conforme à ce contrat : " + schema_text
+        )
+        payload["response_format"] = {"type": "json_object"}
 
 
 class FakeModelAdapter:
     provider = ModelProvider.FAKE
     backend = ModelBackend.FAKE
     transport = ModelTransport.FAKE
-    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
+    capabilities = ModelCapabilities(
+        web_search=True, background=True, conversation=True, structured_output=True
+    )
     requested_model = "fake-deterministic-v1"
     is_external = False
 
@@ -988,8 +933,13 @@ class InMemoryModelOutputStore:
         return content
 
 
-def _responses_input(request: SafeModelRequest) -> list[dict[str, str]]:
-    return [{"role": "user", "content": request.text}]
+def _responses_input(
+    request: SafeModelRequest, *, instruction: str | None = None
+) -> list[dict[str, str]]:
+    content = request.text
+    if instruction:
+        content += "\n\n" + instruction
+    return [{"role": "user", "content": content}]
 
 
 def _responses_result(
@@ -1035,6 +985,8 @@ def _responses_result(
             usage=_usage(raw.get("usage")),
             metadata=metadata,
         )
+    if status == "failed":
+        raise _failed_response_error(raw, response_id=response_id)
     if status != "completed":
         raise ModelGatewayError(f"Model response reached terminal status {status}")
     output_text = _responses_output_text(raw)
@@ -1054,6 +1006,58 @@ def _responses_result(
         structured_output=structured,
         conversation=_conversation_result(raw),
         metadata=_response_metadata(raw),
+    )
+
+
+def _failed_response_error(raw: dict[str, Any], *, response_id: str | None) -> BridgeTransportError:
+    raw_error = raw.get("error")
+    error: dict[str, Any] = raw_error if isinstance(raw_error, dict) else {}
+    raw_metadata = raw.get("metadata")
+    metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
+    raw_details = error.get("details") or raw.get("details") or raw.get("diagnostics")
+    diagnostics = _safe_bridge_diagnostics(raw_details if isinstance(raw_details, dict) else {})
+    raw_code = error.get("code") or raw.get("code")
+    code = raw_code if isinstance(raw_code, str) and raw_code.strip() else "bridge_response_failed"
+    raw_message = error.get("message") or raw.get("message")
+    message = (
+        " ".join(raw_message.split())[:512]
+        if isinstance(raw_message, str) and raw_message.strip()
+        else "Le bridge ChatGPT a terminé la réponse en échec."
+    )
+    raw_phase = error.get("phase") or raw.get("phase") or metadata.get("phase")
+    phase = raw_phase[:64] if isinstance(raw_phase, str) and raw_phase else "generation"
+    raw_submission_state = error.get("submission_state") or raw.get("submission_state")
+    submission_state = (
+        raw_submission_state[:32]
+        if isinstance(raw_submission_state, str) and raw_submission_state
+        else None
+    )
+    raw_retryable = error.get("retryable")
+    if not isinstance(raw_retryable, bool):
+        raw_retryable = raw.get("retryable")
+    retryable = raw_retryable if isinstance(raw_retryable, bool) else False
+    raw_conversation_id = error.get("conversation_id") or raw.get("conversation_id")
+    conversation_id = (
+        raw_conversation_id
+        if isinstance(raw_conversation_id, str) and raw_conversation_id
+        else None
+    )
+    raw_reason = error.get("reason") or raw.get("reason")
+    reason = raw_reason if isinstance(raw_reason, str) and raw_reason else None
+    status_code = raw.get("status_code")
+    return BridgeTransportError(
+        code,
+        message,
+        retryable=retryable,
+        attempts=1,
+        phase=phase,
+        status_code=status_code if isinstance(status_code, int) else None,
+        bridge_run_id=response_id,
+        bridge_status="failed",
+        submission_state=submission_state,
+        diagnostics=diagnostics,
+        conversation_id=conversation_id,
+        reason=reason,
     )
 
 
@@ -1232,27 +1236,6 @@ def _fake_value(schema: dict[str, Any]) -> Any:
     if kind == "boolean":
         return False
     return "fake"
-
-
-def _strict_json_schema(schema: type[BaseModel]) -> dict[str, Any]:
-    """Produce the strict object subset expected by Responses Structured Outputs."""
-
-    def normalize(value: Any) -> Any:
-        if isinstance(value, list):
-            return [normalize(item) for item in value]
-        if not isinstance(value, dict):
-            return value
-        normalized = {key: normalize(item) for key, item in value.items() if key != "default"}
-        properties = normalized.get("properties")
-        if normalized.get("type") == "object" and isinstance(properties, dict):
-            normalized["additionalProperties"] = False
-            normalized["required"] = list(properties)
-        return normalized
-
-    result = normalize(schema.model_json_schema())
-    if not isinstance(result, dict):
-        raise ModelGatewayError("Structured output schema must be an object")
-    return result
 
 
 _RESPONSES_PARAMETERS = frozenset(

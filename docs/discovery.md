@@ -1,10 +1,10 @@
 # Découverte CTI mensuelle
 
 Le parcours comporte trois étapes visibles : recherche ChatGPT, analyse locale du rapport,
-puis sélection éditoriale. Une recherche normale effectue un seul `POST /v1/bridge/runs` avec
+puis sélection éditoriale. Une recherche normale effectue un seul `POST /v1/responses` avec
 `background=true` dans une conversation `fresh`. Le bridge répond immédiatement avec l'identité
-SQLite durable du run ; le worker reprend ensuite exclusivement par `GET /v1/bridge/runs/{id}`
-jusqu'au snapshot final. L'API OpenAI officielle n'est pas utilisée.
+du run ; le worker reprend ensuite exclusivement par `GET /v1/responses/{id}` jusqu'au snapshot
+final. Les endpoints `/v1/bridge/*` restent réservés aux contrôles et à la récupération.
 
 Pendant cette attente, le `ModelRun` reste en `WAITING_BACKGROUND` et le job reste à l'étape 2/4
 « ChatGPT recherche et analyse les sources ». Chaque poll vérifie l'annulation et renouvelle le

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -21,7 +20,6 @@ from cti_app.domain.model_runs import ModelBackend, ModelProvider, ModelRole, Mo
 from cti_app.integrations.models import (
     BridgeTransportError,
     ChatGPTBridgeClient,
-    ChatGPTBridgeTransport,
     FakeModelAdapter,
     OpenAICompatibleChatAdapter,
     OpenAIResearchAdapter,
@@ -196,6 +194,39 @@ async def test_chatgpt_bridge_client_uses_standard_responses_endpoints() -> None
     assert requests[0].headers["X-Idempotency-Key"] == "run:a1"
 
 
+async def test_failed_bridge_response_preserves_typed_diagnostics_without_resubmission() -> None:
+    transport = FakeResponsesTransport(
+        {
+            "id": "resp_failed",
+            "status": "failed",
+            "error": {
+                "code": "bridge_ui_timeout",
+                "message": "La génération a expiré.",
+                "retryable": True,
+                "phase": "submission_confirmation",
+                "submission_state": "post_submission",
+                "conversation_id": "conv_123",
+                "details": {"attempt": 2, "composer_text": "secret à exclure"},
+            },
+        }
+    )
+    adapter = OpenAIResearchAdapter(transport, model="chatgpt-web")
+
+    with pytest.raises(BridgeTransportError) as caught:
+        await adapter.invoke(safe_request(), role=ModelRole.RESEARCH)
+
+    error = caught.value
+    assert error.bridge_run_id == "resp_failed"
+    assert error.bridge_status == "failed"
+    assert error.code == "bridge_ui_timeout"
+    assert error.retryable is True
+    assert error.phase == "submission_confirmation"
+    assert error.submission_state == "post_submission"
+    assert error.conversation_id == "conv_123"
+    assert error.diagnostics == {"attempt": 2}
+    assert len(transport.created_payloads) == 1
+
+
 async def test_gemini_webai_uses_generic_chat_completions_contract() -> None:
     transport = FakeChatTransport(
         {
@@ -220,7 +251,8 @@ async def test_gemini_webai_uses_generic_chat_completions_contract() -> None:
     assert adapter.backend is ModelBackend.GEMINI_WEBAI
     assert adapter.transport is ModelTransport.OPENAI_CHAT_COMPLETIONS
     assert result.structured_output == Extraction(title="Iran", score=2)
-    assert transport.payloads[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in transport.payloads[0]
+    assert "JSON conforme" not in transport.payloads[0]["messages"][0]["content"]
 
 
 async def test_openai_structured_rejects_invalid_output() -> None:
@@ -240,11 +272,10 @@ async def test_openai_structured_rejects_invalid_output() -> None:
             role=ModelRole.STRUCTURED_EXTRACTION,
             output_schema=Extraction,
         )
-    output_format = transport.created_payloads[0]["text"]["format"]
-    assert output_format["type"] == "json_schema"
-    assert output_format["strict"] is True
-    assert output_format["schema"]["additionalProperties"] is False
-    assert output_format["schema"]["required"] == ["title", "score"]
+    payload = transport.created_payloads[0]
+    assert "text" not in payload
+    assert "response_format" not in payload
+    assert '"title"' in payload["input"][0]["content"]
 
 
 async def test_openai_needs_review_preserves_bridge_reason() -> None:
@@ -411,50 +442,6 @@ async def test_bridge_visible_citations_are_exposed_as_adapter_metadata() -> Non
     assert result.metadata["content_script_version"] == "13"
 
 
-async def test_chatgpt_bridge_transport_uses_native_capabilities() -> None:
-    requests: list[httpx.Request] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json={"transport": "chatgpt_web_ui"})
-        return httpx.Response(
-            200,
-            json={
-                "id": "resp_bridge",
-                "status": "queued",
-                "model": "chatgpt-web",
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
-        response = await transport.create(
-            {
-                "model": "premium-profile",
-                "input": [{"role": "user", "content": "Texte"}],
-                "tools": [{"type": "web_search"}],
-                "text": {"format": {"type": "json_schema", "schema": {"type": "object"}}},
-                "background": True,
-                "reasoning": {"effort": "high"},
-            }
-        )
-        capabilities = await transport.capabilities()
-
-    body = json.loads(requests[0].content)
-    assert requests[0].url.path == "/v1/bridge/runs"
-    assert body == {
-        "requested_model": "premium-profile",
-        "input": [{"role": "user", "content": "Texte"}],
-        "web_search": True,
-        "response_format": {"type": "json_schema", "schema": {"type": "object"}},
-        "background": True,
-        "reasoning_effort": "high",
-    }
-    assert response["status"] == "queued"
-    assert capabilities == {"transport": "chatgpt_web_ui"}
-
-
 async def test_bridge_capabilities_and_archive_use_separate_timeouts() -> None:
     class _TimeoutClient:
         def __init__(self) -> None:
@@ -472,7 +459,7 @@ async def test_bridge_capabilities_and_archive_use_separate_timeouts() -> None:
             return httpx.Response(200, json={"archived": True})
 
     client = _TimeoutClient()
-    transport = ChatGPTBridgeTransport(
+    transport = ChatGPTBridgeClient(
         "http://bridge.test/v1",
         capabilities_timeout_seconds=2,
         archive_timeout_seconds=60,
@@ -502,7 +489,7 @@ async def test_bridge_classifies_http_errors_and_never_retries_auth(
         return httpx.Response(status, json={"error": {"message": "unsafe upstream detail"}})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
+        transport = ChatGPTBridgeClient("http://bridge.test/v1", client=client)
         with pytest.raises(BridgeTransportError) as caught:
             await transport.create({"input": "secret"}, idempotency_key="stable")
 
@@ -563,7 +550,7 @@ async def test_bridge_archive_requires_archived_true_on_http_2xx() -> None:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
+        transport = ChatGPTBridgeClient("http://bridge.test/v1", client=client)
         with pytest.raises(BridgeTransportError) as caught:
             await transport.archive_conversation(UUID(conversation_id))
 
@@ -593,7 +580,7 @@ async def test_bridge_archive_accepts_only_explicit_archived_true() -> None:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
+        transport = ChatGPTBridgeClient("http://bridge.test/v1", client=client)
         await transport.archive_conversation(conversation_id)
 
 
@@ -607,7 +594,7 @@ async def test_bridge_archive_read_timeout_is_not_retried() -> None:
 
     conversation_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
+        transport = ChatGPTBridgeClient("http://bridge.test/v1", client=client)
         with pytest.raises(BridgeTransportError) as caught:
             await transport.archive_conversation(conversation_id)
 
@@ -625,44 +612,10 @@ async def test_bridge_connect_error_is_typed_and_post_without_key_is_not_retried
         raise httpx.ConnectError("connection refused secret", request=request)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
+        transport = ChatGPTBridgeClient("http://bridge.test/v1", client=client)
         with pytest.raises(BridgeTransportError) as caught:
             await transport.create({"input": "secret"})
 
     assert caught.value.code == "bridge_unreachable"
     assert caught.value.retryable is True
     assert calls == 1
-
-
-async def test_bridge_429_honours_retry_after_and_reuses_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    requests: list[httpx.Request] = []
-    delays: list[float] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if len(requests) == 1:
-            return httpx.Response(429, headers={"Retry-After": "2"}, json={"error": {}})
-        return httpx.Response(200, json={"id": "resp_1", "status": "completed"})
-
-    async def fake_sleep(delay: float) -> None:
-        delays.append(delay)
-
-    monkeypatch.setattr("cti_app.integrations.models.asyncio.sleep", fake_sleep)
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        transport = ChatGPTBridgeTransport("http://bridge.test/v1", client=client)
-        await transport.create(
-            {"input": "secret"}, idempotency_key="00000000-0000-4000-8000-000000000001:a1"
-        )
-
-    assert delays == [2]
-    assert [request.headers["X-Idempotency-Key"] for request in requests] == [
-        "00000000-0000-4000-8000-000000000001:a1",
-        "00000000-0000-4000-8000-000000000001:a1",
-    ]
-    assert [json.loads(request.content)["request_id"] for request in requests] == [
-        "00000000-0000-4000-8000-000000000001:a1",
-        "00000000-0000-4000-8000-000000000001:a1",
-    ]
-    assert all(":a2" not in request.headers["X-Idempotency-Key"] for request in requests)

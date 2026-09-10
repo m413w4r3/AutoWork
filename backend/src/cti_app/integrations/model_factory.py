@@ -5,6 +5,7 @@ from minio import Minio
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.model_gateway import (
+    ModelCapabilities,
     ModelGateway,
     ModelRouter,
     ModelRoutingHint,
@@ -66,6 +67,7 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
         backend=ModelBackend.GEMINI_WEBAI,
         model=settings.webai_model,
         is_external=settings.webai_is_external,
+        capabilities=ModelCapabilities(structured_output=True),
     )
     fake = FakeModelAdapter()
     force_aliases = {"openai": "chatgpt_bridge", "gemini": "gemini_webai"}

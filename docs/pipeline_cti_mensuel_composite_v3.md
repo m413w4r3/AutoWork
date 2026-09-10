@@ -692,7 +692,7 @@ gates:
 
 **Passe B — structuration :** un second appel reçoit le résultat de recherche et les métadonnées collectées. Il produit un objet strict `ResearchBatch` ou `TopicCluster`. La validation Pydantic rejette toute sortie non conforme.
 
-Cette séparation permet de conserver les sorties natives de recherche, de contrôler les URLs et de ne pas mêler découverte et décision éditoriale. La Responses API prend en charge les Structured Outputs via un schéma JSON strict; voir [Structured model outputs — OpenAI API](https://developers.openai.com/api/docs/guides/structured-outputs).
+Cette séparation permet de conserver les sorties natives de recherche, de contrôler les URLs et de ne pas mêler découverte et décision éditoriale. AutoWork demande un contrat textuel puis valide localement la sortie structurée ; le ChatGPT Bridge ne fournit pas de garantie native de schéma JSON.
 
 ### 10.2 Exemple Python minimal
 
@@ -980,4 +980,3 @@ Les figures sont produites depuis leurs données sources. Chaque figure possède
 6. **Chaque sujet possède son dossier complet.** Les graines et résultats de chasse validés sont séparés, téléchargés et tracés.
 7. **YARA est une sortie normale des sujets fichier; Suricata reste conditionnelle.**
 8. **Les humains contrôlent les décisions irréversibles ou interprétatives.** Sélection, pivots, corpus, attribution, artefacts et publication restent gated.
-
