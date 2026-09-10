@@ -22,18 +22,9 @@ Les workspaces explorables directement depuis l’hôte sont :
 ./var/workspaces/editions
 ```
 
-Avant toute production réelle, vérifier le bridge :
-
-```bash
-make bridge-status
-```
-
-Dans Chrome, l’extension `chatgpt-bridge/extension` doit être chargée, le
-popup doit afficher une session prête avec `ws://127.0.0.1:8001/ws`, et la
-production d’un article de test doit pouvoir atteindre l’étape Références.
-Ne lancer aucune production payante tant que `make bridge-status` ne confirme
-pas `ready` et que la session de l’extension n’est pas prête. Pour les détails
-du bridge, utiliser `make bridge-logs`.
+Pour tester une route qui utilise ChatGPT Bridge, `OPENAI_BRIDGE_BASE_URL`
+doit pointer vers un serveur Bridge externe disponible. La gestion du serveur
+Bridge et de son extension Chrome relève de son repository autonome.
 
 ## Test manuel final — édition 2 articles
 

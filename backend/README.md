@@ -40,7 +40,7 @@ docker compose --profile integration-test rm -sf postgres-test
 
 Les tests créent une base temporaire dans ce serveur. `POSTGRES_DSN` est la connexion à la DB applicative ; `TEST_POSTGRES_ADMIN_DSN` est la connexion ADMIN réservée à pytest pour `CREATE DATABASE` / `DROP DATABASE`. Ces deux URLs ne sont pas interchangeables. Un DSN explicite peut remplacer le service local : `TEST_POSTGRES_ADMIN_DSN=<dsn> make test-integration`.
 
-Après réécriture de l'historique des migrations, `make up-clean` est nécessaire pour recréer la DB applicative. Cette commande est destructive : elle supprime les volumes PostgreSQL, Redis, MinIO et workspaces, mais conserve volontairement `bridge_data`. Sauvegarder les données locales importantes avant de l'utiliser.
+Après réécriture de l'historique des migrations, `make up-clean` est nécessaire pour recréer la DB applicative. Cette commande est destructive : elle supprime les volumes PostgreSQL, Redis, MinIO et workspaces. Sauvegarder les données locales importantes avant de l'utiliser.
 
 Les octets des documents et échantillons ne sont jamais stockés dans PostgreSQL.
 

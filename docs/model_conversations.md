@@ -104,8 +104,7 @@ redémarré — n’est **jamais** reconstruite depuis l’historique ChatGPT ou
 URL : le bridge répond `conversation_unavailable`, de façon déterministe. Il
 n’existe pas de pipeline de suppression/nettoyage séparé : fermer l’onglet
 (Temporary Chat n’étant jamais écrit dans l’historique) est la totalité du
-nettoyage — voir `chatgpt-bridge/AGENTS.md`, section « Ephemeral
-conversations ».
+nettoyage — voir la documentation du service Bridge externe.
 
 Un retry du même ModelRun rejoint le journal SQLite du bridge et le même tour.
 Après un clic au résultat incertain, le tour et la conversation passent en

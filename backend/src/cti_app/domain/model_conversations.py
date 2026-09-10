@@ -49,8 +49,9 @@ class ConversationPolicy(StrEnum):
     for future continuation.
 
     DELETE_ON_SUCCESS: close the live browser Temporary Chat session after a
-    successful bounded operation. Closing the tab is the entire cleanup — see
-    chatgpt-bridge/AGENTS.md, section "Ephemeral conversations".
+    successful bounded operation. Closing the tab is the entire cleanup; see
+    the external Bridge repository documentation for the browser-session
+    details.
     """
 
     KEEP = "keep"

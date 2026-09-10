@@ -63,12 +63,6 @@ evidence_packs/
 *.iso
 *.dmg
 
-# Existing standalone utility runtime files
-chatgpt-bridge/.venv/
-chatgpt-bridge/__pycache__/
-chatgpt-bridge/out/
-
-
 # roo code
 
 .roomodes

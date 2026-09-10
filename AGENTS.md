@@ -2,9 +2,8 @@
 
 Monorepo.
 
-Before modifying files under `backend/`, `frontend/`, or `chatgpt-bridge/`,
-read that area's `AGENTS.md` once. Do not read instructions for unaffected
-areas.
+Before modifying files under `backend/` or `frontend/`, read that area's
+`AGENTS.md` once. Do not read instructions for unaffected areas.
 
 ## Architecture invariants
 

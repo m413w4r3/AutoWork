@@ -31,7 +31,10 @@ Services exposés :
 | Live | <http://localhost:8000/api/health/live> |
 | Ready | <http://localhost:8000/api/health/ready> |
 | MinIO | <http://localhost:9001> |
-| Bridge ChatGPT (hôte uniquement) | <http://127.0.0.1:8001/health> |
+
+ChatGPT Bridge est exploité comme service indépendant. AutoWork peut l'utiliser
+via `OPENAI_BRIDGE_BASE_URL`, au même titre que d'autres transports de modèles
+configurés par le `ModelGateway`.
 
 Les ports hôtes peuvent être adaptés dans `.env` avec `BACKEND_PORT`, `FRONTEND_PORT`, `MINIO_API_PORT` et `MINIO_CONSOLE_PORT`. Les ports internes et le proxy entre services ne changent pas.
 
@@ -45,10 +48,9 @@ Arrêt sans suppression des volumes nommés :
 make stop
 ```
 
-`make stop` reste un alias de `make down`. Les commandes d’exploitation sont
-`make up`, `make down`, `make status`, `make logs`, `make bridge-status`,
-`make bridge-logs` et `make restart-bridge`. `make down` conserve toujours les
-volumes nommés, dont le registre SQLite `bridge_data`.
+`make stop` reste un alias de `make down`. Les commandes d'exploitation sont
+`make up`, `make down`, `make status` et `make logs`. `make down` conserve
+toujours les volumes nommés.
 
 `make model-run-diagnostics RUN_ID=<uuid>` affiche uniquement les métadonnées sûres d'une
 sortie modèle et donne la commande d'export explicite de l'artefact brut.
@@ -62,7 +64,7 @@ cd ../frontend && pnpm install --frozen-lockfile
 
 Les commandes racine sont `make test`, `make test-integration`, `make lint`, `make typecheck` et `make format`. Aucun test ne contacte une API externe. Les tests d'intégration utilisent une base PostgreSQL temporaire indiquée par `TEST_POSTGRES_ADMIN_DSN`.
 
-`make test-integration` démarre automatiquement le service PostgreSQL éphémère `postgres-test`, indépendant de la DB applicative, puis le supprime même en cas d'échec. `POSTGRES_DSN` désigne la DB applicative ; `TEST_POSTGRES_ADMIN_DSN` est réservé à la création et suppression des bases temporaires de pytest. Après une réécriture locale des migrations, `make up-clean` recrée les volumes applicatifs ; cette commande est destructive et conserve uniquement `bridge_data`.
+`make test-integration` démarre automatiquement le service PostgreSQL éphémère `postgres-test`, indépendant de la DB applicative, puis le supprime même en cas d'échec. `POSTGRES_DSN` désigne la DB applicative ; `TEST_POSTGRES_ADMIN_DSN` est réservé à la création et suppression des bases temporaires de pytest. Après une réécriture locale des migrations, `make up-clean` recrée les volumes applicatifs ; cette commande est destructive.
 
 ## Organisation
 

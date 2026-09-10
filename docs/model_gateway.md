@@ -24,8 +24,21 @@ ou une décision humaine et ne devient jamais l'état canonique d'un sujet.
 `MODEL_FORCE_ADAPTER=openai|qwen|fake` permet un forçage uniquement lorsque
 `APP_ENV=development`. `auto` conserve la politique ci-dessus.
 
+Le routage conceptuel est le suivant :
+
+```text
+Application
+    |
+    v
+ModelGateway
+    |
+    +-- ChatGPT Bridge externe
+    +-- Qwen
+    +-- autres providers/transports futurs
+```
+
 Chaque adaptateur expose `is_external`. ChatGPT est toujours externe, même si le premier saut
-HTTP vise le bridge local. Qwen appartient explicitement à la frontière de confiance locale de
+HTTP vise un service Bridge externe. Qwen appartient explicitement à la frontière de confiance locale de
 ce déploiement, quelle que soit la forme de son URL ; `QWEN_IS_EXTERNAL=true` permet de changer
 cette décision sans modifier le domaine. Si l'adaptateur retenu est externe et que
 `external_llm_allowed=false`, le run passe à `blocked` avant tout transport réseau.
@@ -120,7 +133,7 @@ table ni dans les logs. Les sorties complètes vivent dans `model-outputs/` sur 
 
 | Variable | Usage |
 | --- | --- |
-| `OPENAI_BRIDGE_BASE_URL` | base `/v1` du bridge local |
+| `OPENAI_BRIDGE_BASE_URL` | base `/v1` d'un service Bridge externe joignable par HTTP |
 | `OPENAI_BRIDGE_API_KEY` | clé Bearer optionnelle du bridge |
 | `OPENAI_RESEARCH_MODEL` | nom configurable pour la recherche |
 | `OPENAI_STRUCTURED_MODEL` | nom configurable pour l'extraction structurée |
