@@ -1,12 +1,9 @@
-.PHONY: up down clean up-clean status logs bridge-status bridge-logs bridge-soak \
-	restart-bridge model-run-diagnostics diagnostics dev stop test test-integration \
+.PHONY: up down clean up-clean status logs model-run-diagnostics diagnostics dev stop test test-integration \
 	lint format typecheck ctx ctx-dense ctx-lexical ctx-status ctx-doctor ctx-benchmark
 
 UV ?= uv
 PNPM ?= pnpm
 COMPOSE ?= docker compose
-BRIDGE_CI_PROJECT ?= cti-bulletin-bridge-ci
-
 up:
 	$(COMPOSE) up -d --build --wait
 
@@ -16,9 +13,6 @@ down:
 # Wipe the application data (postgres, redis, minio, subject workspaces) and
 # start over. Destructive.
 #
-# `down -v` is deliberately NOT used: it would also drop bridge_data, which
-# holds the authenticated ChatGPT browser profile. Losing it means logging the
-# bridge back in by hand, which no data reset should ever require.
 # Kept in step with the `name:` at the top of compose.yaml.
 COMPOSE_PROJECT ?= cti-bulletin
 CLEAN_VOLUMES = postgres_data redis_data minio_data
@@ -33,7 +27,7 @@ clean:
 		rm -rf -- "$$path"; \
 	done
 	@cat /dev/null > var/diagnostics/events.jsonl
-	@echo "Données applicatives effacées. Session du bridge ChatGPT conservée."
+	@echo "Données applicatives effacées."
 
 # Full reset: wipe the application data, then bring the stack back up.
 up-clean: clean up
@@ -42,14 +36,7 @@ status:
 	$(COMPOSE) ps
 
 logs:
-	$(COMPOSE) logs --tail=200 -f backend worker job-recovery frontend chatgpt-bridge
-
-bridge-status:
-	$(COMPOSE) ps chatgpt-bridge
-	$(COMPOSE) exec -T chatgpt-bridge python tools/status.py
-
-bridge-logs:
-	$(COMPOSE) logs --tail=200 -f chatgpt-bridge worker backend
+	$(COMPOSE) logs --tail=200 -f backend worker job-recovery frontend
 
 model-run-diagnostics:
 	@test -n "$(RUN_ID)" || (echo "Usage: make model-run-diagnostics RUN_ID=<uuid>" >&2; exit 2)
@@ -60,13 +47,6 @@ model-run-diagnostics:
 #   make diagnostics ARGS="merge. -n 100"
 diagnostics:
 	@python3 scripts/diagnostics.py $(ARGS)
-
-bridge-soak:
-	$(COMPOSE) -p $(BRIDGE_CI_PROJECT) --profile bridge-test run --rm --build bridge-soak
-	$(COMPOSE) -p $(BRIDGE_CI_PROJECT) --profile bridge-test down -v
-
-restart-bridge:
-	$(COMPOSE) up -d --build --wait --force-recreate --no-deps chatgpt-bridge
 
 dev:
 	$(COMPOSE) up --build

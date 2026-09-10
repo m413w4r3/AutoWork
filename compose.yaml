@@ -1,91 +1,6 @@
 name: cti-bulletin
 
 services:
-  chatgpt-bridge:
-    build:
-      context: .
-      dockerfile: infra/chatgpt-bridge.Dockerfile
-    environment:
-      BRIDGE_HOST: 0.0.0.0
-      BRIDGE_PORT: 8001
-      BRIDGE_API_KEY: ${OPENAI_BRIDGE_API_KEY:-}
-      BRIDGE_WS_TOKEN: ${BRIDGE_WS_TOKEN:-}
-      BRIDGE_RUN_DB: /data/bridge-runs.sqlite3
-      # Découplé de MODEL_REQUEST_TIMEOUT_SECONDS : celui-ci borne un appel HTTP
-      # au bridge (court, en mode background), pas la durée d'une recherche
-      # ChatGPT, qui dépasse couramment le quart d'heure.
-      BRIDGE_TOTAL_TIMEOUT: ${BRIDGE_TOTAL_TIMEOUT_SECONDS:-3600}
-      BRIDGE_IDLE_TIMEOUT: ${BRIDGE_IDLE_TIMEOUT_SECONDS:-300}
-      BRIDGE_UI_TIMEOUT: ${BRIDGE_UI_TIMEOUT_SECONDS:-30}
-      BRIDGE_SHUTDOWN_GRACE_SECONDS: ${BRIDGE_SHUTDOWN_GRACE_SECONDS:-20}
-    ports:
-      - "127.0.0.1:${BRIDGE_PORT:-8001}:8001"
-    volumes:
-      - bridge_data:/data
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-      start_period: 3s
-    stop_grace_period: 30s
-    restart: unless-stopped
-
-  # Bridge jetable aux échéances accélérées : seul moyen d'observer en quelques
-  # secondes des timeouts qui valent une demi-heure en production.
-  chatgpt-bridge-soak:
-    profiles: ["bridge-test"]
-    build:
-      context: .
-      dockerfile: infra/chatgpt-bridge.Dockerfile
-    environment:
-      BRIDGE_HOST: 0.0.0.0
-      BRIDGE_PORT: 8001
-      # Identifiants de test, valables uniquement dans le réseau Compose.
-      BRIDGE_API_KEY: bridge-soak-key
-      BRIDGE_WS_TOKEN: bridge-soak-token
-      BRIDGE_RUN_DB: /tmp/bridge-soak.sqlite3
-      BRIDGE_TOTAL_TIMEOUT: "3"
-      BRIDGE_IDLE_TIMEOUT: "0.5"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
-      interval: 2s
-      timeout: 3s
-      retries: 15
-      start_period: 2s
-    restart: "no"
-
-  bridge-soak:
-    profiles: ["bridge-test"]
-    build:
-      context: .
-      dockerfile: infra/chatgpt-bridge.Dockerfile
-    command: ["python", "examples/timeout_soak.py"]
-    environment:
-      BRIDGE_HTTP: http://chatgpt-bridge-soak:8001/v1
-      BRIDGE_WS: ws://chatgpt-bridge-soak:8001/ws
-      BRIDGE_API_KEY: bridge-soak-key
-      BRIDGE_WS_TOKEN: bridge-soak-token
-    depends_on:
-      chatgpt-bridge-soak:
-        condition: service_healthy
-    restart: "no"
-
-  bridge-smoke:
-    profiles: ["bridge-test"]
-    build:
-      context: .
-      dockerfile: infra/chatgpt-bridge.Dockerfile
-    command: ["python", "examples/compose_smoke.py"]
-    environment:
-      BRIDGE_HTTP: http://chatgpt-bridge:8001/v1
-      BRIDGE_WS: ws://chatgpt-bridge:8001/ws
-      BRIDGE_API_KEY: ${OPENAI_BRIDGE_API_KEY:-}
-      BRIDGE_WS_TOKEN: ${BRIDGE_WS_TOKEN:-}
-    depends_on:
-      chatgpt-bridge:
-        condition: service_healthy
-
   postgres:
     image: postgres:16-alpine
     environment:
@@ -190,8 +105,8 @@ services:
       JOB_RETRY_MAX_SECONDS: ${JOB_RETRY_MAX_SECONDS:-300}
       JOB_HEARTBEAT_TIMEOUT_SECONDS: ${JOB_HEARTBEAT_TIMEOUT_SECONDS:-120}
       JOB_RECOVERY_INTERVAL_SECONDS: ${JOB_RECOVERY_INTERVAL_SECONDS:-30}
-      # Doit rester supérieur à BRIDGE_TOTAL_TIMEOUT : le worker attend le bridge,
-      # puis parse, persiste et regroupe. 75 min laissent 15 min après le bridge.
+      # Doit rester supérieur au délai maximal du fournisseur modèle : le worker
+      # attend la réponse, puis parse, persiste et regroupe.
       JOB_ACTOR_TIME_LIMIT_SECONDS: ${JOB_ACTOR_TIME_LIMIT_SECONDS:-4500}
       PRODUCTION_SUBJECT_JITTER_MIN_SECONDS: ${PRODUCTION_SUBJECT_JITTER_MIN_SECONDS:-30}
       PRODUCTION_SUBJECT_JITTER_MAX_SECONDS: ${PRODUCTION_SUBJECT_JITTER_MAX_SECONDS:-90}
@@ -203,7 +118,7 @@ services:
       PRODUCTION_Q2_REUSE_MAX_AGE_DAYS: ${PRODUCTION_Q2_REUSE_MAX_AGE_DAYS:-14}
       PRODUCTION_ARCHIVE_FALLBACK_MIN_CHARS: ${PRODUCTION_ARCHIVE_FALLBACK_MIN_CHARS:-1200}
       DISCOVERY_BRIDGE_POLL_INTERVAL_SECONDS: ${DISCOVERY_BRIDGE_POLL_INTERVAL_SECONDS:-5}
-      OPENAI_BRIDGE_BASE_URL: ${OPENAI_BRIDGE_BASE_URL:-http://chatgpt-bridge:8001/v1}
+      OPENAI_BRIDGE_BASE_URL: ${OPENAI_BRIDGE_BASE_URL:-http://host.docker.internal:8001/v1}
       OPENAI_BRIDGE_API_KEY: ${OPENAI_BRIDGE_API_KEY:-}
       OPENAI_BRIDGE_CONNECT_TIMEOUT_SECONDS: ${OPENAI_BRIDGE_CONNECT_TIMEOUT_SECONDS:-3}
       OPENAI_BRIDGE_CAPABILITIES_TIMEOUT_SECONDS: ${OPENAI_BRIDGE_CAPABILITIES_TIMEOUT_SECONDS:-2}
@@ -321,8 +236,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      chatgpt-bridge:
-        condition: service_healthy
       redis:
         condition: service_healthy
       migrate:
@@ -431,7 +344,6 @@ volumes:
   postgres_data:
   redis_data:
   minio_data:
-  bridge_data:
   goodware_cache:
 
 networks:

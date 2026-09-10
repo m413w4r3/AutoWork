@@ -42,7 +42,6 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy src tests
       - run: uv run pytest
-      - run: python -m py_compile ../chatgpt-bridge/server.py ../chatgpt-bridge/chat.py
 
   frontend:
     runs-on: ubuntu-latest
@@ -64,12 +63,6 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test --run
-      - run: node ../chatgpt-bridge/tests/completion.test.js
-      - run: node ../chatgpt-bridge/tests/final-output.test.js
-      - run: node ../chatgpt-bridge/tests/content-dom.test.js
-      - run: node ../chatgpt-bridge/tests/background-conversation.test.js
-      - run: node --check ../chatgpt-bridge/extension/content.js
-      - run: node --check ../chatgpt-bridge/extension/background.js
       - run: pnpm build
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:e2e
@@ -79,8 +72,3 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker compose config --quiet
-      # `--build` est obligatoire : sans lui, `run` réutilise une image existante
-      # et le soak validerait du code qui n'est pas celui du commit.
-      - run: docker compose -p cti-bulletin-bridge-ci --profile bridge-test run --rm --build bridge-soak
-      - if: always()
-        run: docker compose -p cti-bulletin-bridge-ci --profile bridge-test down -v
