@@ -73,7 +73,34 @@ class Settings(BaseSettings):
     qwen_api_key: SecretStr | None = None
     qwen_model: str = "Qwen3-32B"
     qwen_is_external: bool = False
-    model_force_adapter: Literal["auto", "openai", "qwen", "fake"] = "auto"
+    webai_base_url: str = "http://web_ai:6969/v1"
+    webai_api_key: SecretStr | None = None
+    webai_model: str = "gemini-3-flash"
+    webai_is_external: bool = True
+    model_force_adapter: Literal[
+        "auto", "chatgpt_bridge", "gemini_webai", "qwen", "fake", "openai", "gemini"
+    ] = "auto"
+    model_route_web_research: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
+        "chatgpt_bridge"
+    )
+    model_route_bulk_extraction: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
+        "qwen"
+    )
+    model_route_ambiguous_clustering: Literal[
+        "chatgpt_bridge", "gemini_webai", "qwen", "fake"
+    ] = "chatgpt_bridge"
+    model_route_standard_draft: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
+        "qwen"
+    )
+    model_route_premium_synthesis: Literal[
+        "chatgpt_bridge", "gemini_webai", "qwen", "fake"
+    ] = "chatgpt_bridge"
+    model_route_critique: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
+        "chatgpt_bridge"
+    )
+    model_route_discovery_merge: Literal[
+        "chatgpt_bridge", "gemini_webai", "qwen", "fake"
+    ] = "chatgpt_bridge"
     model_request_timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
     model_conversation_retention_days: int = Field(default=90, ge=1, le=3650)
     discovery_chatgpt_structuring_fallback: bool = False

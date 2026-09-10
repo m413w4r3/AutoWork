@@ -39,7 +39,7 @@ from cti_app.application.model_gateway import (
     ModelRoutingHint,
     ResearchModel,
 )
-from cti_app.domain.model_runs import ModelRun, ModelRunStatus
+from cti_app.domain.model_runs import ModelBackend, ModelRun, ModelRunStatus
 from cti_app.logging import get_correlation_id
 
 logger = logging.getLogger(__name__)
@@ -125,6 +125,8 @@ class DiscoveryRecoveryCoordinator:
             )
         ):
             raise ModelGatewayError("ModelRun is not waiting for recovery")
+        if parent.backend not in {ModelBackend.CHATGPT_BRIDGE, ModelBackend.FAKE}:
+            raise ModelGatewayError("Visible recovery is only supported by chatgpt_bridge")
         recovered = await self._bridge_capabilities_provider.preview_visible_recovery(
             parent.response_id
         )
@@ -265,6 +267,8 @@ class DiscoveryRecoveryCoordinator:
             or not expected_turn_id
         ):
             raise ModelGatewayError("Verified discovery conversation is unavailable")
+        if parent.backend not in {ModelBackend.CHATGPT_BRIDGE, ModelBackend.FAKE}:
+            raise ModelGatewayError("Conversation recovery is only supported by chatgpt_bridge")
         child_id = uuid5(NAMESPACE_URL, f"{parent_run_id}:complete-initial-response:v1")
         request = ModelRequest(
             text=(
@@ -277,7 +281,7 @@ class DiscoveryRecoveryCoordinator:
             evidence_pack_hash=parent.evidence_pack_hash,
             external_llm_allowed=parameters.external_llm_allowed,
             routing_hint=ModelRoutingHint.WEB_RESEARCH,
-            provider=parent.provider,
+            backend=parent.backend,
             sensitivity=parameters.sensitivity,
             parameters={
                 "bridge_recovery": True,

@@ -26,7 +26,7 @@ from cti_app.application.production_review_recovery import (
     prepare_batch_for_recovery,
 )
 from cti_app.domain.editions import EditionStatus
-from cti_app.domain.model_runs import ModelRunStatus
+from cti_app.domain.model_runs import ModelBackend, ModelRunStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionSubmissionReconciliation,
@@ -128,6 +128,11 @@ class ProductionReconciliationService:
 
     async def preview_visible(self, run_id: UUID) -> ProductionRecoveryPreview:
         run, reconciliation, model = await self._load_review(run_id, allow_adopted=False)
+        if model.backend is not ModelBackend.CHATGPT_BRIDGE:
+            raise ProductionReconciliationError(
+                "production_reconciliation_backend_unsupported",
+                "La récupération visible est réservée au backend chatgpt_bridge.",
+            )
         if not reconciliation.bridge_response_id:
             raise ProductionReconciliationError(
                 "production_reconciliation_visible_unavailable",
@@ -262,7 +267,12 @@ class ProductionReconciliationService:
         )
 
     async def abandon_visible(self, run_id: UUID) -> dict[str, Any]:
-        _, reconciliation, _ = await self._load_review(run_id)
+        _, reconciliation, model = await self._load_review(run_id)
+        if model.backend is not ModelBackend.CHATGPT_BRIDGE:
+            raise ProductionReconciliationError(
+                "production_reconciliation_backend_unsupported",
+                "La libération visible est réservée au backend chatgpt_bridge.",
+            )
         if not reconciliation.bridge_response_id:
             raise ProductionReconciliationError(
                 "production_reconciliation_visible_unavailable",

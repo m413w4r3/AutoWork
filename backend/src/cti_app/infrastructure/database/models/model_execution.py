@@ -19,7 +19,9 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
 
-MODEL_PROVIDER_VALUES_SQL = "'openai', 'qwen', 'fake'"
+MODEL_PROVIDER_VALUES_SQL = "'openai', 'gemini', 'qwen', 'fake'"
+MODEL_BACKEND_VALUES_SQL = "'chatgpt_bridge', 'gemini_webai', 'qwen', 'fake'"
+MODEL_TRANSPORT_VALUES_SQL = "'openai_responses', 'openai_chat_completions', 'fake'"
 MODEL_ROLE_VALUES_SQL = "'research', 'structured_extraction', 'drafting', 'critic'"
 MODEL_RUN_STATUS_VALUES_SQL = (
     "'running', 'waiting_background', 'needs_review', 'succeeded', 'failed', 'blocked'"
@@ -39,6 +41,12 @@ class ModelRunRow(Base):
     __table_args__ = (
         CheckConstraint(
             f"provider IN ({MODEL_PROVIDER_VALUES_SQL})", name="ck_model_runs_provider"
+        ),
+        CheckConstraint(
+            f"backend IN ({MODEL_BACKEND_VALUES_SQL})", name="ck_model_runs_backend"
+        ),
+        CheckConstraint(
+            f"transport IN ({MODEL_TRANSPORT_VALUES_SQL})", name="ck_model_runs_transport"
         ),
         CheckConstraint(f"model_role IN ({MODEL_ROLE_VALUES_SQL})", name="ck_model_runs_role"),
         CheckConstraint(f"status IN ({MODEL_RUN_STATUS_VALUES_SQL})", name="ck_model_runs_status"),
@@ -74,6 +82,8 @@ class ModelRunRow(Base):
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    backend: Mapped[str] = mapped_column(String(32), nullable=False)
+    transport: Mapped[str] = mapped_column(String(32), nullable=False)
     model_role: Mapped[str] = mapped_column(String(32), nullable=False)
     requested_model: Mapped[str] = mapped_column(String(128), nullable=False)
     actual_model_version: Mapped[str | None] = mapped_column(String(255))

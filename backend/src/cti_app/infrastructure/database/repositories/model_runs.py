@@ -5,12 +5,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.domain.model_runs import (
+    ModelBackend,
     ModelOutputRejection,
     ModelProvider,
     ModelRole,
     ModelRun,
     ModelRunStatus,
     ModelSubmissionState,
+    ModelTransport,
     ModelUsage,
 )
 from cti_app.infrastructure.database.models.model_execution import (
@@ -145,6 +147,8 @@ def _model_run_values(run: ModelRun) -> dict[str, object]:
     return {
         "id": run.id,
         "provider": run.provider.value,
+        "backend": run.backend.value,
+        "transport": run.transport.value,
         "model_role": run.model_role.value,
         "requested_model": run.requested_model,
         "actual_model_version": run.actual_model_version,
@@ -189,6 +193,8 @@ def _model_run_from_row(row: ModelRunRow) -> ModelRun:
     return ModelRun(
         id=row.id,
         provider=ModelProvider(row.provider),
+        backend=ModelBackend(row.backend),
+        transport=ModelTransport(row.transport),
         model_role=ModelRole(row.model_role),
         requested_model=row.requested_model,
         actual_model_version=row.actual_model_version,

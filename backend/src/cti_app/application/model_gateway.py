@@ -16,12 +16,14 @@ from pydantic import BaseModel, ValidationError
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.domain.model_conversations import ConversationTurnStatus
 from cti_app.domain.model_runs import (
+    ModelBackend,
     ModelOutputRejection,
     ModelProvider,
     ModelRole,
     ModelRun,
     ModelRunStatus,
     ModelSubmissionState,
+    ModelTransport,
     ModelUsage,
 )
 from cti_app.logging import get_correlation_id
@@ -76,6 +78,24 @@ class StructuredModelUnavailableError(ModelGatewayError):
     phase = "structuring"
 
 
+class ModelTransportUnavailableError(ModelGatewayError):
+    code = "model_transport_unavailable"
+    retryable = True
+
+    def __init__(self, message: str, *, provider: str) -> None:
+        super().__init__(message)
+        self.provider = provider
+
+
+class ModelCapabilityError(ModelGatewayError):
+    code = "model_capability_unsupported"
+
+    def __init__(self, message: str, *, backend: ModelBackend, capability: str) -> None:
+        super().__init__(message)
+        self.backend = backend
+        self.capability = capability
+
+
 class BackgroundResponsePendingError(ModelGatewayError):
     def __init__(
         self,
@@ -99,6 +119,14 @@ class ModelRoutingHint(StrEnum):
     PREMIUM_SYNTHESIS = "premium_synthesis"
     CRITIQUE = "critique"
     DISCOVERY_MERGE = "discovery_merge"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCapabilities:
+    web_search: bool = False
+    background: bool = False
+    conversation: bool = False
+    structured_output: bool = True
 
 
 class AdapterResultStatus(StrEnum):
@@ -160,6 +188,7 @@ class ModelRequest:
     # implicitly enable web search in a shared conversation.
     web_search: bool = False
     background: bool = False
+    backend: ModelBackend | None = None
     provider: ModelProvider | None = None
     # Stateless requests (bulk extraction, drafting) carry no conversation at all.
     conversation: ConversationContext | None = None
@@ -221,8 +250,11 @@ class ModelExecution:
 
 class ModelAdapter(Protocol):
     provider: ModelProvider
+    backend: ModelBackend
+    transport: ModelTransport
     requested_model: str
     is_external: bool
+    capabilities: ModelCapabilities
 
     async def invoke(
         self,
@@ -321,35 +353,48 @@ class ModelRouter:
         openai_critic: ModelAdapter | None = None,
         qwen: ModelAdapter,
         fake: ModelAdapter,
+        gemini: ModelAdapter | None = None,
+        routing: dict[ModelRoutingHint, ModelBackend] | None = None,
+        forced_backend: ModelBackend | None = None,
         forced_provider: ModelProvider | None = None,
     ) -> None:
-        self._default_adapters = {
-            ModelProvider.QWEN: qwen,
-            ModelProvider.FAKE: fake,
+        self._adapters = {
+            ModelBackend.QWEN: qwen,
+            ModelBackend.FAKE: fake,
         }
+        if gemini is not None:
+            self._adapters[ModelBackend.GEMINI_WEBAI] = gemini
         self._openai_research = openai_research
         self._openai_structured = openai_structured
         self._openai_drafting = openai_drafting or openai_research
         self._openai_critic = openai_critic or openai_research
+        self._adapters[ModelBackend.CHATGPT_BRIDGE] = openai_research
+        self._forced_backend = forced_backend
         self._forced_provider = forced_provider
+        self._routing = routing or {
+            ModelRoutingHint.WEB_RESEARCH: ModelBackend.CHATGPT_BRIDGE,
+            ModelRoutingHint.BULK_EXTRACTION: ModelBackend.QWEN,
+            ModelRoutingHint.AMBIGUOUS_CLUSTERING: ModelBackend.CHATGPT_BRIDGE,
+            ModelRoutingHint.STANDARD_DRAFT: ModelBackend.QWEN,
+            ModelRoutingHint.PREMIUM_SYNTHESIS: ModelBackend.CHATGPT_BRIDGE,
+            ModelRoutingHint.CRITIQUE: ModelBackend.CHATGPT_BRIDGE,
+            ModelRoutingHint.DISCOVERY_MERGE: ModelBackend.CHATGPT_BRIDGE,
+        }
 
     def select(self, request: ModelRequest, role: ModelRole) -> ModelAdapter:
+        if request.backend is not None:
+            return self.by_backend(request.backend, role)
         if request.provider is not None:
             return self.by_provider(request.provider, role)
+        if self._forced_backend is not None:
+            return self.by_backend(self._forced_backend, role)
         if self._forced_provider is not None:
             return self.by_provider(self._forced_provider, role)
-        if role is ModelRole.RESEARCH or request.routing_hint in {
-            ModelRoutingHint.WEB_RESEARCH,
-            ModelRoutingHint.AMBIGUOUS_CLUSTERING,
-            ModelRoutingHint.PREMIUM_SYNTHESIS,
-            ModelRoutingHint.CRITIQUE,
-            ModelRoutingHint.DISCOVERY_MERGE,
-        }:
-            return self.by_provider(ModelProvider.OPENAI, role)
-        return self.by_provider(ModelProvider.QWEN, role)
+        backend = self._routing[request.routing_hint]
+        return self.by_backend(backend, role)
 
-    def by_provider(self, provider: ModelProvider, role: ModelRole) -> ModelAdapter:
-        if provider is ModelProvider.OPENAI:
+    def by_backend(self, backend: ModelBackend, role: ModelRole) -> ModelAdapter:
+        if backend is ModelBackend.CHATGPT_BRIDGE:
             if role is ModelRole.STRUCTURED_EXTRACTION:
                 return self._openai_structured
             if role is ModelRole.DRAFTING:
@@ -357,7 +402,23 @@ class ModelRouter:
             if role is ModelRole.CRITIC:
                 return self._openai_critic
             return self._openai_research
-        return self._default_adapters[provider]
+        try:
+            return self._adapters[backend]
+        except KeyError as exc:
+            raise ModelGatewayError(f"Model backend is not configured: {backend.value}") from exc
+
+    def by_provider(self, provider: ModelProvider, role: ModelRole) -> ModelAdapter:
+        if provider is ModelProvider.OPENAI:
+            return self.by_backend(ModelBackend.CHATGPT_BRIDGE, role)
+        defaults = {
+            ModelProvider.GEMINI: ModelBackend.GEMINI_WEBAI,
+            ModelProvider.QWEN: ModelBackend.QWEN,
+            ModelProvider.FAKE: ModelBackend.FAKE,
+        }
+        try:
+            return self.by_backend(defaults[provider], role)
+        except KeyError as exc:
+            raise ModelGatewayError(f"Model provider is not configured: {provider.value}") from exc
 
 
 class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, CriticModel):
@@ -610,9 +671,14 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
 
     def build_run(self, request: ModelRequest, role: ModelRole) -> ModelRun:
         adapter = self._router.select(request, role)
+        _ensure_capabilities(
+            adapter, request, structured_output=role is ModelRole.STRUCTURED_EXTRACTION
+        )
         safe_request = sanitize_model_request(request)
         return ModelRun(
             provider=adapter.provider,
+            backend=_adapter_backend(adapter),
+            transport=_adapter_transport(adapter),
             model_role=role,
             requested_model=adapter.requested_model,
             prompt_template_id=request.prompt_template_id,
@@ -645,7 +711,13 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 or not run.response_id
             ):
                 raise ModelGatewayError("Model run is not waiting for a background response")
-            adapter = self._router.by_provider(run.provider, run.model_role)
+            adapter = self._router.by_backend(run.backend, run.model_role)
+            if (
+                adapter.provider is not run.provider
+                or _adapter_backend(adapter) is not run.backend
+                or _adapter_transport(adapter) is not run.transport
+            ):
+                raise ModelGatewayError("Persisted ModelRun backend/transport is not configured")
             elapsed_ms = max(
                 0,
                 int((datetime.now(UTC) - run.started_at).total_seconds() * 1000),
@@ -711,6 +783,11 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         output_schema: type[BaseModel] | None = None,
     ) -> ModelExecution:
         adapter = self._router.select(request, role)
+        _ensure_capabilities(
+            adapter,
+            request,
+            structured_output=output_schema is not None or role is ModelRole.STRUCTURED_EXTRACTION,
+        )
         safe_request = sanitize_model_request(request)
         run = self.build_run(request, role)
         persisted_success: ModelRun | None = None
@@ -722,6 +799,8 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             elif (
                 existing.authorized_input_hash != run.authorized_input_hash
                 or existing.provider is not run.provider
+                or existing.backend is not run.backend
+                or existing.transport is not run.transport
                 or existing.model_role is not run.model_role
             ):
                 raise ModelGatewayError("Existing ModelRun does not match this request")
@@ -1036,6 +1115,64 @@ _CERTAIN_PRE_SUBMISSION_CODES = frozenset(
         "bridge_unreachable",
     }
 )
+
+
+def _adapter_backend(adapter: ModelAdapter) -> ModelBackend:
+    value = getattr(adapter, "backend", None)
+    if isinstance(value, ModelBackend):
+        return value
+    defaults = {
+        ModelProvider.OPENAI: ModelBackend.CHATGPT_BRIDGE,
+        ModelProvider.GEMINI: ModelBackend.GEMINI_WEBAI,
+        ModelProvider.QWEN: ModelBackend.QWEN,
+        ModelProvider.FAKE: ModelBackend.FAKE,
+    }
+    return defaults[adapter.provider]
+
+
+def _adapter_transport(adapter: ModelAdapter) -> ModelTransport:
+    value = getattr(adapter, "transport", None)
+    if isinstance(value, ModelTransport):
+        return value
+    defaults = {
+        ModelBackend.CHATGPT_BRIDGE: ModelTransport.OPENAI_RESPONSES,
+        ModelBackend.GEMINI_WEBAI: ModelTransport.OPENAI_CHAT_COMPLETIONS,
+        ModelBackend.QWEN: ModelTransport.OPENAI_CHAT_COMPLETIONS,
+        ModelBackend.FAKE: ModelTransport.FAKE,
+    }
+    return defaults[_adapter_backend(adapter)]
+
+
+def _adapter_capabilities(adapter: ModelAdapter) -> ModelCapabilities:
+    capabilities = getattr(adapter, "capabilities", None)
+    if isinstance(capabilities, ModelCapabilities):
+        return capabilities
+    backend = _adapter_backend(adapter)
+    if backend in {ModelBackend.CHATGPT_BRIDGE, ModelBackend.FAKE}:
+        return ModelCapabilities(web_search=True, background=True, conversation=True)
+    return ModelCapabilities()
+
+
+def _ensure_capabilities(
+    adapter: ModelAdapter, request: ModelRequest, *, structured_output: bool = False
+) -> None:
+    capabilities = _adapter_capabilities(adapter)
+    unsupported: list[str] = []
+    if request.web_search and not capabilities.web_search:
+        unsupported.append("web_search")
+    if request.background and not capabilities.background:
+        unsupported.append("background")
+    if request.conversation is not None and not capabilities.conversation:
+        unsupported.append("conversation")
+    if structured_output and not capabilities.structured_output:
+        unsupported.append("structured_output")
+    if unsupported:
+        backend = _adapter_backend(adapter).value
+        raise ModelCapabilityError(
+            f"Backend {backend} does not support: {', '.join(unsupported)}",
+            backend=_adapter_backend(adapter),
+            capability=unsupported[0],
+        )
 
 
 def sanitize_model_request(request: ModelRequest) -> SafeModelRequest:

@@ -21,12 +21,19 @@ from cti_app.application.model_gateway import (
     AdapterResultStatus,
     ConversationResult,
     ModelAdapter,
+    ModelCapabilities,
     ModelGatewayError,
+    ModelTransportUnavailableError,
     SafeModelRequest,
-    StructuredModelUnavailableError,
     validate_structured_output,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelUsage
+from cti_app.domain.model_runs import (
+    ModelBackend,
+    ModelProvider,
+    ModelRole,
+    ModelTransport,
+    ModelUsage,
+)
 from cti_app.logging import get_correlation_id
 
 logger = logging.getLogger(__name__)
@@ -554,6 +561,32 @@ class ChatGPTBridgeTransport(HttpResponsesTransport):
             raise _archive_response_error(response, conversation_id)
 
 
+class ChatGPTBridgeClient(HttpResponsesTransport):
+    """Responses data plane plus Bridge-only control and recovery operations."""
+
+    async def preview_visible_recovery(self, bridge_run_id: str) -> dict[str, Any]:
+        return await self._request("POST", f"/bridge/runs/{bridge_run_id}/recovery/visible")
+
+    async def release_visible_recovery(self, bridge_run_id: str) -> dict[str, Any]:
+        return await self._request("POST", f"/bridge/runs/{bridge_run_id}/recovery/release")
+
+    async def capabilities(self) -> dict[str, Any]:
+        return await self._request(
+            "GET", "/bridge/capabilities", timeout_seconds=self._capabilities_timeout
+        )
+
+    async def archive_conversation(self, conversation_id: UUID) -> None:
+        response = await self._request(
+            "DELETE",
+            f"/bridge/conversations/{conversation_id}",
+            phase="conversation_archive",
+            timeout_seconds=self._archive_timeout,
+            idempotency_key=f"conversation-archive-{conversation_id}",
+        )
+        if response.get("archived") is not True:
+            raise _archive_response_error(response, conversation_id)
+
+
 class HttpChatCompletionsTransport:
     def __init__(
         self,
@@ -561,11 +594,13 @@ class HttpChatCompletionsTransport:
         *,
         api_key: str | None,
         timeout_seconds: float = 300,
+        provider: str = "qwen",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout_seconds
+        self._provider = provider
         self._client = client
 
     async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -579,17 +614,30 @@ class HttpChatCompletionsTransport:
                     response = await client.post(url, json=payload, headers=headers)
             response.raise_for_status()
         except (httpx.HTTPError, OSError) as exc:
-            raise StructuredModelUnavailableError(
-                "Le modèle local de structuration est indisponible."
+            raise ModelTransportUnavailableError(
+                f"Le transport du provider {self._provider} est indisponible.",
+                provider=self._provider,
             ) from exc
-        value = response.json()
+        try:
+            value = response.json()
+        except ValueError as exc:
+            raise ModelTransportUnavailableError(
+                f"Le provider {self._provider} a renvoyé un JSON invalide.",
+                provider=self._provider,
+            ) from exc
         if not isinstance(value, dict):
-            raise ModelGatewayError("Qwen gateway returned a non-object response")
+            raise ModelTransportUnavailableError(
+                f"Le provider {self._provider} a renvoyé un contrat invalide.",
+                provider=self._provider,
+            )
         return value
 
 
 class OpenAIResearchAdapter:
     provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     is_external = True
 
     def __init__(self, transport: ResponsesTransport, *, model: str) -> None:
@@ -616,6 +664,7 @@ class OpenAIResearchAdapter:
         if request.web_search:
             payload["tools"] = [{"type": "web_search"}]
             payload["include"] = ["web_search_call.action.sources"]
+        payload.update(_bridge_extensions(request))
         payload.update(_allowed_parameters(request.parameters, _RESPONSES_PARAMETERS))
         return _responses_result(
             await self._transport.create(payload, idempotency_key=request.request_id),
@@ -635,6 +684,9 @@ class OpenAIResearchAdapter:
 
 class OpenAIStructuredAdapter:
     provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     is_external = True
 
     def __init__(self, transport: ResponsesTransport, *, model: str) -> None:
@@ -672,6 +724,7 @@ class OpenAIStructuredAdapter:
             payload["conversation"] = request.conversation.bridge_payload()
             payload["bridge_profile"] = request.conversation.expected_profile
             payload["bridge_ui_model"] = request.conversation.requested_model
+        payload.update(_bridge_extensions(request))
         payload.update(_allowed_parameters(request.parameters, _RESPONSES_PARAMETERS))
         return _responses_result(
             await self._transport.create(payload, idempotency_key=request.request_id),
@@ -698,19 +751,23 @@ class OpenAIStructuredAdapter:
         )
 
 
-class QwenAdapter:
-    provider = ModelProvider.QWEN
-
+class OpenAICompatibleChatAdapter:
     def __init__(
         self,
         transport: ChatCompletionsTransport,
         *,
+        provider: ModelProvider,
+        backend: ModelBackend,
         model: str,
         is_external: bool,
     ) -> None:
         self._transport = transport
+        self.provider = provider
+        self.backend = backend
+        self.transport = ModelTransport.OPENAI_CHAT_COMPLETIONS
         self.requested_model = model
         self.is_external = is_external
+        self.capabilities = ModelCapabilities()
 
     async def invoke(
         self,
@@ -771,11 +828,35 @@ class QwenAdapter:
         output_schema: type[BaseModel] | None = None,
     ) -> AdapterResult:
         del response_id, role, output_schema
-        raise ModelGatewayError("Qwen adapter does not expose background response retrieval")
+        raise ModelGatewayError(
+            f"{self.provider.value} adapter does not expose background response retrieval"
+        )
+
+
+class QwenAdapter(OpenAICompatibleChatAdapter):
+    """Compatibility wrapper around the generic OpenAI-compatible adapter."""
+
+    def __init__(
+        self,
+        transport: ChatCompletionsTransport,
+        *,
+        model: str,
+        is_external: bool,
+    ) -> None:
+        super().__init__(
+            transport,
+            provider=ModelProvider.QWEN,
+            backend=ModelBackend.QWEN,
+            model=model,
+            is_external=is_external,
+        )
 
 
 class FakeModelAdapter:
     provider = ModelProvider.FAKE
+    backend = ModelBackend.FAKE
+    transport = ModelTransport.FAKE
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     requested_model = "fake-deterministic-v1"
     is_external = False
 
@@ -1105,10 +1186,10 @@ def _responses_output_text(raw: dict[str, Any]) -> str:
 def _chat_output_text(raw: dict[str, Any]) -> str:
     choices = raw.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        raise ModelGatewayError("Qwen response does not contain a choice")
+        raise ModelGatewayError("Chat Completions response does not contain a choice")
     message = choices[0].get("message")
     if not isinstance(message, dict) or not isinstance(message.get("content"), str):
-        raise ModelGatewayError("Qwen response does not contain text")
+        raise ModelGatewayError("Chat Completions response does not contain text")
     return str(message["content"])
 
 
@@ -1178,6 +1259,15 @@ _RESPONSES_PARAMETERS = frozenset(
     {"reasoning", "temperature", "top_p", "max_output_tokens", "bridge_recovery"}
 )
 _CHAT_PARAMETERS = frozenset({"temperature", "top_p", "max_tokens"})
+
+
+def _bridge_extensions(request: SafeModelRequest) -> dict[str, Any]:
+    extensions: dict[str, Any] = {}
+    for name in ("bridge_profile", "bridge_ui_model", "bridge_recovery"):
+        value = request.parameters.get(name, request.metadata.get(name))
+        if isinstance(value, (str, bool)):
+            extensions[name] = value
+    return extensions
 
 
 def _allowed_parameters(parameters: dict[str, Any], allowed: frozenset[str]) -> dict[str, Any]:

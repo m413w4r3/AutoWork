@@ -26,11 +26,19 @@ from cti_app.application.model_gateway import (
     sanitize_model_request,
 )
 from cti_app.domain.jobs import JobStatus
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus, ModelUsage
+from cti_app.domain.model_runs import (
+    ModelBackend,
+    ModelProvider,
+    ModelRole,
+    ModelRunStatus,
+    ModelTransport,
+    ModelUsage,
+)
 from cti_app.integrations.models import (
     BridgeTransportError,
     FakeModelAdapter,
     InMemoryModelOutputStore,
+    OpenAICompatibleChatAdapter,
     OpenAIResearchAdapter,
     OpenAIStructuredAdapter,
     QwenAdapter,
@@ -181,6 +189,7 @@ def request(
     routing_hint: ModelRoutingHint = ModelRoutingHint.WEB_RESEARCH,
     run_id: UUID | None = None,
     provider: ModelProvider | None = None,
+    backend: ModelBackend | None = None,
 ) -> ModelRequest:
     return ModelRequest(
         text="Analyse token=super-secret /home/analyst/private/report.txt",
@@ -199,6 +208,7 @@ def request(
         background=background,
         run_id=run_id,
         provider=provider,
+        backend=backend,
     )
 
 
@@ -386,6 +396,69 @@ def test_router_prefers_qwen_for_bulk_and_openai_for_premium_drafting() -> None:
     assert router.select(bulk, ModelRole.STRUCTURED_EXTRACTION).provider is ModelProvider.QWEN
     assert router.select(premium, ModelRole.DRAFTING).provider is ModelProvider.OPENAI
     assert router.select(discovery_merge, ModelRole.DRAFTING).provider is ModelProvider.OPENAI
+
+
+async def test_gemini_route_persists_provider_backend_and_transport() -> None:
+    gemini = OpenAICompatibleChatAdapter(
+        FixedChatTransport(),
+        provider=ModelProvider.GEMINI,
+        backend=ModelBackend.GEMINI_WEBAI,
+        model="gemini-3-flash",
+        is_external=True,
+    )
+    router = ModelRouter(
+        openai_research=FakeModelAdapter(),
+        openai_structured=FakeModelAdapter(),
+        qwen=FakeModelAdapter(),
+        gemini=gemini,
+        fake=FakeModelAdapter(),
+    )
+    gateway = ModelGateway(router, InMemoryModelRunUnitOfWorkFactory(), InMemoryModelOutputStore())
+
+    execution = await gateway.draft(
+        request(
+            external_llm_allowed=True,
+            routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS,
+            backend=ModelBackend.GEMINI_WEBAI,
+        )
+    )
+
+    assert execution.run.provider is ModelProvider.GEMINI
+    assert execution.run.backend is ModelBackend.GEMINI_WEBAI
+    assert execution.run.transport is ModelTransport.OPENAI_CHAT_COMPLETIONS
+
+
+async def test_gemini_rejects_unsupported_capabilities_before_transport() -> None:
+    transport = NoCallChatTransport()
+    gemini = OpenAICompatibleChatAdapter(
+        transport,
+        provider=ModelProvider.GEMINI,
+        backend=ModelBackend.GEMINI_WEBAI,
+        model="gemini-3-flash",
+        is_external=True,
+    )
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=FakeModelAdapter(),
+            openai_structured=FakeModelAdapter(),
+            qwen=FakeModelAdapter(),
+            gemini=gemini,
+            fake=FakeModelAdapter(),
+        ),
+        InMemoryModelRunUnitOfWorkFactory(),
+        InMemoryModelOutputStore(),
+    )
+
+    with pytest.raises(ModelGatewayError, match="web_search"):
+        await gateway.research(
+            replace(
+                request(
+                    external_llm_allowed=True,
+                    backend=ModelBackend.GEMINI_WEBAI,
+                ),
+                web_search=True,
+            )
+        )
 
 
 def test_binary_values_are_rejected_by_typed_request() -> None:

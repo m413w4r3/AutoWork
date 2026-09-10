@@ -48,7 +48,7 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
 )
 from cti_app.domain.discovery_cumulative import DiscoveryInputMode
-from cti_app.domain.model_runs import ModelProvider, ModelRunStatus
+from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.logging import get_correlation_id
 
 logger = logging.getLogger(__name__)
@@ -137,7 +137,6 @@ class DiscoveryService:
             evidence_pack_hash=request_hash,
             external_llm_allowed=parameters.external_llm_allowed,
             routing_hint=ModelRoutingHint.WEB_RESEARCH,
-            provider=ModelProvider.OPENAI,
             sensitivity=parameters.sensitivity,
             metadata={
                 "edition_id": str(parameters.edition_id),

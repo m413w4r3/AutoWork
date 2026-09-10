@@ -1,4 +1,4 @@
-# Passerelle de modèles OpenAI et Qwen
+# Passerelle de modèles et routage par tâche
 
 ## Frontières
 
@@ -12,17 +12,39 @@ ou une décision humaine et ne devient jamais l'état canonique d'un sujet.
 
 ## Routage
 
+Le domaine sépare trois notions :
+
+| Notion | Valeurs | Rôle |
+| --- | --- | --- |
+| `ModelProvider` | `openai`, `gemini`, `qwen`, `fake` | fournisseur réel du modèle |
+| `ModelBackend` | `chatgpt_bridge`, `gemini_webai`, `qwen`, `fake` | backend choisi par le routeur |
+| `ModelTransport` | `openai_responses`, `openai_chat_completions`, `fake` | protocole wire utilisé par AutoWork |
+
+`OpenAI-compatible` décrit uniquement le protocole HTTP. Cela ne signifie pas que chaque
+implémentation expose toutes les capacités OpenAI.
+
 | Usage | Adaptateur par défaut |
 | --- | --- |
 | Recherche web | OpenAI via `chatgpt-bridge` |
-| Structuration de la découverte | Qwen explicitement forcé |
+| Structuration de la découverte | Qwen |
 | Regroupement ambigu | OpenAI via `chatgpt-bridge` |
 | Synthèse premium et critique | OpenAI via `chatgpt-bridge` |
 | Extraction volumique | Qwen |
 | Brouillon standard ou contenu sensible | Qwen |
 
-`MODEL_FORCE_ADAPTER=openai|qwen|fake` permet un forçage uniquement lorsque
-`APP_ENV=development`. `auto` conserve la politique ci-dessus.
+Les variables `MODEL_ROUTE_<HINT>` configurent le mapping `ModelRoutingHint -> ModelBackend`.
+`MODEL_FORCE_ADAPTER=chatgpt_bridge|gemini_webai|qwen|fake` permet un forçage uniquement lorsque
+`APP_ENV=development`; `openai` et `gemini` restent des alias de compatibilité. `auto` conserve
+la politique ci-dessus.
+
+Capacités déclarées par AutoWork :
+
+| Backend | web search | background | conversation | structured output |
+| --- | ---: | ---: | ---: | ---: |
+| `chatgpt_bridge` | oui | oui | oui | oui |
+| `gemini_webai` | non | non | non | oui |
+| `qwen` | non | non | non | oui |
+| `fake` | permissif pour les tests | oui | permissif | oui |
 
 Le routage conceptuel est le suivant :
 
@@ -32,9 +54,10 @@ Application
     v
 ModelGateway
     |
-    +-- ChatGPT Bridge externe
-    +-- Qwen
-    +-- autres providers/transports futurs
+    +-- chatgpt_bridge -> OpenAI-compatible Responses -> ChatGPT UI
+    +-- gemini_webai  -> OpenAI-compatible Chat Completions -> Gemini
+    +-- qwen          -> OpenAI-compatible Chat Completions -> Qwen
+    +-- fake          -> fake transport
 ```
 
 Chaque adaptateur expose `is_external`. ChatGPT est toujours externe, même si le premier saut
@@ -49,10 +72,15 @@ métadonnées sensibles sont retirés avant calcul du hash et avant appel.
 
 ## Responses API et bridge ChatGPT
 
-Les adaptateurs construisent une requête selon les concepts de Responses API. Le transport
-`ChatGPTBridgeTransport` la convertit ensuite vers le contrat honnête
-`POST /v1/bridge/runs` : l'application ne suppose donc pas que l'interface web est l'API
-OpenAI. La façade `/v1/responses` reste disponible uniquement pour les clients compatibles.
+Les adaptateurs construisent une requête Responses standard. `ChatGPTBridgeClient`, qui hérite
+de `HttpResponsesTransport`, l'envoie vers `POST /v1/responses` et reprend un run avec
+`GET /v1/responses/{id}`. Le champ `model` est une étiquette de traçabilité : AutoWork ne
+l'utilise pas pour changer le sélecteur de modèle de l'interface.
+
+Les endpoints `/v1/bridge/*` restent réservés aux capacités spécifiques du Bridge :
+capabilities, visible recovery, release, archive/close et diagnostics/control. Les extensions
+`bridge_profile`, `bridge_ui_model` et `bridge_recovery` sont conservées dans les payloads
+Responses lorsqu'elles existent.
 
 Une recherche demande `web_search=true` au bridge. Celui-ci active l'outil de recherche de
 l'interface quand il peut le vérifier, et retombe sinon sur une instruction dans le prompt ;
@@ -87,8 +115,8 @@ de persister l'identité du schéma, ce qui appartient à un incrément ultérie
 ### Limites assumées de `chatgpt-bridge`
 
 Le bridge fournit le sous-ensemble `POST /v1/responses` et
-`GET /v1/responses/{id}` pour compatibilité, ainsi que le contrat interne
-`/v1/bridge/runs`. `GET /v1/bridge/capabilities` décrit les garanties réellement disponibles.
+`GET /v1/responses/{id}` pour le data plane, ainsi que le contrat interne
+`/v1/bridge/*` pour le contrôle. `GET /v1/bridge/capabilities` décrit les garanties réellement disponibles.
 Il traduit ensuite la requête vers l'interface ChatGPT :
 
 - il rapporte le libellé lu dans le sélecteur de modèle de l'interface (`metadata.model_source
@@ -116,7 +144,7 @@ phase, le caractère retryable et le nombre de tentatives. La description publiq
 
 | Groupe | Colonnes |
 | --- | --- |
-| Routage | `provider`, `model_role`, `requested_model`, `actual_model_version` |
+| Routage | `provider`, `backend`, `transport`, `model_role`, `requested_model`, `actual_model_version` |
 | Prompt versionné | `prompt_template_id`, `prompt_template_version` |
 | Preuves d'entrée | `authorized_input_hash`, `evidence_pack_hash` |
 | Observabilité | `parameters`, `duration_ms`, `usage`, `status`, dates |
@@ -143,6 +171,11 @@ table ni dans les logs. Les sorties complètes vivent dans `model-outputs/` sur 
 | `QWEN_API_KEY` | clé du gateway, jamais versionnée |
 | `QWEN_MODEL` | modèle demandé, par défaut `Qwen3-32B` |
 | `QWEN_IS_EXTERNAL` | change explicitement la frontière de confiance Qwen |
+| `WEBAI_BASE_URL` | base `/v1` du gateway WebAI-to-API |
+| `WEBAI_API_KEY` | clé Bearer optionnelle de WebAI |
+| `WEBAI_MODEL` | identifiant Gemini demandé à WebAI |
+| `WEBAI_IS_EXTERNAL` | frontière de confiance WebAI, `true` par défaut |
+| `MODEL_ROUTE_<HINT>` | backend choisi pour chaque type de tâche |
 | `MODEL_FORCE_ADAPTER` | `auto`, ou forçage de développement |
 | `MODEL_REQUEST_TIMEOUT_SECONDS` | timeout HTTP borné |
 | `DISCOVERY_CHATGPT_STRUCTURING_FALLBACK` | fallback explicite, désactivé par défaut |

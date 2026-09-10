@@ -1,17 +1,25 @@
+from typing import cast
+
 from minio import Minio
 
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.model_gateway import ModelGateway, ModelRouter
+from cti_app.application.model_gateway import (
+    ModelGateway,
+    ModelRouter,
+    ModelRoutingHint,
+    ModelRunUnitOfWorkFactory,
+)
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.config import Settings
-from cti_app.domain.model_runs import ModelProvider
+from cti_app.domain.model_runs import ModelBackend, ModelProvider
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.integrations.models import (
     BlobModelOutputStore,
-    ChatGPTBridgeTransport,
+    ChatGPTBridgeClient,
     FakeModelAdapter,
     HttpChatCompletionsTransport,
+    OpenAICompatibleChatAdapter,
     OpenAIResearchAdapter,
     OpenAIStructuredAdapter,
     QwenAdapter,
@@ -21,7 +29,7 @@ from cti_app.integrations.models import (
 def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> ModelGateway:
     if settings.model_force_adapter != "auto" and settings.app_env != "development":
         raise ValueError("A forced model adapter is allowed only in development")
-    bridge_transport = ChatGPTBridgeTransport(
+    bridge_transport = ChatGPTBridgeClient(
         settings.openai_bridge_base_url,
         api_key=_secret_value(settings.openai_bridge_api_key),
         timeout_seconds=settings.model_request_timeout_seconds,
@@ -33,6 +41,13 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
         settings.qwen_base_url,
         api_key=_secret_value(settings.qwen_api_key),
         timeout_seconds=settings.model_request_timeout_seconds,
+        provider="qwen",
+    )
+    webai_transport = HttpChatCompletionsTransport(
+        settings.webai_base_url,
+        api_key=_secret_value(settings.webai_api_key),
+        timeout_seconds=settings.model_request_timeout_seconds,
+        provider="gemini",
     )
     openai_research = OpenAIResearchAdapter(bridge_transport, model=settings.openai_research_model)
     openai_structured = OpenAIStructuredAdapter(
@@ -45,20 +60,42 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
         model=settings.qwen_model,
         is_external=settings.qwen_is_external,
     )
+    gemini = OpenAICompatibleChatAdapter(
+        webai_transport,
+        provider=ModelProvider.GEMINI,
+        backend=ModelBackend.GEMINI_WEBAI,
+        model=settings.webai_model,
+        is_external=settings.webai_is_external,
+    )
     fake = FakeModelAdapter()
+    force_aliases = {"openai": "chatgpt_bridge", "gemini": "gemini_webai"}
     forced = (
-        ModelProvider(settings.model_force_adapter)
+        ModelBackend(force_aliases.get(settings.model_force_adapter, settings.model_force_adapter))
         if settings.model_force_adapter != "auto"
         else None
     )
+    routing = {
+        hint: ModelBackend(value)
+        for hint, value in {
+            ModelRoutingHint.WEB_RESEARCH: settings.model_route_web_research,
+            ModelRoutingHint.BULK_EXTRACTION: settings.model_route_bulk_extraction,
+            ModelRoutingHint.AMBIGUOUS_CLUSTERING: settings.model_route_ambiguous_clustering,
+            ModelRoutingHint.STANDARD_DRAFT: settings.model_route_standard_draft,
+            ModelRoutingHint.PREMIUM_SYNTHESIS: settings.model_route_premium_synthesis,
+            ModelRoutingHint.CRITIQUE: settings.model_route_critique,
+            ModelRoutingHint.DISCOVERY_MERGE: settings.model_route_discovery_merge,
+        }.items()
+    }
     router = ModelRouter(
         openai_research=openai_research,
         openai_structured=openai_structured,
         openai_drafting=openai_drafting,
         openai_critic=openai_critic,
         qwen=qwen,
+        gemini=gemini,
         fake=fake,
-        forced_provider=forced,
+        forced_backend=forced,
+        routing=routing,
     )
     minio_client = Minio(
         settings.s3_endpoint,
@@ -70,19 +107,19 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
     output_store = BlobModelOutputStore(BlobCatalogService(blob_store, uow_factory))
     return ModelGateway(
         router,
-        uow_factory,
+        cast(ModelRunUnitOfWorkFactory, uow_factory),
         output_store,
         diagnostics=DiagnosticsLog.from_env(settings.diagnostics_log_root),
     )
 
 
-def create_bridge_capabilities_provider(settings: Settings) -> ChatGPTBridgeTransport:
+def create_bridge_capabilities_provider(settings: Settings) -> ChatGPTBridgeClient:
     # Cette instance sert deux usages aux budgets opposés : la sonde
     # `/bridge/capabilities`, qui doit rester quasi instantanée et sans rejeu,
     # et la fermeture de session, qui pilote le navigateur. Chaque appel porte
     # désormais son propre budget ; `timeout_seconds` n'est plus qu'un
     # défaut de sécurité.
-    return ChatGPTBridgeTransport(
+    return ChatGPTBridgeClient(
         settings.openai_bridge_base_url,
         api_key=_secret_value(settings.openai_bridge_api_key),
         timeout_seconds=settings.openai_bridge_archive_timeout_seconds,

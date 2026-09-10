@@ -17,11 +17,13 @@ from cti_app.application.model_gateway import (
     SafeModelRequest,
     StructuredOutputError,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelRole
+from cti_app.domain.model_runs import ModelBackend, ModelProvider, ModelRole, ModelTransport
 from cti_app.integrations.models import (
     BridgeTransportError,
+    ChatGPTBridgeClient,
     ChatGPTBridgeTransport,
     FakeModelAdapter,
+    OpenAICompatibleChatAdapter,
     OpenAIResearchAdapter,
     OpenAIStructuredAdapter,
     QwenAdapter,
@@ -172,6 +174,53 @@ async def test_openai_research_uses_responses_web_search_and_background() -> Non
     assert payload["background"] is True
     assert payload["include"] == ["web_search_call.action.sources"]
     assert payload["input"] == [{"role": "user", "content": "Texte autorisé"}]
+
+
+async def test_chatgpt_bridge_client_uses_standard_responses_endpoints() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json={"id": "resp_1", "status": "queued"})
+        return httpx.Response(
+            200, json={"id": "resp_1", "status": "completed", "output_text": "ok"}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = ChatGPTBridgeClient("http://bridge.test/v1", client=client)
+        await transport.create({"model": "chatgpt-web"}, idempotency_key="run:a1")
+        await transport.retrieve("resp_1")
+
+    assert [request.url.path for request in requests] == ["/v1/responses", "/v1/responses/resp_1"]
+    assert requests[0].headers["X-Idempotency-Key"] == "run:a1"
+
+
+async def test_gemini_webai_uses_generic_chat_completions_contract() -> None:
+    transport = FakeChatTransport(
+        {
+            "id": "gemini-1",
+            "model": "gemini-3-flash-actual",
+            "choices": [{"message": {"content": '{"title":"Iran","score":2}'}}],
+        }
+    )
+    adapter = OpenAICompatibleChatAdapter(
+        transport,
+        provider=ModelProvider.GEMINI,
+        backend=ModelBackend.GEMINI_WEBAI,
+        model="gemini-3-flash",
+        is_external=True,
+    )
+
+    result = await adapter.invoke(
+        safe_request(), role=ModelRole.STRUCTURED_EXTRACTION, output_schema=Extraction
+    )
+
+    assert result.provider is ModelProvider.GEMINI
+    assert adapter.backend is ModelBackend.GEMINI_WEBAI
+    assert adapter.transport is ModelTransport.OPENAI_CHAT_COMPLETIONS
+    assert result.structured_output == Extraction(title="Iran", score=2)
+    assert transport.payloads[0]["response_format"] == {"type": "json_object"}
 
 
 async def test_openai_structured_rejects_invalid_output() -> None:

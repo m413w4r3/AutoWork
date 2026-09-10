@@ -1,0 +1,20 @@
+services:
+  backend:
+    networks:
+      - default
+      - model-providers
+
+  worker:
+    networks:
+      - default
+      - model-providers
+
+  job-recovery:
+    networks:
+      - default
+      - model-providers
+
+networks:
+  model-providers:
+    external: true
+    name: metaharness-models

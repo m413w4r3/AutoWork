@@ -9,6 +9,20 @@ from uuid import UUID, uuid4
 
 class ModelProvider(StrEnum):
     OPENAI = "openai"
+    GEMINI = "gemini"
+    QWEN = "qwen"
+    FAKE = "fake"
+
+
+class ModelTransport(StrEnum):
+    OPENAI_RESPONSES = "openai_responses"
+    OPENAI_CHAT_COMPLETIONS = "openai_chat_completions"
+    FAKE = "fake"
+
+
+class ModelBackend(StrEnum):
+    CHATGPT_BRIDGE = "chatgpt_bridge"
+    GEMINI_WEBAI = "gemini_webai"
     QWEN = "qwen"
     FAKE = "fake"
 
@@ -68,6 +82,10 @@ class ModelRun:
     authorized_input_hash: str
     evidence_pack_hash: str
     parameters: dict[str, Any]
+    # Defaults preserve construction compatibility for imported fixtures; the
+    # gateway always supplies the selected backend and transport explicitly.
+    backend: ModelBackend = ModelBackend.CHATGPT_BRIDGE
+    transport: ModelTransport = ModelTransport.OPENAI_RESPONSES
     id: UUID = field(default_factory=uuid4)
     actual_model_version: str | None = None
     duration_ms: int | None = None
@@ -100,6 +118,42 @@ class ModelRun:
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
+        if (
+            self.backend is ModelBackend.CHATGPT_BRIDGE
+            and self.transport is ModelTransport.OPENAI_RESPONSES
+            and self.provider is not ModelProvider.OPENAI
+        ):
+            defaults = {
+                ModelProvider.GEMINI: (
+                    ModelBackend.GEMINI_WEBAI,
+                    ModelTransport.OPENAI_CHAT_COMPLETIONS,
+                ),
+                ModelProvider.QWEN: (
+                    ModelBackend.QWEN,
+                    ModelTransport.OPENAI_CHAT_COMPLETIONS,
+                ),
+                ModelProvider.FAKE: (ModelBackend.FAKE, ModelTransport.FAKE),
+            }
+            self.backend, self.transport = defaults.get(
+                self.provider, (self.backend, self.transport)
+            )
+        expected = {
+            ModelProvider.OPENAI: (
+                ModelBackend.CHATGPT_BRIDGE,
+                ModelTransport.OPENAI_RESPONSES,
+            ),
+            ModelProvider.GEMINI: (
+                ModelBackend.GEMINI_WEBAI,
+                ModelTransport.OPENAI_CHAT_COMPLETIONS,
+            ),
+            ModelProvider.QWEN: (
+                ModelBackend.QWEN,
+                ModelTransport.OPENAI_CHAT_COMPLETIONS,
+            ),
+            ModelProvider.FAKE: (ModelBackend.FAKE, ModelTransport.FAKE),
+        }[self.provider]
+        if (self.backend, self.transport) != expected:
+            raise ValueError("Model provider, backend and transport are inconsistent")
         if not self.requested_model.strip():
             raise ValueError("Requested model must not be empty")
         if not self.prompt_template_id.strip() or not self.prompt_template_version.strip():
