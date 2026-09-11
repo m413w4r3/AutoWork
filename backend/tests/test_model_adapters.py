@@ -11,6 +11,8 @@ from pydantic import BaseModel
 
 from cti_app.application.model_gateway import (
     AdapterResultStatus,
+    ModelCapabilities,
+    ModelCapabilityError,
     ModelGatewayError,
     ModelRoutingHint,
     SafeModelRequest,
@@ -19,8 +21,10 @@ from cti_app.application.model_gateway import (
 from cti_app.domain.model_runs import ModelBackend, ModelProvider, ModelRole, ModelTransport
 from cti_app.integrations.models import (
     BridgeTransportError,
+    ChatCompletionsTransportError,
     ChatGPTBridgeClient,
     FakeModelAdapter,
+    HttpChatCompletionsTransport,
     OpenAICompatibleChatAdapter,
     OpenAIResearchAdapter,
     OpenAIStructuredAdapter,
@@ -86,7 +90,7 @@ def research_case() -> tuple[object, ModelRole, type[BaseModel] | None]:
         {
             "id": "resp_research",
             "status": "completed",
-            "model": "chatgpt-web",
+            "model": "GPT-5 Thinking",
             "output_text": "Résultat sourcé",
             "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
         }
@@ -99,7 +103,7 @@ def structured_case() -> tuple[object, ModelRole, type[BaseModel] | None]:
         {
             "id": "resp_structured",
             "status": "completed",
-            "model": "chatgpt-web",
+            "model": "GPT-5 Thinking",
             "output_text": '{"title":"Iran","score":2}',
             "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
         }
@@ -227,12 +231,12 @@ async def test_failed_bridge_response_preserves_typed_diagnostics_without_resubm
     assert len(transport.created_payloads) == 1
 
 
-async def test_gemini_webai_uses_generic_chat_completions_contract() -> None:
+async def test_gemini_webai_uses_generic_textual_chat_completions_contract() -> None:
     transport = FakeChatTransport(
         {
             "id": "gemini-1",
             "model": "gemini-3-flash-actual",
-            "choices": [{"message": {"content": '{"title":"Iran","score":2}'}}],
+            "choices": [{"message": {"content": "Brouillon Gemini"}}],
         }
     )
     adapter = OpenAICompatibleChatAdapter(
@@ -243,16 +247,45 @@ async def test_gemini_webai_uses_generic_chat_completions_contract() -> None:
         is_external=True,
     )
 
-    result = await adapter.invoke(
-        safe_request(), role=ModelRole.STRUCTURED_EXTRACTION, output_schema=Extraction
-    )
+    result = await adapter.invoke(safe_request(), role=ModelRole.DRAFTING)
 
     assert result.provider is ModelProvider.GEMINI
     assert adapter.backend is ModelBackend.GEMINI_WEBAI
     assert adapter.transport is ModelTransport.OPENAI_CHAT_COMPLETIONS
-    assert result.structured_output == Extraction(title="Iran", score=2)
-    assert "response_format" not in transport.payloads[0]
-    assert "JSON conforme" not in transport.payloads[0]["messages"][0]["content"]
+    assert adapter.capabilities.structured_output is False
+    assert result.output_text == "Brouillon Gemini"
+    assert result.actual_model_version == "gemini-3-flash-actual"
+    payload = transport.payloads[0]
+    assert payload["model"] == "gemini-3-flash"
+    assert not {"response_format", "text", "json_schema"} & payload.keys()
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [None, ModelCapabilities(structured_output=True)],
+    ids=["default", "misdeclared"],
+)
+async def test_gemini_webai_refuses_structured_output_before_transport(
+    capabilities: ModelCapabilities | None,
+) -> None:
+    transport = FakeChatTransport({})
+    adapter = OpenAICompatibleChatAdapter(
+        transport,
+        provider=ModelProvider.GEMINI,
+        backend=ModelBackend.GEMINI_WEBAI,
+        model="gemini-3-flash",
+        is_external=True,
+        capabilities=capabilities,
+    )
+
+    with pytest.raises(ModelCapabilityError) as caught:
+        await adapter.invoke(
+            safe_request(), role=ModelRole.STRUCTURED_EXTRACTION, output_schema=Extraction
+        )
+
+    assert caught.value.backend is ModelBackend.GEMINI_WEBAI
+    assert caught.value.capability == "structured_output"
+    assert transport.payloads == []
 
 
 async def test_openai_structured_rejects_invalid_output() -> None:
@@ -368,34 +401,24 @@ async def test_qwen_protocol_is_confined_to_its_adapter() -> None:
     assert transport.payloads[0]["messages"][1]["content"] == "Texte autorisé"
 
 
-async def test_qwen_uses_compact_contract_and_defers_discovery_validation() -> None:
+async def test_qwen_sends_its_json_contract_and_defers_discovery_validation() -> None:
     transport = FakeChatTransport(
         {
-            "id": "qwen_compact",
+            "id": "qwen_contract",
             "model": "Qwen3-32B",
             "choices": [{"message": {"content": '{"title":"Iran","score":2}'}}],
         }
     )
     adapter = QwenAdapter(transport, model="Qwen3-32B", is_external=False)
-    request = replace(
-        safe_request(),
-        metadata={
-            "compact_contract": {
-                "version": "compact-v1",
-                "required": ["title", "score"],
-            },
-            "defer_validation": True,
-        },
-    )
+    request = replace(safe_request(), metadata={"defer_validation": True})
 
     result = await adapter.invoke(
         request, role=ModelRole.STRUCTURED_EXTRACTION, output_schema=Extraction
     )
 
     system = transport.payloads[0]["messages"][0]["content"]
-    assert "compact-v1" in system
-    assert "$defs" not in system
-    assert '"title":' not in system
+    assert '"title"' in system
+    assert '"score"' in system
     assert transport.payloads[0]["response_format"] == {"type": "json_object"}
     assert result.output_text == '{"title":"Iran","score":2}'
     assert result.structured_output is None
@@ -619,3 +642,207 @@ async def test_bridge_connect_error_is_typed_and_post_without_key_is_not_retried
     assert caught.value.code == "bridge_unreachable"
     assert caught.value.retryable is True
     assert calls == 1
+
+
+async def test_bridge_unobserved_ui_model_is_not_recorded_as_a_model_version() -> None:
+    def completed(model: str) -> FakeResponsesTransport:
+        return FakeResponsesTransport(
+            {"id": "resp_model", "status": "completed", "model": model, "output_text": "ok"}
+        )
+
+    observed = await OpenAIResearchAdapter(completed("GPT-5 Thinking"), model="chatgpt-web").invoke(
+        safe_request(), role=ModelRole.RESEARCH
+    )
+    unobserved = await OpenAIResearchAdapter(completed("chatgpt-web"), model="chatgpt-web").invoke(
+        safe_request(), role=ModelRole.RESEARCH
+    )
+
+    assert observed.actual_model_version == "GPT-5 Thinking"
+    assert unobserved.actual_model_version is None
+
+
+async def test_bridge_fastapi_detail_keeps_submission_state_without_replay() -> None:
+    calls = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            503,
+            json={
+                "detail": {
+                    "code": "bridge_extension_disconnected",
+                    "message": "Extension Chrome non connectée : ouvre un onglet chatgpt.com.",
+                    "retryable": True,
+                    "phase": "pre_submission",
+                    "submission_state": "pre_submission",
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = ChatGPTBridgeClient("http://bridge.test/v1", client=client)
+        with pytest.raises(BridgeTransportError) as caught:
+            await transport.create({"input": "secret"}, idempotency_key="run:a1")
+
+    assert caught.value.code == "bridge_extension_disconnected"
+    assert caught.value.retryable is True
+    assert caught.value.phase == "pre_submission"
+    assert caught.value.submission_state == "pre_submission"
+    assert caught.value.status_code == 503
+    assert calls == 1
+
+
+def test_bridge_detail_submission_state_accepts_only_known_values() -> None:
+    def parsed(value: str) -> str | None:
+        response = httpx.Response(
+            503,
+            request=httpx.Request("POST", "https://bridge.test/v1/responses"),
+            json={"detail": {"code": "bridge_extension_disconnected", "submission_state": value}},
+        )
+        return _bridge_http_error(response, attempts=1).submission_state
+
+    assert parsed("pre_submission") == "pre_submission"
+    assert parsed("submission_attempted") == "submission_attempted"
+    assert parsed("post_submission") == "post_submission"
+    assert parsed("probably_not_sent") is None
+
+
+def _chat_payload(prompt: str = "Texte autorisé") -> dict[str, Any]:
+    return {"model": "gemini-3-flash", "messages": [{"role": "user", "content": prompt}]}
+
+
+async def _webai_error(
+    respond: Callable[[httpx.Request], httpx.Response],
+    payload: dict[str, Any] | None = None,
+) -> tuple[ChatCompletionsTransportError, list[httpx.Request]]:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return respond(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transport = HttpChatCompletionsTransport(
+            "http://web_ai.test/v1", api_key="webai-secret-key", provider="gemini", client=client
+        )
+        with pytest.raises(ChatCompletionsTransportError) as caught:
+            await transport.create(payload or _chat_payload())
+    return caught.value, requests
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "retryable", "submission_state"),
+    [
+        (400, "provider_bad_request", False, None),
+        (401, "provider_auth_failed", False, "pre_submission"),
+        (403, "provider_auth_failed", False, "pre_submission"),
+        (404, "provider_not_found", False, "pre_submission"),
+        (422, "provider_validation_failed", False, None),
+        (429, "provider_rate_limited", True, None),
+        (502, "provider_server_error", True, None),
+        (503, "provider_server_error", True, None),
+        (504, "provider_timeout", True, None),
+    ],
+)
+async def test_webai_http_errors_keep_a_typed_bounded_contract(
+    status: int, code: str, retryable: bool, submission_state: str | None
+) -> None:
+    error, requests = await _webai_error(
+        lambda _: httpx.Response(status, json={"detail": "Gemini WebAPI provider request failed."})
+    )
+
+    assert error.code == code
+    assert error.code != "model_transport_unavailable"
+    assert error.provider == "gemini"
+    assert error.status_code == status
+    assert error.retryable is retryable
+    assert error.submission_state == submission_state
+    assert error.diagnostics["http_status"] == status
+    assert error.diagnostics["provider_message"] == "Gemini WebAPI provider request failed."
+    assert len(requests) == 1
+
+
+async def test_webai_only_an_unopened_connection_is_a_transport_pre_submission() -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    def stall(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timeout", request=request)
+
+    refused, _ = await _webai_error(refuse)
+    stalled, _ = await _webai_error(stall)
+    garbled, _ = await _webai_error(lambda _: httpx.Response(200, content=b"<html>"))
+
+    assert (refused.code, refused.retryable, refused.submission_state) == (
+        "provider_unreachable",
+        True,
+        "pre_submission",
+    )
+    assert (stalled.code, stalled.retryable, stalled.submission_state) == (
+        "provider_timeout",
+        True,
+        None,
+    )
+    assert (garbled.code, garbled.retryable, garbled.submission_state) == (
+        "provider_protocol_error",
+        False,
+        "post_submission",
+    )
+
+
+async def test_webai_explicit_submission_contract_is_honoured_only_when_valid() -> None:
+    def contract(state: str) -> Callable[[httpx.Request], httpx.Response]:
+        return lambda _: httpx.Response(
+            503,
+            json={"detail": {"code": "gemini_not_ready", "submission_state": state}},
+        )
+
+    proven, _ = await _webai_error(contract("pre_submission"))
+    invented, _ = await _webai_error(contract("surely_not_sent"))
+
+    assert proven.submission_state == "pre_submission"
+    assert proven.diagnostics["provider_code"] == "gemini_not_ready"
+    assert invented.submission_state is None
+
+
+async def test_webai_error_never_keeps_prompt_echoes_or_secrets() -> None:
+    prompt = "Rapport confidentiel sur l'acteur APT-Example et ses infrastructures"
+    echoed, requests = await _webai_error(
+        lambda _: httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": f"Invalid content: {prompt}",
+                    "code": "invalid_value",
+                    "type": "invalid_request_error",
+                    "param": "messages[1].content",
+                }
+            },
+        ),
+        _chat_payload(prompt),
+    )
+    leaked, _ = await _webai_error(
+        lambda _: httpx.Response(
+            401,
+            json={"detail": "Rejected Authorization: Bearer sk-live-abcdef123456 cookie=1PSID"},
+        )
+    )
+    validation, _ = await _webai_error(
+        lambda _: httpx.Response(
+            422, json={"detail": [{"loc": ["body", "messages"], "msg": "bad", "input": prompt}]}
+        ),
+        _chat_payload(prompt),
+    )
+
+    assert "provider_message" not in echoed.diagnostics
+    assert echoed.diagnostics["provider_code"] == "invalid_value"
+    assert echoed.diagnostics["provider_param"] == "messages[1].content"
+    assert "provider_message" not in validation.diagnostics
+    for error in (echoed, leaked, validation):
+        rendered = f"{error} {error.diagnostics}"
+        assert "APT-Example" not in rendered
+        assert "sk-live" not in rendered
+        assert "1PSID" not in rendered
+        assert "webai-secret-key" not in rendered
+    assert requests[0].headers["Authorization"] == "Bearer webai-secret-key"

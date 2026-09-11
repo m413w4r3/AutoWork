@@ -39,6 +39,7 @@ from cti_app.domain.discovery import (
 )
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import (
+    ModelBackend,
     ModelProvider,
     ModelRole,
     ModelRun,
@@ -191,7 +192,7 @@ def gateway_for_adapter(
             openai_structured=adapter,
             qwen=adapter,
             fake=adapter,
-            forced_provider=ModelProvider.FAKE,
+            forced_backend=ModelBackend.FAKE,
         ),
         model_uow,
         output_store,
@@ -319,7 +320,7 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
             openai_structured=fake,
             qwen=fake,
             fake=fake,
-            forced_provider=ModelProvider.FAKE,
+            forced_backend=ModelBackend.FAKE,
         ),
         model_uow,
         InMemoryModelOutputStore(),

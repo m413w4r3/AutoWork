@@ -78,15 +78,6 @@ class StructuredModelUnavailableError(ModelGatewayError):
     phase = "structuring"
 
 
-class ModelTransportUnavailableError(ModelGatewayError):
-    code = "model_transport_unavailable"
-    retryable = True
-
-    def __init__(self, message: str, *, provider: str) -> None:
-        super().__init__(message)
-        self.provider = provider
-
-
 class ModelCapabilityError(ModelGatewayError):
     code = "model_capability_unsupported"
 
@@ -147,7 +138,9 @@ class ConversationContext:
     parent_turn_id: UUID | None = None
     previous_head_hash: str | None = None
     expected_profile: str | None = None
-    requested_model: str | None = None
+    # ChatGPT UI model-picker entry to apply and verify (`bridge_ui_model`);
+    # never the OpenAI `model` label, which stays a traceability label.
+    ui_model: str | None = None
     external_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -358,7 +351,6 @@ class ModelRouter:
         gemini: ModelAdapter | None = None,
         routing: dict[ModelRoutingHint, ModelBackend] | None = None,
         forced_backend: ModelBackend | None = None,
-        forced_provider: ModelProvider | None = None,
     ) -> None:
         self._adapters = {
             ModelBackend.QWEN: qwen,
@@ -372,7 +364,6 @@ class ModelRouter:
         self._openai_critic = openai_critic or openai_research
         self._adapters[ModelBackend.CHATGPT_BRIDGE] = openai_research
         self._forced_backend = forced_backend
-        self._forced_provider = forced_provider
         self._routing = routing or {
             ModelRoutingHint.WEB_RESEARCH: ModelBackend.CHATGPT_BRIDGE,
             ModelRoutingHint.BULK_EXTRACTION: ModelBackend.QWEN,
@@ -390,8 +381,6 @@ class ModelRouter:
             return self.by_provider(request.provider, role)
         if self._forced_backend is not None:
             return self.by_backend(self._forced_backend, role)
-        if self._forced_provider is not None:
-            return self.by_provider(self._forced_provider, role)
         backend = self._routing[request.routing_hint]
         return self.by_backend(backend, role)
 
@@ -679,8 +668,8 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         safe_request = sanitize_model_request(request)
         return ModelRun(
             provider=adapter.provider,
-            backend=_adapter_backend(adapter),
-            transport=_adapter_transport(adapter),
+            backend=adapter.backend,
+            transport=adapter.transport,
             model_role=role,
             requested_model=adapter.requested_model,
             prompt_template_id=request.prompt_template_id,
@@ -716,8 +705,8 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             adapter = self._router.by_backend(run.backend, run.model_role)
             if (
                 adapter.provider is not run.provider
-                or _adapter_backend(adapter) is not run.backend
-                or _adapter_transport(adapter) is not run.transport
+                or adapter.backend is not run.backend
+                or adapter.transport is not run.transport
             ):
                 raise ModelGatewayError("Persisted ModelRun backend/transport is not configured")
             elapsed_ms = max(
@@ -1119,46 +1108,10 @@ _CERTAIN_PRE_SUBMISSION_CODES = frozenset(
 )
 
 
-def _adapter_backend(adapter: ModelAdapter) -> ModelBackend:
-    value = getattr(adapter, "backend", None)
-    if isinstance(value, ModelBackend):
-        return value
-    defaults = {
-        ModelProvider.OPENAI: ModelBackend.CHATGPT_BRIDGE,
-        ModelProvider.GEMINI: ModelBackend.GEMINI_WEBAI,
-        ModelProvider.QWEN: ModelBackend.QWEN,
-        ModelProvider.FAKE: ModelBackend.FAKE,
-    }
-    return defaults[adapter.provider]
-
-
-def _adapter_transport(adapter: ModelAdapter) -> ModelTransport:
-    value = getattr(adapter, "transport", None)
-    if isinstance(value, ModelTransport):
-        return value
-    defaults = {
-        ModelBackend.CHATGPT_BRIDGE: ModelTransport.OPENAI_RESPONSES,
-        ModelBackend.GEMINI_WEBAI: ModelTransport.OPENAI_CHAT_COMPLETIONS,
-        ModelBackend.QWEN: ModelTransport.OPENAI_CHAT_COMPLETIONS,
-        ModelBackend.FAKE: ModelTransport.FAKE,
-    }
-    return defaults[_adapter_backend(adapter)]
-
-
-def _adapter_capabilities(adapter: ModelAdapter) -> ModelCapabilities:
-    capabilities = getattr(adapter, "capabilities", None)
-    if isinstance(capabilities, ModelCapabilities):
-        return capabilities
-    backend = _adapter_backend(adapter)
-    if backend in {ModelBackend.CHATGPT_BRIDGE, ModelBackend.FAKE}:
-        return ModelCapabilities(web_search=True, background=True, conversation=True)
-    return ModelCapabilities()
-
-
 def _ensure_capabilities(
     adapter: ModelAdapter, request: ModelRequest, *, structured_output: bool = False
 ) -> None:
-    capabilities = _adapter_capabilities(adapter)
+    capabilities = adapter.capabilities
     unsupported: list[str] = []
     if request.web_search and not capabilities.web_search:
         unsupported.append("web_search")
@@ -1169,10 +1122,9 @@ def _ensure_capabilities(
     if structured_output and not capabilities.structured_output:
         unsupported.append("structured_output")
     if unsupported:
-        backend = _adapter_backend(adapter).value
         raise ModelCapabilityError(
-            f"Backend {backend} does not support: {', '.join(unsupported)}",
-            backend=_adapter_backend(adapter),
+            f"Backend {adapter.backend.value} does not support: {', '.join(unsupported)}",
+            backend=adapter.backend,
             capability=unsupported[0],
         )
 
@@ -1199,7 +1151,8 @@ def sanitize_model_request(request: ModelRequest) -> SafeModelRequest:
             request.conversation.previous_head_hash if request.conversation else None
         ),
         "expected_profile": request.conversation.expected_profile if request.conversation else None,
-        "requested_model": request.conversation.requested_model if request.conversation else None,
+        # Hash key kept stable so pre-persisted runs keep their authorized_input_hash.
+        "requested_model": request.conversation.ui_model if request.conversation else None,
         "external_id": request.conversation.external_id if request.conversation else None,
     }
     digest = hashlib.sha256(

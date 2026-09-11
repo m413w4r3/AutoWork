@@ -22,6 +22,7 @@ from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
     ConversationResult,
+    ModelCapabilities,
     ModelGateway,
     ModelGatewayError,
     ModelRouter,
@@ -71,7 +72,14 @@ from cti_app.domain.editorial import (
     GroupingOutcome,
 )
 from cti_app.domain.entities import SourceDocument, Subject
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
+from cti_app.domain.model_runs import (
+    ModelBackend,
+    ModelProvider,
+    ModelRole,
+    ModelRun,
+    ModelTransport,
+    ModelUsage,
+)
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
@@ -94,6 +102,9 @@ class _CountingRetryModelAdapter:
     """A deterministic bridge-shaped adapter for the real retry workflow."""
 
     provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     requested_model = "fake-production-retry"
     is_external = False
 

@@ -32,7 +32,13 @@ from cti_app.application.jobs import (
 from cti_app.application.model_gateway import ModelGateway, ModelGatewayError, ModelRouter
 from cti_app.domain.discovery_cumulative import DiscoveryInputMode
 from cti_app.domain.jobs import JobStatus
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelRunStatus
+from cti_app.domain.model_runs import (
+    ModelBackend,
+    ModelProvider,
+    ModelRole,
+    ModelRun,
+    ModelRunStatus,
+)
 from cti_app.integrations.models import FakeModelAdapter, InMemoryModelOutputStore
 from tests.discovery_support import InMemoryDiscoveryUnitOfWorkFactory
 from tests.job_support import InMemoryJobUnitOfWorkFactory
@@ -443,7 +449,7 @@ async def test_completion_recovery_links_child_exactly_once_on_creation() -> Non
             openai_structured=adapter,
             qwen=adapter,
             fake=adapter,
-            forced_provider=ModelProvider.FAKE,
+            forced_backend=ModelBackend.FAKE,
         ),
         model_uow,
         InMemoryModelOutputStore(),

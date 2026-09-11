@@ -1,15 +1,29 @@
+# MetaHarness integration override.
+#
+# Joins the external network created by MetaHarness-/Bridges and reaches its
+# services by their Docker names. The standalone compose.yaml keeps its
+# host.docker.internal default for use without the MetaHarness stack.
+#
+#   docker compose -f compose.yaml -f compose.models.yaml up -d
+x-metaharness-model-endpoints: &metaharness-model-endpoints
+  OPENAI_BRIDGE_BASE_URL: http://chatgpt-bridge:8001/v1
+  WEBAI_BASE_URL: http://web_ai:6969/v1
+
 services:
   backend:
+    environment: *metaharness-model-endpoints
     networks:
       - default
       - model-providers
 
   worker:
+    environment: *metaharness-model-endpoints
     networks:
       - default
       - model-providers
 
   job-recovery:
+    environment: *metaharness-model-endpoints
     networks:
       - default
       - model-providers

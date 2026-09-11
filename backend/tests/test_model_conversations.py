@@ -17,6 +17,7 @@ from cti_app.application.model_gateway import (
     AdapterResultStatus,
     ConversationContext,
     ConversationResult,
+    ModelCapabilities,
     ModelGateway,
     ModelGatewayError,
     ModelRequest,
@@ -35,7 +36,14 @@ from cti_app.domain.model_conversations import (
     ConversationTurnStatus,
     ModelConversation,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus, ModelUsage
+from cti_app.domain.model_runs import (
+    ModelBackend,
+    ModelProvider,
+    ModelRole,
+    ModelRunStatus,
+    ModelTransport,
+    ModelUsage,
+)
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.integrations.models import BlobModelOutputStore, BridgeTransportError, FakeModelAdapter
 from tests.conversation_support import InMemoryConversationUnitOfWorkFactory
@@ -215,6 +223,9 @@ class _ScriptedBridgeAdapter:
     exactly once per call — never used as routing identity."""
 
     provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     requested_model = "chatgpt-web"
     is_external = True
 
@@ -782,6 +793,9 @@ class _AlwaysAmbiguousStatelessAdapter:
     """Stateless bridge run: no ConversationContext is ever attached."""
 
     provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     requested_model = "chatgpt-web"
     is_external = True
 

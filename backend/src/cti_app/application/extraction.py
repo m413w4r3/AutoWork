@@ -79,7 +79,7 @@ class ProposedClaim(BaseModel):
     uncertainty: str | None = Field(default=None, max_length=2000)
 
 
-class QwenEvidenceOutput(BaseModel):
+class EvidenceExtractionOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     actors: list[ProposedClaim] = Field(default_factory=list)
@@ -287,10 +287,10 @@ class EvidenceExtractionService:
                         "strategy_version": chunk.strategy_version,
                     },
                 ),
-                QwenEvidenceOutput,
+                EvidenceExtractionOutput,
             )
             output = execution.structured_output
-            if not isinstance(output, QwenEvidenceOutput):
+            if not isinstance(output, EvidenceExtractionOutput):
                 raise ValueError("Structured extraction returned an unexpected schema")
             run = getattr(execution, "run", None)
             model_run_id = getattr(run, "id", None)

@@ -42,7 +42,7 @@ Capacités déclarées par AutoWork :
 | Backend | web search | background | conversation | structured output |
 | --- | ---: | ---: | ---: | ---: |
 | `chatgpt_bridge` | oui | oui | oui | oui, contrat textuel et validation locale |
-| `gemini_webai` | non | non | non | oui, validation locale uniquement |
+| `gemini_webai` | non | non | non | non (fail-closed) |
 | `qwen` | non | non | non | oui, contrat Qwen et validation locale |
 | `fake` | permissif pour les tests | oui | permissif | oui |
 
@@ -88,8 +88,9 @@ l'interface quand il peut le vérifier, et retombe sinon sur une instruction dan
 cas pouvoir reconstruire les appels d'outils natifs.
 
 Le bridge accepte aussi `ui_model` et `profile`, réglages d'interface appliqués puis vérifiés
-dans le DOM, et refuse le run quand la vérification échoue. L'application ne les utilise pas
-encore : `requested_model` reste une étiquette de traçabilité, sans effet sur l'interface. La forme côté adaptateur reste `tools: [{"type": "web_search"}]`, conformément à la
+dans le DOM, et refuse le run quand la vérification échoue. Côté AutoWork, seul
+`ConversationContext.ui_model` est transmis, comme `bridge_ui_model` ; `requested_model` (le
+`model` OpenAI) reste une étiquette de traçabilité, sans effet sur l'interface. La forme côté adaptateur reste `tools: [{"type": "web_search"}]`, conformément à la
 `include: ["web_search_call.action.sources"]`, conformément à la
 [documentation Web search](https://developers.openai.com/api/docs/guides/tools-web-search).
 
@@ -103,10 +104,12 @@ compatible Zero Data Retention, avant de l'autoriser pour une classification sen
 `OpenAIStructuredAdapter` ajoute un contrat textuel à l'entrée, puis revalide la réponse texte
 avec le modèle Pydantic attendu. Le ChatGPT Bridge ne fournit pas de Structured Outputs natifs
 OpenAI : ce chemin ne doit donc pas être décrit comme une garantie fournisseur de JSON Schema.
-Pour la découverte, Qwen conserve son comportement historique : contrat compact versionné,
+Qwen conserve son comportement : schéma JSON du modèle Pydantic injecté dans le prompt système,
 `response_format={"type":"json_object"}` et validation locale finale. Gemini WebAI utilise le
-même protocole HTTP Chat Completions, mais ne reçoit ni `response_format` ni extension de schéma
-OpenAI ; sa structure éventuelle est obtenue par le prompt métier et validée localement.
+même protocole HTTP Chat Completions mais reste textuel : il ne reçoit jamais `response_format`,
+`text.format` ni `json_schema`. Aucun contrat structuré n'étant défini pour lui, il est
+fail-closed : une route `STRUCTURED_EXTRACTION` vers `gemini_webai` échoue avec
+`ModelCapabilityError` avant tout appel réseau et sans créer de `ModelRun`.
 Les extractions structurées de fond sont refusées pour l'instant : reprendre un tel run exige
 de persister l'identité du schéma, ce qui appartient à un incrément ultérieur.
 
@@ -119,7 +122,9 @@ Il traduit ensuite la requête vers l'interface ChatGPT :
 
 - il rapporte le libellé lu dans le sélecteur de modèle de l'interface (`metadata.model_source
   = ui_observed`), et retombe honnêtement sur `chatgpt-web` quand ce libellé n'est pas
-  lisible. Ce libellé reste celui affiché par l'UI, pas le snapshot exact servi par OpenAI ;
+  lisible ; AutoWork enregistre alors `actual_model_version=None`, puisque `chatgpt-web`
+  signale une absence d'observation. Le libellé observé reste celui affiché par l'UI, pas
+  le snapshot exact servi par OpenAI ;
 - son usage est estimé ;
 - il peut activer l'outil de recherche de l'interface et le vérifie
   (`metadata.web_search_mode = ui_tool`), sinon il retombe sur l'instruction dans le prompt
@@ -133,6 +138,33 @@ Il traduit ensuite la requête vers l'interface ChatGPT :
 
 L'intégration est donc remplaçable par le service Responses officiel sans modifier les ports
 métier.
+
+### Erreurs Chat Completions (Qwen, Gemini WebAI)
+
+`HttpChatCompletionsTransport` exige son `provider` et lève `ChatCompletionsTransportError` :
+`provider`, `code`, `status_code`, `retryable`, `submission_state` et des diagnostics bornés
+(code, type et paramètre provider, message nettoyé). Le prompt, les en-têtes `Authorization`, les
+cookies et les secrets ne sont jamais conservés ; un message provider qui cite la requête est
+écarté, tout comme les listes de validation FastAPI qui recopient l'entrée.
+
+| Cas | `code` | retryable | `submission_state` |
+| --- | --- | ---: | --- |
+| connexion jamais ouverte | `provider_unreachable` | oui | `pre_submission` |
+| timeout de lecture/écriture, coupure | `provider_timeout`, `provider_transport_error` | oui | inconnu |
+| 400 | `provider_bad_request` | non | inconnu |
+| 401 / 403 | `provider_auth_failed` | non | `pre_submission` |
+| 404 | `provider_not_found` | non | `pre_submission` |
+| 422 | `provider_validation_failed` | non | inconnu |
+| 429 | `provider_rate_limited` | oui | inconnu |
+| 5xx (504 : `provider_timeout`) | `provider_server_error` | oui | inconnu |
+| 2xx sans JSON objet | `provider_protocol_error` | non | `post_submission` |
+
+`pre_submission` n'est déclaré que lorsqu'il est prouvé : connexion jamais ouverte, refus
+d'authentification ou ressource absente, ou `submission_state` explicite dans le contrat
+d'erreur. Un 400 (filtre de contenu), un 422 ou un 429 (WebAI y mappe les limites d'usage
+Gemini) peut suivre un prompt reçu : l'état reste inconnu et le `ModelRun` passe en
+réconciliation, sans second POST implicite. Les diagnostics sont persistés dans
+`error_details.bridge_diagnostics`.
 
 ## Table `model_runs`
 
@@ -187,6 +219,17 @@ un port publié sur `127.0.0.1` : le Bridge doit être publié sur la passerelle
 LAN) ou sur `0.0.0.0` derrière un pare-feu. Hors loopback, le Bridge exige un
 `BRIDGE_API_KEY` fort, que `OPENAI_BRIDGE_API_KEY` reprend côté AutoWork. Les
 deux dépôts gardent chacun leur nom de variable.
+
+Avec la stack MetaHarness (`MetaHarness-/Bridges`), utiliser l'override
+`compose.models.yaml` : `backend`, `worker` et `job-recovery` rejoignent le réseau externe
+`metaharness-models` et reçoivent `OPENAI_BRIDGE_BASE_URL=http://chatgpt-bridge:8001/v1` et
+`WEBAI_BASE_URL=http://web_ai:6969/v1`, qui priment sur `.env` pour ces services. Le Bridge
+reste publié sur loopback côté hôte ; `OPENAI_BRIDGE_API_KEY` doit égaler le `BRIDGE_API_KEY`
+de la stack. Configuration effective :
+`docker compose -f compose.yaml -f compose.models.yaml config`.
+
+Chaque appel au Bridge est une seule tentative HTTP : une relance éventuelle relève du
+`ModelGateway`, à partir de l'erreur typée et de son `submission_state`.
 
 Le `.env.example` pointe vers le gateway Qwen retenu. Placer la clé uniquement dans `.env` ou
 un secret manager ; elle n'est jamais nécessaire pour les tests. La décision de confiance

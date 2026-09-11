@@ -63,7 +63,6 @@ class Settings(BaseSettings):
     # Le budget doit couvrir BRIDGE_UI_TIMEOUT (30 s) plus la fenêtre de
     # reconnexion BRIDGE_RECONNECT_GRACE (20 s) du service worker MV3.
     openai_bridge_archive_timeout_seconds: float = Field(default=60.0, gt=0, le=300)
-    openai_bridge_max_attempts: int = Field(default=3, ge=1, le=10)
     discovery_bridge_poll_interval_seconds: float = Field(default=5.0, ge=3.0, le=10.0)
     openai_research_model: str = "chatgpt-web"
     openai_structured_model: str = "chatgpt-web"

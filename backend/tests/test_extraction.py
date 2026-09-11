@@ -12,9 +12,9 @@ from pypdf import PdfWriter
 from cti_app.application.extraction import (
     ChunkingPolicy,
     DocumentParsingError,
+    EvidenceExtractionOutput,
     EvidenceExtractionService,
     PdfParsingPolicy,
-    QwenEvidenceOutput,
     extract_indicators,
     parse_document,
     segment_text,
@@ -26,7 +26,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class StructuredFixtureModel:
-    def __init__(self, output: QwenEvidenceOutput) -> None:
+    def __init__(self, output: EvidenceExtractionOutput) -> None:
         self.output = output
         self.requests: list[object] = []
 
@@ -202,7 +202,7 @@ async def test_hallucinated_literal_ioc_claim_is_rejected() -> None:
         (FIXTURES / "source_multilingual.html").read_bytes(),
         DetectedMimeType.HTML,
     )
-    output = QwenEvidenceOutput.model_validate(
+    output = EvidenceExtractionOutput.model_validate(
         {
             "facts": [
                 {
@@ -239,7 +239,7 @@ async def test_claim_span_highlights_exact_source_passage() -> None:
         DetectedMimeType.HTML,
     )
     quote = "ExampleRAT le 12 juillet 2026"
-    output = QwenEvidenceOutput.model_validate(
+    output = EvidenceExtractionOutput.model_validate(
         {
             "facts": [
                 {
@@ -358,7 +358,7 @@ def test_segmentation_is_deterministic_and_bounded() -> None:
 
 
 async def test_invalid_model_proposal_does_not_remove_valid_claim() -> None:
-    output = QwenEvidenceOutput.model_validate(
+    output = EvidenceExtractionOutput.model_validate(
         {
             "actors": [
                 {
@@ -396,7 +396,7 @@ async def test_invalid_model_proposal_does_not_remove_valid_claim() -> None:
 
 async def test_overlap_claim_is_deduplicated_without_losing_chunk_provenance() -> None:
     quote = "ExampleRAT"
-    output = QwenEvidenceOutput.model_validate(
+    output = EvidenceExtractionOutput.model_validate(
         {
             "actors": [
                 {

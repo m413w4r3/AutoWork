@@ -5,7 +5,6 @@ from minio import Minio
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.model_gateway import (
-    ModelCapabilities,
     ModelGateway,
     ModelRouter,
     ModelRoutingHint,
@@ -36,7 +35,6 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
         timeout_seconds=settings.model_request_timeout_seconds,
         connect_timeout_seconds=settings.openai_bridge_connect_timeout_seconds,
         capabilities_timeout_seconds=settings.openai_bridge_capabilities_timeout_seconds,
-        max_attempts=settings.openai_bridge_max_attempts,
     )
     qwen_transport = HttpChatCompletionsTransport(
         settings.qwen_base_url,
@@ -67,7 +65,8 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
         backend=ModelBackend.GEMINI_WEBAI,
         model=settings.webai_model,
         is_external=settings.webai_is_external,
-        capabilities=ModelCapabilities(structured_output=True),
+        # Fail-closed: no structured contract is defined for Gemini WebAI yet,
+        # so STRUCTURED_EXTRACTION routed here fails before any network call.
     )
     fake = FakeModelAdapter()
     force_aliases = {"openai": "chatgpt_bridge", "gemini": "gemini_webai"}
@@ -128,7 +127,6 @@ def create_bridge_capabilities_provider(settings: Settings) -> ChatGPTBridgeClie
         connect_timeout_seconds=settings.openai_bridge_connect_timeout_seconds,
         capabilities_timeout_seconds=settings.openai_bridge_capabilities_timeout_seconds,
         archive_timeout_seconds=settings.openai_bridge_archive_timeout_seconds,
-        max_attempts=settings.openai_bridge_max_attempts,
     )
 
 

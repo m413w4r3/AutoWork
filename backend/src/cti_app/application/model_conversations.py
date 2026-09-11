@@ -8,8 +8,6 @@ from io import BytesIO
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel
-
 from cti_app.application.blob_storage import BlobStore
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.model_gateway import (
@@ -564,7 +562,7 @@ class ModelConversationService:
                     parent.output_sha256 if mode is ConversationMode.CONTINUE and parent else None
                 ),
                 expected_profile=conversation.expected_profile,
-                requested_model=conversation.requested_model,
+                ui_model=conversation.requested_model,
                 external_id=conversation.external_id,
             )
             request = ModelRequest(
@@ -730,45 +728,6 @@ class ModelConversationService:
                     status=ConversationTurnStatus.NEEDS_REVIEW,
                 ) from exc
             raise
-
-    async def extract_structured(
-        self,
-        *,
-        message: str,
-        evidence_pack_hash: str,
-        output_schema: type[BaseModel],
-        external_llm_allowed: bool,
-        prompt_template_id: str,
-        prompt_template_version: str,
-        correlation_id: str,
-        web_search: bool = False,
-        run_id: UUID | None = None,
-        parameters: dict[str, Any] | None = None,
-    ) -> ModelExecution:
-        """Run a stateless, schema-constrained extraction model request."""
-        request = ModelRequest(
-            text=message,
-            prompt_template_id=prompt_template_id,
-            prompt_template_version=prompt_template_version,
-            evidence_pack_hash=evidence_pack_hash,
-            external_llm_allowed=external_llm_allowed,
-            routing_hint=ModelRoutingHint.BULK_EXTRACTION,
-            sensitivity="archived_evidence",
-            metadata={
-                "conversation_output": False,
-                "primary_evidence": True,
-                "correlation_id": correlation_id,
-            },
-            parameters=parameters or {},
-            web_search=web_search,
-            run_id=run_id or uuid4(),
-        )
-        execution = await self._gateway.extract(request, output_schema)
-        if execution.run.status is not ModelRunStatus.SUCCEEDED:
-            raise ModelConversationError("Le modèle n'a pas produit d'extraction structurée")
-        if not isinstance(execution.structured_output, output_schema):
-            raise ModelConversationError("Le modèle n'a pas produit le schéma d'extraction attendu")
-        return execution
 
     async def archive(
         self, conversation_id: UUID, *, context_subject_id: UUID | None = None

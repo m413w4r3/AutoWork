@@ -25,7 +25,7 @@ from cti_app.domain.discovery_cumulative import (
     DiscoverySubject,
 )
 from cti_app.domain.editions import Edition
-from cti_app.domain.model_runs import ModelProvider, ModelRunStatus
+from cti_app.domain.model_runs import ModelBackend, ModelRunStatus
 from cti_app.integrations.models import FakeModelAdapter, InMemoryModelOutputStore
 from cti_app.logging import CorrelationIdMiddleware
 from tests.discovery_support import InMemoryDiscoveryUnitOfWorkFactory
@@ -79,7 +79,7 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
             openai_structured=fake,
             qwen=fake,
             fake=fake,
-            forced_provider=ModelProvider.FAKE,
+            forced_backend=ModelBackend.FAKE,
         ),
         InMemoryModelRunUnitOfWorkFactory(),
         InMemoryModelOutputStore(),
@@ -179,7 +179,7 @@ async def test_manual_recovery_previews_then_resumes_the_original_job() -> None:
             openai_structured=adapter,
             qwen=adapter,
             fake=adapter,
-            forced_provider=ModelProvider.FAKE,
+            forced_backend=ModelBackend.FAKE,
         ),
         model_uow,
         output_store,
@@ -269,7 +269,7 @@ async def _recovery_application() -> tuple[
             openai_structured=adapter,
             qwen=adapter,
             fake=adapter,
-            forced_provider=ModelProvider.FAKE,
+            forced_backend=ModelBackend.FAKE,
         ),
         model_uow,
         InMemoryModelOutputStore(),

@@ -39,6 +39,7 @@ from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
     ConversationResult,
+    ModelCapabilities,
     ModelExecution,
     ModelGateway,
     ModelGatewayError,
@@ -80,7 +81,7 @@ from cti_app.domain.editorial import (
 )
 from cti_app.domain.entities import Subject
 from cti_app.domain.jobs import JobStatus
-from cti_app.domain.model_runs import ModelProvider, ModelRun
+from cti_app.domain.model_runs import ModelBackend, ModelProvider, ModelRun, ModelTransport
 from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 
@@ -247,6 +248,9 @@ class ScriptedModelScript:
 
 class _ScriptedModelAdapter:
     provider = ModelProvider.FAKE
+    backend = ModelBackend.FAKE
+    transport = ModelTransport.FAKE
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     requested_model = "scripted-production-model"
     is_external = False
 

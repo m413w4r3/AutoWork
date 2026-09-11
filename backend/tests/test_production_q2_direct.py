@@ -12,6 +12,7 @@ from cti_app.application import production_workflow
 from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
+    ModelCapabilities,
     ModelGateway,
     ModelGatewayError,
     ModelRequest,
@@ -35,10 +36,12 @@ from cti_app.application.production_workflow import (
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import (
+    ModelBackend,
     ModelProvider,
     ModelRole,
     ModelRunStatus,
     ModelSubmissionState,
+    ModelTransport,
     ModelUsage,
 )
 from cti_app.domain.production import (
@@ -426,6 +429,9 @@ class _Q2Gateway:
 
 class _ArchiveFallbackAdapter:
     provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     requested_model = "chatgpt-web-fake"
     is_external = True
 
@@ -460,6 +466,9 @@ class _ArchiveFallbackAdapter:
 
 class _NeedsReviewQ2Adapter:
     provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     requested_model = "chatgpt-web-fake"
     is_external = True
 
@@ -721,6 +730,9 @@ async def test_q2_retryable_source_failure_stops_before_s2_and_does_not_create_a
 
 class _PersistentQ2Adapter:
     provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     requested_model = "chatgpt-web-fake"
     is_external = True
 

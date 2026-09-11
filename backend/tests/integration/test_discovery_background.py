@@ -15,7 +15,7 @@ from cti_app.application.jobs import JobExecutor, JobService, create_job_registr
 from cti_app.application.model_gateway import ModelGateway, ModelRouter
 from cti_app.domain.classification import TLP
 from cti_app.domain.jobs import JobStatus
-from cti_app.domain.model_runs import ModelProvider, ModelRunStatus
+from cti_app.domain.model_runs import ModelBackend, ModelRunStatus
 from cti_app.infrastructure.database.session import (
     create_postgres_engine,
     create_session_factory,
@@ -45,7 +45,7 @@ async def test_postgres_job_lease_survives_long_background_bridge_run(
             openai_structured=adapter,
             qwen=adapter,
             fake=adapter,
-            forced_provider=ModelProvider.FAKE,
+            forced_backend=ModelBackend.FAKE,
         ),
         uow_factory,
         output_store,

@@ -29,6 +29,7 @@ from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
     ConversationResult,
+    ModelCapabilities,
     ModelGateway,
     ModelGatewayError,
     ModelRouter,
@@ -41,7 +42,13 @@ from cti_app.domain.model_conversations import (
     ConversationTransport,
     ConversationTurnStatus,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelUsage
+from cti_app.domain.model_runs import (
+    ModelBackend,
+    ModelProvider,
+    ModelRole,
+    ModelTransport,
+    ModelUsage,
+)
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.integrations.models import BlobModelOutputStore, FakeModelAdapter
 from tests.conversation_support import InMemoryConversationUnitOfWorkFactory
@@ -52,6 +59,9 @@ class _ScriptedBridgeAdapter:
     answers with a fixed text, exactly once per call."""
 
     provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     requested_model = "chatgpt-web"
     is_external = True
 

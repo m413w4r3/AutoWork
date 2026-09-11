@@ -4,7 +4,9 @@ from dataclasses import replace
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
+from pydantic import BaseModel
 
 from cti_app.application.jobs import (
     JobExecutor,
@@ -18,6 +20,7 @@ from cti_app.application.model_gateway import (
     BinaryModelInputError,
     ExternalModelBlockedError,
     ModelCapabilities,
+    ModelCapabilityError,
     ModelGateway,
     ModelGatewayError,
     ModelRequest,
@@ -37,7 +40,11 @@ from cti_app.domain.model_runs import (
 )
 from cti_app.integrations.models import (
     BridgeTransportError,
+    ChatCompletionsTransport,
+    ChatCompletionsTransportError,
+    ChatGPTBridgeClient,
     FakeModelAdapter,
+    HttpChatCompletionsTransport,
     InMemoryModelOutputStore,
     OpenAICompatibleChatAdapter,
     OpenAIResearchAdapter,
@@ -57,6 +64,16 @@ def test_structured_output_capability_is_opt_in() -> None:
             FixedChatTransport(), model="Qwen3-32B", is_external=False
         ).capabilities.structured_output
         is True
+    )
+    assert (
+        OpenAICompatibleChatAdapter(
+            FixedChatTransport(),
+            provider=ModelProvider.GEMINI,
+            backend=ModelBackend.GEMINI_WEBAI,
+            model="gemini-3-flash",
+            is_external=True,
+        ).capabilities.structured_output
+        is False
     )
 
 
@@ -164,6 +181,9 @@ class FailingChatTransport:
 
 class NeedsReviewAdapter:
     provider = ModelProvider.OPENAI
+    backend = ModelBackend.CHATGPT_BRIDGE
+    transport = ModelTransport.OPENAI_RESPONSES
+    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
     requested_model = "chatgpt-web"
     is_external = True
 
@@ -721,3 +741,169 @@ async def test_background_openai_response_is_resumed_by_job_polling() -> None:
     assert completed_run.response_id == "resp_background"
     assert completed_run.output_references[0].startswith("memory://model-outputs/")
     assert list(output_store.objects.values()) == [b"Recherche termin\xc3\xa9e"]
+
+
+class _CountingChatTransport:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        del payload
+        self.calls += 1
+        raise AssertionError("Gemini transport must not be called")
+
+
+class _Extraction(BaseModel):
+    title: str
+
+
+def _gemini_gateway(
+    transport: ChatCompletionsTransport,
+    *,
+    routing: dict[ModelRoutingHint, ModelBackend] | None = None,
+) -> tuple[ModelGateway, InMemoryModelRunUnitOfWorkFactory]:
+    gemini = OpenAICompatibleChatAdapter(
+        transport,
+        provider=ModelProvider.GEMINI,
+        backend=ModelBackend.GEMINI_WEBAI,
+        model="gemini-3-flash",
+        is_external=True,
+    )
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    router = ModelRouter(
+        openai_research=FakeModelAdapter(),
+        openai_structured=FakeModelAdapter(),
+        qwen=FakeModelAdapter(),
+        gemini=gemini,
+        fake=FakeModelAdapter(),
+        routing=routing,
+    )
+    return ModelGateway(router, model_uow, InMemoryModelOutputStore()), model_uow
+
+
+@pytest.mark.parametrize("routed", [False, True], ids=["explicit_backend", "configured_route"])
+async def test_gemini_structured_extraction_fails_closed_before_transport(routed: bool) -> None:
+    transport = _CountingChatTransport()
+    gateway, model_uow = _gemini_gateway(
+        transport,
+        routing={ModelRoutingHint.BULK_EXTRACTION: ModelBackend.GEMINI_WEBAI} if routed else None,
+    )
+    model_request = request(
+        external_llm_allowed=True,
+        routing_hint=ModelRoutingHint.BULK_EXTRACTION,
+        backend=None if routed else ModelBackend.GEMINI_WEBAI,
+    )
+
+    with pytest.raises(ModelCapabilityError) as caught:
+        await gateway.extract(model_request, _Extraction)
+
+    assert caught.value.backend is ModelBackend.GEMINI_WEBAI
+    assert caught.value.capability == "structured_output"
+    assert transport.calls == 0
+    assert model_uow.state == {}
+
+
+async def test_production_factory_builds_gemini_fail_closed_for_structured_output() -> None:
+    from typing import cast
+
+    from cti_app.application.persistence import UnitOfWorkFactory
+    from cti_app.config import Settings
+    from cti_app.integrations.model_factory import create_model_gateway
+
+    def no_persistence() -> Any:
+        raise AssertionError("A capability refusal must not open a unit of work")
+
+    settings = Settings(_env_file=None, model_route_bulk_extraction="gemini_webai")
+    gateway = create_model_gateway(settings, cast(UnitOfWorkFactory, no_persistence))
+    gemini = gateway._router.by_backend(ModelBackend.GEMINI_WEBAI, ModelRole.STRUCTURED_EXTRACTION)
+
+    assert settings.webai_model == "gemini-3-flash"
+    assert gemini.requested_model == "gemini-3-flash"
+    assert gemini.capabilities.structured_output is False
+    with pytest.raises(ModelCapabilityError):
+        await gateway.extract(
+            request(external_llm_allowed=True, routing_hint=ModelRoutingHint.BULK_EXTRACTION),
+            _Extraction,
+        )
+
+
+async def test_bridge_detail_pre_submission_fails_without_reconciliation() -> None:
+    calls = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            503,
+            json={
+                "detail": {
+                    "code": "bridge_extension_disconnected",
+                    "message": "Extension Chrome non connectée : ouvre un onglet chatgpt.com.",
+                    "retryable": True,
+                    "phase": "pre_submission",
+                    "submission_state": "pre_submission",
+                }
+            },
+        )
+
+    run_id = uuid4()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway, model_uow, _ = gateway_with_transport(
+            ChatGPTBridgeClient("http://bridge.test/v1", client=client)
+        )
+        with pytest.raises(BridgeTransportError) as caught:
+            await gateway.research(request(external_llm_allowed=True, run_id=run_id))
+
+    run = model_uow.state[run_id]
+    assert caught.value.submission_state == "pre_submission"
+    assert calls == 1
+    assert run.status is ModelRunStatus.FAILED
+    assert run.error_code == "bridge_extension_disconnected"
+    assert run.submission_state.value == "not_submitted"
+    assert run.error_details["submission_state"] == "pre_submission"
+
+
+async def test_gemini_http_refusals_are_typed_and_only_proven_ones_skip_reconciliation() -> None:
+    statuses = iter([401, 400])
+    calls: list[int] = []
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        status = next(statuses)
+        calls.append(status)
+        return httpx.Response(status, json={"detail": "refused"})
+
+    def gemini_request(run_id: UUID) -> ModelRequest:
+        return request(
+            external_llm_allowed=True,
+            routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS,
+            backend=ModelBackend.GEMINI_WEBAI,
+            run_id=run_id,
+        )
+
+    auth_run_id, bad_request_run_id = uuid4(), uuid4()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway, model_uow = _gemini_gateway(
+            HttpChatCompletionsTransport(
+                "http://web_ai.test/v1", api_key=None, provider="gemini", client=client
+            )
+        )
+        with pytest.raises(ChatCompletionsTransportError) as refused:
+            await gateway.draft(gemini_request(auth_run_id))
+        with pytest.raises(ModelSubmissionReconciliationRequiredError):
+            await gateway.draft(gemini_request(bad_request_run_id))
+        # A replay of the unproven failure is sealed: no second POST.
+        with pytest.raises(ModelSubmissionReconciliationRequiredError):
+            await gateway.draft(gemini_request(bad_request_run_id))
+
+    assert calls == [401, 400]
+    assert refused.value.code == "provider_auth_failed"
+    auth_run = model_uow.state[auth_run_id]
+    assert auth_run.status is ModelRunStatus.FAILED
+    assert auth_run.error_code == "provider_auth_failed"
+    assert auth_run.submission_state.value == "not_submitted"
+    bad_request_run = model_uow.state[bad_request_run_id]
+    assert bad_request_run.status is ModelRunStatus.NEEDS_REVIEW
+    assert bad_request_run.submission_state.value == "submitted_or_unknown"
+    diagnostics = bad_request_run.error_details["bridge_diagnostics"]
+    assert diagnostics["error_code"] == "provider_bad_request"
+    assert diagnostics["http_status"] == 400
