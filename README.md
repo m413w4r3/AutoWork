@@ -66,6 +66,28 @@ Les commandes racine sont `make test`, `make test-integration`, `make lint`, `ma
 
 `make test-integration` démarre automatiquement le service PostgreSQL éphémère `postgres-test`, indépendant de la DB applicative, puis le supprime même en cas d'échec. `POSTGRES_DSN` désigne la DB applicative ; `TEST_POSTGRES_ADMIN_DSN` est réservé à la création et suppression des bases temporaires de pytest. Après une réécriture locale des migrations, `make up-clean` recrée les volumes applicatifs ; cette commande est destructive.
 
+## Développement automatisé avec MetaHarness
+
+AutoWork peut être utilisé comme dépôt cible de MetaHarness.
+
+MetaHarness reste externe au produit et n'est jamais une source de vérité
+applicative. Il résout le contexte, produit et fait approuver les contrats
+d'implémentation, exécute les workers dans un worktree isolé, lance les
+validations déterministes, réalise la revue sémantique puis contrôle le commit
+et la publication.
+
+Dans un run MetaHarness :
+
+- `AGENTS.md` et les `AGENTS.md` de composants restent les règles
+  d'architecture du dépôt ;
+- `scripts/ctx/ctx.py` est utilisé par la phase de contextualisation/planning,
+  pas par les workers d'implémentation ;
+- les workers reçoivent un scope borné et ne doivent pas refaire la discovery ;
+- MetaHarness possède les checks finaux, Git, le commit et la publication.
+
+Pour l'orchestration, les profils modèles et l'exploitation des runs, voir le
+dépôt MetaHarness ; ce README reste la documentation d'AutoWork lui-même.
+
 ## Organisation
 
 - `backend/` : API FastAPI, ports d'infrastructure et worker Dramatiq ;

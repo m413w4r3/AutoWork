@@ -15,6 +15,36 @@ Before modifying files under `backend/` or `frontend/`, read that area's
 - Destructive actions require a verified external identity.
   Never rely on title, position, DOM index, or visual similarity.
 
+## Execution modes
+
+### MetaHarness bounded execution
+
+When the active runtime identifies the session as a MetaHarness mechanical
+implementation worker or semantic reviser, the MetaHarness contract/prompt
+owns task decomposition, repository discovery, mutable scope, validation,
+Git operations and publication.
+
+In that mode:
+
+- do not invoke `scripts/ctx/ctx.py`; MetaHarness already performed context
+  retrieval before planning;
+- do not perform broad repository discovery;
+- do not spawn subagents;
+- do not broaden the approved READ/WRITE/CREATE/DELETE scope;
+- read only the contract-authorized files, applicable repository instructions,
+  and strictly necessary direct local imports;
+- architecture and component invariants in this file and nested `AGENTS.md`
+  files still apply;
+- do not run broad validation suites unless the MetaHarness contract explicitly
+  requires a local reproduction; MetaHarness owns deterministic validation;
+- if the contract conflicts materially with the repository structure, report
+  the mismatch instead of inventing another architecture.
+
+### Interactive development
+
+Outside MetaHarness bounded execution, follow the Code navigation, Commands
+and Subagents guidance below.
+
 ## Code navigation
 
 Use the locator before broad repository exploration:
