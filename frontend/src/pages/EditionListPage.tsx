@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { type EditionStatus, listEditions } from "../api/editions";
 import { ErrorMessage } from "../components/ErrorMessage";
@@ -11,10 +11,71 @@ import {
 } from "../features/editions/editionPresentation";
 import { Link, navigate } from "../routing";
 
+type EditionFilters = {
+  countryCode: string;
+  period: string;
+  status: EditionStatus | "";
+};
+
+function isEditionStatus(value: string): value is EditionStatus {
+  return Object.prototype.hasOwnProperty.call(statusLabels, value);
+}
+
+function readEditionFilters(search: string): EditionFilters {
+  const parameters = new URLSearchParams(search);
+  const countryCode = parameters.get("country_code") ?? "";
+  const period = parameters.get("period") ?? "";
+  const status = parameters.get("status") ?? "";
+
+  return {
+    countryCode: /^[A-Za-z]{2}$/.test(countryCode)
+      ? countryCode.toUpperCase()
+      : "",
+    period: /^\d{4}-(0[1-9]|1[0-2])$/.test(period) ? period : "",
+    status: isEditionStatus(status) ? status : "",
+  };
+}
+
+function replaceEditionFilterQuery(filters: EditionFilters) {
+  const parameters = new URLSearchParams(window.location.search);
+  const filterParameters: Array<[string, string]> = [
+    ["country_code", filters.countryCode],
+    ["period", filters.period],
+    ["status", filters.status],
+  ];
+  for (const [name, value] of filterParameters) {
+    if (value) {
+      parameters.set(name, value);
+    } else {
+      parameters.delete(name);
+    }
+  }
+  const query = parameters.toString();
+  const updatedPath = `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`;
+  window.history.replaceState(window.history.state, "", updatedPath);
+}
+
 export function EditionListPage() {
-  const [countryCode, setCountryCode] = useState("");
-  const [period, setPeriod] = useState("");
-  const [status, setStatus] = useState<EditionStatus | "">("");
+  const [filters, setFilters] = useState<EditionFilters>(() =>
+    readEditionFilters(window.location.search),
+  );
+  const { countryCode, period, status } = filters;
+
+  useEffect(() => {
+    const updateFiltersFromLocation = () => {
+      setFilters(readEditionFilters(window.location.search));
+    };
+    window.addEventListener("popstate", updateFiltersFromLocation);
+    return () =>
+      window.removeEventListener("popstate", updateFiltersFromLocation);
+  }, []);
+
+  const updateFilters = (nextFilters: Partial<EditionFilters>) => {
+    const next = { ...filters, ...nextFilters };
+    setFilters(next);
+    replaceEditionFilterQuery(next);
+  };
+
   const editions = useQuery({
     queryKey: ["editions", countryCode, period, status],
     queryFn: () => listEditions({ countryCode, period, status }),
@@ -39,7 +100,9 @@ export function EditionListPage() {
             value={countryCode}
             maxLength={2}
             onChange={(event) =>
-              setCountryCode(event.target.value.toUpperCase())
+              updateFilters({
+                countryCode: event.target.value.toUpperCase(),
+              })
             }
           />
         </label>
@@ -48,7 +111,7 @@ export function EditionListPage() {
           <input
             type="month"
             value={period}
-            onChange={(event) => setPeriod(event.target.value)}
+            onChange={(event) => updateFilters({ period: event.target.value })}
           />
         </label>
         <label>
@@ -56,7 +119,9 @@ export function EditionListPage() {
           <select
             value={status}
             onChange={(event) =>
-              setStatus(event.target.value as EditionStatus | "")
+              updateFilters({
+                status: event.target.value as EditionStatus | "",
+              })
             }
           >
             <option value="">Tous</option>
