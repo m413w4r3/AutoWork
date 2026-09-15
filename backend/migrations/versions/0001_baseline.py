@@ -48,7 +48,8 @@ _GUARD_FUNCTIONS: tuple[tuple[str, str], ...] = (
                 WHEN 'CLEAR' THEN 0 WHEN 'GREEN' THEN 1 WHEN 'AMBER' THEN 2
                 WHEN 'AMBER+STRICT' THEN 3 WHEN 'RED' THEN 4 END;
             IF new_rank < old_rank THEN
-                RAISE EXCEPTION 'TLP downgrade from % to % is forbidden', OLD.tlp, NEW.tlp
+                RAISE EXCEPTION 'TLP downgrade from % to % is forbidden', OLD.tlp,
+                    NEW.tlp
                     USING ERRCODE = '23514';
             END IF;
             RETURN NEW;
@@ -127,7 +128,8 @@ _GUARD_FUNCTIONS: tuple[tuple[str, str], ...] = (
         """
         CREATE FUNCTION reject_subject_merge_events_mutation() RETURNS trigger AS $$
         BEGIN
-            RAISE EXCEPTION 'subject_merge_events is append-only' USING ERRCODE = '55000';
+            RAISE EXCEPTION 'subject_merge_events is append-only'
+                USING ERRCODE = '55000';
         END;
         $$ LANGUAGE plpgsql
         """,
@@ -137,7 +139,8 @@ _GUARD_FUNCTIONS: tuple[tuple[str, str], ...] = (
         """
         CREATE FUNCTION reject_subject_contributions_mutation() RETURNS trigger AS $$
         BEGIN
-            RAISE EXCEPTION 'subject_contributions is append-only' USING ERRCODE = '55000';
+            RAISE EXCEPTION 'subject_contributions is append-only'
+                USING ERRCODE = '55000';
         END;
         $$ LANGUAGE plpgsql
         """,
@@ -247,7 +250,12 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
         "reject_audit_mutation",
         "append_only",
     ),
-    ("job_events", "trg_job_events_append_only", "reject_audit_mutation", "append_only"),
+    (
+        "job_events",
+        "trg_job_events_append_only",
+        "reject_audit_mutation",
+        "append_only",
+    ),
     (
         "human_decisions",
         "trg_human_decisions_append_only",
@@ -279,7 +287,12 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
         "append_only",
     ),
     ("claims", "trg_claims_append_only", "reject_evidence_mutation", "append_only"),
-    ("indicators", "trg_indicators_append_only", "reject_evidence_mutation", "append_only"),
+    (
+        "indicators",
+        "trg_indicators_append_only",
+        "reject_evidence_mutation",
+        "append_only",
+    ),
     (
         "collection_policy_snapshots",
         "trg_collection_policy_snapshots_append_only",

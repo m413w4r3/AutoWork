@@ -13,9 +13,11 @@ Ne lance pas ctx.py, rg, find, tree ni une exploration de répertoire.
 Si un chemin listé n'existe pas ou si une abstraction directement requise est
 introuvable, arrête et rapporte le nom précis du blocage au lieu d'explorer.
 
-Ne modifie jamais les migrations 0001 à 0004.
-Chaque lot M2 crée exactement la migration nommée dans son prompt et les lots
-suivants ne la réécrivent pas.
+Jusqu'à AW-013, ou jusqu'à une stabilisation explicitement déclarée, la
+baseline `0001_baseline` est mutable. Les évolutions du schéma cible modifient
+cette baseline ; aucune compatibilité avec les anciennes bases n'est requise.
+Les règles historiques d'immutabilité des migrations 0001 à 0004 ne sont plus
+actives.
 
 Préserve les invariants validés de P04 :
 - la production courante est unifiée en articles ;
@@ -54,9 +56,10 @@ find, tree, recherche web ni exploration de confort. Si une abstraction requise
 n'existe pas dans ces fichiers, STOP avec le chemin/symbole manquant ; ne cherche
 pas un substitut ailleurs.
 
-Les migrations 0001 à 0010 sont immuables. Le lot 09 crée uniquement la migration
-nommée par son prompt. Le lot 10 ne réécrit jamais cette migration et ne crée une
-migration supplémentaire que si son prompt l'autorise explicitement.
+La règle historique qui rendait les migrations 0001 à 0010 immuables n'est plus
+active. Jusqu'à la stabilisation explicite de la baseline, les évolutions du
+schéma cible sont portées par `0001_baseline` ; aucune migration de compatibilité
+pour les anciennes bases n'est requise.
 
 M3 consomme les sorties persistées de M2. Le lot 09 ne relance ni analyse statique,
 ni capa, ni SMDA, ni VirusTotal, ni modèle. Il ne relit pas les octets d'un sample

@@ -76,8 +76,8 @@ def _head_revision() -> str:
     """Read the chain head instead of pinning one migration by name.
 
     The rest of this module compares the live schema against ``Base.metadata``
-    precisely so it stays correct as migrations are added; hardcoding the head
-    revision was the one place that silently drifted.
+    precisely so it stays correct as the mutable baseline and its models evolve;
+    hardcoding the head revision was the one place that silently drifted.
     """
     from alembic.script import ScriptDirectory
 
