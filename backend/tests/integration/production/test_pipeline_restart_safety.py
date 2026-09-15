@@ -18,7 +18,13 @@ from cti_app.application.production_workflow import ProductionWorkflowOrchestrat
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_conversations import ConversationStatus
-from cti_app.domain.model_runs import ModelRunStatus, ModelSubmissionState
+from cti_app.domain.model_runs import (
+    ModelBackend,
+    ModelProvider,
+    ModelRunStatus,
+    ModelSubmissionState,
+    ModelTransport,
+)
 from cti_app.domain.production import (
     ProductionArtifactStage,
     SubjectProductionStage,
@@ -647,6 +653,7 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     migrated_postgres_url: str,
 ) -> None:
     scenario, urls = _configured(production_scenario_factory, 1, all_primary=True)
+    scenario.model.use_chatgpt_bridge_identity()
     bridge_run_id = "bridge-restart-reconciliation"
     scenario.model.script.q2(
         source_url=urls[0],
@@ -670,6 +677,9 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     async with scenario.uow_factory() as uow:
         model_run = await uow.model_runs.get(model_run_id)
     assert model_run is not None
+    assert model_run.provider is ModelProvider.OPENAI
+    assert model_run.backend is ModelBackend.CHATGPT_BRIDGE
+    assert model_run.transport is ModelTransport.OPENAI_RESPONSES
     assert model_run.status is ModelRunStatus.NEEDS_REVIEW
     assert model_run.submission_state is ModelSubmissionState.SUBMITTED_OR_UNKNOWN
 
@@ -680,6 +690,7 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     visible = VisibleRecovery(bridge_run_id, visible_text)
     async with _fresh_runtime(scenario, migrated_postgres_url) as restarted:
         _configure_gateway(restarted, urls, references=False, synthesis=True)
+        restarted.model.use_chatgpt_bridge_identity()
         service = ProductionReconciliationService(
             restarted.uow_factory,
             restarted.model,
@@ -711,6 +722,9 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     async with restarted.uow_factory() as uow:
         adopted_model = await uow.model_runs.get(model_run_id)
     assert adopted_model is not None
+    assert adopted_model.provider is ModelProvider.OPENAI
+    assert adopted_model.backend is ModelBackend.CHATGPT_BRIDGE
+    assert adopted_model.transport is ModelTransport.OPENAI_RESPONSES
     assert adopted_model.status is ModelRunStatus.SUCCEEDED
     assert adopted_model.raw_output_sha256 == preview.sha256
 

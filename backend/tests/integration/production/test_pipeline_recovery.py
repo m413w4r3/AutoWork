@@ -29,7 +29,13 @@ from cti_app.application.production_reconciliation import ProductionReconciliati
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.subject_production import SubjectProductionService
 from cti_app.domain.discovery import SourceRole
-from cti_app.domain.model_runs import ModelRunStatus, ModelSubmissionState
+from cti_app.domain.model_runs import (
+    ModelBackend,
+    ModelProvider,
+    ModelRunStatus,
+    ModelSubmissionState,
+    ModelTransport,
+)
 from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -720,6 +726,7 @@ async def test_post_submission_ambiguity_reconciles_exact_model_run_without_resu
     production_scenario_factory: ScenarioFactory,
 ) -> None:
     scenario, urls = _configured(production_scenario_factory, count=1)
+    scenario.model.use_chatgpt_bridge_identity()
     # Keep the adopted bytes distinct from any plain-text model output already
     # present in the content-addressed catalog while preserving Q2 semantics.
     q2_response = f"{_q2_response(1)}\n"
@@ -776,6 +783,9 @@ async def test_post_submission_ambiguity_reconciles_exact_model_run_without_resu
             if job.kind == "production.subject.reconciliation_resume"
         ]
     assert model_run is not None
+    assert model_run.provider is ModelProvider.OPENAI
+    assert model_run.backend is ModelBackend.CHATGPT_BRIDGE
+    assert model_run.transport is ModelTransport.OPENAI_RESPONSES
     assert model_run.status is ModelRunStatus.SUCCEEDED
     assert model_run.submission_state is ModelSubmissionState.SUBMITTED_OR_UNKNOWN
     assert model_run.submission_attempt == 1

@@ -659,12 +659,14 @@ async def _seed_legacy_rows(database_url: str) -> dict[str, str]:
             await connection.execute(
                 text(
                     "INSERT INTO model_runs "
-                    "(id, provider, model_role, requested_model, prompt_template_id, "
+                    "(id, provider, backend, transport, model_role, requested_model, "
+                    "prompt_template_id, "
                     "prompt_template_version, authorized_input_hash, evidence_pack_hash, "
                     "parameters, status, submission_state, output_references, "
                     "validation_errors, transformations, citation_count, extracted_url_count, "
                     "visible_citations, started_at, updated_at) "
-                    "VALUES (:id, 'fake', 'research', 'legacy-model', 'legacy', '1', "
+                    "VALUES (:id, 'fake', 'fake', 'fake', 'research', 'legacy-model', "
+                    "'legacy', '1', "
                     ":input_hash, :evidence_hash, '{}'::jsonb, 'succeeded', 'not_submitted', "
                     "'[]'::jsonb, '[]'::jsonb, '[]'::jsonb, 0, 0, '[]'::jsonb, "
                     ":created_at, :created_at)"

@@ -259,7 +259,9 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
             assert without_document.rejected_rule_count == 0
             assert without_document.published_rule_count == 0
             assert without_document.retry_stage is not None
-            assert without_document.retry_stage.value == "synthesis"
+            # current_stage records where the run stopped; retry starts at the
+            # first missing durable artifact.
+            assert without_document.retry_stage.value == "references"
 
             with pytest.raises(DBAPIError, match="append-only"):
                 await session.execute(

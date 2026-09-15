@@ -261,6 +261,10 @@ class _ScriptedModelAdapter:
     ) -> None:
         self._script = script
         self._provider_calls = provider_calls
+        self.provider = type(self).provider
+        self.backend = type(self).backend
+        self.transport = type(self).transport
+        self.is_external = type(self).is_external
 
     async def invoke(
         self,
@@ -328,7 +332,19 @@ class ScriptedModelGateway(ModelGateway):
             qwen=adapter,
             fake=adapter,
         )
+        self._adapter = adapter
         super().__init__(router, uow_factory, output_store, diagnostics=diagnostics)
+
+    def use_chatgpt_bridge_identity(self) -> None:
+        """Persist the scripted double as ChatGPT Bridge without contacting ChatGPT.
+
+        This changes only the provenance persisted for the double and exists
+        for tests of guards that depend on backend identity.
+        """
+        self._adapter.provider = ModelProvider.OPENAI
+        self._adapter.backend = ModelBackend.CHATGPT_BRIDGE
+        self._adapter.transport = ModelTransport.OPENAI_RESPONSES
+        self._adapter.is_external = True
 
     async def execute(self, request: ModelRequest, role: ModelRole) -> ModelExecution:
         source_urls = _request_source_urls(request)
