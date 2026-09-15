@@ -17,35 +17,15 @@ Before modifying files under `backend/` or `frontend/`, read that area's
 
 ## Execution modes
 
-### MetaHarness bounded execution
+Under MetaHarness bounded execution, the MetaHarness runtime contract owns
+repository discovery, mutable scope, validation orchestration and Git
+operations. In that mode, the Architecture invariants and Never inspect rules
+in this file and the rules in component `AGENTS.md` files remain
+authoritative, while the Code navigation, Commands and Subagents sections below
+are interactive-development guidance only. Do not broaden the approved
+contract; report a structural mismatch instead.
 
-When the active runtime identifies the session as a MetaHarness mechanical
-implementation worker or semantic reviser, the MetaHarness contract/prompt
-owns task decomposition, repository discovery, mutable scope, validation,
-Git operations and publication.
-
-In that mode:
-
-- do not invoke `scripts/ctx/ctx.py`; MetaHarness already performed context
-  retrieval before planning;
-- do not perform broad repository discovery;
-- do not spawn subagents;
-- do not broaden the approved READ/WRITE/CREATE/DELETE scope;
-- read only the contract-authorized files, applicable repository instructions,
-  and strictly necessary direct local imports;
-- architecture and component invariants in this file and nested `AGENTS.md`
-  files still apply;
-- do not run broad validation suites unless the MetaHarness contract explicitly
-  requires a local reproduction; MetaHarness owns deterministic validation;
-- if the contract conflicts materially with the repository structure, report
-  the mismatch instead of inventing another architecture.
-
-### Interactive development
-
-Outside MetaHarness bounded execution, follow the Code navigation, Commands
-and Subagents guidance below.
-
-## Code navigation
+## Code navigation — interactive development
 
 Use the locator before broad repository exploration:
 
@@ -65,7 +45,7 @@ The lexical index is refreshed automatically when sources changed.
 Do not start with repository-wide `grep`, `find`, `tree`, or bulk file reads.
 The index is a locator, not a source of truth: inspect real code before edits.
 
-## Commands
+## Commands — interactive development
 
     make up | down | status | logs
     make test | test-integration
@@ -74,7 +54,7 @@ The index is a locator, not a source of truth: inspect real code before edits.
 Use the narrowest relevant test/check first. Run repository-wide checks only
 when the change crosses components or before final validation when justified.
 
-## Subagents
+## Subagents — interactive development
 
 Subagents are optional, not the default.
 

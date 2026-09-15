@@ -19,10 +19,6 @@ Code lives under `src/cti_app/`.
 - `alembic upgrade head` on an empty database must create the complete target
   schema.
 
-When running under MetaHarness bounded execution, the rules above remain
-authoritative, but MetaHarness owns repository discovery, mutable scope and
-deterministic validation. Do not broaden the contract or run unrelated suites.
-
 ## Validation
 
 Run the narrowest test first:
