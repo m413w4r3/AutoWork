@@ -28,10 +28,18 @@ uv run --no-sync python -m cti_app.workers.scheduler
 PostgreSQL est la base principale. La migration initiale est appliquée automatiquement par le service Compose `migrate`.
 
 `0001_baseline` constitue le schéma complet destiné à une base vide, et
-`alembic upgrade head` doit toujours créer ce schéma cible. Les migrations
-post-baseline de compatibilité déjà présentes et leurs tests forment un contrat
-historique explicite ; elles ne doivent pas être réécrites silencieusement et
-aucune logique de compatibilité ad hoc ne doit être ajoutée à `0001_baseline`.
+`alembic upgrade head` doit toujours créer ce schéma cible. De AW-002 à AW-013,
+jusqu'à la déclaration explicite de stabilité de la nouvelle baseline,
+`0001_baseline` est volontairement mutable : toute évolution du schéma cible
+doit mettre à jour cette baseline plutôt que d'ajouter une migration destinée
+uniquement à transformer une ancienne base AutoWork.
+
+La baseline mutable doit décrire directement le schéma cible. Il ne faut pas
+ajouter de détection des anciennes bases, de backfills de compatibilité, de
+branches de réparation ni de prise en charge de mise à niveau d'anciennes
+bases. Les protections de downgrade et les gardes qui appartiennent au schéma
+actuel à baseline unique sont conservés ; les tests destinés uniquement à la
+compatibilité avec des révisions supprimées ne le sont pas.
 
 Hors Compose :
 

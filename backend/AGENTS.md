@@ -17,11 +17,16 @@ Code lives under `src/cti_app/`.
 - `0001_baseline` is the complete schema intended for an empty database.
 - `alembic upgrade head` on an empty database must always create the target
   schema.
-- Existing post-baseline compatibility migrations and their tests are an
-  explicit historical contract.
-- Do not add ad hoc compatibility logic to `0001_baseline`.
-- Do not silently rewrite a validated historical migration.
-- Preserve data-loss tests and downgrade guards.
+- Through AW-002 to AW-013, until the new baseline is explicitly declared
+  stable, `0001_baseline` is intentionally mutable. Schema-target changes
+  should update that baseline instead of adding migrations whose only purpose
+  is transforming an older AutoWork database.
+- The mutable baseline must describe the target schema directly. Do not add
+  legacy database detection, compatibility backfills, repair branches, or
+  old-database upgrade support.
+- Preserve downgrade and guard protections that belong to the current
+  single-baseline schema, not tests whose sole purpose is compatibility with
+  deleted revisions.
 
 ## Validation
 

@@ -1,9 +1,9 @@
-"""Current PostgreSQL schema baseline.
+"""Current PostgreSQL schema baseline and sole mutable revision.
 
-The database is reset before this migration is applied. The current ORM
-metadata is therefore the complete target schema: it creates every table,
-column, constraint and index in one operation, with no historical revisions
-or data conversions involved.
+The database is reset before this fresh-database revision is applied. The
+current ORM metadata is therefore the complete target schema: it creates
+every table, column, constraint and index in one operation, with no
+historical revisions or data conversions involved.
 """
 
 from collections.abc import Sequence
@@ -345,10 +345,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # A later migration may already own and have removed one of these tables --
-    # 0004 drops ``production_repair_corrections`` with its trigger -- so the
-    # baseline drops each trigger only where its table is still present. It is
-    # the same tolerance the table drops below already have.
     inspector = inspect(op.get_bind())
     existing_tables = set(inspector.get_table_names())
     for table, trigger_name, _function_name, _kind in reversed(_TRIGGERS):

@@ -1,4 +1,4 @@
-"""Exhaustive coverage of the Alembic migration chain.
+"""Exhaustive coverage of the mutable fresh-database migration baseline.
 
 This module validates, against a real (temporary) PostgreSQL database:
 
@@ -14,20 +14,21 @@ This module validates, against a real (temporary) PostgreSQL database:
    install, and which function each trigger is bound to;
 5. the *behaviour* of the two guard families (TLP-downgrade prevention and
    append-only enforcement), not just their catalog presence;
-6. a full ``upgrade head`` -> ``downgrade base`` -> ``upgrade head`` cycle,
+6. that a database with no tables and no Alembic history upgrades directly
+   to the sole ``0001_baseline`` head, and that repeating ``upgrade head``
+   leaves the schema and trigger definitions unchanged;
+7. a full ``upgrade head`` -> ``downgrade base`` -> ``upgrade head`` cycle,
    asserting tables/functions/triggers are completely gone after the full
    downgrade and fully restored after re-upgrading.
 
 Structural comparisons are generic (driven by ``Base.metadata``) rather than
-transcribed by hand, so the exhaustive checks stay correct as new migrations
-and models are added instead of silently drifting out of date.
+transcribed by hand, so the exhaustive checks stay correct as the mutable
+baseline and its models evolve instead of silently drifting out of date.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -95,6 +96,8 @@ pytestmark = pytest.mark.integration
 # ---------------------------------------------------------------------------
 
 ALEMBIC_TABLE = "alembic_version"
+_REPAIR_TABLE = "production_repair_decisions"
+_REPAIR_TRIGGER = "trg_production_repair_decisions_append_only"
 
 EXPECTED_TABLES = frozenset(Base.metadata.tables) | {ALEMBIC_TABLE}
 
@@ -110,8 +113,8 @@ ColumnShape = tuple[str, bool, int | None]
 IndexShape = tuple[str, tuple[str, ...], bool, bool]
 
 # (table, trigger_name) -> function_name, for every trigger installed by the
-# migration chain at HEAD. This is the complete, canonical baseline installed
-# by the current migration chain.
+# mutable baseline at HEAD. This is the complete, canonical schema installed
+# by the current baseline.
 EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
     (
         "publication_review_decisions",
@@ -568,438 +571,7 @@ def test_append_only_guard_rejects_update_and_delete(migrated_postgres_url: str)
 
 
 # ---------------------------------------------------------------------------
-# 6: compatibility upgrade from a database stamped at 0001
-# ---------------------------------------------------------------------------
-
-
-_LEGACY_ROW_IDS = {
-    "blob": "10000000-0000-0000-0000-000000000001",
-    "edition": "10000000-0000-0000-0000-000000000002",
-    "subject": "10000000-0000-0000-0000-000000000003",
-    "model_run": "10000000-0000-0000-0000-000000000004",
-    "production_run": "10000000-0000-0000-0000-000000000005",
-    "artifact": "10000000-0000-0000-0000-000000000006",
-    "editorial_group": "10000000-0000-0000-0000-000000000007",
-    "source_collection": "10000000-0000-0000-0000-000000000008",
-    "source_document": "10000000-0000-0000-0000-000000000009",
-    "human_decision": "10000000-0000-0000-0000-000000000010",
-}
-_LEGACY_CREATED_AT = datetime(2026, 8, 1, 12, tzinfo=UTC)
-_REPAIR_TABLE = "production_repair_decisions"
-_REPAIR_TRIGGER = "trg_production_repair_decisions_append_only"
-_LEGACY_TABLES = (
-    ("blobs", "blob"),
-    ("editions", "edition"),
-    ("subjects", "subject"),
-    ("model_runs", "model_run"),
-    ("subject_production_runs", "production_run"),
-    ("production_artifacts", "artifact"),
-    ("editorial_groups", "editorial_group"),
-    ("source_collections", "source_collection"),
-    ("source_documents", "source_document"),
-    ("human_decisions", "human_decision"),
-)
-
-
-async def _legacy_data_snapshot(database_url: str) -> dict[str, str]:
-    engine = create_async_engine(database_url)
-    try:
-        async with engine.connect() as connection:
-            snapshots: dict[str, str] = {}
-            for table_name, id_name in _LEGACY_TABLES:
-                result = await connection.execute(
-                    text(
-                        f"SELECT row_to_json(row)::text "
-                        f"FROM (SELECT * FROM {table_name} WHERE id = :row_id) AS row"
-                    ),
-                    {"row_id": _LEGACY_ROW_IDS[id_name]},
-                )
-                snapshots[table_name] = str(result.scalar_one())
-            return snapshots
-    finally:
-        await engine.dispose()
-
-
-async def _seed_legacy_rows(database_url: str) -> dict[str, str]:
-    """Seed rows that must survive the compatibility revision unchanged."""
-    ids = _LEGACY_ROW_IDS
-    engine = create_async_engine(database_url)
-    try:
-        async with engine.begin() as connection:
-            await connection.execute(
-                text(
-                    "INSERT INTO blobs "
-                    "(id, sha256, size, mime_type, logical_bucket, object_key, created_at) "
-                    "VALUES (:id, :sha256, 7, 'text/plain', 'source-raw', "
-                    "'legacy/source.txt', :created_at)"
-                ),
-                {
-                    "id": ids["blob"],
-                    "sha256": "a" * 64,
-                    "created_at": _LEGACY_CREATED_AT,
-                },
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO editions "
-                    "(id, country, country_code, period_start, period_end, tlp, languages, "
-                    "target_articles, source_profile, status, version, created_at, updated_at) "
-                    "VALUES (:id, 'Legacyland', 'LG', '2026-08-01', '2026-08-31', 'GREEN', "
-                    "'[\"fr\"]'::jsonb, 1, 'default', 'review', 1, :created_at, :created_at)"
-                ),
-                {"id": ids["edition"], "created_at": _LEGACY_CREATED_AT},
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO subjects (id, external_id, slug, tlp, created_at) "
-                    "VALUES (:id, 'legacy-subject', 'legacy-subject', 'GREEN', :created_at)"
-                ),
-                {"id": ids["subject"], "created_at": _LEGACY_CREATED_AT},
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO model_runs "
-                    "(id, provider, backend, transport, model_role, requested_model, "
-                    "prompt_template_id, "
-                    "prompt_template_version, authorized_input_hash, evidence_pack_hash, "
-                    "parameters, status, submission_state, output_references, "
-                    "validation_errors, transformations, citation_count, extracted_url_count, "
-                    "visible_citations, started_at, updated_at) "
-                    "VALUES (:id, 'fake', 'fake', 'fake', 'research', 'legacy-model', "
-                    "'legacy', '1', "
-                    ":input_hash, :evidence_hash, '{}'::jsonb, 'succeeded', 'not_submitted', "
-                    "'[]'::jsonb, '[]'::jsonb, '[]'::jsonb, 0, 0, '[]'::jsonb, "
-                    ":created_at, :created_at)"
-                ),
-                {
-                    "id": ids["model_run"],
-                    "input_hash": "b" * 64,
-                    "evidence_hash": "c" * 64,
-                    "created_at": _LEGACY_CREATED_AT,
-                },
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO subject_production_runs "
-                    "(id, subject_id, edition_id, status, current_stage, run_number, "
-                    "pipeline_generation, created_at, updated_at, version) "
-                    "VALUES (:id, :subject_id, :edition_id, 'queued', 'sources', 1, 0, "
-                    ":created_at, :created_at, 1)"
-                ),
-                {
-                    "id": ids["production_run"],
-                    "subject_id": ids["subject"],
-                    "edition_id": ids["edition"],
-                    "created_at": _LEGACY_CREATED_AT,
-                },
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO production_artifacts "
-                    "(id, production_run_id, subject_id, stage, version, input_hash, status, "
-                    '"metadata", created_at) '
-                    "VALUES (:id, :run_id, :subject_id, 'extraction', 1, :input_hash, "
-                    "'verified', '{}'::jsonb, :created_at)"
-                ),
-                {
-                    "id": ids["artifact"],
-                    "run_id": ids["production_run"],
-                    "subject_id": ids["subject"],
-                    "input_hash": "d" * 64,
-                    "created_at": _LEGACY_CREATED_AT,
-                },
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO editorial_groups "
-                    "(id, edition_id, title, outcome, status, source_relationship_status, "
-                    "needs_source_verification, needs_source_expansion, grouping_confidence, "
-                    "grouping_justification, subject_id, payload, version, created_at, updated_at) "
-                    "VALUES (:id, :edition_id, 'Legacy group', 'new_subject', 'selected', "
-                    "'provisional', false, false, 'high', 'legacy seed', :subject_id, "
-                    "'{}'::jsonb, 1, :created_at, :created_at)"
-                ),
-                {
-                    "id": ids["editorial_group"],
-                    "edition_id": ids["edition"],
-                    "subject_id": ids["subject"],
-                    "created_at": _LEGACY_CREATED_AT,
-                },
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO source_collections "
-                    "(id, subject_id, edition_id, group_id, origin_kind, requested_url, "
-                    "canonical_url, title, publisher, published_at, source_tlp, sensitivity, "
-                    "external_llm_allowed, do_not_submit, proposed_role, relationship_status, "
-                    "relationship_evidence, state, attempt_count, created_at, updated_at) "
-                    "VALUES (:id, :subject_id, :edition_id, :group_id, 'discovery', "
-                    "'https://legacy.example/source', 'https://legacy.example/source', "
-                    "'Legacy source', 'Legacy publisher', '2026-08-01', 'GREEN', 'normal', "
-                    "true, false, 'primary', 'provisional', 'legacy seed', 'archived', 0, "
-                    ":created_at, :created_at)"
-                ),
-                {
-                    "id": ids["source_collection"],
-                    "subject_id": ids["subject"],
-                    "edition_id": ids["edition"],
-                    "group_id": ids["editorial_group"],
-                    "created_at": _LEGACY_CREATED_AT,
-                },
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO source_documents "
-                    "(id, subject_id, blob_id, original_name, origin, acquired_at, tlp, "
-                    "do_not_submit, external_llm_allowed, created_at) "
-                    "VALUES (:id, :subject_id, :blob_id, 'source.txt', "
-                    "'https://legacy.example/source', :created_at, 'GREEN', false, true, "
-                    ":created_at)"
-                ),
-                {
-                    "id": ids["source_document"],
-                    "subject_id": ids["subject"],
-                    "blob_id": ids["blob"],
-                    "created_at": _LEGACY_CREATED_AT,
-                },
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO human_decisions "
-                    "(id, edition_id, decision_type, group_ids, actor_id, correlation_id, "
-                    "payload, occurred_at) VALUES (:id, :edition_id, 'select', '[]'::jsonb, "
-                    "'legacy-operator', 'legacy-correlation', '{}'::jsonb, :created_at)"
-                ),
-                {
-                    "id": ids["human_decision"],
-                    "edition_id": ids["edition"],
-                    "created_at": _LEGACY_CREATED_AT,
-                },
-            )
-
-    finally:
-        await engine.dispose()
-
-    return await _legacy_data_snapshot(database_url)
-
-
-async def _remove_repair_table_from_stamped_baseline(database_url: str) -> None:
-    """Model a pre-Repair-Desk DB that was nevertheless stamped at 0001."""
-    engine = create_async_engine(database_url)
-    try:
-        async with engine.begin() as connection:
-            await connection.execute(text(f"DROP TABLE {_REPAIR_TABLE}"))
-    finally:
-        await engine.dispose()
-
-
-def test_legacy_0001_database_gets_repair_desk_without_data_loss(
-    temporary_postgres_url: str,
-) -> None:
-    config = _alembic_config(temporary_postgres_url)
-    command.upgrade(config, "0001_baseline")
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0001_baseline"
-    asyncio.run(_remove_repair_table_from_stamped_baseline(temporary_postgres_url))
-
-    before_tables = asyncio.run(_table_names(temporary_postgres_url))
-    before_triggers = asyncio.run(_trigger_function_pairs(temporary_postgres_url))
-    assert _REPAIR_TABLE not in before_tables
-    assert ("production_repair_decisions", _REPAIR_TRIGGER) not in before_triggers
-    preserved = asyncio.run(_seed_legacy_rows(temporary_postgres_url))
-
-    command.upgrade(config, "head")
-
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    after_tables = asyncio.run(_table_names(temporary_postgres_url))
-    assert after_tables == before_tables | {_REPAIR_TABLE}
-    repair_table = Base.metadata.tables[_REPAIR_TABLE]
-    expected_repair_snapshot = {
-        "columns": _expected_columns(repair_table),
-        "pk": _expected_primary_key(repair_table),
-        "fks": _expected_foreign_keys(repair_table),
-        "uniques": _expected_unique_constraints(repair_table),
-        "checks": _expected_check_constraint_names(repair_table),
-        "indexes": _expected_indexes(repair_table),
-    }
-    assert asyncio.run(_database_snapshot(temporary_postgres_url))[_REPAIR_TABLE] == (
-        expected_repair_snapshot
-    )
-    assert asyncio.run(_trigger_function_pairs(temporary_postgres_url)) == {
-        **before_triggers,
-        (_REPAIR_TABLE, _REPAIR_TRIGGER): "reject_evidence_mutation",
-    }
-
-    assert asyncio.run(_legacy_data_snapshot(temporary_postgres_url)) == preserved
-
-    async def _repair_guard_sqlstates() -> tuple[str, str]:
-        engine = create_async_engine(temporary_postgres_url)
-        try:
-            async with engine.begin() as connection:
-                await connection.execute(
-                    text(
-                        "INSERT INTO production_repair_decisions "
-                        "(id, edition_id, subject_id, production_run_id, observed_artifact_id, "
-                        "repair_key, issue_kind, action, observed_pipeline_generation, actor_id, "
-                        "reason, created_at) VALUES "
-                        "(:id, :edition_id, :subject_id, :run_id, :artifact_id, :repair_key, "
-                        "'rejected_rule', 'include', 0, 'legacy-test', NULL, :created_at)"
-                    ),
-                    {
-                        "id": "10000000-0000-0000-0000-000000000011",
-                        "edition_id": _LEGACY_ROW_IDS["edition"],
-                        "subject_id": _LEGACY_ROW_IDS["subject"],
-                        "run_id": _LEGACY_ROW_IDS["production_run"],
-                        "artifact_id": _LEGACY_ROW_IDS["artifact"],
-                        "repair_key": "e" * 64,
-                        "created_at": _LEGACY_CREATED_AT,
-                    },
-                )
-
-            async def _expect_rejection(statement: str) -> str:
-                try:
-                    async with engine.begin() as connection:
-                        await connection.execute(text(statement))
-                except DBAPIError as exc:
-                    return _sqlstate(exc)
-                return ""
-
-            return (
-                await _expect_rejection(
-                    "UPDATE production_repair_decisions SET reason = 'tampered'"
-                ),
-                await _expect_rejection("DELETE FROM production_repair_decisions"),
-            )
-        finally:
-            await engine.dispose()
-
-    assert asyncio.run(_repair_guard_sqlstates()) == ("55000", "55000")
-
-
-# ---------------------------------------------------------------------------
-# 6b: manual source archival on a database that predates the manual lease
-# ---------------------------------------------------------------------------
-
-
-_PRE_MANUAL_LEASE_SQL = (
-    "ALTER TABLE collection_attempts DROP CONSTRAINT ck_collection_attempts_acquisition",
-    "ALTER TABLE source_collections DROP CONSTRAINT ck_source_collections_single_lease",
-    "ALTER TABLE collection_attempts DROP COLUMN manual_lease_id",
-    "ALTER TABLE source_collections DROP COLUMN manual_lease_id",
-    "ALTER TABLE collection_attempts ALTER COLUMN job_id SET NOT NULL",
-)
-
-
-async def _revert_to_pre_manual_lease_schema(database_url: str) -> None:
-    """Model a real database created before the manual acquisition token."""
-    engine = create_async_engine(database_url)
-    try:
-        async with engine.begin() as connection:
-            for statement in _PRE_MANUAL_LEASE_SQL:
-                await connection.execute(text(statement))
-    finally:
-        await engine.dispose()
-
-
-def test_existing_database_gains_the_manual_lease_without_data_loss(
-    temporary_postgres_url: str,
-) -> None:
-    config = _alembic_config(temporary_postgres_url)
-    command.upgrade(config, "0002_repair_desk_compat")
-    asyncio.run(_revert_to_pre_manual_lease_schema(temporary_postgres_url))
-    preserved = asyncio.run(_seed_legacy_rows(temporary_postgres_url))
-
-    command.upgrade(config, "head")
-
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    snapshot = asyncio.run(_database_snapshot(temporary_postgres_url))
-    for table_name in ("source_collections", "collection_attempts"):
-        table = Base.metadata.tables[table_name]
-        assert snapshot[table_name]["columns"] == _expected_columns(table)
-        assert snapshot[table_name]["checks"] == _expected_check_constraint_names(table)
-        assert snapshot[table_name]["fks"] == _expected_foreign_keys(table)
-
-    # Rows written before the new schema are untouched by the upgrade: the
-    # only difference allowed is the new, empty nullable lease column.
-    after = asyncio.run(_legacy_data_snapshot(temporary_postgres_url))
-    assert _without_manual_lease(after) == _without_manual_lease(preserved)
-    assert json.loads(after["source_collections"])["manual_lease_id"] is None
-
-
-def _without_manual_lease(snapshot: dict[str, str]) -> dict[str, dict[str, Any]]:
-    rows: dict[str, dict[str, Any]] = {}
-    for name, row_json in snapshot.items():
-        row = json.loads(row_json)
-        row.pop("manual_lease_id", None)
-        rows[name] = row
-    return rows
-
-
-def test_downgrade_refuses_to_destroy_manual_collection_attempts(
-    temporary_postgres_url: str,
-) -> None:
-    config = _alembic_config(temporary_postgres_url)
-    command.upgrade(config, "head")
-    asyncio.run(_seed_legacy_rows(temporary_postgres_url))
-    asyncio.run(_seed_manual_collection_attempt(temporary_postgres_url))
-
-    with pytest.raises(RuntimeError, match="manual collection attempts"):
-        command.downgrade(config, "0002_repair_desk_compat")
-
-    # The refused downgrade left the audit row and the schema in place.
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
-    assert asyncio.run(_manual_attempt_count(temporary_postgres_url)) == 1
-
-
-async def _seed_manual_collection_attempt(database_url: str) -> None:
-    engine = create_async_engine(database_url)
-    try:
-        async with engine.begin() as connection:
-            await connection.execute(
-                text(
-                    "INSERT INTO collection_policy_snapshots "
-                    "(id, max_redirects, timeout_seconds, max_download_bytes, "
-                    "max_expanded_bytes, max_decompression_ratio, user_agent, allowed_domains, "
-                    "blocked_domains, collector_version, extraction_limits, created_at) "
-                    "VALUES (:policy_id, 3, 10.0, 1000, 1000, 10.0, 'agent', '[]'::jsonb, "
-                    "'[]'::jsonb, '1', '{}'::jsonb, :created_at)"
-                ),
-                {"policy_id": "f" * 64, "created_at": _LEGACY_CREATED_AT},
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO collection_attempts "
-                    "(id, collection_id, job_id, manual_lease_id, policy_snapshot_id, "
-                    "requested_url, redirect_chain, attempted_at, completed_at, "
-                    "allowed_headers, outcome, failure_reason) "
-                    "VALUES (:id, :collection_id, NULL, gen_random_uuid(), :policy_id, "
-                    "'https://legacy.example/source', '[]'::jsonb, :created_at, :created_at, "
-                    "'{}'::jsonb, 'succeeded', NULL)"
-                ),
-                {
-                    "id": "10000000-0000-0000-0000-000000000012",
-                    "collection_id": _LEGACY_ROW_IDS["source_collection"],
-                    "policy_id": "f" * 64,
-                    "created_at": _LEGACY_CREATED_AT,
-                },
-            )
-    finally:
-        await engine.dispose()
-
-
-async def _manual_attempt_count(database_url: str) -> int:
-    engine = create_async_engine(database_url)
-    try:
-        async with engine.connect() as connection:
-            result = await connection.execute(
-                text("SELECT count(*) FROM collection_attempts WHERE job_id IS NULL")
-            )
-            return int(result.scalar_one())
-    finally:
-        await engine.dispose()
-
-
-# ---------------------------------------------------------------------------
-# 7: fresh install and repeated upgrade
+# 6: fresh install and repeated upgrade
 # ---------------------------------------------------------------------------
 
 
@@ -1008,9 +580,11 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
 ) -> None:
     config = _alembic_config(temporary_postgres_url)
 
+    assert asyncio.run(_table_names(temporary_postgres_url)) == set()
     command.upgrade(config, "head")
     command.current(config)
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0001_baseline"
+    assert _head_revision() == "0001_baseline"
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -1020,18 +594,20 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
         key: function for key, function in triggers.items() if key[0] == _REPAIR_TABLE
     }
     assert repair_triggers == {(_REPAIR_TABLE, _REPAIR_TRIGGER): "reject_evidence_mutation"}
+    schema_definitions = asyncio.run(_database_snapshot(temporary_postgres_url))
     trigger_definitions = asyncio.run(_trigger_definitions(temporary_postgres_url))
 
-    # 0002 must observe the table and trigger made by 0001 and perform no DDL
-    # that conflicts with them.
+    # The single mutable baseline is idempotent: repeating the upgrade is a
+    # no-op for the schema and trigger definitions.
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     assert asyncio.run(_table_names(temporary_postgres_url)) == tables
+    assert asyncio.run(_database_snapshot(temporary_postgres_url)) == schema_definitions
     assert asyncio.run(_trigger_definitions(temporary_postgres_url)) == trigger_definitions
 
 
 # ---------------------------------------------------------------------------
-# 8: upgrade head -> downgrade base -> upgrade head
+# 7: upgrade head -> downgrade base -> upgrade head
 # ---------------------------------------------------------------------------
 
 
