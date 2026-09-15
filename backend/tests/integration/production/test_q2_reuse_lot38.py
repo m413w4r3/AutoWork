@@ -116,8 +116,8 @@ async def test_references_rebuild_reuses_five_q2_sources_and_calls_s6_once(
     initial = await scenario.run_until_terminal()
     assert initial.status is SubjectProductionStatus.READY
     initial_q2 = [call for call in scenario.model.calls if call.stage == "extraction"]
-    assert len(initial_q2) == 5
-    assert {call.source_url for call in initial_q2} == set(URLS[:5])
+    initial_covered_urls = {url for call in initial_q2 for url in call.source_urls}
+    assert initial_covered_urls == set(URLS[:5])
 
     collections = await scenario.collection_service.list_sources(scenario.subject.id)
     s6 = next(collection for collection in collections if collection.canonical_url == URLS[5])
@@ -153,7 +153,8 @@ async def test_references_rebuild_reuses_five_q2_sources_and_calls_s6_once(
     retry_q2 = [call for call in retry_calls if call.stage == "extraction"]
     retry_q4 = [call for call in retry_calls if call.stage == "synthesis"]
     assert len(retry_q2) == 1
-    assert retry_q2[0].source_url == URLS[5]
+    retry_covered_urls = [url for call in retry_q2 for url in call.source_urls]
+    assert retry_covered_urls == [URLS[5]]
     assert len(retry_q4) <= 1
 
     async with scenario.uow_factory() as uow:

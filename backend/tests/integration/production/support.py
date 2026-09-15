@@ -584,6 +584,25 @@ class ProductionScenario:
             raise ValueError("ProductionScenario expects one discovery candidate")
         self.discovery_batch.candidates[0].sources = list(selected)
 
+    def set_source_roles(self, roles: Mapping[str, SourceRole]) -> None:
+        """Express the frozen discovery roles used by the Q2 policy.
+
+        This test-only helper updates only the requested sources, after
+        canonicalizing their URLs and checking that they are present in the
+        current source candidates.  It does not call the database, rebuild the
+        scenario, or alter the Q1 report.
+        """
+        canonical_roles = {_canonical_url(url): role for url, role in roles.items()}
+        candidates_by_url = {source.canonical_url: source for source in self.source_candidates}
+        unknown_urls = set(canonical_roles) - set(candidates_by_url)
+        if unknown_urls:
+            raise ValueError(f"set_source_roles received unknown source URLs: {unknown_urls}")
+        if len(self.discovery_batch.candidates) != 1:
+            raise ValueError("ProductionScenario expects one discovery candidate")
+        for url, role in canonical_roles.items():
+            candidates_by_url[url].role = role
+        self.discovery_batch.candidates[0].sources = list(self.source_candidates)
+
     async def seed(self) -> None:
         discovery_run = ModelRun(
             id=self.discovery_batch.discovery_model_run_id,

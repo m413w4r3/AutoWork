@@ -58,10 +58,7 @@ IOC confirmed domain
     - core-c2.security-lab.io :: Command-and-control domain in the report.
 """
 
-Q2_SECONDARY_RESPONSE = """FACT infection_chain
-- Script launcher executes ExampleRAT :: The report describes the execution chain.
-
-IOC contextual domain
+Q2_SECONDARY_RESPONSE = """IOC contextual domain
 - secondary-c2.security-lab.io :: A related infrastructure domain is discussed.
 """
 

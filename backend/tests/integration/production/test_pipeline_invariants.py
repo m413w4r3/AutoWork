@@ -46,6 +46,7 @@ from cti_app.application.production_workflow import (
 )
 from cti_app.application.subject_production import SubjectProductionService
 from cti_app.domain.collection import CollectionState
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import ModelProvider, ModelRunStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
@@ -252,6 +253,7 @@ def _configure_prince_topology(
     # This is the business input from which the production snapshot and Q2
     # profiles are derived; no profile is injected into the expected result.
     scenario.restrict_core_sources(urls[9:12])
+    scenario.set_source_roles({url: SourceRole.PRIMARY for url in urls[9:12]})
     scenario.model.script.references(_references(urls))
     scenario.model.script.synthesis(_synthesis(urls))
     for index, url in enumerate(urls, start=1):

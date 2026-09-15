@@ -28,6 +28,7 @@ from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_reconciliation import ProductionReconciliationService
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.subject_production import SubjectProductionService
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import ModelRunStatus, ModelSubmissionState
 from cti_app.domain.production import (
     ProductionArtifactStage,
@@ -221,6 +222,7 @@ async def test_retryable_source_recovery_reuses_thirteen_checkpoints(
     production_scenario_factory: ScenarioFactory,
 ) -> None:
     scenario, urls = _configured(production_scenario_factory, count=14)
+    scenario.set_source_roles({urls[-1]: SourceRole.PRIMARY})
     original_response_for = scenario.model.script.response_for
     transient_failures = [
         BridgeTransportError(
@@ -256,10 +258,14 @@ async def test_retryable_source_recovery_reuses_thirteen_checkpoints(
 
     q2_calls = [call for call in scenario.model.calls if call.stage == "extraction"]
     first_model_ids = {
-        call.source_url: call.model_run_id for call in q2_calls if call.source_url != urls[-1]
+        url: call.model_run_id
+        for call in q2_calls
+        for url in call.source_urls
+        if url != urls[-1]
     }
+    assert set(first_model_ids) == set(urls[:-1])
     assert len(first_model_ids) == 13
-    s14_calls = [call for call in q2_calls if call.source_url == urls[-1]]
+    s14_calls = [call for call in q2_calls if urls[-1] in call.source_urls]
     assert len(s14_calls) == 4
     assert len({call.model_run_id for call in s14_calls}) == 2
 
@@ -345,6 +351,12 @@ async def test_mixed_source_retryability_never_opens_global_recovery(
     production_scenario_factory: ScenarioFactory,
 ) -> None:
     scenario, urls = _configured(production_scenario_factory, count=14)
+    scenario.set_source_roles(
+        {
+            urls[-2]: SourceRole.PRIMARY,
+            urls[-1]: SourceRole.PRIMARY,
+        }
+    )
     original_response_for = scenario.model.script.response_for
     retryable_failure = BridgeTransportError(
         "bridge_unreachable",

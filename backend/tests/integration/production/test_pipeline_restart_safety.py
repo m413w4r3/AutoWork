@@ -16,6 +16,7 @@ from cti_app.application.model_gateway import ModelRequest, ModelRole
 from cti_app.application.production_reconciliation import ProductionReconciliationService
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.collection import CollectionState
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_conversations import ConversationStatus
 from cti_app.domain.model_runs import ModelRunStatus, ModelSubmissionState
 from cti_app.domain.production import (
@@ -198,14 +199,15 @@ def _configured(
     factory: ScenarioFactory,
     source_count: int,
     *,
-    all_core: bool = False,
+    all_primary: bool = False,
     bodies: dict[str, str] | None = None,
 ) -> tuple[ProductionScenario, tuple[str, ...]]:
     urls = _urls(source_count)
     scenario = factory(_source_specs(urls, bodies=bodies))
     scenario.edition.country = f"Restart Safety {scenario.edition.country_code}"
-    if all_core:
+    if all_primary:
         scenario.restrict_core_sources(urls)
+        scenario.set_source_roles({url: SourceRole.PRIMARY for url in urls})
     _configure_gateway(scenario, urls)
     return scenario, urls
 
@@ -388,7 +390,7 @@ async def test_restart_mid_q2_reuses_only_the_durable_completed_checkpoints(
     production_scenario_factory: ScenarioFactory,
     migrated_postgres_url: str,
 ) -> None:
-    scenario, urls = _configured(production_scenario_factory, 3, all_core=True)
+    scenario, urls = _configured(production_scenario_factory, 3, all_primary=True)
     await scenario.start()
     await _run_prefix(scenario, 2)
 
@@ -464,7 +466,7 @@ async def test_restart_between_live_unavailable_and_archive_fallback(
     production_scenario_factory: ScenarioFactory,
     migrated_postgres_url: str,
 ) -> None:
-    scenario, urls = _configured(production_scenario_factory, 2, all_core=True)
+    scenario, urls = _configured(production_scenario_factory, 2, all_primary=True)
     _configure_gateway(
         scenario,
         urls,
@@ -546,7 +548,7 @@ async def test_restart_after_synthesis_assembly_consumes_the_persisted_artifact(
     production_scenario_factory: ScenarioFactory,
     migrated_postgres_url: str,
 ) -> None:
-    scenario, _urls = _configured(production_scenario_factory, 1, all_core=True)
+    scenario, _urls = _configured(production_scenario_factory, 1, all_primary=True)
     await scenario.start()
     await _run_prefix(scenario, 4)
     before = await _reload(scenario)
@@ -582,7 +584,7 @@ async def test_restart_after_success_retries_only_browser_cleanup(
     production_scenario_factory: ScenarioFactory,
     migrated_postgres_url: str,
 ) -> None:
-    scenario, _urls = _configured(production_scenario_factory, 1, all_core=True)
+    scenario, _urls = _configured(production_scenario_factory, 1, all_primary=True)
     browser = BrowserTarget(set(), [])
     scenario.model_service._conversation_session_closer = browser
     await scenario.start()
@@ -644,7 +646,7 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     production_scenario_factory: ScenarioFactory,
     migrated_postgres_url: str,
 ) -> None:
-    scenario, urls = _configured(production_scenario_factory, 1, all_core=True)
+    scenario, urls = _configured(production_scenario_factory, 1, all_primary=True)
     bridge_run_id = "bridge-restart-reconciliation"
     scenario.model.script.q2(
         source_url=urls[0],
