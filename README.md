@@ -55,16 +55,62 @@ toujours les volumes nommés.
 `make model-run-diagnostics RUN_ID=<uuid>` affiche uniquement les métadonnées sûres d'une
 sortie modèle et donne la commande d'export explicite de l'artefact brut.
 
-## Développement hors conteneur
+## Développement local
 
 ```bash
-cd backend && uv sync
-cd ../frontend && pnpm install --frozen-lockfile
+make setup
 ```
 
-Les commandes racine sont `make test`, `make test-integration`, `make lint`, `make typecheck` et `make format`. Aucun test ne contacte une API externe. Les tests d'intégration utilisent une base PostgreSQL temporaire indiquée par `TEST_POSTGRES_ADMIN_DSN`.
+`make setup` vérifie les prérequis, synchronise le backend avec `backend/uv.lock`
+en installant explicitement les groupes `dev` et `analysis`, puis installe les
+dépendances frontend. Les commandes utiles pour une action ciblée sont :
 
-`make test-integration` démarre automatiquement le service PostgreSQL éphémère `postgres-test`, indépendant de la DB applicative, puis le supprime même en cas d'échec. `POSTGRES_DSN` désigne la DB applicative ; `TEST_POSTGRES_ADMIN_DSN` est réservé à la création et suppression des bases temporaires de pytest. Après une réécriture locale des migrations, `make up-clean` recrée les volumes applicatifs ; cette commande est destructive.
+```bash
+make doctor
+make backend-sync
+make frontend-sync
+make reset-backend-env
+```
+
+Pour mettre volontairement à jour le lockfile après une modification de
+dépendances, utiliser `make backend-lock`. `backend-sync` utilise `--locked` et
+échoue si `backend/pyproject.toml` et `backend/uv.lock` sont désynchronisés.
+
+Les commandes racine sont `make help`, `make test`, `make test-integration`,
+`make test-all`, `make lint`, `make typecheck` et `make format`. Aucun test ne
+contacte une API externe.
+
+`make test` lance les tests backend ordinaires et frontend, sans PostgreSQL
+d'intégration. `make test-backend` exclut `tests/integration`, tandis que
+`make test-frontend` lance les tests frontend. `make test-integration` ne
+collecte que `backend/tests/integration` avec un PostgreSQL dédié ;
+`make test-all` enchaîne les deux suites.
+
+Exemples de tests ciblés :
+
+```bash
+make test-backend \
+  PYTEST_ARGS="tests/test_static_analysis.py -q"
+
+make test-integration \
+  INTEGRATION_TEST_PATH=tests/integration/production \
+  INTEGRATION_PYTEST_ARGS="-x -vv"
+```
+
+Les tests d'intégration n'utilisent pas `POSTGRES_DSN`, réservé à la base
+applicative. Ils utilisent un PostgreSQL dédié et respectent
+`TEST_POSTGRES_ADMIN_DSN` s'il est fourni ; sinon `make test-integration` démarre
+et supprime le service temporaire dont il est propriétaire, sans collecter les
+tests unitaires.
+
+`make help` affiche les commandes Make documentées et leurs descriptions.
+
+Le service PostgreSQL éphémère `postgres-test` est indépendant de la DB
+applicative et est supprimé même en cas d'échec lorsque la commande l'a démarré.
+`POSTGRES_DSN` désigne la DB applicative ; `TEST_POSTGRES_ADMIN_DSN` est réservé
+à la création et suppression des bases temporaires de pytest. Après une
+modification volontaire de l'état local des migrations, `make up-clean` recrée
+les volumes applicatifs ; cette commande est destructive.
 
 ## Développement automatisé avec MetaHarness
 

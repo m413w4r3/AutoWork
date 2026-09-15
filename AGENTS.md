@@ -47,9 +47,21 @@ The index is a locator, not a source of truth: inspect real code before edits.
 
 ## Commands — interactive development
 
+    make help
+    make doctor | setup
     make up | down | status | logs
-    make test | test-integration
-    make lint | typecheck | format
+
+    make test | test-backend | test-frontend
+    make test-integration | test-all
+
+    make lint | lint-backend | lint-frontend
+    make typecheck | typecheck-backend | typecheck-frontend
+    make format
+
+Préférer les cibles Make aux commandes `uv run pytest` directes lorsque la
+reproductibilité de l'environnement est importante. Pour un test ciblé backend,
+utiliser `PYTEST_ARGS`; pour l'intégration, utiliser `INTEGRATION_TEST_PATH` et
+`INTEGRATION_PYTEST_ARGS`.
 
 Use the narrowest relevant test/check first. Run repository-wide checks only
 when the change crosses components or before final validation when justified.

@@ -6,16 +6,34 @@ L'API des éditions mensuelles est décrite dans `../docs/editions.md`. En déve
 l'abstraction d'identité attribue les décisions à `dev-analyst`; elle ne constitue pas une
 authentification de production.
 
+Depuis la racine du dépôt, synchroniser l'environnement avec :
+
 ```bash
-uv sync
-uv run uvicorn cti_app.api.main:app --reload
-uv run dramatiq cti_app.workers.tasks
-uv run python -m cti_app.workers.scheduler
+make backend-sync
+```
+
+Pour une utilisation volontairement manuelle depuis `backend/`, l'équivalent
+verrouillé est :
+
+```bash
+cd backend
+uv sync --locked --group dev --group analysis
+uv run --no-sync uvicorn cti_app.api.main:app --reload
+uv run --no-sync dramatiq cti_app.workers.tasks
+uv run --no-sync python -m cti_app.workers.scheduler
 ```
 
 ## Migrations
 
-PostgreSQL est la base principale. La migration initiale est appliquée automatiquement par le service Compose `migrate`. La chaîne post-baseline est volontairement réécrivable tant que le projet est en développement local : une base existante doit être recréée après une réécriture. Hors Compose :
+PostgreSQL est la base principale. La migration initiale est appliquée automatiquement par le service Compose `migrate`.
+
+`0001_baseline` constitue le schéma complet destiné à une base vide, et
+`alembic upgrade head` doit toujours créer ce schéma cible. Les migrations
+post-baseline de compatibilité déjà présentes et leurs tests forment un contrat
+historique explicite ; elles ne doivent pas être réécrites silencieusement et
+aucune logique de compatibilité ad hoc ne doit être ajoutée à `0001_baseline`.
+
+Hors Compose :
 
 ```bash
 uv run alembic upgrade head
@@ -33,10 +51,15 @@ make test-integration
 ```bash
 docker compose --profile integration-test up -d --wait postgres-test
 cd backend
+uv sync --locked --group dev --group analysis
 TEST_POSTGRES_ADMIN_DSN=postgresql+asyncpg://postgres:postgres@127.0.0.1:55432/postgres \
-  uv run pytest -m integration
+  uv run --no-sync pytest -m integration tests/integration
+cd ..
 docker compose --profile integration-test rm -sf postgres-test
 ```
+
+La commande manuelle cible explicitement `tests/integration` avec le marqueur
+`integration`; `pytest -m integration` seul n'est pas le workflow recommandé.
 
 Les tests créent une base temporaire dans ce serveur. `POSTGRES_DSN` est la connexion à la DB applicative ; `TEST_POSTGRES_ADMIN_DSN` est la connexion ADMIN réservée à pytest pour `CREATE DATABASE` / `DROP DATABASE`. Ces deux URLs ne sont pas interchangeables. Un DSN explicite peut remplacer le service local : `TEST_POSTGRES_ADMIN_DSN=<dsn> make test-integration`.
 
